@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
-use ccteam_core::{
-    HarnessKind, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, SessionRecord, TeamKind,
-};
+use ccteam_core::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TeamKind};
 
 fn sample_state() -> ProjectState {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 4, 10, 23, 0).unwrap();
@@ -54,8 +52,6 @@ fn sample_state() -> ProjectState {
         last_user_interaction_at: t0,
         user_attached: false,
         user_pause_pending: false,
-        sessions: BTreeMap::new(),
-        next_sid_seq: BTreeMap::new(),
         detached: false,
         schedule_last_fire: BTreeMap::new(),
     }
@@ -218,44 +214,8 @@ fn legacy_state_without_f49_fields_loads_as_workflow_with_empty_sessions() {
 
     let loaded = ProjectState::load(&main).unwrap();
     assert_eq!(loaded.team_kind, TeamKind::Workflow);
-    assert!(loaded.sessions.is_empty());
-    assert!(loaded.next_sid_seq.is_empty());
 
     loaded.save(&main).unwrap();
     let saved = std::fs::read_to_string(&main).unwrap();
-    assert!(!saved.contains("sessions"));
-    assert!(!saved.contains("next_sid_seq"));
     assert!(!saved.contains("team_kind"));
-}
-
-#[test]
-fn flex_sessions_round_trip_and_sid_allocator_does_not_reuse_removed_sid() {
-    let dir = TempDir::new().unwrap();
-    let (main, _, _) = paths(&dir);
-    let t0 = Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).unwrap();
-    let mut state = sample_state();
-    state.team_kind = TeamKind::Flex;
-    let first = state.allocate_sid(HarnessKind::Claude);
-    assert_eq!(first, "claude-1");
-    state.sessions.insert(
-        first.clone(),
-        SessionRecord {
-            harness: HarnessKind::Claude,
-            tmux_session: "ccteam-bookmark-mgr-a3f9-claude-1".into(),
-            started_at: t0,
-            pid: Some(42),
-            job_id: None,
-        },
-    );
-    state.sessions.remove(&first);
-    let second = state.allocate_sid(HarnessKind::Claude);
-    assert_eq!(second, "claude-2");
-
-    state.save(&main).unwrap();
-    let body = std::fs::read_to_string(&main).unwrap();
-    assert!(body.contains("\"team_kind\": \"flex\""));
-    assert!(body.contains("\"next_sid_seq\""));
-    let loaded = ProjectState::load(&main).unwrap();
-    assert_eq!(loaded.team_kind, TeamKind::Flex);
-    assert_eq!(loaded.next_sid_seq.get(&HarnessKind::Claude), Some(&3));
 }

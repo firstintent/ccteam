@@ -18,14 +18,13 @@
 //! the registry's mutex can churn on tmux-server-wide state if we
 //! don't serialize.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ccteam_core::tmux::{tmux_available, TmuxSession};
-use ccteam_core::{CcteamPaths, HarnessKind, ProjectState, SessionRecord, TeamKind};
+use ccteam_core::{CcteamPaths, ProjectState, TeamKind};
 use ccteam_web::{router_with_state, AppState, AuthState};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -82,29 +81,6 @@ fn fixture_workflow_project(paths: &CcteamPaths, slug: &str, tmux_session: &str)
     state.team_kind = TeamKind::Workflow;
     state.created_at = now;
     state.last_user_interaction_at = now;
-    state.save(&paths.project_state(slug)).unwrap();
-}
-
-fn fixture_flex_session(paths: &CcteamPaths, slug: &str, sid: &str, tmux_session: &str) {
-    std::fs::create_dir_all(paths.project_ccteam_dir(slug)).unwrap();
-    let now = Utc::now();
-    let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
-    state.tmux_session = format!("ccteam-{slug}");
-    state.team_kind = TeamKind::Flex;
-    state.created_at = now;
-    state.last_user_interaction_at = now;
-    let mut sessions = BTreeMap::new();
-    sessions.insert(
-        sid.to_string(),
-        SessionRecord {
-            harness: HarnessKind::Claude,
-            tmux_session: tmux_session.to_string(),
-            started_at: now,
-            pid: None,
-            job_id: None,
-        },
-    );
-    state.sessions = sessions;
     state.save(&paths.project_state(slug)).unwrap();
 }
 
@@ -573,23 +549,24 @@ async fn ws_last_client_disconnect_stops_pipe_pane() {
 }
 
 // ---------------------------------------------------------------------------
-// Flex / sid-scoped happy path: hooks up against a `sessions[sid]`
-// record and exercises the same byte relay.
+// Sid-scoped route happy path. W5: the flex per-session registry is gone,
+// so `/ws/{slug}/{sid}/pty` relays the project-level tmux pane (keyed
+// `{slug}/{sid}` for the FIFO). Exercises the same byte relay.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
-async fn ws_flex_sid_scoped_route_relays_bytes() {
+async fn ws_sid_scoped_route_relays_bytes() {
     if !tmux_available() {
-        eprintln!("[skip] ws_flex_sid_scoped_route_relays_bytes: tmux not on PATH");
+        eprintln!("[skip] ws_sid_scoped_route_relays_bytes: tmux not on PATH");
         return;
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let slug = unique_slug("flex-sid");
+    let slug = unique_slug("sid-scoped");
     let sid = "claude-1";
-    let tmux_name = format!("ccteam-{slug}-{sid}");
-    fixture_flex_session(&paths, &slug, sid, &tmux_name);
+    let tmux_name = format!("ccteam-{slug}");
+    fixture_workflow_project(&paths, &slug, &tmux_name);
 
     let scoped = ScopedSession::from_name(&tmux_name);
     scoped
@@ -616,13 +593,13 @@ async fn ws_flex_sid_scoped_route_relays_bytes() {
             "send-keys",
             "-t",
             &format!("{tmux_name}:0.0"),
-            "echo F56FLEXTAG",
+            "echo F56SIDTAG",
             "Enter",
         ])
         .status();
 
-    let saw = wait_for_marker(&mut ws, b"F56FLEXTAG", Duration::from_secs(5)).await;
-    assert!(saw, "expected to see F56FLEXTAG bytes from flex sid pane");
+    let saw = wait_for_marker(&mut ws, b"F56SIDTAG", Duration::from_secs(5)).await;
+    assert!(saw, "expected to see F56SIDTAG bytes from sid-scoped pane");
 
     // FIFO name uses '-' instead of '/' from the key.
     let fifo_path = paths.pty_dir().join(format!("{slug}-{sid}.fifo"));

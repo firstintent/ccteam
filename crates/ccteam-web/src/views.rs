@@ -9,8 +9,8 @@
 //! SSR fallback per the PRD; askama stays in `Cargo.toml` for the
 //! same reason (no live `#[derive(Template)]` references it today).
 //!
-//! What lives on: the **data** structs (`DashboardRow`, `SessionCard`,
-//! `EventRow`, `OutboxRow`, `HarnessSnapshotView`) which the JSON API
+//! What lives on: the **data** structs (`DashboardRow`, `EventRow`,
+//! `OutboxRow`, `HarnessSnapshotView`) which the JSON API
 //! (`routes::api_v1`) doc-comments still reference. These derive
 //! `Serialize` so they encode straight into the F52 JSON contract
 //! without churn.
@@ -32,21 +32,6 @@ pub struct DashboardRow {
     pub badge_class: &'static str,
     pub badge_label: &'static str,
     pub cost_label: String,
-}
-
-#[derive(Serialize)]
-pub struct SessionCard {
-    pub sid: String,
-    pub harness: String,
-    pub harness_class: &'static str,
-    pub tmux_session: String,
-    pub status_class: &'static str,
-    pub status_label: &'static str,
-    pub last_event_label: String,
-    pub cost_label: String,
-    pub detail_href: String,
-    pub screenshot_href: String,
-    pub attach_command: String,
 }
 
 #[derive(Serialize)]

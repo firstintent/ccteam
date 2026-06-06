@@ -8,9 +8,8 @@
 use std::fs;
 use std::net::SocketAddr;
 
-use ccteam_core::{CcteamPaths, HarnessKind, ProjectState, SessionRecord, TeamKind};
+use ccteam_core::{CcteamPaths, ProjectState};
 use ccteam_web::{router_with_state, AppState};
-use chrono::Utc;
 use reqwest::redirect::Policy;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -22,20 +21,13 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     }
 }
 
-fn fixture_flex_project(paths: &CcteamPaths, slug: &str) {
-    let mut state = ProjectState::initial(slug.to_string());
-    state.team_kind = TeamKind::Flex;
-    state.sessions.insert(
-        "claude-1".into(),
-        SessionRecord {
-            harness: HarnessKind::Claude,
-            tmux_session: format!("ccteam-{slug}-claude-1"),
-            started_at: Utc::now(),
-            pid: None,
-            job_id: None,
-        },
-    );
-    state.save(&paths.project_state(slug)).unwrap();
+/// Minimal registered project: a saved `state.json` (which materializes
+/// `<project_dir>/.ccteam/`) is enough for the lookup-free redirect
+/// routes and the project-level `send_to_session` write path.
+fn fixture_project(paths: &CcteamPaths, slug: &str) {
+    ProjectState::initial(slug.to_string())
+        .save(&paths.project_state(slug))
+        .unwrap();
 }
 
 async fn spawn_server(state: AppState) -> SocketAddr {
@@ -113,11 +105,11 @@ async fn project_detail_redirect_location_url_encodes_slug_segment() {
 }
 
 #[tokio::test]
-async fn session_detail_redirects_registered_flex_session_to_spa() {
+async fn session_detail_redirects_registered_session_to_spa() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let slug = "dev-flex";
-    fixture_flex_project(&paths, slug);
+    let slug = "dev-proj";
+    fixture_project(&paths, slug);
 
     let addr = spawn_server(AppState::new(paths)).await;
     let resp = nofollow()
@@ -126,15 +118,15 @@ async fn session_detail_redirects_registered_flex_session_to_spa() {
         .await
         .expect("GET /session/<slug>/<sid>");
     assert_eq!(resp.status(), 301);
-    assert_eq!(location(&resp), "/app/p/dev-flex/s/claude-1");
+    assert_eq!(location(&resp), "/app/p/dev-proj/s/claude-1");
 }
 
 #[tokio::test]
 async fn session_detail_redirects_unknown_sid_without_lookup() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let slug = "dev-flex";
-    fixture_flex_project(&paths, slug);
+    let slug = "dev-proj";
+    fixture_project(&paths, slug);
 
     let addr = spawn_server(AppState::new(paths)).await;
     let resp = nofollow()
@@ -143,16 +135,19 @@ async fn session_detail_redirects_unknown_sid_without_lookup() {
         .await
         .expect("GET /session/<slug>/<sid>");
     assert_eq!(resp.status(), 301);
-    assert_eq!(location(&resp), "/app/p/dev-flex/s/claude-99");
+    assert_eq!(location(&resp), "/app/p/dev-proj/s/claude-99");
 }
 
 #[tokio::test]
-async fn session_btw_posts_to_session_inbox() {
+async fn session_btw_posts_to_project_inbox() {
+    // W5: the flex per-session inbox is gone; session-scoped `/btw`
+    // routes through the project-level `send_to_session` engine call,
+    // landing in the project's `.ccteam/inbox`.
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let paths_for_assert = paths.clone();
-    let slug = "dev-flex";
-    fixture_flex_project(&paths, slug);
+    let slug = "dev-proj";
+    fixture_project(&paths, slug);
 
     let addr = spawn_server(AppState::new(paths)).await;
     let url = format!("http://{addr}/api/{slug}/claude-1/btw");
@@ -163,11 +158,9 @@ async fn session_btw_posts_to_session_inbox() {
         .await
         .expect("POST session btw");
     assert_eq!(resp.status(), 303);
-    assert_eq!(location(&resp), "/session/dev-flex/claude-1");
+    assert_eq!(location(&resp), "/session/dev-proj/claude-1");
 
-    let inbox_dir = paths_for_assert
-        .project_session_dir(slug, "claude-1")
-        .join("inbox");
+    let inbox_dir = paths_for_assert.project_ccteam_dir(slug).join("inbox");
     let mut entries = fs::read_dir(&inbox_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

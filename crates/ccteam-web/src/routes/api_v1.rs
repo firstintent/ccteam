@@ -31,18 +31,16 @@ use ccteam_core::{
     cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
     HarnessKind, ProjectState, TeamKind, WorkflowSummary,
 };
-use ccteam_harness::HarnessSnapshot;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::queries::{
-    event_ts_label, events_to_rows, outbox_rows, recent_event_summary, session_outbox_rows,
-    session_recent_events, slug_recent_events, DEFAULT_OUTBOX_LIMIT, PROJECT_EVENT_DISPLAY_LIMIT,
-    STATUS_EVENT_LIMIT,
+    events_to_rows, outbox_rows, recent_event_summary, slug_recent_events, DEFAULT_OUTBOX_LIMIT,
+    PROJECT_EVENT_DISPLAY_LIMIT, STATUS_EVENT_LIMIT,
 };
 use crate::state::AppState;
 use crate::status::status_badge;
-use crate::views::{DashboardRow, EventRow, HarnessSnapshotView, OutboxRow, SessionCard};
+use crate::views::{DashboardRow, EventRow, HarnessSnapshotView, OutboxRow};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -102,12 +100,10 @@ pub struct ProjectSummary {
     pub slug: String,
     pub team: String,
     pub kind: String,
-    pub is_flex: bool,
     pub badge_class: &'static str,
     pub badge_label: &'static str,
     pub cost_label: String,
     pub created_at: String,
-    pub sessions: Vec<SessionCard>,
     pub state: serde_json::Value,
     pub events: Vec<EventRow>,
     pub outbox: Vec<OutboxRow>,
@@ -243,11 +239,6 @@ async fn handle_project(
         .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as u64)
         .unwrap_or(0);
     let badge = status_badge(&state, &status_events, silent);
-    let sessions = if state.team_kind == TeamKind::Flex {
-        session_cards(&app, &state)
-    } else {
-        Vec::new()
-    };
 
     let state_value = match serde_json::to_value(&state) {
         Ok(v) => v,
@@ -278,12 +269,10 @@ async fn handle_project(
         slug: state.slug.clone(),
         team: state.team.clone(),
         kind: team_kind_label(state.team_kind).to_string(),
-        is_flex: state.team_kind == TeamKind::Flex,
         badge_class: badge.css_class(),
         badge_label: badge.label(),
         cost_label: format!("{:.2}", cost_total),
         created_at: state.created_at.to_rfc3339(),
-        sessions,
         state: state_value,
         events: event_rows,
         outbox,
@@ -318,76 +307,13 @@ async fn handle_session(
                 .into_response();
         }
     };
-    // V0.5.1 F103c — Workflow / multi_workflow projects: synthesize a
-    // SessionDetail from the `agent_spawn` event in progress.jsonl so
-    // the SPA can deep-link into workflow sessions instead of 404'ing.
-    // Pre-F103c only flex was supported.
-    if state.team_kind != TeamKind::Flex {
-        return build_workflow_session_detail(&app, &state, &slug, &sid);
-    }
-    let Some(record) = state.sessions.get(&sid) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!("session not found: {slug}/{sid}")
-            })),
-        )
-            .into_response();
-    };
-
-    let status_events = session_recent_events(&app.paths, &slug, &sid, STATUS_EVENT_LIMIT);
-    let display_start = status_events
-        .len()
-        .saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT);
-    let silent = status_events
-        .last()
-        .and_then(|event| event.get("ts").and_then(|s| s.as_str()))
-        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-        .map(|ts| {
-            Utc::now()
-                .signed_duration_since(ts.with_timezone(&Utc))
-                .num_seconds()
-                .max(0) as u64
-        })
-        .unwrap_or(0);
-    let badge = status_badge(&state, &status_events, silent);
-    let snapshot = load_harness_snapshot(&app, &slug, &sid);
-    // V0.4.6 F91 — when no live harness snapshot is available, fall
-    // back to `cost_total_usd` from `cost_summary` instead of the
-    // frozen `state.cost_used_usd`. Both numbers are project-wide
-    // (not session-specific) — session-granular cost is the snapshot's
-    // job.
-    let cost_label = snapshot
-        .as_ref()
-        .map(|snap| format!("{:.2}", snap.cost_usd_total))
-        .unwrap_or_else(|| {
-            let total = cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths)
-                .map(|c| c.cost_total_usd)
-                .unwrap_or(0.0);
-            format!("{:.2}", total)
-        });
-
-    let detail = SessionDetail {
-        slug: state.slug.clone(),
-        sid: sid.clone(),
-        team: state.team.clone(),
-        kind: "flex".to_string(),
-        harness: harness_label(record.harness).to_string(),
-        harness_class: harness_class(record.harness),
-        tmux_session: record.tmux_session.clone(),
-        started_at: record.started_at.to_rfc3339(),
-        status_class: badge.css_class(),
-        status_label: badge.label(),
-        cost_label,
-        events: events_to_rows(&status_events[display_start..]),
-        outbox: session_outbox_rows(&app.paths, &slug, &sid, DEFAULT_OUTBOX_LIMIT),
-        harness_snapshot: snapshot.map(snapshot_view),
-    };
-    Json(detail).into_response()
+    // Synthesize a SessionDetail from the `agent_spawn` event in
+    // progress.jsonl so the SPA can deep-link into sessions.
+    build_workflow_session_detail(&app, &state, &slug, &sid)
 }
 
-/// V0.5.1 F103c — build a SessionDetail for a workflow/multi_workflow
-/// project session. Sources:
+/// Build a SessionDetail for a workflow/multi_workflow project session.
+/// Sources:
 ///
 /// - progress.jsonl `agent_spawn` event for `<sid>` provides `role` +
 ///   `started_at` (+ `job_id` when present).
@@ -533,86 +459,17 @@ async fn handle_auth_token(State(app): State<AppState>) -> impl IntoResponse {
     })
 }
 
-fn session_cards(app: &AppState, state: &ProjectState) -> Vec<SessionCard> {
-    state
-        .sessions
-        .iter()
-        .map(|(sid, record)| {
-            let events = session_recent_events(&app.paths, &state.slug, sid, STATUS_EVENT_LIMIT);
-            let last_event_label = events
-                .last()
-                .and_then(event_ts_label)
-                .unwrap_or_else(|| "—".to_string());
-            let silent = events
-                .last()
-                .and_then(|event| event.get("ts").and_then(|s| s.as_str()))
-                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                .map(|ts| {
-                    Utc::now()
-                        .signed_duration_since(ts.with_timezone(&Utc))
-                        .num_seconds()
-                        .max(0) as u64
-                })
-                .unwrap_or(0);
-            let badge = status_badge(state, &events, silent);
-            // V0.4.6 F91 — fallback path tracks `cost_total_usd` from
-            // `cost_summary` instead of the frozen state field.
-            let cost_label = load_harness_snapshot(app, &state.slug, sid)
-                .map(|snap| format!("{:.2}", snap.cost_usd_total))
-                .unwrap_or_else(|| {
-                    let total = cost_summary(
-                        &state.slug,
-                        &app.paths.progress_jsonl(&state.slug),
-                        &app.paths,
-                    )
-                    .map(|c| c.cost_total_usd)
-                    .unwrap_or(0.0);
-                    format!("{:.2}", total)
-                });
-            SessionCard {
-                sid: sid.clone(),
-                harness: harness_label(record.harness).to_string(),
-                harness_class: harness_class(record.harness),
-                tmux_session: record.tmux_session.clone(),
-                status_class: badge.css_class(),
-                status_label: badge.label(),
-                last_event_label,
-                cost_label,
-                detail_href: format!("/session/{}/{}", state.slug, sid),
-                screenshot_href: format!("/screenshot/{}-{}.png", state.slug, sid),
-                attach_command: format!("tmux attach -t {}", record.tmux_session),
-            }
-        })
-        .collect()
-}
-
-fn load_harness_snapshot(app: &AppState, slug: &str, sid: &str) -> Option<HarnessSnapshot> {
-    let path = app.paths.harness_dir().join(format!("{slug}-{sid}.json"));
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
-}
-
-fn snapshot_view(snapshot: HarnessSnapshot) -> HarnessSnapshotView {
-    HarnessSnapshotView {
-        model: snapshot.model_display_name,
-        context_used_pct: format!("{}%", snapshot.context_used_pct),
-        cost_usd_total: format!("{:.2}", snapshot.cost_usd_total),
-        rate_limit_pct: snapshot
-            .rate_limit_pct
-            .map(|pct| format!("{pct}%"))
-            .unwrap_or_else(|| "—".to_string()),
-        captured_at: snapshot.captured_at.to_rfc3339(),
-    }
-}
-
 fn team_kind_label(kind: TeamKind) -> &'static str {
     match kind {
         TeamKind::Workflow => "workflow",
         TeamKind::MultiWorkflow => "multi_workflow",
-        TeamKind::Flex => "flex",
     }
 }
 
+// W5 harness facet: HarnessKind → label / css class. Retained for the
+// W5b/W5c session pages, which re-key the session detail off the harness
+// vendor. Not wired into the current workflow-only session detail.
+#[allow(dead_code)]
 fn harness_label(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "claude",
@@ -620,6 +477,7 @@ fn harness_label(harness: HarnessKind) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn harness_class(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "harness-claude",

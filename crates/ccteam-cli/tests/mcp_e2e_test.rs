@@ -3,8 +3,8 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 20 tools, all `ccteam__*`
-//!   (admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2);
+//! - `tools/list` enumerates exactly 12 tools, all `ccteam__*`
+//!   (admin 3 + screenshot 1 + chat 6 + advise 2);
 //! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
 //!   the first content[].text.
 
@@ -112,7 +112,7 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 
 #[test]
 fn mcp_serve_tools_list_returns_full_tool_set() {
-    // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20.
+    // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
     // Bump this when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
@@ -131,8 +131,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        20,
-        "admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20"
+        12,
+        "admin 3 + screenshot 1 + chat 6 + advise 2 = 12"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
@@ -140,15 +140,6 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         "ccteam__admin_ls",
         "ccteam__admin_change_persona",
         "ccteam__admin_add_tool",
-        // Workflow (read-only inspection + lifecycle).
-        "ccteam__workflow_show",
-        "ccteam__workflow_new",
-        "ccteam__workflow_peek",
-        "ccteam__workflow_progress",
-        "ccteam__workflow_pause",
-        "ccteam__workflow_resume",
-        "ccteam__workflow_send_to_session",
-        "ccteam__workflow_inject_decision",
         // Screenshot.
         "ccteam__screenshot",
         // Chat.
@@ -173,8 +164,11 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         !names.contains(&"ccteam__chat_lifecycle"),
         "chat_lifecycle was removed (no deprecated alias per CLAUDE.md §五 #4)"
     );
-    // The 7 F65 workflow-control tools were removed (no deprecated alias).
+    // The entire workflow_* group was retired (no deprecated alias) —
+    // the 7 earlier F65 workflow-control tools plus the 8 read-only /
+    // lifecycle tools that survived until v0.8.6.
     for gone in [
+        // Earlier F65 workflow-control removals.
         "ccteam__workflow_spawn_agent",
         "ccteam__workflow_stop_agent",
         "ccteam__workflow_observe_agents",
@@ -182,8 +176,20 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         "ccteam__workflow_set_parallelism",
         "ccteam__workflow_trigger_gate",
         "ccteam__workflow_get_artifact_summary",
+        // v0.8.6 retirement of the last 8 workflow tools.
+        "ccteam__workflow_show",
+        "ccteam__workflow_peek",
+        "ccteam__workflow_progress",
+        "ccteam__workflow_new",
+        "ccteam__workflow_pause",
+        "ccteam__workflow_resume",
+        "ccteam__workflow_send_to_session",
+        "ccteam__workflow_inject_decision",
     ] {
-        assert!(!names.contains(&gone), "F65 tool must be gone: {gone}");
+        assert!(
+            !names.contains(&gone),
+            "retired workflow tool must be gone: {gone}"
+        );
     }
     // Schema sanity: every tool must declare `inputSchema.type=object`.
     for tool in tools {

@@ -43,7 +43,6 @@ use crate::progress::{
     workflow_cost_total, AgentSessionStatus, AgentSessionSummary,
 };
 use crate::state::ProjectState;
-use crate::team::TeamKind;
 
 #[derive(Debug, Clone)]
 struct WorkflowReadSpec {
@@ -252,48 +251,10 @@ fn summary_from_state(state: ProjectState) -> ProjectSummary {
 
 /// Tail the last `n` JSON-Lines events for a project.
 ///
-/// Workflow / multi-workflow projects read the legacy flat
-/// `~/.ccteam/progress/<slug>.jsonl` file. Flex projects read every
-/// `~/.ccteam/progress/<slug>/<sid>.jsonl` stream and merge them by
-/// their best-effort `ts` field so dashboard / CLI readers keep a
-/// project-level view without forcing the orchestrator to inspect
-/// harness snapshots.
+/// Reads the flat `~/.ccteam/progress/<slug>.jsonl` file.
 pub fn collect_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Result<Vec<Value>> {
-    let state = ProjectState::load(&paths.project_state(slug)).ok();
-    if state
-        .as_ref()
-        .is_some_and(|s| s.team_kind == TeamKind::Flex)
-    {
-        return collect_recent_flex_events(paths, slug, n);
-    }
-
     let path = paths.progress_jsonl(slug);
     read_tail_events(&path, n)
-}
-
-fn collect_recent_flex_events(paths: &CcteamPaths, slug: &str, n: usize) -> Result<Vec<Value>> {
-    let dir = paths.progress_dir().join(slug);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut all = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        all.extend(read_tail_events(&path, n)?);
-    }
-    all.sort_by_key(event_sort_key);
-    if all.len() > n {
-        let drop = all.len() - n;
-        all.drain(..drop);
-    }
-    Ok(all)
 }
 
 fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
@@ -311,14 +272,6 @@ fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
         all.drain(..drop);
     }
     Ok(all)
-}
-
-fn event_sort_key(event: &Value) -> String {
-    event
-        .get("ts")
-        .and_then(|ts| ts.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 // ---------------- V0.4.0 F67 WorkflowSummary ----------------
@@ -606,20 +559,10 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         }
     };
 
-    // Load progress events. Flex projects use sharded per-sid files
-    // (read via `collect_recent_flex_events`); workflow uses the flat
-    // `<slug>.jsonl`. F66 writes to the flat file for workflow
-    // projects (where V0.4.0 lives), so we read that path
-    // directly; flex stays consistent via `collect_recent_events`.
-    let state = ProjectState::load(&paths.project_state(slug)).ok();
-    let events: Vec<Value> = if state
-        .as_ref()
-        .is_some_and(|s| s.team_kind == TeamKind::Flex)
-    {
-        collect_recent_flex_events(paths, slug, usize::MAX).unwrap_or_default()
-    } else {
-        progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default()
-    };
+    // Load progress events from the flat `<slug>.jsonl` file (F66
+    // writes there for workflow projects, where V0.4.0 lives).
+    let events: Vec<Value> =
+        progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
 
     let total_cost_usd = workflow_cost_total(&events);
     // V0.4.6 F91 — rich cost surface (24h / active / total). `cost`
@@ -1793,41 +1736,5 @@ mod tests {
         let paths = fake_paths(tmp.path());
         let out = artifact_status("nope", &paths).unwrap();
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_recent_events_merges_flex_session_streams() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fake_paths(tmp.path());
-        let slug = "flex-foo";
-        let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
-        state.team_kind = TeamKind::Flex;
-        state.save(&paths.project_state(slug)).unwrap();
-
-        let p1 = paths.progress_jsonl_for_session(slug, "claude-1");
-        let p2 = paths.progress_jsonl_for_session(slug, "claude-2");
-        fs::create_dir_all(p1.parent().unwrap()).unwrap();
-        fs::write(
-            &p1,
-            format!(
-                "{}\n{}\n",
-                json!({"event": "a", "sid": "claude-1", "ts": "2026-05-10T00:00:01Z"}),
-                json!({"event": "c", "sid": "claude-1", "ts": "2026-05-10T00:00:03Z"})
-            ),
-        )
-        .unwrap();
-        fs::write(
-            &p2,
-            format!(
-                "{}\n",
-                json!({"event": "b", "sid": "claude-2", "ts": "2026-05-10T00:00:02Z"})
-            ),
-        )
-        .unwrap();
-
-        let out = collect_recent_events(&paths, slug, 2).unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0]["event"], "b");
-        assert_eq!(out[1]["event"], "c");
     }
 }

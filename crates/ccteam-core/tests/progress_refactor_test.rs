@@ -30,7 +30,6 @@ use ccteam_core::progress::{
 // the body as comments so the audit is greppable.
 use ccteam_core::queries::workflow_summary;
 use ccteam_core::state::ProjectState;
-use ccteam_core::team::TeamKind;
 use ccteam_core::CcteamPaths;
 
 // =====================================================================
@@ -449,52 +448,6 @@ agents:
     assert_eq!(
         summary.gate_states.get("reviewer").map(String::as_str),
         Some("fired"),
-    );
-}
-
-#[test]
-fn t12_flex_project_uses_session_streams() {
-    // Flex project writes events to <slug>/<sid>.jsonl rather than
-    // <slug>.jsonl — workflow_summary must still read them.
-    let tmp = TempDir::new().unwrap();
-    let paths = make_paths(&tmp);
-    let slug = "flex-proj";
-    let project_dir = paths.project_dir(slug);
-    std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
-    std::fs::write(
-        project_dir.join("workflow.yaml"),
-        "\
-name: flexworkflow
-agents:
-  planner:
-    executor: claude
-    trigger: manual
-",
-    )
-    .unwrap();
-
-    let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
-    state.team_kind = TeamKind::Flex;
-    state.save(&paths.project_state(slug)).unwrap();
-
-    let sid_path = paths.progress_jsonl_for_session(slug, "claude-1");
-    std::fs::create_dir_all(sid_path.parent().unwrap()).unwrap();
-    let body = serde_json::to_string(&done(
-        "planner",
-        "planner-1",
-        "completed",
-        0.42,
-        "2026-05-10T00:00:00Z",
-    ))
-    .unwrap()
-        + "\n";
-    std::fs::write(&sid_path, body).unwrap();
-
-    let summary = workflow_summary(slug, &paths).unwrap();
-    assert!(
-        (summary.total_cost_usd - 0.42).abs() < 1e-9,
-        "flex session-stream cost expected 0.42, got {}",
-        summary.total_cost_usd,
     );
 }
 

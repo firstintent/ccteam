@@ -5,15 +5,16 @@
 //! - `GET /api/v1/projects` returns a JSON array with the same row
 //!   shape the dashboard renders, including `kind` and `cost_label`.
 //! - `GET /api/v1/projects/{slug}` returns the composite
-//!   `ProjectSummary` shape: state / events / outbox / sessions /
+//!   `ProjectSummary` shape: state / events / outbox /
 //!   workflow_summary — and **does not** include
 //!   `wire_token` / `auth_wire_token` / `auth_enabled` (redline grep #4).
 //!   V0.4.0 F67 dropped the legacy `decision_candidates` /
 //!   `current_phase` fields — the workflow view consumes
 //!   `workflow_summary` (a `WorkflowSummary` or `null`).
-//! - `GET /api/v1/projects/{slug}/sessions/{sid}` (flex only) returns
-//!   `SessionDetail` with `harness_snapshot` populated when the
-//!   harness mirror file exists.
+//! - `GET /api/v1/projects/{slug}/sessions/{sid}` returns the
+//!   synthesized workflow `SessionDetail` (404 on unknown sid). See
+//!   `api_v1_workflow_panels_test.rs` for the full session-detail
+//!   coverage.
 //! - `GET /api/v1/auth/token` returns `{"wire_token":null}` when
 //!   auth is disabled and `"ccteam:<hex>"` when enabled.
 //! - JSON POST `/api/{slug}/btw` returns `{"ok":true}` with status
@@ -28,10 +29,8 @@ use std::fs;
 use std::net::SocketAddr;
 
 use ccteam_core::{
-    bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths, HarnessKind,
-    ProjectState, SessionRecord, TeamKind,
+    bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths, ProjectState,
 };
-use ccteam_harness::HarnessSnapshot;
 use ccteam_web::{router_with_state, AppState, AuthState};
 use reqwest::redirect::Policy;
 use serde_json::Value;
@@ -48,37 +47,6 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 fn fixture_project(paths: &CcteamPaths, slug: &str) {
     disable_tool_surface_bootstrap_for_tests();
     bootstrap_project(paths, slug, "demo request", "dev").unwrap();
-}
-
-fn fixture_flex_project(paths: &CcteamPaths, slug: &str, sid: &str) {
-    let mut state = ProjectState::initial_for_team(slug.to_string(), "flex".into());
-    state.team_kind = TeamKind::Flex;
-    state.sessions.insert(
-        sid.to_string(),
-        SessionRecord {
-            harness: HarnessKind::Claude,
-            tmux_session: format!("ccteam-{slug}-{sid}"),
-            started_at: chrono::Utc::now(),
-            pid: None,
-            job_id: None,
-        },
-    );
-    state.next_sid_seq.insert(HarnessKind::Claude, 2);
-    fs::create_dir_all(paths.project_ccteam_dir(slug)).unwrap();
-    state.save(&paths.project_state(slug)).unwrap();
-}
-
-fn fixture_snapshot(model: &str) -> HarnessSnapshot {
-    HarnessSnapshot {
-        harness: "claude-code".into(),
-        model_display_name: model.into(),
-        context_used_pct: 17,
-        cost_usd_total: 1.23,
-        rate_limit_pct: Some(4),
-        cwd: None,
-        raw: serde_json::json!({"source": "api_v1-test"}),
-        captured_at: chrono::Utc::now(),
-    }
 }
 
 async fn spawn(state: AppState) -> SocketAddr {
@@ -144,7 +112,6 @@ async fn get_api_v1_project_detail_returns_summary_shape() {
     assert_eq!(body["slug"], "demo");
     assert!(body["team"].is_string());
     assert!(body["kind"].is_string());
-    assert!(body["is_flex"].is_boolean());
     assert!(body["created_at"].is_string());
     assert!(
         body["state"].is_object(),
@@ -152,7 +119,6 @@ async fn get_api_v1_project_detail_returns_summary_shape() {
     );
     assert!(body["events"].is_array());
     assert!(body["outbox"].is_array());
-    assert!(body["sessions"].is_array());
     // V0.4.0 F67: `decision_candidates` / `current_phase` retired
     // along with the phase machinery (F60). `workflow_summary` may
     // be null for legacy projects without a workflow.yaml.
@@ -178,44 +144,6 @@ async fn get_api_v1_project_detail_404_for_unknown_slug() {
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await.unwrap();
     assert!(body["error"].as_str().unwrap_or("").contains("missing"));
-}
-
-#[tokio::test]
-async fn get_api_v1_session_detail_returns_harness_snapshot() {
-    let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    let slug = "flex-demo";
-    let sid = "claude-1";
-    fixture_flex_project(&paths, slug, sid);
-    fs::create_dir_all(paths.harness_dir()).unwrap();
-    let mirror = paths.harness_dir().join(format!("{slug}-{sid}.json"));
-    fs::write(
-        &mirror,
-        serde_json::to_string(&fixture_snapshot("Claude Opus 4.7")).unwrap(),
-    )
-    .unwrap();
-
-    let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!(
-        "http://{addr}/api/v1/projects/{slug}/sessions/{sid}"
-    ))
-    .await
-    .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["slug"], slug);
-    assert_eq!(body["sid"], sid);
-    assert_eq!(body["kind"], "flex");
-    assert!(body["events"].is_array());
-    assert!(body["outbox"].is_array());
-    // V0.4.0 F67: session DTO no longer carries `decision_candidates`.
-    assert!(body.get("decision_candidates").is_none());
-    let snap = &body["harness_snapshot"];
-    assert_eq!(snap["model"], "Claude Opus 4.7");
-    assert!(snap["captured_at"].is_string());
-    // Redline: tokens never leak via session JSON.
-    assert!(body.get("wire_token").is_none());
-    assert!(body.get("auth_wire_token").is_none());
 }
 
 #[tokio::test]

@@ -67,14 +67,9 @@ pub enum TeamKind {
     #[default]
     Workflow,
     MultiWorkflow,
-    Flex,
 }
 
 impl TeamKind {
-    pub fn is_flex(self) -> bool {
-        matches!(self, Self::Flex)
-    }
-
     pub fn is_phase_driven(self) -> bool {
         matches!(self, Self::Workflow | Self::MultiWorkflow)
     }
@@ -365,11 +360,8 @@ impl Default for CostPolicy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
-    /// Anthropic's Claude Code TUI — V0.3.1 default + only fully
-    /// supported harness. Backed by [`ccteam_harness::ClaudeCodeAdapter`].
-    /// `#[default]` because Claude Code is the only real harness in
-    /// V0.3.1; F48 PR adds the `kind: flex` team layer that consumes
-    /// this default; F49 fills the master state.json::sessions wiring.
+    /// Anthropic's Claude Code TUI — default + primary supported
+    /// harness. Backed by [`ccteam_harness::ClaudeCodeAdapter`].
     #[default]
     Claude,
     /// OpenAI's `codex` CLI. V0.3.1 ships the trait stub
@@ -431,9 +423,8 @@ pub struct TeamSpec {
     #[serde(default)]
     pub aliases: Vec<String>,
 
-    /// V0.3.1 F48 — team kind. Defaults to [`TeamKind::Workflow`].
-    /// `flex` teams have no phase DAG: no auto-loop, phase prompt
-    /// injection, or golden-rule check. Observability stays on.
+    /// Team kind. Defaults to [`TeamKind::Workflow`]. Selects how the
+    /// (deferred) orchestrator drives the team's phase DAG.
     #[serde(default)]
     pub kind: TeamKind,
 
@@ -669,44 +660,6 @@ impl TeamSpec {
                 "team.yaml: `phase_dir` must be relative to ccteam root; got `{}`",
                 self.phase_dir,
             );
-        }
-        if self.kind.is_flex()
-            && !self.phase_dir.trim().is_empty()
-            && self.phase_dir != default_phase_dir()
-        {
-            bail!(
-                "team.yaml: kind=flex must not declare custom `phase_dir` `{}` \
-                 (F48 / PRD §5.2.1: flex teams have no phase machinery)",
-                self.phase_dir,
-            );
-        }
-
-        if self.kind.is_flex() {
-            if !self.escalate_grammar_extensions.is_empty() {
-                bail!(
-                    "team.yaml: kind=flex must not declare \
-                     `escalate_grammar_extensions` (F48 / PRD §5.2.1: flex \
-                     teams have no phase machinery)",
-                );
-            }
-            if !self.golden_rules.is_empty() {
-                bail!(
-                    "team.yaml: kind=flex must not declare `golden_rules` \
-                     (F48 / PRD §5.2.1: flex teams skip golden-rule checks)",
-                );
-            }
-            if !self.retro_schema.is_empty() {
-                bail!(
-                    "team.yaml: kind=flex must not declare `retro_schema` \
-                     (F48 / PRD §5.3: flex retro phase is deferred)",
-                );
-            }
-            if !self.verdict_schema.is_empty() {
-                bail!(
-                    "team.yaml: kind=flex must not declare `verdict_schema` \
-                     (F48 / PRD §5.3: flex verdict phase is deferred)",
-                );
-            }
         }
 
         // M3.2: escalate_grammar_extensions invariants.
@@ -1400,77 +1353,8 @@ mod tests {
     fn f48_kind_parses_all_values() {
         let workflow = TeamSpec::parse("name: dev\nkind: workflow\n").unwrap();
         let multi = TeamSpec::parse("name: research\nkind: multi_workflow\n").unwrap();
-        let flex = TeamSpec::parse("name: scratch\nkind: flex\n").unwrap();
         assert_eq!(workflow.kind, TeamKind::Workflow);
         assert_eq!(multi.kind, TeamKind::MultiWorkflow);
-        assert_eq!(flex.kind, TeamKind::Flex);
-    }
-
-    #[test]
-    fn f48_kind_round_trips_through_yaml() {
-        let spec = TeamSpec::parse(concat!(
-            "name: scratch\n",
-            "kind: flex\n",
-            "sessions:\n",
-            "  - sid: claude-1\n",
-            "    harness: claude\n",
-        ))
-        .unwrap();
-        let yaml = serde_yaml::to_string(&spec).unwrap();
-        assert!(yaml.contains("kind: flex"), "got:\n{yaml}");
-        let parsed = TeamSpec::parse(&yaml).unwrap();
-        assert_eq!(parsed, spec);
-    }
-
-    #[test]
-    fn f48_flex_rejects_golden_rules() {
-        let err = TeamSpec::parse(concat!(
-            "name: scratch\n",
-            "kind: flex\n",
-            "golden_rules:\n",
-            "  - rule_id: no-todo\n",
-            "    pattern: TODO\n",
-        ))
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("kind=flex"));
-        assert!(format!("{err:#}").contains("golden_rules"));
-    }
-
-    #[test]
-    fn f48_flex_rejects_escalate_grammar_extensions() {
-        let err = TeamSpec::parse(concat!(
-            "name: scratch\n",
-            "kind: flex\n",
-            "escalate_grammar_extensions:\n",
-            "  - prefix: NEED_REVIEW\n",
-            "    route: need_user_input\n",
-        ))
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("kind=flex"));
-        assert!(format!("{err:#}").contains("escalate_grammar_extensions"));
-    }
-
-    #[test]
-    fn f48_flex_rejects_custom_phase_dir() {
-        let err = TeamSpec::parse("name: scratch\nkind: flex\nphase_dir: custom\n").unwrap_err();
-        assert!(format!("{err:#}").contains("custom `phase_dir`"));
-    }
-
-    #[test]
-    fn f48_flex_rejects_retro_and_verdict_phase_machinery() {
-        let retro = TeamSpec::parse(concat!(
-            "name: scratch\n",
-            "kind: flex\n",
-            "retro_schema:\n",
-            "  - field: findings\n",
-            "    description: Findings\n",
-        ))
-        .unwrap_err();
-        assert!(format!("{retro:#}").contains("retro_schema"));
-
-        let verdict = TeamSpec::parse("name: scratch\nkind: flex\nverdict_schema:\n  - verdict\n")
-            .unwrap_err();
-        assert!(format!("{verdict:#}").contains("verdict_schema"));
     }
 
     // ---------------- V0.3.1 F47 sessions[] schema ----------------
@@ -1589,7 +1473,7 @@ mod tests {
         let original = TeamSpec {
             name: "my-flex".into(),
             aliases: Vec::new(),
-            kind: TeamKind::Flex,
+            kind: TeamKind::Workflow,
             description: String::new(),
             retro_schema: Vec::new(),
             critic_dimensions: Vec::new(),

@@ -144,11 +144,14 @@ fn resolve_screenshot_target(app: &AppState, stem: &str) -> (String, Option<Stri
     if app.paths.project_state(stem).exists() {
         return (stem.to_string(), None);
     }
+    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
+    // is gone, so a `<slug>-<sid>` stem can no longer be validated against
+    // it. If the stem parses as slug+sid and the project exists, pass the
+    // sid through to the renderer; otherwise treat the whole stem as a
+    // project slug. TODO(V0.8.6 W5b/W5c): re-key per-session screenshots
+    // onto the new session record.
     if let Some((slug, sid)) = split_slug_sid(stem) {
-        if ccteam_core::ProjectState::load(&app.paths.project_state(slug))
-            .map(|state| state.sessions.contains_key(sid))
-            .unwrap_or(false)
-        {
+        if app.paths.project_state(slug).exists() {
             return (slug.to_string(), Some(sid.to_string()));
         }
     }
@@ -173,8 +176,7 @@ fn split_slug_sid(stem: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccteam_core::{HarnessKind, ProjectState, SessionRecord, TeamKind};
-    use chrono::Utc;
+    use ccteam_core::ProjectState;
 
     fn fake_app() -> (tempfile::TempDir, AppState) {
         let tmp = tempfile::tempdir().unwrap();
@@ -194,20 +196,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_screenshot_target_uses_registered_flex_sid() {
+    fn resolve_screenshot_target_passes_sid_when_project_exists() {
+        // W5: a `<slug>-<sid>` stem resolves to (slug, Some(sid)) as long
+        // as the `<slug>` project state exists — the per-session registry
+        // is gone, so the sid is not validated further.
         let (_tmp, app) = fake_app();
-        let mut state = ProjectState::initial_for_team("dev-flex".into(), "dev".into());
-        state.team_kind = TeamKind::Flex;
-        state.sessions.insert(
-            "claude-1".into(),
-            SessionRecord {
-                harness: HarnessKind::Claude,
-                tmux_session: "ccteam-dev-flex-claude-1".into(),
-                started_at: Utc::now(),
-                pid: None,
-                job_id: None,
-            },
-        );
+        let state = ProjectState::initial("dev-flex".into());
         state.save(&app.paths.project_state("dev-flex")).unwrap();
 
         assert_eq!(

@@ -39,7 +39,7 @@
 
 use std::path::{Component, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use axum::{
     body,
     extract::{FromRequest, Path, Request, State},
@@ -49,11 +49,7 @@ use axum::{
     Json, Router,
 };
 use ccteam_core::actions::{self, DecisionInput};
-use ccteam_core::{
-    inbox_filename, next_inbox_seq, InboxFrontMatter, InboxMessage, ProjectState, SessionMailbox,
-    TeamKind, LATEST_SCHEMA_VERSION,
-};
-use chrono::Utc;
+use ccteam_core::ProjectState;
 use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::state::AppState;
@@ -404,64 +400,34 @@ async fn handle_session_resume(
 fn validate_known_session(
     app: &AppState,
     slug: &str,
-    sid: &str,
+    _sid: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let state = ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
+    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
+    // is gone. Validation is project-load only; W5b re-keys session-scoped
+    // pause/resume against the new session record.
+    ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
         (
             StatusCode::NOT_FOUND,
             format!("project not found or unreadable: {slug}: {err}"),
         )
     })?;
-    if state.team_kind != TeamKind::Flex {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("project {slug} is not a flex project"),
-        ));
-    }
-    if !state.sessions.contains_key(sid) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("session not found: {slug}/{sid}"),
-        ));
-    }
     Ok(())
 }
 
+/// Session-scoped `/btw`. W5: routes through the project-level
+/// [`actions::send_to_session`] engine call — the per-session inbox
+/// (which keyed off the removed flex `project_session_dir`) is gone. The
+/// `sid` is validated for project existence only; W5b re-keys this onto
+/// the new session record.
 fn send_to_registered_session(
     app: &AppState,
     slug: &str,
-    sid: &str,
+    _sid: &str,
     body: &str,
 ) -> anyhow::Result<()> {
-    let state = ProjectState::load(&app.paths.project_state(slug))
+    ProjectState::load(&app.paths.project_state(slug))
         .with_context(|| format!("load state for {slug}"))?;
-    if state.team_kind != TeamKind::Flex {
-        bail!("project {slug} is not a flex project");
-    }
-    if !state.sessions.contains_key(sid) {
-        bail!("session not found: {slug}/{sid}");
-    }
-
-    let mailbox = SessionMailbox::for_ccteam_dir(&app.paths.project_session_dir(slug, sid));
-    mailbox.ensure_dirs()?;
-    let now = Utc::now();
-    let filename = inbox_filename(now, next_inbox_seq(&mailbox)?);
-    let inbox_path = mailbox.inbox.join(&filename);
-    let msg = InboxMessage {
-        front: InboxFrontMatter {
-            schema_version: LATEST_SCHEMA_VERSION,
-            source: "ccteam-web".into(),
-            source_chat_id: None,
-            source_msg_id: None,
-            source_user: "web".into(),
-            created_at: now,
-            ingested_at: now,
-            content_type: "text".into(),
-            attachments: Vec::new(),
-        },
-        body: format!("{}\n", body.trim_end_matches('\n')),
-    };
-    msg.save(&inbox_path)?;
+    actions::send_to_session(&app.paths, slug, body)?;
     Ok(())
 }
 

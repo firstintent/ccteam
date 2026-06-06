@@ -1940,11 +1940,8 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// V0.8 W1 — routes through `ccteam_core::capture_pane_tail_from_session`
 /// (re-exported over `ccteam_harness::tmux_ops::capture_pane_tail_from_session`,
 /// the same primitive `TmuxBackend::capture` calls under the hood).
-/// Keeps run_peek sync per the W1 "sync sites stay sync" decision.
-pub fn run_peek(paths: &CcteamPaths, slug: &str) -> Result<String> {
-    run_peek_with_role(paths, slug, None)
-}
-
+/// Keeps the peek path sync per the W1 "sync sites stay sync" decision.
+///
 /// `ccteam internal peek <slug> [role]`. Resolves a live chat session
 /// (`ccteam-chat-<slug>-<role>`) first — mirroring `attach` — and falls
 /// back to the project pane (`ccteam-<slug>`) when none matches. This is
@@ -5331,7 +5328,7 @@ mod tests {
         state.save(&paths.project_state("meta-cto")).unwrap();
 
         std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
-        let result = run_peek(&paths, "meta-cto");
+        let result = run_peek_with_role(&paths, "meta-cto", None);
         std::env::remove_var("CCTEAM_MUX_BACKEND");
 
         let err = result.unwrap_err();
@@ -6862,7 +6859,7 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 20, "ships 20 tools");
+        assert_eq!(report.total_tools, 12, "ships 12 tools");
     }
 
     #[test]

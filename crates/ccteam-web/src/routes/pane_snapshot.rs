@@ -14,7 +14,6 @@ use axum::{
     routing::get,
     Router,
 };
-use ccteam_core::{ProjectState, TeamKind};
 use ccteam_harness::MuxSessionId;
 
 use crate::state::AppState;
@@ -126,27 +125,20 @@ async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: St
 fn session_name_for_project_session(
     app: &AppState,
     slug: &str,
-    sid: &str,
+    _sid: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let state = ProjectState::load(&app.paths.project_state(slug)).map_err(|err| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("project not found or unreadable: {slug}: {err}"),
-        )
-    })?;
-    if state.team_kind != TeamKind::Flex {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("project {slug} is not a flex project"),
-        ));
+    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
+    // is gone, so the session's tmux name can no longer be resolved from
+    // it. Validate the project exists, then fall back to the project-level
+    // pane. TODO(V0.8.6 W5b/W5c): re-key this onto the new session record
+    // so the per-session terminal page targets the right pane again.
+    if !app.paths.project_state(slug).exists() {
+        return Err((StatusCode::NOT_FOUND, format!("project not found: {slug}")));
     }
-    let record = state.sessions.get(sid).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("session not found: {slug}/{sid}"),
-        )
-    })?;
-    Ok(record.tmux_session.clone())
+    Ok(ccteam_core::session_name_for_project(
+        app.paths.as_ref(),
+        slug,
+    ))
 }
 
 fn digit_header(n: u16) -> HeaderValue {

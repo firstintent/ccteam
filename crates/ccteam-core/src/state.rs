@@ -4,8 +4,8 @@
 //! V0.4.0 F60: the pre-F60 phase state machine (PhaseState variants
 //! InFlight / DonePending / AutoLocked) is gone — F66 reintroduces an
 //! `agent_sessions` shape against `workflow.yaml`. Until then we keep
-//! the identity / cost / lifecycle fields plus the V0.3.1 F49 flex
-//! session registry. `current_phase`, `phase_history`, and
+//! the identity / cost / lifecycle fields. `current_phase`,
+//! `phase_history`, and
 //! `last_event_type` survive as **serde-only compat fields** with
 //! `skip_serializing_if` so fresh writes drop them but old state.json
 //! files load unchanged (the F66 workflow loop won't read these — it
@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::team::{HarnessKind, TeamKind};
+use crate::team::TeamKind;
 
 /// V0.4.0 F60 — only `Idle` and `Done` survive the phase-machine purge.
 /// `Idle` keeps existing tests / hook code that reads `state.phase_state`
@@ -77,31 +77,11 @@ pub struct PhaseHistoryEntry {
     pub cost_usd: f64,
 }
 
-/// V0.3.1 F49 — one registered harness session in a flex project's
-/// master `state.json::sessions` map.
-///
-/// V0.4.0 F61 added `job_id` for the Claude Code `--bg` background-job
-/// id. Codex rows leave it `None`; old state.json files written before
-/// F61 also deserialize with `None` (serde default), keeping the
-/// upgrade path migration-free.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionRecord {
-    pub harness: HarnessKind,
-    pub tmux_session: String,
-    pub started_at: DateTime<Utc>,
-    pub pid: Option<u32>,
-    /// V0.4.0 F61 — Claude Code background-job id. `None` for codex
-    /// sessions and for legacy rows written before F61.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-}
-
 /// Project-level state, persisted as `~/projects/<slug>/.ccteam/state.json`.
 ///
 /// V0.4.0 F60: phase state machine fields removed. The F66 workflow
 /// loop reintroduces dispatch tracking on a fresh shape; until then
-/// only identity / lifecycle / cost / context-budget fields remain,
-/// plus the V0.3.1 F49 flex `sessions` registry.
+/// only identity / lifecycle / cost / context-budget fields remain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub slug: String,
@@ -172,15 +152,6 @@ pub struct ProjectState {
     pub last_user_interaction_at: DateTime<Utc>,
     pub user_attached: bool,
     pub user_pause_pending: bool,
-    /// V0.3.1 F49 — flex-only session registry. Empty for workflow /
-    /// multi_workflow projects and skipped on serialize for old-shape
-    /// compatibility.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sessions: BTreeMap<String, SessionRecord>,
-    /// Next sid sequence per harness. Values are monotonic and not
-    /// decremented on `session rm`, so removed sids are never reused.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub next_sid_seq: BTreeMap<HarnessKind, u64>,
     /// V0.5.0 F97 — agent-team mode marker for `cleanup_on_stop:
     /// leave-running`. When `true`, `ccteam stop <slug>` dropped the
     /// ccteam-side watch but left the lead bg job alive; a subsequent
@@ -268,38 +239,9 @@ impl ProjectState {
             last_user_interaction_at: now,
             user_attached: false,
             user_pause_pending: false,
-            sessions: BTreeMap::new(),
-            next_sid_seq: BTreeMap::new(),
             detached: false,
             schedule_last_fire: BTreeMap::new(),
         }
-    }
-
-    pub fn allocate_sid(&mut self, harness: HarnessKind) -> String {
-        let next = self
-            .next_sid_seq
-            .get(&harness)
-            .copied()
-            .unwrap_or(1)
-            .max(self.max_sid_number(harness).saturating_add(1))
-            .max(1);
-        self.next_sid_seq.insert(harness, next.saturating_add(1));
-        format!("{}-{next}", harness_sid_prefix(harness))
-    }
-
-    pub fn reserve_sid(&mut self, harness: HarnessKind, sid: &str) {
-        if let Some(n) = sid_number_for_harness(sid, harness) {
-            let entry = self.next_sid_seq.entry(harness).or_insert(1);
-            *entry = (*entry).max(n.saturating_add(1));
-        }
-    }
-
-    fn max_sid_number(&self, harness: HarnessKind) -> u64 {
-        self.sessions
-            .keys()
-            .filter_map(|sid| sid_number_for_harness(sid, harness))
-            .max()
-            .unwrap_or(0)
     }
 
     /// Atomically persist to `path`. Rotates any existing file to `<path>.bak`
@@ -352,19 +294,6 @@ impl ProjectState {
             }
         }
     }
-}
-
-pub fn harness_sid_prefix(harness: HarnessKind) -> &'static str {
-    match harness {
-        HarnessKind::Claude => "claude",
-        HarnessKind::Codex => "codex",
-    }
-}
-
-fn sid_number_for_harness(sid: &str, harness: HarnessKind) -> Option<u64> {
-    sid.strip_prefix(harness_sid_prefix(harness))
-        .and_then(|rest| rest.strip_prefix('-'))
-        .and_then(|n| n.parse::<u64>().ok())
 }
 
 fn read_and_parse(path: &Path) -> Result<ProjectState> {

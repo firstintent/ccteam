@@ -452,51 +452,6 @@ agents:
 
 // ----- V0.5.1 F103c — workflow SessionDetail -----
 
-/// Pre-F103c regression guard: flex SessionDetail flow stays
-/// unchanged — `kind=="flex"` and harness/tmux fields populated from
-/// the SessionRecord registry.
-#[tokio::test]
-async fn t07_session_detail_flex_branch_unchanged() {
-    use ccteam_core::{HarnessKind, ProjectState, SessionRecord, TeamKind};
-    use std::collections::BTreeMap;
-    let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    let slug = "flex-demo";
-    let sid = "claude-1";
-    let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
-    state.team_kind = TeamKind::Flex;
-    let mut sessions = BTreeMap::new();
-    sessions.insert(
-        sid.to_string(),
-        SessionRecord {
-            harness: HarnessKind::Claude,
-            tmux_session: format!("ccteam-{slug}-{sid}"),
-            started_at: chrono::Utc::now(),
-            pid: None,
-            job_id: None,
-        },
-    );
-    state.sessions = sessions;
-    state.next_sid_seq.insert(HarnessKind::Claude, 2);
-    fs::create_dir_all(paths.project_ccteam_dir(slug)).unwrap();
-    state.save(&paths.project_state(slug)).unwrap();
-
-    let addr = spawn(AppState::new(paths)).await;
-    let resp = client()
-        .get(format!(
-            "http://{addr}/api/v1/projects/{slug}/sessions/{sid}"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["kind"], "flex");
-    assert_eq!(body["slug"], slug);
-    assert_eq!(body["sid"], sid);
-    assert!(body["events"].is_array());
-}
-
 /// Workflow project (default team_kind) with one `agent_spawn` event
 /// → SessionDetail returns 200 with `kind="workflow"`, `harness=null`,
 /// and started_at sourced from the spawn event.

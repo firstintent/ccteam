@@ -83,12 +83,8 @@ async fn dashboard_root_redirect_is_independent_of_team_kind() {
 
     let mut multi = ProjectState::initial("dev-multi".to_string());
     multi.team_kind = TeamKind::MultiWorkflow;
+    multi.current_phase = "must-not-render".into();
     multi.save(&paths.project_state("dev-multi")).unwrap();
-
-    let mut flex = ProjectState::initial("dev-flex".to_string());
-    flex.team_kind = TeamKind::Flex;
-    flex.current_phase = "must-not-render".into();
-    flex.save(&paths.project_state("dev-flex")).unwrap();
 
     assert_root_redirects_to_spa(paths).await;
 }

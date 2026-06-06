@@ -232,9 +232,7 @@ pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
     StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
-pub use state::{
-    harness_sid_prefix, Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, SessionRecord,
-};
+pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DefaultSessionSpec, DomainRule,
     EscalateGrammarExtension, EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule,

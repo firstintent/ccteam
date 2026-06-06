@@ -52,7 +52,6 @@ use vt100::Parser;
 use ccteam_harness::MuxSessionId;
 
 use crate::paths::CcteamPaths;
-use crate::state::ProjectState;
 use crate::tmux::session_name_for_project;
 
 pub mod ansi_palette;
@@ -158,7 +157,7 @@ pub fn render_screenshot(
     lines: usize,
 ) -> ScreenshotResult {
     let session_name = match sid {
-        Some(sid) => session_name_for_project_session(paths, slug, sid),
+        Some(sid) => format!("ccteam-{slug}-{sid}"),
         None => session_name_for_project(paths, slug),
     };
 
@@ -283,19 +282,6 @@ pub fn render_screenshot(
         return Ok(None);
     }
     Ok(Some(out))
-}
-
-fn session_name_for_project_session(paths: &CcteamPaths, slug: &str, sid: &str) -> String {
-    ProjectState::load(&paths.project_state(slug))
-        .ok()
-        .and_then(|state| {
-            state
-                .sessions
-                .get(sid)
-                .map(|record| record.tmux_session.clone())
-        })
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| format!("ccteam-{slug}-{sid}"))
 }
 
 /// Inner render path — pure compute over the ANSI byte stream + font.

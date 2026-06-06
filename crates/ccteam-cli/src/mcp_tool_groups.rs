@@ -10,13 +10,13 @@
 //!
 //! Group model:
 //! - 3 admin tools (`ls` + `change_persona` + `add_tool`)
-//! - 8 workflow tools (`show` / `peek` / `progress` / `new` / `pause` /
-//!   `resume` / `send_to_session` / `inject_decision`)
+//! - 0 workflow tools (the group was retired; the `Workflow` variant is
+//!   kept so the `workflow_` prefix routing + env toggle stay stable)
 //! - 1 screenshot tool
 //! - 6 chat tools
 //! - 2 advise tools
 //!
-//! Total: 20 tools registered. Disabling a group hides every tool in
+//! Total: 12 tools registered. Disabling a group hides every tool in
 //! that group from `tools/list`; `tools/call` against a disabled tool
 //! falls through to the standard "unknown tool" error.
 

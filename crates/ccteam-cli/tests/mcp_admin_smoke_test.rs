@@ -7,11 +7,14 @@
 //! and, where applicable, file-system side-effects.
 //!
 //! Operations covered (one test each):
-//!  1. `admin_workflow_pause`    — `ccteam__workflow_pause` returns ok=true
-//!  2. `admin_workflow_resume`   — `ccteam__workflow_resume` returns ok=true
-//!  3. `admin_list_workflows`    — `ccteam__admin_ls` returns project list
-//!  4. `admin_cost_today`        — `ccteam__admin_ls` response carries cost fields
-//!  5. `admin_change_persona`    — `ccteam__admin_change_persona` rewrites agent .md
+//!  1. `admin_list_workflows`    — `ccteam__admin_ls` returns project list
+//!  2. `admin_cost_today`        — `ccteam__admin_ls` response carries cost fields
+//!  3. `admin_change_persona`    — `ccteam__admin_change_persona` rewrites agent .md
+//!
+//! Engine pause/resume is covered by the `actions::{pause,resume}` unit
+//! tests (`crates/ccteam-core`) and `run_resume` CLI coverage — the
+//! retired `workflow_pause` / `workflow_resume` MCP tools no longer have
+//! a wire surface to smoke-test here.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -101,8 +104,8 @@ agents:
     output: .ccteam/output/
 "#;
 
-/// Minimal state.json required by `pause` / `resume` (ProjectState
-/// serde-defaults handle all optional fields).
+/// Minimal state.json so `admin_ls` can load each bootstrapped project
+/// (ProjectState serde-defaults handle all optional fields).
 fn minimal_state_json(slug: &str) -> String {
     let now = chrono::Utc::now().to_rfc3339();
     format!(
@@ -128,7 +131,7 @@ fn minimal_state_json(slug: &str) -> String {
 ///
 /// Creates:
 /// - `projects/<slug>/.ccteam/workflow.yaml`
-/// - `projects/<slug>/.ccteam/state.json`       (for pause/resume)
+/// - `projects/<slug>/.ccteam/state.json`       (so admin_ls can load it)
 /// - `projects/<slug>/.claude/agents/<bot>.md`  (for change-persona test)
 fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str, bot: Option<&str>) {
     std::fs::create_dir_all(home).unwrap();
@@ -173,70 +176,9 @@ fn call_tool(srv: &mut McpServer, name: &str, args: Value) -> Value {
     serde_json::from_str(text).expect("parse tool body as JSON")
 }
 
-// ─────────────────────────── 1. pause ──────────────────────────────
+// ─────────────────────────── 1. list workflows ─────────────────────
 
-/// F150 smoke 1 — `admin_workflow_pause`:
-/// `ccteam__workflow_pause` must return `ok=true` and set
-/// `user_pause_pending=true` in the response envelope.
-#[test]
-fn admin_workflow_pause() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-alpha", None);
-    let _daemon = fake_daemon(&home);
-
-    let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(
-        &mut srv,
-        "ccteam__workflow_pause",
-        json!({ "slug": "dev-alpha" }),
-    );
-    assert_eq!(body["ok"], true, "pause must return ok=true");
-    assert_eq!(body["slug"], "dev-alpha", "pause must echo the slug back");
-    assert_eq!(
-        body["user_pause_pending"], true,
-        "pause must set user_pause_pending=true in response"
-    );
-    srv.shutdown();
-}
-
-// ─────────────────────────── 2. resume ─────────────────────────────
-
-/// F150 smoke 2 — `admin_workflow_resume`:
-/// `ccteam__workflow_resume` must return `ok=true`.  We start from an
-/// already-paused state (pause first) so the full round-trip exercises
-/// both directions.
-#[test]
-fn admin_workflow_resume() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-beta", None);
-    let _daemon = fake_daemon(&home);
-
-    let mut srv = McpServer::spawn(&home, &projects);
-
-    // Pause first, then resume — exercise the full round-trip.
-    call_tool(
-        &mut srv,
-        "ccteam__workflow_pause",
-        json!({ "slug": "dev-beta" }),
-    );
-
-    let body = call_tool(
-        &mut srv,
-        "ccteam__workflow_resume",
-        json!({ "slug": "dev-beta" }),
-    );
-    assert_eq!(body["ok"], true, "resume must return ok=true");
-    assert_eq!(body["slug"], "dev-beta", "resume must echo the slug");
-    srv.shutdown();
-}
-
-// ─────────────────────────── 3. list workflows ─────────────────────
-
-/// F150 smoke 3 — `admin_list_workflows`:
+/// F150 smoke 1 — `admin_list_workflows`:
 /// `ccteam__admin_ls` must enumerate existing projects and report them
 /// in a `projects` array with the correct slugs.
 #[test]
@@ -269,9 +211,9 @@ fn admin_list_workflows() {
     srv.shutdown();
 }
 
-// ─────────────────────────── 4. cost today ─────────────────────────
+// ─────────────────────────── 2. cost today ─────────────────────────
 
-/// F150 smoke 4 — `admin_cost_today`:
+/// F150 smoke 2 — `admin_cost_today`:
 /// `ccteam__admin_ls` response must carry `cost_24h_usd` on every
 /// project entry — that is the data backing `/ccteam-control show-cost`
 /// and `@ccteam cost today`.
@@ -311,9 +253,9 @@ fn admin_cost_today() {
     srv.shutdown();
 }
 
-// ─────────────────────────── 5. change persona ─────────────────────
+// ─────────────────────────── 3. change persona ─────────────────────
 
-/// F150 smoke 6 — `admin_change_persona`:
+/// F150 smoke 3 — `admin_change_persona`:
 /// `ccteam__admin_change_persona` must rewrite the bot's agent .md
 /// with the provided content and return `ok=true` + `bytes_written`.
 #[test]

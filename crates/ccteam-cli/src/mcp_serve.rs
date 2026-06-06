@@ -1,6 +1,6 @@
 //! M2.5: `ccteam mcp-serve` — stdio MCP server.
 //!
-//! Exposes the ccteam control surface as 9 MCP tools so the user's
+//! Exposes the ccteam control surface as MCP tools so the user's
 //! daily-driver Claude Code session (and the meta-agent session) can
 //! drive ccteam without shelling out to the CLI. Architecture and
 //! red lines:
@@ -29,20 +29,12 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-// V0.3 M5.0 (F45 promote): write-helper logic lives in
-// `ccteam_core::actions`; the wrappers below stay thin (args parse +
-// JSON encode + delegate). Web-side consumers (`crates/ccteam-web`)
-// pick up the same import line in M5.3 (`docs/versions/v0-3/dev-plan.md` §5
-// #4.3) — at which point `git grep -nE 'use ccteam_core::actions'`
-// returns ≥ 2 hits.
-use ccteam_core::actions;
 use ccteam_core::{
-    bootstrap_project, check_daemon_health, cost_summary, pick_unused_slug, render_screenshot,
-    CcteamPaths, DaemonHealth, SendOptions,
+    check_daemon_health, cost_summary, render_screenshot, CcteamPaths, DaemonHealth,
 };
 use ccteam_flow::MAX_CONCURRENT_PROJECTS;
 
-use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
+use crate::commands::collect_projects;
 // V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
 // CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
 // dispatch handlers; Wave 1 lands stubs so the tool surface shape +
@@ -347,15 +339,12 @@ fn tools_list_response() -> Value {
     json!({ "tools": tools })
 }
 
-/// Single source of truth for the MCP tool surface. The workflow group
-/// carries the read-only inspection + lifecycle tools (`show` / `peek` /
-/// `progress` / `new` / `pause` / `resume` / `send_to_session` /
-/// `inject_decision`); admin has 3 (`ls` + `change_persona` +
-/// `add_tool`); chat has 6; advise has 2; `ccteam__screenshot` is its
-/// own single-member group → **20 total**. All tools carry a group
-/// sub-prefix (`admin_`, `workflow_`, `chat_`, `advise_`) except
-/// `ccteam__screenshot` which keeps its single-member-group name for
-/// V0.5 muscle memory.
+/// Single source of truth for the MCP tool surface. admin has 3 (`ls` +
+/// `change_persona` + `add_tool`); chat has 6; advise has 2;
+/// `ccteam__screenshot` is its own single-member group → **12 total**.
+/// All tools carry a group sub-prefix (`admin_`, `chat_`, `advise_`)
+/// except `ccteam__screenshot` which keeps its single-member-group name
+/// for V0.5 muscle memory.
 pub(crate) fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
@@ -364,83 +353,8 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             "description": "List every ccteam project under ~/projects/ with its current phase, state, cost, and stall level. Equivalent to `ccteam ls --format json`.",
             "inputSchema": object_schema(&[]),
         }),
-        json!({
-            "name": "ccteam__workflow_show",
-            "description": "Return the full state.json + recent progress events + artifact list for a single project. Equivalent to `ccteam show <slug> --format json`.",
-            "inputSchema": object_schema(&[("slug", "string", "Project slug, as listed by ccteam__admin_ls.")]),
-        }),
-        json!({
-            "name": "ccteam__workflow_peek",
-            "description": "Capture the current tmux pane contents for a project session (one-shot, no attach). Useful when you want to see what claude is showing without interrupting.",
-            "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
-        }),
-        json!({
-            "name": "ccteam__workflow_progress",
-            "description": "Return the last N progress.jsonl events for a project. Default N=50.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "Project slug." },
-                    "last_n": { "type": "integer", "description": "How many events to return (default 50)." }
-                },
-                "required": ["slug"],
-            }),
-        }),
-        // Lifecycle.
-        json!({
-            "name": "ccteam__workflow_new",
-            "description": "Create a new ccteam project from a free-text request. Returns the assigned slug and project directory. Defaults team=dev (M3 will accept other teams).",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "prompt": { "type": "string", "description": "Free-text user request." },
-                    "team": { "type": "string", "description": "Team name (default 'dev')." }
-                },
-                "required": ["prompt"],
-            }),
-        }),
-        json!({
-            "name": "ccteam__workflow_pause",
-            "description": "Pause auto-dispatch for one project (sets user_pause_pending). Does not kill the tmux session.",
-            "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
-        }),
-        json!({
-            "name": "ccteam__workflow_resume",
-            "description": "Resume an escalated / paused project (clears user_pause_pending and archives any escalation.md so the daemon's next tick re-dispatches the current phase).",
-            "inputSchema": object_schema(&[("slug", "string", "Project slug.")]),
-        }),
-        // M2.5 new pair.
-        json!({
-            "name": "ccteam__workflow_send_to_session",
-            "description": "Atomically write a markdown message into a session's .ccteam/inbox/. The orchestrator's next inotify wake delivers it via tmux send-keys. Use for free-form NL into project or meta-agent sessions.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "session": { "type": "string", "description": "Project slug OR meta session slug (e.g. 'meta-rob')." },
-                    "content_type": { "type": "string", "description": "Content type: text|markdown (default 'text')." },
-                    "body": { "type": "string", "description": "Message body (NL/markdown)." }
-                },
-                "required": ["session", "body"],
-            }),
-        }),
-        json!({
-            "name": "ccteam__workflow_inject_decision",
-            "description": "Inject a structured ESCALATE-style decision into a project session's inbox. Used when the meta-agent has resolved a clarify/escalation and wants the project session to act on the resolution.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "Project slug." },
-                    "escalate_kind": {
-                        "type": "string",
-                        "description": "One of: revert_to_phase | need_user_input | abort | insufficient_clarification | phase_done_pending. See interfaces §4.1.1."
-                    },
-                    "args": { "type": "object", "description": "Per-kind args. revert_to_phase needs target_phase; all kinds accept reason." }
-                },
-                "required": ["slug", "escalate_kind"],
-            }),
-        }),
         // V0.2.2 F38 — terminal screenshot. Read-only (no daemon
-        // requirement); mirrors `ccteam__workflow_peek` semantics.
+        // requirement).
         json!({
             "name": "ccteam__screenshot",
             "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
@@ -497,26 +411,6 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
         "ccteam__admin_ls" => Ok(text_content(tool_ls(paths)?)),
-        "ccteam__workflow_show" => Ok(text_content(tool_show(paths, &args)?)),
-        "ccteam__workflow_peek" => Ok(text_content(tool_peek(paths, &args)?)),
-        "ccteam__workflow_progress" => Ok(text_content(tool_progress(paths, &args)?)),
-        "ccteam__workflow_new" => Ok(text_content(tool_new(paths, &args)?)),
-        "ccteam__workflow_pause" => {
-            require_healthy_daemon(paths)?;
-            Ok(text_content(tool_pause(paths, &args)?))
-        }
-        "ccteam__workflow_resume" => {
-            require_healthy_daemon(paths)?;
-            Ok(text_content(tool_resume(paths, &args)?))
-        }
-        "ccteam__workflow_send_to_session" => {
-            require_healthy_daemon(paths)?;
-            Ok(text_content(tool_send_to_session(paths, &args)?))
-        }
-        "ccteam__workflow_inject_decision" => {
-            require_healthy_daemon(paths)?;
-            Ok(text_content(tool_inject_decision(paths, &args)?))
-        }
         "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
         // V0.8.4 P2b — `chat_send_file` is a LIVE tool: it needs the
         // daemon's gateway-event sink (which this stdio process doesn't
@@ -719,155 +613,6 @@ fn daemon_health_json(health: &DaemonHealth) -> Value {
     }
 }
 
-fn tool_show(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    run_show(paths, &slug, OutputFormat::Json)
-}
-
-fn tool_peek(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    run_peek(paths, &slug)
-}
-
-fn tool_progress(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    let last_n = args.get("last_n").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    let events = collect_recent_events(paths, &slug, last_n)?;
-    Ok(serde_json::to_string_pretty(&json!({ "events": events }))?)
-}
-
-fn tool_new(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let prompt = arg_string(args, "prompt")?;
-    let team = args
-        .get("team")
-        .and_then(|v| v.as_str())
-        .unwrap_or("dev")
-        .to_string();
-    if prompt.trim().is_empty() {
-        return Err(anyhow!("prompt must be non-empty"));
-    }
-    let slug = pick_unused_slug(paths, &prompt, &team)?;
-    let project_dir = bootstrap_project(paths, &slug, &prompt, &team)?;
-    // V0.4.2 F73: register the new project in config.yaml so the
-    // daemon roster (which reads `config.yaml::projects[]` first)
-    // picks it up immediately. Without this, mcp-created projects
-    // are only visible via the legacy fs-walk fallback.
-    ccteam_core::upsert_project_in_config(
-        &paths.root,
-        ccteam_core::ProjectEntry {
-            slug: slug.clone(),
-            path: project_dir.clone(),
-            team: team.clone(),
-            installed_at: chrono::Utc::now(),
-        },
-    )
-    .with_context(|| {
-        format!(
-            "upsert project `{slug}` into {}",
-            ccteam_core::ccteam_config_path(&paths.root).display(),
-        )
-    })?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "slug": slug,
-        "workspace": project_dir.to_string_lossy(),
-    }))?)
-}
-
-fn tool_pause(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    actions::pause(paths, &slug)?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "slug": slug,
-        "user_pause_pending": true,
-    }))?)
-}
-
-fn tool_resume(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    actions::resume(paths, &slug)?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "slug": slug,
-    }))?)
-}
-
-fn tool_send_to_session(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let session = arg_string(args, "session")?;
-    let body = arg_string(args, "body")?;
-    let content_type = args
-        .get("content_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("text")
-        .to_string();
-    // Wrapper keeps `source = "ccteam-mcp"` for backward compat with
-    // retro / silence-classifier consumers that grep on `source`.
-    let opts = SendOptions {
-        source: "ccteam-mcp".into(),
-        source_user: "mcp".into(),
-        content_type,
-    };
-    let result = actions::send_to_session_with(paths, &session, &body, &opts)?;
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "session": session,
-        "inbox_file": result.inbox_file,
-    }))?)
-}
-
-fn tool_inject_decision(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    let kind = arg_string(args, "escalate_kind")?;
-    let kind_norm = kind.to_lowercase();
-    let inner_args = args.get("args").cloned().unwrap_or(json!({}));
-    let reason = inner_args
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no reason provided)");
-    let target_phase = inner_args.get("target_phase").and_then(|v| v.as_str());
-
-    // Build a structured NL message that the in-session claude can
-    // recognize as a meta-agent decision. The body re-uses the
-    // ESCALATE grammar shape (interfaces §4.1.1) so claude can map
-    // the decision back to its own routing logic.
-    let body = match kind_norm.as_str() {
-        "revert_to_phase" => {
-            let phase = target_phase.ok_or_else(|| {
-                anyhow!("revert_to_phase requires args.target_phase")
-            })?;
-            format!(
-                "**META-AGENT DECISION**: revert to phase `{phase}`.\n\n原因:{reason}\n\n请回到 `{phase}` 阶段继续。",
-            )
-        }
-        "need_user_input" => format!(
-            "**META-AGENT DECISION**: clarification provided.\n\n{reason}\n\n请基于上述信息继续当前 phase。",
-        ),
-        "abort" => format!(
-            "**META-AGENT DECISION**: abort this project.\n\n原因:{reason}\n\n请停止后续工作,本次结束输出 `ESCALATE: ABORT — {reason}`。",
-        ),
-        "insufficient_clarification" => format!(
-            "**META-AGENT DECISION**: accept best-effort artifact.\n\n{reason}\n\n请基于现有产物继续到下一 phase,无需追加 CLARIFY 轮次。",
-        ),
-        "phase_done_pending" => format!(
-            "**META-AGENT DECISION**: deferred decisions resolved.\n\n{reason}\n\n请将之前 PHASE_DONE_PENDING 的子任务标记完成,推进到下一 phase。",
-        ),
-        other => return Err(anyhow!(
-            "unknown escalate_kind `{other}`; valid: revert_to_phase | need_user_input | abort | insufficient_clarification | phase_done_pending",
-        )),
-    };
-
-    // Reuse send_to_session's inbox-write path so the orchestrator's
-    // existing inotify+send-keys delivery picks it up.
-    tool_send_to_session(
-        paths,
-        &json!({
-            "session": slug,
-            "content_type": "markdown",
-            "body": body,
-        }),
-    )
-}
-
 /// V0.2.2 F38: render a PNG screenshot of the project's pane and
 /// return the absolute path. `lines` defaults to 50 when omitted.
 /// Returns `{ok:true, path}` on success and `{ok:false, reason}` on
@@ -1005,9 +750,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20.
+        // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 20);
+        assert_eq!(tool_definitions().len(), 12);
     }
 
     #[test]
@@ -1016,7 +761,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 20, "tool names must be unique");
+        assert_eq!(names.len(), 12, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1091,17 +836,6 @@ mod tests {
         assert_eq!(e["id"], 7);
         assert_eq!(e["error"]["code"], -32601);
         assert!(e["error"]["message"].as_str().unwrap().contains("foo"));
-    }
-
-    fn ensure_isolation() {
-        ccteam_core::disable_tool_surface_bootstrap_for_tests();
-    }
-
-    #[cfg(unix)]
-    fn fake_daemon(paths: &CcteamPaths) -> std::os::unix::net::UnixListener {
-        let socket = ccteam_core::daemon_socket_path(paths);
-        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        std::os::unix::net::UnixListener::bind(socket).unwrap()
     }
 
     #[tokio::test]
@@ -1192,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20.
+        // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1206,13 +940,11 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"ccteam__admin_ls"));
         assert!(names.contains(&"ccteam__screenshot"));
         assert!(names.contains(&"ccteam__chat_send_file"));
-        // Spot-check a couple of workflow tools are in the list.
-        assert!(names.contains(&"ccteam__workflow_show"));
-        assert!(names.contains(&"ccteam__workflow_send_to_session"));
         // V0.6.0 Wave 1 — chat / advise stubs present.
         assert!(names.contains(&"ccteam__chat_send_input"));
         assert!(names.contains(&"ccteam__advise_vote"));
@@ -1221,13 +953,28 @@ mod tests {
         assert!(names.contains(&"ccteam__chat_register_bot"));
         assert!(names.contains(&"ccteam__chat_unregister_bot"));
         assert!(!names.contains(&"ccteam__chat_lifecycle"));
+        // The 8 workflow_* tools were retired (no deprecated alias).
+        for gone in [
+            "ccteam__workflow_show",
+            "ccteam__workflow_peek",
+            "ccteam__workflow_progress",
+            "ccteam__workflow_new",
+            "ccteam__workflow_pause",
+            "ccteam__workflow_resume",
+            "ccteam__workflow_send_to_session",
+            "ccteam__workflow_inject_decision",
+        ] {
+            assert!(
+                !names.contains(&gone),
+                "retired workflow tool present: {gone}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn handle_tools_call_screenshot_degrades_when_session_missing() {
         // No tmux session for this slug → the tool returns ok=false
-        // with a reason, NOT isError=true. (Mirrors `peek` semantics:
-        // read-only, daemon-independent.)
+        // with a reason, NOT isError=true (read-only, daemon-independent).
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1305,127 +1052,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_tools_call_send_to_session_writes_inbox_file() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        let _daemon = fake_daemon(&paths);
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "ccteam__workflow_send_to_session",
-                "arguments": { "session": "demo", "body": "hello from MCP" }
-            }
-        });
-        let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], false);
-        let inbox = paths.project_ccteam_dir("demo").join("inbox");
-        let entries: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "send_to_session must write exactly one inbox file"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_tools_call_inject_decision_writes_revert_payload() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        let _daemon = fake_daemon(&paths);
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": 8,
-            "method": "tools/call",
-            "params": {
-                "name": "ccteam__workflow_inject_decision",
-                "arguments": {
-                    "slug": "demo",
-                    "escalate_kind": "revert_to_phase",
-                    "args": { "target_phase": "plan-eng", "reason": "选型有问题" }
-                }
-            }
-        });
-        let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], false);
-        let inbox = paths.project_ccteam_dir("demo").join("inbox");
-        let entries: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
-        assert_eq!(entries.len(), 1);
-        let path = entries[0].as_ref().unwrap().path();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("revert to phase `plan-eng`"));
-        assert!(body.contains("选型有问题"));
-    }
-
-    #[tokio::test]
-    async fn send_to_session_fails_loud_when_daemon_down() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        // No MCP socket listener → daemon considered down.
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": 70,
-            "method": "tools/call",
-            "params": {
-                "name": "ccteam__workflow_send_to_session",
-                "arguments": { "session": "demo", "body": "ignored" }
-            }
-        });
-        let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("daemon"), "got: {text}");
-        // And no inbox entry was created (fail-loud, not silent ack).
-        let inbox = paths.project_ccteam_dir("demo").join("inbox");
-        if inbox.exists() {
-            let entries: Vec<_> = std::fs::read_dir(&inbox).unwrap().collect();
-            assert_eq!(entries.len(), 0, "fail-loud must not write inbox");
-        }
-    }
-
-    #[tokio::test]
-    async fn pause_and_resume_fail_loud_when_daemon_down() {
-        ensure_isolation();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
-        for tool in ["ccteam__workflow_pause", "ccteam__workflow_resume"] {
-            let req = json!({
-                "jsonrpc": "2.0",
-                "id": 71,
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": { "slug": "demo" }
-                }
-            });
-            let resp = handle_request(&paths, &req).await.unwrap();
-            assert_eq!(resp["result"]["isError"], true, "{tool}");
-            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("daemon"), "{tool}: {text}");
-        }
-    }
-
-    #[tokio::test]
     async fn ls_succeeds_without_daemon_and_annotates_health() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -1498,31 +1124,6 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", v);
         }
-    }
-
-    #[tokio::test]
-    async fn handle_tools_call_inject_decision_rejects_unknown_kind() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join("home"),
-            projects_root: tmp.path().join("projects"),
-        };
-        // Reachable daemon socket so the health gate doesn't preempt
-        // the unknown-kind validation we're testing here.
-        let _daemon = fake_daemon(&paths);
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": 9,
-            "method": "tools/call",
-            "params": {
-                "name": "ccteam__workflow_inject_decision",
-                "arguments": { "slug": "demo", "escalate_kind": "fly_to_mars" }
-            }
-        });
-        let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("fly_to_mars"));
     }
 }
 

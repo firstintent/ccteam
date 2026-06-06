@@ -4,7 +4,10 @@
 //! Each test spawns `ccteam mcp-serve` with a different
 //! `CCTEAM_DISABLE_TOOLS` value and confirms `tools/list` shrinks /
 //! grows as expected. Group enum (V0.6.0 README §A):
-//! `admin` / `workflow` / `screenshot` / `chat` / `advise`.
+//! `admin` / `workflow` / `screenshot` / `chat` / `advise`. The
+//! `workflow` token stays a valid enum value, but after the W5a EOL of
+//! the `workflow_*` tools it gates an empty set, so only four groups
+//! ever surface in `tools/list`.
 //!
 //! Unknown tokens are silently dropped (PRD F111 §B: the filter is
 //! best-effort UX, not a security boundary). The acceptance script
@@ -128,16 +131,25 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
 }
 
 #[test]
-fn disable_unset_returns_all_five_groups() {
+fn disable_unset_returns_all_visible_groups() {
+    // W5a EOL — the 8 `workflow_*` tools were retired, so the `workflow`
+    // group surfaces no tools and never appears in `tools/list` (its
+    // enum token stays valid for the disable parser, but it gates an
+    // empty set). The visible surface is the four remaining groups.
     let names = names_with_disable(None);
     let groups = group_set(&names);
-    for g in ["admin", "workflow", "screenshot", "chat", "advise"] {
+    for g in ["admin", "screenshot", "chat", "advise"] {
         assert!(
             groups.contains(g),
             "default tools/list should contain group `{g}`; got groups {:?}",
             groups
         );
     }
+    assert!(
+        !groups.contains("workflow"),
+        "workflow group has no tools after W5a EOL; got groups {:?}",
+        groups
+    );
 }
 
 #[test]
@@ -145,7 +157,7 @@ fn disable_chat_hides_chat_keeps_others() {
     let names = names_with_disable(Some("chat"));
     let groups = group_set(&names);
     assert!(!groups.contains("chat"), "chat group should be hidden");
-    for g in ["admin", "workflow", "screenshot", "advise"] {
+    for g in ["admin", "screenshot", "advise"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
     // Spot-check specific stubs.
@@ -161,7 +173,6 @@ fn disable_chat_and_screenshot_combines() {
     assert!(!groups.contains("chat"));
     assert!(!groups.contains("screenshot"));
     assert!(!names.contains(&"ccteam__screenshot".to_string()));
-    assert!(groups.contains("workflow"));
     assert!(groups.contains("admin"));
     assert!(groups.contains("advise"));
 }

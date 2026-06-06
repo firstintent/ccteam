@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::state::ProjectState;
-use crate::team::TeamKind;
 
 #[derive(Debug, Clone)]
 pub struct CcteamPaths {
@@ -49,10 +48,6 @@ impl CcteamPaths {
 
     pub fn progress_jsonl(&self, slug: &str) -> PathBuf {
         self.progress_dir().join(format!("{slug}.jsonl"))
-    }
-
-    pub fn progress_jsonl_for_session(&self, slug: &str, sid: &str) -> PathBuf {
-        self.progress_dir().join(slug).join(format!("{sid}.jsonl"))
     }
 
     /// `~/.ccteam/progress/` — directory holding `<slug>.jsonl`
@@ -131,21 +126,8 @@ impl CcteamPaths {
         self.project_ccteam_dir(slug).join("state.json")
     }
 
-    pub fn project_sessions_dir(&self, slug: &str) -> PathBuf {
-        self.project_ccteam_dir(slug).join("sessions")
-    }
-
-    pub fn project_session_dir(&self, slug: &str, sid: &str) -> PathBuf {
-        self.project_sessions_dir(slug).join(sid)
-    }
-
     pub fn progress_jsonl_for_context(&self, context: &ProjectSessionContext) -> PathBuf {
-        if context.team_kind == TeamKind::Flex {
-            let sid = context.sid.as_deref().unwrap_or(crate::DEFAULT_CLAUDE_SID);
-            self.progress_jsonl_for_session(&context.slug, sid)
-        } else {
-            self.progress_jsonl(&context.slug)
-        }
+        self.progress_jsonl(&context.slug)
     }
 
     pub fn project_state_in(project_dir: &Path) -> PathBuf {
@@ -233,7 +215,6 @@ pub struct ProjectSessionContext {
     pub slug: String,
     pub sid: Option<String>,
     pub project_dir: PathBuf,
-    pub team_kind: TeamKind,
 }
 
 /// v0.8.6 — canonical `~/.ccteam/` subdirectory layout that `ccteam
@@ -336,7 +317,6 @@ pub fn session_context_from_cwd(cwd: &Path, paths: &CcteamPaths) -> Result<Proje
         slug: state.slug,
         sid,
         project_dir,
-        team_kind: state.team_kind,
     })
 }
 
@@ -375,7 +355,6 @@ fn sid_from_components<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::team::TeamKind;
     use tempfile::TempDir;
 
     fn paths(tmp: &TempDir) -> CcteamPaths {
@@ -386,30 +365,35 @@ mod tests {
     }
 
     #[test]
-    fn f49_session_context_detects_sid_subdir() {
+    fn session_context_detects_sid_subdir() {
         let tmp = TempDir::new().unwrap();
         let paths = paths(&tmp);
-        let slug = "flex-demo";
+        let slug = "demo";
         let project_dir = paths.project_dir(slug);
-        std::fs::create_dir_all(paths.project_session_dir(slug, "claude-1")).unwrap();
-        let mut state = ProjectState::initial_for_team(slug.into(), "flex".into());
-        state.team_kind = TeamKind::Flex;
-        state.save(&paths.project_state(slug)).unwrap();
+        let session_dir = paths
+            .project_ccteam_dir(slug)
+            .join("sessions")
+            .join("claude-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        ProjectState::initial_for_team(slug.into(), "dev".into())
+            .save(&paths.project_state(slug))
+            .unwrap();
 
-        let cwd = paths.project_session_dir(slug, "claude-1").join("work");
+        let cwd = session_dir.join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         let context = session_context_from_cwd(&cwd, &paths).unwrap();
         assert_eq!(context.slug, slug);
         assert_eq!(context.sid.as_deref(), Some("claude-1"));
         assert_eq!(context.project_dir, project_dir);
+        // Progress routing is flat regardless of sid sub-dir.
         assert_eq!(
             paths.progress_jsonl_for_context(&context),
-            paths.progress_jsonl_for_session(slug, "claude-1"),
+            paths.progress_jsonl(slug),
         );
     }
 
     #[test]
-    fn f49_session_context_keeps_workflow_progress_flat() {
+    fn session_context_keeps_workflow_progress_flat() {
         let tmp = TempDir::new().unwrap();
         let paths = paths(&tmp);
         let slug = "dev-demo";
@@ -420,7 +404,6 @@ mod tests {
 
         let context = session_context_from_cwd(&paths.project_dir(slug), &paths).unwrap();
         assert_eq!(context.sid, None);
-        assert_eq!(context.team_kind, TeamKind::Workflow);
         assert_eq!(
             paths.progress_jsonl_for_context(&context),
             paths.progress_jsonl(slug),

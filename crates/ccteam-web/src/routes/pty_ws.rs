@@ -2,10 +2,11 @@
 //!
 //! Two routes:
 //!
-//! - `GET /ws/{slug}/pty`           — workflow / default project (tmux
-//!   session from `ProjectState::tmux_session`).
-//! - `GET /ws/{slug}/{sid}/pty`     — flex per-session (tmux session
-//!   from `ProjectState::sessions[sid].tmux_session`).
+//! - `GET /ws/{slug}/pty`           — project pane (tmux session from
+//!   `ProjectState::tmux_session`).
+//! - `GET /ws/{slug}/{sid}/pty`     — per-session route. W5: the flex
+//!   per-session registry is gone, so this currently relays the
+//!   project-level pane; W5b/W5c re-key it onto the new session record.
 //!
 //! ## Wire protocol (subprotocol `ccteam-pty.v1`)
 //!
@@ -53,7 +54,7 @@ use axum::{
     routing::get,
     Router,
 };
-use ccteam_core::{ProjectState, TeamKind};
+use ccteam_core::ProjectState;
 use ccteam_harness::{MuxSessionId, PaneBackend, ProcessBackend, TmuxBackend};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -100,25 +101,19 @@ async fn handle_session_ws(
     State(app): State<AppState>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> Response {
+    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
+    // is gone, so the session's tmux name can no longer be resolved from
+    // it. Fall back to the project-level tmux session. TODO(V0.8.6
+    // W5b/W5c): re-key this onto the new session record so the
+    // per-session terminal relay targets the right pane again.
     let state = match ProjectState::load(&app.paths.project_state(&slug)) {
         Ok(s) => s,
         Err(_) => return (StatusCode::NOT_FOUND, "project not found").into_response(),
     };
-    if state.team_kind != TeamKind::Flex {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("project {slug} is not a flex project"),
-        )
-            .into_response();
+    let tmux_session = state.tmux_session.clone();
+    if tmux_session.trim().is_empty() {
+        return (StatusCode::NOT_FOUND, "project has no tmux session").into_response();
     }
-    let Some(record) = state.sessions.get(&sid) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("session not found: {slug}/{sid}"),
-        )
-            .into_response();
-    };
-    let tmux_session = record.tmux_session.clone();
     let key = format!("{slug}/{sid}");
     upgrade(ws, app, key, tmux_session)
 }

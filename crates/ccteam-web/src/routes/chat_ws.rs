@@ -14,7 +14,6 @@ use axum::{
     routing::get,
     Router,
 };
-use ccteam_core::TeamKind;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
@@ -365,39 +364,13 @@ fn session_items(app: &AppState) -> Vec<SessionItem> {
     let mut items = Vec::new();
     for project in projects {
         let state = project.state;
-        if state.team_kind == TeamKind::Flex {
-            for (sid, record) in state.sessions {
-                let role = role_from_chat_tmux(&record.tmux_session, &state.slug);
-                items.push(SessionItem {
-                    project: state.slug.clone(),
-                    session: Some(sid),
-                    vendor: Some(format!("{:?}", record.harness).to_lowercase()),
-                    role,
-                    current: false,
-                });
-            }
-        } else {
-            items.push(SessionItem {
-                project: state.slug,
-                session: None,
-                vendor: None,
-                role: None,
-                current: false,
-            });
-        }
+        items.push(SessionItem {
+            project: state.slug,
+            session: None,
+            vendor: None,
+            role: None,
+            current: false,
+        });
     }
     items
-}
-
-/// Recover the agent role from a chat session's tmux name. Chat panes are
-/// named `ccteam-chat-<slug>-<role>` by the gateway; since the slug is
-/// known we strip the `ccteam-chat-<slug>-` prefix rather than guessing
-/// split points in a slug that may itself contain hyphens. Returns `None`
-/// for non-chat tmux names (the role isn't recoverable from disk).
-fn role_from_chat_tmux(tmux_session: &str, slug: &str) -> Option<String> {
-    let prefix = format!("ccteam-chat-{slug}-");
-    tmux_session
-        .strip_prefix(&prefix)
-        .filter(|role| !role.is_empty())
-        .map(|role| role.to_string())
 }
