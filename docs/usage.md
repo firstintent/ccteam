@@ -1,17 +1,29 @@
 # ccteam 使用指南
 
-一份命令为主的端到端用户指南:install → init → start → 接入 IM → 日常用 → 运维。
+一份命令为主的端到端用户指南:install → init → config → start → 接入 IM → 日常用 → 运维。
 直接照着代码块敲。所有命令都对照当前 CLI 校验过。
 
-核心模型:**一个 chat 就是一台终端**。三个对象——
+核心模型:**一个 chat 就是一台终端**。四个对象——
 
 - **chat**:Telegram / 飞书(Lark)私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
 - **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
-- **session**:一个可继续上下文的 agent 会话,属于某个 chat + 某个 project。
+- **session**:一个可继续上下文的 agent 会话(spawn-on-demand、按 id resume、空闲释放),属于某个 chat + 某个 project。
+- **role**:session 启动时绑定的角色(`.claude/agents/<role>.md` 定义 persona + 工具)。session 以 `claude --agent <role>` 启动,**就 become 该 role**。默认 role 是 `cto`(chat-first 管家)。换 role = IM 里 `/role <role>`(底层 = 带新 `--agent` 重启该 session)。
 
-两类命令别混:**shell 里的 `ccteam <子命令>`**(运维 + 安装) vs **IM / web chat 里的网关命令 `/pair /new /use /cd /sessions /projects /newproject /help`、路由前缀 `@<handle>`、管理 `@ccteam`**(日常对话)。
+两类命令别混:
 
-> **命令菜单**:daemon 启动时会把上面这些**网关自有命令**注册进你的 IM 客户端(Telegram 走 `setMyCommands`)—— 在聊天框敲 `/` 就能看到候选(其余透传给 agent 的 slash 不进菜单,因为它跟当前 vendor 相关、列进去会误导)。随时发 `/help` 看网关命令清单 + 「其余 `/` 命令透传给当前 agent」的说明。
+- **shell 里的 `ccteam <子命令>`**(安装 + 运维):扁平 `init / start / stop / status / config / doctor` + 分组 `project <ls|show|new|stop|rm>` + 分组 `session <ls|attach|pause|resume|register|unregister|persona|add-tool|bots|role>`。
+- **IM / web chat 里的网关命令**(日常对话):`/pair /new /use /role /cd /sessions /projects /newproject /help`、路由前缀 `@<handle>`、管理前缀 `@ccteam`。
+
+> **命令菜单**:daemon 启动时会把**网关自有命令**注册进你的 IM 客户端(Telegram 走 `setMyCommands`)—— 在聊天框敲 `/` 就能看到候选(其余透传给 agent 的 slash 不进菜单,因为它跟当前 vendor 相关、列进去会误导)。随时发 `/help` 看网关命令清单 + 「其余 `/` 命令透传给当前 agent」的说明。
+
+整体上手四步(终端一次性)+ IM 日常:
+
+```text
+curl install.sh | sh   →   ccteam init   →   ccteam config   →   ccteam start
+                                                                      ↓
+IM:  /pair <code>  →  /cd <项目>  →  (自动 spawn cto)  →  /role <role>  →  /new · /use · @handle  →  @ccteam status/pause/remove
+```
 
 ---
 
@@ -33,11 +45,11 @@ export PATH="$HOME/.local/bin:$PATH"
 cargo install --git https://github.com/firstintent/ccteam ccteam-cli
 ```
 
-ccteam 不打包 Claude / Codex,调用你机器上的真实 CLI。确认装好且已登录:
+ccteam 不打包 Claude / Codex,调用你机器上的真实 CLI。本版主驱动是 **claude-code**(Codex best-effort)。确认装好且已登录:
 
 ```bash
-claude --version          # 需要时按提示登录
-codex --version           # 用 Codex bot 才需要
+claude --version          # 必需;需要时按提示登录
+codex --version           # 可选,用 Codex 会话才需要
 ```
 
 在 Claude Code 会话里装插件(`/plugin` 是 Claude Code 内建命令,给 agent 提供 `mcp__ccteam__*` 工具):
@@ -52,46 +64,68 @@ codex --version           # 用 Codex bot 才需要
 codex plugin marketplace add firstintent/ccteam
 ```
 
-```bash
-# 体检 + MCP 表面自检(应显示 active 28 / stubs 0)
-ccteam doctor
-ccteam doctor --verify-mcp
-```
-
-```bash
-# 装插件后 Claude 看不到 MCP 工具时,显式注册再重载会话
-ccteam doctor --install-mcp
-```
+> 注册 MCP 服务用 `ccteam config`(见 §3),不再用 `doctor --install-mcp`。
 
 ---
 
-## 2. 初始化项目
+## 2. 初始化项目(`ccteam init`)
 
-一个 chat 可同时管多个项目。在每个项目目录跑一次 `init`:
+在每个你想交给 ccteam 管的目录跑一次 `init`。默认就地初始化当前目录(slug = 目录名):
 
 ```bash
 cd ~/projects/demo-app
-ccteam init --slug demo-app
+ccteam init
 ```
+
+`ccteam init` 写入两处,**只碰 ccteam 自己的东西**:
+
+- 项目 `.ccteam/` —— 仅 `state.json` + `workflow.yaml`(项目状态 + agent 拓扑声明,无 prompt)。
+- 项目 `.claude/agents/cto.md` —— 默认 role(chat-first「CTO 管家」persona)。这是 ccteam 唯一托管的「指令面」。
+- 项目 `.claude/settings.local.json` —— ccteam 的 hook + 基础设置写进**本地层**(gitignored、与你的 `.claude/settings.json` 合并),**绝不碰**你的 `.claude/settings.json`。
+
+> **ccteam 不生成、不修改、不抑制项目知识文件**。项目自有的知识走 vendor 原生:Claude 自动读 `CLAUDE.md`,Codex 自动读 `AGENTS.md` —— 这俩文件都归项目自己(老项目用自己的,新项目有啥读啥),ccteam 不接管、不桥接。业务代码 / `.git/` / `.env` 永远保留;重跑 `init` 安全。
 
 ```bash
-cd ~/projects/demo-api
-ccteam init --slug demo-api
+ccteam init --in /path/to/repo          # 在别处初始化(slug 默认取目录名)
+ccteam init --slug demo-app             # 覆盖自动推断的 slug
+ccteam init --force                     # 覆盖 ccteam 生成物(在源码目录自举时也用它)
+ccteam project ls                       # 列已知项目
 ```
 
-`ccteam init` 写入 `.ccteam/{agents,skills,state.json}`、`.claude/agents`,以及一份自动管理的 `<project>/CLAUDE.md`。业务代码 / `.git/` / `.env` 永远保留;重跑安全。
+**slug 撞名 = 数字累加**:默认 slug 取目录名。两个不同路径同名(如 `/ws/demo` vs `/ws2/demo`)时,后建的自动累加成 `demo2` / `demo3` …(可读,非随机后缀)。同一路径重复 `init` = re-init 刷新,不算撞名。需要显式名用 `--slug`。
 
-```bash
-ccteam init --in /path/to/repo --slug myproj    # 在别处初始化
-ccteam init --force                             # 覆盖 ccteam 生成物(在源码目录自举时也用它)
-ccteam ls                                        # 列已知项目
-```
+要在 `<projects_root>/<team>-<slug>/` 下**新建**一个带 team 前缀的项目目录,用 `ccteam project new <slug>`(见 §7),`init` 是就地初始化已有目录。
 
 ---
 
-## 3. 接入 IM(Telegram / 飞书 Lark bot)
+## 3. 一次性配置(`ccteam config`)
 
-在 Telegram 找 `@BotFather` → `/newbot` 拿 token。给 bot 发一条消息(群里则把 bot 拉进去发一条),再取 chat id:
+`ccteam config` 是 setup 总入口,**吸收**了原来散落的「装 MCP / 配 IM token / 改偏好」。
+
+```bash
+ccteam config                  # 交互式编号菜单(需要 TTY)
+```
+
+菜单三项:① 注册 / 刷新 ccteam MCP 服务(写 `~/.claude.json`,让日常 claude 会话看到 ccteam 工具)② 设置 IM(Telegram)bot token ③ 查看偏好。
+
+非交互形(headless / CI):
+
+```bash
+ccteam config mcp                          # 注册 / 刷新 ccteam MCP 服务(等价菜单①)
+ccteam config show                         # 打印当前偏好
+ccteam config get fallback.on_claude_quota # 读一项偏好
+ccteam config fallback.on_claude_quota codex   # 设一项偏好(off|codex)
+```
+
+偏好存 `~/.ccteam/preferences.toml`。当前支持的 key:`fallback.on_claude_quota`(`off` | `codex`,Claude 配额触顶时是否回退 Codex)。
+
+IM token 也可手写凭证文件(见 §4);`ccteam config` 的菜单②会校验 token + 长轮询抓到你的 chat_id 后自动落盘到 `~/.ccteam/im/credentials.json`。
+
+---
+
+## 4. 接入 IM(Telegram / 飞书 Lark bot)
+
+最省事走 `ccteam config` 菜单②(交互式)。要手写,在 Telegram 找 `@BotFather` → `/newbot` 拿 token,给 bot 发一条消息(群里则把 bot 拉进去发一条),再取 chat id:
 
 ```bash
 BOT_TOKEN='123456:replace_me'
@@ -149,13 +183,13 @@ Telegram 之外可同时接入飞书/Lark(同一个 `credentials.json`,与 teleg
 
 ---
 
-## 4. 启动 gateway daemon
+## 5. 启动 gateway daemon(`ccteam start`)
 
 ```bash
 ccteam start > /tmp/ccteam.log 2>&1 &     # 一个进程:IM gateway + web chat + MCP socket + web UI
 ```
 
-`ccteam start`(无 slug)启动常驻网关,同进程提供:IM gateway(Telegram 长轮询 + 出站)、web chat WS(`/ws/chat`)、MCP socket(`~/.ccteam/run/mcp.sock`)、Web UI(默认 `0.0.0.0:7331`)、hook sink。
+`ccteam start`(无参)启动常驻网关 —— **不 tick、无 orchestrator 循环**,纯路由 + 按需 spawn / resume session。同进程提供:IM gateway(Telegram 长轮询 + 出站、飞书/Lark WS)、web chat WS(`/ws/chat`)、标准资源 API(`/api/v1/*`)、MCP socket(`~/.ccteam/run/mcp.sock`)、Web UI(默认 `0.0.0.0:7331`)、hook sink。
 
 ```bash
 ccteam start --web-bind 127.0.0.1:7331    # 只绑环回(此时 web 不需 token)
@@ -169,11 +203,11 @@ ccteam stop
 ccteam start > /tmp/ccteam.log 2>&1 &
 ```
 
-> `--web-bind` 是 `ccteam start` 的 web 地址参数;独立的 `ccteam web` 子命令用 `--bind`。两者别搞混。
+> `--web-bind` 是 `ccteam start` 的 web 地址参数;独立的内部 web 服务用 `ccteam internal web --bind`。两者别搞混。
 
 ---
 
-## 5. 日常使用(IM 网关命令)
+## 6. 日常使用(IM 网关命令)
 
 配对当前 chat(`<code>` 任意,如 `phone`;回 `paired <code>`):
 
@@ -181,28 +215,39 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 /pair phone
 ```
 
-切项目、建 session(`/new <vendor> <handle>`,vendor = `claude` | `codex`):
+切项目、建 session:
 
 ```text
-/cd demo-app
-/new claude reviewer
-/cd demo-api
-/new codex api
+/cd demo-app                当前 chat 切到 demo-app
+/cd demo-api               切另一个项目
+/newproject demo /ws/demo  新建并 init 一个项目(team 前缀目录),再切过去
 ```
 
-切换 / 查看:
+`/cd` 进一个项目后,该 chat 第一次发消息会**自动 spawn 一个 `cto` session**(`claude --agent cto`)—— 直接跟 cto 对话即可。cto 是 chat-first 管家:懂 ccteam、会**推荐**合适的 work-role、帮你串流程。本版 cto 只**推荐**,你自己用 `/role` 换角色。
+
+**换角色干活**(把当前 session 切成另一个 role):
 
 ```text
-/use s1            切到 session s1
-/cd demo-api       当前 chat 切到 demo-api;活动 session 跟着切(无则下条消息在那新建)
-/sessions          列当前 chat 的 session(每行带 model + 上下文用量)
-/projects          列 daemon 已知项目(= 已 init 且 daemon 已加载)
-/newproject demo   新建并 init 一个项目(team 前缀目录)
+/role reviewer    当前 session 切到 reviewer 角色(底层 = 带新 --agent 重启,保持同一 session id)
+/role cto         切回管家
+```
+
+`/role` 原地换角色:同一个 session id(`/use <id>` 不失效),用新 `--agent <role>` 重启;同 role = no-op(不白扔上下文)。role 必须在项目 `.claude/agents/<role>.md` 有对应文件。
+
+> **work-role 从哪来**:自己写 `.claude/agents/<role>.md`,或从 **agency-agents**(Claude 原生 .md 角色库,MIT)挑一个 .md 丢进 `.claude/agents/`。本版选 role = 手动丢 `.md` + `/role`;picker / import UI 是后续项。
+
+**多 session + 切换 + 查看**:
+
+```text
+/new claude reviewer   建新 session(vendor = claude|codex;role 可选,默认 cto)
+/use s1                切到 session s1
+/sessions              列当前 chat 的 session(每行带 role + model + 上下文用量)
+/projects              列 daemon 已知项目(= 已 init 且 daemon 已加载)
 ```
 
 `/sessions` 每行形如 `s1:demo-app:claude:reviewer  claude-opus-4-8[1m] · ctx 188k / 1M (19%)` —— 末尾是该 session 的 **model + 上下文用量**(绝对值 + 百分比;窗口 1M 来自 model id 的 `[1m]` 后缀,否则按 200k 基线)。用量是回合后值:空闲时准,turn 跑到一半偏旧。
 
-发消息 + slash 透传(`@handle` 决定路由并设为当前 session;不带 `@` 时发给当前 session):
+**发消息 + slash 透传**(`@handle` 决定路由并设为当前 session;不带 `@` 时发给当前 session):
 
 ```text
 @reviewer 看一下这个项目的 README,给我三条风险
@@ -219,6 +264,8 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 - **Claude session**:开放集(skill / 自定义命令 / `/compact` `/clear` `/usage` …)按字面 `send-keys` 透传给 TUI;弹窗选择型(`/model` 等)带参直接应用、不带参(bare)弹出 **inline 选项按钮**(web chat 里是 chips),点一下即应用;纯设置面板型(`/config` `/agents` 等无法用一句参数驱动的)会**显式拒绝并给提示**(不盲发、免得隐藏 TUI 卡进 modal 吞输入);万一卡住,发 `/esc` 等于按一下 Esc 把 TUI 拉回来。
 - **Codex session**:每条 slash 映射 app-server **原生 RPC** 或即时查询(`/compact` `/review` `/interrupt` `/status` `/skills` …);弹窗型(`/model` `/review` `/permissions` …)bare 先弹**选项按钮**、选了再应用(两段式);`/new` `/clear` `/resume` 这类 Codex 无 in-thread 等价的,会**重定向**提示你用网关命令(如 `/new` 建新 session、`/use` 切 session);确实不支持 / TUI-only 的命令显式回执拒绝。
 
+> 本版 role 绑定(`--agent`)是 **Claude 路径**的能力;Codex session 只保证读项目原生 `AGENTS.md`,role 绑定推后。
+
 **turn 进行中的进度**:turn 跑的时候会有一条活的 status 消息逐步编辑,折叠显示步骤(形如 `⏳ working… · 📖 read ×5 · 🔧 bash ×3`),结束收尾成 `✅ done · n tools · m files`;最终答案单独成一条新消息(会 ping)。想关掉只发答案:daemon 起前设 `CCTEAM_IM_PROGRESS=off`(编辑节流阈值 `CCTEAM_IM_PROGRESS_THROTTLE_MS`,默认 1500ms)。
 
 **长消息自动分片**:超过 Telegram 4096(UTF-16)上限的回答会被有序切成多条发出(代码块跨片自动闭合/重开),不再截断丢数据。
@@ -229,16 +276,72 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 **agent 反问你**:当 agent 自己在 turn 中途要拿主意(发起 AskUserQuestion),它的问题会以**选项按钮**形式弹到你 chat 里 —— 点一下(或回数字 / 回一段自由文本)即把答案喂回 agent,它继续往下跑,不卡死。等太久没答会按兜底策略让它自决。
 
-给 bot 设定固定行为走官方机制(**不靠注入**):Claude 读项目根 `CLAUDE.md`(`init` 已生成),Codex 读项目根 `AGENTS.md`(需手建);全局指令放 `~/.claude/CLAUDE.md`。
+**给 bot 设定固定行为**走官方机制(**不靠注入**):role 的 persona 写在 `.claude/agents/<role>.md`(`/role` 换的就是它);项目知识走 vendor 原生 —— Claude 读项目 `CLAUDE.md`、Codex 读 `AGENTS.md`(都归项目自己,ccteam 不生成);全局指令放 `~/.claude/CLAUDE.md`。
 
 ```bash
-$EDITOR ~/projects/demo-app/CLAUDE.md     # Claude bot 下个 turn 生效
-$EDITOR ~/projects/demo-api/AGENTS.md     # Codex bot 读取
+$EDITOR ~/projects/demo-app/.claude/agents/reviewer.md   # 改 reviewer 角色;下次 /role reviewer(fresh start)生效
+$EDITOR ~/projects/demo-app/CLAUDE.md                     # 项目知识(Claude 自动读,vendor 原生)
 ```
+
+> 注:改 role.md 在 **fresh start / `/role` 切换**后生效;`/use` resume 一个已活 session 会沿用它历史里展现的 persona(in-context,不重读)。要立刻换 persona 就 `/role`。
 
 ---
 
-## 6. Web 控制台
+## 7. shell 侧项目 / session 管理(`project` / `session` 组)
+
+日常驱动在 IM;shell 这组用于脚本 / 运维 / 无 IM 场景。
+
+**`ccteam project`**(项目生命周期):
+
+```bash
+ccteam project ls                  # 列已知项目
+ccteam project show demo-app       # 看一个项目的完整状态 + 近期事件
+ccteam project new demo --team dev # 在 <projects_root>/dev-demo/ 下新建并 init
+ccteam project stop demo-app       # 停该项目所有 session(kill tmux,可 resume;非删)
+ccteam project rm demo-app         # 注销项目(只摘 config 注册 + 清 ~/.ccteam 内 per-slug 状态)
+```
+
+**删除(`project rm`)= init 的逆**:
+
+```bash
+ccteam project rm demo-app --dry-run        # 先列「会停 …」+「会删 …」,不动手
+ccteam project rm demo-app --purge          # 注销 + 删 ccteam 在项目里的痕迹
+ccteam project rm demo-app --purge --force  # 跳过「永不主动 kill 长 session」的确认门
+```
+
+- 不带 `--purge` = 仅注销(摘 `~/.ccteam/config.yaml` 注册项 + 清 `~/.ccteam/{progress,imd/registry}/<slug>`),项目目录里的文件原样不动。
+- `--purge` = 额外删 **ccteam 建的**:项目 `.ccteam/`、种入的 `.claude/agents/cto.md`、`.claude/settings.local.json` 里 ccteam 的 hook 段。
+- **永远保留不碰**:你自选的 work-role(`.claude/agents/` 里非 cto 的 .md)、项目 `CLAUDE.md` / `AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
+- `rm` 默认先停活动 session 再删;`--force` 跳过确认门。
+
+> `project stop` = 停(显式用户命令,resumable,不违「永不主动 kill」红线);`project rm` = 删(先停再删)。
+
+**`ccteam session`**(会话 + bot 配置):
+
+```bash
+ccteam session ls                          # 列活的网关 chat-mode session,并标出 orphan
+ccteam session attach demo-app reviewer    # attach 到一个 chat session(role 可省,单个时自动选)
+ccteam session pause demo-app              # 暂停某项目自动派工(永不 kill 长 session)
+ccteam session resume demo-app
+ccteam session persona demo-app reviewer - # 用 stdin 整文件替换 reviewer 的 .claude/agents/reviewer.md
+ccteam session add-tool demo-app reviewer "Bash(git*)"   # 往 role 的 tools CSV 加一条
+ccteam session role demo-app s1 reviewer   # 提示:换 session 的 role 走 IM /role(daemon 内存态)
+```
+
+- `session register / unregister / bots` 管 IM bot 注册(镜像 `mcp__ccteam__chat_*` / `admin_*` 工具),脚本 / 无-daemon 兜底用:
+
+```bash
+ccteam session register --slug demo-app --role reviewer --vendor claude \
+  --platform telegram --chat-id 123456789 --chat-handle reviewer
+ccteam session bots --slug demo-app        # 看注册表(role → @handle → platform/chat_id + running 状态)
+ccteam session unregister --slug demo-app --role reviewer
+```
+
+> `session role` 是个**指针命令**:真正换 session 的 role 需要 daemon 的内存态,走 IM `/role <role>`;CLI 这条只打印指引。单 session 粒度删(`session rm`)本版未做。
+
+---
+
+## 8. Web 控制台 + 标准资源 API
 
 ```bash
 # token 落在文件里;ccteam start 已尝试自动复制到剪贴板(--no-clipboard 跳过)
@@ -248,31 +351,56 @@ cat ~/.ccteam/web-token
 - 本机环回:`ccteam start --web-bind 127.0.0.1:7331` → 浏览器开 `http://127.0.0.1:7331`(无需 token)。
 - LAN / 非环回 bind(默认 `0.0.0.0:7331`):自动开 token 鉴权,用上面 `~/.ccteam/web-token` 的值。
 
-```bash
-ccteam web --bind 127.0.0.1:7331          # 单独起 web(不带网关)
-```
-
-打开 `http://<host>:7331/app/chat` 进入 web chat 控制台。它和 IM 共用同一个 Gateway:
+打开 `http://<host>:7331/app/chat` 进入 web chat 控制台。它和 IM 共用同一个 Gateway(同样 `/new` `/use` `/cd` `@handle` `/role`):
 
 ```text
 /new claude reviewer
-/new codex api
 @reviewer 看一下当前项目
 @api /review
-@api /compact
 ```
 
-Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v1`。`ccteam start --no-imd` 只启动 web server,此时 Chat 面板能打开但不会接入 Gateway;要使用 web chat,保持 IM gateway task 启用(默认)。
+Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v1`。`ccteam start --no-imd` 只启动 web server,此时 Chat 面板能打开但不会接入 Gateway;要用 web chat,保持 IM gateway task 启用(默认)。
+
+### 标准资源 API(`/api/v1`,给集成方)
+
+daemon 暴露一套 **web-token 鉴权**的标准资源 API(供 app / 独立前端集成;web UI 自身也基于它)。三资源 + 能力探测:
+
+```text
+GET    /api/v1/projects                      列项目
+POST   /api/v1/projects                      注册项目
+GET    /api/v1/projects/{slug}               单项目详情
+DELETE /api/v1/projects/{slug}               注销 + 停 session(破坏性 file-purge 仍走 CLI project rm --purge)
+
+GET    /api/v1/projects/{slug}/roles         列 role(读 .claude/agents)
+GET    /api/v1/projects/{slug}/roles/{role}  读单个 role 定义
+PUT    /api/v1/projects/{slug}/roles/{role}  写单个 role 定义
+
+GET    /api/v1/projects/{slug}/sessions      列 session
+POST   /api/v1/projects/{slug}/sessions      建 session(project × role × harness)
+GET    /api/v1/sessions/{sid}                session 历史
+POST   /api/v1/sessions/{sid}/turn           发一个 turn
+GET    /api/v1/sessions/{sid}/events         按 sid 过滤的事件流(SSE)
+POST   /api/v1/sessions/{sid}/stop           停 session
+
+GET    /api/v1/capabilities                  当前可用 harness(× provider)动态列表(PATH 探测)
+```
+
+- **session-id** 命名空间 = gateway `s{n}`(与 IM 的 `/use s1` 一致)。
+- **harness × provider**:harness = agentic CLI 驱动(本版 claude-code;codex best-effort;gemini-cli / grok-cli 等后续 adapter),provider = 子 facet(model)。都是 session 属性、非顶层资源,经 `GET /capabilities` 动态暴露。
+- session 端点需要 live gateway(`ccteam start` 起的 daemon);独立 `internal web`(无 gateway)下 session 端点优雅返回 503。
+- **DELETE `/projects/{slug}`** = 注销 + 停 session,**不**删文件树;要删 ccteam 痕迹用 CLI `project rm --purge`。
+
+> 注:per-session 独立 web 视图(每个 session 自己的页 + 切换器)是已记录的前端后续项;**API 本身已 live**。
 
 ---
 
-## 7. 运维
+## 9. 运维
 
 ```bash
 ccteam status                  # daemon 心跳 + 每个项目 OK/warn/STUCK + 活跃 session
-ccteam sessions                # 列活的网关 chat-mode session,并标出 orphan
+ccteam session ls              # 列活的网关 chat-mode session,并标出 orphan
 ccteam doctor                  # 安装 / 依赖体检
-ccteam doctor --verify-mcp     # MCP 表面验收(active 28 / stubs 0)
+ccteam doctor --verify-mcp     # MCP 表面验收(active 12 / stubs 0,drift 退出码 1)
 ccteam stop                    # 优雅停 daemon(保留 tmux session)
 ```
 
@@ -285,10 +413,10 @@ ccteam doctor --check-cost-orphan          # ledger 对账(shell 侧)
 ```text
 @ccteam cost today             IM 侧 24h 成本汇总(也可 @ccteam cost <slug>)
 @ccteam status                 daemon + bot 状态
-@ccteam list                   列已注册 bot
-@ccteam pause <slug>           暂停 / 恢复某项目自动派工(永不 kill 长 session)
+@ccteam list                   列已注册 bot(@ccteam list bots / who 列本 chat 可达的)
+@ccteam pause <slug>           暂停 / 恢复某项目自动派工(永不 kill 长 session;可 <slug>/<role>)
 @ccteam resume <slug>
-@ccteam stop <slug>            停某项目的 bot;@ccteam stop everything 停全部(危险,需二次确认)
+@ccteam stop <slug>            停某项目的 bot;@ccteam stop everything 停全部(危险,需回 CONFIRM 二次确认)
 ```
 
 状态文件速查:
@@ -298,6 +426,7 @@ tail -120 /tmp/ccteam.log                  # daemon 日志
 tail -80 ~/.ccteam/imd/outbound.jsonl      # outbound ledger(重启后重放 queued/failed)
 cat ~/.ccteam/imd/gateway-state.json       # gateway session state
 cat <project>/.ccteam/state.json           # 项目状态
+cat <project>/.ccteam/progress.jsonl       # 业务事件(state SoT)
 ```
 
 环境变量(隔离 / 覆盖路径):
@@ -311,9 +440,11 @@ CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=...  # 覆盖 vendor CLI 路径
 CCTEAM_CODEX_APP_SERVER_SOCKET=/path/to/app-server-control.sock
 ```
 
+> `~/.ccteam` 规范布局由 `ccteam-core::canonical_home_dirs()` 单一定义(hooks / progress / run / state);`ccteam doctor` 会报告 home-layout drift。
+
 ---
 
-## 8. 卡住时(最常见 5 条)
+## 10. 卡住时(最常见 5 条)
 
 ```bash
 # 先跑这三条,八成能定位
@@ -323,9 +454,9 @@ tail -120 /tmp/ccteam.log
 ```
 
 1. **`ccteam: command not found`** — `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"`。
-2. **Telegram 不回 / `drop msg from non-allowed chat`** — chat id 不在 allowlist,或改了凭证没重启:编辑 `~/.ccteam/im/credentials.json` 的 `allowed_chat_ids` → `ccteam stop && ccteam start`。
+2. **Telegram 不回 / `drop msg from non-allowed chat`** — chat id 不在 allowlist,或改了凭证没重启:编辑 `~/.ccteam/im/credentials.json` 的 `allowed_chat_ids`(或重跑 `ccteam config`)→ `ccteam stop && ccteam start`。
 3. **IM 收到 `gateway error: ...`(pane 死 / socket 断)** — `ccteam stop && ccteam start`,再发同一 `@handle`;仍失败用 `/new claude reviewer2` 开新 session。
 4. **`gateway error: turn timed out ...`** — 等一会重试;长上下文先 `@bot /compact`;反复超时就新建 session。
-5. **`/new` 报 `unknown project`** — 项目没 init 或 daemon 没加载:`cd <repo> && ccteam init --slug <s>` → `ccteam stop && ccteam start` → IM 里 `/projects` 确认 → `/cd <s>`。
+5. **`/cd` / `/new` 报 `unknown project`** — 项目没 init 或 daemon 没加载:`cd <repo> && ccteam init` → `ccteam stop && ccteam start` → IM 里 `/projects` 确认 → `/cd <s>`。
 
 > IM 路径里的 Claude session 使用 `--dangerously-skip-permissions`(无批准门,YOLO 模式)——只把 bot 暴露给可信 chat,bot token 不进 git。

@@ -109,9 +109,9 @@ ccteam 服务于**想把主流 code agent（Claude Code、Codex、Gemini、Pi…
 > "团队的运转**不依赖我在场**。我下班关电脑，早上起来看结果。"
 
 **ccteam 当前进展**:
-- "用户在场当 team-lead"这一主诉求,由当前的 chat session(IM bot 通过手机随时下指令)+ bg session 已大头解决 —— 用户不需要守着主对话窗口,团队的执行不依赖人在场。
-- **webhook ingress 的 HTTP 入口已落地**:daemon web server 挂 `POST /webhook/:project/:token` 端点,外部世界(CI 红 / CVE / PR-open 等)可直接把事件推进来,落成 `.ccteam/webhooks/` 记录 —— 这个入口当前可用。
-- **schedule trigger(真 cron)**、以及"webhook 记录 / 定时事件自动 fan-out 成 agent 任务"属**推后的编排层(ccteam-flow)** —— 让定时巡检 / 夜间任务、以及推进来的事件自动 spawn 成多 agent 工作流,要等编排层落地才完整。
+- "用户在场当 team-lead"这一主诉求,由当前的 chat session(IM bot 通过手机随时下指令)已大头解决 —— 用户不需要守着主对话窗口,团队的执行不依赖人在场;关电脑后 daemon 常驻续跑,session 重启不丢上下文。
+- **标准资源 API 的 HTTP 入口已落地**:daemon web server 挂一套 `/api/v1`(project / role / session + SSE event 流,web-token 鉴权),外部世界(自有 app / 第三方 / 集成端)可直接注册项目、开 session、发 turn、订阅事件 —— 这是当前可用的程序化入口。
+- **schedule trigger(真 cron)**、以及"外部事件自动 fan-out 成多 agent 任务"属**推后的编排层(ccteam-flow)** —— 让定时巡检 / 夜间任务、以及推进来的事件自动 spawn 成多 agent 工作流,要等编排层落地才完整。
 
 ---
 
@@ -312,8 +312,7 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 
 **长跑维护方向的当前进展**:
 - **vendor-seam forward-compat**(`vendor_compat::warn_unknown_vendor_token` warn-once;未知 Claude job state → 非终态续 probe,未知 Codex event → skip + warn)让上游 CLI 节奏外的新字段 / 新 enum 值不把 daemon 干 panic —— 这服务"长跑可靠性",当前可用。
-- **webhook ingress** 的 HTTP 入口当前可用(daemon web server 挂 `POST /webhook/:project/:token`,外部 CI 红 / CVE / PR-open 事件可直接推进来)。
-- **真 cron(定时巡检 / 夜间依赖升级)**与"外部事件 → 自动 spawn 修复 agent"属**推后的编排层(ccteam-flow)**。
+- **标准资源 API**(`/api/v1` project / role / session + SSE)的 HTTP 入口当前可用,外部 app / 集成端可直接驱动 session;真正把外部事件**自动**接成修复 agent(`POST event → 自动 spawn`)与**真 cron(定时巡检 / 夜间依赖升级)**则属**推后的编排层(ccteam-flow)**。
 - **距"≥7 天连续自助跑"目标仍有距离** —— 关键缺口在 budget shaping / 跨模块语义同步(见上)+ 整个自主编排循环要等编排层落地。
 
 **目标**:
@@ -337,6 +336,10 @@ ccteam 主动开了 4 个 tmux session 并行——后端 1 个、前端 1 个�
 - 痛点 14 讲的是**领域**——把自动化从编程拓到研究 / 运营 / 投资等其他领域。
 - 痛点 13 讲的是**受众**——让非技术的人也能用上（即便还在编程相关的活上）。
 - 一个扩"能做什么样的活"，一个扩"谁能用得动"；两者呼应但不同。
+
+**ccteam 当前进展**:
+- **IM 通用驱动已落地**:用户从 IM(Telegram 等)/ web 纯自然语言下指令,无需碰 CLI / git / YAML;agent 的全套 slash 命令(含弹窗式选择)在 IM 里都有等价交互(inline 按钮),agent 反问也能在聊天里直接答 —— 非技术用户的"门槛挡在外面"主诉求已大头解决。每个 session 启动即绑定一个 role(`.claude/agents/<role>.md`),默认 `cto` 管家会帮非技术用户**推荐**该用哪个角色。
+- **标准资源 API**(`/api/v1`)让"用 NL 驱动"也能被自有 app / 第三方端封装成更友好的非技术界面 —— 不止 IM 一个入口。
 
 ---
 
