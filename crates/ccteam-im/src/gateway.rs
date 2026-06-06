@@ -1020,13 +1020,24 @@ impl Gateway {
             self.persist_state()?;
             return Ok(id);
         }
-        self.next_session += 1;
-        let id = format!("s{}", self.next_session);
         let cwd = self
             .projects
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+        // v0.8.7 (FIX-2) — reject a role with no `.claude/agents/<role>.md`
+        // BEFORE allocating a session id or spawning, so any create path (web /
+        // API / IM `/new` / cto-dispatch) that names an unseeded persona fails
+        // fast with a clear hint instead of spawning `claude --agent <undefined>`
+        // → a live-but-brainless pane that never produces a forwardable turn
+        // (the original `assistant` web-default bug). Done before the
+        // `next_session += 1` bump so a rejected create doesn't burn an `s{n}`.
+        // This is the same `read_role` existence check `/role`
+        // (switch_current_role) already applies; here it guards creation. See
+        // `ensure_role_exists` for the test-dir exemption.
+        ensure_role_exists(&cwd, &role)?;
+        self.next_session += 1;
+        let id = format!("s{}", self.next_session);
         let adapter = (self.adapter_factory)(vendor);
         let thread = adapter
             .start_thread(
@@ -1850,6 +1861,26 @@ impl Gateway {
             .map(|s| s.id.clone())
     }
 
+    /// v0.8.7 (FIX-1) — resolve the live reply target `(channel, chat_id)` for
+    /// the session currently running `(project, role)`. This is the outbound
+    /// addressing the IM `chat_send_file` / `interaction/ask` paths need so an
+    /// agent the user is actively chatting with can push a file back to that
+    /// same chat WITHOUT a prior `chat_register_bot` (the on-disk registry is
+    /// only written by an explicit register, so the inbound spawn path never
+    /// populates it). Mirrors [`session_sid_for`](Self::session_sid_for)'s
+    /// `(project, role)` dedup find, then resolves the session's `reply_to`
+    /// (whoever last drove it) → `owner` fallback exactly like the private
+    /// [`pump_target`] free fn. Returns `None` when no tracked session matches
+    /// (the caller then falls back to the on-disk `resolve_home_chat`
+    /// registry). Read-only, holds no `.await`.
+    pub fn reply_target_for(&self, project: &str, role: &str) -> Option<(String, String)> {
+        let session = self
+            .sessions
+            .values()
+            .find(|s| s.project == project && s.role == role)?;
+        Some(pump_target(session))
+    }
+
     /// Create a session from the network API (W5b). Thin wrapper over
     /// [`start_session`](Self::start_session): the caller supplies the
     /// project + role + vendor + permission mode; the handle defaults to the
@@ -2095,6 +2126,34 @@ fn wrap_inbound(
         format!("{payload}\n{}", extra_lines.join("\n"))
     };
     format!("<channel {attrs}>\n{body}\n</channel>")
+}
+
+/// v0.8.7 (FIX-2) — fail fast when a create path names a role that has no
+/// `.claude/agents/<role>.md` under the project dir, so we never spawn
+/// `claude --agent <undefined>` (a live-but-brainless pane that never produces
+/// a forwardable turn). Mirrors the `read_role` existence check `/role`
+/// already applies on a role switch.
+///
+/// Exemption: when the project's `.claude/agents/` directory does NOT exist at
+/// all, validation is SKIPPED. A real ccteam project always has that dir
+/// (`ccteam init` seeds `cto.md` into it), so in production the dir is present
+/// and the check is strict. The skip exists for the gateway's many unit /
+/// integration tests that spawn against bare fake project dirs (e.g.
+/// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
+/// routing, not personas, and shouldn't be forced to scaffold a role tree.
+fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+    // No agents dir → uninitialized / test project; skip (see doc comment).
+    if !ccteam_core::agents_dir(cwd).exists() {
+        return Ok(());
+    }
+    // `read_role` returns Err on a bad name (charset / traversal) and Ok(None)
+    // when the file is absent — both mean "no such role" here.
+    if ccteam_core::read_role(cwd, role).ok().flatten().is_none() {
+        return Err(anyhow!(
+            "role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -3008,6 +3067,104 @@ mod tests {
         assert_eq!(gateway.session_sid_for("alpha", "reviewer"), Some(sid));
         assert_eq!(gateway.session_sid_for("alpha", "ghost"), None);
         assert_eq!(gateway.session_sid_for("other", "reviewer"), None);
+    }
+
+    /// v0.8.7 (FIX-1) — `reply_target_for(project, role)` resolves a live
+    /// session's reply target from the in-memory map, with NO on-disk registry
+    /// involved. After a `/new` + a driving message the session's `reply_to`
+    /// points at the chat that last drove it, so an outbound `chat_send_file`
+    /// can deliver back to that chat without a prior `chat_register_bot`.
+    #[tokio::test]
+    async fn reply_target_for_resolves_live_session_without_registry() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-fix1");
+        // Create + drive a session from a specific chat (sets reply_to → chat).
+        gateway
+            .handle_text("telegram", "chat-99", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-99", "alice", "hello")
+            .await
+            .unwrap();
+        // The live target is the driving chat — resolved purely from memory.
+        assert_eq!(
+            gateway.reply_target_for("alpha", "reviewer"),
+            Some(("telegram".to_string(), "chat-99".to_string()))
+        );
+        // No tracked session for these → None (caller falls back to registry).
+        assert_eq!(gateway.reply_target_for("alpha", "ghost"), None);
+        assert_eq!(gateway.reply_target_for("other", "reviewer"), None);
+    }
+
+    /// v0.8.7 (FIX-2) — when the project HAS a `.claude/agents/` dir, a create
+    /// path that names a role with no `<role>.md` is rejected fast (no session
+    /// created, no dead pane), while a seeded role succeeds. This is the web
+    /// `assistant`-default bug: an undefined agent must never spawn.
+    #[tokio::test]
+    async fn create_session_rejects_unseeded_role_when_agents_dir_present() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // Real project dir WITH an agents dir → strict validation applies.
+        let proj = tempfile::TempDir::new().unwrap();
+        seed_role(proj.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        // Unseeded role → fail fast, nothing spawned, no session tracked.
+        let err = gateway
+            .create_session_api(
+                "alpha".into(),
+                "assistant".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("assistant.md"),
+            "clear hint expected; got: {msg}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "no spawn on bad role"
+        );
+        assert!(
+            gateway.session_views().is_empty(),
+            "rejected role must not appear in session ls"
+        );
+
+        // Seeded role → ok.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// v0.8.7 (FIX-2) — the test-dir exemption: a bare project dir with NO
+    /// `.claude/agents/` dir (the gateway's many fake-adapter tests) skips
+    /// persona validation so routing tests don't have to scaffold a role tree.
+    #[tokio::test]
+    async fn create_session_skips_validation_without_agents_dir() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-no-agents");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "anything".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
     }
 
     /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
@@ -4114,8 +4271,10 @@ mod tests {
         let fake = Arc::new(FakeAdapter::default());
         // `/role` validates `.claude/agents/<role>.md` under the project dir
         // before re-spawning, so point the project at a real temp dir and seed
-        // the target role there.
+        // the target role there. v0.8.7 (FIX-2): the create path now validates
+        // too, so the default `cto` (spawned by `/new`) must also be seeded.
         let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
         seed_role(tmp.path(), "reviewer");
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
@@ -4185,7 +4344,10 @@ mod tests {
     async fn gateway_role_missing_role_keeps_session_intact() {
         let fake = Arc::new(FakeAdapter::default());
         let tmp = tempfile::tempdir().unwrap();
-        // `reviewer` exists; `ghost` deliberately does not.
+        // `cto` (the `/new` default) + `reviewer` exist; `ghost` deliberately
+        // does not. v0.8.7 (FIX-2): the create path validates the persona, so
+        // the default `cto` must be seeded for `/new` to succeed.
+        seed_role(tmp.path(), "cto");
         seed_role(tmp.path(), "reviewer");
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 

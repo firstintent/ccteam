@@ -24,6 +24,7 @@ import { Link } from "react-router-dom";
 import { MessageSquare, Plus, Send, Terminal } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
 import { CHAT_SUBPROTOCOL, chatUrlFor } from "../lib/terminalConfig";
+import { DEFAULT_ROLE, ROLE_SUGGESTIONS } from "./chatDefaults";
 
 type SessionItem = {
   project: string;
@@ -68,7 +69,9 @@ const WEB_USER_ID = "web-user";
 const ROWS_KEY = "ccteam.chat.rows.v1";
 const FOCUS_KEY = "ccteam.chat.focus.v1";
 const ROWS_CAP = 400;
-const ROLE_SUGGESTIONS = ["assistant", "reviewer", "api", "ui", "qa", "docs"];
+// FIX-2 — default role + suggestions live in a dependency-free sibling module
+// (`chatDefaults`) so they stay the single source of truth and are unit-testable
+// without importing this React/`window`-touching component.
 
 function nextId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -696,7 +699,7 @@ function NewSessionModal({
   const [role, setRole] = useState("");
 
   const isNew = project === NEW_PROJECT;
-  const effectiveRole = role.trim() || "assistant";
+  const effectiveRole = role.trim() || DEFAULT_ROLE;
   const slug = newName.trim();
   const path = newPath.trim();
   // The gateway requires an absolute (or ~) path; validate here so a bad path

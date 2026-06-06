@@ -194,7 +194,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
             }
         };
         seen_slugs.insert(state.slug.clone());
-        out.push(summary_from_state(state));
+        out.push(summary_from_state(paths, state));
     }
 
     // 2. Legacy fallback: walk projects_root for unregistered slugs.
@@ -224,7 +224,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
                     continue;
                 }
             };
-            out.push(summary_from_state(state));
+            out.push(summary_from_state(paths, state));
         }
     }
 
@@ -232,14 +232,27 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
     Ok(out)
 }
 
-fn summary_from_state(state: ProjectState) -> ProjectSummary {
+fn summary_from_state(paths: &CcteamPaths, mut state: ProjectState) -> ProjectSummary {
     let now = Utc::now();
     let age = now
         .signed_duration_since(state.created_at)
         .num_seconds()
         .max(0) as u64;
-    let silent = state
-        .last_progress_event_at
+    // v0.8.7 (FIX-3) — derive the last-progress timestamp from the SoT
+    // (`progress.jsonl`'s last line `ts`) rather than `state.last_progress_event_at`,
+    // which is NEVER written in production (only in a test) and so was always
+    // `None` → the stall clock fell back to `now − created_at` → ANY project
+    // older than 15 min showed STUCK regardless of activity. `progress.jsonl`
+    // is already the state SoT (chat turns append to it), so reading its tail
+    // keeps that discipline without the harness layer writing `state.json`.
+    // We fold the derived value back into `state.last_progress_event_at` so the
+    // "last event" labels (CLI / web) that read that field show real data too —
+    // a single read-side derivation point fixes every downstream consumer.
+    let last_progress = last_progress_event_ts(paths, &state.slug);
+    if last_progress.is_some() {
+        state.last_progress_event_at = last_progress;
+    }
+    let silent = last_progress
         .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
         .unwrap_or(age);
     ProjectSummary {
@@ -247,6 +260,20 @@ fn summary_from_state(state: ProjectState) -> ProjectSummary {
         age_seconds: age,
         stall_silent_seconds: silent,
     }
+}
+
+/// v0.8.7 (FIX-3) — read the timestamp of the most recent `progress.jsonl`
+/// event for `slug`, or `None` when the file is absent / empty / the last line
+/// has no parseable `ts`. This is the live stall-clock baseline (progress.jsonl
+/// is the state SoT). Read errors fold to `None` (a missing/half-written file
+/// must not crash `ccteam status`).
+fn last_progress_event_ts(paths: &CcteamPaths, slug: &str) -> Option<DateTime<Utc>> {
+    let path = paths.progress_jsonl(slug);
+    let last = crate::progress::last_event(&path).ok().flatten()?;
+    let ts = last.get("ts").and_then(|v| v.as_str())?;
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Tail the last `n` JSON-Lines events for a project.
@@ -1411,6 +1438,75 @@ mod tests {
         let out = collect_projects(&paths).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state.slug, slug);
+    }
+
+    /// v0.8.7 (FIX-3) — a project created long ago but with a RECENT
+    /// `progress.jsonl` event is NOT stuck: the stall clock reads the last
+    /// event ts (the SoT), not `now − created_at`. Pre-fix this misfired STUCK
+    /// for any project older than 15 min regardless of activity.
+    #[test]
+    fn collect_projects_recent_progress_event_is_not_stuck() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let slug = "dev-active";
+        // Created 2h ago — old enough that the pure-age heuristic would say STUCK.
+        let mut state = ProjectState::initial(slug.to_string());
+        state.created_at = Utc::now() - chrono::Duration::hours(2);
+        state.save(&paths.project_state(slug)).unwrap();
+        // …but a progress event landed 10s ago.
+        let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let pp = paths.progress_jsonl(slug);
+        fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        fs::write(
+            &pp,
+            format!(
+                "{}\n",
+                json!({"event": "chat_turn_completed", "ts": recent})
+            ),
+        )
+        .unwrap();
+
+        let out = collect_projects(&paths).unwrap();
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        assert!(
+            s.stall_silent_seconds < crate::stall::STALL_SUSPICIOUS_SECONDS,
+            "recent event must not be STUCK; silent={}",
+            s.stall_silent_seconds
+        );
+        // The derived last-event ts is folded back into the state for the
+        // "last event" labels (CLI/web) that read this field.
+        assert!(s.state.last_progress_event_at.is_some());
+    }
+
+    /// v0.8.7 (FIX-3) — a project whose last progress event is genuinely old
+    /// DOES report STUCK (silence past the suspicious threshold). Confirms the
+    /// fix didn't suppress real stalls.
+    #[test]
+    fn collect_projects_idle_past_threshold_is_stuck() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let slug = "dev-idle";
+        let mut state = ProjectState::initial(slug.to_string());
+        state.created_at = Utc::now() - chrono::Duration::hours(2);
+        state.save(&paths.project_state(slug)).unwrap();
+        // Last event 40 min ago → past the 15-min suspicious + 30-min escalate.
+        let old = (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339();
+        let pp = paths.progress_jsonl(slug);
+        fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        fs::write(
+            &pp,
+            format!("{}\n", json!({"event": "chat_turn_completed", "ts": old})),
+        )
+        .unwrap();
+
+        let out = collect_projects(&paths).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].stall_silent_seconds >= crate::stall::STALL_SUSPICIOUS_SECONDS,
+            "truly-idle project must be STUCK; silent={}",
+            out[0].stall_silent_seconds
+        );
     }
 
     /// V0.4.2 F73: a project registered in config.yaml but living

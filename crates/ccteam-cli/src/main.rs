@@ -2128,7 +2128,13 @@ async fn handle_mcp_socket_connection(
         // prompt, renders buttons via the sink, and blocks (no lock held) on
         // the user's selection before responding.
         let response = if is_interaction_ask_call(&req) {
-            Some(execute_interaction_ask(&req, sink.as_ref(), pending.as_ref()).await)
+            // v0.8.7 (FIX-1) — like chat_send_file, interaction/ask now also
+            // holds the gateway handle so a live (project, role) session's
+            // reply target wins over the on-disk registry.
+            Some(
+                execute_interaction_ask(&req, sink.as_ref(), pending.as_ref(), gateway.as_ref())
+                    .await,
+            )
         } else if is_permission_ask_call(&req) {
             // v0.8.7 W2 (DB.3) — HITL permission approval. Same blocking
             // External-pending + IM-buttons mechanism as interaction/ask, but
@@ -2140,7 +2146,11 @@ async fn handle_mcp_socket_connection(
                     .await,
             )
         } else if is_chat_send_file_call(&req) {
-            Some(execute_chat_send_file(&req, sink.as_ref()).await)
+            // v0.8.7 (FIX-1) — the file-send branch now also holds the gateway
+            // handle so a live (project, role) session's reply target wins over
+            // the on-disk registry (an actively-chatting agent can push a file
+            // back without a prior `chat_register_bot`).
+            Some(execute_chat_send_file(&req, sink.as_ref(), gateway.as_ref()).await)
         } else if is_session_tool_call(&req) {
             // v0.8.7 W1 — cto scheduling. We own the gateway handle here;
             // enforce the cto-only gate + drive the session map. Intercept
@@ -2208,13 +2218,21 @@ fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
 async fn execute_chat_send_file(
     req: &serde_json::Value,
     sink: Option<&GatewayEventSink>,
+    gateway: Option<&GatewayHandle>,
 ) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let args = req
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let (text, is_error) = match run_chat_send_file(&args, sink) {
+    // v0.8.7 (FIX-1) — resolve the live session's reply target FIRST, under
+    // the gateway lock, then DROP the guard before any fs read / send (lock
+    // discipline §7-1, mirroring run_session_collect). `None` here means no
+    // live (project, role) session is tracked → run_chat_send_file falls back
+    // to the on-disk registry. We resolve here (async) and inject the result
+    // into the sync builder so build_send_file_event stays unit-testable.
+    let live_target = resolve_live_reply_target(&args, gateway).await;
+    let (text, is_error) = match run_chat_send_file(&args, sink, live_target) {
         Ok(text) => (text, false),
         Err(text) => (text, true),
     };
@@ -2228,15 +2246,42 @@ async fn execute_chat_send_file(
     })
 }
 
+/// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the
+/// `(slug, role)` the `chat_send_file` / `interaction/ask` args name, by
+/// looking up the gateway's in-memory session map. The gateway guard is
+/// taken and dropped INSIDE this fn (the lookup is sync + holds no `.await`)
+/// so callers never hold it across an fs read / send. `None` when no gateway
+/// handle, no `slug`/`role`, or no tracked session matches.
+async fn resolve_live_reply_target(
+    args: &serde_json::Value,
+    gateway: Option<&GatewayHandle>,
+) -> Option<(String, String)> {
+    let gw = gateway?;
+    let slug = args
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let role = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if slug.is_empty() || role.is_empty() {
+        return None;
+    }
+    let guard = gw.lock().await;
+    guard.reply_target_for(slug, role)
+}
+
 fn run_chat_send_file(
     args: &serde_json::Value,
     sink: Option<&GatewayEventSink>,
+    live_target: Option<(String, String)>,
 ) -> std::result::Result<String, String> {
     let sink = sink.ok_or_else(|| "chat_send_file: IM gateway not running".to_string())?;
     let bots =
         ccteam_im::list_bots().map_err(|e| format!("chat_send_file: registry error: {e}"))?;
     let seq = CHAT_SEND_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let event = build_send_file_event(args, &bots, seq)?;
+    let event = build_send_file_event(args, &bots, seq, live_target)?;
     let dest = format!("{}/{}", event.channel, event.chat_id);
     sink.send(event)
         .map_err(|_| "chat_send_file: gateway sink closed".to_string())?;
@@ -2255,6 +2300,7 @@ fn build_send_file_event(
     args: &serde_json::Value,
     bots: &[ccteam_im::BotRegistration],
     seq: u64,
+    live_target: Option<(String, String)>,
 ) -> std::result::Result<ccteam_im::gateway::GatewayEvent, String> {
     use ccteam_im::transport::OutboundFileKind;
     let path = args
@@ -2289,7 +2335,13 @@ fn build_send_file_event(
             max / (1024 * 1024),
         ));
     }
-    let (channel, chat_id) = ccteam_im::resolve_home_chat(slug, role, bots)
+    // v0.8.7 (FIX-1) — prefer the live session's reply target (the chat the
+    // user is actively talking to), falling back to the on-disk registry only
+    // when no live (project, role) session is tracked. This lets an
+    // actively-chatting agent push a file back without a prior
+    // `chat_register_bot` (the registry is only written by explicit register).
+    let (channel, chat_id) = live_target
+        .or_else(|| ccteam_im::resolve_home_chat(slug, role, bots))
         .ok_or_else(|| format!("chat_send_file: no registered chat for {slug}/{role}"))?;
     Ok(ccteam_im::gateway::GatewayEvent {
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
@@ -2352,6 +2404,7 @@ async fn execute_interaction_ask(
     req: &serde_json::Value,
     sink: Option<&GatewayEventSink>,
     pending: Option<&PendingRegistry>,
+    gateway: Option<&GatewayHandle>,
 ) -> serde_json::Value {
     use ccteam_harness::{ChoiceOption, ChoicePrompt, ChoiceSelection};
     use ccteam_im::gateway::{GatewayEvent, GatewayEventKind};
@@ -2399,11 +2452,29 @@ async fn execute_interaction_ask(
     }
 
     // Resolve addressing first — no point registering a pending we can't show.
-    let bots = match ccteam_im::list_bots() {
-        Ok(b) => b,
-        Err(e) => return err_resp(format!("interaction/ask: registry error: {e}")),
+    // v0.8.7 (FIX-1) — prefer the live (project, role) session's reply target
+    // (resolve under the gateway lock, drop the guard before the long await —
+    // the lookup is sync), falling back to the on-disk registry. Lets an
+    // actively-chatting agent ask the user a question without a prior
+    // `chat_register_bot`.
+    let live_target = match gateway {
+        Some(gw) if !slug.is_empty() && !role.is_empty() => {
+            let guard = gw.lock().await;
+            guard.reply_target_for(slug, role)
+        }
+        _ => None,
     };
-    let Some((channel, chat_id)) = ccteam_im::resolve_home_chat(slug, role, &bots) else {
+    let resolved = match live_target {
+        Some(t) => Some(t),
+        None => {
+            let bots = match ccteam_im::list_bots() {
+                Ok(b) => b,
+                Err(e) => return err_resp(format!("interaction/ask: registry error: {e}")),
+            };
+            ccteam_im::resolve_home_chat(slug, role, &bots)
+        }
+    };
+    let Some((channel, chat_id)) = resolved else {
         return err_resp(format!(
             "interaction/ask: no registered chat for {slug}/{role}"
         ));
@@ -3670,7 +3741,7 @@ mod chat_send_file_tests {
             "slug": "dev-foo",
             "role": "lead",
         });
-        let evt = build_send_file_event(&args, &bots, 7).unwrap();
+        let evt = build_send_file_event(&args, &bots, 7, None).unwrap();
         assert_eq!(evt.channel, "telegram");
         assert_eq!(evt.chat_id, "chat-42");
         assert_eq!(evt.attachments.len(), 1);
@@ -3679,13 +3750,51 @@ mod chat_send_file_tests {
         assert!(evt.id.ends_with("-7"));
     }
 
+    /// v0.8.7 (FIX-1) — a live session's reply target wins even when the
+    /// on-disk registry is EMPTY (the actively-chatting agent can push a file
+    /// back without a prior `chat_register_bot`).
+    #[test]
+    fn build_send_file_event_uses_live_target_over_empty_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("shot.png");
+        std::fs::write(&file, b"png").unwrap();
+        // Empty registry — only the live target can address this.
+        let bots: Vec<ccteam_im::BotRegistration> = vec![];
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(),
+            "slug": "dev-foo",
+            "role": "cto",
+        });
+        let live = Some(("telegram".to_string(), "live-chat-7".to_string()));
+        let evt = build_send_file_event(&args, &bots, 1, live).unwrap();
+        assert_eq!(evt.channel, "telegram");
+        assert_eq!(evt.chat_id, "live-chat-7");
+    }
+
+    /// v0.8.7 (FIX-1) — when both a live target and a registry row exist, the
+    /// live session (whoever the user is actually chatting with) wins.
+    #[test]
+    fn build_send_file_event_live_target_overrides_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("x.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let bots = vec![bot("dev-foo", "lead", "telegram", "stale-chat")];
+        let args = serde_json::json!({
+            "path": file.to_string_lossy(), "slug": "dev-foo", "role": "lead",
+        });
+        let live = Some(("web".to_string(), "web-live".to_string()));
+        let evt = build_send_file_event(&args, &bots, 2, live).unwrap();
+        assert_eq!(evt.channel, "web");
+        assert_eq!(evt.chat_id, "web-live");
+    }
+
     #[test]
     fn build_send_file_event_errors_on_missing_file() {
         let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
         let args = serde_json::json!({
             "path": "/nope/does-not-exist.png", "slug": "dev-foo", "role": "lead",
         });
-        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
         assert!(err.contains("file not found"), "got: {err}");
     }
 
@@ -3698,7 +3807,7 @@ mod chat_send_file_tests {
         let args = serde_json::json!({
             "path": file.to_string_lossy(), "slug": "dev-foo", "role": "ghost",
         });
-        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
         assert!(err.contains("no registered chat"), "got: {err}");
     }
 
@@ -3712,7 +3821,7 @@ mod chat_send_file_tests {
         let args = serde_json::json!({
             "path": file.to_string_lossy(), "slug": "dev-foo", "role": "lead",
         });
-        let err = build_send_file_event(&args, &bots, 0).unwrap_err();
+        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
         assert!(err.contains("too large"), "got: {err}");
     }
 }

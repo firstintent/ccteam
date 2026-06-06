@@ -224,7 +224,7 @@ pub use queries::{
     ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
     WorkflowSummary,
 };
-pub use roles::{list_roles, read_role, RoleDetail, RoleSummary};
+pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
     FONT_ENV as SCREENSHOT_FONT_ENV,
