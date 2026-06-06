@@ -23,6 +23,7 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、但数据按
 | **B2** | web「新建项目」入口恢复 | bug | v0.8.7 W4 回归删掉了 | BUG-2 |
 | **B3** | 新建弹窗 role 改下拉真实 role | bug/UX | 现手输 + 静态建议,不知有哪些 role | BUG-4 |
 | **B4** | `session ls`/`status` 显示 vendor + 修 codex 活性误报 | bug/UX | session ls 按 backend 名枚举、看不到 codex(误报 not running)、且无 vendor 列 | BUG-5 |
+| **B5** | web 终端(per-session PTY WS)修复 + "像本地终端" | bug/feature | 连上即断循环:路由没指向会话 pane(W4 遗留 TODO)+ send-keys/resize 硬编码 tmux;裸字节保真 = rmux W2b | BUG-6 |
 
 > BUG-3(per-session 串台)**不单列修项** —— 它是 `session = role` 的症状,由 **F1 根治**。
 > 后续 user 追加的需求 append 到本表 + 新小节。
@@ -93,3 +94,4 @@ CLI 输出层重写(`commands.rs` status handler + `queries.rs` 取数);LAN ip �
 - **2026-06-06 初版**:F1 独立 session(Direction A)+ F2 roleless + B1/B2/B3;BUG-3 归 F1 根治。
 - **2026-06-06 +F3**:`ccteam status` 重写(TG 2363:列项目+会话 / 删最近事件 / web token+url 两行 LAN ip)。
 - **2026-06-06 +B4 / F3 细化**:B4 = `session ls`/`status` 显示 vendor + 修 codex 活性误报(BUG-5,TG 2365);F3 开放问题 ①② 经 TG 2366 确认(两行按 user 实例 / status 同显 projects+sessions);每会话行加 vendor。
+- **2026-06-06 +B5**:web 终端 per-session PTY WS 一直断开(BUG-6,TG 2367/2368):路由退回项目级 pane、没指向 sid(W4 遗留 TODO)+ send-keys/resize 硬编码 tmux;"像本地终端"完整保真需 rmux 裸字节(W2b)。

@@ -132,3 +132,27 @@
 **验收**:codex 起的 cto 在 `session ls` 显示 `alive=yes` + `vendor=codex`;claude 会话不变;orphan 仍能标;`status` 同样每会话带 vendor。
 
 **归属**:CLI(`session ls`)+ 跟 F3 `status` vendor 同批;依赖 gateway session 查询(`session_views`/API 已有)。属 prd.md **B4**。
+
+---
+
+## BUG-6 · web 终端(per-session PTY WS)一直断开重连 —— 路由没指向会话 pane + I/O 硬编码 tmux
+
+**状态**:OPEN（2026-06-06 用户报告 + 截图 + 抓包,TG 2367/2368）
+
+**症状**:web「终端」tab 打开后,WS `ws://<host>:7331/ws/ideas/s5/pty` 连上→立刻断→`[Disconnected, reconnecting in 1s... (1/7)]` 死循环(计数停在 1/7 = 每次连上即断)。客户端反复只发一个 `{"type":"resize","cols":149,"rows":50}` 就掉线。
+
+**根因(file:line 实证)= 三处叠加**:
+1. **per-session PTY 路由根本没解析 `sid`、退回项目级 pane(W4 遗留 TODO 没做)**:`handle_session_ws`(`crates/ccteam-web/src/routes/pty_ws.rs:99-119`)注释自承 "the per-session runtime registry is gone … Fall back to the project-level tmux session. TODO(V0.8.6 W5b/W5c): re-key this onto the new session record"(`:104-108`),直接用 `ProjectState.tmux_session`(`:113`)而非 `s5 → ccteam-chat-ideas-architect`。chat/session=role 下项目级 tmux_session 不是会话 pane(空 / `ccteam-ideas`,默认 rmux daemon 里不存在)→ `app.pty.subscribe(...)`(`:143`)失败/空 → `run` 返回 Err(`:126-133` 记 "relay loop exited with error")或 broadcast `Closed`(`:170-175`)→ WS 立刻关 → 前端重连 → 循环。
+2. **输入/resize 硬编码 `TmuxBackend`**:`send_keys`(`pty_ws.rs:216-232`,`:228 TmuxBackend::new()`)+ `resize_window`(`:234-239`,`:236` 同)写死 tmux、**没走 `default_backend()`**。默认 rmux 时客户端的 resize/键击都打到不存在的 tmux 会话(resize 失败仅 warn、不直接断;但与 #1 叠加 → 终端整体不可用)。
+3. **rmux 的流是行文本、不是裸 ANSI 字节**(=能不能"像本地终端"的核心):PtyRegistry 已改走 `terminal_from_env()`(rmux,`crates/ccteam-web/src/pty.rs:58`),但 rmux `subscribe` 把 pane 输出转成 `PaneLineItem::Line` 文本(`crates/ccteam-harness/src/rmux_backend.rs:17-20`),`with_ansi` 拿不到裸字节(W2b 已知 gap ~`rmux_backend.rs:36`)。xterm.js 要裸 ANSI/光标控制才能忠实渲染 TUI(如 claude 的 TUI)→ 即便修了 #1#2,rmux 路径"像本地终端"的渲染保真仍缺(需 rmux 裸字节流 = W2b,或用 tmux backend)。
+- 另:模块 doc(`pty_ws.rs:5-27`)还在描述旧的"项目 pane + tmux pipe-pane"模型,stale。
+
+**影响**:web 终端在默认(rmux)+ per-session 下完全不可用(连不上/秒断)。= v0.8.7 W4 per-session UI 留的 TODO(终端那一路没 re-key)+ rmux-default tmux 硬编码(同 BUG-1/BUG-5 一类)。
+
+**修法**:① `handle_session_ws` 经 gateway 把 `sid → role/pane`(`chat_session_name(slug, role)`,像 API `session_resolve`)再 subscribe;② `send_keys`/`resize_window` 改 `default_backend()` 而非 `TmuxBackend::new()`;③ "像本地终端"的完整保真需 rmux 裸字节订阅(W2b)或显式 tmux backend —— 作为终端体验子项单列。与 **F1**(per-session pane 解析)同源。
+
+**用户问题"最终能像本地终端一样操作吗?"**:能 —— 设计本就是裸字节双向中继(server→client pane 字节 + client→server send-keys + resize)= 全交互终端镜像;修好 #1#2 即可操作,#3 决定 TUI 渲染保真度。
+
+**验收**:打开 web 终端稳定连住(无 1s 重连循环),像本地一样输入/看输出/resize,目标 = 当前 sid 的 pane(非项目级、不串别会话);codex 会话也适用(经 gateway 解析,不依赖 tmux 名)。
+
+**归属**:`ccteam-web` pty_ws + pty registry;依赖 gateway session 解析(F1);rmux 裸字节(W2b)= 渲染保真子项。属 prd.md **B5**。
