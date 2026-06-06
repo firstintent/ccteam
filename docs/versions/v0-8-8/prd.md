@@ -31,7 +31,22 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 
 ---
 
-## 二、功能项
+## 二、web UI 质量基线(横切要求,所有 web 项 F1(前端)/F4/F5 + B2/B3/B5 必须满足)
+
+> **user(TG 2373):"web 类开发增加要求,必须设计高质量、交互友好的 UI。"** 下列是把它落成**可验收**的标准,不是泛泛"做好看点"。
+
+- **一致设计系统**:复用现有 Tailwind 主题 token(`surface-*` / amber 强调色)+ 既有组件风格(`crates/ccteam-web/web/src/components/`);不引入风格割裂的新控件。
+- **完整状态**:每个数据视图都有 **loading / empty / error / success** 四态,不留白屏 / 不卡死;异步操作即时反馈(按钮 disable + spinner / 乐观更新)。
+- **错误可读**:API 错误转人话提示(不是裸 500 / stack),可重试。
+- **响应式 + 移动友好**:SPA 已含移动键盘 / 手势 hook(`useMobileKeyboard` / `useEdgeSwipe` / pinch-zoom),新页在窄屏可用。
+- **交互细节**:键盘可达(focus、Esc 关弹窗、Enter 提交)、防重复提交、危险操作二次确认、长列表可滚 / 必要时虚拟化。
+- **即时性**:列表 / 状态走现有 SSE / 轮询保持新鲜,避免"手动刷新才更新"。
+- **无障碍基线**:语义化标签 + 对比度 + 可聚焦。
+- **✅ 验收追加**:每个 web 项的验收除"功能对"外,**加一条"UX 过关"**(上述清单 + 人工走查);dev-plan 里 web wave 的 gate 含一轮 UI review。
+
+---
+
+## 三、功能项
 
 ### F1 · 独立 session 模型(headline)
 
@@ -77,7 +92,7 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 
 ---
 
-## 三、Bug 修(详见 `bug.md`,各条 file:line 已验证)
+## 四、Bug 修(详见 `bug.md`,各条 file:line 已验证)
 - **B1 / BUG-1**:`stop_project_chat_sessions` 改经 `default_backend()` 枚举 + kill(去 tmux-only)。
 - **B2 / BUG-2**:web「＋ 新建」恢复「＋ 新建项目…」,走 REST `POST /api/v1/projects`。
 - **B3 / BUG-4**:新建弹窗 role 改下拉,拉 `GET /api/v1/projects/{slug}/roles`。
@@ -87,12 +102,13 @@ v0.8.7 的 per-session web UI 把"会话"做成了 **UI 壳独立、数据按 `(
 
 > **同类模式**:B1 / B4 / B5(+ BUG-3)都是 **tmux 硬编码 / 按 role 而非 session** 在默认 rmux + per-session 下露馅;**F1(gateway = session SoT)是它们的结构性修复主干**。
 
-## 四、流程 & 纪律
+## 五、流程 & 纪律
 - **doc-first**:本 PRD → scope 冻结 → dev-plan(waves)→ user review → **另一个 dev session 实现**。本文作者只收集需求 + 写文档,**不开发**(TG 2362)。
 - **需求持续补充**:user 边用边加 → append `### F*` / `### B*` 子节 + §一 表行;dev-plan 等 scope 稳了再写。
 - **pre-v1.0 纪律**:不做历史迁移 —— 新旧 session 数据不兼容时直接「清旧(`~/.ccteam` + 各项目 `.ccteam`)→ 重 `ccteam init`」,不写迁移/兼容分支;deprecated 直接删。
 
-## 五、变更记录
+## 六、变更记录
 - **2026-06-06 初版**:F1 独立 session(Direction A)+ F2 roleless + B1/B2/B3;BUG-3 归 F1 根治。
 - **2026-06-06 +F3 / +B4 / +B5**:F3 status 重写(TG 2363,开放问题经 2366 确认、加 vendor);B4 session ls vendor + codex 活性(BUG-5,TG 2365);B5 web 终端 PTY WS 断开(BUG-6,TG 2367/2368)。
 - **2026-06-06 +F4 / +F5 + 结构重排**:F4 web config 模块(telegram+lark,TG 2370);F5 web role 浏览页(TG 2371);PRD 改成"功能项 = `### F*` 子节"的可扩展结构(新需求不再动顶层编号)。
+- **2026-06-06 + web UI 质量基线**:新增横切要求 §二(TG 2373:高质量、交互友好 UI),落成可验收清单(设计系统 / 四态 / 错误可读 / 响应式 / 交互细节 / 即时性 / a11y),每个 web 项验收加"UX 过关"+ web wave gate 含 UI review。
