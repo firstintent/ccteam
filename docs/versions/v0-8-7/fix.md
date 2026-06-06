@@ -9,6 +9,8 @@
 
 ## FIX-1 · 出站文件发送:正在聊天的 IM/web session 无法 `chat_send_file`(registry 与 live 绑定两套地址未对账)
 
+> ✅ FIXED in 935eb66 —— 新 `Gateway::reply_target_for(project,role)` + `gateway` 穿 file-send/ask 支,live session 优先、registry 兜底(`resolve_live_reply_target` lock-discipline)。
+
 **症状**:用户在 TG 跟 cto 聊天,让它发 `.md` 文件,`chat_send_file` 报 `no registered chat for <slug>/<role>`;cto 只能手动读 `gateway-state.json` + 调 `chat_register_bot` 绕过(自动得到 handle "Euclid")。"正在跟它聊的 session 还要手动注册才能发文件" = 缺失。
 
 **根因(file:line 实证)= 两套地址存储,出站文件路径没打通**:
@@ -32,6 +34,8 @@
 
 ## FIX-2 · web 默认 role=`assistant` 是**未定义 agent** → spawn 出无脑 pane、聊天不回复
 
+> ✅ FIXED in 935eb66 —— SPA 默认 role `assistant`→`cto`(`chatDefaults.ts`)+ create chokepoint `Gateway::start_session` 加 `ensure_role_exists`(未种 role fail-fast、不留死 pane)。
+
 **症状**:web 新建 session 默认 role=`assistant`,聊天无回复;`ccteam session ls` 每项目同时有 `…-assistant`(web 建)和 `…-cto`(IM/默认建),都 ALIVE。
 
 **根因(HIGH 置信,file:line)**:
@@ -54,6 +58,8 @@
 ---
 
 ## FIX-3 · `ccteam status` 的 `STUCK` 是死的纯年龄启发式(**误报**,与 session 健康无关)
+
+> ✅ FIXED in 935eb66 —— `summary_from_state` stall 时钟改从 `progress.jsonl` 末行 ts 取(`last_progress_event_ts`)并回填 state 字段;刚活跃项目不再误报 STUCK。
 
 **症状**:`ccteam status` 两个项目都 `STUCK`(`age == last-event`,19m / 58m)。
 

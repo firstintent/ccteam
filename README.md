@@ -11,7 +11,7 @@ The AI runs on **your computer**: it reads your files, runs your commands, touch
 You talk to ccteam from three places, all backed by one daemon:
 
 - **From IM** — DM a bot to work on a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`, …). The full slash-command surface of the agent works straight from chat (see below), and when an agent asks you a question, you answer it right there.
-- **Inside a Claude or Codex session** — the `mcp__ccteam__*` MCP tools are the programmatic surface: register a bot, send input to a session, pull history, take a screenshot, or ask a panel of agents to vote.
+- **Inside a Claude or Codex session** — the `mcp__ccteam__*` MCP tools are the programmatic surface: register a bot, send input to a session, pull history, take a screenshot, or ask a panel of agents to vote. The default `cto` manager can also spawn a work-role session, dispatch a task to it, and collect the result — so it delegates instead of doing everything itself.
 - **From a web console** — a local dashboard plus a standard HTTP resource API (under `/api/v1`) so the same projects, roles, and sessions are reachable from a browser, your own app, or a third-party integration.
 
 ## Key concepts
@@ -23,7 +23,7 @@ You talk to ccteam from three places, all backed by one daemon:
 - A **session** is a resident agent handle with its own context (`/compact` and `/clear` are per-session). You spin up sessions with `/new`, switch between them with `@handle` / `/use`, and switch projects with `/cd`.
 - A **role** is who a session *is*. Every session launches as a specific role from the project's role library, and the role library is just `.claude/agents/<role>.md` — plain Markdown persona files. `ccteam init` seeds one default role, **`cto`**: a chat-first manager that understands ccteam, recommends the right work-role for the job, and hands off. You switch a session's role at any time with `/role <role>`.
 
-**A role library, your way.** Because a role is just a Markdown file in `.claude/agents/`, you build your team by dropping in `.md` files — write your own, or pull from open role libraries like [agency-agents](https://github.com/wshobson/agents) (200+ ready-made Claude-native roles, MIT). The default `cto` is a manager that suggests which role fits the task; you make the call with `/role`.
+**A role library, your way.** Because a role is just a Markdown file in `.claude/agents/`, you build your team by dropping in `.md` files — write your own, or pull from open role libraries like [agency-agents](https://github.com/wshobson/agents) (a catalog of ready-made Claude-native roles, MIT) with `ccteam role search` / `ccteam role add`. The default `cto` is a manager that suggests which role fits the task; you make the call with `/role`.
 
 **One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM/web⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, the web server and its resource API, and a local MCP Unix socket (so the Claude/Codex plugins can call ccteam tools). All tasks share one clean-shutdown signal.
 
@@ -32,6 +32,8 @@ You talk to ccteam from three places, all backed by one daemon:
 **Harness × provider, best-fit drive.** ccteam abstracts each agentic CLI as a *harness*; the model behind it is the *provider* sub-facet. Today the primary harness is **claude-code**, driven through a long-lived **tmux TUI** session — durable, full TUI, driven with `send-keys` plus transcript tailing and the official Claude Code hooks. ccteam never scrapes terminal output. **Codex** is supported on a best-effort basis, and more harnesses (gemini-cli, grok-cli, …) are designed to plug in as adapters. Whatever is actually installed on your `PATH` is reported live by the API's `GET /capabilities`.
 
 **Full slash-command coverage, from chat.** A slash command you type in IM (or the web console) does the right thing for whichever agent owns the session — no command silently degrades into literal text. Claude's open command set (skills, `/compact`, `/clear`, custom commands, …) passes straight through to the TUI. Popup / picker commands — pick a model, choose a review target, and the like — are answered with **inline buttons** in IM (or **chips** in web chat) instead of getting stuck in a hidden TUI modal. And when an agent itself raises a question mid-task (an `AskUserQuestion`), it surfaces as the same kind of inline choice, so you can answer from your phone and the agent keeps going.
+
+**Approve dangerous actions, per session (optional).** By default a session runs hands-off. Spin one up with human-in-the-loop instead (`/new claude <role> hitl`) and any non-allowlisted tool call pauses for your **approve / deny** — surfaced as inline buttons in chat or the web console, via Claude's native permission hook (ccteam never injects a prompt to do this). Deny blocks just that one tool, never the whole turn. Auto-allowed tools never prompt.
 
 **Resume-by-id, durable sessions.** Sessions are spawned on demand (first message creates one), resumed by id, and released when idle — state lives on disk, never as a shadow source of truth. They survive a daemon restart: the next `ccteam start` re-attaches your bots and replays any unsent IM replies, so upgrading or restarting ccteam doesn't lose context. If a Claude pane was killed, it is recreated with `claude --resume` for a lossless reload of the model's full context; if resume isn't possible, ccteam falls back to a fresh session and emits a visible reset event rather than silently forgetting.
 
@@ -42,7 +44,7 @@ You talk to ccteam from three places, all backed by one daemon:
 - **sessions** — `GET`/`POST /projects/{slug}/sessions`, `GET /sessions/{sid}`, `POST /sessions/{sid}/turn`, `GET /sessions/{sid}/events` (SSE), `POST /sessions/{sid}/stop`
 - **capabilities** — `GET /capabilities` (which harnesses, and which are available on `PATH`)
 
-This is the integration surface: an app or third party can register a project, list its roles, open a session, stream its events, and send turns — the same primitives IM and the web console use.
+It is self-documenting: `GET /api/docs` serves an interactive (Scalar) UI and `GET /api/v1/openapi.json` the OpenAPI 3.1 spec, both generated from the same route registrations. This is the integration surface: an app or third party can register a project, list its roles, open a session, stream its events, and send turns — the same primitives IM and the web console use.
 
 ## Quickstart
 
@@ -107,20 +109,21 @@ ccteam doctor                   # diagnostics / self-check (--verify-mcp)
 ## Features
 
 - **A meta AI team you drive from your phone** — assign work, get results, and intervene from IM, anywhere.
-- **Session = role, from a role library** — every session is a named role you can swap on the fly with `/role`; a default `cto` manager helps pick the right one. Roles are plain `.claude/agents/*.md` files — write your own or import from open libraries.
+- **Session = role, from a role library** — every session is a named role you can swap on the fly with `/role`; a default `cto` manager helps pick the right one (and can spawn / dispatch / collect work-role sessions to delegate). Roles are plain `.claude/agents/*.md` files — write your own or import from open libraries with `ccteam role search` / `add`.
 - **Live, legible IM turns** — a turn shows folded step-by-step progress (`📖 read ×5 · 🔧 bash ×3`) in one editable status message while it works, then the answer arrives as its own message. Long replies are split into ordered chunks (code fences kept intact) instead of being truncated.
 - **Pictures both ways** — send a screenshot or file to the bot and the agent reads it; the agent can send images/files back to your chat.
 - **Multi-project, multi-session** — one chat fans out across many repos and many concurrent agent sessions, each with its own context. `/sessions` lists them with each session's model and live context usage (e.g. `188k / 1M (19%)`), and a command menu is registered with your IM client so the gateway commands are discoverable.
 - **Full slash coverage from chat** — every agent slash command works from IM: Claude's open set passes through, model/review-style pickers become inline buttons, and an agent's own questions are answerable inline.
 - **No prompt injection** — the vendor self-loads its role and project memory; ccteam drives, it doesn't ventriloquize.
+- **Optional human-in-the-loop** — run a session in `hitl` mode and every risky tool call waits for your inline approve/deny; the rest run hands-off.
 - **Harness × provider** — a pluggable adapter model: claude-code today, Codex best-effort, more agentic CLIs by design. `GET /capabilities` reports what's actually available on your machine.
-- **A standard resource API** — versioned, web-token-authed `/api/v1` for projects, roles, and sessions (with SSE event streams), so apps and third parties integrate against the same primitives as IM and the web console.
+- **A standard resource API** — versioned, web-token-authed `/api/v1` for projects, roles, and sessions (with SSE event streams), self-documenting via an interactive `/api/docs` (Scalar) and an OpenAPI spec, so apps and third parties integrate against the same primitives as IM and the web console.
 - **Durable by design** — sessions survive daemon restarts and machine reboots; nothing silently forgets.
 - **File-system source of truth** — all state is reconstructable from disk; ccteam reads hooks, transcripts, and RPC events, never scraped terminal text.
 - **Cost-aware** — per-vendor 24h budgets with a hard ceiling; long-running sessions are never killed unless a budget cap is hit (or you explicitly stop them).
 - **Cross-project memory** — lessons accumulate through the official Claude Code / Codex memory channels, so new projects don't start from zero.
-- **Web console** — a local dashboard to watch sessions, transcripts, and spend in real time.
-- **MCP surface** — the `ccteam` MCP server exposes chat, advise, admin, and screenshot tool groups for programmatic control.
+- **Web console** — a local dashboard to watch sessions, transcripts, and spend in real time, with a dedicated per-session view (`/chat/s/:sid`) for each running session.
+- **MCP surface** — the `ccteam` MCP server exposes chat, advise, admin, session (cto dispatch), and screenshot tool groups for programmatic control.
 
 ## Docs
 
