@@ -76,6 +76,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/projects/{slug}/sessions"),
         ("GET", "/api/v1/sessions/{sid}"),
         ("POST", "/api/v1/sessions/{sid}/turn"),
+        // v0.8.7 review-fix (R-H1) — web HITL token-resolve endpoint.
+        ("POST", "/api/v1/sessions/{sid}/resolve"),
         ("GET", "/api/v1/sessions/{sid}/events"),
         ("POST", "/api/v1/sessions/{sid}/stop"),
         // teams
@@ -242,6 +244,7 @@ async fn openapi_json_and_docs_served_under_auth() {
         "CreatedProject",
         "CreateSessionForm",
         "TurnForm",
+        "ResolveForm",
         "RoleContentForm",
     ] {
         assert!(

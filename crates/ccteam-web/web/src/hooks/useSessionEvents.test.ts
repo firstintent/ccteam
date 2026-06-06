@@ -42,17 +42,40 @@ describe("parseSessionEvent (W2 payload shape)", () => {
     expect(ev!.done).toBe(true);
   });
 
-  it("carries approval options[] (the W2 ChoicePrompt labels)", () => {
+  it("carries approval options ({label,id}) + token (R-H1)", () => {
     const ev = parseSessionEvent(
       JSON.stringify({
         sid: "s2",
         kind: "answer",
         content: "session s2 wants to run rm -rf /",
-        options: ["Approve", "Deny"],
+        options: [
+          { label: "✅ Approve", id: "allow" },
+          { label: "⛔ Deny", id: "deny" },
+        ],
+        token: "pdeadbeef",
       }),
     );
-    expect(ev!.options).toEqual(["Approve", "Deny"]);
+    expect(ev!.options).toEqual([
+      { label: "✅ Approve", id: "allow" },
+      { label: "⛔ Deny", id: "deny" },
+    ]);
+    expect(ev!.token).toBe("pdeadbeef");
     expect(ev!.sid).toBe("s2");
+  });
+
+  it("drops malformed option entries but keeps well-formed ones (R-H1)", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({
+        kind: "answer",
+        content: "x",
+        // a non-object and an object missing label are both dropped; the id
+        // defaults to "" when absent.
+        options: ["bare-string", { label: "Approve" }, { foo: "bar" }],
+        token: "ptok",
+      }),
+    );
+    expect(ev!.options).toEqual([{ label: "Approve", id: "" }]);
+    expect(ev!.token).toBe("ptok");
   });
 
   it("defaults an unknown kind to answer and missing content to ''", () => {

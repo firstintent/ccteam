@@ -9,6 +9,7 @@ import {
   createSession,
   getHistory,
   listSessions,
+  resolveApproval,
   sessionUrl,
   sessionsUrl,
   stopSession,
@@ -116,6 +117,29 @@ describe("sessionsApi", () => {
       body: JSON.stringify({}),
     });
     expect(got.stopped).toBe(true);
+  });
+
+  it("resolveApproval POSTs {token,selection} to /sessions/{sid}/resolve (R-H1)", async () => {
+    // The web HITL approve path — NOT a turn. It must hit /resolve with the
+    // pending token + the chosen option id, so the gateway resolves the same
+    // token-keyed pending an IM click does.
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { resolved: true }));
+    const got = await resolveApproval("s2", "pdeadbeef", "allow");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions/s2/resolve", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ token: "pdeadbeef", selection: "allow" }),
+    });
+    expect(got.resolved).toBe(true);
+    // It must NOT be the turn endpoint (the old broken path).
+    expect(fetchMock.mock.calls[0][0]).not.toContain("/turn");
+  });
+
+  it("resolveApproval maps an unknown/expired token (404) to NOT_FOUND", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "gone" }));
+    await expect(resolveApproval("s2", "stale", "deny")).rejects.toThrow("NOT_FOUND");
   });
 
   it("createSession POSTs role+vendor+permission_mode to the project list", async () => {

@@ -33,18 +33,19 @@ use serde_json::Value;
 pub use ccteam_harness::execution::progress_bridge::{
     append_event, build_chat_bot_marker_stuck_event, build_chat_bot_permanent_failure_event,
     build_chat_compact_done_event, build_chat_hop_escalate_event,
-    build_chat_marker_self_heal_attempt_event, build_chat_session_reset_event,
-    build_chat_session_reset_event_with_reason, build_chat_session_reset_with_recovery_event,
-    build_chat_session_started_event, build_chat_tool_call_started_event,
-    build_chat_turn_completed_event, build_chat_turn_running_long_event,
-    build_chat_turn_timeout_event, build_chat_turn_user_prompt_event,
-    build_codex_plan_updated_event, build_codex_rate_limit_event, build_codex_thread_status_event,
-    build_codex_token_usage_event, build_merger_lossy_partial_event, build_typed_event_event,
-    CHAT_BOT_MARKER_STUCK, CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
-    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_SESSION_RESET, CHAT_SESSION_RESET_WITH_RECOVERY,
-    CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED, CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG,
-    CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT, CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT,
-    CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
+    build_chat_marker_self_heal_attempt_event, build_chat_permission_prompt_outstanding_event,
+    build_chat_session_reset_event, build_chat_session_reset_event_with_reason,
+    build_chat_session_reset_with_recovery_event, build_chat_session_started_event,
+    build_chat_tool_call_started_event, build_chat_turn_completed_event,
+    build_chat_turn_running_long_event, build_chat_turn_timeout_event,
+    build_chat_turn_user_prompt_event, build_codex_plan_updated_event,
+    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
+    build_merger_lossy_partial_event, build_typed_event_event, CHAT_BOT_MARKER_STUCK,
+    CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
+    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET,
+    CHAT_SESSION_RESET_WITH_RECOVERY, CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED,
+    CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT,
+    CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 
 /// Read + parse the last non-empty line of `path`. `Ok(None)` when the
@@ -812,6 +813,42 @@ mod tests {
         assert_eq!(ev["role"], "alice");
         assert_eq!(ev["project_dir"], "/home/u/projects/dev-foo");
         assert!(ev["ts"].is_string());
+    }
+
+    /// v0.8.7 review-fix (R-L1) — the parked-prompt progress line carries the
+    /// role, tool, a (truncated) summary, and the prompt's TTL so an operator
+    /// sees the agent is awaiting approval, not stuck.
+    #[test]
+    fn build_chat_permission_prompt_outstanding_event_shape() {
+        let long = "x".repeat(1000);
+        let ev = build_chat_permission_prompt_outstanding_event("cto", "Bash", &long, 120);
+        assert_eq!(ev["event"], CHAT_PERMISSION_PROMPT_OUTSTANDING);
+        assert_eq!(ev["role"], "cto");
+        assert_eq!(ev["tool"], "Bash");
+        assert_eq!(ev["ttl_secs"], 120);
+        assert_eq!(
+            ev["summary"].as_str().unwrap().chars().count(),
+            256,
+            "summary is truncated to 256 chars"
+        );
+        assert!(ev["ts"].is_string());
+    }
+
+    /// v0.8.7 review-fix (R-L1) — appending the parked line round-trips through
+    /// the canonical `append_event` (the SoT writer) and `last_event` reads it
+    /// back. Deterministic (explicit path, no env). This pins "a progress line
+    /// IS emitted when a permission prompt is outstanding".
+    #[test]
+    fn permission_prompt_outstanding_line_round_trips_through_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-foo.jsonl");
+        let ev =
+            build_chat_permission_prompt_outstanding_event("cto", "Bash", "rm -rf /tmp/x", 120);
+        append_event(&path, &ev).unwrap();
+        let last = last_event(&path).unwrap().expect("one event present");
+        assert_eq!(last["event"], CHAT_PERMISSION_PROMPT_OUTSTANDING);
+        assert_eq!(last["tool"], "Bash");
+        assert_eq!(last["summary"], "rm -rf /tmp/x");
     }
 
     #[test]

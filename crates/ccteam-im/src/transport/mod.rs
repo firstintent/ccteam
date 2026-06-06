@@ -127,6 +127,14 @@ pub struct MessageOption {
     pub data: String,
     /// Human-readable button label.
     pub label: String,
+    /// v0.8.7 review-fix (R-H1) — the stable option `id` from the source
+    /// [`ChoiceOption`] (e.g. `"allow"` / `"deny"`). IM channels ignore it
+    /// (they render `label`, echo `data` on click); it exists so a tokenless
+    /// web client can carry the option's real id through its own
+    /// `POST /sessions/{sid}/resolve {token, selection=id}` path — resolving
+    /// the SAME token-keyed pending the IM callback does, never a turn.
+    #[serde(default)]
+    pub id: String,
 }
 
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).

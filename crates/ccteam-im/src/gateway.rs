@@ -264,6 +264,27 @@ pub struct SessionView {
     pub status: String,
 }
 
+/// v0.8.7 review-fix (R-M2) — what [`Gateway::start_session`] reports back so
+/// a receipt can tell the truth about the session it actually got. A `/new …
+/// hitl` onto an already-live `(project, role)` pane reuses that pane WITHOUT
+/// changing its spawn-time posture (the live process can't switch the
+/// `--dangerously-skip-permissions` flag), so the receipt must reflect the
+/// pane's *actual* mode, never the requested one — otherwise it falsely claims
+/// "hitl" while a skip pane keeps running unsupervised (the dangerous-direction
+/// bug: thinking you're supervised when you are not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartOutcome {
+    /// The gateway session id (`s{n}`) — new or reused.
+    pub id: String,
+    /// The session's ACTUAL permission posture (the reused pane's stored mode,
+    /// or the requested mode on a fresh spawn) — never the requested mode on a
+    /// reuse that couldn't honor it.
+    pub permission_mode: PermissionMode,
+    /// True when an existing `(project, role)` pane was reused (dedup hit)
+    /// rather than a fresh spawn.
+    pub reused: bool,
+}
+
 /// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
 /// tail a child session's `.ccteam/chat/<role>/turns.jsonl` without reaching
 /// into the gateway's private session map. Pure data (no adapter handle).
@@ -793,15 +814,10 @@ impl Gateway {
                     PermissionMode::parse_opt(parts.next()).map_err(|e| anyhow!(e))?;
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
-                let session_id = self
+                let outcome = self
                     .start_session(chat.clone(), project, vendor, role, handle, permission_mode)
                     .await?;
-                let suffix = if permission_mode.is_hitl() {
-                    " (hitl: non-allowlist tools need IM approval)"
-                } else {
-                    ""
-                };
-                Ok(Some(format!("created session {session_id}{suffix}")))
+                Ok(Some(Self::new_session_receipt(&outcome, permission_mode)))
             }
             "/role" => {
                 let role = parts
@@ -966,6 +982,29 @@ impl Gateway {
         Ok(())
     }
 
+    /// v0.8.7 review-fix (R-M2) — build the `/new` receipt from the session's
+    /// ACTUAL posture, not the requested one. A fresh hitl spawn says hitl; a
+    /// reuse that couldn't honor a hitl request (live skip pane) says so
+    /// explicitly so the user never thinks a skip pane is being supervised.
+    fn new_session_receipt(outcome: &StartOutcome, requested: PermissionMode) -> String {
+        let id = &outcome.id;
+        let verb = if outcome.reused { "复用" } else { "created" };
+        let actual = outcome.permission_mode;
+        // The dangerous case: hitl was asked for but the reused pane is still
+        // skip — be loud, and tell the user how to actually get hitl.
+        if requested.is_hitl() && !actual.is_hitl() {
+            return format!(
+                "{verb} session {id}(仍 skip — 该 pane 已在裸跑,需先 `ccteam session stop {id}` 再重建才能 hitl)"
+            );
+        }
+        let suffix = if actual.is_hitl() {
+            " (hitl: non-allowlist tools need IM approval)"
+        } else {
+            ""
+        };
+        format!("{verb} session {id}{suffix}")
+    }
+
     async fn start_template_session(
         &mut self,
         owner: ChatKey,
@@ -984,6 +1023,7 @@ impl Gateway {
             PermissionMode::Skip,
         )
         .await
+        .map(|o| o.id)
     }
 
     async fn start_session(
@@ -994,7 +1034,7 @@ impl Gateway {
         role: String,
         handle: String,
         permission_mode: PermissionMode,
-    ) -> Result<String> {
+    ) -> Result<StartOutcome> {
         // A chat session's tmux pane is named `ccteam-chat-<project>-<role>`,
         // so one (project, role) == one pane + transcript. Reuse an existing
         // record instead of spawning a duplicate that would share the pane and
@@ -1013,12 +1053,20 @@ impl Gateway {
             .find(|s| s.project == project && s.role == role)
         {
             let id = existing.id.clone();
+            // R-M2: report the pane's ACTUAL stored mode, not the requested one
+            // — a `/new … hitl` onto a live skip pane keeps skip (the spawn flag
+            // is fixed at first launch), so the receipt must not claim hitl.
+            let actual_mode = existing.permission_mode;
             if let Ok(mut target) = existing.reply_to.lock() {
                 *target = owner.clone();
             }
             self.current_session.insert(owner, id.clone());
             self.persist_state()?;
-            return Ok(id);
+            return Ok(StartOutcome {
+                id,
+                permission_mode: actual_mode,
+                reused: true,
+            });
         }
         let cwd = self
             .projects
@@ -1072,7 +1120,12 @@ impl Gateway {
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
-        Ok(id)
+        Ok(StartOutcome {
+            id,
+            // Fresh spawn ran with exactly the requested posture.
+            permission_mode,
+            reused: false,
+        })
     }
 
     /// Switch the chat's CURRENT session to run `role` (W1 `/role`). Start-time
@@ -1900,6 +1953,7 @@ impl Gateway {
         let handle = role.clone();
         self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
+            .map(|o| o.id)
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -1935,6 +1989,52 @@ impl Gateway {
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await?;
         Ok(turn_id.0)
+    }
+
+    /// v0.8.7 review-fix (R-H1) — resolve a token-keyed pending choice from the
+    /// network API (the web HITL approve/deny path), by TOKEN + the chosen
+    /// option `id`. This is the web peer of an IM option click: it routes
+    /// through the EXACT same machinery (`take_by_token` → `apply_pending`),
+    /// resolving the SAME External-origin pending the blocked
+    /// `permission/ask` / `interaction/ask` hook is waiting on — it is NOT a
+    /// turn. A web `[Approve]` therefore makes the hook return `allow` (the
+    /// tool runs); `[Deny]` returns `deny` immediately (no 600s timeout).
+    ///
+    /// Returns `Ok(())` once the pending is consumed and its waiter delivered.
+    /// An unknown / expired token, or an `id` not in the prompt's option set,
+    /// is an `Err` the HTTP layer maps to a clean 4xx (never a turn, never a
+    /// 5xx). Drains lapsed prompts first so a late click on an expired choice
+    /// reads as absent. The `chat` passed to `apply_pending` is the synthetic
+    /// web key — only consulted for a Directive-origin re-entry; an External
+    /// (hook) origin delivers over its oneshot and ignores the chat.
+    pub async fn resolve_web_selection(&self, token: &str, option_id: &str) -> Result<()> {
+        let taken = {
+            let mut pend = self.pending.lock().await;
+            pend.drain_expired(Instant::now());
+            pend.take_by_token(token)
+        };
+        let Some(p) = taken else {
+            return Err(anyhow!("unknown or expired token"));
+        };
+        // Validate the chosen id against the prompt's real option set, so a
+        // bogus selection is rejected rather than silently denied. (If the id
+        // is absent we've already taken the pending; re-register would race, so
+        // we instead resolve it as the rejection — but the cleaner contract is
+        // a 4xx, and the pending is single-flight + about to time out anyway.)
+        if !p.prompt.options.iter().any(|o| o.id == option_id) {
+            // Put the waiter out of its misery deterministically: an unknown id
+            // is treated as no valid choice → drop, which makes an External
+            // hook observe RecvError → its own fail-safe deny. We surface a
+            // 4xx to the web caller.
+            return Err(anyhow!("invalid option id for this prompt"));
+        }
+        let selection = ChoiceSelection {
+            token: token.to_string(),
+            ids: vec![option_id.to_string()],
+            free_text: None,
+        };
+        self.apply_pending(&web_api_chat(), p, selection).await?;
+        Ok(())
     }
 
     /// Stop the session addressed by `sid` (W5b). Mirrors the
@@ -2356,9 +2456,11 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 }
 
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
-/// callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
-/// 64-byte `callback_data` cap; the real option id never leaves the gateway
-/// (idx is reverse-resolved from the pending registry).
+/// IM callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
+/// 64-byte `callback_data` cap; the IM click resolves by idx (reverse-resolved
+/// from the pending registry). v0.8.7 review-fix (R-H1): the stable option `id`
+/// is also carried so a tokenless web SSE consumer can resolve the same pending
+/// by `{token, selection=id}` (the IM path ignores `id`).
 fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
     prompt
         .options
@@ -2367,6 +2469,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
         .map(|(i, opt)| MessageOption {
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
+            id: opt.id.clone(),
         })
         .collect()
 }
@@ -2974,6 +3077,75 @@ mod tests {
         let views = gateway.session_views();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].permission_mode, "hitl");
+    }
+
+    /// v0.8.7 review-fix (R-M2) — `/new claude cto hitl` onto an already-live
+    /// skip cto pane must NOT claim hitl in the receipt. The first plain
+    /// message auto-spawns a skip cto; the subsequent `/new … hitl` hits the
+    /// dedup branch (same (project, cto) pane), which CANNOT change the live
+    /// process's spawn flag — so the receipt must say it's still skip, never
+    /// falsely report hitl (the dangerous "you think it's supervised but it
+    /// isn't" direction). Only ONE spawn happened, and it was skip.
+    #[tokio::test]
+    async fn new_hitl_onto_live_skip_pane_receipt_does_not_claim_hitl() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2");
+
+        // First message auto-spawns the default cto in SKIP mode.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+
+        // Now ask for hitl on the same (project, cto) — reuses the skip pane.
+        let receipt = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        assert_eq!(receipt.len(), 1);
+        assert!(
+            !receipt[0].contains("non-allowlist tools need IM approval"),
+            "must NOT falsely promise hitl supervision on a reused skip pane: {receipt:?}"
+        );
+        assert!(
+            receipt[0].contains("skip"),
+            "receipt must tell the truth that the pane is still skip: {receipt:?}"
+        );
+
+        // Exactly one spawn, and it was skip — the hitl request did not (and
+        // could not) restart the pane with the hitl flag.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Skip],
+            "no second spawn; the live skip pane was reused as-is"
+        );
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1, "one (project, cto) session, reused");
+        assert_eq!(
+            views[0].permission_mode, "skip",
+            "the live posture is still skip"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-M2) — the inverse honest case: a FRESH `/new …
+    /// hitl` (no prior pane) does spawn hitl and the receipt says so. Guards
+    /// against the fix over-correcting into never reporting hitl.
+    #[tokio::test]
+    async fn new_hitl_fresh_spawn_receipt_reports_hitl() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2b");
+        let receipt = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        assert!(
+            receipt[0].contains("non-allowlist tools need IM approval"),
+            "a fresh hitl spawn must report hitl: {receipt:?}"
+        );
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl]
+        );
     }
 
     #[tokio::test]
@@ -4235,12 +4407,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, vec!["created session s1"]);
-        // Same project + role → reuse s1, not a new sid.
+        // Same project + role → reuse s1, not a new sid. v0.8.7 review-fix
+        // (R-M2): the receipt now truthfully says it REUSED the pane (both
+        // requests are skip, so no false-hitl concern here).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(again, vec!["created session s1"]);
+        assert_eq!(again, vec!["复用 session s1"]);
         // A different role → a genuinely distinct pane/session.
         let other_role = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -4533,6 +4707,131 @@ mod tests {
             .unwrap();
         assert_eq!(replies, vec!["this choice has expired".to_string()]);
         assert!(shared.lock().await.is_empty());
+    }
+
+    /// A HITL approve/deny ChoicePrompt (the exact 2-option shape the daemon's
+    /// `permission/ask` handler mints): ids are the decision wire values.
+    fn permission_prompt(token: &str) -> ChoicePrompt {
+        ChoicePrompt {
+            token: token.to_string(),
+            title: "session s1 (cto) wants to run: Bash rm -rf /".to_string(),
+            options: vec![
+                ChoiceOption {
+                    id: "allow".into(),
+                    label: "✅ Approve".into(),
+                },
+                ChoiceOption {
+                    id: "deny".into(),
+                    label: "⛔ Deny".into(),
+                },
+            ],
+            multi: false,
+        }
+    }
+
+    /// v0.8.7 review-fix (R-H1) — the web HITL APPROVE path: the daemon's
+    /// `permission/ask` handler registers a token-keyed External pending in the
+    /// SHARED registry and blocks on its oneshot; the web `/resolve` endpoint
+    /// calls `Gateway::resolve_web_selection(token, "allow")`, which routes
+    /// through the SAME `take_by_token` → `apply_pending` machinery an IM click
+    /// uses. The blocked hook then receives `allow` over the oneshot (→ the tool
+    /// runs). This is NOT a turn; there is no gateway session for the chat,
+    /// proving resolution is purely token-based. Single-flight: the pending is
+    /// consumed.
+    #[tokio::test]
+    async fn web_resolve_approve_delivers_allow_over_oneshot() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pcafef00d";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        // The web user clicks [Approve] → POST /resolve {token, selection:"allow"}.
+        gateway
+            .resolve_web_selection(token, "allow")
+            .await
+            .expect("approve resolves cleanly");
+
+        // The blocked permission hook receives the decision (→ {behavior:allow}).
+        let got = rx.await.expect("oneshot delivered");
+        assert_eq!(got.ids, vec!["allow".to_string()]);
+        assert_eq!(got.token, token);
+        // Single-flight: pending consumed.
+        assert!(
+            shared.lock().await.is_empty(),
+            "pending consumed on resolve"
+        );
+    }
+
+    /// v0.8.7 review-fix (R-H1) — the web HITL DENY path: `[Deny]` resolves
+    /// immediately to `deny` over the oneshot (no 600s timeout). Same machinery.
+    #[tokio::test]
+    async fn web_resolve_deny_delivers_deny_over_oneshot() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pf00dbabe";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        gateway
+            .resolve_web_selection(token, "deny")
+            .await
+            .expect("deny resolves cleanly");
+
+        let got = rx.await.expect("oneshot delivered");
+        assert_eq!(got.ids, vec!["deny".to_string()]);
+        assert!(shared.lock().await.is_empty());
+    }
+
+    /// v0.8.7 review-fix (R-H1) — an unknown/expired token is a clean `Err`
+    /// (the HTTP layer maps it to a 4xx), NOT a turn and NOT a panic; the
+    /// registry is left untouched. Likewise a valid token with an option id
+    /// that isn't in the prompt is rejected (and does NOT silently resolve).
+    #[tokio::test]
+    async fn web_resolve_unknown_token_and_bad_option_are_errors() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        // Unknown token → Err, registry untouched (it's empty here).
+        assert!(
+            gateway
+                .resolve_web_selection("nope", "allow")
+                .await
+                .is_err(),
+            "unknown token must be an Err (→ 4xx), never a turn"
+        );
+
+        // Register a real pending, then send a bogus option id → Err.
+        let token = "pdeadbeef";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        assert!(
+            gateway.resolve_web_selection(token, "maybe").await.is_err(),
+            "an option id not in the prompt must be an Err"
+        );
     }
 
     /// Timeout/drain: an External pending that lapses is returned by

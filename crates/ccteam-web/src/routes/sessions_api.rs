@@ -355,6 +355,85 @@ pub(crate) async fn handle_session_turn(
     }
 }
 
+/// POST body for resolving a pending choice (the HITL approve/deny path) —
+/// `token` (the pending-resolution token carried on the SSE choice frame) +
+/// `selection` (the chosen option `id`, e.g. `"allow"` / `"deny"`). Form or
+/// JSON. v0.8.7 review-fix (R-H1).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveForm {
+    /// Pending-resolution token (from the SSE choice frame's `token`).
+    pub token: String,
+    /// Chosen option id (the SSE choice frame's `options[].id`).
+    pub selection: String,
+}
+
+/// `POST /api/v1/sessions/{sid}/resolve`
+///
+/// v0.8.7 review-fix (R-H1) — resolve a token-keyed pending choice (the web
+/// HITL approve/deny click) through the SAME gateway machinery an IM option
+/// click uses ([`Gateway::resolve_web_selection`] → `take_by_token` →
+/// `apply_pending`). This is **not** a turn: it delivers the decision to the
+/// blocked `permission/ask` hook so `[Approve]` makes the tool actually run
+/// and `[Deny]` denies immediately (no 600s timeout). 200 `{resolved:true}`
+/// on success. 400 on empty token/selection. 404 (clean 4xx, never a turn)
+/// when the token is unknown/expired or the selection is not a valid option
+/// for that prompt. 503 with no gateway.
+///
+/// The `{sid}` is the addressing namespace for parity with the other session
+/// endpoints; resolution itself is token-global (a pending is keyed by its
+/// token, unique per outstanding prompt), so the token is the authority.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{sid}/resolve",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body(content = ResolveForm, description = "Pending resolution (JSON or x-www-form-urlencoded)"),
+    responses(
+        (status = 200, description = "Resolved; the decision was delivered to the waiting hook. `{resolved:true}`", body = serde_json::Value),
+        (status = 400, description = "Empty token or selection"),
+        (status = 404, description = "Unknown/expired token or invalid selection (NOT submitted as a turn)"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_resolve(
+    State(app): State<AppState>,
+    Path(sid): Path<String>,
+    FormOrJson(form, mode): FormOrJson<ResolveForm>,
+) -> Response {
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let token = form.token.trim();
+    let selection = form.selection.trim();
+    if token.is_empty() || selection.is_empty() {
+        return create_error(
+            StatusCode::BAD_REQUEST,
+            "token and selection must not be empty".into(),
+            mode,
+        );
+    }
+    let result = {
+        // resolve_web_selection takes &self (the pending registry is behind its
+        // own inner lock), so a shared guard suffices.
+        let guard = gw.lock().await;
+        guard.resolve_web_selection(token, selection).await
+    };
+    match result {
+        Ok(()) => Json(json!({"resolved": true})).into_response(),
+        Err(err) => {
+            // Unknown/expired token or a bad option id — a clean 4xx, never a
+            // turn (the whole point of R-H1). 404 mirrors the unknown-session
+            // shape the other session endpoints return.
+            tracing::warn!(%sid, %err, "resolve_web_selection failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("resolve failed: {err}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /api/v1/sessions/{sid}/events`
 ///
 /// SSE stream for one session. Subscribes to the gateway's event broadcast
@@ -483,6 +562,17 @@ fn session_event(ev: &GatewayEvent) -> Event {
 
 /// The JSON payload [`session_event`] serializes (split out for unit tests —
 /// asserting on an `axum` `Event`'s rendered body is awkward).
+///
+/// v0.8.7 review-fix (R-H1): a choice prompt (e.g. the HITL approve/deny
+/// bubble) now also carries the resolution `token` plus, per option, its
+/// stable `id` — so the SPA can resolve the pending via
+/// `POST /api/v1/sessions/{sid}/resolve {token, selection=id}` (the SAME
+/// token-keyed pending the IM click resolves), instead of misfiring the
+/// option index as a brand-new turn (which never resolved the pending and
+/// let the blocked permission hook time out to deny). The `options` array
+/// stays backward-friendly: each entry is `{label, id}`. The token is parsed
+/// from the option callback `data` (`"{token}:{idx}"`), the single source of
+/// the token on the wire.
 fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     use ccteam_im::gateway::GatewayEventKind;
     let (kind, done) = match &ev.kind {
@@ -499,10 +589,27 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         payload["done"] = serde_json::Value::Bool(true);
     }
     if !ev.options.is_empty() {
-        payload["options"] =
-            serde_json::Value::Array(ev.options.iter().map(|o| json!(o.label)).collect());
+        payload["options"] = serde_json::Value::Array(
+            ev.options
+                .iter()
+                .map(|o| json!({ "label": o.label, "id": o.id }))
+                .collect(),
+        );
+        if let Some(token) = approval_token(ev) {
+            payload["token"] = serde_json::Value::String(token);
+        }
     }
     payload
+}
+
+/// Extract the pending-resolution token from a choice-prompt event. Every
+/// option's callback `data` is `"{token}:{idx}"` (the single on-wire carrier
+/// of the token), so the token is the prefix before the first `:` of the
+/// first option. `None` when there are no options or the shape is unexpected
+/// (the SPA then omits the resolve affordance rather than guess).
+fn approval_token(ev: &GatewayEvent) -> Option<String> {
+    let data = &ev.options.first()?.data;
+    data.split_once(':').map(|(token, _)| token.to_string())
 }
 
 /// Synthetic lag/close frame — mirrors [`super::sse`]'s `reconnect_hint`.
@@ -665,6 +772,9 @@ mod tests {
         assert_eq!(answer["sid"], "s1");
         assert_eq!(answer["content"], "hi");
         assert!(answer.get("done").is_none());
+        // No options ⇒ no token / no options key.
+        assert!(answer.get("options").is_none());
+        assert!(answer.get("token").is_none());
 
         // Finalizing progress → kind "progress" + done:true.
         let mut prog = gw_event(Some("s1"));
@@ -675,6 +785,54 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    /// v0.8.7 review-fix (R-H1) — an approval ChoicePrompt event serializes its
+    /// resolution `token` plus, per option, `{label, id}`, so the SPA can
+    /// resolve via `POST /resolve {token, selection=id}` (NOT misfire the index
+    /// as a turn). The token is parsed from the option callback `data`
+    /// (`"{token}:{idx}"`), the single on-wire carrier.
+    #[test]
+    fn session_event_carries_token_and_option_ids_for_approval() {
+        use ccteam_im::transport::MessageOption;
+        let mut ev = gw_event(Some("s7"));
+        ev.content = "session s7 (cto) wants to run: Bash rm -rf /".into();
+        ev.options = vec![
+            MessageOption {
+                data: "pcafef00d:0".into(),
+                label: "✅ Approve".into(),
+                id: "allow".into(),
+            },
+            MessageOption {
+                data: "pcafef00d:1".into(),
+                label: "⛔ Deny".into(),
+                id: "deny".into(),
+            },
+        ];
+        let payload = session_event_payload(&ev);
+        // token lifted from the option `data` prefix.
+        assert_eq!(payload["token"], "pcafef00d");
+        // each option carries its stable id (the decision value) + label.
+        let opts = payload["options"].as_array().expect("options array");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["label"], "✅ Approve");
+        assert_eq!(opts[0]["id"], "allow");
+        assert_eq!(opts[1]["id"], "deny");
+    }
+
+    #[test]
+    fn approval_token_parses_prefix_and_handles_empty() {
+        use ccteam_im::transport::MessageOption;
+        let mut ev = gw_event(Some("s1"));
+        ev.options = vec![MessageOption {
+            data: "ptok:0".into(),
+            label: "x".into(),
+            id: "allow".into(),
+        }];
+        assert_eq!(approval_token(&ev).as_deref(), Some("ptok"));
+        // No options ⇒ None (the payload then omits the resolve affordance).
+        let bare = gw_event(Some("s1"));
+        assert!(approval_token(&bare).is_none());
     }
 
     #[test]

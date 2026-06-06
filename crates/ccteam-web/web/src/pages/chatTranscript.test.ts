@@ -106,13 +106,26 @@ describe("chatTranscript eventToRow", () => {
     expect(r!.id).toBe("e1");
   });
 
-  it("maps an event with options to an approval row (W2 ChoicePrompt)", () => {
+  it("maps an event with options to an approval row carrying token + ids (R-H1)", () => {
     const r = eventToRow(
-      ev({ kind: "answer", content: "session s2 wants to run rm -rf", options: ["Approve", "Deny"] }),
+      ev({
+        kind: "answer",
+        content: "session s2 wants to run rm -rf",
+        options: [
+          { label: "✅ Approve", id: "allow" },
+          { label: "⛔ Deny", id: "deny" },
+        ],
+        token: "pcafef00d",
+      }),
     );
     expect(r).not.toBeNull();
     expect(r!.kind).toBe("approval");
-    expect(r!.options).toEqual(["Approve", "Deny"]);
+    expect(r!.options).toEqual([
+      { label: "✅ Approve", id: "allow" },
+      { label: "⛔ Deny", id: "deny" },
+    ]);
+    // The token rides onto the row so the resolve POST can carry it (R-H1).
+    expect(r!.token).toBe("pcafef00d");
     expect(r!.content).toContain("wants to run");
   });
 

@@ -13,9 +13,11 @@
 //            per-sid SSE at `/api/v1/sessions/{sid}/events`).
 //   - STORE  each sid owns its OWN transcript (per-sid localStorage key via
 //            `chatTranscript`), so switching sessions NEVER mixes streams.
-//   - APPROVE W2 ChoicePrompt events (tagged with sid + options) render as
-//            "session sX wants to run … [option chips]"; clicking submits
-//            the choice back through the turn endpoint.
+//   - APPROVE W2 ChoicePrompt events (tagged with sid + options + token)
+//            render as "session sX wants to run … [option chips]"; clicking
+//            POSTs {token, selection=id} to /resolve (R-H1) — the SAME
+//            gateway pending machinery an IM click uses, NOT a turn — so the
+//            blocked tool actually runs on Approve / denies on Deny.
 //
 // Red lines: reads structured turn/SSE frames (never scrapes a pane); the
 // terminal view is the existing `ccteam-pty.v1` byte relay; the new-session
@@ -35,6 +37,7 @@ import {
   createSession as apiCreateSession,
   getHistory,
   listSessions,
+  resolveApproval as apiResolveApproval,
   stopSession as apiStopSession,
   submitTurn,
   type SessionView,
@@ -172,22 +175,35 @@ export default function ChatConsole() {
     });
   }, [draft, sid, pushRow]);
 
-  // ---- resolve a W2 approval prompt --------------------------------------
-  // The per-sid SSE tags the ChoicePrompt with sid + option labels but not
-  // the resolution token, so a tokenless web client resolves via the same
-  // 1-based numeric short-reply the IM channel accepts, sent over the turn
-  // endpoint. (Token-based callback resolution lives on the IM/WS path; a
-  // turn-endpoint route into `resolve_numeric` is a follow-up.)
+  // ---- resolve a W2 approval prompt (R-H1) -------------------------------
+  // The per-sid SSE tags the ChoicePrompt with sid + each option's {label,id}
+  // + the pending-resolution token. Clicking POSTs {token, selection=id} to
+  // `/resolve`, which routes through the gateway's SAME pending machinery an
+  // IM click uses (take_by_token → apply_pending) — NOT a turn. So [Approve]
+  // makes the blocked tool actually run and [Deny] denies immediately (no
+  // 600s timeout). A row with no token (or a chosen option with no id) can't
+  // be resolved this way; we surface that rather than misfire a fake turn.
   const resolveApproval = useCallback(
     (row: TranscriptRow, optionIndex: number) => {
       if (!sid) return;
+      const option = row.options?.[optionIndex];
+      if (!row.token || !option?.id) {
+        pushRow({
+          kind: "system",
+          content: "无法批准: 该提示缺少 token/选项 id(请在 IM 批准,或重开会话)",
+        });
+        return;
+      }
       // mark the row resolved so the chips disable.
       setRows((current) =>
         current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)),
       );
-      const choiceLabel = row.options?.[optionIndex] ?? `${optionIndex + 1}`;
-      pushRow({ kind: "user", content: `→ ${choiceLabel}` });
-      submitTurn(sid, String(optionIndex + 1)).catch((e) => {
+      pushRow({ kind: "user", content: `→ ${option.label}` });
+      apiResolveApproval(sid, row.token, option.id).catch((e) => {
+        // Re-enable the chips so the user can retry on a transient failure.
+        setRows((current) =>
+          current.map((r) => (r.id === row.id ? { ...r, resolved: false } : r)),
+        );
         pushRow({
           kind: "system",
           content: `批准提交失败: ${e instanceof Error ? e.message : "unknown"}`,
@@ -464,7 +480,7 @@ export default function ChatConsole() {
                                 onClick={() => resolveApproval(row, i)}
                                 className="h-7 px-3 rounded-md text-xs bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40"
                               >
-                                {opt}
+                                {opt.label}
                               </button>
                             ))}
                           </div>

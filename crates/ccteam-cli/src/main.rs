@@ -2296,6 +2296,25 @@ const SESSION_COLLECT_DEFAULT_N: usize = 20;
 /// degrades to deny-with-reason). Matches the gateway pending TTL default.
 const INTERACTION_ASK_TIMEOUT_SECS: u64 = 600;
 
+/// v0.8.7 review-fix (R-L1) — a HITL `permission/ask` prompt gets a SHORTER
+/// deadline than the 600s `interaction/ask`: a tool-approval blocks the
+/// agent's whole turn, so a long park is worse than a fast fail-safe deny.
+/// On lapse the hook still denies (fail-safe = deny). Env-overridable
+/// (`CCTEAM_PERMISSION_PROMPT_TTL_SECS`) for ops + tests.
+const PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT: u64 = 120;
+
+/// Resolve the HITL permission-prompt TTL: the env override when set + valid,
+/// else [`PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT`]. Clamped to ≥1s so a
+/// misconfig can't make the prompt expire instantly (which would deny every
+/// tool before the user can possibly click).
+fn permission_prompt_timeout_secs() -> u64 {
+    std::env::var("CCTEAM_PERMISSION_PROMPT_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT)
+}
+
 /// Monotonic id source so each `chat_send_file` gets a distinct durable
 /// ledger row (avoids `{id}-0` collisions in `outbound.jsonl`).
 static CHAT_SEND_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2599,6 +2618,10 @@ async fn execute_interaction_ask(
         .map(|(i, opt)| MessageOption {
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
+            // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.
+            // "allow"/"deny") so the web SSE consumer can resolve by
+            // {token, selection=id} through the same pending machinery.
+            id: opt.id.clone(),
         })
         .collect();
 
@@ -2792,13 +2815,20 @@ async fn execute_permission_ask(
         .map(|(i, opt)| MessageOption {
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
+            // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.
+            // "allow"/"deny") so the web SSE consumer can resolve by
+            // {token, selection=id} through the same pending machinery.
+            id: opt.id.clone(),
         })
         .collect();
 
     // Register the External-origin pending (token-keyed); release the guard
     // BEFORE the long await (lock discipline §7-1).
+    // v0.8.7 review-fix (R-L1) — a permission prompt blocks the whole turn, so
+    // it uses a SHORTER TTL than the 600s interaction/ask; fail-safe stays deny.
     let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
-    let ttl = std::time::Duration::from_secs(INTERACTION_ASK_TIMEOUT_SECS);
+    let ttl_secs = permission_prompt_timeout_secs();
+    let ttl = std::time::Duration::from_secs(ttl_secs);
     {
         let mut guard = pending.lock().await;
         guard.register(
@@ -2830,6 +2860,13 @@ async fn execute_permission_ask(
         return err_resp("permission/ask: gateway sink closed".to_string());
     }
 
+    // v0.8.7 review-fix (R-L1) — emit a progress.jsonl line so an operator
+    // (`ccteam status` / dashboard / `progress`) sees the session is PARKED
+    // awaiting approval, not silently stuck. Best-effort: a write failure must
+    // never block the approval flow. progress.jsonl stays the state SoT (we
+    // only append; nothing here mutates session state).
+    emit_permission_prompt_outstanding(slug, role, &tool_name, &summary, ttl_secs);
+
     // Block on the click, holding NO lock. The daemon enforces the TTL; on
     // lapse the hook degrades to deny.
     match tokio::time::timeout(ttl, rx).await {
@@ -2853,6 +2890,34 @@ async fn execute_permission_ask(
                 "result": { "timeout": true },
             })
         }
+    }
+}
+
+/// v0.8.7 review-fix (R-L1) — append a `chat_permission_prompt_outstanding`
+/// line to the project's `progress.jsonl` so an operator sees the session is
+/// parked awaiting approval. Best-effort: resolve the path from env (the
+/// daemon process has `CCTEAM_HOME`); any failure (no env, write error) is
+/// logged and swallowed — the approval flow must never depend on this signal.
+/// progress.jsonl stays the state SoT (append-only; nothing here mutates
+/// session state). A blank `slug` (the hook didn't pass one) is skipped.
+fn emit_permission_prompt_outstanding(
+    slug: &str,
+    role: &str,
+    tool_name: &str,
+    summary: &str,
+    ttl_secs: u64,
+) {
+    if slug.is_empty() {
+        return;
+    }
+    let Ok(paths) = ccteam_core::CcteamPaths::from_env() else {
+        return;
+    };
+    let event = ccteam_core::progress::build_chat_permission_prompt_outstanding_event(
+        role, tool_name, summary, ttl_secs,
+    );
+    if let Err(e) = ccteam_core::progress::append_event(&paths.progress_jsonl(slug), &event) {
+        tracing::warn!(%slug, %role, %e, "failed to append permission-prompt-outstanding progress line");
     }
 }
 
@@ -4112,5 +4177,32 @@ mod session_tool_tests {
             "no gateway ⇒ JSON-RPC error so the hook denies: {resp}"
         );
         assert_eq!(resp["id"], json!(7));
+    }
+
+    /// v0.8.7 review-fix (R-L1) — the resolved HITL permission-prompt TTL is
+    /// SHORTER than the 600s interaction/ask TTL (a tool-approval parks the
+    /// whole turn, so a fast fail-safe deny beats a long park). Exercises the
+    /// runtime resolver (default path, env unset) so the relation is a real
+    /// value comparison, not a const fold. The env override is exercised by an
+    /// integration test (separate process — env mutation discipline).
+    #[test]
+    fn permission_prompt_ttl_is_shorter_than_interaction_ttl() {
+        let ttl = permission_prompt_timeout_secs();
+        let interaction = INTERACTION_ASK_TIMEOUT_SECS;
+        assert!(
+            ttl < interaction,
+            "permission TTL ({ttl}s) must be shorter than interaction TTL ({interaction}s)"
+        );
+        assert!(ttl >= 1, "TTL must be clamped to >= 1s, got {ttl}");
+    }
+
+    /// v0.8.7 review-fix (R-L1) — `emit_permission_prompt_outstanding` with a
+    /// blank slug is a no-op (nothing to address) and never panics. The
+    /// env-resolved write path is covered by an integration test (separate
+    /// process); here we pin the cheap guard.
+    #[test]
+    fn emit_permission_prompt_outstanding_blank_slug_is_noop() {
+        // Must not panic / must not touch the filesystem for a blank slug.
+        emit_permission_prompt_outstanding("", "cto", "Bash", "rm -rf /", 120);
     }
 }

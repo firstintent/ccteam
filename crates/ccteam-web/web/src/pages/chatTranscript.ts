@@ -9,20 +9,24 @@
 // owns its OWN transcript (a per-sid localStorage key), so switching the
 // sid view NEVER mixes two sessions' rows.
 
-import type { SessionEvent } from "../hooks/useSessionEvents";
+import type { SessionEvent, SessionEventOption } from "../hooks/useSessionEvents";
 import type { SessionHistoryEvent } from "../lib/sessionsApi";
 
 export type RowKind = "user" | "assistant" | "tool" | "system" | "approval";
 
 /** One rendered transcript row. `approval` rows carry the W2 ChoicePrompt
- *  option labels so ChatConsole can render clickable [Approve][Deny] chips;
- *  `resolved` flips once the user clicks (so the chips disable). */
+ *  options (`{label, id}`) so ChatConsole can render clickable
+ *  [Approve][Deny] chips, plus the `token` the web resolve path POSTs back
+ *  (R-H1); `resolved` flips once the user clicks (so the chips disable). */
 export interface TranscriptRow {
   id: string;
   kind: RowKind;
   content: string;
-  /** Approval-only: the option labels to render as buttons. */
-  options?: string[];
+  /** Approval-only: the options to render as buttons (`{label, id}`). */
+  options?: SessionEventOption[];
+  /** Approval-only: the pending-resolution token the resolve POST carries
+   *  (R-H1). Absent ⇒ the row can't be resolved (no affordance). */
+  token?: string;
   /** Approval-only: true once an option was clicked. */
   resolved?: boolean;
 }
@@ -60,6 +64,7 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       kind: "approval",
       content: ev.content || "needs approval",
       options: ev.options,
+      token: ev.token,
     };
   }
   if (ev.kind === "answer") {

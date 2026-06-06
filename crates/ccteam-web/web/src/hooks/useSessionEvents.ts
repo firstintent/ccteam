@@ -20,17 +20,28 @@
 
 import { useEffect, useRef, useState } from "react";
 
+/** One selectable option on an approval ChoicePrompt (the SSE frame's
+ *  `options[]`). `label` is the button text; `id` is the stable decision
+ *  value (e.g. `"allow"` / `"deny"`) the web resolve path sends back as
+ *  `selection`. v0.8.7 review-fix (R-H1). */
+export interface SessionEventOption {
+  label: string;
+  id: string;
+}
+
 /** One event line off the per-session SSE stream (the W2 payload shape).
  *  `kind` is "answer" (assistant reply / approval prompt) or "progress"
  *  (status edit, `done` on the finalizing one). `options` present + non-
- *  empty marks an approval prompt. */
+ *  empty marks an approval prompt; `token` is then the pending-resolution
+ *  token the web resolve path POSTs back (R-H1). */
 export interface SessionEvent {
   id?: string;
   sid?: string;
   kind: "answer" | "progress";
   content: string;
   done?: boolean;
-  options?: string[];
+  options?: SessionEventOption[];
+  token?: string;
 }
 
 export interface UseSessionEventsResult {
@@ -80,8 +91,25 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   if (typeof obj.sid === "string") event.sid = obj.sid;
   if (obj.done === true) event.done = true;
   if (Array.isArray(obj.options)) {
-    event.options = obj.options.filter((o): o is string => typeof o === "string");
+    // v0.8.7 review-fix (R-H1) — options are `{label, id}` objects; the id is
+    // the decision value the resolve path sends back as `selection`. Drop any
+    // malformed entry (no string label) so a half-formed frame can't render a
+    // broken chip.
+    const opts: SessionEventOption[] = [];
+    for (const o of obj.options) {
+      if (typeof o === "object" && o !== null) {
+        const rec = o as Record<string, unknown>;
+        if (typeof rec.label === "string") {
+          opts.push({
+            label: rec.label,
+            id: typeof rec.id === "string" ? rec.id : "",
+          });
+        }
+      }
+    }
+    if (opts.length > 0) event.options = opts;
   }
+  if (typeof obj.token === "string") event.token = obj.token;
   return event;
 }
 

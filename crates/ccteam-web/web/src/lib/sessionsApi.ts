@@ -117,6 +117,23 @@ export function stopSession(sid: string): Promise<{ stopped: boolean }> {
   return postJson<{ stopped: boolean }>(`${sessionUrl(sid)}/stop`, {});
 }
 
+/** `POST /api/v1/sessions/{sid}/resolve` — resolve a pending HITL choice by
+ *  `token` + the chosen option `id` (`selection`). v0.8.7 review-fix (R-H1):
+ *  this routes through the SAME gateway pending machinery an IM click uses
+ *  (NOT a turn), so `[Approve]` makes the blocked tool actually run and
+ *  `[Deny]` denies immediately. 200 `{resolved:true}`; 404 (mapped to
+ *  NOT_FOUND) for an unknown/expired token or an invalid selection. */
+export function resolveApproval(
+  sid: string,
+  token: string,
+  selection: string,
+): Promise<{ resolved: boolean }> {
+  return postJson<{ resolved: boolean }>(`${sessionUrl(sid)}/resolve`, {
+    token,
+    selection,
+  });
+}
+
 /** Options for {@link createSession}. `permission_mode` defaults to skip
  *  server-side when omitted; pass `"hitl"` to opt the new session into W2
  *  IM-approval prompts for non-allowlist tool calls. */
