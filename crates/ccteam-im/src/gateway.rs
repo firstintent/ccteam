@@ -17,8 +17,8 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
-    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, ProcessBackend, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,10 @@ struct GatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.7 W2 (DB.1) — per-session permission posture (`skip` default /
+    /// `hitl`). Remembered so a `/role` re-spawn and a daemon-restart resume
+    /// re-apply the same mode (and the same hook install).
+    permission_mode: PermissionMode,
     handle: String,
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -249,6 +253,11 @@ pub struct SessionView {
     pub role: String,
     /// Vendor, stringified (`"claude"` / `"codex"`).
     pub vendor: String,
+    /// v0.8.7 W2 (DB.1) — permission posture, stringified (`"skip"` /
+    /// `"hitl"`) so the UI / API can show whether a session prompts for
+    /// non-allowlist tools. `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub permission_mode: String,
     /// Whether this session is the active one for at least one chat.
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
@@ -292,6 +301,11 @@ struct SavedGatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.7 W2 (DB.1) — persisted permission posture so a daemon restart
+    /// re-spawns a hitl session as hitl. `#[serde(default)]` ⇒ already-saved
+    /// state files (no field) restore as `Skip`, matching prior behavior.
+    #[serde(default)]
+    permission_mode: PermissionMode,
     handle: String,
     thread: ThreadHandle,
 }
@@ -317,8 +331,8 @@ pub struct GatewayCommandSpec {
 pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[vendor] [role]"),
-        help: "start a new session",
+        arg_hint: Some("[vendor] [role] [hitl]"),
+        help: "start a new session (trailing `hitl` = approve tools in IM)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -558,6 +572,9 @@ impl Gateway {
                                         project_dir: cwd,
                                         extra_args: vec![],
                                         model_id: None,
+                                        // Restart resume re-applies the
+                                        // persisted posture (DB.1).
+                                        permission_mode: snapshot.permission_mode,
                                     },
                                 )
                                 .await
@@ -769,12 +786,22 @@ impl Gateway {
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 let role = parts.next().unwrap_or("cto").to_string();
+                // v0.8.7 W2 (DB.1) — optional trailing `hitl` token enables
+                // human-in-the-loop approval for this session, e.g.
+                // `/new claude cto hitl`. Absent / `skip` ⇒ default skip.
+                let permission_mode =
+                    PermissionMode::parse_opt(parts.next()).map_err(|e| anyhow!(e))?;
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
                 let session_id = self
-                    .start_session(chat.clone(), project, vendor, role, handle)
+                    .start_session(chat.clone(), project, vendor, role, handle, permission_mode)
                     .await?;
-                Ok(Some(format!("created session {session_id}")))
+                let suffix = if permission_mode.is_hitl() {
+                    " (hitl: non-allowlist tools need IM approval)"
+                } else {
+                    ""
+                };
+                Ok(Some(format!("created session {session_id}{suffix}")))
             }
             "/role" => {
                 let role = parts
@@ -931,6 +958,9 @@ impl Gateway {
             AgentVendor::Claude,
             "cto".to_string(),
             "cto".to_string(),
+            // Implicit default-cto spawn (first message, no `/new`) stays
+            // skip — HITL is opt-in via `/new … hitl` / API / cto tool.
+            PermissionMode::Skip,
         )
         .await?;
         Ok(())
@@ -949,6 +979,9 @@ impl Gateway {
             template.vendor,
             template.role,
             template.handle,
+            // Template-spawned sessions are skip (the route template has no
+            // mode field; HITL is opt-in per session, not per route).
+            PermissionMode::Skip,
         )
         .await
     }
@@ -960,12 +993,20 @@ impl Gateway {
         vendor: AgentVendor,
         role: String,
         handle: String,
+        permission_mode: PermissionMode,
     ) -> Result<String> {
         // A chat session's tmux pane is named `ccteam-chat-<project>-<role>`,
         // so one (project, role) == one pane + transcript. Reuse an existing
         // record instead of spawning a duplicate that would share the pane and
         // run a second event pump over the same transcript (which doubles every
         // reply and clutters the session list). Point it at the new driver.
+        //
+        // v0.8.7 W2 (DB.1) — `permission_mode` is FIXED at first spawn: the
+        // reused pane is already running with its original posture, so a later
+        // `/new … hitl` on a live `skip` pane keeps `skip` (the pane would have
+        // to be restarted to change the spawn flag). We don't silently mutate
+        // the stored mode here to avoid claiming a posture the live process
+        // isn't actually running under.
         if let Some(existing) = self
             .sessions
             .values()
@@ -997,6 +1038,7 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id: None,
+                    permission_mode,
                 },
             )
             .await?;
@@ -1008,6 +1050,7 @@ impl Gateway {
                 project,
                 role,
                 vendor,
+                permission_mode,
                 handle,
                 thread,
                 adapter,
@@ -1049,6 +1092,11 @@ impl Gateway {
         }
         let project = old.project.clone();
         let vendor = old.vendor;
+        // v0.8.7 W2 (DB.1) — preserve the session's permission posture across a
+        // `/role` re-spawn (the new pane re-applies the same hitl/skip spawn
+        // flag + hook install). Without capturing it here the fresh SpawnCtx
+        // would default the session back to skip.
+        let permission_mode = old.permission_mode;
         let owner = old.owner.clone();
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
@@ -1092,6 +1140,7 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id: None,
+                    permission_mode,
                 },
             )
             .await?;
@@ -1106,6 +1155,7 @@ impl Gateway {
                 project,
                 role: role.clone(),
                 vendor,
+                permission_mode,
                 handle: role,
                 thread,
                 adapter,
@@ -1278,6 +1328,7 @@ impl Gateway {
                     project: saved_session.project,
                     role: saved_session.role,
                     vendor: saved_session.vendor,
+                    permission_mode: saved_session.permission_mode,
                     handle: saved_session.handle,
                     thread: saved_session.thread,
                     adapter,
@@ -1327,6 +1378,7 @@ impl Gateway {
                     project: session.project.clone(),
                     role: session.role.clone(),
                     vendor: session.vendor,
+                    permission_mode: session.permission_mode,
                     handle: session.handle.clone(),
                     thread: session.thread.clone(),
                 })
@@ -1758,6 +1810,7 @@ impl Gateway {
                 project: s.project.clone(),
                 role: s.role.clone(),
                 vendor: vendor_str(s.vendor).to_string(),
+                permission_mode: s.permission_mode.as_str().to_string(),
                 current: current.contains(&s.id),
                 status: "live".to_string(),
             })
@@ -1783,23 +1836,38 @@ impl Gateway {
         })
     }
 
+    /// v0.8.7 W2 (DB.3) — resolve a `(project_slug, role)` to its gateway
+    /// session id for the HITL approval prompt label ("session sX (role)
+    /// wants to run …"). A chat pane is uniquely keyed by `(project, role)`
+    /// (same invariant `start_session` dedups on), so this is the gateway-sid
+    /// for the firing session. Returns `None` when no tracked session matches
+    /// (the approval prompt then falls back to a sid-less label). Read-only,
+    /// holds no `.await`.
+    pub fn session_sid_for(&self, project: &str, role: &str) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|s| s.project == project && s.role == role)
+            .map(|s| s.id.clone())
+    }
+
     /// Create a session from the network API (W5b). Thin wrapper over
     /// [`start_session`](Self::start_session): the caller supplies the
-    /// project + role + vendor; the handle defaults to the role name (the
-    /// established convention from `/new`). Returns the new `s{n}` id. The
-    /// `owner` is a synthetic `web` chat key so replies route to the web
-    /// console; an SSE handler then filters the outbound stream by `sid`.
-    /// Reuses an existing (project, role) pane if one is already tracked
-    /// (same dedup as `/new`), so a duplicate API call is idempotent.
+    /// project + role + vendor + permission mode; the handle defaults to the
+    /// role name (the established convention from `/new`). Returns the new
+    /// `s{n}` id. The `owner` is a synthetic `web` chat key so replies route
+    /// to the web console; an SSE handler then filters the outbound stream by
+    /// `sid`. Reuses an existing (project, role) pane if one is already
+    /// tracked (same dedup as `/new`), so a duplicate API call is idempotent.
     pub async fn create_session_api(
         &mut self,
         project: String,
         role: String,
         vendor: AgentVendor,
+        permission_mode: PermissionMode,
     ) -> Result<String> {
         let owner = web_api_chat();
         let handle = role.clone();
-        self.start_session(owner, project, vendor, role, handle)
+        self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
     }
 
@@ -2563,6 +2631,10 @@ mod tests {
         directive_script: Arc<Mutex<VecDeque<DirectiveOutcome>>>,
         /// Status returned by `thread_status` (v0.8.5 P3).
         status: Arc<Mutex<ThreadStatus>>,
+        /// v0.8.7 W2 — `SpawnCtx::permission_mode` captured per start_thread,
+        /// in spawn order, so a test can assert the gateway threaded the right
+        /// posture (skip vs hitl) down to the adapter.
+        spawn_modes: Arc<Mutex<Vec<PermissionMode>>>,
     }
 
     impl Default for FakeAdapter {
@@ -2582,6 +2654,7 @@ mod tests {
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
+                spawn_modes: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2614,6 +2687,7 @@ mod tests {
             ctx: &SpawnCtx,
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            self.spawn_modes.lock().await.push(ctx.permission_mode);
             Ok(ThreadHandle {
                 vendor: self.vendor,
                 mode: ExecutionMode::Chat,
@@ -2737,7 +2811,12 @@ mod tests {
 
         // Create by API → s1, tracked, role/vendor/project as supplied.
         let sid = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         assert_eq!(sid, "s1");
@@ -2783,11 +2862,21 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         let a = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         let b = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         assert_eq!(a, b, "same (project, role) reuses the session id");
@@ -2796,6 +2885,161 @@ mod tests {
             fake.starts.load(Ordering::SeqCst),
             1,
             "the pane is started exactly once"
+        );
+    }
+
+    /// v0.8.7 W2 (DB.1) — `/new claude reviewer hitl` parses the trailing
+    /// token and threads `PermissionMode::Hitl` all the way to the adapter's
+    /// SpawnCtx; the SessionView reports `hitl`. A plain `/new` stays skip.
+    #[tokio::test]
+    async fn new_command_parses_hitl_token_and_threads_mode() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let created = gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer hitl")
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert!(
+            created[0].contains("hitl"),
+            "the /new receipt should mention hitl, got: {created:?}"
+        );
+
+        // The SpawnCtx that reached the adapter carried Hitl.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl]
+        );
+        // The view reports the posture.
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].permission_mode, "hitl");
+    }
+
+    #[tokio::test]
+    async fn new_command_defaults_to_skip() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Skip],
+            "absent trailing token ⇒ skip"
+        );
+        assert_eq!(gateway.session_views()[0].permission_mode, "skip");
+    }
+
+    #[tokio::test]
+    async fn new_command_rejects_bad_permission_token() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // A bad trailing token is a command error (surfaces the typo); no
+        // session is spawned.
+        let res = gateway
+            .handle_command(
+                &ChatKey::new("mock", "chat-1", "alice"),
+                "/new claude reviewer bogus",
+            )
+            .await;
+        assert!(res.is_err(), "a bad permission token must be rejected");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "no spawn on bad token"
+        );
+    }
+
+    /// v0.8.7 W2 (DB.1) — a `/role` re-spawn preserves the session's hitl
+    /// posture (the new pane re-applies the same spawn flag + hook install).
+    #[tokio::test]
+    async fn role_switch_preserves_hitl_mode() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // The role validation reads `.claude/agents/<role>.md` under the
+        // project dir, so seed a target role on disk in a tempdir project.
+        let proj = tempfile::TempDir::new().unwrap();
+        let agents = proj.path().join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("cto.md"), "---\nname: cto\n---\nx").unwrap();
+        std::fs::write(agents.join("builder.md"), "---\nname: builder\n---\nx").unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/role builder")
+            .await
+            .unwrap();
+
+        // Two spawns: the cto (hitl) + the builder re-spawn — both hitl.
+        assert_eq!(
+            fake.spawn_modes.lock().await.as_slice(),
+            &[PermissionMode::Hitl, PermissionMode::Hitl],
+            "/role must preserve the hitl posture across the re-spawn"
+        );
+        // Same sid, still hitl in the view.
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].role, "builder");
+        assert_eq!(views[0].permission_mode, "hitl");
+    }
+
+    /// v0.8.7 W2 (DB.3) — `session_sid_for(slug, role)` maps a firing
+    /// session's (project, role) back to its gateway sid (for the HITL
+    /// approval prompt label).
+    #[tokio::test]
+    async fn session_sid_for_maps_project_role_to_sid() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Hitl,
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_sid_for("alpha", "reviewer"), Some(sid));
+        assert_eq!(gateway.session_sid_for("alpha", "ghost"), None);
+        assert_eq!(gateway.session_sid_for("other", "reviewer"), None);
+    }
+
+    /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
+    /// persist → reload → the restored session reports hitl. Uses a state file
+    /// so the SavedGatewaySession serde round-trip is exercised.
+    #[tokio::test]
+    async fn hitl_mode_persists_across_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("gateway-state.json");
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            gateway.enable_persistence(&state).unwrap();
+            gateway
+                .create_session_api(
+                    "alpha".into(),
+                    "reviewer".into(),
+                    AgentVendor::Claude,
+                    PermissionMode::Hitl,
+                )
+                .await
+                .unwrap();
+        }
+        // Fresh gateway loading the same state file.
+        let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw2 = Gateway::new(fake2.clone(), "alpha", "/tmp/alpha");
+        gw2.enable_persistence(&state).unwrap();
+        let views = gw2.session_views();
+        assert_eq!(views.len(), 1, "the session restored from disk");
+        assert_eq!(
+            views[0].permission_mode, "hitl",
+            "the hitl posture must survive the persist/reload round-trip"
         );
     }
 
@@ -2819,7 +3063,12 @@ mod tests {
         // cto spawns a work-role session + dispatches a task (gateway-driven
         // half of session_spawn / session_dispatch).
         let sid = gateway
-            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
             .await
             .unwrap();
         assert_eq!(sid, "s1");

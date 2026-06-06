@@ -133,6 +133,21 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+    }
+}
+
+/// v0.8.7 W2 — a HITL variant of [`make_ctx`] so the argv tests can assert
+/// the hitl spawn drops the skip flag and carries `--permission-mode default`.
+fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
+    SpawnCtx {
+        slug: slug.to_string(),
+        sid: "chat-f172".into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Hitl,
     }
 }
 
@@ -277,6 +292,69 @@ async fn fresh_spawn_argv_contains_name_flag() {
     assert!(
         !argv.contains("--resume"),
         "fresh argv must NOT contain --resume; got: {argv}"
+    );
+    // v0.8.7 W2 — default (skip) session carries the skip flag, NOT
+    // --permission-mode.
+    assert!(
+        argv.contains("--dangerously-skip-permissions"),
+        "default (skip) fresh argv must carry --dangerously-skip-permissions; got: {argv}"
+    );
+    assert!(
+        !argv.contains("--permission-mode"),
+        "skip fresh argv must NOT carry --permission-mode; got: {argv}"
+    );
+
+    kill_session_quiet(&session_name);
+    std::env::remove_var(CLAUDE_BIN_ENV);
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b (v0.8.7 W2): a HITL fresh spawn drops the skip flag and carries
+// `--permission-mode default` so Claude's permission ask-path stays alive.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn hitl_fresh_spawn_argv_uses_permission_mode_default_and_no_skip() {
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
+    if !ccteam_harness::tmux_ops::tmux_available() {
+        eprintln!("skip: tmux not available");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = fake_claude_logging_script(&tmp);
+
+    let slug = format!("hitl-fresh-{}", std::process::id());
+    let role = "alpha";
+    let session_name = chat_session_name(&slug, role);
+    kill_session_quiet(&session_name);
+
+    std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
+    let brief = AgentSpecBrief {
+        role: role.to_string(),
+    };
+    let ctx = make_ctx_hitl(&slug, &tmp);
+
+    let _handle = ClaudeTuiAdapter::new()
+        .start_thread(&brief, &ctx)
+        .await
+        .expect("start_thread hitl fresh path must succeed");
+
+    let lines = wait_for_argv_lines(tmp.path(), 1, 2000);
+    assert_eq!(lines.len(), 1, "fresh path spawns exactly one invocation");
+    let argv = &lines[0];
+    assert!(
+        argv.contains("--permission-mode") && argv.contains("default"),
+        "hitl fresh argv must carry --permission-mode default; got: {argv}"
+    );
+    assert!(
+        !argv.contains("--dangerously-skip-permissions"),
+        "hitl fresh argv must DROP --dangerously-skip-permissions; got: {argv}"
+    );
+    // Still the keystone --agent + --name (just no skip flag).
+    assert!(
+        argv.contains(&format!("--agent {role}")) && argv.contains("--name"),
+        "hitl fresh argv keeps --agent <role> + --name; got: {argv}"
     );
 
     kill_session_quiet(&session_name);

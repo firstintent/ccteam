@@ -70,6 +70,7 @@ async fn real_codex_app_server_start_thread_smoke() {
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],
                 model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
             },
         ),
     )
@@ -129,6 +130,7 @@ async fn real_codex_reply_roundtrip_proves_model_output() {
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],
                 model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
             },
         ),
     )
@@ -320,6 +322,7 @@ async fn raw_extras_transport_is_resolved_tag() {
                 project_dir: std::env::temp_dir(),
                 extra_args: vec![],
                 model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
             },
         )
         .await
@@ -371,6 +374,7 @@ async fn f10_real_codex_stdio_new_smoke() {
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],
                 model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
             },
         ),
     )
@@ -690,6 +694,7 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
     };
     let err = adapter.start_thread(&spec, &ctx).await.unwrap_err();
     assert!(matches!(err, HarnessError::SpawnFailed(_)));
@@ -763,6 +768,7 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     assert_eq!(h.identity, "tid-77");
@@ -860,6 +866,7 @@ async fn adapter_start_thread_against_scripted_peer() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     assert_eq!(h.vendor, AgentVendor::Codex);
@@ -925,6 +932,7 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     let user_turn = adapter
@@ -1143,6 +1151,7 @@ async fn d2_start_with_notif(
                 project_dir: std::env::temp_dir(),
                 extra_args: vec![],
                 model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
             },
         )
         .await

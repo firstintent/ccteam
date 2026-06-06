@@ -78,6 +78,11 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["claude", "codex"],
                         "description": "Harness vendor (lowercase). Default `claude`."
+                    },
+                    "permission_mode": {
+                        "type": "string",
+                        "enum": ["skip", "hitl"],
+                        "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) drops the skip flag at spawn so a non-allowlist tool call pops an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt. Use for a supervised work-role."
                     }
                 },
                 "required": ["role"],
@@ -235,6 +240,34 @@ mod tests {
         for t in session_tool_definitions() {
             assert_eq!(t["inputSchema"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn session_spawn_schema_carries_permission_mode_param() {
+        // v0.8.7 W2 (DB.1) — session_spawn gains an optional permission_mode
+        // param (a schema change to an EXISTING tool — tool count stays 17).
+        let spawn = session_tool_definitions()
+            .into_iter()
+            .find(|t| t["name"] == "ccteam__session_spawn")
+            .expect("session_spawn defined");
+        let pm = &spawn["inputSchema"]["properties"]["permission_mode"];
+        assert_eq!(pm["type"], "string");
+        let en: Vec<&str> = pm["enum"]
+            .as_array()
+            .expect("permission_mode has an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(en, vec!["skip", "hitl"]);
+        // It is NOT required (default skip), so old callers keep working.
+        let required: Vec<&str> = spawn["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!required.contains(&"permission_mode"));
+        assert_eq!(required, vec!["role"]);
     }
 
     #[test]

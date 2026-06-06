@@ -55,7 +55,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ccteam_harness::AgentVendor;
+use ccteam_harness::{AgentVendor, PermissionMode};
 use ccteam_im::gateway::GatewayEvent;
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -137,12 +137,17 @@ async fn handle_list_sessions(State(app): State<AppState>, Path(slug): Path<Stri
 }
 
 /// POST body for session creation — `role` (required), `vendor` (optional,
-/// defaults `claude`). Accepts form or JSON via [`FormOrJson`].
+/// defaults `claude`), `permission_mode` (optional, `skip` default / `hitl`).
+/// Accepts form or JSON via [`FormOrJson`].
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionForm {
     pub role: String,
     #[serde(default)]
     pub vendor: Option<String>,
+    /// v0.8.7 W2 (DB.1) — `"skip"` (default) or `"hitl"`. Hitl drops the
+    /// skip flag at spawn so non-allowlist tool calls prompt the IM user.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -172,11 +177,16 @@ async fn handle_create_session(
         Ok(v) => v,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
+    // v0.8.7 W2 (DB.1) — optional `permission_mode` body field; default skip.
+    let permission_mode = match PermissionMode::parse_opt(form.permission_mode.as_deref()) {
+        Ok(m) => m,
+        Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
+    };
 
     let sid = {
         let mut guard = gw.lock().await;
         guard
-            .create_session_api(slug.clone(), role.clone(), vendor)
+            .create_session_api(slug.clone(), role.clone(), vendor, permission_mode)
             .await
     };
     match sid {
@@ -443,6 +453,32 @@ mod tests {
     fn parse_vendor_rejects_unknown() {
         assert!(parse_vendor("gemini").is_err());
         assert!(parse_vendor("").is_err());
+    }
+
+    #[test]
+    fn create_session_form_parses_optional_permission_mode() {
+        // v0.8.7 W2 (DB.1) — JSON body with permission_mode → parsed; absent
+        // field → None → default skip at the handler.
+        let with: CreateSessionForm =
+            serde_json::from_str(r#"{"role":"r","permission_mode":"hitl"}"#).unwrap();
+        assert_eq!(with.permission_mode.as_deref(), Some("hitl"));
+        assert_eq!(
+            PermissionMode::parse_opt(with.permission_mode.as_deref()).unwrap(),
+            PermissionMode::Hitl
+        );
+
+        let without: CreateSessionForm = serde_json::from_str(r#"{"role":"r"}"#).unwrap();
+        assert!(without.permission_mode.is_none());
+        assert_eq!(
+            PermissionMode::parse_opt(without.permission_mode.as_deref()).unwrap(),
+            PermissionMode::Skip,
+            "absent permission_mode ⇒ skip"
+        );
+
+        // A bad token is rejected at the API edge (→ 400).
+        let bad: CreateSessionForm =
+            serde_json::from_str(r#"{"role":"r","permission_mode":"nope"}"#).unwrap();
+        assert!(PermissionMode::parse_opt(bad.permission_mode.as_deref()).is_err());
     }
 
     #[test]

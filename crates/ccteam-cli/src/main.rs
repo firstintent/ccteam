@@ -850,6 +850,11 @@ enum HookCommand {
     /// outbox / clarify protocol instead of synchronously waiting on
     /// an offline user.
     InterceptAsk,
+    /// v0.8.7 W2 (DB.3) — `PermissionRequest` hook for HITL chat sessions.
+    /// Fires only for a non-allowlist tool (Claude's ask-path); turns it
+    /// into an IM approve/deny round-trip over the daemon mcp.sock and
+    /// returns the `behavior: allow|deny` decision. Fail-safe deny.
+    PermissionRequest,
     /// V0.6.0 F108 — `mode: chat` Claude Code hook callback. Each
     /// hook event arg maps to one ccteam `chat_*` progress.jsonl
     /// emission. See `ccteam_hooks::chat_progress` for the dispatch
@@ -1587,6 +1592,9 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
         // from stdin (the chat variant routes the question to IM); the bg
         // variant ignores the payload and still denies.
         HookCommand::InterceptAsk => ("intercept-ask", None, true),
+        // v0.8.7 W2 (DB.3) — reads the PermissionRequest payload from stdin
+        // and prints the allow/deny decision JSON.
+        HookCommand::PermissionRequest => ("permission-request", None, true),
         HookCommand::ChatProgress { event } => ("chat-progress", Some(event.as_str()), true),
     };
     let stdin = if needs_stdin {
@@ -2121,6 +2129,16 @@ async fn handle_mcp_socket_connection(
         // the user's selection before responding.
         let response = if is_interaction_ask_call(&req) {
             Some(execute_interaction_ask(&req, sink.as_ref(), pending.as_ref()).await)
+        } else if is_permission_ask_call(&req) {
+            // v0.8.7 W2 (DB.3) — HITL permission approval. Same blocking
+            // External-pending + IM-buttons mechanism as interaction/ask, but
+            // the prompt is an approve/deny and we map the click → an
+            // allow/deny behavior the hook returns to Claude. Reads the
+            // gateway handle for the firing session's sid label.
+            Some(
+                execute_permission_ask(&req, sink.as_ref(), pending.as_ref(), gateway.as_ref())
+                    .await,
+            )
         } else if is_chat_send_file_call(&req) {
             Some(execute_chat_send_file(&req, sink.as_ref()).await)
         } else if is_session_tool_call(&req) {
@@ -2486,6 +2504,218 @@ async fn execute_interaction_ask(
     }
 }
 
+/// v0.8.7 W2 (DB.3) — true when this line is the HITL `PermissionRequest`
+/// hook's `permission/ask` RPC (raw JSON-RPC `method`, not a `tools/call`).
+fn is_permission_ask_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("permission/ask")
+}
+
+/// v0.8.7 W2 (DB.3/DB.4) — handle one `permission/ask` request from a HITL
+/// session's `PermissionRequest` hook. Builds a 2-option (Approve / Deny)
+/// [`ChoicePrompt`], renders it to the bound IM chat as clickable buttons,
+/// and BLOCKS (with a TTL, holding NO lock) on the user's click — the exact
+/// blocking-External-pending mechanism as [`execute_interaction_ask`].
+///
+/// Request:  `{"jsonrpc":"2.0","id":N,"method":"permission/ask",
+///             "params":{"slug","role","tool_name","tool_input",
+///                       "session_id","cwd"}}`
+/// Response: `{"result":{"behavior":"allow"|"deny"}}` on a click,
+///           `{"result":{"timeout":true}}` on TTL lapse (hook → deny), or a
+///           JSON-RPC `error` when addressing / wiring is unavailable (the
+///           hook then fail-safe denies).
+async fn execute_permission_ask(
+    req: &serde_json::Value,
+    sink: Option<&GatewayEventSink>,
+    pending: Option<&PendingRegistry>,
+    gateway: Option<&GatewayHandle>,
+) -> serde_json::Value {
+    use ccteam_harness::{ChoiceOption, ChoicePrompt, ChoiceSelection};
+    use ccteam_im::gateway::{GatewayEvent, GatewayEventKind};
+    use ccteam_im::pending::InteractionOrigin;
+    use ccteam_im::transport::MessageOption;
+
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let err_resp = |msg: String| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.clone(),
+            "error": { "code": -32000, "message": msg },
+        })
+    };
+
+    let (Some(sink), Some(pending)) = (sink, pending) else {
+        return err_resp("permission/ask: IM gateway not running".to_string());
+    };
+    let params = req
+        .pointer("/params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let slug = params.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_name = params
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if tool_name.is_empty() {
+        return err_resp("permission/ask: missing tool_name".to_string());
+    }
+    let tool_input = params
+        .get("tool_input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Resolve addressing first — no point registering a pending we can't show.
+    let bots = match ccteam_im::list_bots() {
+        Ok(b) => b,
+        Err(e) => return err_resp(format!("permission/ask: registry error: {e}")),
+    };
+    let Some((channel, chat_id)) = ccteam_im::resolve_home_chat(slug, role, &bots) else {
+        return err_resp(format!(
+            "permission/ask: no registered chat for {slug}/{role}"
+        ));
+    };
+
+    // Resolve the firing session's gateway sid (for the prompt label). The
+    // pane is uniquely keyed by (slug, role) — same invariant start_session
+    // dedups on. Read-only lookup; drop the gateway guard immediately (never
+    // held across the long await — lock discipline §7-1).
+    let sid_label = match gateway {
+        Some(gw) => {
+            let guard = gw.lock().await;
+            guard.session_sid_for(slug, role)
+        }
+        None => None,
+    };
+    let session_desc = match (&sid_label, role.is_empty()) {
+        (Some(sid), false) => format!("session {sid} ({role})"),
+        (Some(sid), true) => format!("session {sid}"),
+        (None, false) => format!("session ({role})"),
+        (None, true) => "session".to_string(),
+    };
+
+    let summary = summarize_tool_input(&tool_name, &tool_input);
+    let title = format!("{session_desc} wants to run: {summary}");
+
+    // Mint a short token (≤16B ASCII, no `:` — the ChoicePrompt contract).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("p{:x}", (nanos as u64) & 0xff_ffff_ffff);
+
+    // The option `id`s are the decision wire values the hook maps to a
+    // PermissionRequest behavior; the labels are the human-clickable text.
+    let prompt = ChoicePrompt {
+        token: token.clone(),
+        title: title.clone(),
+        options: vec![
+            ChoiceOption {
+                id: "allow".to_string(),
+                label: "✅ Approve".to_string(),
+            },
+            ChoiceOption {
+                id: "deny".to_string(),
+                label: "⛔ Deny".to_string(),
+            },
+        ],
+        multi: false,
+    };
+    let message_options: Vec<MessageOption> = prompt
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| MessageOption {
+            data: format!("{token}:{i}"),
+            label: opt.label.clone(),
+        })
+        .collect();
+
+    // Register the External-origin pending (token-keyed); release the guard
+    // BEFORE the long await (lock discipline §7-1).
+    let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+    let ttl = std::time::Duration::from_secs(INTERACTION_ASK_TIMEOUT_SECS);
+    {
+        let mut guard = pending.lock().await;
+        guard.register(
+            token.clone(),
+            prompt.clone(),
+            InteractionOrigin::External { reply: tx },
+            std::time::Instant::now() + ttl,
+        );
+    }
+
+    // Render the approve/deny buttons in IM.
+    if sink
+        .send(GatewayEvent {
+            id: format!("permission-{token}"),
+            channel,
+            chat_id,
+            thread_ts: None,
+            content: title,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: message_options,
+            // sid set so a per-session web UI stream can show the approval
+            // (None would route to IM fine but be filtered out of SSE).
+            sid: sid_label.clone(),
+        })
+        .is_err()
+    {
+        pending.lock().await.take_by_token(&token);
+        return err_resp("permission/ask: gateway sink closed".to_string());
+    }
+
+    // Block on the click, holding NO lock. The daemon enforces the TTL; on
+    // lapse the hook degrades to deny.
+    match tokio::time::timeout(ttl, rx).await {
+        Ok(Ok(selection)) => {
+            // The resolved id IS the decision ("allow" / "deny").
+            let behavior = match selection.ids.first().map(String::as_str) {
+                Some("allow") => "allow",
+                _ => "deny",
+            };
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "behavior": behavior },
+            })
+        }
+        _ => {
+            pending.lock().await.take_by_token(&token);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "timeout": true },
+            })
+        }
+    }
+}
+
+/// v0.8.7 W2 (DB.4) — render a short, human-readable one-liner of a tool
+/// call for the approval prompt. Picks the most useful field per common tool
+/// (`Bash` → command, file tools → path) and truncates so the IM message
+/// stays compact. Falls back to the tool name when no obvious field exists.
+fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    const MAX: usize = 160;
+    let pick = |key: &str| tool_input.get(key).and_then(|v| v.as_str());
+    let detail = pick("command")
+        .or_else(|| pick("file_path"))
+        .or_else(|| pick("path"))
+        .or_else(|| pick("url"))
+        .or_else(|| pick("pattern"));
+    let body = match detail {
+        Some(d) => format!("{tool_name} {d}"),
+        None => tool_name.to_string(),
+    };
+    if body.chars().count() > MAX {
+        let truncated: String = body.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        body
+    }
+}
+
 // =====================================================================
 // v0.8.7 W1 — cto scheduling: daemon-side `session_*` tool handlers.
 //
@@ -2633,10 +2863,17 @@ async fn run_session_spawn(
         })
         .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?;
     let vendor = parse_session_vendor(args)?;
+    // v0.8.7 W2 (DB.1) — optional `permission_mode` arg (`skip` default /
+    // `hitl`). Lets the cto spawn a supervised work-role whose non-allowlist
+    // tools require IM approval.
+    let permission_mode = ccteam_harness::PermissionMode::parse_opt(
+        args.get("permission_mode").and_then(|v| v.as_str()),
+    )
+    .map_err(|e| format!("session_spawn: {e}"))?;
 
     let mut gw = gateway.lock().await;
     let sid = gw
-        .create_session_api(project.clone(), role.clone(), vendor)
+        .create_session_api(project.clone(), role.clone(), vendor, permission_mode)
         .await
         .map_err(|e| format!("session_spawn failed: {e}"))?;
     drop(gw);
@@ -2645,6 +2882,7 @@ async fn run_session_spawn(
         "sid": sid,
         "project": project,
         "role": role,
+        "permission_mode": permission_mode.as_str(),
         "hint": "dispatch a task with session_dispatch{sid, task}, then poll session_collect{sid}.",
     }))
     .unwrap_or_else(|_| "{}".to_string()))
@@ -3607,5 +3845,70 @@ mod session_tool_tests {
         assert_eq!(ok["result"]["content"][0]["text"], "done");
         let err = session_tool_response(json!(2), "boom".into(), true);
         assert_eq!(err["result"]["isError"], true);
+    }
+
+    // ── v0.8.7 W2 (DB.3/DB.4) — HITL permission/ask wiring ────────────────
+
+    #[test]
+    fn is_permission_ask_call_matches_only_the_raw_method() {
+        assert!(is_permission_ask_call(
+            &json!({ "method": "permission/ask" })
+        ));
+        // Not a tools/call, and not interaction/ask.
+        assert!(!is_permission_ask_call(
+            &json!({ "method": "interaction/ask" })
+        ));
+        assert!(!is_permission_ask_call(&call(
+            "ccteam__session_spawn",
+            json!({})
+        )));
+    }
+
+    #[test]
+    fn summarize_tool_input_picks_the_useful_field() {
+        // Bash → command.
+        assert_eq!(
+            summarize_tool_input("Bash", &json!({ "command": "rm -rf /tmp/x" })),
+            "Bash rm -rf /tmp/x"
+        );
+        // File tools → file_path / path.
+        assert_eq!(
+            summarize_tool_input("Write", &json!({ "file_path": "/a/b.rs" })),
+            "Write /a/b.rs"
+        );
+        // No obvious field → just the tool name.
+        assert_eq!(summarize_tool_input("Glob", &json!({})), "Glob");
+    }
+
+    #[test]
+    fn summarize_tool_input_truncates_long_detail() {
+        let long = "x".repeat(500);
+        let out = summarize_tool_input("Bash", &json!({ "command": long }));
+        // Truncated with an ellipsis; comfortably bounded.
+        assert!(out.ends_with('…'));
+        assert!(
+            out.chars().count() <= 162,
+            "got {} chars",
+            out.chars().count()
+        );
+    }
+
+    /// permission/ask with no gateway/sink/pending wired returns a JSON-RPC
+    /// error (the hook then fail-safe denies) — never panics. Deterministic:
+    /// passes `None` for sink/pending/gateway, so no socket / IM is touched.
+    #[tokio::test]
+    async fn permission_ask_without_gateway_returns_error() {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "permission/ask",
+            "params": { "slug": "s", "role": "r", "tool_name": "Bash" }
+        });
+        let resp = execute_permission_ask(&req, None, None, None).await;
+        assert!(
+            resp.get("error").is_some(),
+            "no gateway ⇒ JSON-RPC error so the hook denies: {resp}"
+        );
+        assert_eq!(resp["id"], json!(7));
     }
 }

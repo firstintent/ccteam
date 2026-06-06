@@ -13,7 +13,7 @@ use ccteam_harness::execution::claude_tui::{
 };
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    SpawnCtx, ThreadHandle, TurnInput, CLAUDE_BIN_ENV,
+    PermissionMode, SpawnCtx, ThreadHandle, TurnInput, CLAUDE_BIN_ENV,
 };
 use serial_test::serial;
 
@@ -52,6 +52,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: PermissionMode::Skip,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -98,6 +99,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: PermissionMode::Skip,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -156,6 +158,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: PermissionMode::Skip,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -233,7 +236,12 @@ fn chat_session_name_format_is_stable() {
 #[test]
 fn ensure_chat_hooks_creates_settings_with_all_events() {
     let tmp = tempfile::TempDir::new().unwrap();
-    ensure_chat_hooks_installed(tmp.path(), "/home/u/.ccteam/hooks/hook.sh").unwrap();
+    ensure_chat_hooks_installed(
+        tmp.path(),
+        "/home/u/.ccteam/hooks/hook.sh",
+        PermissionMode::Skip,
+    )
+    .unwrap();
     // v0.8.6 W2b — ccteam writes its managed hooks to the local settings
     // layer (settings.local.json), never the user-committed settings.json.
     let body = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap();
@@ -279,6 +287,85 @@ fn ensure_chat_hooks_creates_settings_with_all_events() {
         cmd.ends_with("intercept-ask") && cmd.contains("hook.sh"),
         "AskUserQuestion routes to the intercept-ask wrapper, got: {cmd}"
     );
+
+    // v0.8.7 W2 — a SKIP session must NOT install the PermissionRequest hook
+    // (the spawn keeps --dangerously-skip-permissions, so the ask-path never
+    // fires; an entry here would be dead + confusing).
+    assert!(
+        hooks.get("PermissionRequest").is_none(),
+        "skip session must not carry a PermissionRequest hook: {hooks:?}"
+    );
+}
+
+#[test]
+fn ensure_chat_hooks_hitl_installs_permission_request_hook() {
+    // v0.8.7 W2 (DB.2) — a HITL session installs a PermissionRequest hook
+    // routing to `{hook_sh} permission-request`, with NO `timeout` field (a
+    // long human approval must not be killed by Claude Code's hook budget)
+    // and NO `matcher` (all tools reach the ask-path).
+    let tmp = tempfile::TempDir::new().unwrap();
+    ensure_chat_hooks_installed(
+        tmp.path(),
+        "/home/u/.ccteam/hooks/hook.sh",
+        PermissionMode::Hitl,
+    )
+    .unwrap();
+    let body = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pr = v
+        .pointer("/hooks/PermissionRequest")
+        .and_then(|p| p.as_array())
+        .expect("hitl session has a PermissionRequest hook array");
+    assert_eq!(pr.len(), 1, "one PermissionRequest entry");
+    let entry = &pr[0];
+    // No matcher = all tools.
+    assert!(
+        entry.get("matcher").is_none(),
+        "PermissionRequest entry must omit matcher (all tools): {entry:?}"
+    );
+    let hook0 = entry.pointer("/hooks/0").expect("entry has a hook");
+    let cmd = hook0
+        .get("command")
+        .and_then(|c| c.as_str())
+        .expect("hook has a command");
+    assert!(
+        cmd.ends_with("permission-request") && cmd.contains("hook.sh"),
+        "PermissionRequest routes to the permission-request wrapper, got: {cmd}"
+    );
+    // CRITICAL: no `timeout` — a 600s human approval must not be killed.
+    assert!(
+        hook0.get("timeout").is_none(),
+        "PermissionRequest hook must NOT set a timeout (human approval ~600s): {hook0:?}"
+    );
+}
+
+#[test]
+fn ensure_chat_hooks_skip_removes_stale_permission_request_entry() {
+    // v0.8.7 W2 — re-installing as skip after a prior hitl install must REMOVE
+    // the PermissionRequest entry so the hook set matches the spawn flag.
+    let tmp = tempfile::TempDir::new().unwrap();
+    ensure_chat_hooks_installed(
+        tmp.path(),
+        "/home/u/.ccteam/hooks/hook.sh",
+        PermissionMode::Hitl,
+    )
+    .unwrap();
+    ensure_chat_hooks_installed(
+        tmp.path(),
+        "/home/u/.ccteam/hooks/hook.sh",
+        PermissionMode::Skip,
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        v.pointer("/hooks/PermissionRequest").is_none(),
+        "re-installing as skip must drop the stale PermissionRequest entry"
+    );
+    // The ordinary chat-progress hooks are still present.
+    assert!(v["hooks"]["Stop"].is_array());
 }
 
 #[test]
@@ -292,7 +379,12 @@ fn ensure_chat_hooks_preserves_unrelated_top_level_keys() {
         r#"{"someOtherKey": {"x": 1}}"#,
     )
     .unwrap();
-    ensure_chat_hooks_installed(tmp.path(), "/home/u/.ccteam/hooks/hook.sh").unwrap();
+    ensure_chat_hooks_installed(
+        tmp.path(),
+        "/home/u/.ccteam/hooks/hook.sh",
+        PermissionMode::Skip,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(tmp.path().join(".claude/settings.local.json")).unwrap(),
     )

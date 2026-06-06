@@ -176,6 +176,7 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
         project_dir: cwd.to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
     }
 }
 
@@ -402,5 +403,134 @@ async fn claude_agent_session_role_keystone_smoke() {
         saw_followup,
         "a follow-up turn after `--resume` must produce another assistant message \
          carrying the persona token"
+    );
+}
+
+// ===========================================================================
+// v0.8.7 W2 — HITL `PermissionRequest` smoke (real binary, #[ignore]d).
+//
+// Proves the smoke-gate GROUND TRUTH against a live `claude`: a HITL chat
+// session (spawned with `--permission-mode default`, NO skip flag, with the
+// `PermissionRequest` hook installed) FIRES the `PermissionRequest` hook when
+// the assistant attempts a NON-allowlist tool. We log the hook firing with a
+// shell wrapper and assert it recorded `permission-request`.
+//
+// The hook wrapper here exits 0 with EMPTY stdout (it only needs to prove the
+// firing, not drive the IM round-trip — the daemon-side approve/deny path is
+// covered by the deterministic unit tests). We never assert the tool ran; the
+// point is the hook reached our handler, which only happens on the ask-path
+// that `--permission-mode default` (vs `--dangerously-skip-permissions`)
+// keeps alive.
+// ===========================================================================
+
+/// A persona that, when asked, attempts a NON-allowlist tool (a `Bash rm` on
+/// a path under the system temp dir). The exact token is unimportant — we
+/// only care that the model issues a tool call that Claude classifies as
+/// "ask" (non-allowlist), which is what fires the PermissionRequest hook.
+const HITL_ROLE: &str = "smoke-hitl";
+const HITL_SLUG: &str = "agent-hitl";
+
+fn seed_hitl_persona(project_dir: &Path, victim: &Path) {
+    let agents_dir = project_dir.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("create .claude/agents");
+    let body = format!(
+        "---\nname: {HITL_ROLE}\ndescription: ccteam HITL permission-request smoke persona.\n---\n\n\
+         When the user asks you to delete the file, immediately run a single Bash \
+         tool call: `rm {}`. Do not ask for confirmation in text; just issue the \
+         Bash tool call.\n",
+        victim.display()
+    );
+    std::fs::write(agents_dir.join(format!("{HITL_ROLE}.md")), body).expect("write persona .md");
+}
+
+fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
+    SpawnCtx {
+        slug: HITL_SLUG.to_string(),
+        sid: "s-agent-hitl".to_string(),
+        cwd: cwd.to_path_buf(),
+        project_dir: cwd.to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        permission_mode: ccteam_harness::PermissionMode::Hitl,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "real claude binary + login; HITL PermissionRequest fires on non-allowlist tool, run with --ignored"]
+async fn claude_agent_hitl_permission_request_fires_smoke() {
+    if skip_if_unavailable() {
+        return;
+    }
+
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    // The non-allowlist tool target: a real file the model is told to `rm`.
+    let victim = project.path().join("delete-me.txt");
+    std::fs::write(&victim, b"smoke").unwrap();
+    seed_hitl_persona(project.path(), &victim);
+    let (hook_sh, hook_log) = write_hook_logger(home.path());
+
+    let prior_home = std::env::var_os("CCTEAM_HOME");
+    let prior_hook = std::env::var_os("CCTEAM_HOOK_SH");
+    let prior_via = std::env::var_os("CCTEAM_HOOK_VIA_DAEMON");
+    std::env::set_var("CCTEAM_HOME", home.path());
+    std::env::set_var("CCTEAM_HOOK_SH", &hook_sh);
+    std::env::remove_var("CCTEAM_HOOK_VIA_DAEMON");
+
+    let session_name = chat_session_name(HITL_SLUG, HITL_ROLE);
+    kill_session_quiet(&session_name);
+
+    let adapter = ClaudeTuiAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: HITL_ROLE.to_string(),
+            },
+            &make_ctx_hitl(project.path()),
+        )
+        .await
+        .expect("start_thread (claude --permission-mode default) must succeed");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    adapter
+        .submit_turn(
+            &handle,
+            TurnInput::UserText("Delete the file now.".to_string()),
+        )
+        .await
+        .expect("submit_turn must succeed");
+
+    // The PermissionRequest hook should fire on the (non-allowlist) Bash rm →
+    // our logger records `permission-request`. Generous window: the model has
+    // to plan + emit the tool call, then Claude evaluates the allowlist.
+    let saw_permission_hook =
+        wait_for_file_contains(&hook_log, "permission-request", Duration::from_secs(120));
+
+    // Cleanup (self-cleaning).
+    kill_session_quiet(&session_name);
+    if let Some(v) = prior_home {
+        std::env::set_var("CCTEAM_HOME", v);
+    } else {
+        std::env::remove_var("CCTEAM_HOME");
+    }
+    if let Some(v) = prior_hook {
+        std::env::set_var("CCTEAM_HOOK_SH", v);
+    } else {
+        std::env::remove_var("CCTEAM_HOOK_SH");
+    }
+    if let Some(v) = prior_via {
+        std::env::set_var("CCTEAM_HOOK_VIA_DAEMON", v);
+    }
+
+    assert!(
+        saw_permission_hook,
+        "the PermissionRequest hook must fire for a non-allowlist tool under \
+         `--permission-mode default` (hook log `{}` should contain \
+         `permission-request`). If this fails, the HITL ask-path is not alive — \
+         verify the spawn dropped --dangerously-skip-permissions and the \
+         settings.local.json carries the PermissionRequest hook.",
+        hook_log.display()
     );
 }
