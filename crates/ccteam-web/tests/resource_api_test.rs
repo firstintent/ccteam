@@ -1,0 +1,357 @@
+//! v0.8.6 W5b ResDisk — resource API route integration tests.
+//!
+//! Each case fixtures a project under a tempdir-backed `CcteamPaths`,
+//! spins a real axum listener (so the full `stateful_router` — including
+//! the api_v1 GETs sharing paths with the new POST/DELETE — builds
+//! without a route collision), fires the relevant request, and asserts
+//! the status + body shape + disk side effect.
+//!
+//! These cover the disk/config-backed verbs only (the gateway is left
+//! `None`, the standalone "internal web" path); the session endpoints +
+//! their gateway-stop behaviour land in the next stage's smoke tests.
+//! Auth is disabled (loopback default) so these focus on route logic.
+
+use std::net::SocketAddr;
+
+use ccteam_core::{
+    bootstrap_project, disable_tool_surface_bootstrap_for_tests, write_role, CcteamPaths,
+};
+use ccteam_web::{router_with_state, AppState};
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+
+fn fake_paths(root: &std::path::Path) -> CcteamPaths {
+    CcteamPaths {
+        root: root.join(".ccteam"),
+        projects_root: root.join("projects"),
+    }
+}
+
+fn fixture_project(paths: &CcteamPaths, slug: &str) {
+    disable_tool_surface_bootstrap_for_tests();
+    bootstrap_project(paths, slug, "demo request", "dev").unwrap();
+}
+
+async fn spawn(state: AppState) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router_with_state(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    addr
+}
+
+// ----------------------------- roles -----------------------------
+
+#[tokio::test]
+async fn get_roles_lists_agent_md_files() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    // bootstrap seeds cto.md; add a second role with frontmatter.
+    write_role(
+        &paths.project_dir("demo"),
+        "reviewer",
+        "---\nname: reviewer\ndescription: Reviews diffs\nmodel: sonnet\n---\nbody\n",
+    )
+    .unwrap();
+
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/demo/roles"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    let roles = arr.as_array().unwrap();
+    // cto (seeded) + reviewer; sorted by role name.
+    let names: Vec<&str> = roles
+        .iter()
+        .map(|r| r.get("role").unwrap().as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"reviewer"), "got names: {names:?}");
+    let reviewer = roles
+        .iter()
+        .find(|r| r.get("role").unwrap() == "reviewer")
+        .unwrap();
+    assert_eq!(reviewer.get("description").unwrap(), "Reviews diffs");
+    assert_eq!(reviewer.get("model").unwrap(), "sonnet");
+}
+
+#[tokio::test]
+async fn get_roles_unknown_project_404() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/ghost/roles"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn get_single_role_returns_frontmatter_and_body() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    write_role(
+        &paths.project_dir("demo"),
+        "reviewer",
+        "---\nmodel: opus\n---\nYou review.\n",
+    )
+    .unwrap();
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/demo/roles/reviewer"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v.get("role").unwrap(), "reviewer");
+    assert_eq!(v.get("frontmatter").unwrap().get("model").unwrap(), "opus");
+    assert_eq!(v.get("body").unwrap(), "You review.\n");
+}
+
+#[tokio::test]
+async fn get_single_role_unknown_role_404() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/demo/roles/nope"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn put_role_json_writes_file() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let project_dir = paths.project_dir("demo");
+    let addr = spawn(AppState::new(paths)).await;
+
+    let content = "---\nname: newbot\nmodel: haiku\n---\nfresh persona\n";
+    let resp = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/projects/demo/roles/newbot"))
+        .json(&serde_json::json!({ "content": content }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v.get("ok").unwrap(), true);
+    let written = std::fs::read_to_string(project_dir.join(".claude/agents/newbot.md")).unwrap();
+    assert_eq!(written, content);
+}
+
+#[tokio::test]
+async fn put_role_raw_body_writes_file() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let project_dir = paths.project_dir("demo");
+    let addr = spawn(AppState::new(paths)).await;
+
+    let content = "---\nname: rawbot\n---\nraw markdown body\n";
+    let resp = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/projects/demo/roles/rawbot"))
+        .header("content-type", "text/markdown")
+        .body(content)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let written = std::fs::read_to_string(project_dir.join(".claude/agents/rawbot.md")).unwrap();
+    assert_eq!(written, content);
+}
+
+#[tokio::test]
+async fn put_role_rejects_bad_name() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::Client::new()
+        .put(format!(
+            "http://{addr}/api/v1/projects/demo/roles/Bad%20Name"
+        ))
+        .json(&serde_json::json!({ "content": "---\nx\n---\nbody\n" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+// --------------------------- capabilities ---------------------------
+
+#[tokio::test]
+async fn get_capabilities_lists_both_vendors() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/capabilities"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let harnesses = v.get("harnesses").unwrap().as_array().unwrap();
+    assert_eq!(harnesses.len(), 2);
+    let ids: Vec<&str> = harnesses
+        .iter()
+        .map(|h| h.get("id").unwrap().as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"claude-code"));
+    assert!(ids.contains(&"codex"));
+    // `available` is a bool; `providers` is an array (empty for now).
+    for h in harnesses {
+        assert!(h.get("available").unwrap().is_boolean());
+        assert!(h.get("providers").unwrap().as_array().unwrap().is_empty());
+        assert!(h.get("vendor").unwrap().is_string());
+    }
+}
+
+// ----------------------------- projects -----------------------------
+
+#[tokio::test]
+async fn post_project_creates_and_registers() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let root = paths.root.clone();
+    let target = tmp.path().join("adopted-repo");
+    let addr = spawn(AppState::new(paths)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({
+            "slug": "myapp",
+            "path": target.display().to_string(),
+            "team": "dev",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v.get("slug").unwrap(), "myapp");
+    assert_eq!(v.get("path").unwrap(), &target.display().to_string());
+
+    // Side effects: state.json on disk + registered in config.yaml.
+    assert!(target.join(".ccteam/state.json").exists());
+    let entry = ccteam_core::lookup_project_in_config(&root, "myapp")
+        .unwrap()
+        .expect("myapp registered");
+    assert_eq!(entry.path, target);
+    assert_eq!(entry.team, "dev");
+}
+
+#[tokio::test]
+async fn post_project_rejects_bad_slug() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({ "slug": "Bad Slug", "path": "/tmp/x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn post_project_rejects_relative_path() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({ "slug": "myapp", "path": "rel/dir" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn post_project_conflict_on_duplicate_slug() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let target = tmp.path().join("repo1");
+    let addr = spawn(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({ "slug": "dup", "path": target.display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 201);
+
+    let second = client
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({ "slug": "dup", "path": target.display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 409);
+}
+
+#[tokio::test]
+async fn delete_project_deregisters_without_gateway() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let root = paths.root.clone();
+    let target = tmp.path().join("torm");
+    let addr = spawn(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+
+    // Create then delete.
+    client
+        .post(format!("http://{addr}/api/v1/projects"))
+        .json(&serde_json::json!({ "slug": "torm", "path": target.display().to_string() }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v.get("removed").unwrap(), true);
+    // sessions_stopped is empty (no gateway attached).
+    assert!(v
+        .get("sessions_stopped")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Deregistered from config.yaml; working tree NOT purged.
+    assert!(ccteam_core::lookup_project_in_config(&root, "torm")
+        .unwrap()
+        .is_none());
+    assert!(
+        target.exists(),
+        "DELETE must NOT file-purge the working tree"
+    );
+    assert!(target.join(".ccteam/state.json").exists());
+}
+
+#[tokio::test]
+async fn delete_unknown_project_404() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/v1/projects/ghost"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

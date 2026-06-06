@@ -30,6 +30,13 @@ ccteam-hooks.workspace = true
 # pty.rs::PtyRegistry still calls `tmux pipe-pane` directly; that port
 # into `TmuxBackend::subscribe` lands in W2.
 ccteam-harness.workspace = true
+# V0.8.6 W5b — the resource-API spine drives live sessions through the
+# IM gateway. AppState holds `Option<Arc<Mutex<Gateway>>>`; session
+# endpoints compose `Gateway::{session_views,create_session_api,
+# submit_to_sid,stop_session}`. ACYCLIC: `ccteam-im` depends on
+# `ccteam-harness` (not on `ccteam-web`), so `ccteam-web -> ccteam-im`
+# adds no cycle.
+ccteam-im.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 # V0.5.0 F96 — resolve `~/.claude/` root (Anthropic Agent Teams SoT).

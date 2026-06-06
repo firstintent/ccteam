@@ -116,6 +116,16 @@ pub struct DaemonArgs {
     /// (standalone `ccteam-im run`, no mcp.sock) → the gateway keeps its own
     /// fresh registry.
     pub pending: Option<Arc<Mutex<crate::pending::PendingInteractions>>>,
+    /// V0.8.6 W5b — caller-provided gateway handle. `ccteam start` is the
+    /// composition root: it builds the `Arc<Mutex<Gateway>>` once (via
+    /// [`build_gateway_for_daemon`]) and hands the SAME handle to both this
+    /// daemon and the web `AppState`, so the resource API and the IM router
+    /// drive one in-memory session map. When `Some`, the daemon runs its
+    /// post-build wiring (pending registry, restored-session resume, event
+    /// sink) on this handle instead of constructing its own. `None`
+    /// (standalone `ccteam-im run`, no web) → the daemon builds + owns its
+    /// gateway exactly as before.
+    pub gateway: Option<Arc<Mutex<Gateway>>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -136,6 +146,7 @@ impl std::fmt::Debug for DaemonArgs {
             .field("gateway_event_tx", &self.gateway_event_tx.is_some())
             .field("gateway_event_rx", &self.gateway_event_rx.is_some())
             .field("pending", &self.pending.is_some())
+            .field("gateway", &self.gateway.is_some())
             .finish()
     }
 }
@@ -225,17 +236,18 @@ where
         }
     }
     replay_durable_outbox(&channels).await;
-    let mut gateway_inner =
-        build_gateway(factory.clone(), &projects_root, &config_projects, &initial);
-    // v0.8.5 D6 — inject the shared pending-interaction registry when one was
-    // supplied (`ccteam start` hands the same `Arc` to the mcp.sock handler so
-    // the D6 `interaction/ask` ingress and the gateway resolve through one
-    // registry). Standalone runs leave the gateway's own fresh registry.
-    if let Some(pending) = args.pending.clone() {
-        gateway_inner.set_pending(pending);
-    }
-    gateway_inner.resume_restored_sessions().await;
-    log_orphan_chat_sessions(&gateway_inner).await;
+    // V0.8.6 W5b — use the caller-provided gateway handle when `ccteam start`
+    // built one (so the web `AppState` and this daemon drive the SAME session
+    // map); else build + own one (standalone `ccteam-im run`). The post-build
+    // wiring below runs identically on either, under a brief lock.
+    let gateway = args.gateway.clone().unwrap_or_else(|| {
+        Arc::new(Mutex::new(build_gateway(
+            factory.clone(),
+            &projects_root,
+            &config_projects,
+            &initial,
+        )))
+    });
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
     // our own (standalone `ccteam-im run`).
@@ -244,8 +256,23 @@ where
             (Some(tx), Some(rx)) => (tx, rx),
             _ => tokio::sync::mpsc::unbounded_channel::<GatewayEvent>(),
         };
-    gateway_inner.set_event_sink(gateway_event_tx);
-    let gateway = Arc::new(Mutex::new(gateway_inner));
+    {
+        // Hold the gateway lock only for the synchronous + short-async setup.
+        // (At daemon boot nothing else has the handle yet, so this never
+        // contends; doing it under one guard keeps the sequence atomic.)
+        let mut g = gateway.lock().await;
+        // v0.8.5 D6 — inject the shared pending-interaction registry when one
+        // was supplied (`ccteam start` hands the same `Arc` to the mcp.sock
+        // handler so the D6 `interaction/ask` ingress and the gateway resolve
+        // through one registry). Standalone runs leave the gateway's own fresh
+        // registry.
+        if let Some(pending) = args.pending.clone() {
+            g.set_pending(pending);
+        }
+        g.resume_restored_sessions().await;
+        log_orphan_chat_sessions(&g).await;
+        g.set_event_sink(gateway_event_tx);
+    }
 
     // V0.6.1 F132 — spawn one `Channel::listen` task per active
     // channel. Each listener pushes ChannelMessages into a shared mpsc
@@ -511,6 +538,38 @@ fn build_gateway(
         );
     }
     gateway
+}
+
+/// V0.8.6 W5b — build the gateway the daemon would, for the composition
+/// root (`ccteam start`). Derives the same inputs the daemon's startup
+/// computes (default adapter factory, `projects_root` from the optional
+/// `registry` override, `config.yaml::projects[]`, and the persisted bot
+/// list), then returns a [`Gateway`] in the *pre-wiring* state — exactly
+/// what [`build_gateway`] returns. The caller wraps it in
+/// `Arc<Mutex<…>>`, clones the handle into both the web `AppState`
+/// (`AppState::with_gateway`) and [`DaemonArgs::gateway`], and the daemon
+/// then runs its identical post-build wiring (pending registry, restored
+/// session resume, event sink) on the shared handle. Building it here —
+/// instead of after the daemon spawns — eliminates the spawn-order race
+/// between the web task and the IM task: the handle exists before either
+/// runs. `registry` mirrors [`DaemonArgs::registry`] (the projects_root
+/// override; `None` → `~/projects`).
+pub fn build_gateway_for_daemon(registry: Option<PathBuf>) -> Result<Gateway> {
+    let factory = default_adapter_factory();
+    let projects_root: PathBuf = registry.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join("projects")
+    });
+    let ccteam_root = crate::default_ccteam_root_public();
+    let config_projects = crate::load_config_projects_map(&ccteam_root).unwrap_or_default();
+    let bots = list_bots()?;
+    Ok(build_gateway(
+        factory,
+        &projects_root,
+        &config_projects,
+        &bots,
+    ))
 }
 
 /// Surface `ccteam-chat-*` processes that outlived a prior daemon but are not

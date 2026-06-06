@@ -16,6 +16,8 @@ use crate::state::AppState;
 pub mod actions;
 pub mod api_v1;
 pub mod assets;
+// v0.8.6 W5b ResDisk — resource API: capabilities probe.
+pub mod capabilities;
 pub mod chat_ws;
 pub mod dashboard;
 pub mod harness_sse;
@@ -25,9 +27,16 @@ pub mod health;
 pub mod internal_hook;
 pub mod pane_snapshot;
 pub mod project;
+// v0.8.6 W5b ResDisk — resource API: project lifecycle (POST/DELETE) +
+// project-scoped roles (GET/PUT). `project` (singular) is the legacy
+// redirect handler; `projects` / `roles` are the new resource routers.
+pub mod projects;
 pub mod pty_ws;
+pub mod roles;
 pub mod screenshot;
 pub mod session;
+// v0.8.6 W5b ResSessions — session resource API over the gateway spine.
+pub mod sessions_api;
 pub mod sse;
 // V0.5.0 F96 — Agent Teams JSON API + SSE channel.
 pub mod teams_api;
@@ -51,6 +60,17 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(actions::router())
         .merge(internal_hook::router())
         .merge(api_v1::router())
+        // v0.8.6 W5b ResDisk — resource API. `projects` adds POST/DELETE
+        // on the same `/api/v1/projects[/{slug}]` paths api_v1 serves GET
+        // on (axum merges distinct methods); `roles` + `capabilities` are
+        // new paths.
+        .merge(projects::router())
+        .merge(roles::router())
+        .merge(capabilities::router())
+        // v0.8.6 W5b ResSessions — session lifecycle over the gateway spine
+        // (`/api/v1/projects/{slug}/sessions` + `/api/v1/sessions/{sid}/*`).
+        // New paths; 503 when no gateway is attached.
+        .merge(sessions_api::router())
         .merge(chat_ws::router())
         .merge(pty_ws::router())
         // V0.5.0 F96 — Agent Teams surface.

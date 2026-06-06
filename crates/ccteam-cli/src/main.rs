@@ -1715,6 +1715,32 @@ fn run_start(
             None
         };
 
+        // V0.8.6 W5b — composition root for the resource-API spine. When BOTH
+        // web and the IM gateway run in this process, build the shared
+        // `Arc<Mutex<Gateway>>` ONCE here, before either task spawns, and hand
+        // the SAME handle to the web `AppState` (read/drive sessions over HTTP)
+        // and the daemon (owns the session map). Building it pre-spawn removes
+        // the web-vs-IM spawn-order race. When web is off (standalone "internal
+        // web" has no daemon gateway) or IM is off, leave it `None`: the daemon
+        // then builds + owns its own gateway exactly as before, and any web
+        // session endpoint returns 503 (gateway is `None` in `AppState`).
+        let shared_gateway: Option<
+            std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>,
+        > = if web.disabled || imd.disabled {
+            None
+        } else {
+            match ccteam_im::build_gateway_for_daemon(None) {
+                Ok(g) => Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "ccteam start: failed to build shared gateway; web session API will be unavailable (503), daemon builds its own"
+                    );
+                    None
+                }
+            }
+        };
+
         let signal_task = tokio::spawn(async move {
             wait_for_shutdown_signal().await;
             let _ = shutdown_tx.send(true);
@@ -1741,16 +1767,22 @@ fn run_start(
                         bridge.conns.clone(),
                     )
                 });
+            // V0.8.6 W5b — clone the shared gateway handle into the web state
+            // factory so HTTP session endpoints drive the same session map the
+            // daemon owns.
+            let web_gateway = shared_gateway.clone();
             Some(tokio::spawn(async move {
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
                     move |paths, auth| {
-                        let state = ccteam_web::AppState::with_auth(paths, auth);
+                        let mut state = ccteam_web::AppState::with_auth(paths, auth);
                         if let Some((inbound, outbound, backlog, conns)) = web_bridge {
-                            state.with_chat_bridge(inbound, outbound, backlog, conns)
-                        } else {
-                            state
+                            state = state.with_chat_bridge(inbound, outbound, backlog, conns);
                         }
+                        if let Some(gw) = web_gateway {
+                            state = state.with_gateway(gw);
+                        }
+                        state
                     },
                     async move {
                         let _ = rx.changed().await;
@@ -1796,6 +1828,10 @@ fn run_start(
                 gateway_event_tx: gw_event_tx.clone(),
                 gateway_event_rx: gw_event_rx,
                 pending: pending_registry.clone(),
+                // V0.8.6 W5b — reuse the gateway the composition root built so
+                // the daemon and the web `AppState` drive ONE session map. When
+                // `None` (web off), the daemon builds + owns its own.
+                gateway: shared_gateway.clone(),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {
@@ -2210,6 +2246,8 @@ fn build_send_file_event(
             kind,
         }],
         options: Vec::new(),
+        // No gateway session backs the `chat_send_file` MCP path.
+        sid: None,
     })
 }
 
@@ -2368,6 +2406,8 @@ async fn execute_interaction_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            // The D6 `interaction/ask` hook prompt has no gateway session.
+            sid: None,
         })
         .is_err()
     {

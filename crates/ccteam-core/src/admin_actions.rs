@@ -71,6 +71,35 @@ pub fn change_persona(project_dir: &Path, bot: &str, new_persona_md: &str) -> Re
     Ok(path)
 }
 
+/// v0.8.6 W5b ResDisk — create-or-replace a role's persona file.
+///
+/// Unlike [`change_persona`] (which refuses if the file is missing —
+/// the F128 "operate on an existing bot" semantics), this is the
+/// idempotent **PUT** primitive the resource API uses: it writes
+/// `<project_dir>/.claude/agents/<role>.md`, creating the file (and the
+/// `.claude/agents/` parent) when absent. Same atomic tmp + rename write
+/// as `change_persona` so a concurrent Claude Code open-on-read can't
+/// race a half-written file. Refuses an empty body (a content-less role
+/// file is surface-level user error) or a `role` outside `[a-z0-9_-]`.
+/// Returns the absolute path written.
+pub fn write_role(project_dir: &Path, role: &str, content: &str) -> Result<PathBuf> {
+    validate_bot_name(role)?;
+    if content.trim().is_empty() {
+        bail!("write_role: content is empty");
+    }
+    let path = agent_md_path(project_dir, role);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("agent .md path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
 /// Return value from [`add_tool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddToolResult {
@@ -308,6 +337,33 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_persona(tmp.path(), "alice", "---\nname: alice\n---\n");
         assert!(change_persona(tmp.path(), "alice", "   \n").is_err());
+    }
+
+    #[test]
+    fn write_role_creates_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        // No seed: write_role must create the file (unlike change_persona).
+        let content = "---\nname: reviewer\nmodel: sonnet\n---\nbody\n";
+        let written = write_role(tmp.path(), "reviewer", content).unwrap();
+        assert_eq!(written, agent_md_path(tmp.path(), "reviewer"));
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), content);
+    }
+
+    #[test]
+    fn write_role_replaces_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        seed_persona(tmp.path(), "reviewer", "---\nname: reviewer\n---\nold\n");
+        let new = "---\nname: reviewer\n---\nnew body\n";
+        write_role(tmp.path(), "reviewer", new).unwrap();
+        let got = std::fs::read_to_string(agent_md_path(tmp.path(), "reviewer")).unwrap();
+        assert_eq!(got, new);
+    }
+
+    #[test]
+    fn write_role_rejects_empty_and_bad_name() {
+        let tmp = TempDir::new().unwrap();
+        assert!(write_role(tmp.path(), "reviewer", "   \n").is_err());
+        assert!(write_role(tmp.path(), "Bad Name", "---\nx\n---\n").is_err());
     }
 
     #[test]

@@ -535,6 +535,7 @@ dependencies = [
  "ccteam-core",
  "ccteam-harness",
  "ccteam-hooks",
+ "ccteam-im",
  "chrono",
  "dirs",
  "futures",

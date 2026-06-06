@@ -1868,6 +1868,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
             kind: OutboundFileKind::Photo,
         }],
         options: Vec::new(),
+        sid: None,
     })
     .unwrap();
 
@@ -1886,6 +1887,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
         gateway_event_tx: Some(tx.clone()),
         gateway_event_rx: Some(rx),
         pending: None,
+        gateway: None,
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

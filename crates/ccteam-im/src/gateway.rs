@@ -151,6 +151,15 @@ pub struct GatewayEvent {
     /// for ordinary answers; non-empty when an adapter `NeedsChoice` (or a
     /// D6 hook prompt, W2) is delivered asynchronously.
     pub options: Vec<crate::transport::MessageOption>,
+    /// Originating gateway session id (`s{n}`), when the event came from a
+    /// tracked session's event pump / turn watchdog (V0.8.6 W5b). This is
+    /// the **SSE filter key**: a per-session web SSE handler keeps only the
+    /// events whose `sid` matches the session it is streaming. `None` for
+    /// events not tied to a session (e.g. the `chat_send_file` MCP path and
+    /// the D6 `interaction/ask` hook prompt, which have no gateway session).
+    /// The IM delivery path ignores `sid` entirely — it routes by `channel`
+    /// + `chat_id` as before — so this is additive.
+    pub sid: Option<String>,
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
@@ -175,6 +184,33 @@ pub struct SessionInventory {
     pub tracked: Vec<String>,
     /// Live `ccteam-chat-*` names with no tracked session (orphans).
     pub orphans: Vec<OrphanSession>,
+}
+
+/// A serializable, read-only snapshot of one tracked gateway session
+/// (V0.8.6 W5b — the resource API spine). Produced by
+/// [`Gateway::session_views`] under a brief lock (fields are cloned; no
+/// `.await` is held), so the web layer can list live sessions without
+/// reaching into the gateway's private maps. `vendor` is stringified
+/// (`"claude"` / `"codex"`) to keep the wire shape stable independent of
+/// the harness enum. `current` is true when the session is the active one
+/// for *any* chat the gateway is routing (the web console is a global
+/// operator view, so "current for someone" is the useful hint). `status`
+/// is a cheap, synchronous liveness label — the async per-session model /
+/// context detail stays in `/sessions` (which `.await`s `thread_status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionView {
+    /// Gateway session id (`s{n}`) — the network-API session namespace.
+    pub sid: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Agent role (`.claude/agents/<role>.md`).
+    pub role: String,
+    /// Vendor, stringified (`"claude"` / `"codex"`).
+    pub vendor: String,
+    /// Whether this session is the active one for at least one chat.
+    pub current: bool,
+    /// Cheap synchronous liveness hint (`"live"` for any tracked session).
+    pub status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1059,6 +1095,7 @@ impl Gateway {
                                     kind: GatewayEventKind::Answer,
                                     attachments: Vec::new(),
                                     options: Vec::new(),
+                                    sid: Some(session_id.clone()),
                                 })
                                 .is_err()
                             {
@@ -1345,6 +1382,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: to_message_options(&prompt),
+                sid: Some(session_id.to_string()),
             });
             Ok(Vec::new())
         } else {
@@ -1602,6 +1640,137 @@ impl Gateway {
             lines.join("\n")
         }
     }
+
+    // =================================================================
+    // V0.8.6 W5b — resource-API spine. Public, web-facing accessors that
+    // compose the existing private internals so `ccteam-web` can drive
+    // sessions over HTTP without reaching into the gateway's private maps.
+    // =================================================================
+
+    /// Snapshot every tracked session as a [`SessionView`] (W5b). Holds the
+    /// gateway only long enough to clone scalar fields — no `.await` runs
+    /// under any lock — so an SSE/list handler can call this cheaply. A
+    /// session is `current` when it is the active session for at least one
+    /// routed chat. Ordered by `s{n}` index for stable rendering.
+    pub fn session_views(&self) -> Vec<SessionView> {
+        let current: std::collections::HashSet<&String> = self.current_session.values().collect();
+        let mut views: Vec<SessionView> = self
+            .sessions
+            .values()
+            .map(|s| SessionView {
+                sid: s.id.clone(),
+                project: s.project.clone(),
+                role: s.role.clone(),
+                vendor: vendor_str(s.vendor).to_string(),
+                current: current.contains(&s.id),
+                status: "live".to_string(),
+            })
+            .collect();
+        views.sort_by_key(|v| session_index(&v.sid));
+        views
+    }
+
+    /// Create a session from the network API (W5b). Thin wrapper over
+    /// [`start_session`](Self::start_session): the caller supplies the
+    /// project + role + vendor; the handle defaults to the role name (the
+    /// established convention from `/new`). Returns the new `s{n}` id. The
+    /// `owner` is a synthetic `web` chat key so replies route to the web
+    /// console; an SSE handler then filters the outbound stream by `sid`.
+    /// Reuses an existing (project, role) pane if one is already tracked
+    /// (same dedup as `/new`), so a duplicate API call is idempotent.
+    pub async fn create_session_api(
+        &mut self,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+    ) -> Result<String> {
+        let owner = web_api_chat();
+        let handle = role.clone();
+        self.start_session(owner, project, vendor, role, handle)
+            .await
+    }
+
+    /// Submit a user-text turn to a session addressed by `sid` (W5b).
+    /// Looks the session up by id (not by current-chat routing), points its
+    /// `reply_to` at the web console so the async answer/progress events
+    /// route back to a web SSE subscriber, then submits via the owning
+    /// adapter. The lock is held only across the (fast) `submit_turn`
+    /// send-keys / RPC; the long turn streams asynchronously through the
+    /// event pump. Returns the submitted [`TurnId`]'s inner string.
+    pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
+        let session = self
+            .sessions
+            .get(sid)
+            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        // Route this turn's async replies to the web console (mirrors the
+        // per-turn `reply_to` retarget the inbound submit path does).
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = web_api_chat();
+        }
+        let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        let submit_wait = gateway_submit_timeout_duration();
+        let turn_id = tokio::time::timeout(
+            submit_wait,
+            session
+                .adapter
+                .submit_turn(&session.thread, TurnInput::UserText(text)),
+        )
+        .await
+        .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {sid}"))??;
+        // Arm the same async-turn machinery the inbound path uses (turn
+        // watchdog when a sink is wired; otherwise this is a no-op drain).
+        let _ = self
+            .after_turn_submitted(session, start_visible_events, &turn_id.0)
+            .await?;
+        Ok(turn_id.0)
+    }
+
+    /// Stop the session addressed by `sid` (W5b). Mirrors the
+    /// [`switch_current_role`](Self::switch_current_role) teardown: abort
+    /// the event pump, `close_thread` on the owning adapter, drop the
+    /// session record, clear any `current_session` route that pointed at
+    /// it, then persist. Idempotent-ish: an unknown `sid` is an error so
+    /// the API can surface a 404, but a missing tmux pane inside
+    /// `close_thread` is tolerated (adapter close is idempotent). Never
+    /// file-purges — deregister-only, per the locked W5b decision.
+    pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
+        let session = self
+            .sessions
+            .get(sid)
+            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        let thread = session.thread.clone();
+        let adapter = Arc::clone(&session.adapter);
+        // Abort the pump before closing so no stale pump keeps draining the
+        // retired transcript (mirrors switch_current_role).
+        if let Some(pump) = self.event_pumps.remove(sid) {
+            pump.abort();
+        }
+        let _ = adapter.close_thread(&thread).await;
+        self.sessions.remove(sid);
+        // Drop every current-session route that pointed at this sid so a
+        // chat doesn't keep addressing a dead session.
+        self.current_session.retain(|_, v| v != sid);
+        self.persist_state()?;
+        Ok(())
+    }
+}
+
+/// Stringify a vendor for the [`SessionView`] wire shape. Kept local so
+/// the web layer never depends on the harness enum's serde rename.
+fn vendor_str(v: AgentVendor) -> &'static str {
+    match v {
+        AgentVendor::Claude => "claude",
+        AgentVendor::Codex => "codex",
+    }
+}
+
+/// The synthetic chat key used by the network resource API (W5b) as the
+/// `owner` / `reply_to` for sessions it creates or drives. `channel ==
+/// "web"` so it matches the web console's existing cross-entry sharing
+/// rules (e.g. global `/sessions`, `/use` any session), and the
+/// per-`sid` SSE filter keys on `chat_id == sid` via [`pump_target`].
+fn web_api_chat() -> ChatKey {
+    ChatKey::new("web", "web-api", "web-api")
 }
 
 /// Reconcile live `ccteam-chat-*` process names against a set of *tracked*
@@ -1702,6 +1871,7 @@ fn spawn_turn_timeout_watchdog(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            sid: Some(session_id.clone()),
         });
     });
 }
@@ -1774,6 +1944,7 @@ fn emit_progress(
         chat_id,
         thread_ts: None,
         content: content.to_string(),
+        sid: Some(session_id.to_string()),
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
         options: Vec::new(),
@@ -2363,6 +2534,79 @@ mod tests {
         assert_eq!(
             fake.submissions.lock().await.as_slice(),
             &[("alpha-reviewer-s1".to_string(), "hi".to_string())]
+        );
+    }
+
+    /// V0.8.6 W5b — the resource-API spine: create a session via
+    /// `create_session_api`, see it in `session_views`, submit a turn by
+    /// `sid` (the sink-less drain returns the fake echo), then `stop_session`
+    /// removes it. Confirms the web layer can drive a session purely by id.
+    #[tokio::test]
+    async fn gateway_resource_api_create_view_submit_stop() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        // Create by API → s1, tracked, role/vendor/project as supplied.
+        let sid = gateway
+            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.sid, "s1");
+        assert_eq!(v.project, "alpha");
+        assert_eq!(v.role, "reviewer");
+        assert_eq!(v.vendor, "claude", "vendor is stringified for the wire");
+        assert_eq!(v.status, "live");
+        assert!(
+            v.current,
+            "the API session is current for its synthetic web chat"
+        );
+
+        // Submit by sid → sink-less drain returns the fake's echo; the
+        // adapter recorded the UserText against the right thread.
+        let turn = gateway.submit_to_sid("s1", "hello".into()).await.unwrap();
+        assert!(turn.starts_with("turn-alpha-reviewer-s1"));
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[("alpha-reviewer-s1".to_string(), "hello".to_string())]
+        );
+
+        // Submit to an unknown sid is an error (→ 404 at the API edge).
+        assert!(gateway.submit_to_sid("s99", "x".into()).await.is_err());
+
+        // Stop by sid → session gone, view list empty; idempotent-not (a
+        // second stop is an error so the API can 404).
+        gateway.stop_session("s1").await.unwrap();
+        assert!(gateway.session_views().is_empty());
+        assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    /// V0.8.6 W5b — `create_session_api` is idempotent on (project, role):
+    /// a duplicate call reuses the existing pane / session id rather than
+    /// spawning a second thread over the same transcript (same dedup `/new`
+    /// relies on).
+    #[tokio::test]
+    async fn gateway_resource_api_create_dedups_pane() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let a = gateway
+            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .await
+            .unwrap();
+        let b = gateway
+            .create_session_api("alpha".into(), "reviewer".into(), AgentVendor::Claude)
+            .await
+            .unwrap();
+        assert_eq!(a, b, "same (project, role) reuses the session id");
+        assert_eq!(gateway.session_views().len(), 1);
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "the pane is started exactly once"
         );
     }
 

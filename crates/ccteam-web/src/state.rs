@@ -73,6 +73,16 @@ pub struct AppState {
     /// parked in `chat_backlog` (0 sockets). The WS edge bumps this on
     /// connect and decrements on disconnect.
     pub chat_conns: ChatConns,
+    /// V0.8.6 W5b — handle to the live IM gateway, shared with the daemon
+    /// that owns the session map (the web server runs in the same daemon
+    /// process). `Some` when `ccteam start` runs the gateway alongside web;
+    /// the resource-API session endpoints compose
+    /// `Gateway::{session_views,create_session_api,submit_to_sid,
+    /// stop_session}` through it. `None` for the standalone "internal web"
+    /// path (no daemon gateway) — session endpoints then return 503. The
+    /// coupling is a direct crate dep (`ccteam-web -> ccteam-im`), acyclic
+    /// because `ccteam-im` does not depend on `ccteam-web`.
+    pub gateway: Option<Arc<Mutex<ccteam_im::gateway::Gateway>>>,
 }
 
 /// Shared map of `chat_id` → live web-chat socket count.
@@ -139,6 +149,7 @@ impl AppState {
             chat_outbound,
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
+            gateway: None,
         }
     }
 
@@ -162,6 +173,7 @@ impl AppState {
             chat_outbound,
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
+            gateway: None,
         }
     }
 
@@ -192,6 +204,17 @@ impl AppState {
         self.chat_outbound = outbound;
         self.chat_backlog = backlog;
         self.chat_conns = conns;
+        self
+    }
+
+    /// V0.8.6 W5b — attach the live IM gateway handle. `ccteam start`
+    /// builds the `Arc<Mutex<Gateway>>` once (composition root) and clones
+    /// it into the web state factory here and into the daemon, so both
+    /// drive the *same* in-memory session map. The standalone "internal
+    /// web" path never calls this, leaving `gateway = None` so session
+    /// endpoints return 503.
+    pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
+        self.gateway = Some(gateway);
         self
     }
 }

@@ -596,7 +596,7 @@ pub fn resolve_home_chat(
 /// V0.6.1 F130 form `ccteam start` consumes (caller-supplied shutdown
 /// future); `run_daemon` is the SIGINT-only convenience wrapper kept
 /// for the existing integration-test surface.
-pub use daemon::{run_daemon, run_daemon_with_shutdown, DaemonArgs};
+pub use daemon::{build_gateway_for_daemon, run_daemon, run_daemon_with_shutdown, DaemonArgs};
 
 #[cfg(test)]
 mod tests {

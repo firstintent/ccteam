@@ -70,6 +70,9 @@ pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
 pub mod queries;
+// v0.8.6 W5b ResDisk — read-side reader for project-scoped agent roles
+// (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
+pub mod roles;
 pub mod screenshot;
 pub mod silence_classifier;
 pub mod skill;
@@ -100,6 +103,9 @@ pub use actions::{
     inject_decision, next_inbox_seq, pause, resume, send_to_session, send_to_session_with,
     DecisionInput, SendOptions, SendResult,
 };
+// V0.6.1 F128 + v0.8.6 W5b — agent .md write primitives. `write_role` is
+// the create-or-replace PUT primitive the resource API uses.
+pub use admin_actions::{agent_md_path, change_persona, write_role, AddToolResult};
 // V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
 // (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
 pub use advise::{
@@ -210,6 +216,7 @@ pub use projects::{
     pre_trust_project, refuses_active_session, slugify, slugify_brief, validate_slug_format,
     ActiveSessionRefusal,
 };
+// v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{
     active_sessions, artifact_queue, artifact_status, collect_projects, collect_recent_events,
     compute_cost_summary, cost_history_buckets, cost_summary, cost_summary_from_events,
@@ -217,6 +224,7 @@ pub use queries::{
     ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
     WorkflowSummary,
 };
+pub use roles::{list_roles, read_role, RoleDetail, RoleSummary};
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
     FONT_ENV as SCREENSHOT_FONT_ENV,

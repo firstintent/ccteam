@@ -1,0 +1,306 @@
+//! v0.8.6 W5b ResDisk — project resource lifecycle endpoints.
+//!
+//! This module owns the **mutating** project resource verbs:
+//!
+//! - `POST   /api/v1/projects`        → create (bootstrap + register) → 201
+//! - `DELETE /api/v1/projects/{slug}` → deregister + stop its sessions → 200
+//!
+//! The **read** verbs (`GET /api/v1/projects` list, `GET
+//! /api/v1/projects/{slug}` detail) are served by the pre-existing
+//! [`super::api_v1`] handlers (`handle_projects` → `DashboardRow[]` via
+//! `ccteam_core::collect_projects`; `handle_project` → `ProjectSummary`).
+//! axum merges this router's `POST` / `DELETE` method handlers onto the
+//! same paths as api_v1's `GET`s — different HTTP methods on one path do
+//! not collide. We deliberately do **not** re-register the GETs here: the
+//! SPA already consumes api_v1's richer shapes, and a second GET handler
+//! on the same path would panic at router build time.
+//!
+//! **DELETE semantics (locked W5b decision)**: deregister only —
+//! `config::remove_project(slug)` plus, when a gateway is attached, stop
+//! every live session for that project via the spine. It never
+//! file-purges the working tree; destructive purge stays the CLI op
+//! `ccteam project rm --purge`.
+//!
+//! Auth: merged into [`super::stateful_router`], so the existing
+//! `auth_layer` gate applies.
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, post},
+    Json, Router,
+};
+use ccteam_core::ProjectEntry;
+use serde::{Deserialize, Serialize};
+
+use super::actions::{FormOrJson, InputMode};
+use crate::state::AppState;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/projects", post(handle_create_project))
+        .route("/api/v1/projects/{slug}", delete(handle_delete_project))
+}
+
+/// POST body — `slug` (required), `path` (required, absolute or
+/// `~`-relative working-tree dir), `team` (optional, defaults `dev`).
+#[derive(Debug, Deserialize)]
+pub struct CreateProjectForm {
+    pub slug: String,
+    pub path: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// 201 response body for a created project.
+#[derive(Debug, Serialize)]
+pub struct CreatedProject {
+    pub slug: String,
+    pub path: String,
+}
+
+/// `POST /api/v1/projects`
+///
+/// Mirrors `Gateway::create_project`'s sequence (validate slug →
+/// bootstrap at the resolved dir → register in config.yaml) but does
+/// **not** require a gateway: project scaffolding is pure disk/config
+/// work. When a gateway *is* attached, a later `POST .../sessions` call
+/// will lazily load the freshly-registered project (`/cd`-style), so we
+/// don't need to push it into the in-memory roster here.
+async fn handle_create_project(
+    State(app): State<AppState>,
+    FormOrJson(form, mode): FormOrJson<CreateProjectForm>,
+) -> Response {
+    let team = form
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("dev")
+        .to_string();
+
+    // 1. Validate the slug grammar ([a-z0-9-]+, ≤60, no edge dashes).
+    let slug = match ccteam_core::validate_slug_format(&form.slug) {
+        Ok(s) => s,
+        Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
+    };
+
+    // 2. Reject a slug already registered (idempotency guard mirroring
+    //    Gateway::create_project) — a re-POST shouldn't silently clobber.
+    match ccteam_core::lookup_project_in_config(&app.paths.root, &slug) {
+        Ok(Some(_)) => {
+            return create_error(
+                StatusCode::CONFLICT,
+                format!("project already exists: {slug}"),
+                mode,
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(%slug, %err, "lookup_project_in_config failed");
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry read failed: {err}"),
+                mode,
+            );
+        }
+    }
+
+    // 3. Resolve the working-tree dir. `~`-expansion + absolute-path
+    //    enforcement; we keep this local (the gateway's `expand_project_
+    //    path` is private) but apply the same rule: must be absolute after
+    //    expansion.
+    let abs = match expand_project_path(&form.path) {
+        Ok(p) => p,
+        Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
+    };
+
+    // 4. Bootstrap on disk (leaves existing user files alone; creates the
+    //    dir when empty) then register in config.yaml.
+    let paths = app.paths.clone();
+    let slug_for_blocking = slug.clone();
+    let abs_for_blocking = abs.clone();
+    let team_for_blocking = team.clone();
+    let scaffold = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        ccteam_core::bootstrap_project_at_dir(
+            &paths,
+            &abs_for_blocking,
+            &slug_for_blocking,
+            "(created from web resource API)",
+            &team_for_blocking,
+        )?;
+        ccteam_core::upsert_project_in_config(
+            &paths.root,
+            ProjectEntry {
+                slug: slug_for_blocking.clone(),
+                path: abs_for_blocking.clone(),
+                team: team_for_blocking.clone(),
+                installed_at: chrono::Utc::now(),
+            },
+        )?;
+        Ok(())
+    })
+    .await;
+
+    match scaffold {
+        Ok(Ok(())) => {
+            let body = CreatedProject {
+                slug: slug.clone(),
+                path: abs.display().to_string(),
+            };
+            match mode {
+                // Both modes return 201 with the created resource — the
+                // form path here is API (not htmx), so a redirect would be
+                // wrong; a 201 + JSON body is the honest REST shape.
+                InputMode::Form | InputMode::Json => {
+                    (StatusCode::CREATED, Json(body)).into_response()
+                }
+            }
+        }
+        Ok(Err(err)) => {
+            tracing::error!(%slug, %err, "create_project scaffold/register failed");
+            create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create failed: {err}"),
+                mode,
+            )
+        }
+        Err(err) => {
+            tracing::error!(%slug, ?err, "create_project worker failed");
+            create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "create worker failed".to_string(),
+                mode,
+            )
+        }
+    }
+}
+
+/// `DELETE /api/v1/projects/{slug}`
+///
+/// Deregister-only: remove the slug from `config.yaml`, then (when a
+/// gateway is attached) stop every live session belonging to that
+/// project via the spine. 404 when the slug is not registered. Never
+/// file-purges. Returns `{ "removed": true }` on success.
+async fn handle_delete_project(State(app): State<AppState>, Path(slug): Path<String>) -> Response {
+    // 1. Deregister from config.yaml. `false` = slug wasn't present → 404.
+    match ccteam_core::remove_project_from_config(&app.paths.root, &slug) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("project not registered: {slug}")})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(%slug, %err, "remove_project_from_config failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("deregister failed: {err}")})),
+            )
+                .into_response();
+        }
+    }
+
+    // 2. Stop every live session for this project via the spine, if a
+    //    gateway is attached. Snapshot the sids under one lock (session_
+    //    views is sync), then stop them (each stop_session is async, held
+    //    under the same lock — the gateway access pattern from the spine).
+    //    No gateway (standalone internal-web path) ⇒ skip; deregister
+    //    alone is the meaningful effect there.
+    let mut stopped: Vec<String> = Vec::new();
+    if let Some(gw) = app.gateway.as_ref() {
+        let mut guard = gw.lock().await;
+        let sids: Vec<String> = guard
+            .session_views()
+            .into_iter()
+            .filter(|v| v.project == slug)
+            .map(|v| v.sid)
+            .collect();
+        for sid in sids {
+            match guard.stop_session(&sid).await {
+                Ok(()) => stopped.push(sid),
+                Err(err) => {
+                    // Best-effort: a session that vanished mid-teardown
+                    // shouldn't fail the deregister (already removed from
+                    // config). Log + continue.
+                    tracing::warn!(%slug, %sid, %err, "stop_session during project delete failed");
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "removed": true,
+        "sessions_stopped": stopped,
+    }))
+    .into_response()
+}
+
+/// Shared POST error responder honoring the [`FormOrJson`] mode
+/// convention: form ⇒ plain text, JSON ⇒ `{ "ok": false, "error": ... }`.
+fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
+    match mode {
+        InputMode::Form => (status, msg).into_response(),
+        InputMode::Json => {
+            (status, Json(serde_json::json!({"ok": false, "error": msg}))).into_response()
+        }
+    }
+}
+
+/// Expand a `~`-relative or relative project path to an absolute
+/// `PathBuf`, mirroring `Gateway::create_project`'s `expand_project_path`
+/// contract (the gateway's helper is private to ccteam-im). Rules:
+///
+/// - `~` / `~/...` expands against `$HOME`.
+/// - The result must be absolute (a bare relative path with no `~` is
+///   rejected — the API caller must be explicit about where the working
+///   tree lives).
+fn expand_project_path(raw: &str) -> anyhow::Result<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("path must be non-empty");
+    }
+    let expanded: std::path::PathBuf = if trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+    if !expanded.is_absolute() {
+        anyhow::bail!("path must be absolute (or ~-relative); got {:?}", trimmed);
+    }
+    Ok(expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_project_path_rejects_relative() {
+        assert!(expand_project_path("some/rel/dir").is_err());
+        assert!(expand_project_path("").is_err());
+    }
+
+    #[test]
+    fn expand_project_path_keeps_absolute() {
+        let p = expand_project_path("/abs/dir").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/abs/dir"));
+    }
+
+    #[test]
+    fn expand_project_path_expands_home() {
+        if let Some(home) = dirs::home_dir() {
+            let p = expand_project_path("~/work/x").unwrap();
+            assert_eq!(p, home.join("work/x"));
+            let bare = expand_project_path("~").unwrap();
+            assert_eq!(bare, home);
+        }
+    }
+}
