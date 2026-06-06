@@ -37,10 +37,16 @@
 //! but keep-alives — fix #2.)
 //!
 //! **History**: the gateway keeps no in-memory transcript, so the history
-//! endpoint tails the per-session source on disk — the project's
-//! `progress.jsonl`, filtered to lines carrying this `session_id`. It is
-//! best-effort: an empty `events` array is a valid 200 when nothing has
-//! been written yet. A `sid` unknown to the gateway is a 404.
+//! endpoint tails the per-session source on disk. The gateway session id
+//! (`s{n}`) never appears in the flat `<slug>.jsonl` progress, so the
+//! handler resolves `sid → {role, project_dir}` via
+//! [`Gateway::session_resolve`](ccteam_im::gateway::Gateway::session_resolve)
+//! (under the gateway lock, which it drops before the blocking fs read)
+//! then reads the ccteam-owned mirror
+//! `<project_dir>/.ccteam/chat/<role>/turns.jsonl` via
+//! [`read_all_turns`](ccteam_harness::execution::turns_mirror::read_all_turns).
+//! It is best-effort: an empty `events` array is a valid 200 when nothing
+//! has been written yet. A `sid` unknown to the gateway is a 404.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -55,6 +61,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::{AgentVendor, PermissionMode};
 use ccteam_im::gateway::GatewayEvent;
 use futures::stream::{Stream, StreamExt};
@@ -204,48 +211,62 @@ async fn handle_create_session(
 
 /// `GET /api/v1/sessions/{sid}`
 ///
-/// History for one session. The gateway keeps no in-memory transcript, so
-/// we resolve the session's project via [`SessionView`] (404 if the sid is
-/// unknown to the gateway), then tail that project's `progress.jsonl`,
-/// keeping lines whose `session_id == sid`. Best-effort: returns
-/// `{sid, events: []}` (200) when nothing matches. 503 with no gateway.
+/// History for one session. The gateway keeps no in-memory transcript, and
+/// the gateway session id (`s{n}`) is *not* the `session_id` that ever
+/// appears in the flat `<slug>.jsonl` progress — so we resolve the sid to
+/// its `{role, project_dir}` via [`Gateway::session_resolve`] (404 if the
+/// sid is unknown to the gateway) and read the ccteam-owned per-session
+/// mirror `<project_dir>/.ccteam/chat/<role>/turns.jsonl`. Best-effort:
+/// returns `{sid, events: []}` (200) when no turn has been mirrored yet (or
+/// the file read fails). 503 with no gateway.
+///
+/// Lock discipline: `session_resolve` is sync (no `.await`) and only clones
+/// scalar fields, so we run it under the gateway guard, then **drop the
+/// guard** before the blocking `read_all_turns` fs read.
 async fn handle_session_history(State(app): State<AppState>, Path(sid): Path<String>) -> Response {
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    // Resolve the owning project from the live view (also our 404 gate).
-    let project = {
+    // Resolve sid → role + project_dir under the lock (also our 404 gate),
+    // then drop the guard before touching the filesystem.
+    let resolved = {
         let guard = gw.lock().await;
-        guard
-            .session_views()
-            .into_iter()
-            .find(|v| v.sid == sid)
-            .map(|v| v.project)
+        guard.session_resolve(&sid)
     };
-    let Some(project) = project else {
+    let Some(resolved) = resolved else {
         return unknown_session(&sid);
     };
-    let events = collect_session_progress(&app, &project, &sid);
+    let events = collect_session_turns(&resolved.project_dir, &resolved.role);
     Json(json!({ "sid": sid, "events": events })).into_response()
 }
 
-/// Reconstruct a session's history from the project `progress.jsonl`,
-/// keeping only lines whose `session_id` matches `sid`. Mirrors the
-/// progress reconstruction `super::api_v1::build_workflow_session_detail`
-/// uses (read → split lines → parse JSON objects → filter by
-/// `session_id`), but returns the raw event objects rather than a
-/// presentation DTO. Any read/parse miss folds to an empty list — this is
-/// a best-effort history view.
-fn collect_session_progress(app: &AppState, slug: &str, sid: &str) -> Vec<serde_json::Value> {
-    let progress_path = app.paths.progress_jsonl(slug);
-    let Ok(body) = std::fs::read_to_string(&progress_path) else {
-        return Vec::new();
-    };
-    body.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|e| e.get("session_id").and_then(|s| s.as_str()) == Some(sid))
-        .collect()
+/// Reconstruct a session's history from its ccteam-owned transcript mirror
+/// `<project_dir>/.ccteam/chat/<role>/turns.jsonl` (the same file the W1
+/// `session_collect` path reads). Each [`TurnRecord`] becomes one event
+/// object; any read error folds to an empty list — a best-effort history
+/// view (an absent file is the legitimate first-turn case, which
+/// [`read_all_turns`] already returns as `Ok(empty)`). Split out from the
+/// handler so the disk → events mapping is unit-testable without a live
+/// gateway.
+fn collect_session_turns(project_dir: &std::path::Path, role: &str) -> Vec<serde_json::Value> {
+    match read_all_turns(project_dir, role) {
+        Ok(turns) => turns.iter().map(turn_to_event).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Map one mirrored [`TurnRecord`] to the history event shape the SPA
+/// renders. Keeps the user prompt + assistant reply + turn id/ts so a
+/// reopened per-session page can seed its transcript before the live SSE
+/// takes over.
+fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
+    json!({
+        "turn_id": turn.turn_id,
+        "ts": turn.ts,
+        "role": turn.role,
+        "user": turn.user,
+        "assistant": turn.assistant,
+    })
 }
 
 /// POST body for a turn submission — `text` (required). Form or JSON.
@@ -482,33 +503,63 @@ mod tests {
     }
 
     #[test]
-    fn collect_session_progress_filters_by_session_id() {
-        use ccteam_core::CcteamPaths;
-        use std::io::Write;
+    fn collect_session_turns_reads_mirrored_turns() {
+        // v0.8.7 W4 — the history handler reads the ccteam-owned mirror
+        // `<project_dir>/.ccteam/chat/<role>/turns.jsonl` (resolved from the
+        // gateway sid), NOT the flat progress.jsonl. Seed two turns and one
+        // garbage line; expect two well-formed history events in order.
+        use ccteam_harness::execution::turns_mirror::append_turn;
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join(".ccteam"),
-            projects_root: tmp.path().join("projects"),
+        let project_dir = tmp.path();
+        let role = "reviewer";
+        let mk = |id: &str, user: &str, assistant: &str| TurnRecord {
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: role.into(),
+            user: user.into(),
+            assistant: assistant.into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
         };
-        let app = AppState::new(paths);
-        let slug = "demo";
-        let progress_path = app.paths.progress_jsonl(slug);
-        std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
-        let mut f = std::fs::File::create(&progress_path).unwrap();
-        // Two for s1, one for s2, one with no session_id, one garbage line.
-        writeln!(f, r#"{{"event":"a","session_id":"s1","ts":"t1"}}"#).unwrap();
-        writeln!(f, r#"{{"event":"b","session_id":"s2","ts":"t2"}}"#).unwrap();
-        writeln!(f, r#"{{"event":"c","session_id":"s1","ts":"t3"}}"#).unwrap();
-        writeln!(f, r#"{{"event":"d","ts":"t4"}}"#).unwrap();
-        writeln!(f, "not-json").unwrap();
-        let s1 = collect_session_progress(&app, slug, "s1");
-        assert_eq!(s1.len(), 2);
-        assert_eq!(s1[0]["event"], "a");
-        assert_eq!(s1[1]["event"], "c");
-        let s2 = collect_session_progress(&app, slug, "s2");
-        assert_eq!(s2.len(), 1);
-        let none = collect_session_progress(&app, slug, "s99");
-        assert!(none.is_empty());
+        append_turn(project_dir, role, &mk("t1", "review the diff", "LGTM")).unwrap();
+        append_turn(project_dir, role, &mk("t2", "and the tests?", "all green")).unwrap();
+        // A half-flushed / garbage line must be skipped (read_all_turns drops it).
+        let path = ccteam_harness::execution::turns_mirror::turns_jsonl_path(project_dir, role);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "not-json").unwrap();
+        }
+        let events = collect_session_turns(project_dir, role);
+        assert_eq!(events.len(), 2, "two parseable turns → two events");
+        assert_eq!(events[0]["turn_id"], "t1");
+        assert_eq!(events[0]["user"], "review the diff");
+        assert_eq!(events[0]["assistant"], "LGTM");
+        assert_eq!(events[1]["turn_id"], "t2");
+        assert_eq!(events[1]["assistant"], "all green");
+    }
+
+    #[test]
+    fn turn_to_event_carries_user_and_assistant() {
+        let turn = TurnRecord {
+            turn_id: "t9".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: "cto".into(),
+            user: "spawn a reviewer".into(),
+            assistant: "done — s2".into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
+        };
+        let ev = turn_to_event(&turn);
+        assert_eq!(ev["turn_id"], "t9");
+        assert_eq!(ev["role"], "cto");
+        assert_eq!(ev["user"], "spawn a reviewer");
+        assert_eq!(ev["assistant"], "done — s2");
     }
 
     /// Build a minimal [`GatewayEvent`] with the given `sid` for filter tests.
@@ -558,14 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn collect_session_progress_missing_file_is_empty() {
-        use ccteam_core::CcteamPaths;
+    fn collect_session_turns_missing_file_is_empty() {
+        // Absent turns.jsonl is the legitimate first-turn case → empty (200),
+        // not an error. read_all_turns returns Ok(empty) for a missing file.
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = CcteamPaths {
-            root: tmp.path().join(".ccteam"),
-            projects_root: tmp.path().join("projects"),
-        };
-        let app = AppState::new(paths);
-        assert!(collect_session_progress(&app, "ghost", "s1").is_empty());
+        assert!(collect_session_turns(tmp.path(), "ghost").is_empty());
     }
 }
