@@ -12,14 +12,13 @@ use serde_json::{json, Map, Value};
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
     bootstrap_meta_project, cost_summary, current_ccteam_bin, install_ccteam_control_skill,
-    install_ccteam_creator_skill, install_ccteam_scan_skill, install_ccteam_team_skill,
-    migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks, pricing_schema_version,
-    pricing_schema_version_for, rewrite_legacy_hook_commands, session_name_for_project,
-    user_claude_dir, write_global_helper_templates, CcteamPaths, HookCmdRewriteAction,
-    HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction, LegacySkillReport,
-    MetaBootstrapReport, MigrationReport, PhaseState, ProjectState, SkillInstallAction,
-    ToolSurfaceSnapshot, Vendor, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_SCAN_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME,
+    install_ccteam_creator_skill, migrate_legacy_skill_dirs, migrate_recommended_agent_symlinks,
+    pricing_schema_version, pricing_schema_version_for, rewrite_legacy_hook_commands,
+    session_name_for_project, user_claude_dir, write_global_helper_templates, CcteamPaths,
+    HookCmdRewriteAction, HookCmdRewriteReport, InstallSkillOptions, LegacySkillAction,
+    LegacySkillReport, MetaBootstrapReport, MigrationReport, PhaseState, ProjectState,
+    SkillInstallAction, ToolSurfaceSnapshot, Vendor, BUILTIN_SUBAGENTS, CCTEAM_CONTROL_SKILL_NAME,
+    CCTEAM_CREATOR_SKILL_NAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -111,10 +110,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         "progress",
         "inbox",
         "control",
-        "queue",
-        "memory",
         "state",
-        "log",
     ] {
         let dir = paths.root.join(sub);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -701,28 +697,6 @@ fn ask_yn(question: &str, yes_to_all: bool) -> Result<bool> {
         "" | "y" | "yes" | "ok"
     );
     Ok(answer)
-}
-
-/// Resolve `team_kind` from the on-disk team registry. Built-in
-/// teams (`dev`, `meta-agent`) default to Workflow. Other teams must
-/// resolve via `~/.ccteam/teams/<team>/team.yaml` — when the lookup
-/// fails the caller (`refresh_state_team_kind`) preserves whatever
-/// `state.json::team_kind` already has, so a project saved as Flex
-/// stays Flex even when its team.yaml isn't on disk in this env.
-///
-/// V0.4.2 F75: the V0.4.0 `ensure_team_resolvable` fail-loud gate was
-/// dropped (it lived inside the deleted `run_new`); kind resolution
-/// itself is unchanged.
-fn resolve_team_kind(paths: &CcteamPaths, team: &str) -> Result<ccteam_core::TeamKind> {
-    use ccteam_core::{default_user_staging_dir, resolve_team, TeamKind, TeamResolveContext};
-    if team == "dev" || team == ccteam_core::META_TEAM_NAME {
-        return Ok(TeamKind::Workflow);
-    }
-    let user_staging = default_user_staging_dir();
-    let ctx = TeamResolveContext::for_orchestrator(&paths.root, &user_staging);
-    let spec =
-        resolve_team(team, &ctx).with_context(|| format!("resolve team `{team}` for team kind"))?;
-    Ok(spec.kind)
 }
 
 /// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
@@ -2092,7 +2066,7 @@ fn peek_session_by_name(session_name: &str) -> Result<String> {
     // V0.8 W5 — backend-aware peek. Under the rmux backend, capture is
     // non-interactive (a plain-text grid snapshot) so it fits the async
     // `ProcessBackend::capture` trait method cleanly; drive it on a
-    // current-thread tokio runtime (same pattern as `run_session_rm`).
+    // current-thread tokio runtime.
     // The tmux path (opt-out) is unchanged.
     if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2130,25 +2104,6 @@ fn peek_session_by_name(session_name: &str) -> Result<String> {
 /// stdout in a polling loop until Ctrl-C.
 pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
     use std::io::Write;
-    let state = ProjectState::load(&paths.project_state(slug)).ok();
-    if state
-        .as_ref()
-        .is_some_and(|s| s.team_kind == ccteam_core::TeamKind::Flex)
-    {
-        if tail {
-            bail!(
-                "ccteam progress --tail is not supported for flex project `{slug}`; \
-                 use `ccteam session ls {slug}` or the web session view",
-            );
-        }
-        let events = collect_recent_events(paths, slug, usize::MAX)?;
-        let mut stdout = std::io::stdout().lock();
-        for event in events {
-            writeln!(stdout, "{}", serde_json::to_string(&event)?)?;
-        }
-        return Ok(());
-    }
-
     let path = paths.progress_jsonl(slug);
     if !path.exists() {
         bail!("no progress.jsonl yet for {slug}: {}", path.display());
@@ -2204,309 +2159,6 @@ pub fn run_resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
     ccteam_core::actions::resume(paths, slug)
 }
 
-// =====================================================================
-// V0.3.1 F49 — `ccteam session` handlers for flex teams
-// =====================================================================
-
-/// Add a registered harness session to a flex project. Both claude
-/// and codex sessions record in the master `state.json::sessions`
-/// map. V0.4.0 F61 changes the claude branch to launch
-/// `claude --bg --agent <role>` (no tmux); the codex branch (F62)
-/// still uses tmux + `codex` CLI.
-pub fn run_session_add(slug: &str, harness: ccteam_core::HarnessKind, role: String) -> Result<()> {
-    use ccteam_core::{harness_sid_prefix, HarnessKind, SessionRecord, TeamKind};
-    use ccteam_harness::execution::CodexExecAdapter;
-    use ccteam_harness::{
-        AgentSpecBrief, ClaudeBgAdapter, HarnessAdapter, SessionHandle, SpawnCtx,
-    };
-
-    let paths = CcteamPaths::from_env()?;
-    let state_path = paths.project_state(slug);
-    let mut state = load_project_state(&paths, slug)?;
-    refresh_state_team_kind(&paths, &mut state)?;
-    if state.team_kind != TeamKind::Flex {
-        bail_session_requires_flex(&state)?;
-    }
-
-    let sid = state.allocate_sid(harness);
-    let session_dir = paths.project_session_dir(slug, &sid);
-    std::fs::create_dir_all(session_dir.join("inbox"))
-        .with_context(|| format!("create {}", session_dir.join("inbox").display()))?;
-    std::fs::create_dir_all(session_dir.join("outbox"))
-        .with_context(|| format!("create {}", session_dir.join("outbox").display()))?;
-
-    // V0.6.0 F107 — adapter dispatch goes through the new 5-method
-    // HarnessAdapter trait. We need a tokio runtime to drive
-    // `start_thread().await`; `run_session_add` is sync CLI surface
-    // so we spin up a current_thread runtime locally rather than
-    // making the whole CLI async.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for start_thread")?;
-
-    let brief = AgentSpecBrief {
-        role: match harness {
-            HarnessKind::Claude => role.clone(),
-            // Codex has no role surface yet (V0.4.0 F62); pass empty.
-            HarnessKind::Codex => String::new(),
-        },
-    };
-    let ctx = SpawnCtx {
-        slug: slug.to_string(),
-        sid: sid.clone(),
-        cwd: session_dir.clone(),
-        project_dir: paths.project_dir(slug),
-        extra_args: Vec::new(),
-        // Wave 4 D14 — session-add CLI doesn't carry workflow.yaml's
-        // model field; adapter falls back to vendor default.
-        model_id: None,
-    };
-
-    let thread_handle = runtime.block_on(async {
-        match harness {
-            HarnessKind::Claude => {
-                let adapter = ClaudeBgAdapter::new();
-                adapter
-                    .start_thread(&brief, &ctx)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{err}"))
-            }
-            HarnessKind::Codex => {
-                let adapter = CodexExecAdapter::new();
-                adapter
-                    .start_thread(&brief, &ctx)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{err}"))
-            }
-        }
-    })?;
-    let handle = SessionHandle::from_thread_handle(&thread_handle, &sid);
-
-    let was_empty = state.sessions.is_empty();
-    if was_empty {
-        state.tmux_session = handle.tmux_session.clone();
-        state.claude_pid = handle.pid.and_then(|pid| i32::try_from(pid).ok());
-    }
-    state.sessions.insert(
-        sid.clone(),
-        SessionRecord {
-            harness,
-            tmux_session: handle.tmux_session.clone(),
-            started_at: handle.started_at,
-            pid: handle.pid,
-            job_id: handle.job_id.clone(),
-        },
-    );
-    state.save(&state_path)?;
-    println!(
-        "added session {sid} ({}) for {slug}\n  tmux: {}\n  cwd: {}",
-        harness_sid_prefix(harness),
-        handle.tmux_session,
-        session_dir.display(),
-    );
-    Ok(())
-}
-
-/// Print one row per registered flex session.
-pub fn run_session_ls(slug: &str) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    let mut state = load_project_state(&paths, slug)?;
-    refresh_state_team_kind(&paths, &mut state)?;
-    if state.team_kind != ccteam_core::TeamKind::Flex {
-        bail_session_requires_flex(&state)?;
-    }
-
-    println!("sid\tharness\ttmux\tstarted_at\tpid\tlast_event");
-    for (sid, record) in &state.sessions {
-        let last = session_last_event(&paths, slug, sid)?;
-        let pid = record
-            .pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
-        println!(
-            "{sid}\t{}\t{}\t{}\t{}\t{}",
-            ccteam_core::harness_sid_prefix(record.harness),
-            record.tmux_session,
-            record.started_at.to_rfc3339(),
-            pid,
-            last.unwrap_or_else(|| "-".into()),
-        );
-    }
-    Ok(())
-}
-
-/// Attach to one registered flex session.
-pub fn run_session_attach(slug: &str, sid: &str) -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    let mut state = load_project_state(&paths, slug)?;
-    refresh_state_team_kind(&paths, &mut state)?;
-    if state.team_kind != ccteam_core::TeamKind::Flex {
-        bail_session_requires_flex(&state)?;
-    }
-    let record = state.sessions.get(sid).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown session `{sid}` for `{slug}`; available: {}",
-            available_sids(&state)
-        )
-    })?;
-    // V0.8 W5 — backend-aware: the persisted `tmux_session` name is the
-    // mux session name for both backends (rmux reuses the same label).
-    // Under rmux, attach through the daemon; the existence check is the
-    // daemon's job (begin_attach rejects an absent session).
-    if ccteam_harness::backend_kind_from_env() == ccteam_harness::BackendKind::Rmux {
-        return rmux_interactive_attach(&record.tmux_session);
-    }
-
-    let session = TmuxSession::from_name(record.tmux_session.clone());
-    if !session.exists() {
-        bail!("tmux session not running: {}", session.name());
-    }
-    // V0.8 W1 — argv from `ccteam_harness::interactive_attach_argv` (audit
-    // delta 6). Caller spawns blocking `Command::status()` on the CLI's
-    // own controlling tty.
-    let argv =
-        ccteam_harness::interactive_attach_argv(ccteam_harness::BackendKind::Tmux, session.name());
-    let (bin, args) = argv
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
-    let status = Command::new(bin)
-        .args(args)
-        .status()
-        .context("spawn tmux attach")?;
-    if !status.success() {
-        bail!("tmux attach exited with {status}");
-    }
-    Ok(())
-}
-
-/// Gracefully shut down one registered flex session and scrub it from
-/// `state.json::sessions[]`.
-pub fn run_session_rm(slug: &str, sid: &str) -> Result<()> {
-    use ccteam_harness::execution::CodexExecAdapter;
-    use ccteam_harness::{
-        AgentVendor, ClaudeBgAdapter, ExecutionMode, HarnessAdapter, ThreadHandle,
-    };
-
-    let paths = CcteamPaths::from_env()?;
-    let state_path = paths.project_state(slug);
-    let mut state = load_project_state(&paths, slug)?;
-    refresh_state_team_kind(&paths, &mut state)?;
-    if state.team_kind != ccteam_core::TeamKind::Flex {
-        bail_session_requires_flex(&state)?;
-    }
-    let record = state.sessions.get(sid).cloned().ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown session `{sid}` for `{slug}`; available: {}",
-            available_sids(&state)
-        )
-    })?;
-
-    // V0.6.0 F107 — close_thread goes through the new trait.
-    // Reconstitute a ThreadHandle from the persisted SessionRecord
-    // shape so the adapter has everything it needs (identity =
-    // job_id for bg / tmux_session for codex; raw_extras carry the
-    // tmux_session + pid).
-    let (vendor, mode, identity) = match record.harness {
-        ccteam_core::HarnessKind::Claude => (
-            AgentVendor::Claude,
-            ExecutionMode::Bg,
-            record.job_id.clone().unwrap_or_default(),
-        ),
-        ccteam_core::HarnessKind::Codex => (
-            AgentVendor::Codex,
-            ExecutionMode::Bg,
-            record.tmux_session.clone(),
-        ),
-    };
-    let mut extras = serde_json::json!({"tmux_session": record.tmux_session.clone()});
-    if let Some(pid) = record.pid {
-        extras["pid"] = serde_json::json!(pid);
-    }
-    let thread_handle = ThreadHandle {
-        vendor,
-        mode,
-        identity,
-        started_at: record.started_at,
-        raw_extras: extras,
-    };
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for close_thread")?;
-
-    runtime.block_on(async {
-        match record.harness {
-            ccteam_core::HarnessKind::Claude => ClaudeBgAdapter::new()
-                .close_thread(&thread_handle)
-                .await
-                .map_err(|err| anyhow::anyhow!("{err}")),
-            ccteam_core::HarnessKind::Codex => CodexExecAdapter::new()
-                .close_thread(&thread_handle)
-                .await
-                .map_err(|err| anyhow::anyhow!("{err}")),
-        }
-    })?;
-    state.sessions.remove(sid);
-    state.save(&state_path)?;
-    println!("removed session {sid} from {slug}");
-    Ok(())
-}
-
-fn load_project_state(paths: &CcteamPaths, slug: &str) -> Result<ProjectState> {
-    let state_path = paths.project_state(slug);
-    if !state_path.exists() {
-        bail!("project not found: {slug}");
-    }
-    ProjectState::load(&state_path)
-}
-
-fn refresh_state_team_kind(paths: &CcteamPaths, state: &mut ProjectState) -> Result<()> {
-    if let Ok(kind) = resolve_team_kind(paths, &state.team) {
-        state.team_kind = kind;
-    }
-    Ok(())
-}
-
-fn bail_session_requires_flex(state: &ProjectState) -> Result<()> {
-    bail!(
-        "session subcommands only work on flex teams; project `{}` is team `{}` (kind={:?})\n  \
-         gateway chat sessions: list with `ccteam sessions` (or Telegram `/sessions`), \
-         attach with `ccteam internal attach <slug> [role]`",
-        state.slug,
-        state.team,
-        state.team_kind,
-    )
-}
-
-fn available_sids(state: &ProjectState) -> String {
-    if state.sessions.is_empty() {
-        "(none)".into()
-    } else {
-        state
-            .sessions
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-fn session_last_event(paths: &CcteamPaths, slug: &str, sid: &str) -> Result<Option<String>> {
-    let path = paths.progress_jsonl_for_session(slug, sid);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let body =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(body
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<Value>(line).ok())
-        .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string)))
-}
-
 /// `ccteam doctor` flags. Each mode is a separate boolean / option so
 /// they can be combined (e.g. `--install-meta-agent rob` implies
 /// `--install-skill` automatically).
@@ -2522,15 +2174,13 @@ pub struct DoctorOptions {
     ///
     /// V0.5.0 F93a: pair with `install_skill_only = Some("<name>")` to
     /// install just one named skill. Default (`install_skill_only = None`)
-    /// installs every shipped skill: `ccteam-control`, `ccteam-creator`,
-    /// `ccteam-team`, and the V0.6.2 F141 `ccteam-scan`.
+    /// installs every shipped skill: `ccteam-control` and `ccteam-creator`.
     pub install_skill: bool,
     /// V0.5.0 F93a: when `install_skill == true` and this is `Some(name)`,
     /// install only the named skill (one of `ccteam-control` /
-    /// `ccteam-creator` / `ccteam-team` / `ccteam-scan` / `all`). `None`
-    /// or `Some("all")` install every shipped skill. The CLI flag is
-    /// `--install-skill [NAME]` (no value = install all, matches the
-    /// V0.4.6 behavior).
+    /// `ccteam-creator` / `all`). `None` or `Some("all")` install every
+    /// shipped skill. The CLI flag is `--install-skill [NAME]` (no value =
+    /// install all, matches the V0.4.6 behavior).
     pub install_skill_only: Option<String>,
     /// V0.4.1: bootstrap the meta-agent project at `~/projects/meta/`.
     /// `true` triggers `install_skill` regardless of its standalone
@@ -2784,9 +2434,10 @@ const NO_MODE_HELP: &str = "\nccteam doctor: pass at least one mode flag for the
      cross-check phase templates' tools_required against current reachability — \
      plugin-pipeline-aware (V0.2 M0.20).\n  \
      --install-skill [NAME] [--force]\n      \
-     write ~/.claude/skills/ccteam-{control,team-author,project-creator,team}/SKILL.md \
+     write ~/.claude/skills/ccteam-{control,creator}/SKILL.md \
      (M1.8 + V0.5.0 F93a). Pass NAME=all (or omit) for every shipped skill; pass a \
-     single skill name (`ccteam-team` etc.) to install just one. Default installs run \
+     single skill name (`ccteam-control` / `ccteam-creator`) to install just one. \
+     Default installs run \
      the V0.2.2 (F39'd) → V0.2.2 (F44'd) reverse migration (legacy `cct-*` skill dirs + \
      stale settings.json hook command paths); single-skill installs skip the migration.\n  \
      --install-meta-agent\n      \
@@ -3100,10 +2751,10 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         dry_run: opts.dry_run,
     };
 
-    // V0.5.0 F93a: classify the selector. `None` / `Some("all")` ⇒
-    // install every shipped skill (V0.4.6 behavior + new ccteam-team).
-    // `Some("<name>")` ⇒ install just that one and skip F44 migration
-    // because the migration touches every shipped skill name.
+    // Classify the selector. `None` / `Some("all")` ⇒ install every
+    // shipped skill. `Some("<name>")` ⇒ install just that one and skip
+    // F44 migration because the migration touches every shipped skill
+    // name.
     let selector = opts.install_skill_only.as_deref().unwrap_or("all");
     let selector_lc = selector.to_ascii_lowercase();
     let install_all = selector_lc.is_empty() || selector_lc == "all";
@@ -3116,15 +2767,11 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         let target = match selector_lc.as_str() {
             CCTEAM_CONTROL_SKILL_NAME => install_ccteam_control_skill(install_opts)?,
             CCTEAM_CREATOR_SKILL_NAME => install_ccteam_creator_skill(install_opts)?,
-            CCTEAM_TEAM_SKILL_NAME => install_ccteam_team_skill(install_opts)?,
-            CCTEAM_SCAN_SKILL_NAME => install_ccteam_scan_skill(install_opts)?,
             other => bail!(
                 "ccteam doctor --install-skill {other}: unknown skill name; expected one of \
-                 `all` / {ctrl} / {creator} / {tt} / {scan}",
+                 `all` / {ctrl} / {creator}",
                 ctrl = CCTEAM_CONTROL_SKILL_NAME,
                 creator = CCTEAM_CREATOR_SKILL_NAME,
-                tt = CCTEAM_TEAM_SKILL_NAME,
-                scan = CCTEAM_SCAN_SKILL_NAME,
             ),
         };
         out.push_str(&format!(
@@ -3139,9 +2786,9 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
 
     let mut out = String::from("ccteam doctor --install-skill\n\n");
 
-    // V0.5.0 F100: 3 shipped skills (down from 5). Legacy F39 `cct-*`
-    // and V0.2/V0.2.2 `ccteam-team-author` + `ccteam-project-creator`
-    // are swept by the F44 reverse migration below.
+    // 2 shipped skills. Legacy F39 `cct-*` and V0.2/V0.2.2
+    // `ccteam-team-author` + `ccteam-project-creator` are swept by the
+    // F44 reverse migration below.
     let control = install_ccteam_control_skill(install_opts)?;
     out.push_str(&format!(
         "  ccteam-control          {label}  {}\n",
@@ -3153,18 +2800,6 @@ fn render_install_skill_report(paths: &CcteamPaths, opts: &DoctorOptions) -> Res
         "  ccteam-creator          {label}  {}\n",
         creator.target.display(),
         label = skill_install_label(&creator.action),
-    ));
-    let team_skill = install_ccteam_team_skill(install_opts)?;
-    out.push_str(&format!(
-        "  ccteam-team             {label}  {}\n",
-        team_skill.target.display(),
-        label = skill_install_label(&team_skill.action),
-    ));
-    let scan = install_ccteam_scan_skill(install_opts)?;
-    out.push_str(&format!(
-        "  ccteam-scan             {label}  {}\n",
-        scan.target.display(),
-        label = skill_install_label(&scan.action),
     ));
     out.push('\n');
 
@@ -4509,8 +4144,7 @@ fn render_ls_json(
     daemon_up: bool,
 ) -> Result<String> {
     // V0.4.0 F60: the phase state machine was deleted; "active" can no
-    // longer be derived from `phase_state == InFlight`. F66 will
-    // recompute this from `state.sessions` (live agent count).
+    // longer be derived from `phase_state == InFlight`.
     let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
@@ -6713,8 +6347,8 @@ mod tests {
         assert_eq!(state.slug, "meta");
         assert_eq!(state.tmux_session, "ccteam-meta");
 
-        // Skill landed under the redirected ~/.claude/. V0.5.0 F100
-        // shipped set: ccteam-control / ccteam-creator / ccteam-team.
+        // Skill landed under the redirected ~/.claude/. Shipped set:
+        // ccteam-control / ccteam-creator.
         let control = tmp.path().join("skills/ccteam-control/SKILL.md");
         assert!(
             control.is_file(),
@@ -7343,7 +6977,7 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 28, "V0.8.4 ships 28 tools");
+        assert_eq!(report.total_tools, 20, "ships 20 tools");
     }
 
     #[test]

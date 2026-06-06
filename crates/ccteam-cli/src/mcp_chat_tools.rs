@@ -20,12 +20,6 @@
 //! - `chat_history` — tails `<project>/.ccteam/chat/<role>/turns.jsonl`,
 //!   returns the last `n` rows. `include_user` flag toggles whether
 //!   user-side prompts are included (default: assistant only).
-//! - `chat_reset` — writes `<project>/.ccteam/chat/<role>/signals/reset.signal`.
-//!   The supervisor's next `decide()` tick returns `ResetSession`, which
-//!   archives `turns.jsonl` → `archive/turns-<unix-ms>.jsonl`, closes
-//!   the active tmux session, force-resets the in-memory OutboundCursor
-//!   (V0.6.4 Bug B防线) + clears the on-disk transcript cursor, then
-//!   spawns a fresh session.
 //!
 //! Architecture:
 //!
@@ -52,12 +46,13 @@ use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{render_envelope, InboxEnvelope};
 use ccteam_im::{
-    bot_running_status_in, chat_inbox_dir, chat_reset_signal_path, last_turn_at, list_bots_in,
-    register_bot_checked_in, turns_jsonl_path, unregister_bot_in, RegisterOutcome,
+    bot_running_status_in, chat_inbox_dir, last_turn_at, list_bots_in, register_bot_checked_in,
+    turns_jsonl_path, unregister_bot_in, RegisterOutcome,
 };
 
-/// Tool definitions for the chat group: 3 real + 3 stubs (total 6).
-/// Merged into the top-level `tool_definitions()` in `mcp_serve.rs`.
+/// Tool definitions for the chat group (total 6): register / unregister
+/// / list_bots / send_input / history / send_file. Merged into the
+/// top-level `tool_definitions()` in `mcp_serve.rs`.
 pub fn chat_tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -138,18 +133,6 @@ pub fn chat_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__chat_reset",
-            "description": "V0.6.5 F147 legacy supervisor reset request for a chat-mode bot. Writes `<project>/.ccteam/chat/<role>/signals/reset.signal`; v8.2 daemon IM ingress routes through the gateway and no longer runs the supervisor tick loop, so this file is consumed only by legacy supervisor-driven chat paths. Returns immediately after writing the signal.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "workflow_slug": { "type": "string", "description": "Workflow slug." },
-                    "role": { "type": "string", "description": "Bot role." }
-                },
-                "required": ["workflow_slug", "role"],
-            }),
-        }),
-        json!({
             "name": "ccteam__chat_send_file",
             "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
             "inputSchema": json!({
@@ -178,11 +161,6 @@ pub fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<
             args,
         )?)),
         "ccteam__chat_history" => Ok(Some(dispatch_history_in(
-            &paths.root,
-            &paths.projects_root,
-            args,
-        )?)),
-        "ccteam__chat_reset" => Ok(Some(dispatch_reset_in(
             &paths.root,
             &paths.projects_root,
             args,
@@ -592,37 +570,6 @@ pub fn dispatch_history_in(
     }))?)
 }
 
-/// V0.6.5 F147 — `ccteam__chat_reset` dispatcher (tempdir-aware variant
-/// for tests).
-///
-/// F185 — writes the signal under the bot's registered `project_dir`
-/// when set; falls back to `<projects_root>/<slug>/` otherwise.
-pub fn dispatch_reset_in(ccteam_root: &Path, projects_root: &Path, args: &Value) -> Result<String> {
-    let workflow_slug = arg_str(args, "workflow_slug")?;
-    validate_slug(&workflow_slug, "workflow_slug")?;
-    let role = arg_str(args, "role")?;
-    validate_slug(&role, "role")?;
-
-    let reg = lookup_or_synthesize_reg(ccteam_root, &workflow_slug, &role);
-    let sig = chat_reset_signal_path(projects_root, &reg);
-    if let Some(parent) = sig.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
-    }
-    // Body = unix-ms so the supervisor can log when the reset was
-    // requested vs when it was applied. Idempotent overwrite — if a
-    // prior signal hasn't been consumed yet, we just refresh the ts.
-    let unix_ms = chrono::Utc::now().timestamp_millis();
-    fs::write(&sig, format!("{unix_ms}")).with_context(|| format!("write {}", sig.display()))?;
-
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "signal_path": sig.display().to_string(),
-        "workflow_slug": workflow_slug,
-        "role": role,
-        "requested_at_unix_ms": unix_ms,
-    }))?)
-}
-
 fn turn_to_value(t: &TurnRecord, side: &str, content: &str) -> Value {
     json!({
         "turn_id": t.turn_id,
@@ -719,9 +666,9 @@ mod tests {
     }
 
     #[test]
-    fn seven_chat_tools_registered_with_correct_names() {
+    fn six_chat_tools_registered_with_correct_names() {
         let tools = chat_tool_definitions();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // V0.6.5 F146 real tools.
         assert!(names.contains(&"ccteam__chat_register_bot"));
@@ -729,14 +676,11 @@ mod tests {
         assert!(names.contains(&"ccteam__chat_list_bots"));
         // V0.8.4 P2b — outbound file send.
         assert!(names.contains(&"ccteam__chat_send_file"));
-        // V0.6.5 F147 real tools (renamed from the V0.6.0 stub names —
-        // `chat_session_reset` → `chat_reset`; `chat_show_turn_log` →
-        // `chat_history`. CLAUDE.md §五 #4 forbids deprecated aliases
-        // pre-v1.0).
+        // V0.6.5 F147 real tools.
         assert!(names.contains(&"ccteam__chat_send_input"));
         assert!(names.contains(&"ccteam__chat_history"));
-        assert!(names.contains(&"ccteam__chat_reset"));
-        // Removed in V0.6.5 F146 / F147 — no deprecated alias.
+        // Removed (no deprecated alias — CLAUDE.md §五 #4).
+        assert!(!names.contains(&"ccteam__chat_reset"));
         assert!(!names.contains(&"ccteam__chat_lifecycle"));
         assert!(!names.contains(&"ccteam__chat_session_reset"));
         assert!(!names.contains(&"ccteam__chat_show_turn_log"));
@@ -791,27 +735,6 @@ mod tests {
         assert_eq!(env.platform, "mcp");
         assert!(path.contains("demo/.ccteam/chat/helper/inbox/msg-"));
         assert!(path.ends_with(".md"));
-    }
-
-    #[test]
-    fn reset_writes_signal_file_at_documented_path() {
-        let tmp = TempDir::new().unwrap();
-        let p = paths(&tmp);
-        let body = dispatch(
-            &p,
-            "ccteam__chat_reset",
-            &json!({ "workflow_slug": "demo", "role": "helper" }),
-        )
-        .unwrap()
-        .expect("matched our tool");
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["ok"], true);
-        let sig = parsed["signal_path"].as_str().unwrap();
-        assert!(std::path::Path::new(sig).exists());
-        assert!(
-            sig.ends_with("demo/.ccteam/chat/helper/signals/reset.signal"),
-            "unexpected signal path: {sig}"
-        );
     }
 
     #[test]

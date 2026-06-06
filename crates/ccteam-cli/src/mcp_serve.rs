@@ -43,10 +43,6 @@ use ccteam_core::{
 use ccteam_flow::MAX_CONCURRENT_PROJECTS;
 
 use crate::commands::{collect_projects, collect_recent_events, run_peek, run_show, OutputFormat};
-// V0.4.0 F65 — 7 new workflow tools. Schemas + handlers live in a
-// dedicated module so `mcp_serve.rs` stays focused on the M2.5 protocol
-// surface.
-use crate::mcp_workflow_tools;
 // V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
 // CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
 // dispatch handlers; Wave 1 lands stubs so the tool surface shape +
@@ -351,19 +347,15 @@ fn tools_list_response() -> Value {
     json!({ "tools": tools })
 }
 
-/// Single source of truth for the MCP tool surface. M2.5 shipped 9
-/// tools; V0.2.2 F38 added `ccteam__screenshot` → 10; V0.4.0 F65 adds
-/// 7 workflow-control tools (`spawn_agent` / `stop_agent` /
-/// `observe_agents` / `signal` / `set_parallelism` / `trigger_gate` /
-/// `get_artifact_summary`) → 17. V0.6.0 Wave 1 (F111) adds 5 chat
-/// stubs + 2 advise stubs → 24. V0.6.1 F128 adds 2 admin mutators
-/// (`admin_change_persona` + `admin_add_tool`) → 26. V0.6.5 F146
-/// swaps `chat_lifecycle` STUB for real `chat_register_bot` +
-/// `chat_unregister_bot` (no deprecated alias — CLAUDE.md §五 #4)
-/// → **27 total**. All tools carry a group sub-prefix (`admin_`,
-/// `workflow_`, `chat_`, `advise_`) except `ccteam__screenshot`
-/// which keeps its single-member-group name for V0.5 muscle memory.
-/// Schemas mirror interfaces.md §12.2.
+/// Single source of truth for the MCP tool surface. The workflow group
+/// carries the read-only inspection + lifecycle tools (`show` / `peek` /
+/// `progress` / `new` / `pause` / `resume` / `send_to_session` /
+/// `inject_decision`); admin has 3 (`ls` + `change_persona` +
+/// `add_tool`); chat has 6; advise has 2; `ccteam__screenshot` is its
+/// own single-member group → **20 total**. All tools carry a group
+/// sub-prefix (`admin_`, `workflow_`, `chat_`, `advise_`) except
+/// `ccteam__screenshot` which keeps its single-member-group name for
+/// V0.5 muscle memory.
 pub(crate) fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         // Read-only inspection.
@@ -465,8 +457,6 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             }),
         }),
     ];
-    // V0.4.0 F65 — append the 7 workflow-control tools.
-    tools.extend(mcp_workflow_tools::workflow_tool_definitions());
     // V0.6.0 Wave 1 (F108 / F112) — append chat (6) + advise (2)
     // tools. V0.6.5 F146 / F147 turned all 6 chat stubs into real
     // implementations; V0.6.5 F152 / F153 turned both advise stubs
@@ -535,27 +525,14 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         // handler intercepts it before `handle_request`, so it never loops
         // back into this branch.)
         "ccteam__chat_send_file" => forward_chat_send_file(paths, &args).await,
-        // V0.4.0 F65 — route the 7 workflow tools through the
-        // dedicated dispatcher. Mutating tools (spawn / stop / signal /
-        // set_parallelism / trigger_gate) gate on a reachable gateway
-        // daemon so a dead control plane surfaces immediately rather
-        // than silently swallowing writes that no one consumes.
-        // Read-only tools (observe_agents / get_artifact_summary) stay
-        // daemon-independent so the meta-agent can inspect a stopped
-        // project.
+        // Route the remaining group tools (chat / advise / admin
+        // mutators) through their dedicated dispatchers.
         other => {
-            if mcp_workflow_tools::requires_daemon(other) {
-                require_healthy_daemon(paths)?;
-            }
             // V0.6.1 F128 — admin mutator tools (`change_persona` /
-            // `add_tool`) gate on live daemon, mirroring the
-            // workflow mutators above. `admin_ls` stays inline and
-            // is read-only so it does not gate.
+            // `add_tool`) gate on a live daemon. `admin_ls` stays inline
+            // above and is read-only so it does not gate.
             if mcp_admin_tools::requires_daemon(other) {
                 require_healthy_daemon(paths)?;
-            }
-            if let Some(body) = mcp_workflow_tools::dispatch(paths, other, &args)? {
-                return Ok(text_content(body));
             }
             // V0.6.5 F146 — chat group: real register / unregister /
             // list_bots dispatchers + 3 F147-pending stubs. The
@@ -1028,15 +1005,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // M2.5 brief: 9 tools. V0.2.2 F38 adds `ccteam__screenshot` →
-        // 10. V0.4.0 F65 adds 7 workflow tools → 17. V0.6.0 Wave 1
-        // (F111) adds 5 chat stubs + 2 advise stubs → 24. V0.6.1 F128
-        // adds 2 admin mutators (`change_persona` + `add_tool`) → 26.
-        // V0.6.5 F146 chat group net +1 (removed `chat_lifecycle`,
-        // added `chat_register_bot` + `chat_unregister_bot`) → 27.
-        // V0.8.4 P2b adds `chat_send_file` → 28.
+        // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 28);
+        assert_eq!(tool_definitions().len(), 20);
     }
 
     #[test]
@@ -1045,7 +1016,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 28, "tool names must be unique");
+        assert_eq!(names.len(), 20, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1221,12 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // M2.5: 9 tools. V0.2.2 F38: +1 (`ccteam__screenshot`) → 10.
-        // V0.4.0 F65: +7 workflow tools → 17. V0.6.0 Wave 1 (F111):
-        // +5 chat stubs +2 advise stubs → 24. V0.6.1 F128: +2 admin
-        // mutators (`change_persona` + `add_tool`) → 26. V0.6.5 F146:
-        // chat group went from 5 → 6 (removed `chat_lifecycle`,
-        // added `chat_register_bot` + `chat_unregister_bot`) → 27.
+        // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1240,13 +1206,13 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 20);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__screenshot"));
         assert!(names.contains(&"ccteam__chat_send_file"));
-        // V0.4.0 F65 — spot-check one of the new tools is in the list.
-        assert!(names.contains(&"ccteam__workflow_spawn_agent"));
-        assert!(names.contains(&"ccteam__workflow_get_artifact_summary"));
+        // Spot-check a couple of workflow tools are in the list.
+        assert!(names.contains(&"ccteam__workflow_show"));
+        assert!(names.contains(&"ccteam__workflow_send_to_session"));
         // V0.6.0 Wave 1 — chat / advise stubs present.
         assert!(names.contains(&"ccteam__chat_send_input"));
         assert!(names.contains(&"ccteam__advise_vote"));

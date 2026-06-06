@@ -258,6 +258,26 @@ pub struct ProjectSessionContext {
     pub team_kind: TeamKind,
 }
 
+/// v0.8.6 — canonical `~/.ccteam/` subdirectory layout that `ccteam
+/// init` (and the resident daemon on first start) is allowed to create.
+/// This is the single source of truth for the home-layout manifest:
+/// `ccteam doctor`'s home-drift check compares the real `~/.ccteam/`
+/// against this set and flags any orchestrator-era leftovers
+/// (`phases/`, `queue/`, `memory/`, `control/`, `templates/`, …).
+///
+/// The config file (`~/.ccteam/config.yaml`) and other top-level files
+/// (`web-token`, `teams-progress.jsonl`, …) are intentionally excluded
+/// — this lists directories only. `imd/` is created lazily by bot
+/// registration, not by `init`, so it is not part of the init-time set.
+///
+/// Kept minimal on purpose: only directories the current architecture
+/// actually writes — `hooks/` (hook.sh dispatcher), `progress/`
+/// (per-project jsonl streams), `run/` (daemon socket / runtime files),
+/// `state/` (daemon pidfile).
+pub fn canonical_home_dirs() -> &'static [&'static str] {
+    &["hooks", "progress", "run", "state"]
+}
+
 /// V0.5.0 F95 — resolve the **global** Anthropic Agent Teams progress
 /// stream path (`~/.ccteam/teams-progress.jsonl`). F96 SSE channel
 /// reads this file; F95 watcher writes it. Pure: honours `CCTEAM_HOME`

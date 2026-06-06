@@ -3,11 +3,6 @@
 mod clipboard;
 mod commands;
 mod mcp_serve;
-// V0.4.0 F65 — meta-agent MCP workflow tools (7 new). Lives in its own
-// module to keep `mcp_serve.rs` focused on the M2.5 protocol surface
-// while the workflow tools accumulate in lockstep with the F66
-// orchestrator.
-mod mcp_workflow_tools;
 // V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
 // ToolGroup enum + CCTEAM_DISABLE_TOOLS filter. Wave 2/3 fills the
 // chat / advise dispatch handlers.
@@ -474,9 +469,8 @@ enum Command {
         tool_surface: bool,
         /// Install ccteam skills under `~/.claude/skills/<name>/SKILL.md`.
         /// M1.8 + V0.5.0 F93a. Default (no value) installs every shipped
-        /// skill (`ccteam-control` / `ccteam-team-author` /
-        /// `ccteam-project-creator` / `ccteam-team`). Pass a single skill
-        /// name (e.g. `--install-skill ccteam-team`) to install just one.
+        /// skill (`ccteam-control` / `ccteam-creator`). Pass a single skill
+        /// name (e.g. `--install-skill ccteam-control`) to install just one.
         /// Pass `--install-skill all` for the explicit default. Idempotent.
         #[arg(
             long,
@@ -648,13 +642,6 @@ enum Command {
         /// today; ignored otherwise).
         #[arg(long, default_value_t = false)]
         json: bool,
-    },
-    /// V0.3.1 F49 — adhoc multi-session primitives for `kind: flex`
-    /// teams. `add --harness claude` creates a registered tmux session;
-    /// `add --harness codex` still returns the V0.3.2 stub error.
-    Session {
-        #[command(subcommand)]
-        action: SessionAction,
     },
     /// V0.3 M5.0: serve the ccteam web UI (read + restricted-write,
     /// `docs/versions/v0-3/prd.md` §3-§6). M5.0 ships the scaffold + `/health`
@@ -929,56 +916,6 @@ enum InternalCommand {
         role: String,
         prompt: Option<String>,
     },
-}
-
-/// V0.3.1 F49 — `ccteam session` subcommand surface for flex teams.
-#[derive(Subcommand)]
-enum SessionAction {
-    /// Add a new harness session to an existing flex project.
-    Add {
-        /// Project slug (must already exist under `~/projects/`).
-        slug: String,
-        /// Harness backing the new session. Defaults to `claude` to
-        /// match `HarnessKind::default()`.
-        #[arg(long, value_enum, default_value_t = HarnessKindCli::Claude)]
-        harness: HarnessKindCli,
-        /// V0.4.0 F61 — agent role for `claude --bg --agent <role>`.
-        /// Resolves against the project's `.claude/agents/<role>.md`.
-        /// Required for claude sessions; ignored for codex (codex
-        /// threads role-equivalents through its own argv).
-        #[arg(long, default_value = "main")]
-        role: String,
-    },
-    /// List sessions registered for a flex project.
-    Ls {
-        /// Project slug.
-        slug: String,
-    },
-    /// Attach to one specific session of a flex project.
-    Attach {
-        /// Project slug.
-        slug: String,
-        /// Session id (e.g. `claude-1`, `codex-2`).
-        sid: String,
-    },
-    /// Remove (graceful shutdown) one session of a flex project.
-    Rm {
-        /// Project slug.
-        slug: String,
-        /// Session id to remove.
-        sid: String,
-    },
-}
-
-/// V0.3.1 F47 — CLI surface mirror of [`ccteam_core::HarnessKind`].
-/// Lives in the CLI crate so `clap::ValueEnum` derivation doesn't
-/// pollute the core schema enum (which deserves to round-trip yaml /
-/// json without clap dependencies). Convert via `match` at dispatch
-/// time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum HarnessKindCli {
-    Claude,
-    Codex,
 }
 
 #[derive(Subcommand)]
@@ -1321,7 +1258,6 @@ fn main() -> Result<()> {
                 verify_mcp_json: json,
             })
         }
-        Command::Session { action } => run_session(action),
         Command::Web {
             bind,
             no_auth,
@@ -1609,27 +1545,6 @@ fn run_resume(slug: &str) -> Result<()> {
     commands::run_resume(&paths, slug)?;
     println!("ccteam: resumed `{slug}`");
     Ok(())
-}
-
-/// V0.3.1 F49 — dispatch `ccteam session <action>` to the flex
-/// multi-session handlers.
-fn run_session(action: SessionAction) -> Result<()> {
-    match action {
-        SessionAction::Add {
-            slug,
-            harness,
-            role,
-        } => {
-            let kind = match harness {
-                HarnessKindCli::Claude => ccteam_core::HarnessKind::Claude,
-                HarnessKindCli::Codex => ccteam_core::HarnessKind::Codex,
-            };
-            commands::run_session_add(&slug, kind, role)
-        }
-        SessionAction::Ls { slug } => commands::run_session_ls(&slug),
-        SessionAction::Attach { slug, sid } => commands::run_session_attach(&slug, &sid),
-        SessionAction::Rm { slug, sid } => commands::run_session_rm(&slug, &sid),
-    }
 }
 
 /// V0.4.6 F86 — per-user shutdown trigger file. `ccteam stop` writes

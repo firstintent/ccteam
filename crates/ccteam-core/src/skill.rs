@@ -9,14 +9,10 @@
 //! The markdown bodies live under the repo-root `skills/` directory
 //! (cross-dir `include_str!` into the ccteam-core binary).
 //!
-//! V0.5.0 F100 — 5 skills reduced to 3:
-//! `ccteam-control` (CLI/MCP wrap),
-//! `ccteam-creator` (new project + workflow/agent/skill scaffold),
-//! `ccteam-team` (`/ccteam-team` in current session).
-//! The deleted `ccteam-team-author` (V0.2 team plugin factory) and
-//! `ccteam-project-creator` (V0.2.2 four-phase dispatch dialogue) bodies
-//! are folded into `ccteam-creator` step 1/2/3/4 and the
-//! `/ccteam-team` skill respectively.
+//! Shipped install helpers cover `ccteam-control` (CLI/MCP wrap) and
+//! `ccteam-creator` (new project + workflow/agent/skill scaffold). The
+//! generic [`install_skill_body_into`] writer backs any additional
+//! skill an external caller wants to materialize from an embedded body.
 
 use std::path::{Path, PathBuf};
 
@@ -35,20 +31,6 @@ pub const CCTEAM_CONTROL_SKILL_NAME: &str = "ccteam-control";
 /// the V0.2 `ccteam-team-author` (team plugin factory; the factory
 /// itself was deleted in V0.5.0 F100).
 pub const CCTEAM_CREATOR_SKILL_NAME: &str = "ccteam-creator";
-
-/// V0.5.0 F93a — `ccteam-team` skill name. Primary path for the
-/// agent-team mode: `/ccteam-team "<task>"` in the user's current
-/// Claude session spawns an Anthropic Agent Team in-process without
-/// any ccteam workflow.yaml / `ccteam init` step. SKILL.md ships under
-/// `<repo>/skills/ccteam-team/SKILL.md`.
-pub const CCTEAM_TEAM_SKILL_NAME: &str = "ccteam-team";
-
-/// V0.6.2 F141 — `ccteam-scan` skill name. Read-only large-codebase
-/// audit: probes monorepo structure, recommends a `scope:` value per
-/// subsystem for `workflow.yaml`, and reports navigability gaps
-/// (layered CLAUDE.md / `permissions.deny` noise exclusion / LSP).
-/// SKILL.md ships under `<repo>/skills/ccteam-scan/SKILL.md`.
-pub const CCTEAM_SCAN_SKILL_NAME: &str = "ccteam-scan";
 
 /// V0.2.2 F44 + V0.5.0 F100: legacy skill directory names that
 /// `ccteam doctor` migrates back when found.
@@ -82,18 +64,6 @@ pub const CCTEAM_CONTROL_SKILL_MD: &str = include_str!(concat!(
 pub const CCTEAM_CREATOR_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../skills/ccteam-creator/SKILL.md"
-));
-
-/// Embedded `SKILL.md` body for the V0.5.0 F93a `/ccteam-team` skill.
-pub const CCTEAM_TEAM_SKILL_MD: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../skills/ccteam-team/SKILL.md"
-));
-
-/// V0.6.2 F141 — embedded `SKILL.md` body for `ccteam-scan`.
-pub const CCTEAM_SCAN_SKILL_MD: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../skills/ccteam-scan/SKILL.md"
 ));
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,24 +108,6 @@ pub fn install_ccteam_creator_skill(opts: InstallSkillOptions) -> Result<Install
         CCTEAM_CREATOR_SKILL_MD,
         opts,
     )
-}
-
-/// V0.5.0 F93a: install the `ccteam-team` skill into
-/// `~/.claude/skills/ccteam-team/SKILL.md`. Same idempotent semantics
-/// as the other shipped skills. Entry point for the V0.5.0 primary
-/// path — once installed, `/ccteam-team "<task>"` in any Claude
-/// session in any git repo spawns an Anthropic Agent Team in-process.
-pub fn install_ccteam_team_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
-    let claude = user_claude_dir().context("resolve ~/.claude/")?;
-    install_skill_body_into(&claude, CCTEAM_TEAM_SKILL_NAME, CCTEAM_TEAM_SKILL_MD, opts)
-}
-
-/// V0.6.2 F141: install the `ccteam-scan` skill into
-/// `~/.claude/skills/ccteam-scan/SKILL.md`. Same idempotent semantics
-/// as the other shipped skills.
-pub fn install_ccteam_scan_skill(opts: InstallSkillOptions) -> Result<InstallSkillReport> {
-    let claude = user_claude_dir().context("resolve ~/.claude/")?;
-    install_skill_body_into(&claude, CCTEAM_SCAN_SKILL_NAME, CCTEAM_SCAN_SKILL_MD, opts)
 }
 
 /// Test-injectable variant: write into `<claude_dir>/skills/...` so unit
@@ -316,101 +268,6 @@ mod tests {
             tmp.path(),
             CCTEAM_CREATOR_SKILL_NAME,
             CCTEAM_CREATOR_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
-    }
-
-    // ----------------- V0.5.0 F93a ccteam-team skill -----------------
-
-    #[test]
-    fn ccteam_team_skill_installs_under_canonical_dir() {
-        // V0.5.0 F93a: ccteam-team skill ships the `/ccteam:team`
-        // primary-path entry. The body must declare the canonical
-        // `name: ccteam-team` frontmatter so Claude Code's skill loader
-        // picks it up, and must contain the plan-first protocol +
-        // Worker Preamble that the skill is designed around.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let report = install_skill_body_into(
-            tmp.path(),
-            CCTEAM_TEAM_SKILL_NAME,
-            CCTEAM_TEAM_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(report.action, SkillInstallAction::Wrote);
-        assert!(report.target.exists());
-        let body = std::fs::read_to_string(&report.target).unwrap();
-        assert!(body.starts_with("---\nname: ccteam-team"));
-        // Plan-first protocol is the F93a red line — verify it's
-        // literally in the skill body so a future edit can't silently
-        // drop it.
-        assert!(body.contains("TEAM PLAN"));
-        assert!(body.contains("Worker Preamble"));
-        // The entry syntax block must include all four forms documented
-        // in the PRD F93a §需求.
-        for form in ["/ccteam-team <task>", "N \"<task>\"", "N:role", "auto"] {
-            assert!(body.contains(form), "missing entry syntax form: {form}");
-        }
-    }
-
-    #[test]
-    fn ccteam_team_skill_install_is_idempotent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        install_skill_body_into(
-            tmp.path(),
-            CCTEAM_TEAM_SKILL_NAME,
-            CCTEAM_TEAM_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        let r2 = install_skill_body_into(
-            tmp.path(),
-            CCTEAM_TEAM_SKILL_NAME,
-            CCTEAM_TEAM_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(r2.action, SkillInstallAction::AlreadyPresent);
-    }
-
-    // ----------------- V0.6.2 F141 ccteam-scan skill -----------------
-
-    #[test]
-    fn ccteam_scan_skill_installs_under_canonical_dir() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let report = install_skill_body_into(
-            tmp.path(),
-            CCTEAM_SCAN_SKILL_NAME,
-            CCTEAM_SCAN_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(report.action, SkillInstallAction::Wrote);
-        assert!(report.target.exists());
-        let body = std::fs::read_to_string(&report.target).unwrap();
-        assert!(body.starts_with("---\nname: ccteam-scan"));
-        // Read-only contract is the F141 red line — verify it's literally
-        // in the body so a future edit can't silently drop it.
-        assert!(body.contains("只读"));
-        assert!(body.contains("codebase-scan.md"));
-    }
-
-    #[test]
-    fn ccteam_scan_skill_install_is_idempotent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        install_skill_body_into(
-            tmp.path(),
-            CCTEAM_SCAN_SKILL_NAME,
-            CCTEAM_SCAN_SKILL_MD,
-            InstallSkillOptions::default(),
-        )
-        .unwrap();
-        let r2 = install_skill_body_into(
-            tmp.path(),
-            CCTEAM_SCAN_SKILL_NAME,
-            CCTEAM_SCAN_SKILL_MD,
             InstallSkillOptions::default(),
         )
         .unwrap();

@@ -8,7 +8,7 @@
 //! must not regress.
 //!
 //! Tests cover:
-//!   - active tool count matches the spec (28 after V0.8.4, see
+//!   - active tool count matches the spec (20, see
 //!     `mcp_serve::tool_definitions_count_matches_spec`)
 //!   - `STUB_TOOLS` is empty after V0.6.5 ship (asserted via the
 //!     `stub_count: 0` line + empty `unexpected_stubs` array)
@@ -45,17 +45,16 @@ fn run_doctor_verify_mcp(extra_args: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
-fn active_count_is_28_and_stub_count_is_0_on_clean_tree() {
-    // V0.6.5 F146 grew the chat group 5 → 6 tools (total 26 → 27);
-    // V0.8.4 P2b adds `chat_send_file` → 28. The STUB allow-list
-    // (`mcp_tool_groups::STUB_TOOLS`) is empty. F171 is the automated
-    // assertion.
+fn active_count_is_20_and_stub_count_is_0_on_clean_tree() {
+    // admin 3 + workflow 8 + screenshot 1 + chat 6 + advise 2 = 20. The
+    // STUB allow-list (`mcp_tool_groups::STUB_TOOLS`) is empty. F171 is
+    // the automated assertion.
     let (stdout, stderr, code) = run_doctor_verify_mcp(&["--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(v["ok"], Value::Bool(true), "{v}");
-    assert_eq!(v["total_tools"], Value::Number(28.into()), "{v}");
-    assert_eq!(v["active_count"], Value::Number(28.into()), "{v}");
+    assert_eq!(v["total_tools"], Value::Number(20.into()), "{v}");
+    assert_eq!(v["active_count"], Value::Number(20.into()), "{v}");
     assert_eq!(v["stub_count"], Value::Number(0.into()), "{v}");
     assert!(v["unexpected_stubs"].as_array().unwrap().is_empty(), "{v}");
 }
@@ -113,8 +112,8 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
         stdout.contains("V0.6.6 F171"),
         "header must carry F171 marker for traceability: {stdout}",
     );
-    assert!(stdout.contains("total tools:    28"), "got: {stdout}");
-    assert!(stdout.contains("active:         28"), "got: {stdout}");
+    assert!(stdout.contains("total tools:    20"), "got: {stdout}");
+    assert!(stdout.contains("active:         20"), "got: {stdout}");
     assert!(stdout.contains("stubs:          0"), "got: {stdout}");
     assert!(stdout.contains("per-group breakdown:"), "got: {stdout}");
     // Verdict line on clean tree.
@@ -175,9 +174,9 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
     assert_eq!(code, 0);
     for (group, active) in [
         ("admin:", 3),
-        ("workflow:", 15),
+        ("workflow:", 8),
         ("screenshot:", 1),
-        ("chat:", 7),
+        ("chat:", 6),
         ("advise:", 2),
     ] {
         let needle = format!("{group}    {active} active / 0 stub");

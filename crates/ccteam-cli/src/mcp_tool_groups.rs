@@ -8,23 +8,17 @@
 //! clean env-driven way to disable categories the user doesn't care
 //! about (e.g. `CCTEAM_DISABLE_TOOLS=chat,screenshot`).
 //!
-//! V0.6.0 Wave 1 model:
-//! - 1 admin tool (`ls`)
-//! - 15 workflow tools (V0.5 9 + V0.4 F65 7, minus screenshot)
+//! Group model:
+//! - 3 admin tools (`ls` + `change_persona` + `add_tool`)
+//! - 8 workflow tools (`show` / `peek` / `progress` / `new` / `pause` /
+//!   `resume` / `send_to_session` / `inject_decision`)
 //! - 1 screenshot tool
-//! - 5 chat stubs (Wave 2 F108)
-//! - 2 advise stubs (Wave 3 F112)
+//! - 6 chat tools
+//! - 2 advise tools
 //!
-//! V0.6.1 F128 grows admin group 1 → 3 (`change_persona` +
-//! `add_tool` real implementations).
-//!
-//! V0.6.5 F146 swaps the `chat_lifecycle` STUB for real
-//! `chat_register_bot` + `chat_unregister_bot` tools (no deprecated
-//! alias — CLAUDE.md §五 #4) growing the chat group 5 → 6.
-//!
-//! Total: 28 tools registered (V0.8.4 adds `chat_send_file`). Disabling a group hides every
-//! tool in that group from `tools/list`; `tools/call` against a
-//! disabled tool falls through to the standard "unknown tool" error.
+//! Total: 20 tools registered. Disabling a group hides every tool in
+//! that group from `tools/list`; `tools/call` against a disabled tool
+//! falls through to the standard "unknown tool" error.
 
 use std::collections::HashSet;
 
@@ -45,16 +39,16 @@ pub const STUB_TOOLS: &[&str] = &[];
 /// `CCTEAM_DISABLE_TOOLS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolGroup {
-    /// Cross-project admin (`ls`).
+    /// Cross-project admin (`ls` / `change_persona` / `add_tool`).
     Admin,
-    /// Per-workflow operations (`show`, `peek`, F65 spawn/stop/...).
+    /// Per-workflow operations (`show`, `peek`, `progress`, lifecycle).
     Workflow,
     /// Pure-read tmux pane → PNG capture; its own group so heavy /
     /// privacy-sensitive deployments can disable it independently.
     Screenshot,
-    /// Wave 2 F108 chat workflow (5 tools).
+    /// Chat-mode bot workflow (6 tools).
     Chat,
-    /// Wave 3 F112 Codex + Claude parallel advisor (2 tools).
+    /// Codex + Claude parallel advisor (2 tools).
     Advise,
 }
 

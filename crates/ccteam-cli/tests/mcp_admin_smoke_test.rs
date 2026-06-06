@@ -11,8 +11,7 @@
 //!  2. `admin_workflow_resume`   — `ccteam__workflow_resume` returns ok=true
 //!  3. `admin_list_workflows`    — `ccteam__admin_ls` returns project list
 //!  4. `admin_cost_today`        — `ccteam__admin_ls` response carries cost fields
-//!  5. `admin_stop_everything`   — `ccteam__workflow_signal` stop → inbox file
-//!  6. `admin_change_persona`    — `ccteam__admin_change_persona` rewrites agent .md
+//!  5. `admin_change_persona`    — `ccteam__admin_change_persona` rewrites agent .md
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -312,66 +311,7 @@ fn admin_cost_today() {
     srv.shutdown();
 }
 
-// ─────────────────────────── 5. stop everything ────────────────────
-
-/// F150 smoke 5 — `admin_stop_everything`:
-/// `ccteam__workflow_stop_agent` with no `session_id` (i.e. stop ALL
-/// sessions of a role) is the MCP primitive backing the NL admin
-/// `@ccteam stop everything` path.  We confirm a `.ccteam/stop_signal/`
-/// marker file is written and the tool returns `ok=true`.
-#[test]
-fn admin_stop_everything() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-zeta", None);
-    let _daemon = fake_daemon(&home);
-
-    // stop_agent is gated on a reachable daemon so the control-plane
-    // write cannot be silently accepted while ccteam is down.
-    let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(
-        &mut srv,
-        "ccteam__workflow_stop_agent",
-        json!({
-            "slug": "dev-zeta",
-            "role": "worker",
-            // session_id omitted → stop ALL sessions of this role
-        }),
-    );
-    assert_eq!(body["ok"], true, "stop_agent must return ok=true");
-    assert_eq!(body["slug"], "dev-zeta", "response must echo slug");
-    assert_eq!(body["role"], "worker", "response must echo role");
-
-    // The marker file must be written to .ccteam/stop_signal/.
-    let stop_dir = projects.join("dev-zeta/.ccteam/stop_signal");
-    assert!(
-        stop_dir.exists(),
-        "stop_signal dir must exist after stop_agent; checked {}",
-        stop_dir.display()
-    );
-    let entries: Vec<_> = std::fs::read_dir(&stop_dir).unwrap().collect();
-    assert_eq!(
-        entries.len(),
-        1,
-        "exactly one stop_signal marker expected; found {}",
-        entries.len()
-    );
-    // The marker file should be named `worker___all__` (session omitted).
-    let marker_name = entries[0]
-        .as_ref()
-        .unwrap()
-        .file_name()
-        .into_string()
-        .unwrap();
-    assert!(
-        marker_name.starts_with("worker_"),
-        "marker file must start with role prefix `worker_`; got `{marker_name}`"
-    );
-    srv.shutdown();
-}
-
-// ─────────────────────────── 6. change persona ─────────────────────
+// ─────────────────────────── 5. change persona ─────────────────────
 
 /// F150 smoke 6 — `admin_change_persona`:
 /// `ccteam__admin_change_persona` must rewrite the bot's agent .md

@@ -32,7 +32,10 @@ pub mod sse;
 // V0.5.0 F96 — Agent Teams JSON API + SSE channel.
 pub mod teams_api;
 pub mod teams_sse;
-// V0.6.3 F143 — `POST /webhook/{project}/{token}` HTTP→file ingress.
+// Per-project webhook secret helper (`generate_or_load_secret`),
+// surfaced by the CLI's `ccteam show` so the operator can see the
+// webhook URL. The HTTP ingress route itself is re-introduced by the
+// flow engine later.
 pub mod webhook;
 
 /// Compose every M5.x sub-router available at the current ship state.
@@ -65,14 +68,4 @@ pub fn stateful_router() -> Router<AppState> {
 /// the secret token.
 pub fn stateless_router() -> Router {
     Router::new().merge(health::router())
-}
-
-/// V0.6.3 F143 — webhook ingress router. It is stateful (needs
-/// `AppState` to resolve project paths) but mounted **outside** the
-/// `auth_layer` bearer gate: the `POST /webhook/{project}/{token}`
-/// route carries its own per-project token in the URL path. The
-/// caller (`lib::router_with_state`) attaches `AppState` via
-/// `.with_state(...)` before merging it at the top level.
-pub fn webhook_router() -> Router<AppState> {
-    webhook::router()
 }

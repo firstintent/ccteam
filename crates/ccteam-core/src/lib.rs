@@ -199,7 +199,7 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
-pub use paths::{agent_tasks_root, agent_teams_root, teams_progress_path};
+pub use paths::{agent_tasks_root, agent_teams_root, canonical_home_dirs, teams_progress_path};
 pub use plan_approval::{PlanApprovalOnTimeout, PlanApprovalSpec};
 pub use progress::{
     current_agent_sessions, escalation_count, read_all_events, workflow_cost_total,
@@ -228,10 +228,9 @@ pub use silence_classifier::{
     SilenceClass, LIMBO_RETRY_FILE, MAX_LIMBO_RETRY,
 };
 pub use skill::{
-    install_ccteam_control_skill, install_ccteam_creator_skill, install_ccteam_scan_skill,
-    install_ccteam_team_skill, install_into as install_skill_into, install_skill_body_into,
-    InstallSkillOptions, InstallSkillReport, SkillInstallAction, CCTEAM_CONTROL_SKILL_NAME,
-    CCTEAM_CREATOR_SKILL_NAME, CCTEAM_SCAN_SKILL_NAME, CCTEAM_TEAM_SKILL_NAME, LEGACY_SKILL_NAMES,
+    install_ccteam_control_skill, install_ccteam_creator_skill, install_into as install_skill_into,
+    install_skill_body_into, InstallSkillOptions, InstallSkillReport, SkillInstallAction,
+    CCTEAM_CONTROL_SKILL_NAME, CCTEAM_CREATOR_SKILL_NAME, LEGACY_SKILL_NAMES,
 };
 pub use stall::{
     classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,

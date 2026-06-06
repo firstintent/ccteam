@@ -110,20 +110,12 @@ pub fn router() -> Result<Router> {
 /// `Authorization: Bearer ccteam:<token>` header or the matching
 /// `ccteam_token` cookie set via the URL shim (see
 /// `auth::auth_layer`).
-///
-/// V0.6.3 F143 — the webhook ingress router (`POST
-/// /webhook/{project}/{token}`) is mounted **outside** the `auth_layer`
-/// gate: it carries its own per-project token in the URL path, so it
-/// must stay reachable even when the bearer gate is enabled on a
-/// non-loopback bind.
 pub fn router_with_state(state: AppState) -> Router {
     let stateful = routes::stateful_router()
         .layer(from_fn_with_state(state.clone(), auth::auth_layer))
-        .with_state(state.clone());
-    let webhook = routes::webhook_router().with_state(state);
+        .with_state(state);
     Router::new()
         .merge(routes::stateless_router())
-        .merge(webhook)
         .merge(stateful)
 }
 
