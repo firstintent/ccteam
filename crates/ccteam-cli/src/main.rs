@@ -3267,7 +3267,7 @@ async fn run_session_collect(
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
 
-    // Tail the ccteam-owned transcript mirror (same source as chat_history).
+    // Tail the ccteam-owned transcript mirror.
     // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
     // not role, so read by `resolved.sid` (role is a content label only).
     let all = ccteam_harness::execution::turns_mirror::read_all_turns(
@@ -4390,7 +4390,7 @@ mod session_tool_tests {
         )));
         // Foreign tool name.
         assert!(!is_session_tool_call(&call(
-            "ccteam__chat_send_input",
+            "ccteam__chat_register_bot",
             json!({})
         )));
         // Right name, wrong method.

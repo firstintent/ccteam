@@ -13,12 +13,12 @@
 //! - 0 workflow tools (the group was retired; the `Workflow` variant is
 //!   kept so the `workflow_` prefix routing + env toggle stay stable)
 //! - 1 screenshot tool
-//! - 6 chat tools
+//! - 4 chat tools (register / unregister / list_bots / send_file)
 //! - 2 advise tools
 //! - 5 session tools (v0.8.7 W1 — cto scheduling: spawn / dispatch /
 //!   collect / list / stop)
 //!
-//! Total: 17 tools registered. Disabling a group hides every tool in
+//! Total: 15 tools registered. Disabling a group hides every tool in
 //! that group from `tools/list`; `tools/call` against a disabled tool
 //! falls through to the standard "unknown tool" error.
 
@@ -217,7 +217,7 @@ mod tests {
             Some(ToolGroup::Screenshot)
         );
         assert_eq!(
-            group_for_tool("ccteam__chat_send_input"),
+            group_for_tool("ccteam__chat_register_bot"),
             Some(ToolGroup::Chat)
         );
         assert_eq!(
@@ -238,7 +238,7 @@ mod tests {
             json!({ "name": "ccteam__admin_ls" }),
             json!({ "name": "ccteam__workflow_show" }),
             json!({ "name": "ccteam__screenshot" }),
-            json!({ "name": "ccteam__chat_send_input" }),
+            json!({ "name": "ccteam__chat_register_bot" }),
             json!({ "name": "ccteam__advise_vote" }),
         ];
         let mut disabled = HashSet::new();
@@ -260,7 +260,7 @@ mod tests {
     fn filter_by_disabled_empty_set_is_passthrough() {
         let tools = vec![
             json!({ "name": "ccteam__admin_ls" }),
-            json!({ "name": "ccteam__chat_send_input" }),
+            json!({ "name": "ccteam__chat_register_bot" }),
         ];
         let kept = filter_by_disabled(tools.clone(), &HashSet::new());
         assert_eq!(kept.len(), 2);

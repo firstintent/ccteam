@@ -3,8 +3,8 @@
 //!
 //! Confirms the wire contract that interfaces.md §12 promises:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 12 tools, all `ccteam__*`
-//!   (admin 3 + screenshot 1 + chat 6 + advise 2);
+//! - `tools/list` enumerates exactly 15 tools, all `ccteam__*`
+//!   (admin 3 + screenshot 1 + chat 4 + advise 2 + session 5);
 //! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
 //!   the first content[].text.
 
@@ -112,7 +112,7 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 
 #[test]
 fn mcp_serve_tools_list_returns_full_tool_set() {
-    // admin 3 + screenshot 1 + chat 6 + advise 2 = 12.
+    // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
     // Bump this when a new tool lands.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
@@ -131,8 +131,8 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        17,
-        "admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17"
+        15,
+        "admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15"
     );
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for required in [
@@ -143,11 +143,9 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         // Screenshot.
         "ccteam__screenshot",
         // Chat.
-        "ccteam__chat_send_input",
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
         "ccteam__chat_list_bots",
-        "ccteam__chat_history",
         "ccteam__chat_send_file",
         // Advise.
         "ccteam__advise_vote",

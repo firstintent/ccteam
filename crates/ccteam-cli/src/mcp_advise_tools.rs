@@ -271,7 +271,7 @@ mod tests {
     async fn dispatch_returns_none_for_foreign_tools() {
         let tmp = TempDir::new().unwrap();
         let p = paths(&tmp);
-        assert!(dispatch(&p, "ccteam__chat_send_input", &json!({}))
+        assert!(dispatch(&p, "ccteam__chat_register_bot", &json!({}))
             .await
             .unwrap()
             .is_none());

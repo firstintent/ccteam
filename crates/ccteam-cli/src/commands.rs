@@ -7446,7 +7446,7 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 17, "ships 17 tools");
+        assert_eq!(report.total_tools, 15, "ships 15 tools");
     }
 
     #[test]

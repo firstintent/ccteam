@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn session_spawn_schema_carries_permission_mode_param() {
         // v0.8.7 W2 (DB.1) — session_spawn gains an optional permission_mode
-        // param (a schema change to an EXISTING tool — tool count stays 17).
+        // param (a schema change to an EXISTING tool — tool count unchanged).
         let spawn = session_tool_definitions()
             .into_iter()
             .find(|t| t["name"] == "ccteam__session_spawn")
@@ -300,7 +300,7 @@ mod tests {
     fn is_session_tool_recognizes_group_and_rejects_others() {
         assert!(is_session_tool("ccteam__session_spawn"));
         assert!(is_session_tool("ccteam__session_stop"));
-        assert!(!is_session_tool("ccteam__chat_send_input"));
+        assert!(!is_session_tool("ccteam__chat_register_bot"));
         assert!(!is_session_tool("ccteam__advise_vote"));
         assert!(!is_session_tool("ccteam__session_bogus"));
     }
@@ -312,7 +312,7 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        assert!(dispatch(&paths, "ccteam__chat_send_input", &json!({}))
+        assert!(dispatch(&paths, "ccteam__chat_register_bot", &json!({}))
             .await
             .unwrap()
             .is_none());
