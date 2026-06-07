@@ -193,6 +193,23 @@ pub fn ingest_codex_pane(raw: &str) -> Result<HarnessSnapshot, HarnessError> {
     Ok(snapshot_from_status(parse_status_line(raw)))
 }
 
+/// Codex 侧 per-session 容器 pane 名的【单一权威】(对齐 claude 侧
+/// [`chat_session_name`](crate::chat_session_name) 的单一权威)。
+///
+/// 字节定义 = `session_name_for_slug(slug)`(= `ccteam-{slug}`)+ `-{sid}`,
+/// 再 `trim_start_matches('-')`(slug 为空时 `ccteam--{sid}` 退化的边界
+/// 保护)。这与 [`CodexExecAdapter::start_thread`] 历来构造 `tmux_session`
+/// 的方式**逐字节一致** —— 抽出来后,web 终端解析 sid→pane 与 codex
+/// 真正起容器 pane 共用这一个定义,避免两份漂移。
+///
+/// v0.8.8 B5 — 第二参语义是 **sid**(`s<N>`),非 role:同一 `(project,
+/// role)` 可有多个会话,唯一键是 sid。
+pub fn codex_chat_session_name(slug: &str, sid: &str) -> String {
+    format!("{}-{}", session_name_for_slug(slug), sid)
+        .trim_start_matches('-')
+        .to_string()
+}
+
 #[async_trait]
 impl HarnessAdapter for CodexExecAdapter {
     fn name(&self) -> &'static str {
@@ -208,9 +225,9 @@ impl HarnessAdapter for CodexExecAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
-        let tmux_session = format!("{}-{}", session_name_for_slug(&ctx.slug), ctx.sid)
-            .trim_start_matches('-')
-            .to_string();
+        // v0.8.8 B5 — pane 名走单一权威 helper(web 终端 sid→pane 解析共用),
+        // 字节定义不变(`ccteam-{slug}-{sid}`,空 slug 边界 trim 前导 '-')。
+        let tmux_session = codex_chat_session_name(&ctx.slug, &ctx.sid);
 
         // V0.8 W2c — route the container lifecycle through the ProcessBackend
         // trait (default = TmuxBackend; behavior unchanged vs V0.6.x).
@@ -807,6 +824,25 @@ mod tests {
         let snap = snapshot_from_status(None);
         assert_eq!(snap.harness, "codex");
         assert_eq!(snap.model_display_name, "codex");
+    }
+
+    // v0.8.8 B5 — `codex_chat_session_name` 是 codex pane 名的单一权威。
+    // 断言它与 `start_thread` 历来的 inline 构造逐字节一致(并覆盖空 slug
+    // 的前导 '-' trim 边界)。
+    #[test]
+    fn codex_chat_session_name_matches_inline_construction() {
+        // 常规:`ccteam-{slug}-{sid}`。slug 自身含 dash 也照样拼接。
+        assert_eq!(
+            codex_chat_session_name("dev-proj", "s3"),
+            "ccteam-dev-proj-s3"
+        );
+        // 与历史 inline 写法逐字节等价。
+        let inline = format!("{}-{}", session_name_for_slug("dev-proj"), "s3")
+            .trim_start_matches('-')
+            .to_string();
+        assert_eq!(codex_chat_session_name("dev-proj", "s3"), inline);
+        // 空 slug 边界:`ccteam--s1` → trim 前导 '-' 不影响(无前导 '-')。
+        assert_eq!(codex_chat_session_name("", "s1"), "ccteam--s1");
     }
 
     // V0.6.3 F144 — forward-compat regression tests. OpenAI may ship a

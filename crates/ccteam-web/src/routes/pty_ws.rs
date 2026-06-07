@@ -1,30 +1,41 @@
-//! V0.3.2 F56 — WebSocket PTY relay endpoints.
+//! WebSocket PTY relay endpoints (backend-neutral).
 //!
 //! Two routes:
 //!
-//! - `GET /ws/{slug}/pty`           — project pane (tmux session from
+//! - `GET /ws/{slug}/pty`           — project pane (tmux/rmux session name from
 //!   `ProjectState::tmux_session`).
-//! - `GET /ws/{slug}/{sid}/pty`     — per-session route. W5: the flex
-//!   per-session registry is gone, so this currently relays the
-//!   project-level pane; W5b/W5c re-key it onto the new session record.
+//! - `GET /ws/{slug}/{sid}/pty`     — **per-session** route. v0.8.8 B5: there is
+//!   no project-level pane anymore (F1) — each session's pane is per-sid. The
+//!   handler resolves `sid → {vendor, project, …}` via the live gateway
+//!   ([`Gateway::session_resolve`](ccteam_im::gateway::Gateway::session_resolve))
+//!   and targets the per-session pane: claude = `ccteam-chat-{slug}-{sid}`,
+//!   codex = `ccteam-{slug}-{sid}` (see [`super::session_pane`]). No live
+//!   gateway → 503 (standalone internal-web has no session map); a sid the
+//!   gateway does not track → 404.
 //!
 //! ## Wire protocol (subprotocol `ccteam-pty.v1`)
 //!
-//! - **Server → client, binary frame**: raw bytes captured from the
-//!   tmux pane via `tmux pipe-pane` (one or more pane updates, no
-//!   chunk boundary semantics).
-//! - **Server → client, text frame** (control): `{"type":"lag",
-//!   "behind":N}` — emitted once on broadcast lag; the stream continues
-//!   from the latest available offset. The socket is NOT closed on
-//!   lag.
-//! - **Client → server, binary frame**: raw bytes piped to `tmux
-//!   send-keys -l -- <bytes>`. `-l` (literal) keeps tmux from
-//!   interpreting tokens like `Enter` or `C-c` as named keys — the
-//!   browser xterm.js layer sends those as the underlying control
-//!   bytes already.
+//! - **Server → client, binary frame**: pane output from the configured mux
+//!   backend's `subscribe` stream (see the fidelity caveat below).
+//! - **Server → client, text frame** (control): `{"type":"lag","behind":N}` —
+//!   emitted once on broadcast lag; the stream continues from the latest
+//!   available offset. The socket is NOT closed on lag.
+//! - **Client → server, binary frame**: bytes forwarded to the backend's
+//!   `send_text` (literal keystrokes; the browser xterm.js layer already sends
+//!   control keys as their underlying bytes).
 //! - **Client → server, text frame** (control):
-//!   `{"type":"resize","cols":C,"rows":R}` — invokes `tmux
-//!   resize-window -t <session> -x C -y R`.
+//!   `{"type":"resize","cols":C,"rows":R}` — invokes the backend's `resize`.
+//!
+//! ## Fidelity caveat (v0.8.8 B5)
+//!
+//! Raw-byte faithfulness holds ONLY under the `tmux` backend
+//! (`CCTEAM_MUX_BACKEND=tmux`, which streams real `pipe-pane` bytes). The
+//! **default** backend is `rmux`, whose `subscribe` re-emits re-assembled lines
+//! (strips `\r`, re-appends `\n`) — adequate for display + pattern-matching but
+//! NOT byte-exact ANSI replay. So "looks exactly like a local terminal / full
+//! raw ANSI" is a `tmux`-backend-only property; under default rmux it degrades
+//! to line-text. TODO: a byte-faithful rmux capture shim (the ANSI gap noted in
+//! `ccteam_harness::rmux_backend`'s `subscribe`).
 //!
 //! ## Auth
 //!
@@ -34,13 +45,14 @@
 //! `auth required` body as the rest of the app; the upgrade is
 //! refused, not accepted-and-closed.
 //!
-//! ## Red lines (CLAUDE.md §三 + PRD §6 §F56)
+//! ## Red lines (CLAUDE.md §三)
 //!
-//! - We never parse pane output for semantics. F56 is a raw byte
-//!   relay; orchestrator state comes from `progress.jsonl` alone.
-//! - We never invoke `tmux kill-session`. The only teardown F56 does
-//!   is `tmux pipe-pane -t <session>:0.0` (stop, no command) once the
-//!   last subscriber drops.
+//! - We never parse pane output for semantics. This is a pane byte/line relay,
+//!   not a `capture-pane` scrape; orchestrator state comes from
+//!   `progress.jsonl` alone.
+//! - We never kill a session. The only teardown is stopping the pane relay
+//!   (backend-side, e.g. `pipe-pane` stop under tmux) once the last subscriber
+//!   drops.
 
 use std::sync::Arc;
 
@@ -55,11 +67,16 @@ use axum::{
     Router,
 };
 use ccteam_core::ProjectState;
-use ccteam_harness::{MuxSessionId, PaneBackend, ProcessBackend, TmuxBackend};
+// B5 — `default_backend()` returns `Arc<dyn PaneBackend>`; `send_text` /
+// `resize` are callable on the trait object directly (vtable methods), so
+// the `PaneBackend` / `ProcessBackend` traits need not be in scope. The
+// previously-hardcoded `TmuxBackend` is no longer referenced.
+use ccteam_harness::{default_backend, MuxSessionId};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
+use super::session_pane::{resolve_session_pane, PaneResolveError};
 use crate::pty::Subscription;
 use crate::state::AppState;
 
@@ -101,19 +118,26 @@ async fn handle_session_ws(
     State(app): State<AppState>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> Response {
-    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
-    // is gone, so the session's tmux name can no longer be resolved from
-    // it. Fall back to the project-level tmux session. TODO(V0.8.6
-    // W5b/W5c): re-key this onto the new session record so the
-    // per-session terminal relay targets the right pane again.
-    let state = match ProjectState::load(&app.paths.project_state(&slug)) {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::NOT_FOUND, "project not found").into_response(),
+    // v0.8.8 B5 — F1 后【没有项目级 pane】:每会话 pane 是 per-sid。经 live
+    // gateway 把 sid 解析成 {vendor, project, …},再按 vendor 构 per-session
+    // pane 名(claude=ccteam-chat-{slug}-{sid} / codex=ccteam-{slug}-{sid})。
+    // 无 gateway(standalone internal-web,无会话表)→ 503;sid 未知 → 404。
+    // 不再退回 ProjectState::load + state.tmux_session(F1 后那个名字根本不
+    // 对应任何活 pane,会 subscribe 空/秒断 → SPA 1s 重连循环)。
+    let (tmux_session, _resolved) = match resolve_session_pane(&app, &sid).await {
+        Ok(pair) => pair,
+        Err(PaneResolveError::NoGateway) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no live gateway: per-session terminal unavailable on standalone web",
+            )
+                .into_response()
+        }
+        Err(PaneResolveError::Unknown) => {
+            return (StatusCode::NOT_FOUND, format!("unknown session: {sid}")).into_response()
+        }
     };
-    let tmux_session = state.tmux_session.clone();
-    if tmux_session.trim().is_empty() {
-        return (StatusCode::NOT_FOUND, "project has no tmux session").into_response();
-    }
+    // FIFO/relay key 仍用 `{slug}/{sid}`(URL 寻址),pane 目标用解析出的名字。
     let key = format!("{slug}/{sid}");
     upgrade(ws, app, key, tmux_session)
 }
@@ -220,20 +244,20 @@ async fn send_keys(tmux_session: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let s = std::str::from_utf8(bytes).map_err(|_| {
         anyhow::anyhow!("send-keys: non-UTF-8 input rejected (would corrupt tmux argv)")
     })?;
-    // V0.8 W1 — route through the ProcessBackend trait. Note `TmuxBackend`
-    // currently targets bare session-name (`-t <name>`) rather than the
-    // legacy `<name>:0.0` form. The change is benign for CCTEAM-managed
-    // single-window-single-pane sessions and removes an audit §4-B
-    // base-index landmine.
-    let backend = TmuxBackend::new();
+    // v0.8.8 B5 — route through the configured mux backend (rmux-aware;
+    // honors `CCTEAM_MUX_BACKEND`). Previously hardcoded `TmuxBackend::new()`,
+    // which sent keystrokes to a tmux server that does not exist under the
+    // default rmux backend, so input never reached the pane.
+    let backend = default_backend();
     let id = MuxSessionId::new(tmux_session.to_string());
     backend.send_text(&id, s).await?;
     Ok(())
 }
 
 async fn resize_window(tmux_session: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
-    // V0.8 W1 — route through the ProcessBackend trait.
-    let backend = TmuxBackend::new();
+    // v0.8.8 B5 — route through the configured mux backend (rmux-aware),
+    // matching the subscribe + send paths. Was hardcoded `TmuxBackend::new()`.
+    let backend = default_backend();
     let id = MuxSessionId::new(tmux_session.to_string());
     backend.resize(&id, cols, rows).await
 }

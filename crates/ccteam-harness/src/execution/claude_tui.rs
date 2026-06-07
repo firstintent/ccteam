@@ -362,7 +362,13 @@ fn spec_for_resume(
     permission_mode: PermissionMode,
     secret: &str,
 ) -> MuxSessionSpec {
-    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
+    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。
+    let mut argv = vec![claude_bin()];
+    if !role.is_empty() {
+        argv.push("--agent".to_string());
+        argv.push(role.to_string());
+    }
     argv.extend(permission_args(permission_mode));
     argv.push("--resume".to_string());
     argv.push(session_id_name.to_string());
@@ -373,10 +379,11 @@ fn spec_for_resume(
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
-/// `claude --agent <role> --name <session_id_name>` (no context carry-over;
+/// `claude [--agent <role>] --name <session_id_name>` (no context carry-over;
 /// pairs with the `chat_session_reset` event the caller emits). Delegates to
-/// [`spec_for_new`], so it inherits the `--agent <role>` persona binding
-/// (v0.8.6 W1 session-is-the-role keystone).
+/// [`spec_for_new`], so it inherits the same `--agent <role>` persona binding
+/// (v0.8.6 W1 session-is-the-role keystone) — or, when `role` is empty
+/// (v0.8.8 F2 roleless), the same `--agent`-omitted bare-claude shape.
 fn spec_for_fresh(
     role: &str,
     slug: &str,
@@ -398,10 +405,12 @@ fn spec_for_fresh(
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
-/// `claude --agent <role> --name <session_id_name>` so Anthropic files the
+/// `claude [--agent <role>] --name <session_id_name>` so Anthropic files the
 /// session jsonl under a deterministic name (enabling future recreate-path
 /// `--resume`) AND binds the role persona from `.claude/agents/<role>.md` —
-/// the session-is-the-role keystone (v0.8.6 W1).
+/// the session-is-the-role keystone (v0.8.6 W1). v0.8.8 F2 — an empty `role`
+/// (roleless) OMITS `--agent` so bare claude reads the project's own
+/// `CLAUDE.md`; the `--name`/sid segment is unconditional.
 fn spec_for_new(
     role: &str,
     slug: &str,
@@ -411,7 +420,14 @@ fn spec_for_new(
     permission_mode: PermissionMode,
     secret: &str,
 ) -> MuxSessionSpec {
-    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
+    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。`--name`/
+    // sid 段恒在,roleless 仍要确定性 session jsonl 名供后续 `--resume`。
+    let mut argv = vec![claude_bin()];
+    if !role.is_empty() {
+        argv.push("--agent".to_string());
+        argv.push(role.to_string());
+    }
     argv.extend(permission_args(permission_mode));
     argv.push("--name".to_string());
     argv.push(session_id_name.to_string());
@@ -529,11 +545,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
-        if spec.role.is_empty() {
-            return Err(HarnessError::SpawnFailed(
-                "claude-tui requires a non-empty role (AgentSpecBrief::role)".into(),
-            ));
-        }
+        // v0.8.8 F2 — roleless session 合法:空 role → spawn 不加 `--agent`
+        // (vendor 原生裸 claude 自读项目 CLAUDE.md)。这是红线允许的(红线只禁
+        // 注入 system prompt,不禁省略 `--agent`),故移除原先的非空 role 硬挡。
         // 1. Install chat-progress hooks into
         //    <project>/.claude/settings.local.json (ccteam-managed local
         //    layer; never dirties the user's committed settings.json).
@@ -1663,8 +1677,15 @@ mod tests {
             .iter()
             .any(|a| a == "--dangerously-skip-permissions"));
         assert!(!skip.argv.iter().any(|a| a == "--permission-mode"));
-        // Still the keystone --agent + --name.
-        assert!(skip.argv.iter().any(|a| a == "--agent"));
+        // Still the keystone --agent + --name (v0.8.8 F2: non-empty role path
+        // is unchanged — `--agent` is present and immediately followed by the
+        // role token "dev", so roleless's `--agent` omission never regresses a
+        // named-role spawn).
+        let agent_at = skip.argv.iter().position(|a| a == "--agent");
+        assert_eq!(
+            skip.argv.get(agent_at.unwrap() + 1).map(String::as_str),
+            Some("dev")
+        );
         assert!(skip.argv.iter().any(|a| a == "--name"));
         // Hitl: drops the skip flag, carries --permission-mode default.
         let hitl = spec_for_new("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Hitl, "");
@@ -1689,6 +1710,42 @@ mod tests {
         assert!(hitl.argv.iter().any(|a| a == "--permission-mode"));
         // Resume path keeps --resume (not --name).
         assert!(hitl.argv.iter().any(|a| a == "--resume"));
+    }
+
+    /// v0.8.8 F2 — roleless: 空 role 的 spawn argv **不含** `--agent`(裸 claude
+    /// 自读项目 CLAUDE.md),但 `--name`+sid+skip 段恒在(确定性 session jsonl
+    /// 名供后续 resume)。
+    #[test]
+    fn spec_for_new_roleless_omits_agent() {
+        let cwd = std::path::Path::new("/tmp/cc-roleless");
+        let spec = spec_for_new("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !spec.argv.iter().any(|a| a == "--agent"),
+            "roleless spawn must omit --agent, got: {:?}",
+            spec.argv
+        );
+        // The `--name`/sid + skip segment stays put.
+        assert!(spec.argv.iter().any(|a| a == "--name"));
+        assert!(spec.argv.iter().any(|a| a == "sid-1"));
+        assert!(spec
+            .argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    /// v0.8.8 F2 — roleless resume:空 role 的 resume argv 同样 **不含**
+    /// `--agent`,且保留 `--resume`+sid。
+    #[test]
+    fn spec_for_resume_roleless_omits_agent() {
+        let cwd = std::path::Path::new("/tmp/cc-roleless");
+        let spec = spec_for_resume("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !spec.argv.iter().any(|a| a == "--agent"),
+            "roleless resume must omit --agent, got: {:?}",
+            spec.argv
+        );
+        assert!(spec.argv.iter().any(|a| a == "--resume"));
+        assert!(spec.argv.iter().any(|a| a == "sid-1"));
     }
 
     /// v0.8.7 review-fix (R-M1) — a non-empty per-session secret is injected

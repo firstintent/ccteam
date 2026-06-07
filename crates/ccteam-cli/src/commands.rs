@@ -1653,96 +1653,141 @@ pub fn try_attach_chat_session(slug_or_name: &str, sid: Option<&str>) -> Result<
     }
 }
 
-/// `ccteam sessions` — read-only snapshot of gateway chat-mode bot sessions
-/// (`ccteam-chat-<slug>-<role>`). Enumerates live sessions from the mux backend
-/// (R6: names only, never capture-pane) and reconciles them against the
-/// daemon's persisted registry, flagging orphans (live but untracked) and
-/// registered sessions that are no longer running. Never spawns or kills.
+/// `ccteam session ls` — read-only snapshot of gateway chat-mode bot sessions.
+///
+/// v0.8.8 B4 — the row source is now the daemon's **persisted** session records
+/// (sid · project · role · vendor · permission_mode) via
+/// [`ccteam_im::gateway::tracked_chat_sessions`], not a process-name enumeration.
+/// A tracked record means the daemon owns the session, so it shows **live** —
+/// this is the BUG-5 fix: codex sessions (which the process backend can't always
+/// confirm by name) are live whenever the gateway tracks them, instead of the
+/// old false "registered, not running". Live OS panes (`ccteam-chat-*`) that are
+/// **not** in the tracked set are surfaced as orphans (a process that outlived
+/// the daemon that spawned it). Reading the mux backend is name-enumeration only
+/// (R6: never capture-pane); never spawns or kills.
 pub fn run_sessions() -> Result<()> {
-    let backend = ccteam_harness::default_process_backend();
-    let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
-    let live_set: std::collections::BTreeSet<&str> = live.iter().map(String::as_str).collect();
+    let paths = CcteamPaths::from_env()?;
+    let daemon_up = ccteam_core::daemon::daemon_reachable(&paths);
 
+    // Live OS pane names (for orphan detection). Best-effort: a backend error
+    // just means we can't flag orphans, not that we refuse to list tracked rows.
+    let live = block_on_async(ccteam_harness::list_chat_sessions(
+        ccteam_harness::default_process_backend().as_ref(),
+    ))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    // A missing / unreadable registry is non-fatal: no tracked rows, every live
+    // pane is then an orphan.
     let state_path = ccteam_im::default_gateway_state_path();
-    // A missing / unreadable registry is non-fatal: treat every live session as
-    // an orphan rather than refusing to list anything.
-    let tracked = ccteam_im::gateway::tracked_chat_session_names(&state_path).unwrap_or_default();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
 
-    // Reuse the gateway's reconcile classification (orphan = live ∧ untracked).
-    let inventory = ccteam_im::gateway::reconcile_chat_sessions(&tracked, &live);
-    let orphan_names: std::collections::BTreeSet<&str> =
-        inventory.orphans.iter().map(|o| o.name.as_str()).collect();
+    print!("{}", render_sessions_table(&tracked, &live, daemon_up));
+    Ok(())
+}
 
-    // Row set = union of live + tracked, deterministically ordered by name.
-    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    names.extend(live.iter().map(String::as_str));
-    names.extend(tracked.iter().map(String::as_str));
+/// Pure renderer for `ccteam session ls` (testable without a daemon / terminal).
+///
+/// `tracked` = persisted gateway session records (each shows **live** when the
+/// daemon is up, else `registered (daemon down)`); `live_panes` = live
+/// `ccteam-chat-*` OS pane names used only to flag **orphans** (live pane ∧ not
+/// tracked). Columns: SLUG · SID · ROLE · VENDOR · STATUS. An orphan has no
+/// role/vendor (the pane name only carries slug+sid post-F1) → `-`.
+fn render_sessions_table(
+    tracked: &[ccteam_im::gateway::TrackedSessionRow],
+    live_panes: &[String],
+    daemon_up: bool,
+) -> String {
+    // Canonical names the daemon tracks, to subtract from live panes → orphans.
+    let tracked_names: std::collections::BTreeSet<String> = tracked
+        .iter()
+        .map(|r| ccteam_harness::chat_session_name(&r.project, &r.sid))
+        .collect();
 
-    if names.is_empty() {
-        println!("no chat sessions (none live, none registered).");
-        println!(
-            "  Gateway chat sessions appear here once a bot is spawned \
-             (e.g. via Telegram `/new`)."
-        );
-        return Ok(());
-    }
-
-    // v0.8.8 F1 — the trailing pane segment is the SID (`s<N>`), the unique
-    // session key, not a role. Display it as the SID column (role is no longer
-    // recoverable from an orphan pane name — accepted UX cost of sid-keyed panes).
     struct Row {
         slug: String,
         sid: String,
-        name: String,
-        alive: bool,
-        note: &'static str,
+        role: String,
+        vendor: String,
+        status: String,
     }
-    let rows: Vec<Row> = names
+
+    let tracked_status = if daemon_up {
+        "live"
+    } else {
+        "registered (daemon down)"
+    };
+
+    let mut rows: Vec<Row> = tracked
         .iter()
-        .map(|name| {
-            let (slug, sid) = ccteam_harness::parse_chat_session_name(name)
-                .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-            let alive = live_set.contains(name);
-            let note = if orphan_names.contains(name) {
-                "orphan (untracked)"
-            } else if !alive {
-                "registered, not running"
-            } else {
-                ""
-            };
-            Row {
-                slug,
-                sid,
-                name: (*name).to_string(),
-                alive,
-                note,
-            }
+        .map(|r| Row {
+            slug: r.project.clone(),
+            sid: r.sid.clone(),
+            role: r.role.clone(),
+            vendor: r.vendor.clone(),
+            status: tracked_status.to_string(),
         })
         .collect();
 
+    // Orphans: a live pane whose canonical name the daemon doesn't track.
+    for name in live_panes {
+        if tracked_names.contains(name) {
+            continue;
+        }
+        if let Some((slug, sid)) = ccteam_harness::parse_chat_session_name(name) {
+            rows.push(Row {
+                slug,
+                sid,
+                role: "-".to_string(),
+                vendor: "-".to_string(),
+                status: "orphan (untracked live pane)".to_string(),
+            });
+        }
+    }
+
+    // Deterministic order: slug, then sid.
+    rows.sort_by(|a, b| a.slug.cmp(&b.slug).then(a.sid.cmp(&b.sid)));
+
+    if rows.is_empty() {
+        let mut out = String::new();
+        out.push_str("no chat sessions (none tracked, none live).\n");
+        out.push_str(
+            "  Gateway chat sessions appear here once a bot is spawned \
+             (e.g. via Telegram `/new`).\n",
+        );
+        return out;
+    }
+
+    // Column widths mirror the existing `w_sid` algorithm (header-floor max).
     let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
     let w_sid = rows.iter().map(|r| r.sid.len()).max().unwrap_or(0).max(3);
-    let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(7);
+    let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
+    let w_vendor = rows
+        .iter()
+        .map(|r| r.vendor.len())
+        .max()
+        .unwrap_or(0)
+        .max(6);
 
+    let mut out = String::new();
     let header = format!(
-        "{:<w_slug$}  {:<w_sid$}  {:<w_name$}  {:<5}  NOTE",
-        "SLUG", "SID", "SESSION", "ALIVE"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  STATUS",
+        "SLUG", "SID", "ROLE", "VENDOR"
     );
-    println!("{}", header.trim_end());
+    out.push_str(header.trim_end());
+    out.push('\n');
     for r in &rows {
         let line = format!(
-            "{:<w_slug$}  {:<w_sid$}  {:<w_name$}  {:<5}  {}",
-            r.slug,
-            r.sid,
-            r.name,
-            if r.alive { "yes" } else { "no" },
-            r.note,
+            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {}",
+            r.slug, r.sid, r.role, r.vendor, r.status,
         );
-        println!("{}", line.trim_end());
+        out.push_str(line.trim_end());
+        out.push('\n');
     }
-    println!();
-    println!("attach: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)");
-    Ok(())
+    out.push('\n');
+    out.push_str("attach: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)\n");
+    out
 }
 
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
@@ -5742,6 +5787,103 @@ mod tests {
         assert!(dry.would_stop.is_empty() && dry.stopped.is_empty());
         let stop = stop_project_chat_sessions(&backend, "dev-foo", false).unwrap();
         assert!(stop.would_stop.is_empty() && stop.stopped.is_empty());
+    }
+
+    /// v0.8.8 B4 — a tracked row from a fixture gateway state renders one row
+    /// per session with its VENDOR + SID, and a **codex** session shows
+    /// `live` (the BUG-5 fix: tracked ⇒ live regardless of vendor, no more
+    /// false "registered, not running").
+    #[test]
+    fn render_sessions_table_codex_tracked_is_live_with_vendor() {
+        let tracked = vec![
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s1".into(),
+                project: "alpha".into(),
+                role: "reviewer".into(),
+                vendor: "claude".into(),
+                permission_mode: "skip".into(),
+            },
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s2".into(),
+                project: "alpha".into(),
+                role: "builder".into(),
+                vendor: "codex".into(),
+                permission_mode: "hitl".into(),
+            },
+        ];
+        let out = render_sessions_table(&tracked, &[], true);
+
+        // Header carries the new VENDOR column alongside SLUG/SID/ROLE.
+        assert!(out.contains("SLUG"));
+        assert!(out.contains("SID"));
+        assert!(out.contains("ROLE"));
+        assert!(out.contains("VENDOR"));
+
+        // Both rows present with their sid + vendor.
+        let claude_line = out.lines().find(|l| l.contains("s1")).expect("claude row");
+        assert!(claude_line.contains("reviewer"), "{claude_line}");
+        assert!(claude_line.contains("claude"), "{claude_line}");
+        assert!(claude_line.contains("live"), "{claude_line}");
+
+        let codex_line = out.lines().find(|l| l.contains("s2")).expect("codex row");
+        assert!(codex_line.contains("builder"), "{codex_line}");
+        assert!(codex_line.contains("codex"), "{codex_line}");
+        // BUG-5: codex tracked session is live, never "registered, not running".
+        assert!(codex_line.contains("live"), "{codex_line}");
+        assert!(
+            !out.contains("registered, not running"),
+            "BUG-5 regression: false not-running note returned: {out}"
+        );
+    }
+
+    /// v0.8.8 B4 — a live `ccteam-chat-*` pane the daemon does not track is an
+    /// orphan (role/vendor `-`); daemon-down degrades tracked rows to
+    /// `registered (daemon down)` rather than erroring.
+    #[test]
+    fn render_sessions_table_orphan_and_daemon_down() {
+        let tracked = vec![ccteam_im::gateway::TrackedSessionRow {
+            sid: "s1".into(),
+            project: "alpha".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+        }];
+        // One untracked live pane → orphan; the tracked s1's own pane is NOT
+        // listed, so it must not double as an orphan.
+        let live = vec!["ccteam-chat-ghost-zombie".to_string()];
+        let out = render_sessions_table(&tracked, &live, false);
+
+        let tracked_line = out.lines().find(|l| l.contains("s1")).expect("tracked");
+        assert!(
+            tracked_line.contains("registered (daemon down)"),
+            "{tracked_line}"
+        );
+
+        let orphan_line = out
+            .lines()
+            .find(|l| l.contains("zombie"))
+            .expect("orphan row");
+        assert!(orphan_line.contains("ghost"), "{orphan_line}");
+        assert!(orphan_line.contains("orphan"), "{orphan_line}");
+    }
+
+    /// v0.8.8 B4 — a tracked session's own live pane is reconciled (matched by
+    /// canonical name), never re-listed as an orphan.
+    #[test]
+    fn render_sessions_table_tracked_pane_not_an_orphan() {
+        let tracked = vec![ccteam_im::gateway::TrackedSessionRow {
+            sid: "s1".into(),
+            project: "alpha".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+        }];
+        // The live pane name matches the canonical name of the tracked s1.
+        let live = vec!["ccteam-chat-alpha-s1".to_string()];
+        let out = render_sessions_table(&tracked, &live, true);
+        assert!(!out.contains("orphan"), "tracked pane misflagged: {out}");
+        // Exactly one data row (s1), not two.
+        assert_eq!(out.matches("s1").count(), 1, "{out}");
     }
 
     #[test]

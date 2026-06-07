@@ -215,15 +215,11 @@ enum Command {
         restart_team: bool,
     },
     /// V0.4.1: one-screen aggregate health view. Reports daemon
-    /// heartbeat age, every project's slug + age + recent-event time,
-    /// the last N progress events merged across projects, and the
-    /// embedded-web token (file path + value). Replaces having to grep
-    /// `ls` + `progress` + multiple `doctor` checks.
-    Status {
-        /// How many recent progress events to merge + print.
-        #[arg(long, default_value_t = 5)]
-        tail: usize,
-    },
+    /// heartbeat age, every project's slug + age + last-event time with
+    /// its tracked sessions (role · vendor · status · sid) nested
+    /// underneath, and the embedded-web token + LAN URL. Replaces having
+    /// to grep `ls` + `session ls` + multiple `doctor` checks.
+    Status,
     /// Internal commands — hook handlers + meta-agent / MCP integration
     /// points + low-level utilities (mux hook-emit, probe-project, web).
     /// Not user-facing day to day; meta-agent and the `ccteam-control`
@@ -1078,7 +1074,7 @@ fn main() -> Result<()> {
                 StartImdOpts { disabled: no_imd },
             ),
         },
-        Command::Status { tail } => run_status(tail),
+        Command::Status => run_status(),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
             // V0.5.0 F97 — per-slug agent-team cleanup.
@@ -3568,28 +3564,57 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
     })
 }
 
-fn run_status(tail: usize) -> Result<()> {
+fn run_status() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     use ccteam_core::check_daemon_health;
 
     println!("ccteam status");
     println!();
 
-    // Daemon health
+    // ① Daemon health.
     let health = check_daemon_health(&paths);
+    let daemon_up = health.is_healthy();
     println!("  daemon:  {}", health.describe());
     println!();
 
-    // Projects
+    // ② Projects, each with its tracked sessions nested underneath.
+    //
+    // v0.8.8 F3 — the old flat "projects" / "running sessions" / "recent
+    // events" trio is collapsed into one tree: a project row (slug · age ·
+    // last-event · STUCK/OK verdict) followed by its sessions, grouped from
+    // the daemon's persisted records via `tracked_chat_sessions` (same
+    // out-of-process source `session ls` uses, so the two never drift).
     let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
+
+    // Group tracked sessions by project slug. A missing / unreadable registry
+    // is non-fatal — just an empty map (no sessions shown).
+    let state_path = ccteam_im::default_gateway_state_path();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
+    let mut sessions_by_project: std::collections::BTreeMap<
+        String,
+        Vec<ccteam_im::gateway::TrackedSessionRow>,
+    > = std::collections::BTreeMap::new();
+    for row in tracked {
+        sessions_by_project
+            .entry(row.project.clone())
+            .or_default()
+            .push(row);
+    }
+
+    // tracked ⇒ live when the daemon is up; else degrade (matches `session ls`).
+    let session_status = if daemon_up {
+        "live"
+    } else {
+        "registered (daemon down)"
+    };
+
     if projects.is_empty() {
         println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
     } else {
         println!("  projects ({}):", projects.len());
         // Classify each project's silence into a short verdict so the
         // operator reads "STUCK" instead of decoding raw seconds. Reuses
-        // the same `commands::stall_level` tiers the `--json` path emits,
-        // keeping the human + machine views consistent.
+        // `commands::stall_verdict` so the human + JSON views stay consistent.
         let mut needs_attention: Vec<(&str, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
@@ -3602,6 +3627,24 @@ fn run_status(tail: usize) -> Result<()> {
                 "    {:<32}  age {:>8}  last-event {:>8}  {}",
                 p.state.slug, age, silent, verdict
             );
+
+            // Nested session rows for this project. The gateway state carries
+            // no per-session timestamp, so the session "last-event" reuses the
+            // project-level silence (a glance-level proxy); `-` when unknown.
+            if let Some(rows) = sessions_by_project.get(&p.state.slug) {
+                let last_event = if p.stall_silent_seconds > 0 {
+                    silent.clone()
+                } else {
+                    "-".to_string()
+                };
+                for s in rows {
+                    let role = if s.role.is_empty() { "-" } else { &s.role };
+                    println!(
+                        "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
+                        role, s.vendor, session_status, s.sid, last_event
+                    );
+                }
+            }
         }
         // One actionable hint line per warn-or-higher project so the
         // operator knows the exact peek → attach takeover sequence.
@@ -3611,84 +3654,24 @@ fn run_status(tail: usize) -> Result<()> {
     }
     println!();
 
-    // V0.4.7 — running sessions across all projects. Reuses the
-    // same `active_sessions` core function the web dashboard reads,
-    // so CLI / SPA never drift on what they think is alive.
-    if !projects.is_empty() {
-        let mut rows: Vec<(String, ccteam_core::ActiveSessionInfo)> = Vec::new();
-        for p in &projects {
-            match ccteam_core::active_sessions(&p.state.slug, &paths) {
-                Ok(list) => rows.extend(list.into_iter().map(|s| (p.state.slug.clone(), s))),
-                Err(_) => continue,
-            }
-        }
-        if !rows.is_empty() {
-            println!("  running sessions ({}):", rows.len());
-            for (slug, s) in &rows {
-                let model = s.model.as_deref().unwrap_or("—");
-                let ctx = s
-                    .context_remaining_pct
-                    .map(|p| format!("ctx {:>3.0}%", p))
-                    .unwrap_or_else(|| "ctx   —".into());
-                let age = parse_rfc3339_age_secs(&s.started_at)
-                    .map(humanize_secs)
-                    .unwrap_or_else(|| "?".into());
-                let short_job = s
-                    .job_id
-                    .as_deref()
-                    .map(|j| j.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "—".into());
-                println!(
-                    "    {:<24}  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} ago",
-                    slug, s.role, short_job, model, ctx, s.cost_usd, age
-                );
-            }
-            println!("    tip: `claude attach <id>` to take over a session live");
-            println!();
-        }
-    }
-
-    // Recent events across all projects (merged)
-    if tail > 0 && !projects.is_empty() {
-        println!("  recent events (last {}):", tail);
-        let mut all_events: Vec<(String, serde_json::Value)> = Vec::new();
-        for p in &projects {
-            let evs = ccteam_core::progress::read_all_events(&paths.progress_jsonl(&p.state.slug))
-                .unwrap_or_default();
-            for e in evs {
-                all_events.push((p.state.slug.clone(), e));
-            }
-        }
-        // Sort by event ts string (RFC3339 sorts lexicographically).
-        all_events.sort_by_key(|(_, e)| {
-            e.get("ts")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default()
-        });
-        for (slug, evt) in all_events.iter().rev().take(tail).rev() {
-            let kind = evt.get("event").and_then(|v| v.as_str()).unwrap_or("?");
-            let ts = evt.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-            let role = evt.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let role_s = if role.is_empty() {
-                String::new()
-            } else {
-                format!(" role={role}")
-            };
-            println!("    [{ts}] {slug} {kind}{role_s}");
-        }
-        println!();
-    }
-
-    // Web token
+    // ④ Web token + URL (two lines).
+    //
+    // - `web token:` prints the BARE hex (no `ccteam:` prefix) so it can be
+    //   copy-pasted into tools that add their own prefixing.
+    // - `web url:` embeds the token WITH the `ccteam:` prefix (the form the web
+    //   console expects in the query string) at the LAN IP + port 7331.
     let token_path = ccteam_web::token::default_token_path(&paths);
     if token_path.exists() {
-        match std::fs::read_to_string(&token_path) {
-            Ok(hex) => println!(
-                "  web token: ccteam:{}  ({})",
-                hex.trim(),
-                token_path.display()
-            ),
+        match ccteam_web::token::load_existing(&token_path) {
+            Ok(hex) => {
+                println!("  web token: {hex}");
+                match first_lan_ipv4() {
+                    Some(ip) => {
+                        println!("  web url:   http://{ip}:7331/?token=ccteam:{hex}")
+                    }
+                    None => println!("  web url:   <no LAN ip detected> (use http://localhost:7331/?token=ccteam:{hex})"),
+                }
+            }
             Err(_) => println!("  web token: <unreadable> ({})", token_path.display()),
         }
     } else {
@@ -3700,19 +3683,62 @@ fn run_status(tail: usize) -> Result<()> {
     Ok(())
 }
 
-/// Parse an RFC3339 timestamp + return seconds-since for the
-/// status / show table. Returns None on unparseable input.
-fn parse_rfc3339_age_secs(ts: &str) -> Option<u64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    let now = chrono::Utc::now();
-    let secs = now
-        .signed_duration_since(dt.with_timezone(&chrono::Utc))
-        .num_seconds();
-    if secs < 0 {
-        Some(0)
-    } else {
-        Some(secs as u64)
+/// v0.8.8 F3 — predicate for a LAN-reachable IPv4: a private
+/// (RFC1918) address that is neither loopback (`127.0.0.0/8`) nor
+/// link-local (`169.254.0.0/16`). Pure so the interface-walk in
+/// [`first_lan_ipv4`] can be unit-tested without real interfaces.
+fn is_lan_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_link_local() && ip.is_private()
+}
+
+/// v0.8.8 F3 — first non-loopback, non-link-local, private IPv4 of any local
+/// interface, for the `ccteam status` web URL line (so the operator gets a
+/// LAN-reachable address, not `127.0.0.1`). Returns `None` when no private
+/// IPv4 is configured (the URL line then degrades to a localhost hint).
+///
+/// Uses `getifaddrs(3)` directly — `ccteam-cli` already depends on `libc`
+/// (zero new deps). The unsafe FFI is fully contained here: it walks the
+/// linked list, reads only `AF_INET` entries, converts the network-order
+/// `s_addr` to host order for `Ipv4Addr`, and always `freeifaddrs`-frees the
+/// list before returning.
+#[cfg(unix)]
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+
+    // SAFETY: `getifaddrs` writes a heap-allocated linked list into `ifap` on
+    // success (returns 0) which we must `freeifaddrs`. We only read fields
+    // through valid non-null pointers and free exactly once before returning.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut found: Option<Ipv4Addr> = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            let addr = ifa.ifa_addr;
+            if !addr.is_null() && (*addr).sa_family as i32 == libc::AF_INET {
+                // The generic `sockaddr` for an AF_INET entry is really a
+                // `sockaddr_in`; read its network-order `s_addr`.
+                let sin = &*(addr as *const libc::sockaddr_in);
+                let be = sin.sin_addr.s_addr; // network byte order
+                let ip = Ipv4Addr::from(u32::from_be(be));
+                if is_lan_ipv4(&ip) {
+                    found = Some(ip);
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found
     }
+}
+
+#[cfg(not(unix))]
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    None
 }
 
 fn humanize_secs(s: u64) -> String {
@@ -4631,5 +4657,36 @@ mod session_tool_tests {
         let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20);
         assert_eq!(rows_u.len(), 3);
         assert!(!trunc_u);
+    }
+}
+
+#[cfg(test)]
+mod lan_ip_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// v0.8.8 F3 — the LAN predicate accepts only private addresses and
+    /// rejects loopback / link-local. Exercises the exact tiers the recon
+    /// test plan named (192.168 / 127.0.0.1 / 169.254).
+    #[test]
+    fn is_lan_ipv4_filters_loopback_and_linklocal() {
+        // Private (RFC1918) → accepted.
+        assert!(is_lan_ipv4(&Ipv4Addr::new(192, 168, 1, 5)));
+        assert!(is_lan_ipv4(&Ipv4Addr::new(10, 0, 0, 7)));
+        assert!(is_lan_ipv4(&Ipv4Addr::new(172, 16, 3, 9)));
+        // Loopback / link-local / public → rejected.
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(169, 254, 10, 10)));
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    /// v0.8.8 F3 — querying real interfaces must never panic, and any
+    /// address it returns must satisfy the LAN predicate (no loopback /
+    /// link-local / public leaking into the web URL).
+    #[test]
+    fn first_lan_ipv4_does_not_panic_and_is_lan() {
+        if let Some(ip) = first_lan_ipv4() {
+            assert!(is_lan_ipv4(&ip), "returned non-LAN ip: {ip}");
+        }
     }
 }

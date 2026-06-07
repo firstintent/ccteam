@@ -542,33 +542,14 @@ async fn codex_exec_close_thread_idempotent_on_missing_session() {
 }
 
 // =====================================================================
-// 4. ClaudeTuiAdapter Wave 2 surface — name / vendor / empty-role guard
+// 4. ClaudeTuiAdapter Wave 2 surface — name / vendor
 // =====================================================================
-
-#[tokio::test(flavor = "current_thread")]
-async fn claude_tui_rejects_empty_role() {
-    let brief = AgentSpecBrief {
-        role: String::new(),
-    };
-    let ctx = SpawnCtx {
-        slug: "demo".into(),
-        sid: "chat-1".into(),
-        cwd: std::env::temp_dir(),
-        project_dir: std::env::temp_dir(),
-        extra_args: vec![],
-        model_id: None,
-        permission_mode: ccteam_harness::PermissionMode::Skip,
-        secret: String::new(),
-    };
-    let err = ClaudeTuiAdapter::new()
-        .start_thread(&brief, &ctx)
-        .await
-        .expect_err("empty role must error");
-    match err {
-        HarnessError::SpawnFailed(msg) => assert!(msg.contains("non-empty role")),
-        other => panic!("expected SpawnFailed, got {other:?}"),
-    }
-}
+// v0.8.8 F2: the empty-role guard was REMOVED on purpose — roleless = spawn
+// WITHOUT `--agent` (the brain comes from the project's native CLAUDE.md).
+// The roleless argv contract (no `--agent` when role is empty; `--name`/sid
+// still present) is covered by the `spec_for_new`/`spec_for_resume`
+// `*_roleless_omits_agent` unit tests in claude_tui.rs, and create-path
+// behavior by `create_session_empty_role_is_ok` in gateway.rs.
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]

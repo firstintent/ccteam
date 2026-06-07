@@ -1,11 +1,19 @@
 //! Read-only xterm.js pane snapshot endpoint.
 //!
-//! `GET /api/<slug>/pane-snapshot.ansi` captures the active tmux pane
-//! with ANSI escapes preserved and returns the raw bytes for browser-side
-//! rendering by the vendored `@xterm/xterm` widget. This deliberately
-//! stays snapshot-only: no WebSocket, no input forwarding, and no PTY
-//! resize path. The existing PNG `/screenshot/<slug>.png` route remains
-//! as a fallback.
+//! `GET /api/<slug>/pane-snapshot.ansi` captures the active pane (project
+//! session name) with ANSI escapes preserved (under the tmux backend) and
+//! returns the bytes for browser-side rendering by the vendored
+//! `@xterm/xterm` widget. This deliberately stays snapshot-only: no
+//! WebSocket, no input forwarding, and no PTY resize path. The existing PNG
+//! `/screenshot/<slug>.png` route remains as a fallback.
+//!
+//! `GET /api/<slug>/<sid>/pane-snapshot.ansi` is the **per-session** variant.
+//! v0.8.8 B5: F1 removed the project-level pane, so the sid is resolved via the
+//! live gateway to the per-session pane name (claude = `ccteam-chat-{slug}-{sid}`,
+//! codex = `ccteam-{slug}-{sid}`) using the shared [`super::session_pane`] helper
+//! — the same resolution `pty_ws` uses. No live gateway → 503; a sid the gateway
+//! does not track → 404. (Under the default rmux backend, `capture(with_ansi)`
+//! returns rendered text, not byte-level ANSI — the rmux ANSI gap below.)
 
 use axum::{
     extract::{Path, State},
@@ -16,6 +24,7 @@ use axum::{
 };
 use ccteam_harness::MuxSessionId;
 
+use super::session_pane::{resolve_session_pane, PaneResolveError};
 use crate::state::AppState;
 
 const SNAPSHOT_LINES: usize = 50;
@@ -39,9 +48,22 @@ async fn handle_session_pane_snapshot(
     State(app): State<AppState>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> Response {
-    let session_name = match session_name_for_project_session(&app, &slug, &sid) {
-        Ok(name) => name,
-        Err((status, message)) => return (status, message).into_response(),
+    // v0.8.8 B5 — F1 后没有项目级 pane:经 live gateway 把 sid 解析成
+    // per-session pane 名(claude=ccteam-chat-{slug}-{sid} /
+    // codex=ccteam-{slug}-{sid}),与 pty_ws 共用同一 helper(无 gateway → 503;
+    // sid 未知 → 404)。替换了 W5 忽略 _sid 退回项目级 tmux session 的旧逻辑。
+    let session_name = match resolve_session_pane(&app, &sid).await {
+        Ok((name, _resolved)) => name,
+        Err(PaneResolveError::NoGateway) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no live gateway: per-session pane snapshot unavailable on standalone web\n",
+            )
+                .into_response()
+        }
+        Err(PaneResolveError::Unknown) => {
+            return (StatusCode::NOT_FOUND, format!("unknown session: {sid}\n")).into_response()
+        }
     };
     serve_pane_snapshot(slug, Some(sid), session_name).await
 }
@@ -120,25 +142,6 @@ async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: St
         bytes,
     )
         .into_response()
-}
-
-fn session_name_for_project_session(
-    app: &AppState,
-    slug: &str,
-    _sid: &str,
-) -> Result<String, (StatusCode, String)> {
-    // W5: the per-session runtime registry (flex `ProjectState.sessions`)
-    // is gone, so the session's tmux name can no longer be resolved from
-    // it. Validate the project exists, then fall back to the project-level
-    // pane. TODO(V0.8.6 W5b/W5c): re-key this onto the new session record
-    // so the per-session terminal page targets the right pane again.
-    if !app.paths.project_state(slug).exists() {
-        return Err((StatusCode::NOT_FOUND, format!("project not found: {slug}")));
-    }
-    Ok(ccteam_core::session_name_for_project(
-        app.paths.as_ref(),
-        slug,
-    ))
 }
 
 fn digit_header(n: u16) -> HeaderValue {

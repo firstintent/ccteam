@@ -60,6 +60,7 @@ pub use enriched_event::{
     EnrichmentSource, EventKind, EventMerger, MergeOutcome, Vendor, DEFAULT_GRACE,
 };
 pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT_SESSION_PREFIX};
+pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;

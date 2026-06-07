@@ -1094,6 +1094,15 @@ impl Gateway {
         ensure_role_exists(&cwd, &role)?;
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
+        // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
+        // 而空 handle 会让 @handle 路由(session_by_handle / template_by_handle)
+        // 误匹配/互撞。空 handle 时回退到 sid(全局唯一,绝不撞),保证 @handle
+        // 寻址始终非空且确定。非空 handle(常规 role)原样保留。
+        let handle = if handle.is_empty() {
+            id.clone()
+        } else {
+            handle
+        };
         // v0.8.7 review-fix (R-M1) — mint the per-session cto-gate secret and
         // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
         // in-pane stdio forwarder can authenticate `session_*` calls against
@@ -2040,6 +2049,8 @@ impl Gateway {
         permission_mode: PermissionMode,
     ) -> Result<String> {
         let owner = web_api_chat();
+        // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
+        // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
         self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
@@ -2234,6 +2245,60 @@ pub fn tracked_chat_session_names(state_path: &Path) -> Result<std::collections:
         .collect())
 }
 
+/// v0.8.8 B4/F3 — one tracked gateway session, flattened for out-of-process
+/// readers (the `ccteam session ls` / `ccteam status` CLI). The gateway's
+/// in-memory [`SessionView`] lives inside the daemon process; the CLI is a
+/// separate process and can only reach the persisted [`SavedGatewayState`]
+/// file. This projection exposes exactly the columns those views render
+/// (sid · project · role · vendor · permission_mode) without leaking the
+/// persisted struct's private fields (`secret` / `handle` / `thread`).
+#[derive(Debug, Clone)]
+pub struct TrackedSessionRow {
+    /// Gateway session id (`s<N>`) — the unique session key (F1).
+    pub sid: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Agent role (display label).
+    pub role: String,
+    /// Vendor, stringified (`"claude"` / `"codex"`).
+    pub vendor: String,
+    /// Permission posture wire string (`"skip"` / `"hitl"`).
+    pub permission_mode: String,
+}
+
+/// Load the gateway's tracked sessions as flat [`TrackedSessionRow`]s from the
+/// persisted route table at `state_path` (see
+/// [`default_gateway_state_path`](crate::default_gateway_state_path)).
+///
+/// Shares the exact read path of [`tracked_chat_session_names`] (same
+/// [`SavedGatewayState`] file; **absent ⇒ empty `Vec`**, never an error) so
+/// the two daemon-independent CLI views (`session ls` reconcile + `status`
+/// nesting) never drift on what the daemon has persisted. Strictly read-only.
+///
+/// The sub-second drift between the in-memory gateway map and this on-disk
+/// snapshot is accepted for the status / ls views (they're a glance, not a
+/// liveness gate).
+pub fn tracked_chat_sessions(state_path: &Path) -> Result<Vec<TrackedSessionRow>> {
+    if !state_path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(state_path)
+        .with_context(|| format!("read gateway state {}", state_path.display()))?;
+    let saved: SavedGatewayState = serde_json::from_str(&raw)
+        .with_context(|| format!("parse gateway state {}", state_path.display()))?;
+    Ok(saved
+        .sessions
+        .into_iter()
+        .map(|s| TrackedSessionRow {
+            sid: s.id,
+            project: s.project,
+            role: s.role,
+            vendor: vendor_str(s.vendor).to_string(),
+            permission_mode: s.permission_mode.as_str().to_string(),
+        })
+        .collect())
+}
+
 impl Drop for Gateway {
     fn drop(&mut self) {
         for (_, handle) in std::mem::take(&mut self.event_pumps) {
@@ -2336,6 +2401,12 @@ fn wrap_inbound(
 /// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
 /// routing, not personas, and shouldn't be forced to scaffold a role tree.
 fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+    // v0.8.8 F2 — 空 role = 显式 roleless(裸 claude 自读项目 CLAUDE.md):跳过
+    // 存在性校验。必须在 `read_role` 之前(`read_role("")` 会因 charset 校验
+    // bail → `.ok().flatten()` 折成 None → 误报 RoleNotFound)。
+    if role.is_empty() {
+        return Ok(());
+    }
     // No agents dir → uninitialized / test project; skip (see doc comment).
     if !ccteam_core::agents_dir(cwd).exists() {
         return Ok(());
@@ -3754,6 +3825,51 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
+    /// v0.8.8 F2 — an EMPTY role is explicit "roleless" (bare claude reads the
+    /// project's own `CLAUDE.md`), NOT a typo: `create_session_api` returns
+    /// `Ok(sid)` even when the project HAS a `.claude/agents/` dir (the strict
+    /// path that rejects a non-empty unseeded role). This is the mirror of
+    /// `create_session_unknown_role_is_role_not_found` for the empty case.
+    /// Also confirms the handle falls back to the sid (never empty, so @handle
+    /// addressing can't collide / mis-match).
+    #[tokio::test]
+    async fn create_session_empty_role_is_ok() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // Real project dir WITH an agents dir → strict validation applies to a
+        // non-empty role; an EMPTY role must still slip through (roleless).
+        let proj = tempfile::TempDir::new().unwrap();
+        seed_role(proj.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .expect("empty role (roleless) must create Ok, not RoleNotFound");
+        assert_eq!(sid, "s1");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "roleless still spawns"
+        );
+
+        // The session is tracked with an EMPTY role label …
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].role, "", "roleless session reports an empty role");
+        // … but the handle fell back to the sid (non-empty), so @handle routing
+        // resolves it deterministically and never collides on "".
+        assert_eq!(
+            gateway.session_by_handle(&web_api_chat(), &sid),
+            Some(sid.clone()),
+            "roleless handle must fall back to the sid (addressable, non-empty)"
+        );
+    }
+
     /// v0.8.7 (FIX-2) — the test-dir exemption: a bare project dir with NO
     /// `.claude/agents/` dir (the gateway's many fake-adapter tests) skips
     /// persona validation so routing tests don't have to scaffold a role tree.
@@ -4566,6 +4682,51 @@ mod tests {
             names.contains("ccteam-chat-beta-s1"),
             "expected sid-keyed canonical chat-session name, got {names:?}"
         );
+    }
+
+    #[test]
+    fn tracked_chat_sessions_empty_when_state_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.json");
+        assert!(tracked_chat_sessions(&missing).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracked_chat_sessions_projects_vendor_role_sid() {
+        // v0.8.8 B4/F3 — spawn one claude + one codex session through the
+        // gateway, persist, then read the flat rows back out-of-process.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("gateway-state.json");
+        let fake = Arc::new(FakeAdapter::default());
+
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway.enable_persistence(&state_path).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex builder")
+            .await
+            .unwrap();
+
+        let rows = tracked_chat_sessions(&state_path).unwrap();
+        assert_eq!(rows.len(), 2, "expected two tracked rows, got {rows:?}");
+
+        let claude = rows
+            .iter()
+            .find(|r| r.role == "reviewer")
+            .expect("reviewer row");
+        assert_eq!(claude.vendor, "claude");
+        assert_eq!(claude.permission_mode, "skip");
+        assert!(claude.sid.starts_with('s'), "sid shape: {}", claude.sid);
+        assert_eq!(claude.project, "alpha");
+
+        let codex = rows
+            .iter()
+            .find(|r| r.role == "builder")
+            .expect("builder row");
+        assert_eq!(codex.vendor, "codex");
     }
 
     #[tokio::test]

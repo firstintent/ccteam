@@ -296,6 +296,13 @@ export default function ChatConsole() {
     [navigate],
   );
 
+  // v0.8.8 B5 — claude-only for now. The PTY backend now resolves per-sid panes
+  // for BOTH vendors (codex pane name = ccteam-{slug}-{sid}, wired in
+  // routes/session_pane.rs), so the codex terminal is backend-ready. But it is
+  // unverified on a real codex pane (the daemon currently wires the codex
+  // app-server adapter, which owns no tmux/rmux pane), so we don't promise a
+  // codex terminal in the UI yet. TODO: flip to allow codex once the codex
+  // per-session pane is dogfooded on a real box.
   const canTerminal = activeView?.vendor === "claude" && !!sid;
   const showTerminal = view === "terminal" && canTerminal;
 
