@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccteam v0.9.0 架构图 — 多机协同:Machine 一等资源 + Control/Worker 星型联邦 + 能力派活调度</title>
+<style>
+  /* ---- design tokens (深色 + amber,沿用 v0.8.9 / v0.9.0 prototype) ---- */
+  :root{
+    --bg:#0e1014; --s900:#14171d; --s800:#1b1f27; --s700:#262b34; --border:#2a3039;
+    --text:#e7e9ec; --dim:#9aa3ad; --faint:#6b7480;
+    --amber:#f59e0b; --amber-dim:#7a5012; --green:#34d399; --red:#f87171; --blue:#60a5fa;
+    --claude:#d97757; --codex:#10a37f; --radius:10px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif;
+    /* group accents */
+    --g-entry:#a78bfa; --g-control:#f59e0b; --g-worker:#60a5fa; --g-vendor:#10a37f; --g-state:#34d399;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--blue)}
+  .wrap{max-width:1480px;margin:0 auto;padding:22px 26px 60px}
+  header.pg{margin-bottom:18px}
+  header.pg h1{font-size:20px;margin:0 0 6px;font-weight:700}
+  header.pg h1 small{font-size:12px;font-weight:600;color:var(--faint);background:var(--s700);padding:2px 8px;border-radius:7px;margin-left:8px;font-family:var(--mono)}
+  header.pg p{margin:0;color:var(--dim);max-width:1180px;font-size:13px}
+  header.pg .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--amber);margin-right:8px;vertical-align:middle}
+
+  /* legend */
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 6px;align-items:center}
+  .legend .lg{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);background:var(--s900);border:1px solid var(--border);border-radius:20px;padding:4px 12px}
+  .legend .sw{width:12px;height:12px;border-radius:4px;flex:none}
+  .legend .ln{width:26px;height:0;border-top:2px solid var(--dim);flex:none}
+  .legend .ln.dash{border-top-style:dashed}
+  .legend .ln.mtls{border-top:3px solid var(--amber)}
+  .legend .ln.local{border-top:2px dotted var(--green)}
+
+  /* canvas */
+  .stage{position:relative;background:var(--s900);border:1px solid var(--border);border-radius:14px;margin-top:14px;overflow:hidden}
+  .canvas{position:relative;width:1420px;height:1180px;margin:0 auto}
+  svg.edges{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1}
+
+  /* swimlane backdrops */
+  .lane{position:absolute;border-radius:12px;border:1px dashed var(--border);z-index:0}
+  .lane .lane-h{position:absolute;top:-11px;left:16px;background:var(--s900);padding:0 10px;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+  .lane.entry{border-color:rgba(167,139,250,.45)} .lane.entry .lane-h{color:var(--g-entry)}
+  .lane.control{border-color:rgba(245,158,11,.45)} .lane.control .lane-h{color:var(--g-control)}
+  .lane.worker{border-color:rgba(96,165,250,.45)} .lane.worker .lane-h{color:var(--g-worker)}
+  .lane.vendor{border-color:rgba(16,163,127,.5)} .lane.vendor .lane-h{color:var(--g-vendor)}
+  .lane.state{border-color:rgba(52,211,153,.45)} .lane.state .lane-h{color:var(--g-state)}
+  /* host frame for the low-config collapsed worker */
+  .hostframe{position:absolute;border-radius:12px;border:1px solid rgba(96,165,250,.35);background:rgba(96,165,250,.04);z-index:0}
+  .hostframe .hh{position:absolute;top:-10px;left:14px;background:var(--s900);padding:0 8px;font-size:10px;font-weight:700;color:var(--g-worker);font-family:var(--mono)}
+
+  /* nodes */
+  .node{position:absolute;z-index:2;border-radius:10px;border:1px solid var(--border);background:var(--s800);
+        padding:9px 11px;box-shadow:0 2px 8px #0006}
+  .node .nt{font-weight:700;font-size:12.5px;display:flex;align-items:center;gap:6px;line-height:1.25}
+  .node .nd{color:var(--dim);font-size:11px;margin-top:3px;line-height:1.35}
+  .node .gk{position:absolute;top:-8px;right:9px;font-size:9px;font-weight:700;padding:1px 6px;border-radius:5px;font-family:var(--mono);letter-spacing:.02em}
+  .node .icn{width:7px;height:7px;border-radius:50%;flex:none}
+  /* group color edges (left bar) */
+  .node.g-entry{border-left:3px solid var(--g-entry)}   .node.g-entry .gk{color:var(--g-entry);background:#1c1733}
+  .node.g-control{border-left:3px solid var(--g-control)} .node.g-control .gk{color:var(--g-control);background:#231806}
+  .node.g-worker{border-left:3px solid var(--g-worker)}  .node.g-worker .gk{color:var(--g-worker);background:#13233b}
+  .node.g-vendor{border-left:3px solid var(--g-vendor)}  .node.g-vendor .gk{color:var(--g-vendor);background:#0e2420}
+  .node.g-state{border-left:3px solid var(--g-state)}    .node.g-state .gk{color:var(--g-state);background:#0e2420}
+  .node.g-entry .icn{background:var(--g-entry)} .node.g-control .icn{background:var(--g-control)}
+  .node.g-worker .icn{background:var(--g-worker)} .node.g-vendor .icn{background:var(--g-vendor)} .node.g-state .icn{background:var(--g-state)}
+  .node code{font-family:var(--mono);font-size:10.5px;background:#0008;padding:0 4px;border-radius:4px;color:var(--text)}
+  /* the Control singleton box gets the amber halo (peer of node.ctrl in prototype) */
+  .node.control-host{box-shadow:0 0 0 1px rgba(245,158,11,.22), 0 2px 10px #0007}
+  /* highlight worker-hi as the detailed exemplar */
+  .node.worker-host{box-shadow:0 0 0 1px rgba(96,165,250,.22), 0 2px 10px #0007}
+  .node .pin{font-size:9px;font-weight:700;color:var(--green);background:#0e2420;border-radius:5px;padding:0 5px;margin-left:4px}
+  .node .pin.warn{color:var(--amber);background:#231806}
+  .node .pin.local{color:var(--green);background:#0e2420}
+
+  /* edge labels */
+  .elabel{position:absolute;z-index:3;font-size:10px;font-family:var(--mono);color:var(--dim);
+          background:rgba(14,16,20,.92);border:1px solid var(--border);border-radius:6px;
+          padding:1px 6px;max-width:230px;line-height:1.3;pointer-events:none;transform:translate(-50%,-50%)}
+  .elabel.mtls{color:var(--amber);border-color:var(--amber-dim);background:rgba(35,24,6,.95)}
+  .elabel.local{color:var(--green);border-color:rgba(52,211,153,.4)}
+  .elabel.hot{color:var(--green);border-style:dashed}
+  .elabel.hb{color:var(--blue);border-color:rgba(96,165,250,.4)}
+
+  /* notes / legend cards below */
+  .notes{margin-top:22px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .ncard{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+  .ncard h3{margin:0 0 8px;font-size:13px;color:var(--amber);display:flex;align-items:center;gap:7px}
+  .ncard h3 .b{width:8px;height:8px;border-radius:50%;background:var(--amber)}
+  .ncard ul{margin:0;padding-left:18px;color:var(--dim);font-size:12.5px}
+  .ncard li{margin:5px 0;line-height:1.45}
+  .ncard code{font-family:var(--mono);font-size:11px;background:#0008;padding:0 5px;border-radius:4px;color:var(--text)}
+  .ncard .k{color:var(--amber);font-weight:700}
+  .full{grid-column:1 / -1}
+  .pillrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+  .pill{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px}
+  .pill.ok{color:var(--green);background:#0e2420} .pill.warn{color:var(--amber);background:#231806}
+  .pill.bad{color:var(--red);background:#2a1414} .pill.info{color:var(--blue);background:#13233b}
+  .pill .d{width:7px;height:7px;border-radius:50%}
+  .pill.ok .d{background:var(--green)} .pill.warn .d{background:var(--amber)} .pill.bad .d{background:var(--red)} .pill.info .d{background:var(--blue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="pg">
+    <h1><span class="dot"></span>ccteam v0.9.0 架构图<small>多机协同 · 星型联邦</small></h1>
+    <p><b>Machine 一等资源 + Control/Worker 星型联邦 + 能力派活调度。</b>
+       一个 <b style="color:var(--amber)">Control 节点</b>统一入口(IM 收口 + web/SSE + 调度 + 注册表 + CA,<b>ZERO pane 计算</b>),
+       N 个 <b style="color:var(--blue)">Worker 节点</b>各自承载 pane(= 今天 daemon <b>MINUS</b> IM listener)。
+       执行钉死在 owning node(<code>Arc&lt;dyn HarnessAdapter&gt;</code> 不可序列化 · transcript 本机 inotify · mcp/hook 是 AF_UNIX),
+       只有 <b>DATA + CONTROL</b> 过 <b style="color:var(--amber)">mTLS</b> 线;sid 用节点前缀 <code>n-&lt;node&gt;:s&lt;N&gt;</code>,Worker 自铸不 round-trip。</p>
+  </header>
+
+  <!-- LEGEND -->
+  <div class="legend">
+    <span class="lg"><span class="sw" style="background:var(--g-entry)"></span>entry 用户 / IM 入口</span>
+    <span class="lg"><span class="sw" style="background:var(--g-control)"></span>control-plane Control 单例</span>
+    <span class="lg"><span class="sw" style="background:var(--g-worker)"></span>worker 每台执行节点</span>
+    <span class="lg"><span class="sw" style="background:var(--g-vendor)"></span>vendor Claude/Codex 进程</span>
+    <span class="lg"><span class="sw" style="background:var(--g-state)"></span>shared-state 文件/JSONL</span>
+    <span class="lg"><span class="ln"></span>普通数据流</span>
+    <span class="lg"><span class="ln mtls"></span>跨机 mTLS(过网,双向证书)</span>
+    <span class="lg"><span class="ln dash" style="border-color:var(--green)"></span>本机热路径 / 零 lookup</span>
+    <span class="lg"><span class="ln local"></span>本机回路(永不跨网,node 内 best-effort)</span>
+    <span class="lg"><span class="ln" style="border-color:var(--blue)"></span>心跳 / 注册(TTL 刷新)</span>
+  </div>
+
+  <!-- ============ CANVAS ============ -->
+  <div class="stage">
+  <div class="canvas" id="cv">
+
+    <!-- swimlane backdrops -->
+    <div class="lane entry"   style="left:24px;  top:60px;  width:300px; height:230px"><span class="lane-h">entry · 用户 / IM 入口</span></div>
+    <div class="lane control" style="left:360px; top:36px;  width:336px; height:1108px"><span class="lane-h">control-plane · Control 单例(不 spawn pane)</span></div>
+    <div class="lane worker"  style="left:728px; top:36px;  width:402px; height:1108px"><span class="lane-h">worker · 执行节点(=今天 daemon − IM)</span></div>
+    <div class="lane vendor"  style="left:1162px;top:60px;  width:234px; height:470px"><span class="lane-h">vendor · Claude/Codex</span></div>
+    <div class="lane state"   style="left:1162px;top:560px; width:234px; height:560px"><span class="lane-h">shared-state · 文件/JSONL(owning Worker 写)</span></div>
+
+    <!-- host frame: low-config worker (collapsed exemplar) -->
+    <div class="hostframe" style="left:744px; top:930px; width:368px; height:196px"><span class="hh">主机 B · n-laptop(同构折叠展示)</span></div>
+
+    <!-- ====== EDGES (drawn under nodes via SVG) ====== -->
+    <svg class="edges" viewBox="0 0 1420 1180" preserveAspectRatio="none" id="svg">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+          <path d="M0,0 L8,3.2 L0,6.4 Z" fill="#9aa3ad"/>
+        </marker>
+        <marker id="ah-amber" markerWidth="10" markerHeight="10" refX="7.5" refY="3.4" orient="auto">
+          <path d="M0,0 L9,3.4 L0,6.8 Z" fill="#f59e0b"/>
+        </marker>
+        <marker id="ah-green" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+          <path d="M0,0 L8,3.2 L0,6.4 Z" fill="#34d399"/>
+        </marker>
+        <marker id="ah-blue" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+          <path d="M0,0 L8,3.2 L0,6.4 Z" fill="#60a5fa"/>
+        </marker>
+      </defs>
+      <!-- paths injected by JS from EDGES[] so geometry stays in one source -->
+    </svg>
+
+    <!-- ====== NODES ====== -->
+    <!-- entry -->
+    <div class="node g-entry" id="n-user" style="left:40px; top:96px; width:268px">
+      <div class="nt"><span class="icn"></span>用户(手机 / 浏览器)</div>
+      <div class="nd">同一个 IM/web 入口统一驱动整队机器</div><span class="gk">entry</span>
+    </div>
+    <div class="node g-entry" id="n-telegram" style="left:40px; top:196px; width:268px">
+      <div class="nt"><span class="icn"></span>Telegram 云</div>
+      <div class="nd"><code>getUpdates</code> 单消费者 — 天然只能一个</div><span class="gk">entry</span>
+    </div>
+
+    <!-- control-plane -->
+    <div class="node g-control control-host" id="n-control" style="left:376px; top:74px; width:304px">
+      <div class="nt"><span class="icn"></span>Control 节点 <span class="pin">ZERO pane</span></div>
+      <div class="nd"><code>ccteam start --role control</code> · 单例 · 纯 I/O 路由 + 聚合读 · 弱机也能领强机队</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-im_gw" style="left:376px; top:178px; width:304px">
+      <div class="nt"><span class="icn"></span>IM gateway + inbound mpsc</div>
+      <div class="nd">Telegram long-poll 单消费者必在此 · Worker 绝不起 IM listener</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-web_ctrl" style="left:376px; top:282px; width:304px">
+      <div class="nt"><span class="icn"></span>web / axum + SSE</div>
+      <div class="nd"><code>0.0.0.0:7331</code> · web-token · pending/HITL 注册表 · 心跳接收端</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-sched" style="left:376px; top:388px; width:304px">
+      <div class="nt"><span class="icn"></span>Scheduler <span class="pin">ccteam-sched</span></div>
+      <div class="nd"><code>place_session()</code> 纯函数 · 无 I/O 无 tick · 每-tag FIFO 背压队列(202 queued / 503 capacity)</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-registry" style="left:376px; top:496px; width:304px">
+      <div class="nt"><span class="icn"></span>ClusterRegistry + sid→node 路由表</div>
+      <div class="nd">ChatKey→sid→node 内存查找 · 派生只读 INDEX · <b>永不</b>当第二写者</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-remote_client" style="left:376px; top:604px; width:304px">
+      <div class="nt"><span class="icn"></span>RemoteGatewayClient</div>
+      <div class="nd">reqwest + rustls · mTLS client cert · node!=self 走远端 · 忠实复现 reply_to-retarget + watchdog + SSE relay</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-ca" style="left:376px; top:716px; width:304px">
+      <div class="nt"><span class="icn"></span>自签 CA <span class="pin warn">rcgen · 唯一新 dep</span></div>
+      <div class="nd">私钥 <code>0600 ~/.ccteam</code> · enroll 时签 per-node client cert(CN=node_id)· 机器凭证 ≠ web-token</div><span class="gk">control</span>
+    </div>
+    <div class="node g-control" id="n-fleet_budget" style="left:376px; top:1012px; width:304px">
+      <div class="nt"><span class="icn"></span>fleet cost-cap 聚合强制</div>
+      <div class="nd">聚合各 Worker cost ledger → <b>强制</b>一个 fleet 上限(不止 surface Σ-spend)</div><span class="gk">control</span>
+    </div>
+
+    <!-- worker (high-config exemplar, detailed) -->
+    <div class="node g-worker worker-host" id="n-worker_hi" style="left:748px; top:74px; width:366px">
+      <div class="nt"><span class="icn"></span>Worker 高配机 <code>n-gpu-box</code> <span class="pin warn">class=high</span></div>
+      <div class="nd"><code>--role worker --control … --enroll …</code> · tags=[deploy,e2e,stress] · 独占自己 session · 永不被 kill</div><span class="gk">worker</span>
+    </div>
+    <div class="node g-worker" id="n-mtls_hi" style="left:748px; top:178px; width:366px">
+      <div class="nt"><span class="icn"></span>私有 mTLS 控制口 <code>7332</code> + /api/v1</div>
+      <div class="nd">只 Control 调 · 双向 TLS(未签名 peer 在 TLS 层被拒,handler 之前)· 复用既有 axum router,不造新 RPC</div><span class="gk">worker</span>
+    </div>
+    <div class="node g-worker" id="n-gw_hi" style="left:748px; top:288px; width:366px">
+      <div class="nt"><span class="icn"></span>Worker gateway + sessions map + event pump</div>
+      <div class="nd">持 <code>Arc&lt;dyn HarnessAdapter&gt;</code> + ThreadHandle(不可序列化)· event pump = <b>唯一 turns.jsonl writer</b> · sid 本机 node-naive <code>s&lt;N&gt;</code> 自铸</div><span class="gk">worker</span>
+    </div>
+    <div class="node g-worker" id="n-rmux_hi" style="left:748px; top:404px; width:366px">
+      <div class="nt"><span class="icn"></span>rmux 自托管 + PTY pane</div>
+      <div class="nd">本机 AF_UNIX <code>mux.sock</code> · <code>adapter.submit_turn</code> 本机执行 · send-keys 本机 PTY</div><span class="gk">worker</span>
+    </div>
+    <div class="node g-worker" id="n-sock_hi" style="left:748px; top:508px; width:366px">
+      <div class="nt"><span class="icn"></span>本机 <code>mcp.sock</code> / <code>hook.sock</code> <span class="pin local">不跨机</span></div>
+      <div class="nd">AF_UNIX(UDS 不跨主机)· session_* / permission/ask 校验 per-session secret(node 内 best-effort)</div><span class="gk">worker</span>
+    </div>
+
+    <!-- worker B (low-config, collapsed) inside hostframe -->
+    <div class="node g-worker" id="n-worker_lo" style="left:760px; top:980px; width:336px">
+      <div class="nt"><span class="icn"></span>Worker 低配机 <code>n-laptop</code> <span class="pin">class=low</span></div>
+      <div class="nd"><code>--role worker</code> · tags=[design,prototype] · 同构(自有 gateway/event pump/rmux/三 socket/transcript)· 独立安全域,各持 spend-capable <code>~/.claude</code></div><span class="gk">worker</span>
+    </div>
+
+    <!-- vendor -->
+    <div class="node g-vendor" id="n-pane_hi" style="left:1178px; top:96px; width:202px">
+      <div class="nt"><span class="icn"></span>claude / codex pane</div>
+      <div class="nd"><code>--agent &lt;role&gt;</code> / roleless 裸 claude · No prompt injection</div><span class="gk">vendor</span>
+    </div>
+    <div class="node g-vendor" id="n-vendor_hi" style="left:1178px; top:340px; width:202px">
+      <div class="nt"><span class="icn"></span><code>~/.claude</code> + <code>~/.codex</code></div>
+      <div class="nd">per-machine login · spend-capable · login_ok 真实探针(堵 logged-out-但-available 陷阱)</div><span class="gk">vendor</span>
+    </div>
+
+    <!-- shared-state -->
+    <div class="node g-state" id="n-transcript_hi" style="left:1178px; top:596px; width:202px">
+      <div class="nt"><span class="icn"></span><code>~/.claude/projects</code> transcript</div>
+      <div class="nd">vendor 写 · <b>本机 inotify tail</b>(不可跨机)· 不 scrape pane</div><span class="gk">state</span>
+    </div>
+    <div class="node g-state" id="n-turns_hi" style="left:1178px; top:716px; width:202px">
+      <div class="nt"><span class="icn"></span>progress / turns.jsonl</div>
+      <div class="nd"><code>progress/&lt;slug&gt;.jsonl</code> + <code>.ccteam/chat/&lt;sid&gt;/turns.jsonl</code> · <b>owning Worker 写</b>,Control 不镜像</div><span class="gk">state</span>
+    </div>
+    <div class="node g-state" id="n-node_json_hi" style="left:1178px; top:840px; width:202px">
+      <div class="nt"><span class="icn"></span><code>~/.ccteam/node.json</code></div>
+      <div class="nd">首启铸<b>持久 node id</b> <code>n-&lt;host&gt;-&lt;6hex&gt;</code>(扛重启/不复用)+ <code>cost-budget.json</code></div><span class="gk">state</span>
+    </div>
+    <div class="node g-state" id="n-machines_yaml" style="left:1178px; top:964px; width:202px">
+      <div class="nt"><span class="icn"></span><code>~/.ccteam/machines.yaml</code></div>
+      <div class="nd">Control 持 · MachineEntry 注册表(node_id/endpoint/tags/class/status/cert_fingerprint)</div><span class="gk">state</span>
+    </div>
+
+    <!-- edge labels (positioned at edge midpoints; JS verifies anchor presence) -->
+    <div class="elabel"      style="left:40px;  top:163px">消息</div>
+    <div class="elabel hb"   style="left:188px; top:235px">long-poll(单消费者,只在 Control)</div>
+    <div class="elabel"      style="left:206px; top:300px">https web/SSE + web-token</div>
+    <div class="elabel"      style="left:528px; top:240px">ChatKey→sid→node 内存查找</div>
+    <div class="elabel"      style="left:528px; top:345px">create-session → placement hint</div>
+    <div class="elabel"      style="left:528px; top:450px">读 capability+headroom,选 node / 排队</div>
+    <div class="elabel"      style="left:528px; top:558px">node!=self → 走远端</div>
+    <div class="elabel"      style="left:300px; top:662px">签 per-node client cert</div>
+    <div class="elabel mtls" style="left:714px; top:150px">mTLS:POST /turn · GET /events SSE · stop(双向证书)</div>
+    <div class="elabel mtls" style="left:606px; top:840px">同 wire 到低配机</div>
+    <div class="elabel"      style="left:931px; top:236px">复用既有 /api/v1 router</div>
+    <div class="elabel"      style="left:931px; top:350px">adapter.submit_turn(本机)</div>
+    <div class="elabel"      style="left:931px; top:460px">send-keys 本机 PTY</div>
+    <div class="elabel local" style="left:1060px;top:160px">in-pane forwarder / HITL hook 回连(本机,不跨网)</div>
+    <div class="elabel local" style="left:836px; top:478px">校验 per-session secret(node 内 best-effort)</div>
+    <div class="elabel"      style="left:1126px;top:660px">vendor 写,本机 inotify tail</div>
+    <div class="elabel hot"  style="left:1124px;top:702px">event pump 写(唯一 live writer)</div>
+    <div class="elabel hot"  style="left:1124px;top:300px">读 per-machine 登录态</div>
+    <div class="elabel hb"   style="left:705px; top:355px">GatewayEvent SSE 流回</div>
+    <div class="elabel hb"   style="left:712px; top:228px">SSE relay → Control outbound</div>
+    <div class="elabel hb"   style="left:1010px;top:660px">心跳:capability+headroom+owned sids(TTL 刷新)</div>
+    <div class="elabel hb"   style="left:900px; top:1000px">heartbeat</div>
+    <div class="elabel"      style="left:1086px;top:548px">持久 MachineEntry</div>
+    <div class="elabel"      style="left:1086px;top:910px">首启铸持久 node id</div>
+    <div class="elabel mtls" style="left:582px; top:1012px">聚合各 Worker cost ledger → 强制 fleet cap</div>
+    <div class="elabel mtls" style="left:1010px;top:720px">按 cert_fingerprint pin 校验 peer</div>
+  </div>
+  </div><!-- /stage -->
+
+  <!-- ============ NOTES / 图例说明 ============ -->
+  <div class="notes">
+
+    <div class="ncard">
+      <h3><span class="b"></span>group 图例(分组语义)</h3>
+      <ul>
+        <li><span class="k">entry</span> = 用户 / IM 入口。</li>
+        <li><span class="k">control-plane</span> = Control 单例(IM 收口 + web + 调度 + 注册表 + CA),<b>ZERO pane 计算</b>,纯 I/O 路由 + 聚合读 ⇒ 一台弱机也能领一队强机。</li>
+        <li><span class="k">worker</span> = 每台执行节点(<b>= 今天 daemon MINUS IM listener</b>),独占自己 session。</li>
+        <li><span class="k">vendor</span> = Claude/Codex 进程 + per-machine 登录。</li>
+        <li><span class="k">shared-state</span> = 文件/JSONL;可中心化的是<b>派生 INDEX</b>,<b>owning Worker 才是写者</b>。</li>
+      </ul>
+    </div>
+
+    <div class="ncard">
+      <h3><span class="b"></span>执行不可迁移的三条硬绑定(已读码核验)</h3>
+      <ul>
+        <li>gateway 持<b>非序列化</b> <code>Arc&lt;dyn HarnessAdapter&gt;</code> + <code>ThreadHandle</code>(重启 <code>resume_thread</code> 重连<b>本机</b> pane)。</li>
+        <li>Anthropic transcript 在本机 <code>~/.claude/projects/</code> → 靠<b>本机 inotify</b> tail。</li>
+        <li>hook 回连 + in-pane MCP forwarder 走<b>本机</b> AF_UNIX <code>mcp.sock</code> / <code>hook.sock</code>(UDS 不跨主机)。</li>
+        <li>故 turn 必在 owning node 跑,只 <b>DATA + CONTROL</b> 过 mTLS。rmux <code>RmuxEndpoint</code> 虽 <code>#[non_exhaustive]</code> 留了 TCP,<b>本版不走 remote-backend 路线</b>。</li>
+      </ul>
+    </div>
+
+    <div class="ncard">
+      <h3><span class="b"></span>sid 命名空间 = <code>n-&lt;node&gt;:s&lt;N&gt;</code></h3>
+      <ul>
+        <li>Worker <b>自铸</b> <code>s&lt;N&gt;</code>(保留 next_session 单调计数器,<b>不</b> round-trip Control mint id)⇒ burst fan-out 不被序列化。</li>
+        <li>节点前缀使命名空间<b>正交</b>、ownership 编码进 id(prefix==node_id 即 owner)。</li>
+        <li>本机 turn 字节级同今天(<b>零 lookup</b>,见绿色虚线热路径);跨机才解析前缀。</li>
+        <li>本地 <code>s&lt;N&gt;</code> 仍是 pane / turns / marker 键(<code>chat_session_name</code> / <code>CCTEAM_CHAT_SID</code> 零改)。</li>
+      </ul>
+    </div>
+
+    <div class="ncard">
+      <h3><span class="b"></span>单点诚实 + <code>--role both</code> 退化</h3>
+      <ul>
+        <li><b>Control = 单点</b>(IM/web 入口 + placement,<b>无 HA,本版 defer</b>)。</li>
+        <li>Control 宕 = 入口宕,但每个 Worker live session <b>继续跑</b>(永不被 kill)且经自己 standalone <code>/api/v1</code> + web 仍可驱动 ⇒ degraded,not dead。</li>
+        <li>Control 重启从 <code>machines.yaml</code> + 下轮 heartbeat 重建全局视图(<b>Worker 是 SoT,Control 可重建</b>)。</li>
+        <li><span class="k">--role both</span>(默认单机):Control+Worker 折叠一进程、loopback、<b>无 mTLS、省 node 前缀</b> ⇒ 与今天 daemon <b>字节级一致</b>,1-2 机用户零行为变化。</li>
+      </ul>
+    </div>
+
+    <div class="ncard full">
+      <h3><span class="b"></span>安全边界:过网只有 daemon↔daemon;本机回路永不跨网</h3>
+      <div class="pillrow" style="margin-bottom:10px">
+        <span class="pill ok"><span class="d"></span>本版交付</span>
+        <span class="pill ok"><span class="d"></span>Tier 1 传输机密性(TLS,硬 blocker:今天 7331 是明文 http)</span>
+        <span class="pill ok"><span class="d"></span>Tier 2 机器身份 = mTLS(per-node client cert,proof-of-key-possession,非裸 bearer)</span>
+        <span class="pill ok"><span class="d"></span>Tier 3 in-pane→daemon 刻意留<b>本机</b>(session 钉 owning node,此回路永不跨网)</span>
+        <span class="pill info"><span class="d"></span>跨机特权边界(真边界:op 来自 Control mTLS 链路 + <b>Worker 间不互相通信</b>)</span>
+        <span class="pill ok"><span class="d"></span>fleet 级 cost-cap 聚合<b>强制</b></span>
+      </div>
+      <div class="pillrow">
+        <span class="pill warn"><span class="d"></span>fail-closed 前提(硬 gate):acl 空 allowlist 翻 fail-closed · Slack stub 补真 HMAC · <code>~/.ccteam/run</code> 收紧 0700</span>
+        <span class="pill bad"><span class="d"></span>DEFER:per-agent 沙箱隔离</span>
+        <span class="pill bad"><span class="d"></span>DEFER:Control HA / failover</span>
+        <span class="pill bad"><span class="d"></span>DEFER(给 fail-closed 退路):跨机 HITL 强化</span>
+        <span class="pill bad"><span class="d"></span>DEFER:自动跨机 clone repo</span>
+      </div>
+      <ul style="margin-top:12px">
+        <li><b style="color:var(--amber)">单一信任域声明</b>:enroll 一台 Worker = 「我信任它如同我的 Control 机」。整队属同一个人 — <b>不</b>假装多租户;星型(Worker 间不通信)已把横向爆炸半径压到比 mesh 小。</li>
+        <li><b>机器凭证(cert)≠ 人的 web-token</b>:web-token 是单一共享明文(<code>ccteam status</code> 明文打印 + 自动复制剪贴板),<b>绝不</b>复用当节点间凭证;cert 独立类、<b>永不打印</b>、可 <code>ccteam cluster rotate</code> 轮转。</li>
+        <li>per-session secret 在<b>目标 Worker 本地</b> mint 注入本地 pane env,<b>绝不过线</b> ⇒ 保住(承认是 best-effort 的)gate 语义 per-node。</li>
+        <li><b style="color:var(--red)">硬 ship gate</b>:若 server-TLS + cert-pin 这版排不进 scope,正确动作是 <b>DEFER 跨机特权控制</b>,只发单机 + 只读聚合视图(Phase A)+ 文档「联邦需你自备私网(wireguard/tailscale)」;<b>绝不</b>在明文上发特权跨机控制面。</li>
+      </ul>
+    </div>
+
+    <div class="ncard full">
+      <h3><span class="b"></span>能力派活(placement)+ 并行度拉满</h3>
+      <ul>
+        <li><b>三入口同一函数</b>:IM <code>/new &lt;project&gt; [--on &lt;tag|node&gt;]</code> · web create-modal placement picker · cto <code>session_spawn{placement}</code> — 全 funnel 进 <code>place_session()</code>。</li>
+        <li><b>匹配</b>:filter 到 <code>{require tags} ∩ {vendor available 且 login_ok 且 version-ok} ∩ {repo 在该 node} ∩ {未触 cost-cap、未满 max_parallel}</code> 的 node。</li>
+        <li><b>负载均衡</b>:幸存者按 <code>headroom_score = w1·空闲并行度 + w2·(1−load_avg) + w3·budget_fraction − penalty(未登录)</code> 取最大(贪心 least-loaded);fan-out 反复取当前最大 ⇒ K 个 session 自然铺到 K 台。</li>
+        <li><b>背压(不 thrash)</b>:每-tag FIFO(cap=64,high/low 各一条队)。全满 → <b>不</b> spawn-and-thrash,返回 <code>202 queued + 位次</code>;空位由<b>心跳到达事件驱动</b> admit(<b>NOT tick</b>);队满 → <code>503 capacity</code> + 「加机器或抬 --max-parallel」。</li>
+        <li><b>护栏</b>:placement 严格只决定 WHERE;WHAT/HOW-MANY 归 cto/用户,调度器<b>绝不</b>注入额外并行;不长 tick / DAG executor(否则撞 deferred <code>ccteam-flow</code>);placement <b>sticky</b>(一个 sid 生命周期内不迁移)。</li>
+        <li><b>用户原例</b>:高配机 <code>--tags deploy,e2e,stress --class high</code> 跑端到端部署+压测;低配机 <code>--tags design,prototype --class low</code> 跑需求讨论+原型 — <b>同时</b>跑、各扬所长,从同一个 Telegram chat 驱动。并行天花板:从「一台机容量」升成 <b>Σ(per-node session 容量)</b>。</li>
+      </ul>
+    </div>
+
+  </div><!-- /notes -->
+
+</div>
+
+<script>
+/* ---- single source of truth for edges: id pairs + style + optional waypoints.
+   Geometry computed from live node rects so the SVG never drifts from the boxes. ---- */
+const EDGES = [
+  // from, to, style, side hint (how to leave/enter), bow (curve magnitude px)
+  ["n-user","n-telegram","plain","v",0],
+  ["n-telegram","n-im_gw","hb","h",0],
+  ["n-user","n-web_ctrl","plain","h",10],
+  ["n-im_gw","n-registry","plain","v-left",-60],     // ChatKey lookup (down the control lane, left bow)
+  ["n-web_ctrl","n-sched","plain","v",0],
+  ["n-sched","n-registry","plain","v",0],
+  ["n-registry","n-remote_client","plain","v",0],
+  ["n-ca","n-remote_client","plain","v-up",0],
+  ["n-remote_client","n-mtls_hi","mtls","h-up",-40],  // mTLS turn/SSE/stop to high worker
+  ["n-remote_client","n-worker_lo","mtls","h-down",40],// same wire to low worker
+  ["n-mtls_hi","n-gw_hi","plain","v",0],
+  ["n-gw_hi","n-rmux_hi","plain","v",0],
+  ["n-rmux_hi","n-pane_hi","plain","h",0],
+  ["n-pane_hi","n-vendor_hi","hot","v",0],
+  ["n-pane_hi","n-sock_hi","local","h-down",-30],     // in-pane forwarder back to local sock
+  ["n-sock_hi","n-gw_hi","local","v-up",-50],         // verify secret (node-internal)
+  ["n-gw_hi","n-turns_hi","hot","h-down",0],          // event pump writes (only live writer)
+  ["n-pane_hi","n-transcript_hi","plain","h-down",0], // vendor writes, local inotify tail
+  ["n-gw_hi","n-mtls_hi","hb","v-left",-40],          // GatewayEvent SSE back up
+  ["n-mtls_hi","n-remote_client","hb","h-up",-72],    // SSE relay -> Control outbound
+  ["n-worker_hi","n-web_ctrl","hb","h-up",-110],      // heartbeat (high)
+  ["n-worker_lo","n-web_ctrl","hb","h-down",120],     // heartbeat (low)
+  ["n-registry","n-machines_yaml","plain","h-down",0],// persist MachineEntry
+  ["n-worker_hi","n-node_json_hi","plain","h-down",0],// mint persistent node id
+  ["n-fleet_budget","n-worker_hi","mtls","h-up",0],   // aggregate ledger -> enforce fleet cap
+  ["n-remote_client","n-machines_yaml","mtls","h-down",90], // pin peer by cert fingerprint
+];
+
+const STYLE = {
+  plain: {stroke:"#5b6470", w:1.6, marker:"url(#ah)",       dash:null},
+  mtls:  {stroke:"#f59e0b", w:2.4, marker:"url(#ah-amber)", dash:null},
+  hot:   {stroke:"#34d399", w:1.8, marker:"url(#ah-green)", dash:"7 5"},
+  local: {stroke:"#34d399", w:1.6, marker:"url(#ah-green)", dash:"2 4"},
+  hb:    {stroke:"#60a5fa", w:1.6, marker:"url(#ah-blue)",  dash:"5 5"},
+};
+
+function rc(el){ // rect relative to canvas
+  const c = document.getElementById("cv").getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  return {x:r.left-c.left, y:r.top-c.top, w:r.width, h:r.height,
+          cx:r.left-c.left+r.width/2, cy:r.top-c.top+r.height/2};
+}
+
+/* pick exit/entry anchor points based on hint */
+function anchors(a, b, hint){
+  let p1, p2;
+  const ev = hint.split("-")[0]; // primary orientation v|h
+  const mod = hint.split("-")[1]; // up|down|left|right
+  if(ev === "v"){
+    // vertical: a bottom -> b top (or reverse)
+    if(a.cy <= b.cy){ p1={x:a.cx,y:a.y+a.h}; p2={x:b.cx,y:b.y}; }
+    else            { p1={x:a.cx,y:a.y};     p2={x:b.cx,y:b.y+b.h}; }
+    if(mod==="left"){ p1.x = a.x; }       // leave from left edge
+  } else {
+    // horizontal: a right -> b left (or reverse)
+    if(a.cx <= b.cx){ p1={x:a.x+a.w,y:a.cy}; p2={x:b.x,y:b.cy}; }
+    else            { p1={x:a.x,y:a.cy};     p2={x:b.x+b.w,y:b.cy}; }
+    if(mod==="up"){   p1.y = a.y + a.h*0.30; p2.y = b.y + b.h*0.30; }
+    if(mod==="down"){ p1.y = a.y + a.h*0.70; p2.y = b.y + b.h*0.70; }
+  }
+  return [p1, p2, ev];
+}
+
+function build(){
+  const svg = document.getElementById("svg");
+  let missing = [];
+  for(const [fromId, toId, styleKey, hint, bow] of EDGES){
+    const A = document.getElementById(fromId), B = document.getElementById(toId);
+    if(!A || !B){ missing.push(fromId+"→"+toId); continue; }
+    const a = rc(A), b = rc(B);
+    const [p1, p2, ev] = anchors(a, b, hint);
+    const s = STYLE[styleKey] || STYLE.plain;
+    // control point: bow perpendicular to the dominant axis
+    let cpx, cpy;
+    const mx = (p1.x+p2.x)/2, my = (p1.y+p2.y)/2;
+    if(ev === "v"){ cpx = mx + (bow||0); cpy = my; }
+    else          { cpx = mx; cpy = my + (bow||0); }
+    const d = `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+    const path = document.createElementNS("http://www.w3.org/2000/svg","path");
+    path.setAttribute("d", d);
+    path.setAttribute("fill","none");
+    path.setAttribute("stroke", s.stroke);
+    path.setAttribute("stroke-width", s.w);
+    path.setAttribute("marker-end", s.marker);
+    if(s.dash) path.setAttribute("stroke-dasharray", s.dash);
+    path.setAttribute("opacity","0.92");
+    svg.appendChild(path);
+  }
+  if(missing.length) console.warn("missing edge anchors:", missing);
+  // expose counts for verification
+  window.__diagram = {nodes: document.querySelectorAll('.node').length, edges: EDGES.length};
+  console.log("diagram nodes/edges:", window.__diagram);
+}
+window.addEventListener("load", build);
+window.addEventListener("resize", ()=>{ document.getElementById("svg").innerHTML='<defs>'+document.querySelector('#svg defs').innerHTML+'</defs>'; build(); });
+</script>
+</body>
+</html>

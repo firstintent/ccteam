@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccteam v0.9.0 — 多机协同:Machine 一等资源 + 星型联邦 + 能力派活</title>
+<style>
+  /* ---- design tokens (深色 + amber,沿用 v0.8.9 surface-*/amber) ---- */
+  :root{
+    --bg:#0e1014; --s900:#14171d; --s800:#1b1f27; --s700:#262b34; --border:#2a3039;
+    --text:#e7e9ec; --dim:#9aa3ad; --faint:#6b7480;
+    --amber:#f59e0b; --amber-dim:#7a5012; --green:#34d399; --red:#f87171; --blue:#60a5fa;
+    --claude:#d97757; --codex:#10a37f; --radius:10px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif;
+  }
+  *{box-sizing:border-box} html,body{height:100%}
+  body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+  .app{display:grid;grid-template-columns:264px 1fr;height:100vh}
+  /* ---- sidebar ---- */
+  .side{background:var(--s900);border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+  .brand{height:52px;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid var(--border);font-weight:700}
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--amber)}
+  .brand small{color:var(--faint);font-weight:500;font-size:11px;background:var(--s700);padding:1px 6px;border-radius:6px}
+  .newbtn{margin:12px;padding:9px;border:0;border-radius:var(--radius);background:var(--amber);color:#1a1205;font-weight:700;cursor:pointer}
+  .newbtn:hover{filter:brightness(1.08)}
+  .tree{flex:1;overflow:auto;padding:4px 8px}
+  .proj{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:10px 8px 4px;display:flex;align-items:center;gap:6px}
+  .proj .pnode{margin-left:auto;text-transform:none;letter-spacing:0;color:var(--faint);font-family:var(--mono);font-size:10px}
+  .sess{display:flex;align-items:center;gap:7px;padding:8px 10px;border-radius:8px;cursor:pointer;margin:2px 0}
+  .sess:hover{background:var(--s800)}
+  .sess.active{background:var(--s800);box-shadow:inset 2px 0 0 var(--amber)}
+  .sess .live{width:7px;height:7px;border-radius:50%;background:var(--green);flex:none}
+  .sess .live.off{background:var(--faint)}
+  .sess .live.queued{background:var(--blue)}
+  .sess .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess .sid{color:var(--faint);font-size:10px;font-family:var(--mono)}
+  .badge{font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;flex:none}
+  .badge.claude{color:var(--claude);background:#2a1c17}
+  .badge.codex{color:var(--codex);background:#0e2420}
+  .badge.none{color:var(--faint);background:var(--s700)}
+  .nbadge{font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;flex:none;color:var(--blue);background:#13233b;font-family:var(--mono);cursor:help}
+  .nbadge.hi{color:var(--amber);background:#231806}
+  .nav{border-top:1px solid var(--border);padding:8px}
+  .nav a{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;color:var(--dim);text-decoration:none;cursor:pointer}
+  .nav a:hover{background:var(--s800);color:var(--text)}
+  .nav a.on{background:var(--s800);color:var(--amber)}
+  .nav .ico{width:16px;text-align:center}
+  .nav .tag{margin-left:auto;font-size:10px;font-weight:700;color:var(--faint);background:var(--s700);border-radius:6px;padding:1px 6px;font-family:var(--mono)}
+  /* ---- main ---- */
+  .main{display:flex;flex-direction:column;min-width:0;min-height:0}
+  .top{height:52px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--s900)}
+  .crumb{font-weight:600;display:flex;align-items:center;gap:8px;min-width:0}
+  .crumb .sep{color:var(--faint)} .crumb .muted{color:var(--dim);font-weight:500}
+  .conn{display:flex;align-items:center;gap:6px;color:var(--green);font-size:12px}
+  .conn .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+  .cost{font-size:12px;font-family:var(--mono);padding:3px 10px;border-radius:20px;background:var(--s800);border:1px solid var(--border);color:var(--dim);cursor:pointer}
+  .cost b{color:var(--text)} .cost.warn{border-color:var(--amber);color:var(--amber)}
+  .spacer{flex:1}
+  .tabs{display:flex;background:var(--s800);border-radius:8px;padding:2px}
+  .tabs button{border:0;background:transparent;color:var(--dim);padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:600}
+  .tabs button.on{background:var(--s700);color:var(--text)}
+  .stop{border:1px solid var(--border);background:transparent;color:var(--dim);padding:6px 12px;border-radius:8px;cursor:pointer}
+  .body{flex:1;overflow:auto;min-height:0}
+  .view{display:none;height:100%} .view.on{display:block}
+  /* ---- chat ---- */
+  .chat{display:flex;flex-direction:column;height:100%}
+  .scroll{flex:1;overflow:auto;padding:20px 22px;display:flex;flex-direction:column;gap:14px}
+  .msg{max-width:780px;padding:11px 14px;border-radius:12px}
+  .msg.u{align-self:flex-end;background:var(--amber-dim);color:#fde9c8;border-bottom-right-radius:4px}
+  .msg.a{align-self:flex-start;background:var(--s800);border:1px solid var(--border);border-bottom-left-radius:4px}
+  .msg .who{font-size:11px;color:var(--faint);margin-bottom:3px;display:flex;align-items:center;gap:6px}
+  .msg code{font-family:var(--mono);background:#0008;padding:1px 5px;border-radius:4px;font-size:12px}
+  .approve{align-self:flex-start;max-width:780px;border:1px solid var(--amber);background:#1f1707;border-radius:12px;padding:12px 14px}
+  .approve .q{margin-bottom:10px} .approve .q b{color:var(--amber)}
+  .approve .btns{display:flex;gap:8px}
+  .approve button{border:0;border-radius:8px;padding:7px 16px;cursor:pointer;font-weight:700}
+  .ok{background:var(--green);color:#04231a} .no{background:var(--s700);color:var(--text)}
+  .composer{border-top:1px solid var(--border);padding:12px 16px;display:flex;gap:10px;background:var(--s900)}
+  .composer input{flex:1;background:var(--s800);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:11px 14px;outline:none}
+  .composer input:focus{border-color:var(--amber)}
+  .composer .send{background:var(--amber);color:#1a1205;border:0;border-radius:10px;padding:0 18px;font-weight:700;cursor:pointer}
+  /* fan-out panel inside chat */
+  .fan{align-self:flex-start;max-width:780px;width:100%;border:1px solid var(--border);background:var(--s900);border-radius:12px;padding:12px 14px}
+  .fan .fh{font-size:12px;color:var(--dim);margin-bottom:10px}
+  .fan .fh b{color:var(--text)}
+  .fanrow{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--border)}
+  .fanrow:first-of-type{border-top:0}
+  .fanrow .child{font-family:var(--mono);font-size:12px;flex:none;width:160px;color:var(--text)}
+  .fanbar{flex:1;height:7px;border-radius:4px;background:var(--s700);overflow:hidden}
+  .fanbar i{display:block;height:100%;background:var(--green)}
+  .fanrow .pct{font-family:var(--mono);font-size:11px;color:var(--dim);width:42px;text-align:right}
+  /* ---- terminal ---- */
+  .term{height:100%;background:#07090c;padding:16px 18px;font-family:var(--mono);font-size:13px;color:#cdd3da;overflow:auto;white-space:pre-wrap}
+  .term .p{color:var(--green)} .term .c{color:var(--amber)} .term .cur{background:var(--text);color:#07090c} .term .rem{color:var(--blue)}
+  /* ---- generic page ---- */
+  .page{padding:22px 26px;max-width:1080px}
+  .page h2{margin:0 0 4px;font-size:18px} .page .sub{color:var(--dim);margin-bottom:18px}
+  .card{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:12px}
+  .field{margin:12px 0} .field label{display:block;color:var(--dim);font-size:12px;margin-bottom:5px}
+  .field input,.field select{width:100%;background:var(--s800);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 12px;outline:none;font-family:var(--mono)}
+  .field input:focus,.field select:focus{border-color:var(--amber)}
+  .pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px}
+  .pill.ok{color:var(--green);background:#0e2420} .pill.warn{color:var(--amber);background:#231806} .pill.bad{color:var(--red);background:#2a1414} .pill.info{color:var(--blue);background:#13233b}
+  .save{margin-top:8px;background:var(--amber);color:#1a1205;border:0;border-radius:8px;padding:9px 18px;font-weight:700;cursor:pointer}
+  .hint{color:var(--faint);font-size:12px;margin-top:6px}
+  .note{margin:14px 26px;padding:10px 14px;border-left:3px solid var(--amber);background:var(--s900);color:var(--dim);font-size:12px;border-radius:0 8px 8px 0}
+  .navhint{color:var(--faint);font-size:11px;padding:6px 10px 8px;line-height:1.4}
+  /* ---- fleet / machines ---- */
+  .fleethdr{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  .fleethdr .stat{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:8px 14px;min-width:96px}
+  .fleethdr .stat .k{color:var(--dim);font-size:11px}
+  .fleethdr .stat .v{font-size:18px;font-weight:700;font-family:var(--mono);margin-top:1px}
+  .fleethdr .stat .v small{font-size:11px;color:var(--faint);font-weight:500}
+  .ctrlbar{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .ctrlbar .invite{border:0;background:var(--amber);color:#1a1205;font-weight:700;border-radius:8px;padding:8px 14px;cursor:pointer}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+  .node{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;display:flex;flex-direction:column;gap:9px}
+  .node.ctrl{border-color:var(--amber);box-shadow:inset 0 0 0 1px rgba(245,158,11,.18)}
+  .node.down{opacity:.62}
+  .node-h{display:flex;align-items:center;gap:9px}
+  .node-h .sdot{width:9px;height:9px;border-radius:50%;flex:none}
+  .sdot.live{background:var(--green)} .sdot.draining{background:var(--amber)} .sdot.down{background:var(--red)}
+  .node-h .host{font-weight:700;font-size:15px}
+  .node-h .nid{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .node-h .role{margin-left:auto;font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px}
+  .role.control{color:var(--amber);background:#231806} .role.worker{color:var(--blue);background:#13233b}
+  .cls{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:2px 9px;border-radius:6px}
+  .cls.high{color:#fbbf24;background:#2a2008} .cls.low{color:var(--dim);background:var(--s700)}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px;display:inline-flex;align-items:center;gap:5px}
+  .chip.tag{color:var(--blue);background:#13233b;font-family:var(--mono)}
+  .chip.cap-ok{color:var(--green);background:#0e2420}
+  .chip.cap-warn{color:var(--amber);background:#231806}
+  .chip.cap-claude{color:var(--claude);background:#2a1c17}
+  .chip.cap-codex{color:var(--codex);background:#0e2420}
+  .nrow{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  .nrow .lbl{color:var(--faint);width:72px;flex:none}
+  .headroom{flex:1;height:8px;border-radius:5px;background:var(--s700);overflow:hidden;min-width:60px}
+  .headroom i{display:block;height:100%;background:var(--green)}
+  .headroom i.busy{background:var(--amber)} .headroom i.full{background:var(--red)}
+  .mono{font-family:var(--mono)} .small{font-size:11px;color:var(--faint)}
+  .node-f{display:flex;align-items:center;gap:8px;border-top:1px solid var(--border);padding-top:9px;margin-top:1px}
+  .node-f a{color:var(--blue);font-size:12px;text-decoration:none;cursor:pointer}
+  .node-f a:hover{text-decoration:underline}
+  /* table */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--faint);font-size:11px;font-weight:600;padding:6px 10px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.03em}
+  td{padding:8px 10px;border-bottom:1px solid var(--border)}
+  tr:hover td{background:var(--s800)}
+  td .lk{color:var(--blue);cursor:pointer;text-decoration:none} td .lk:hover{text-decoration:underline}
+  .filterbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .filterbar select,.filterbar input{background:var(--s800);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 12px;outline:none}
+  .filterbar select:focus,.filterbar input:focus{border-color:var(--amber)}
+  .filterbar .grow{flex:1;min-width:120px}
+  /* modal */
+  .scrim{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
+  .scrim.on{display:flex}
+  .modal{background:var(--s900);border:1px solid var(--border);border-radius:14px;width:min(560px,92vw);padding:20px 22px;max-height:90vh;overflow:auto}
+  .modal h3{margin:0 0 4px;font-size:16px} .modal .msub{color:var(--dim);font-size:13px;margin-bottom:14px}
+  .modal .x{float:right;cursor:pointer;color:var(--faint);font-size:18px;line-height:1}
+  .seg{display:inline-flex;background:var(--s800);border-radius:8px;padding:2px;flex-wrap:wrap}
+  .seg button{border:0;background:transparent;color:var(--dim);padding:6px 13px;border-radius:6px;cursor:pointer;font-weight:600}
+  .seg button.on{background:var(--s700);color:var(--text)}
+  .placement-preview{margin-top:6px;background:var(--s800);border:1px dashed var(--border);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--dim)}
+  .placement-preview b{color:var(--green)}
+  .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  .btn-ghost{border:1px solid var(--border);background:transparent;color:var(--dim);border-radius:8px;padding:9px 16px;cursor:pointer}
+  /* code block */
+  pre.code{background:#07090c;border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:var(--mono);font-size:12px;color:#cdd3da;overflow:auto;white-space:pre}
+  pre.code .p{color:var(--green)} pre.code .c{color:var(--amber)} pre.code .m{color:var(--faint)} pre.code .n{color:var(--blue)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:12px;margin-top:8px}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .legend .d{width:9px;height:9px;border-radius:50%}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ sidebar ============ -->
+  <aside class="side">
+    <div class="brand"><span class="dot"></span>ccteam<small>v0.9.0</small></div>
+    <button class="newbtn" onclick="openNew()">＋ 新建会话 / 项目</button>
+    <div class="tree">
+      <div class="proj">▾ ideas <span class="pnode" title="项目住在 init 它的那台机器">@n-gpu-box</span></div>
+      <div class="sess active" onclick="pick(this,'architect · claude','n-gpu-box:s5','n-gpu-box','hi')"><span class="live"></span><span class="nm">architect</span><span class="badge claude">claude</span><span class="nbadge hi" title="跑在高配机 n-gpu-box">@gpu-box</span></div>
+      <div class="sess" onclick="pick(this,'cto · claude','n-gpu-box:s9','n-gpu-box','hi')"><span class="live"></span><span class="nm">cto</span><span class="badge claude">claude</span><span class="nbadge hi" title="跑在高配机 n-gpu-box">@gpu-box</span></div>
+      <div class="proj">▾ webapp <span class="pnode" title="项目住在 init 它的那台机器">@n-laptop</span></div>
+      <div class="sess" onclick="pick(this,'designer · claude','n-laptop:s2','n-laptop','lo')"><span class="live"></span><span class="nm">designer</span><span class="badge claude">claude</span><span class="nbadge" title="跑在低配机 n-laptop">@laptop</span></div>
+      <div class="sess" onclick="pick(this,'(无 role) · claude','n-laptop:s4','n-laptop','lo')"><span class="live off"></span><span class="nm" style="color:var(--faint)">(无 role)</span><span class="badge none">bare</span><span class="nbadge" title="跑在低配机 n-laptop">@laptop</span></div>
+      <div class="proj">▾ api-svc <span class="pnode" title="项目住在 init 它的那台机器">@n-gpu-box</span></div>
+      <div class="sess" onclick="pick(this,'deployer (queued) · claude','—:queued','n-gpu-box','q')"><span class="live queued"></span><span class="nm" style="color:var(--blue)">deployer</span><span class="badge claude">claude</span><span class="nbadge" title="排队中,待高配机空位" style="color:var(--blue);background:#13233b">排队#2</span></div>
+    </div>
+    <nav class="nav">
+      <div class="navhint">↑ 点会话 = 进它的聊天(每个 session 独立对话,徽标 <b>@机器</b> 标明它跑在哪台)。下面是全局页:</div>
+      <a data-nav="fleet" class="on" onclick="go('fleet',this)"><span class="ico">🖥️</span>Machines<span class="tag">3 台</span></a>
+      <a data-nav="sessions" onclick="go('sessions',this)"><span class="ico">🗂️</span>全机群会话</a>
+      <a data-nav="market" onclick="go('market',this)"><span class="ico">🧩</span>插件市场</a>
+      <a data-nav="status" onclick="go('status',this)"><span class="ico">📊</span>Status</a>
+      <a data-nav="settings" onclick="go('settings',this)"><span class="ico">⚙︎</span>Settings</a>
+    </nav>
+  </aside>
+
+  <!-- ============ main ============ -->
+  <section class="main">
+    <header class="top">
+      <div class="crumb"><span id="crumbproj">机群</span><span class="sep">/</span><span class="muted" id="crumb">Machines · Fleet 总览</span><span class="sep" id="crumbsep" style="display:none">·</span><span class="sid muted" id="crumbsid" style="font-family:var(--mono);display:none"></span></div>
+      <div class="conn" id="conn"><span class="dot"></span>Control 已连接</div>
+      <span class="cost warn" onclick="go('status',document.querySelector('[data-nav=status]'))" title="全机群今日花费 / fleet 24h 预算上限(点开看 per-node)">机群 <b>$6.30</b> / $60</span>
+      <div class="spacer"></div>
+      <div class="tabs" id="tabs" style="visibility:hidden">
+        <button class="on" onclick="tab('chat',this)">Chat</button>
+        <button onclick="tab('term',this)">终端</button>
+      </div>
+      <button class="stop" style="visibility:hidden" id="stopbtn">停止</button>
+    </header>
+
+    <div class="body">
+      <!-- ============ chat view ============ -->
+      <div class="view" id="v-chat">
+        <div class="chat">
+          <div class="scroll">
+            <div class="msg u"><div class="who">你</div>从这一个 Telegram chat 一次性把活铺开:在高配机端到端部署 + 压测 api-svc,同时低配机继续 webapp 的需求讨论 + 原型。</div>
+            <div class="msg a"><div class="who">cto · claude · <span class="mono">n-gpu-box:s9</span> <span class="nbadge hi">@gpu-box</span></div>调度器按能力派活了:部署+压测要 <code>require=[deploy,stress]</code> → 落高配机;讨论/原型无重 require → 落低配机。两边并行各扬所长,我会把进度都汇到这条会话。</div>
+            <!-- fan-out panel -->
+            <div class="fan">
+              <div class="fh"><b>cto fan-out</b> — 3 个 child session,调度器按 tag + headroom 各选不同机器(并行,非堆一台)</div>
+              <div class="fanrow"><span class="child">deploy · gpu-box:s12</span><div class="fanbar"><i style="width:72%"></i></div><span class="pct">72%</span></div>
+              <div class="fanrow"><span class="child">stress · gpu-box:s13</span><div class="fanbar"><i style="width:48%;background:var(--amber)"></i></div><span class="pct">48%</span></div>
+              <div class="fanrow"><span class="child">prototype · laptop:s2</span><div class="fanbar"><i style="width:90%"></i></div><span class="pct">90%</span></div>
+            </div>
+            <div class="msg u"><div class="who">你</div>再加一个 e2e 回归。</div>
+            <div class="msg a"><div class="who">cto · claude · <span class="mono">n-gpu-box:s9</span> <span class="nbadge hi">@gpu-box</span></div>诚实回报:高配机当前 4/4 满载(部署+压测+两个已有 session 占满 <code>max_parallel</code>),e2e <code>require=[e2e,class=high]</code> 暂时<b style="color:var(--blue)">排队 #2</b> —— 有空位即起,不会去抢占别人变慢。要快可 <code>ccteam node ... --max-parallel 6</code> 抬上限或再 enroll 一台高配机。</div>
+            <div class="approve">
+              <div class="q"><b>需要批准</b> · deployer(hitl)在 <span class="nbadge hi">@gpu-box</span> 上想运行:<code>kubectl apply -f deploy/prod.yaml</code></div>
+              <div class="btns"><button class="ok">✅ 同意</button><button class="no">⛔ 拒绝</button></div>
+              <div class="hint" style="margin-top:8px">本会话 own 在 n-gpu-box;批准经 Control 的 mTLS 链路代理回该机的 pending 注册表(600s 阻塞语义保留)。deny 只挡这一次工具、不 kill turn。</div>
+            </div>
+          </div>
+          <div class="composer">
+            <input placeholder="发消息 / 命令(/compact /clear /role /new --on <tag|node> …)…">
+            <button class="send">发送</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ terminal view ============ -->
+      <div class="view" id="v-term">
+        <div class="term"><span class="rem">// Control 透明代理 owning-Worker(n-gpu-box)的 pane 字节中继(xterm.js)— 你察觉不到 entry≠home</span>
+<span class="p">rob@n-gpu-box</span>:<span class="c">~/work/ideas</span>$ claude --agent architect --name ccteam-chat-ideas-s5
+  ▐ Claude Code — architect (本机 sid s5 · 全机群 n-gpu-box:s5)
+  ▐ reading .claude/agents/architect.md …
+  ▐ ready. 1M context · skip-permissions
+
+› 实时 pane 字节中继。Chat / 终端 是同一会话的两个 tab;终端流来自该 session 真正 own 的机器。
+<span class="cur"> </span>
+</div>
+      </div>
+
+      <!-- ============ FLEET / Machines view ============ -->
+      <div class="view on" id="v-fleet">
+        <div class="page" style="max-width:1180px">
+          <h2>Machines · Fleet 总览</h2>
+          <div class="sub">星型联邦:一个 Control 节点统一入口(IM/web/调度),N 个 Worker 节点各自承载 pane。Control 自己不 spawn 任何 pane —— 纯 I/O 路由 + 聚合读,所以弱机也能领一队强机。</div>
+
+          <div class="fleethdr">
+            <div class="stat"><div class="k">节点</div><div class="v">3 <small>/ 2 live</small></div></div>
+            <div class="stat"><div class="k">活跃会话</div><div class="v">5 <small>+1 排队</small></div></div>
+            <div class="stat"><div class="k">并行容量</div><div class="v">6/14 <small>占用</small></div></div>
+            <div class="stat"><div class="k">机群今日成本</div><div class="v" style="color:var(--amber)">$6.30 <small>/ $60</small></div></div>
+            <div class="ctrlbar">
+              <span class="small">enroll = 信任它如同我的 Control 机(单一信任域)</span>
+              <button class="invite" onclick="openInvite()">＋ 邀请机器入队</button>
+            </div>
+          </div>
+
+          <div class="grid">
+            <!-- Control node (也是 worker, --role both 升级前是单机) -->
+            <div class="node ctrl">
+              <div class="node-h"><span class="sdot live"></span><span class="host">n-gpu-box</span><span class="nid">n-gpu-box-3f9a2c</span><span class="role control">CONTROL</span></div>
+              <div class="chips">
+                <span class="cls high">⚡ class=high</span>
+                <span class="chip tag">deploy</span><span class="chip tag">e2e</span><span class="chip tag">stress</span>
+              </div>
+              <div class="chips">
+                <span class="chip cap-claude">claude ✓ login_ok · [1m]</span>
+                <span class="chip cap-codex">codex ✓ login_ok · v0.134</span>
+              </div>
+              <div class="nrow"><span class="lbl">headroom</span><div class="headroom"><i class="busy" style="width:67%"></i></div><span class="mono small">4 / 6 session</span></div>
+              <div class="nrow"><span class="lbl">硬件</span><span class="mono small">32 核 · 128GB · GPU ✓(RTX 4090)· load 5.2</span></div>
+              <div class="nrow"><span class="lbl">预算</span><span class="mono small">$4.10 / $30 余 68%</span></div>
+              <div class="nrow"><span class="lbl">心跳</span><span class="mono small">Control 自身 · 自有 endpoint :7331/:7332</span></div>
+              <div class="node-f"><a onclick="go('sessions',document.querySelector('[data-nav=sessions]'))">查看 4 个会话 →</a><span class="small" style="margin-left:auto">web :7331 · 本机有自己的 token/url</span></div>
+            </div>
+
+            <!-- Worker high (remote, 已 enroll mTLS) -->
+            <div class="node">
+              <div class="node-h"><span class="sdot live"></span><span class="host">n-gpu-2</span><span class="nid">n-gpu-2-b71e44</span><span class="role worker">WORKER</span></div>
+              <div class="chips">
+                <span class="cls high">⚡ class=high</span>
+                <span class="chip tag">deploy</span><span class="chip tag">stress</span><span class="chip tag">e2e</span>
+              </div>
+              <div class="chips">
+                <span class="chip cap-claude">claude ✓ login_ok · [1m]</span>
+                <span class="chip cap-warn">codex ⚠ 未登录(spawn 会跳过)</span>
+              </div>
+              <div class="nrow"><span class="lbl">headroom</span><div class="headroom"><i style="width:25%"></i></div><span class="mono small">2 / 8 session</span></div>
+              <div class="nrow"><span class="lbl">硬件</span><span class="mono small">48 核 · 256GB · GPU ✓(A100)· load 3.1</span></div>
+              <div class="nrow"><span class="lbl">预算</span><span class="mono small">$2.20 / $24 余 91%</span></div>
+              <div class="nrow"><span class="lbl">心跳</span><span class="mono small">2s 前 · TTL 健康 · mTLS 链路 OK</span></div>
+              <div class="node-f"><a onclick="go('sessions',document.querySelector('[data-nav=sessions]'))">查看 2 个会话 →</a><a style="margin-left:auto" onclick="alert('演示:ccteam cluster rotate n-gpu-2-b71e44 — 轮转机器凭证(cert),与人的 web-token 完全分离,永不打印')">轮转凭证</a></div>
+            </div>
+
+            <!-- Worker low (remote) -->
+            <div class="node">
+              <div class="node-h"><span class="sdot live"></span><span class="host">n-laptop</span><span class="nid">n-laptop-9c0d11</span><span class="role worker">WORKER</span></div>
+              <div class="chips">
+                <span class="cls low">class=low</span>
+                <span class="chip tag">design</span><span class="chip tag">prototype</span><span class="chip tag">discuss</span>
+              </div>
+              <div class="chips">
+                <span class="chip cap-claude">claude ✓ login_ok · 200k</span>
+                <span class="chip cap-warn">codex — 未安装</span>
+              </div>
+              <div class="nrow"><span class="lbl">headroom</span><div class="headroom"><i style="width:25%"></i></div><span class="mono small">1 / 4 session</span></div>
+              <div class="nrow"><span class="lbl">硬件</span><span class="mono small">8 核 · 16GB · 无 GPU · load 1.4</span></div>
+              <div class="nrow"><span class="lbl">预算</span><span class="mono small">$0.00 / $6 余 100%</span></div>
+              <div class="nrow"><span class="lbl">心跳</span><span class="mono small">1s 前 · TTL 健康 · mTLS 链路 OK</span></div>
+              <div class="node-f"><a onclick="go('sessions',document.querySelector('[data-nav=sessions]'))">查看 1 个会话 →</a><a style="margin-left:auto" onclick="alert('演示:ccteam cluster rotate n-laptop-9c0d11')">轮转凭证</a></div>
+            </div>
+
+            <!-- Worker down (missed heartbeats) -->
+            <div class="node down">
+              <div class="node-h"><span class="sdot down"></span><span class="host">n-cloud-arm</span><span class="nid">n-cloud-arm-5e2b88</span><span class="role worker">WORKER</span></div>
+              <div class="chips">
+                <span class="cls low">class=low</span>
+                <span class="chip tag">build</span><span class="chip tag">test</span>
+              </div>
+              <div class="chips">
+                <span class="chip cap-warn">心跳超时 · 能力快照已过 TTL</span>
+              </div>
+              <div class="nrow"><span class="lbl">headroom</span><div class="headroom"><i class="full" style="width:0%"></i></div><span class="mono small">下线 · 不接新活</span></div>
+              <div class="nrow"><span class="lbl">心跳</span><span class="mono small" style="color:var(--red)">4m 前 — unreachable(超 TTL)</span></div>
+              <div class="nrow"><span class="lbl small" style="color:var(--faint)">红线</span><span class="small" style="color:var(--dim)">missed heartbeat <b>不</b>触发 kill — 该机若仍活,pane 继续跑,愈合时按 node_id reconcile</span></div>
+              <div class="node-f"><span class="small">不计入可派活 node</span><a style="margin-left:auto;color:var(--red)" onclick="alert('演示:ccteam cluster rm n-cloud-arm-5e2b88 — evict(从注册表逐出 + 凭证失效)。仅 operator 显式命令,非自动 kill')">逐出</a></div>
+            </div>
+          </div>
+
+          <div class="legend">
+            <span><span class="d" style="background:var(--green)"></span>live(心跳健康)</span>
+            <span><span class="d" style="background:var(--amber)"></span>draining(不接新活、跑完现有)</span>
+            <span><span class="d" style="background:var(--red)"></span>down(超 TTL,但 live session 不被 kill)</span>
+            <span style="margin-left:auto"><b style="color:var(--amber)">CONTROL</b> = IM/web/调度单例(无 HA,本版 defer;宕则入口宕,Worker live session 继续跑)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 全机群 SESSIONS view ============ -->
+      <div class="view" id="v-sessions">
+        <div class="page" style="max-width:1180px">
+          <h2>全机群会话</h2>
+          <div class="sub">Control fan-out 并发 GET 各 Worker <code>/api/v1/sessions</code> 再 merge(100 session 跨 10 机 = 10 个并发 cheap 调用,非串行 walk)。可按机器过滤/分组 —— 跨机 fan-out 一眼可见。</div>
+          <div class="filterbar">
+            <select onchange="filterSess(this.value)">
+              <option value="all">全部机器</option>
+              <option value="n-gpu-box">n-gpu-box(Control,high)</option>
+              <option value="n-gpu-2">n-gpu-2(worker,high)</option>
+              <option value="n-laptop">n-laptop(worker,low)</option>
+            </select>
+            <select><option>全部状态</option><option>live</option><option>idle</option><option>queued</option></select>
+            <input class="grow" placeholder="按 sid / project / role 过滤…">
+          </div>
+          <table id="sesstable">
+            <thead><tr><th>状态</th><th>会话 (sid)</th><th>项目 / role</th><th>vendor</th><th>机器</th><th>能力匹配</th><th>last event</th><th></th></tr></thead>
+            <tbody>
+              <tr data-node="n-gpu-box"><td><span class="pill ok">live</span></td><td class="mono">n-gpu-box:s5</td><td>ideas / architect</td><td><span class="badge claude">claude</span></td><td><span class="nbadge hi">@gpu-box</span></td><td><span class="chip tag">class=high</span></td><td class="small">7s</td><td><a class="lk" onclick="pickFromTable('architect · claude','n-gpu-box:s5','n-gpu-box','hi')">打开 →</a></td></tr>
+              <tr data-node="n-gpu-box"><td><span class="pill ok">live</span></td><td class="mono">n-gpu-box:s9</td><td>ideas / cto</td><td><span class="badge claude">claude</span></td><td><span class="nbadge hi">@gpu-box</span></td><td><span class="chip tag">deploy</span></td><td class="small">1m</td><td><a class="lk" onclick="pickFromTable('cto · claude','n-gpu-box:s9','n-gpu-box','hi')">打开 →</a></td></tr>
+              <tr data-node="n-gpu-box"><td><span class="pill ok">live</span></td><td class="mono">n-gpu-box:s12</td><td>api-svc / deployer</td><td><span class="badge claude">claude</span></td><td><span class="nbadge hi">@gpu-box</span></td><td><span class="chip tag">deploy</span><span class="chip tag">stress</span></td><td class="small">22s</td><td><a class="lk" onclick="pickFromTable('deployer · claude','n-gpu-box:s12','n-gpu-box','hi')">打开 →</a></td></tr>
+              <tr data-node="n-gpu-2"><td><span class="pill ok">live</span></td><td class="mono">n-gpu-2:s13</td><td>api-svc / stress</td><td><span class="badge claude">claude</span></td><td><span class="nbadge" style="color:var(--amber);background:#231806">@gpu-2</span></td><td><span class="chip tag">stress</span><span class="chip tag">class=high</span></td><td class="small">9s</td><td><a class="lk" onclick="pickFromTable('stress · claude','n-gpu-2:s13','n-gpu-2','hi')">打开 →</a></td></tr>
+              <tr data-node="n-gpu-2"><td><span class="pill ok">live</span></td><td class="mono">n-gpu-2:s4</td><td>api-svc / e2e</td><td><span class="badge claude">claude</span></td><td><span class="nbadge" style="color:var(--amber);background:#231806">@gpu-2</span></td><td><span class="chip tag">e2e</span></td><td class="small">40s</td><td><a class="lk" onclick="pickFromTable('e2e · claude','n-gpu-2:s4','n-gpu-2','hi')">打开 →</a></td></tr>
+              <tr data-node="n-laptop"><td><span class="pill ok">live</span></td><td class="mono">n-laptop:s2</td><td>webapp / designer</td><td><span class="badge claude">claude</span></td><td><span class="nbadge">@laptop</span></td><td><span class="chip tag">prototype</span></td><td class="small">3s</td><td><a class="lk" onclick="pickFromTable('designer · claude','n-laptop:s2','n-laptop','lo')">打开 →</a></td></tr>
+              <tr data-node="n-laptop"><td><span class="pill warn">idle</span></td><td class="mono">n-laptop:s4</td><td>webapp / (无 role)</td><td><span class="badge none">bare</span></td><td><span class="nbadge">@laptop</span></td><td><span class="chip tag">design</span></td><td class="small">14m</td><td><a class="lk" onclick="pickFromTable('(无 role) · claude','n-laptop:s4','n-laptop','lo')">打开 →</a></td></tr>
+              <tr data-node="n-gpu-box"><td><span class="pill info">queued #2</span></td><td class="mono">—(待铸)</td><td>api-svc / e2e-regress</td><td><span class="badge claude">claude</span></td><td><span class="small">待高配机空位</span></td><td><span class="chip tag">e2e</span><span class="chip tag">class=high</span></td><td class="small">—</td><td><span class="small">FIFO 队列(high)</span></td></tr>
+            </tbody>
+          </table>
+          <div class="note" style="margin:16px 0 0">背压(不 thrash):每-tag FIFO 队列(bounded 64)。全部 tag-eligible node 满载 → <b>不</b> spawn-and-thrash(那会让每个 session 都变慢),返回 <b>202 queued + 位次</b>;空位由心跳到达<b>事件</b>驱动 admit(不 tick)。队满 → <b>503 capacity</b> + 「加机器或抬 --max-parallel」诚实提示,绝不静默超订。</div>
+        </div>
+      </div>
+
+      <!-- ============ marketplace (沿用 v0.8.9) ============ -->
+      <div class="view" id="v-market">
+        <div class="page" style="max-width:1000px">
+          <h2>插件市场</h2>
+          <div class="sub">浏览 + 一键装 role/agent、skill、workflow。来源:ccteam-hub(自建)+ agency-agents 等开源(192+)。装到当前项目的所属机器。</div>
+          <div class="filterbar">
+            <div class="seg"><button class="on">Agents / Roles</button><button>Skills</button><button>Workflows</button></div>
+            <select class="src"><option>全部来源</option><option>builtin</option><option>agency-agents</option></select>
+            <input class="grow" placeholder="搜索插件…">
+          </div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))">
+            <div class="card" style="margin:0"><div style="display:flex;align-items:center;gap:8px"><b>cto</b><span class="badge none">builtin</span></div><div class="small" style="margin:6px 0;color:var(--dim)">Chat-first 管家(引擎自带例外)。本版加:按 spec-class 派活 + 排队状态回报。</div><span class="pill ok">已装</span></div>
+            <div class="card" style="margin:0"><div style="display:flex;align-items:center;gap:8px"><b>architect</b><span class="badge none">builtin</span></div><div class="small" style="margin:6px 0;color:var(--dim)">系统设计 + 重构、读码定位。</div><span class="pill ok">已装</span></div>
+            <div class="card" style="margin:0"><div style="display:flex;align-items:center;gap:8px"><b>deployer</b><span class="badge none">builtin</span></div><div class="small" style="margin:6px 0;color:var(--dim)">端到端部署 · 配 [deploy,stress] tag → 高配机。</div><button class="save" style="margin:0;padding:6px 14px">安装</button></div>
+            <div class="card" style="margin:0"><div style="display:flex;align-items:center;gap:8px"><b>code-reviewer</b><span class="badge none" style="color:#a78bfa;background:#221c3a">agency-agents</span></div><div class="small" style="margin:6px 0;color:var(--dim)">开源 · 逐行 review + 安全。MIT。</div><button class="save" style="margin:0;padding:6px 14px">安装</button></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ status (CLI fleet tree mirror) ============ -->
+      <div class="view" id="v-status">
+        <div class="page">
+          <h2>Status · 运维总览</h2>
+          <div class="sub">轻量运维视图。本版扩成 <b>fleet tree</b>:NODES → 各 node 的 projects → sessions,每 node 一块 web token/url + LAN-ip(每台有自己的 endpoint)。镜像 <code>ccteam status</code> CLI 输出。</div>
+          <pre class="code"><span class="m"># ccteam status</span>
+
+<span class="c">CONTROL</span>  n-gpu-box   <span class="n">●live</span>  class=high  tags=[deploy,e2e,stress]  4 live / 6 cap  budget $4.10/$30
+  <span class="p">web</span>  http://192.168.1.20:7331   token …3c2dc5b5f1
+  <span class="p">api</span>  https://192.168.1.20:7332  (mTLS 控制口,仅 Control↔Worker)
+  ideas/
+    architect · claude · <span class="n">n-gpu-box:s5</span>   ●live 7s
+    cto       · claude · <span class="n">n-gpu-box:s9</span>   ●live 1m
+  api-svc/
+    deployer  · claude · <span class="n">n-gpu-box:s12</span>  ●live 22s
+
+<span class="c">WORKER</span>   n-gpu-2     <span class="n">●live</span>  class=high  tags=[deploy,stress,e2e]  2 live / 8 cap  budget $2.20/$24
+  <span class="p">web</span>  http://192.168.1.31:7331   token …a1f0922be
+  api-svc/
+    stress    · claude · <span class="n">n-gpu-2:s13</span>   ●live 9s
+    e2e       · claude · <span class="n">n-gpu-2:s4</span>    ●live 40s
+
+<span class="c">WORKER</span>   n-laptop    <span class="n">●live</span>  class=low   tags=[design,prototype]   1 live / 4 cap  budget $0.00/$6
+  <span class="p">web</span>  http://192.168.1.55:7331   token …d4e7c10ab
+  webapp/
+    designer  · claude · <span class="n">n-laptop:s2</span>   ●live 3s
+    (无 role) · claude · <span class="n">n-laptop:s4</span>   <span style="color:var(--amber)">○idle</span> 14m
+
+<span class="c">WORKER</span>   n-cloud-arm <span style="color:var(--red)">●down</span>  超 TTL 4m — live session 不被 kill,愈合后 reconcile
+
+<span class="m"># fleet budget(Control 聚合各 Worker cost ledger 并强制 fleet cap)</span>
+  机群今日 <span style="color:var(--amber)">$6.30</span> / fleet cap $60   (claude $5.10 · codex $1.20)
+  排队:api-svc/e2e-regress  <span class="n">queued #2 (high)</span></pre>
+          <div class="card" style="display:flex;align-items:center;gap:10px"><span class="sdot live" style="width:9px;height:9px"></span><div><b>Control daemon healthy</b> · 3 Worker enrolled(2 live · 1 down)</div><span class="pill ok" style="margin-left:auto">mTLS CA OK · cert 链有效</span></div>
+        </div>
+      </div>
+
+      <!-- ============ settings ============ -->
+      <div class="view" id="v-settings">
+        <div class="page">
+          <h2>Settings · IM 配置(Control 节点)</h2>
+          <div class="sub">IM 入站收口只在 Control(Telegram getUpdates 单消费者天然只能一个);Worker 绝不起 IM listener。秘密只显示状态 + 末几位,绝不回显明文。</div>
+          <div class="card">
+            <div style="display:flex;align-items:center"><div style="font-weight:600">Telegram</div><span class="pill ok" style="margin-left:10px">已配置</span></div>
+            <div class="field"><label>Bot Token</label><input value="•••••••••••••••••••••••••••3c2dc5b5f1" readonly></div>
+            <div class="hint">改 token:粘贴新 token → 提示「现在去给 bot 发条消息」→ 自动抓 chat_id。这条 bot 驱动整个机群。</div>
+          </div>
+          <div class="card">
+            <div style="font-weight:600;margin-bottom:4px">机器凭证(cluster CA)</div>
+            <div class="small" style="color:var(--dim);margin-bottom:8px">机器身份 = mTLS（自签 CA + per-node client cert)。<b style="color:var(--amber)">独立类、永不打印、与人的 web-token 完全分离</b>。</div>
+            <div class="field"><label>CA 指纹</label><input value="SHA256:a1:b2:…:9f  (私钥 0600 ~/.ccteam,本版唯一新 dep rcgen 签发)" readonly></div>
+            <div class="hint">逐出/轮转:<code>ccteam cluster rm &lt;node&gt;</code> / <code>ccteam cluster rotate &lt;node&gt;</code>。本版不引入 CRL/OCSP —— 吊销 = rm + cert 过期 + 轮转。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ============ create-session modal (PlacementPicker) ============ -->
+<div class="scrim" id="newscrim">
+  <div class="modal">
+    <span class="x" onclick="closeNew()">✕</span>
+    <h3>新建会话</h3>
+    <div class="msub">默认让调度器<b style="color:var(--green)"> 自动派活</b>(常见路径不打扰);高级可声明能力 require-tags、spec-class 或显式 pin 一台机器。</div>
+    <div class="field"><label>项目</label><select><option>api-svc @n-gpu-box</option><option>ideas @n-gpu-box</option><option>webapp @n-laptop</option></select></div>
+    <div class="field"><label>Role(可空 = roleless 裸 claude)</label><select><option>cto</option><option>architect</option><option>deployer</option><option>(无 role)</option></select></div>
+    <div class="field"><label>派活模式</label>
+      <div class="seg" id="placemode">
+        <button class="on" onclick="placeMode(this,'auto')">自动(推荐)</button>
+        <button onclick="placeMode(this,'tags')">按能力 require-tags</button>
+        <button onclick="placeMode(this,'class')">按 spec-class</button>
+        <button onclick="placeMode(this,'pin')">pin 一台机器</button>
+      </div>
+    </div>
+    <div class="field" id="place-tags" style="display:none"><label>require tags(逗号分隔)</label><input value="deploy, stress" placeholder="deploy, stress, e2e, claude:1m"></div>
+    <div class="field" id="place-class" style="display:none"><label>spec-class</label><select><option>high(部署/压测/e2e)</option><option>low(讨论/原型)</option></select></div>
+    <div class="field" id="place-pin" style="display:none"><label>pin node</label><select><option>n-gpu-box(high · 4/6)</option><option>n-gpu-2(high · 2/8)</option><option>n-laptop(low · 1/4)</option></select></div>
+    <div class="placement-preview" id="ppv">调度器将 filter 满足 {require tags} ∩ {vendor available 且 <b>login_ok</b> 且 version-ok} ∩ {repo 在该 node} ∩ {未触 cost-cap、未满 max_parallel} 的 node,在幸存者里按 <b>headroom_score</b>(算力 + 负载 + 预算加权)取最大 → 预计落 <b>n-gpu-2</b>(headroom 最高)。建完显示实际落点。</div>
+    <div class="actions"><button class="btn-ghost" onclick="closeNew()">取消</button><button class="save" style="margin:0" onclick="closeNew()">创建会话</button></div>
+  </div>
+</div>
+
+<!-- ============ invite-machine modal (cluster invite) ============ -->
+<div class="scrim" id="invscrim">
+  <div class="modal">
+    <span class="x" onclick="closeInvite()">✕</span>
+    <h3>邀请机器入队</h3>
+    <div class="msub">operator 显式入网(无 mDNS/广播自动发现 — LAN footgun)。一次性短 TTL bootstrap token → Worker 本地生成 keypair + TOFU pin CA 指纹 + CSR → Control 签 client cert(CN=node_id)。</div>
+    <div class="field"><label>给新机贴的 capability 标签</label><input value="deploy, stress, e2e" placeholder="deploy, stress / design, prototype"></div>
+    <div class="field"><label>spec-class</label><select><option>high</option><option>low</option></select></div>
+    <div class="placement-preview">在新机上执行 ↓ (token 90s 内有效):</div>
+    <pre class="code" style="margin-top:8px">ccteam start --role worker \
+  --control <span class="n">https://192.168.1.20:7332</span> \
+  --enroll  <span class="c">CT-8fa31c…</span> \
+  --tags deploy,stress,e2e --class high</pre>
+    <div class="hint">⚠ 单一信任域:enroll 一台 Worker = 「我信任它如同我的 Control 机」。本版不声称 per-agent / 多租户隔离;星型(Worker 间不通信)已把横向爆炸半径压到比 mesh 小。</div>
+    <div class="actions"><button class="btn-ghost" onclick="closeInvite()">关闭</button><button class="save" style="margin:0" onclick="alert('演示:已 mint 一次性 enroll token,90s 后失效')">重新 mint token</button></div>
+  </div>
+</div>
+
+<div class="note">原型说明(v0.9.0 多机协同):在 v0.8.9 统一 chat shell 上加 <b>node 维度</b>。<b>左侧 项目→会话</b>:每个 session 带 <b>@机器徽标</b> 标明它跑在哪台(执行钉死 owning node)、项目头标 <b>@所属机</b>、排队 session 显 <b>排队#N</b>。底部全局页新增 <b>Machines</b>(node card:status/spec-class/capability chips/headroom/tags/budget,含 Control 单例 + Worker + down 节点)+ <b>全机群会话</b>(可按机器过滤/分组的聚合表,排队行可见);沿用 <b>插件市场 / Status(扩成 fleet tree)/ Settings</b>。<b>＋ 新建会话</b> 弹 PlacementPicker(默认 auto,高级 require-tags/class/pin)。<b>＋ 邀请机器</b> 弹 cluster invite(一次性 token + mTLS enroll)。点左侧会话、底部导航、顶部 Chat|终端 tab、两个弹窗均可点切演示。深色 + amber 一套 token,纯单文件、零外部 CDN。</div>
+
+<script>
+  // ----- 全局页(fleet/sessions/market/status/settings)= 离开会话上下文,隐藏 Chat|终端 tab -----
+  function go(v, el){
+    document.querySelectorAll('.sess').forEach(s=>s.classList.remove('active'));
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
+    if(el) el.classList.add('on');
+    var map = {fleet:'v-fleet', sessions:'v-sessions', market:'v-market', status:'v-status', settings:'v-settings'};
+    var crumbs = {fleet:['机群','Machines · Fleet 总览'], sessions:['机群','全机群会话'], market:['全局','插件市场'], status:['运维','Status · fleet tree'], settings:['Control','Settings · IM 配置']};
+    show(map[v]);
+    document.getElementById('crumbproj').textContent = crumbs[v][0];
+    document.getElementById('crumb').textContent = crumbs[v][1];
+    document.getElementById('crumbsep').style.display='none';
+    document.getElementById('crumbsid').style.display='none';
+    document.getElementById('tabs').style.visibility = 'hidden';
+    document.getElementById('stopbtn').style.visibility = 'hidden';
+  }
+  // ----- 会话内的 Chat | 终端 -----
+  function tab(t, el){
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
+    el.classList.add('on');
+    show(t==='chat'?'v-chat':'v-term');
+  }
+  function show(id){
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
+    document.getElementById(id).classList.add('on');
+  }
+  // ----- 点会话 = 进入它的聊天(node 徽标随之进 chat header) -----
+  function pick(el, label, sid, node, cls){
+    document.querySelectorAll('.sess').forEach(s=>s.classList.remove('active'));
+    if(el) el.classList.add('active');
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
+    var proj = sid.startsWith('n-gpu-box')||sid.startsWith('—')&&node==='n-gpu-box' ? 'ideas' : (node==='n-laptop'?'webapp':'api-svc');
+    document.getElementById('crumbproj').textContent = proj;
+    document.getElementById('crumb').textContent = label;
+    document.getElementById('crumbsep').style.display='';
+    var sidEl = document.getElementById('crumbsid');
+    sidEl.style.display=''; sidEl.textContent = sid;
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
+    document.querySelector('#tabs button').classList.add('on');
+    document.getElementById('tabs').style.visibility = 'visible';
+    document.getElementById('stopbtn').style.visibility = 'visible';
+    show('v-chat');
+  }
+  function pickFromTable(label, sid, node, cls){
+    // 同步左侧高亮(若能找到对应行)+ 打开聊天
+    pick(null, label, sid, node, cls);
+    var found=null;
+    document.querySelectorAll('.sess .nbadge,.sess .sid').forEach(function(){});
+    document.querySelectorAll('.sess').forEach(function(s){ if(s.textContent.indexOf(sid.split(':')[0])>-1 && s.querySelector('.nm') && label.indexOf(s.querySelector('.nm').textContent)>-1) found=s; });
+    if(found){ document.querySelectorAll('.sess').forEach(x=>x.classList.remove('active')); found.classList.add('active'); }
+  }
+  // ----- 全机群会话表:按机器过滤 -----
+  function filterSess(node){
+    document.querySelectorAll('#sesstable tbody tr').forEach(function(tr){
+      tr.style.display = (node==='all' || tr.getAttribute('data-node')===node) ? '' : 'none';
+    });
+  }
+  // ----- create-session modal -----
+  function openNew(){ document.getElementById('newscrim').classList.add('on'); }
+  function closeNew(){ document.getElementById('newscrim').classList.remove('on'); }
+  function placeMode(el, mode){
+    document.querySelectorAll('#placemode button').forEach(b=>b.classList.remove('on'));
+    el.classList.add('on');
+    document.getElementById('place-tags').style.display = mode==='tags'?'':'none';
+    document.getElementById('place-class').style.display = mode==='class'?'':'none';
+    document.getElementById('place-pin').style.display = mode==='pin'?'':'none';
+    var pv = document.getElementById('ppv');
+    if(mode==='auto') pv.innerHTML='调度器将 filter 满足 {require tags} ∩ {vendor available 且 <b>login_ok</b> 且 version-ok} ∩ {repo 在该 node} ∩ {未触 cost-cap、未满 max_parallel} 的 node,在幸存者里按 <b>headroom_score</b>(算力 + 负载 + 预算加权)取最大 → 预计落 <b>n-gpu-2</b>(headroom 最高)。建完显示实际落点。';
+    if(mode==='tags') pv.innerHTML='require=[deploy,stress] → 仅高配机匹配(n-gpu-box / n-gpu-2 带 deploy+stress tag)→ 取 headroom 最高的 <b>n-gpu-2</b>。低配机被 tag 过滤掉。';
+    if(mode==='class') pv.innerHTML='class=high → 在所有 class=high 的 node(n-gpu-box / n-gpu-2)里按 headroom 取最大 → <b>n-gpu-2</b>。';
+    if(mode==='pin') pv.innerHTML='显式 pin → 跳过自动选点,直接落你选的那台(若该机满载则进它的 per-tag 队列排队,不超订)。';
+  }
+  // ----- invite-machine modal -----
+  function openInvite(){ document.getElementById('invscrim').classList.add('on'); }
+  function closeInvite(){ document.getElementById('invscrim').classList.remove('on'); }
+  // close modal on scrim click
+  document.querySelectorAll('.scrim').forEach(function(s){ s.addEventListener('click', function(e){ if(e.target===s) s.classList.remove('on'); }); });
+</script>
+</body>
+</html>
