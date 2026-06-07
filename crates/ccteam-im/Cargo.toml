@@ -37,6 +37,11 @@ notify.workspace = true
 regex.workspace = true
 # HTTP client for Telegram getUpdates + Slack chat.postMessage + Discord REST.
 reqwest = { workspace = true, features = ["json", "multipart"] }
+# v0.8.9 Phase 2 — sha256 integrity verification of ccteam-hub plugin bodies
+# (`hub::fetch_plugin_body` checks the fetched body against the hub index's
+# `content_sha`; `hub::installed_status` hashes on-disk bytes to detect an
+# available update). Refuses a tampered body instead of writing it.
+sha2.workspace = true
 # UNIX-only signalling for graceful supervisor SIGTERM (libc::kill).
 libc = "0.2"
 # Lightweight WebSocket Channel used for local/browser IM e2e validation,

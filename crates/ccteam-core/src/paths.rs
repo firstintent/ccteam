@@ -58,6 +58,17 @@ impl CcteamPaths {
         self.root.join("progress")
     }
 
+    /// `~/.ccteam/hub-cache/` — v0.8.9 Phase 2 local cache of the
+    /// ccteam-hub catalog. `ccteam_im::hub::load_catalog` writes
+    /// `index.json` here (atomic tmp + rename) on a refresh and reads it
+    /// back for offline browse. Part of [`canonical_home_dirs`] so the
+    /// `ccteam doctor` home-drift check does not flag it. Honours
+    /// `CCTEAM_HOME` via [`CcteamPaths::from_env`] like every other
+    /// `~/.ccteam/` subdir.
+    pub fn hub_cache_dir(&self) -> PathBuf {
+        self.root.join("hub-cache")
+    }
+
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join("inbox")
     }
@@ -232,9 +243,10 @@ pub struct ProjectSessionContext {
 /// Kept minimal on purpose: only directories the current architecture
 /// actually writes — `hooks/` (hook.sh dispatcher), `progress/`
 /// (per-project jsonl streams), `run/` (daemon socket / runtime files),
-/// `state/` (daemon pidfile).
+/// `state/` (daemon pidfile), and `hub-cache/` (v0.8.9 Phase 2 ccteam-hub
+/// catalog cache — the marketplace's offline `index.json`).
 pub fn canonical_home_dirs() -> &'static [&'static str] {
-    &["hooks", "progress", "run", "state"]
+    &["hooks", "progress", "run", "state", "hub-cache"]
 }
 
 /// V0.5.0 F95 — resolve the **global** Anthropic Agent Teams progress

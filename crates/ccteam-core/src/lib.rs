@@ -39,6 +39,11 @@ pub mod defaults;
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
+// v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) raw-content base
+// URL. Leaf-crate part only: the async fetch + sha256-verify + install
+// backend lives in `ccteam-im::hub` so this primitives leaf stays free of an
+// async HTTP + sha2 dependency (same split as role_catalog ↔ role_import).
+pub mod hub;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;
@@ -109,8 +114,12 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 // V0.6.1 F128 + v0.8.6 W5b — agent .md write primitives. `write_role` is
-// the create-or-replace PUT primitive the resource API uses.
-pub use admin_actions::{agent_md_path, change_persona, write_role, AddToolResult};
+// the create-or-replace PUT primitive the resource API uses. v0.8.9 Phase 2
+// adds the skill sibling `write_skill` (`.claude/skills/<id>/SKILL.md`) used
+// by the hub installer.
+pub use admin_actions::{
+    agent_md_path, change_persona, skill_md_path, write_role, write_skill, AddToolResult,
+};
 // V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
 // (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
 pub use advise::{
@@ -165,6 +174,8 @@ pub use handoff::{
     WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
     HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
 };
+// v0.8.9 Phase 2 — ccteam-hub raw-content base (curated marketplace).
+pub use hub::HUB_RAW_BASE;
 // v0.8.6 — generic config hot-reload wrapper (used by the IM gateway for
 // config.yaml; reusable for any future config file).
 pub use hot_config::HotConfig;

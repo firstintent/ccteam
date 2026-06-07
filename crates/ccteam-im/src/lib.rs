@@ -30,6 +30,13 @@ pub mod acl;
 pub mod credentials;
 pub mod daemon;
 pub mod gateway;
+// v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) read + install
+// backend. Reads the hub `index.json` over HTTPS + a `~/.ccteam/hub-cache/`
+// local cache, verifies each plugin body's sha256 against the index, and
+// installs into a project's `.claude/agents|skills/`. Lives here (not core)
+// so the primitives leaf stays free of an async HTTP + sha2 dependency —
+// same split as `role_catalog` (core, offline) ↔ `role_import` (im, HTTP).
+pub mod hub;
 pub mod inbound;
 pub mod latency;
 pub mod nl_admin;
