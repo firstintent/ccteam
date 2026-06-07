@@ -248,6 +248,29 @@ pub fn bootstrap_project(
 /// refresh of an already-installed project lives in `ccteam init`'s
 /// refresh helpers; this function assumes the caller already decided
 /// "this is a new install".
+/// v0.8.9 (owner decision) — scaffold body for an EMPTY project's `AGENTS.md`.
+/// It tells a bare / roleless agent the project is uninitialized so it asks the
+/// user to set it up instead of spinning on an under-specified task. Written
+/// ONLY when the project has neither `CLAUDE.md` nor `AGENTS.md` (see
+/// [`bootstrap_project_at_dir`]); never overwrites existing content.
+const EMPTY_PROJECT_AGENTS_MD: &str = "\
+# Project guide
+
+> ⚠️ This project has not been initialized yet — ccteam created this file as a
+> placeholder.
+
+**Before doing any substantial work here, remind the user to initialize the
+project.** Ask them to describe, in this file:
+
+- what this project is and what it is for;
+- its layout and the key directories / files;
+- the conventions, constraints, and tooling to follow;
+- how agents should operate here — what to do, and what to avoid.
+
+Until this file is filled in, keep replies short, ask clarifying questions, and
+do **not** guess at the task or start open-ended exploration.
+";
+
 pub fn bootstrap_project_at_dir(
     // `paths` is the global `~/.ccteam/` root. It feeds the
     // home-ensure below (`ensure_ccteam_home`) so the `hook.sh`
@@ -322,6 +345,50 @@ pub fn bootstrap_project_at_dir(
     if !cto_md.exists() {
         std::fs::write(&cto_md, CTO_ROLE_MD)
             .with_context(|| format!("write {}", cto_md.display()))?;
+    }
+
+    // v0.8.9 (owner decision) — scaffold a minimal project brain for an EMPTY
+    // project so a roleless / bare-claude session asks the user to initialize
+    // it instead of spinning on an under-specified task. ONLY when the project
+    // has NEITHER CLAUDE.md NOR AGENTS.md (either present ⇒ a real project —
+    // never touch it). This deliberately relaxes the earlier "ccteam never
+    // generates the project knowledge layer" red-line, scoped to the
+    // empty-project bootstrap and never overwriting existing content.
+    let claude_md = project_dir.join("CLAUDE.md");
+    let agents_md = project_dir.join("AGENTS.md");
+    if !claude_md.exists() && !agents_md.exists() {
+        std::fs::write(&agents_md, EMPTY_PROJECT_AGENTS_MD)
+            .with_context(|| format!("write {}", agents_md.display()))?;
+        // CLAUDE.md reuses AGENTS.md as the single source of truth via Claude
+        // Code's `@import` (Codex reads AGENTS.md directly).
+        std::fs::write(&claude_md, "@AGENTS.md\n")
+            .with_context(|| format!("write {}", claude_md.display()))?;
+    }
+
+    // v0.8.9 (owner request) — keep `.ccteam/` out of git: add a `.ccteam/`
+    // line to the project's .gitignore (create it if absent; append only when
+    // no equivalent ignore is already present). Best-effort — a .gitignore
+    // write failure must never fail project creation.
+    {
+        let gitignore = project_dir.join(".gitignore");
+        let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+        let already = existing
+            .lines()
+            .any(|l| matches!(l.trim().trim_end_matches('/'), ".ccteam" | "/.ccteam"));
+        if !already {
+            let mut body = existing;
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(".ccteam/\n");
+            if let Err(err) = std::fs::write(&gitignore, &body) {
+                tracing::warn!(
+                    project_dir = %project_dir.display(),
+                    error = %err,
+                    "could not add .ccteam/ to .gitignore",
+                );
+            }
+        }
     }
 
     Ok(project_dir)
@@ -1135,6 +1202,115 @@ mod tests {
     /// `ensure_ccteam_home` is the shared idempotent home-ensure: a
     /// re-run must succeed and leave hook.sh in place (it underpins the
     /// daemon-start + every create path, all of which may run repeatedly).
+    #[test]
+    fn bootstrap_empty_project_scaffolds_claude_and_agents_md() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("empty-repo");
+
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
+            .unwrap();
+
+        let agents_md = project_dir.join("AGENTS.md");
+        let claude_md = project_dir.join("CLAUDE.md");
+        assert!(
+            agents_md.exists(),
+            "an empty project must get a scaffolded AGENTS.md"
+        );
+        assert!(
+            claude_md.exists(),
+            "an empty project must get a scaffolded CLAUDE.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "@AGENTS.md\n",
+            "CLAUDE.md must @-import AGENTS.md (single source of truth)"
+        );
+        assert!(
+            std::fs::read_to_string(&agents_md)
+                .unwrap()
+                .contains("has not been initialized"),
+            "scaffolded AGENTS.md must prompt the user to initialize the project"
+        );
+    }
+
+    #[test]
+    fn bootstrap_nonempty_project_keeps_existing_knowledge_layer() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // A project that ALREADY has a CLAUDE.md is non-empty → bootstrap must
+        // neither overwrite it nor create an AGENTS.md scaffold.
+        let project_dir = tmp.path().join("workspace").join("real-repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("CLAUDE.md"),
+            "# Real project\nuser content\n",
+        )
+        .unwrap();
+
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(project_dir.join("CLAUDE.md")).unwrap(),
+            "# Real project\nuser content\n",
+            "bootstrap must NOT overwrite an existing CLAUDE.md"
+        );
+        assert!(
+            !project_dir.join("AGENTS.md").exists(),
+            "a project that already has CLAUDE.md is non-empty → no AGENTS.md scaffold"
+        );
+    }
+
+    #[test]
+    fn bootstrap_adds_ccteam_to_gitignore_idempotently() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // Existing .gitignore with user content (no trailing newline) —
+        // bootstrap must APPEND `.ccteam/` without clobbering, exactly once.
+        let project_dir = tmp.path().join("workspace").join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(".gitignore"), "target\nnode_modules").unwrap();
+
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev").unwrap();
+        let body = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        assert!(
+            body.contains("target") && body.contains("node_modules"),
+            "must preserve existing .gitignore entries; got: {body:?}"
+        );
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.trim().trim_end_matches('/') == ".ccteam")
+                .count(),
+            1,
+            "exactly one .ccteam ignore line; got: {body:?}"
+        );
+
+        // Re-bootstrap (idempotent / re-create) must NOT add a duplicate line.
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(x)", "dev").unwrap();
+        let body2 = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            body2
+                .lines()
+                .filter(|l| l.trim().trim_end_matches('/') == ".ccteam")
+                .count(),
+            1,
+            "re-bootstrap must not duplicate the .ccteam ignore; got: {body2:?}"
+        );
+    }
+
     #[test]
     fn ensure_ccteam_home_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
