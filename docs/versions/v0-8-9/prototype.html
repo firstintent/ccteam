@@ -48,6 +48,8 @@
   .crumb .sep{color:var(--faint)} .crumb .muted{color:var(--dim);font-weight:500}
   .conn{display:flex;align-items:center;gap:6px;color:var(--green);font-size:12px}
   .conn .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+  .cost{font-size:12px;font-family:var(--mono);padding:3px 10px;border-radius:20px;background:var(--s800);border:1px solid var(--border);color:var(--dim);cursor:pointer}
+  .cost b{color:var(--text)} .cost.warn{border-color:var(--amber);color:var(--amber)}
   .spacer{flex:1}
   .tabs{display:flex;background:var(--s800);border-radius:8px;padding:2px}
   .tabs button{border:0;background:transparent;color:var(--dim);padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:600}
@@ -113,6 +115,7 @@
       <a class="on" data-nav="chat" onclick="go('chat',this)"><span class="ico">💬</span>Chat</a>
       <a data-nav="roles" onclick="go('roles',this)"><span class="ico">👤</span>Roles</a>
       <a data-nav="settings" onclick="go('settings',this)"><span class="ico">⚙︎</span>Settings</a>
+      <a data-nav="status" onclick="go('status',this)"><span class="ico">📊</span>Status</a>
     </nav>
   </aside>
 
@@ -121,6 +124,7 @@
     <header class="top">
       <div class="crumb"><span>ideas</span><span class="sep">/</span><span class="muted" id="crumb">architect · claude</span><span class="sep">·</span><span class="sid muted" id="crumbsid" style="font-family:var(--mono)">s5</span></div>
       <div class="conn" id="conn"><span class="dot"></span>已连接</div>
+      <span class="cost warn" title="今日花费 / 24h 预算(点开看 per-vendor)">今日 <b>$2.14</b> / $20</span>
       <div class="spacer"></div>
       <div class="tabs" id="tabs">
         <button class="on" onclick="tab('chat',this)">Chat</button>
@@ -192,6 +196,26 @@
           </div>
         </div>
       </div>
+
+      <!-- status view (轻量运维,取代旧 operator dashboard) -->
+      <div class="view" id="v-status">
+        <div class="page">
+          <h2>Status · 运维总览</h2>
+          <div class="sub">轻量运维视图(取代旧 operator dashboard)—— 守 24/7 云端团队,不再单独一套 operator skin。</div>
+          <div class="card" style="display:flex;align-items:center;gap:10px"><span class="live"></span><div class="t">daemon healthy</div><span class="pill ok" style="margin-left:auto">MCP sock OK</span></div>
+          <div class="card">
+            <div class="t" style="margin-bottom:8px">会话(3 live · 1 idle)</div>
+            <div class="d">ideas / architect · claude · s5 &nbsp;<span class="pill ok">live</span> · 7s</div>
+            <div class="d">ideas / cto · codex · s7 &nbsp;<span class="pill ok">live</span> · 1m</div>
+            <div class="d">ideas / cto · claude · s9 &nbsp;<span class="pill ok">live</span> · 12m</div>
+            <div class="d">demo2 / reviewer · claude · s3 &nbsp;<span class="pill warn">idle</span> · 1h</div>
+          </div>
+          <div class="card">
+            <div style="display:flex;align-items:center"><div class="t">今日成本</div><b style="margin-left:auto;font-family:var(--mono)">$2.14 / $20.00</b></div>
+            <div class="d" style="margin-top:6px">claude $1.62 · codex $0.52 · 距 24h 预算 89%(接近上限会自停 — 红线)</div>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 </div>
@@ -202,7 +226,7 @@
   function go(v, el){
     document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
     el.classList.add('on');
-    var map = {chat:'v-chat', roles:'v-roles', settings:'v-settings'};
+    var map = {chat:'v-chat', roles:'v-roles', settings:'v-settings', status:'v-status'};
     show(map[v]);
     document.getElementById('tabs').style.visibility = (v==='chat') ? 'visible':'hidden';
   }

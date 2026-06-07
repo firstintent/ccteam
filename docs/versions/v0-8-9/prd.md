@@ -23,12 +23,12 @@
 - ~~`crates/ccteam-core/src/templates/cto_role.md`~~ **保留**(TG 2388:cto 先留作**唯一 bootstrap 例外**,`cto_role.md` 留 repo = 引擎自带默认管家;其余照清)
 - `crates/ccteam-core/src/templates/meta_agent_role.md` + `workflow.agent-team.yaml` + `squad_roster.rs`(meta-agent / agent-team 模板·花名册,legacy)
 - 根 `agents/`(__lead/explorer)+ `workflows/`(dev-flow/qa-autoloop)← **v0.8.8 C1 漏删的两个,现在必删**
-- `crates/ccteam-core/src/templates/agency_agents_catalog.json`(catalog **索引/指针**,非 prompt body)← 见开放问题③
+- `crates/ccteam-core/src/templates/agency_agents_catalog.json`(catalog 索引)← **移出**(TG 2391:连索引也搬 hub,由 hub `index.json` + ingestion 承载;ccteam 不留任何市场目录)
 
 **开放问题(要 user 拍)**:
 - **① 种 cto 怎么办** — **✅ 已定(TG 2388):(b) cto 先留作唯一 bootstrap 例外** —— `cto_role.md` 留 repo(引擎自带默认管家、算引擎配置非插件),其余 prompt 内容照清。"先" = 暂定,后续可重审是否也搬 hub。
-- **② scope 切分**:v0.8.9 做到哪?**建议**:v0.8.9 = UI 整体改造(已批)+ F5 升级成**市场形态 UI**(壳/接口就位、数据源指向 hub/开源)+ **从 repo 清出提示词内容**(上面清单,cto 按①定);**ccteam-hub 建库 + 填充(自建迁入 + 开源 ingestion 管线)= 并行/后续轨**(它得先有 hub repo + 拉取/安装协议)。要不要把"建 hub + 接 agency-agents"也压进 v0.8.9?
-- **③ catalog 索引**:`agency_agents_catalog.json`(192 条索引)留 repo 作指针,还是连索引也搬 hub?
+- **② scope 切分** — **✅ 已定(TG 2391):全压进 v0.8.9**。即 v0.8.9 = UI 整体改造 + F5 升级成市场 UI + 从 repo 清出提示词内容 + **ccteam-hub 填充(自建迁入)+ agency-agents 等开源 ingestion 管线**。(注:范围变大 → dev-plan 要好好分阶段。)
+- **③ catalog 索引** — **✅ 已定(TG 2391):连索引也搬 hub**。`agency_agents_catalog.json` 移出 ccteam repo → 由 hub 的 `index.json`(+ ingestion 生成的条目)承载;ccteam repo **不留任何市场目录**,市场列举全读 hub。
 
 ---
 
@@ -65,10 +65,13 @@
 ## 三、处置细节 + 开放问题
 
 - **项目/session 列表**:确认 `WorkspaceSidebar` 覆盖 Dashboard/SessionsListPage 给的(项目列、session 列、状态)→ 覆盖则删旧页;缺啥补到 sidebar。
-- **cost / 健康**:`CostSparkline` + 项目 STUCK/OK 是否值得留?**建议**:统一 shell 顶 bar 放一个轻量成本/状态指示(可选),其余 operator 面板删。**待 user 定**。
+- **cost / 健康**:**建议(已写进下方 UI 决策②)**:顶 bar 放紧凑 cost pill;daemon 健康 + session 状态 + last-event 归入轻量 Status 面板(UI 决策①);旧 operator 面板(CostSparkline/EventsLive/HarnessPanel…)删。
 - **events / 进度**:per-session SSE 已喂 ChatConsole;是否还要全局 events 视图?**建议**不要(per-session 足够)。**待 user 定**。
 - **移动端**:统一 shell 必须延续 v0.8.8 移动 hook(键盘/手势);窄屏 sidebar 收起。
-- **开放问题**:① 是否保留任何 operator/调试视图(给运维)还是全砍?② cost 指示要不要?③ Roles 页要不要从只读升到可编辑 + catalog 在线装(v0.8.8 deferred)一起做?④ 死链清理(supervisor/outbound + `chat_history`/`send_input` 死工具,v0.8.8 deferred)是否并入本版?
+- **UI 决策(user 委托我建议,TG 2391;`prototype.html` 已加演示)**:
+  - **① operator/运维视图 → 建议:不留独立 operator UI,把有用的运维信号并进统一 shell**。sidebar 已有 项目→会话 + 状态点(live/idle)+ vendor 徽标 = "什么在跑" 基本覆盖;再加一个**轻量 Status 面板/页**(daemon 健康 + 各 session 状态 + 今日成本 + last-event 龄)替代旧 Dashboard 的有用片段。砍掉深 operator 视图(SessionDetail 的 HarnessPanel/BTW/PauseResume、claude-N 命名空间、teams)。理由:再留一套 operator skin = 正是本版要消灭的分叉。
+  - **② 顶 bar cost 指示 → 建议:要,一个紧凑 cost pill**(今日 $X.XX / 24h 预算,接近上限变色),点开看 per-vendor 拆分。理由:云端 24/7 + `budgets.*.max_cost_usd_per_24h` 自停红线,glanceable 花费对运营有用且便宜;复用现有 `cost-budget.json` / cost rollup。
+- **其余开放**:③ **Roles 可编辑 + catalog 在线装** —— catalog 在线装已**在范围内**(F5 = 市场);web **在线编辑 role 建议本版只读浏览 + 安装**,编辑留后续。④ **死链清理**(supervisor/outbound + `chat_history`/`send_input` 死工具)—— **建议并入本版**(已大改 + strip,顺手清),你定。
 
 ## 四、设计系统(风格统一)
 
@@ -88,4 +91,5 @@
 - doc-first → user review 原型 + PRD → scope 冻结 → dev-plan → dev session 实现(workflow,延续 v0.8.8 模式)。
 - **2026-06-07 初版**:UI 改造范围(统一 chat shell + 删旧 + 迁有用 + 统一风格)+ 现状 keep/migrate/remove 表 + 目标 IA + `prototype.html`。
 - **2026-06-07 +★ 架构决策(TG 2385/2386)**:user 批 UI 方向、继续;追加 = roles/skills/workflows 做成**插件市场**(F5 升级,接 agency-agents 等开源)+ **ccteam repo 零提示词内容**(新红线,清单含 cto_role.md/meta_agent_role.md/workflow.agent-team.yaml/squad_roster + 根 agents//workflows/ + catalog.json)+ 新 **ccteam-hub** 仓库(路径 `…/ccteam/ccteam-hub`,已 stub)。3 个开放问题待 user 拍(种 cto 来源 / v0.8.9 scope 切分 / catalog 索引去留)。
-- **2026-06-07 cto 例外 + hub scaffold**:①已定 —— cto 先留作唯一 bootstrap 例外(`cto_role.md` 留 repo);`ccteam-hub` 已 scaffold(README + `agents/`/`skills/`/`workflows/` + `index.json`,提交到 hub 仓库,TG 2388/2389)。②③ 仍待。
+- **2026-06-07 cto 例外 + hub scaffold**:①已定 —— cto 先留作唯一 bootstrap 例外(`cto_role.md` 留 repo);`ccteam-hub` 已 scaffold(README + `agents/`/`skills/`/`workflows/` + `index.json`,提交到 hub 仓库,TG 2388/2389)。
+- **2026-06-07 scope + catalog + UI 建议**(TG 2391):②**全压进 v0.8.9**(含 hub 填充 + agency-agents ingestion 管线);③**连索引也搬 hub**(catalog 移出 ccteam,市场列举全读 hub)。UI 决策(我建议):operator 视图不单留 → 轻量 Status 面板进统一 shell;顶 bar 加紧凑 cost pill。`prototype.html` 已加 cost pill + Status 视图演示。Roles 本版只读+装、死链清理建议并入(待 user 终拍)。**dev-prompt 暂不出**(user:需求讨论清楚再出)。
