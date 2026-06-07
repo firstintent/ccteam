@@ -55,7 +55,8 @@
 ## 二、目标 IA(一个统一 chat 风格 shell)
 
 **一个 shell 承载全部**(删掉 `/chat` 与 operator 壳的分叉):
-- **左 sidebar**:workspace → projects → sessions 树(每 session 显示 role + vendor 徽标 + 状态点,呼应 v0.8.8 的独立 session);底部导航 **Chat / Roles / Settings**;顶部 **＋新建**(session / 项目)。
+- **左 sidebar = 聊天导航**:workspace → projects → sessions 树(每 session 显示 role + vendor 徽标 + 状态点)。**点某个 session = 进入它的聊天**(每 session 独立对话)—— 所以**没有单独的「Chat」菜单**(TG 2394 修正)。顶部 **＋新建**(session / 项目)。底部全局页导航 = **插件市场 / Status / Settings**(3 个,不含 Chat)。
+  - **插件市场**(= 原 Roles **升级成市场浏览器**,TG 2394):浏览 + 一键装 role/agent · skill · workflow,来源 ccteam-hub + agency-agents 等开源;不再有独立的"Roles"概念,role 只是市场里的一个类目。
 - **顶 bar**:面包屑(项目 / role · vendor · sid)+ 连接状态 + 视图切换 **Chat | 终端** + Stop。
 - **中区**:per-session **Chat**(transcript + composer + HITL 审批气泡)/ **终端**(xterm 实时 pane);切到 **市场(Plugins/Roles)** = 插件市场(浏览 + 装 role/skill/workflow,接 ccteam-hub + 开源,见 ★ 架构决策);切到 **Settings** = IM 配置(F4)。
 - **风格**:深色 + amber 强调,一套设计 token,全站一致(落实 v0.8.8 §二 web UI 质量基线 + deferred「ChatConsole 配色统一」)。
@@ -93,3 +94,4 @@
 - **2026-06-07 +★ 架构决策(TG 2385/2386)**:user 批 UI 方向、继续;追加 = roles/skills/workflows 做成**插件市场**(F5 升级,接 agency-agents 等开源)+ **ccteam repo 零提示词内容**(新红线,清单含 cto_role.md/meta_agent_role.md/workflow.agent-team.yaml/squad_roster + 根 agents//workflows/ + catalog.json)+ 新 **ccteam-hub** 仓库(路径 `…/ccteam/ccteam-hub`,已 stub)。3 个开放问题待 user 拍(种 cto 来源 / v0.8.9 scope 切分 / catalog 索引去留)。
 - **2026-06-07 cto 例外 + hub scaffold**:①已定 —— cto 先留作唯一 bootstrap 例外(`cto_role.md` 留 repo);`ccteam-hub` 已 scaffold(README + `agents/`/`skills/`/`workflows/` + `index.json`,提交到 hub 仓库,TG 2388/2389)。
 - **2026-06-07 scope + catalog + UI 建议**(TG 2391):②**全压进 v0.8.9**(含 hub 填充 + agency-agents ingestion 管线);③**连索引也搬 hub**(catalog 移出 ccteam,市场列举全读 hub)。UI 决策(我建议):operator 视图不单留 → 轻量 Status 面板进统一 shell;顶 bar 加紧凑 cost pill。`prototype.html` 已加 cost pill + Status 视图演示。Roles 本版只读+装、死链清理建议并入(待 user 终拍)。**dev-prompt 暂不出**(user:需求讨论清楚再出)。
+- **2026-06-07 IA 修正(TG 2394)**:① 去掉「Chat」导航项 —— **左侧点 session 即进聊天**(session 列表 = 聊天导航);② 「Roles」**砍掉、升级成「插件市场」浏览器**(role 是市场里一个类目,不再独立);③ 底部全局页 = 插件市场 / Status / Settings。`prototype.html` 重做(市场视图 = 类目 Agents/Skills/Workflows + 来源 builtin/agency-agents + 安装/已装;去掉 Chat 菜单;session-点击=聊天 的模式)。

@@ -94,6 +94,19 @@
   .save{margin-top:8px;background:var(--amber);color:#1a1205;border:0;border-radius:8px;padding:9px 18px;font-weight:700;cursor:pointer}
   .hint{color:var(--faint);font-size:12px;margin-top:6px}
   .note{margin:14px 26px;padding:10px 14px;border-left:3px solid var(--amber);background:var(--s900);color:var(--dim);font-size:12px;border-radius:0 8px 8px 0}
+  /* ---- nav hint + marketplace ---- */
+  .navhint{color:var(--faint);font-size:11px;padding:6px 10px 8px;line-height:1.4}
+  .badge.oss{color:#a78bfa;background:#221c3a}
+  .mkt-bar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+  .mkt-bar .src{background:var(--s800);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;outline:none}
+  .mkt-bar .search{flex:1;min-width:140px;background:var(--s800);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 12px;outline:none}
+  .mkt-bar .search:focus,.mkt-bar .src:focus{border-color:var(--amber)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+  .mkt{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:13px 15px;display:flex;flex-direction:column;gap:7px}
+  .mkt-h{display:flex;align-items:center;gap:8px} .mkt-h b{font-size:14px}
+  .mkt .d{color:var(--dim);font-size:12px;flex:1}
+  .mkt-f{display:flex;align-items:center}
+  .install{margin-left:auto;border:0;background:var(--amber);color:#1a1205;font-weight:700;border-radius:7px;padding:5px 14px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -112,10 +125,10 @@
       <div class="sess" onclick="pick(this,'reviewer · claude','s3')"><span class="live off"></span><span class="nm">reviewer</span><span class="badge claude">claude</span><span class="sid">s3</span></div>
     </div>
     <nav class="nav">
-      <a class="on" data-nav="chat" onclick="go('chat',this)"><span class="ico">💬</span>Chat</a>
-      <a data-nav="roles" onclick="go('roles',this)"><span class="ico">👤</span>Roles</a>
-      <a data-nav="settings" onclick="go('settings',this)"><span class="ico">⚙︎</span>Settings</a>
+      <div class="navhint">↑ 点上面的会话 = 进入它的聊天(每个 session 一个独立对话)。下面是全局页:</div>
+      <a data-nav="market" onclick="go('market',this)"><span class="ico">🧩</span>插件市场</a>
       <a data-nav="status" onclick="go('status',this)"><span class="ico">📊</span>Status</a>
+      <a data-nav="settings" onclick="go('settings',this)"><span class="ico">⚙︎</span>Settings</a>
     </nav>
   </aside>
 
@@ -166,15 +179,24 @@
 </div>
       </div>
 
-      <!-- roles view -->
-      <div class="view" id="v-roles">
-        <div class="page">
-          <h2>Roles · ideas</h2>
-          <div class="sub">浏览本项目已装的 role(<code>.claude/agents/*.md</code>)。新建会话时可选。</div>
-          <div class="card row"><div><div class="t">cto <span class="pill ok">默认</span></div><div class="d">Chat-first 管家:懂 ccteam、推荐 work-role、按需调度。</div></div></div>
-          <div class="card row"><div><div class="t">architect</div><div class="d">系统设计 + 重构;读码定位、给 file:line 方案。</div></div></div>
-          <div class="card row"><div><div class="t">reviewer</div><div class="d">对抗式复审:找真 bug + 收敛建议,不写报告文件。</div></div></div>
-          <div class="card row" style="border-style:dashed;color:var(--dim)"><div><div class="t">＋ 从 catalog 安装…</div><div class="d">从 agency-agents(192)浏览 + 一键装(可选 stretch)。</div></div></div>
+      <!-- marketplace view (= 原 Roles 升级成「市场浏览器」) -->
+      <div class="view" id="v-market">
+        <div class="page" style="max-width:1000px">
+          <h2>插件市场</h2>
+          <div class="sub">浏览 + 一键装 role/agent、skill、workflow。来源:ccteam-hub(自建)+ agency-agents 等开源(192+)。装到当前项目。</div>
+          <div class="mkt-bar">
+            <div class="seg"><button class="on">Agents / Roles</button><button>Skills</button><button>Workflows</button></div>
+            <select class="src"><option>全部来源</option><option>builtin</option><option>agency-agents</option></select>
+            <input class="search" placeholder="搜索插件…">
+          </div>
+          <div class="grid">
+            <div class="mkt"><div class="mkt-h"><b>cto</b><span class="badge none">builtin</span></div><div class="d">Chat-first 管家(引擎自带例外)。</div><div class="mkt-f"><span class="pill ok">已装</span></div></div>
+            <div class="mkt"><div class="mkt-h"><b>architect</b><span class="badge none">builtin</span></div><div class="d">系统设计 + 重构、读码定位。</div><div class="mkt-f"><span class="pill ok">已装</span></div></div>
+            <div class="mkt"><div class="mkt-h"><b>reviewer</b><span class="badge none">builtin</span></div><div class="d">对抗式代码复审。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>code-reviewer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · 逐行 review + 安全。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>pr-describer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · 生成 PR 描述。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>doc-writer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · README / 文档。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+          </div>
         </div>
       </div>
 
@@ -220,16 +242,18 @@
   </section>
 </div>
 
-<div class="note">原型说明:统一一个 chat 风格 shell —— 左侧 项目→会话(role + vendor 徽标 + sid,呼应 v0.8.9 独立 session),底部 Chat/Roles/Settings 导航;中区按会话切 Chat | 终端,或切到 Roles/Settings。删掉旧的 Dashboard / SessionsList / SessionDetail / Teams operator 视图。深色 + amber 一套 token。点左侧会话、底部导航、顶部 tab 可切换演示。</div>
+<div class="note">原型说明(按 TG 2394 修正):一个统一 chat 风格 shell。<b>左侧 项目→会话 = 聊天导航</b> —— 点哪个 session 就进哪个的聊天(每个 session 独立对话),<b>所以没有单独的「Chat」菜单</b>。底部 3 个全局页:<b>插件市场</b>(原 Roles 升级 = 浏览+装 role/skill/workflow,接 ccteam-hub + agency-agents)/ <b>Status</b>(轻量运维)/ <b>Settings</b>(IM 配置)。顶 bar 有 cost pill。删掉旧 Dashboard / SessionsList / SessionDetail / Teams operator 视图。深色 + amber 一套 token。点左侧会话、底部导航、顶部 Chat|终端 tab 可切换演示。</div>
 
 <script>
+  // 全局页(市场/Status/Settings)—— 离开会话上下文,隐藏 Chat|终端 tab
   function go(v, el){
     document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
     el.classList.add('on');
-    var map = {chat:'v-chat', roles:'v-roles', settings:'v-settings', status:'v-status'};
+    var map = {market:'v-market', settings:'v-settings', status:'v-status'};
     show(map[v]);
-    document.getElementById('tabs').style.visibility = (v==='chat') ? 'visible':'hidden';
+    document.getElementById('tabs').style.visibility = 'hidden';
   }
+  // 会话内的 Chat | 终端
   function tab(t, el){
     document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
     el.classList.add('on');
@@ -239,11 +263,17 @@
     document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
     document.getElementById(id).classList.add('on');
   }
+  // 点会话 = 进入它的聊天(= 这就是"chat",没有单独的 Chat 菜单)
   function pick(el, label, sid){
     document.querySelectorAll('.sess').forEach(s=>s.classList.remove('active'));
     el.classList.add('active');
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on')); // 离开全局页
     document.getElementById('crumb').textContent = label;
     document.getElementById('crumbsid').textContent = sid;
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
+    document.querySelector('#tabs button').classList.add('on');
+    document.getElementById('tabs').style.visibility = 'visible';
+    show('v-chat');
   }
 </script>
 </body>
