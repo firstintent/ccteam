@@ -440,6 +440,20 @@ pub(crate) fn dispatch_list_bots(paths: &CcteamPaths, args: &Value) -> Result<St
 /// registration carries an explicit `project_dir`. Pre-registration
 /// callers (no matching reg yet) fall back to the legacy
 /// `<projects_root>/<slug>/` layout via [`lookup_or_synthesize_reg`].
+///
+/// TODO(V0.8-f1-send-input) — KNOWN DEAD WRITE PATH, deferred with reason.
+/// This tool writes a `(slug, role)`-keyed envelope into
+/// `<project>/.ccteam/chat/<role>/inbox/`, but the daemon never wires the
+/// supervisor side that would drain it (`BotSupervisor::{drain_inboxes,
+/// handle_inbound}` are unwired this round) → the inbox file is written but
+/// NEVER consumed. Same dead supervisor chain as `chat_history` above (which
+/// reads the parallel role-keyed `turns.jsonl` that F1 also stopped writing).
+/// Under F1 the live turn ingress is sid-keyed (the gateway submits user turns
+/// per-sid; turns land under `<project>/.ccteam/chat/<sid>/turns.jsonl`), so a
+/// correct fix needs a sid to address — but the IM bot registry stays
+/// `(slug, role)`-keyed this round (per-sid IM binding is a V0.8 follow-up).
+/// Behavior left unchanged: the write still succeeds (no crash); it is simply
+/// a no-op downstream.
 pub fn dispatch_send_input_in(
     ccteam_root: &Path,
     projects_root: &Path,
@@ -506,6 +520,19 @@ pub fn dispatch_send_input_in(
 ///
 /// F185 — reads under the bot's registered `project_dir` (when set)
 /// rather than the legacy `<projects_root>/<slug>/` join.
+///
+/// TODO(V0.8-f1-chat-history) — KNOWN DEAD READ PATH, deferred with reason.
+/// This tool reads `<project>/.ccteam/chat/<role>/turns.jsonl` (role-keyed via
+/// the bot registry), but the F1 gateway writes turns under
+/// `<project>/.ccteam/chat/<sid>/turns.jsonl` (keyed by the session sid, since
+/// a `(project, role)` pair can now host several independent sessions). The
+/// role-keyed file is therefore NEVER written → this tool gracefully returns
+/// an EMPTY `turns` list (the `!turns_path.exists()` guard below) rather than
+/// crashing or reading stale data. A correct fix needs a sid to read by, but
+/// the IM bot registry stays `(slug, role)`-keyed this round (the F1 boundary:
+/// per-sid IM binding is a V0.8 follow-up), so there is no cheap sid to thread
+/// here. The live sid-accurate read paths are `session_collect` (cto) and the
+/// web `GET /sessions/{sid}/events` history — both already key by sid.
 pub fn dispatch_history_in(
     ccteam_root: &Path,
     projects_root: &Path,

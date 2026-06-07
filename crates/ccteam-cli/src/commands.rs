@@ -1598,49 +1598,53 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
 /// session matches `slug_or_name`, so the caller may fall back to the
 /// project-oriented attach. Read-only enumeration (R6) — never captures panes.
 /// Resolve a chat-session reference to its canonical tmux name
-/// (`ccteam-chat-<slug>-<role>`):
+/// (`ccteam-chat-<slug>-<sid>`):
 /// - a full `ccteam-chat-…` name passes through verbatim;
-/// - an explicit role yields the deterministic name;
+/// - an explicit `sid` yields the deterministic name;
 /// - otherwise live chat sessions are enumerated and filtered by slug.
 ///
 /// Returns `Ok(None)` when nothing matches (the caller falls back to the
 /// project pane `ccteam-<slug>`); `Err` when `<slug>` is ambiguous across
-/// roles. Shared by `attach` and `peek` so both resolve identically.
-pub fn resolve_chat_session_name(slug_or_name: &str, role: Option<&str>) -> Result<Option<String>> {
+/// sessions. Shared by `attach` and `peek` so both resolve identically.
+///
+/// v0.8.8 F1 — the disambiguator is now the **sid** (`s<N>`), not a role: the
+/// pane name's trailing segment is the sid, and the same `(project, role)` can
+/// host several independent sessions, so a role no longer uniquely names one.
+pub fn resolve_chat_session_name(slug_or_name: &str, sid: Option<&str>) -> Result<Option<String>> {
     if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
         return Ok(Some(slug_or_name.to_string()));
     }
-    if let Some(role) = role {
-        return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, role)));
+    if let Some(sid) = sid {
+        return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, sid)));
     }
     let backend = ccteam_harness::default_process_backend();
     let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
     let mut matches: Vec<(String, String)> = live
         .iter()
         .filter_map(|name| {
-            let (slug, role) = ccteam_harness::parse_chat_session_name(name)?;
-            (slug == slug_or_name).then(|| (role, name.clone()))
+            let (slug, sid) = ccteam_harness::parse_chat_session_name(name)?;
+            (slug == slug_or_name).then(|| (sid, name.clone()))
         })
         .collect();
     matches.sort();
     match matches.as_slice() {
         [] => Ok(None),
-        [(_role, name)] => Ok(Some(name.clone())),
+        [(_sid, name)] => Ok(Some(name.clone())),
         many => {
             let mut msg = format!(
-                "`{slug_or_name}` has {} live chat sessions; specify a role:",
+                "`{slug_or_name}` has {} live chat sessions; specify a sid:",
                 many.len()
             );
-            for (role, name) in many {
-                msg.push_str(&format!("\n  {slug_or_name} {role}   # {name}"));
+            for (sid, name) in many {
+                msg.push_str(&format!("\n  {slug_or_name} {sid}   # {name}"));
             }
             bail!("{msg}")
         }
     }
 }
 
-pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result<bool> {
-    match resolve_chat_session_name(slug_or_name, role)? {
+pub fn try_attach_chat_session(slug_or_name: &str, sid: Option<&str>) -> Result<bool> {
+    match resolve_chat_session_name(slug_or_name, sid)? {
         Some(name) => {
             attach_interactive_by_name(&name)?;
             Ok(true)
@@ -1683,9 +1687,12 @@ pub fn run_sessions() -> Result<()> {
         return Ok(());
     }
 
+    // v0.8.8 F1 — the trailing pane segment is the SID (`s<N>`), the unique
+    // session key, not a role. Display it as the SID column (role is no longer
+    // recoverable from an orphan pane name — accepted UX cost of sid-keyed panes).
     struct Row {
         slug: String,
-        role: String,
+        sid: String,
         name: String,
         alive: bool,
         note: &'static str,
@@ -1693,7 +1700,7 @@ pub fn run_sessions() -> Result<()> {
     let rows: Vec<Row> = names
         .iter()
         .map(|name| {
-            let (slug, role) = ccteam_harness::parse_chat_session_name(name)
+            let (slug, sid) = ccteam_harness::parse_chat_session_name(name)
                 .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
             let alive = live_set.contains(name);
             let note = if orphan_names.contains(name) {
@@ -1705,7 +1712,7 @@ pub fn run_sessions() -> Result<()> {
             };
             Row {
                 slug,
-                role,
+                sid,
                 name: (*name).to_string(),
                 alive,
                 note,
@@ -1714,19 +1721,19 @@ pub fn run_sessions() -> Result<()> {
         .collect();
 
     let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
-    let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
+    let w_sid = rows.iter().map(|r| r.sid.len()).max().unwrap_or(0).max(3);
     let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(7);
 
     let header = format!(
-        "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  NOTE",
-        "SLUG", "ROLE", "SESSION", "ALIVE"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_name$}  {:<5}  NOTE",
+        "SLUG", "SID", "SESSION", "ALIVE"
     );
     println!("{}", header.trim_end());
     for r in &rows {
         let line = format!(
-            "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  {}",
+            "{:<w_slug$}  {:<w_sid$}  {:<w_name$}  {:<5}  {}",
             r.slug,
-            r.role,
+            r.sid,
             r.name,
             if r.alive { "yes" } else { "no" },
             r.note,
@@ -1734,7 +1741,7 @@ pub fn run_sessions() -> Result<()> {
         println!("{}", line.trim_end());
     }
     println!();
-    println!("attach: `ccteam internal attach <slug> [role]`  (Telegram: `/sessions`)");
+    println!("attach: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)");
     Ok(())
 }
 
@@ -1932,17 +1939,20 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// the same primitive `TmuxBackend::capture` calls under the hood).
 /// Keeps the peek path sync per the W1 "sync sites stay sync" decision.
 ///
-/// `ccteam internal peek <slug> [role]`. Resolves a live chat session
-/// (`ccteam-chat-<slug>-<role>`) first — mirroring `attach` — and falls
+/// `ccteam internal peek <slug> [sid]`. Resolves a live chat session
+/// (`ccteam-chat-<slug>-<sid>`) first — mirroring `attach` — and falls
 /// back to the project pane (`ccteam-<slug>`) when none matches. This is
 /// why a bare `peek <slug>` against a chat session used to fail with
 /// "rmux session not running: ccteam-<slug>" while `attach` worked.
+///
+/// v0.8.8 F1 — the optional disambiguator is the session **sid** (`s<N>`),
+/// not a role (the pane's trailing segment is the sid post-F1).
 pub fn run_peek_with_role(
     paths: &CcteamPaths,
     slug_or_name: &str,
-    role: Option<&str>,
+    sid: Option<&str>,
 ) -> Result<String> {
-    let session_name = match resolve_chat_session_name(slug_or_name, role)? {
+    let session_name = match resolve_chat_session_name(slug_or_name, sid)? {
         Some(name) => name,
         None => session_name_for_project(paths, slug_or_name),
     };

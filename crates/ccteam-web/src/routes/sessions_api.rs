@@ -39,14 +39,16 @@
 //! **History**: the gateway keeps no in-memory transcript, so the history
 //! endpoint tails the per-session source on disk. The gateway session id
 //! (`s{n}`) never appears in the flat `<slug>.jsonl` progress, so the
-//! handler resolves `sid → {role, project_dir}` via
+//! handler resolves `sid → {project_dir, sid, …}` via
 //! [`Gateway::session_resolve`](ccteam_im::gateway::Gateway::session_resolve)
 //! (under the gateway lock, which it drops before the blocking fs read)
 //! then reads the ccteam-owned mirror
-//! `<project_dir>/.ccteam/chat/<role>/turns.jsonl` via
+//! `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` via
 //! [`read_all_turns`](ccteam_harness::execution::turns_mirror::read_all_turns).
-//! It is best-effort: an empty `events` array is a valid 200 when nothing
-//! has been written yet. A `sid` unknown to the gateway is a 404.
+//! v0.8.8 F1 — the mirror is keyed by the session **sid**, not the role, so
+//! two same-role sessions have independent histories (no cross-bleed). It is
+//! best-effort: an empty `events` array is a valid 200 when nothing has been
+//! written yet. A `sid` unknown to the gateway is a 404.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -160,11 +162,12 @@ pub struct CreateSessionForm {
 
 /// `POST /api/v1/projects/{slug}/sessions`
 ///
-/// Creates (or idempotently reuses) a `(project, role)` session via the
-/// spine. 201 `{sid}` on success. 400 on a bad vendor token or empty
-/// role. 422 when the named role has no `.claude/agents/<role>.md` (a caller
-/// mistake, R-M6). 503 with no gateway. 500 if the gateway create fails for a
-/// genuine internal reason (project not registered / adapter spawn error).
+/// Creates a new session via the spine. v0.8.8 F1 — ALWAYS mints a fresh sid
+/// (no `(project, role)` dedup), so a project can run multiple same-role
+/// sessions side by side. 201 `{sid}` on success. 400 on a bad vendor token or
+/// empty role. 422 when the named role has no `.claude/agents/<role>.md` (a
+/// caller mistake, R-M6). 503 with no gateway. 500 if the gateway create fails
+/// for a genuine internal reason (project not registered / adapter spawn error).
 #[utoipa::path(
     post,
     path = "/api/v1/projects/{slug}/sessions",
@@ -265,7 +268,7 @@ pub(crate) async fn handle_session_history(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    // Resolve sid → role + project_dir under the lock (also our 404 gate),
+    // Resolve sid → sid + project_dir under the lock (also our 404 gate),
     // then drop the guard before touching the filesystem.
     let resolved = {
         let guard = gw.lock().await;
@@ -274,20 +277,24 @@ pub(crate) async fn handle_session_history(
     let Some(resolved) = resolved else {
         return unknown_session(&sid);
     };
-    let events = collect_session_turns(&resolved.project_dir, &resolved.role);
+    let events = collect_session_turns(&resolved.project_dir, &resolved.sid);
     Json(json!({ "sid": sid, "events": events })).into_response()
 }
 
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
-/// `<project_dir>/.ccteam/chat/<role>/turns.jsonl` (the same file the W1
+/// `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (the same file the W1
 /// `session_collect` path reads). Each [`TurnRecord`] becomes one event
 /// object; any read error folds to an empty list — a best-effort history
 /// view (an absent file is the legitimate first-turn case, which
 /// [`read_all_turns`] already returns as `Ok(empty)`). Split out from the
 /// handler so the disk → events mapping is unit-testable without a live
 /// gateway.
-fn collect_session_turns(project_dir: &std::path::Path, role: &str) -> Vec<serde_json::Value> {
-    match read_all_turns(project_dir, role) {
+///
+/// v0.8.8 F1 — keyed by `sid` (the transcript directory is
+/// `.ccteam/chat/<sid>/`, not role): two same-role sessions therefore have
+/// independent histories that do not bleed into each other.
+fn collect_session_turns(project_dir: &std::path::Path, sid: &str) -> Vec<serde_json::Value> {
+    match read_all_turns(project_dir, sid) {
         Ok(turns) => turns.iter().map(turn_to_event).collect(),
         Err(_) => Vec::new(),
     }
@@ -690,28 +697,30 @@ mod tests {
 
     #[test]
     fn collect_session_turns_reads_mirrored_turns() {
-        // v0.8.7 W4 — the history handler reads the ccteam-owned mirror
-        // `<project_dir>/.ccteam/chat/<role>/turns.jsonl` (resolved from the
-        // gateway sid), NOT the flat progress.jsonl. Seed two turns and one
-        // garbage line; expect two well-formed history events in order.
+        // v0.8.8 F1 — the history handler reads the ccteam-owned mirror
+        // `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (resolved from the
+        // gateway sid), NOT the flat progress.jsonl and NOT a role-keyed dir.
+        // Seed two turns and one garbage line; expect two well-formed history
+        // events in order.
         use ccteam_harness::execution::turns_mirror::append_turn;
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path();
-        let role = "reviewer";
+        // Key the mirror by the session sid (the trailing `s<N>`), not the role.
+        let sid = "s1";
         let mk = |id: &str, user: &str, assistant: &str| TurnRecord {
             turn_id: id.into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
-            role: role.into(),
+            role: "reviewer".into(),
             user: user.into(),
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
         };
-        append_turn(project_dir, role, &mk("t1", "review the diff", "LGTM")).unwrap();
-        append_turn(project_dir, role, &mk("t2", "and the tests?", "all green")).unwrap();
+        append_turn(project_dir, sid, &mk("t1", "review the diff", "LGTM")).unwrap();
+        append_turn(project_dir, sid, &mk("t2", "and the tests?", "all green")).unwrap();
         // A half-flushed / garbage line must be skipped (read_all_turns drops it).
-        let path = ccteam_harness::execution::turns_mirror::turns_jsonl_path(project_dir, role);
+        let path = ccteam_harness::execution::turns_mirror::turns_jsonl_path(project_dir, sid);
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -720,13 +729,54 @@ mod tests {
                 .unwrap();
             writeln!(f, "not-json").unwrap();
         }
-        let events = collect_session_turns(project_dir, role);
+        let events = collect_session_turns(project_dir, sid);
         assert_eq!(events.len(), 2, "two parseable turns → two events");
         assert_eq!(events[0]["turn_id"], "t1");
         assert_eq!(events[0]["user"], "review the diff");
         assert_eq!(events[0]["assistant"], "LGTM");
         assert_eq!(events[1]["turn_id"], "t2");
         assert_eq!(events[1]["assistant"], "all green");
+    }
+
+    #[test]
+    fn collect_session_turns_two_same_role_sids_do_not_bleed() {
+        // v0.8.8 F1 (acceptance d) — the BUG-3 root: two sessions of the SAME
+        // role keep INDEPENDENT histories because the mirror is keyed by sid,
+        // not role. Write a turn under sid1 + a turn under sid2; collecting by
+        // sid1 must see ONLY sid1's turn (no cross-bleed).
+        use ccteam_harness::execution::turns_mirror::append_turn;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path();
+        let mk = |id: &str, assistant: &str| TurnRecord {
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: "reviewer".into(), // SAME role for both sessions
+            user: String::new(),
+            assistant: assistant.into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
+        };
+        append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
+        append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
+
+        let only_s1 = collect_session_turns(project_dir, "s1");
+        assert_eq!(
+            only_s1.len(),
+            1,
+            "sid1 history must not include sid2's turn"
+        );
+        assert_eq!(only_s1[0]["turn_id"], "t1");
+        assert_eq!(only_s1[0]["assistant"], "from-s1");
+
+        let only_s2 = collect_session_turns(project_dir, "s2");
+        assert_eq!(
+            only_s2.len(),
+            1,
+            "sid2 history must not include sid1's turn"
+        );
+        assert_eq!(only_s2[0]["turn_id"], "t2");
+        assert_eq!(only_s2[0]["assistant"], "from-s2");
     }
 
     #[test]
@@ -849,7 +899,8 @@ mod tests {
     fn collect_session_turns_missing_file_is_empty() {
         // Absent turns.jsonl is the legitimate first-turn case → empty (200),
         // not an error. read_all_turns returns Ok(empty) for a missing file.
+        // v0.8.8 F1 — keyed by sid (the never-spawned `s99` has no mirror yet).
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(collect_session_turns(tmp.path(), "ghost").is_empty());
+        assert!(collect_session_turns(tmp.path(), "s99").is_empty());
     }
 }

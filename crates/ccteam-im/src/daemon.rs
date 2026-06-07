@@ -612,7 +612,8 @@ async fn log_orphan_chat_sessions(gateway: &Gateway) {
         tracing::warn!(
             session = %orphan.name,
             slug = %orphan.slug,
-            role = %orphan.role,
+            // v0.8.8 F1 — orphan names carry the sid (not a role) post-F1.
+            sid = %orphan.sid,
             "ccteam-im: orphaned chat session (untracked; survived a prior daemon) — reclaim explicitly, never auto-killed"
         );
     }

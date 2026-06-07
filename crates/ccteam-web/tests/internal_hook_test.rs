@@ -131,7 +131,10 @@ async fn chat_progress_session_start_uses_role_header() {
     bootstrap_project(&paths, "demo", "demo", "chat").unwrap();
     let progress = paths.progress_jsonl("demo");
     let cwd = paths.project_dir("demo");
-    let marker = cwd.join(".ccteam/chat/alice/active-session-id");
+    // v0.8.8 F1 — the marker dir is keyed by the ccteam session sid, which the
+    // daemon HTTP path learns from the `x-ccteam-sid` header (folded into
+    // stdin `ccteam_sid`).
+    let marker = cwd.join(".ccteam/chat/s1/active-session-id");
 
     let state = AppState::new(paths);
     let addr = spawn(state).await;
@@ -142,6 +145,7 @@ async fn chat_progress_session_start_uses_role_header() {
         ))
         .header("x-ccteam-role", "alice")
         .header("x-ccteam-slug", "demo")
+        .header("x-ccteam-sid", "s1")
         .json(&json!({
             "hook_event_name": "SessionStart",
             "session_id": "sid-f186",
@@ -166,8 +170,9 @@ async fn chat_progress_session_start_uses_role_header() {
         "expected role=alice from X-Ccteam-Role header injection, got: {line}",
     );
 
-    // F176 active-session-id marker should land under the per-bot dir
-    // — this is the load-bearing side effect F186 protects.
+    // F176 active-session-id marker should land under the per-session sid dir
+    // — this is the load-bearing side effect F186 protects (v0.8.8 F1 re-keys
+    // it from role to sid). The marker *body* stays Anthropic's session UUID.
     let marker_body = std::fs::read_to_string(&marker).expect("active-session-id marker written");
     assert_eq!(marker_body.trim(), "sid-f186");
 }
@@ -184,7 +189,8 @@ async fn chat_progress_user_prompt_refreshes_marker() {
     disable_tool_surface_bootstrap_for_tests();
     bootstrap_project(&paths, "demo", "demo", "chat").unwrap();
     let cwd = paths.project_dir("demo");
-    let marker = cwd.join(".ccteam/chat/alice/active-session-id");
+    // v0.8.8 F1 — sid-keyed marker dir; sid arrives via the x-ccteam-sid header.
+    let marker = cwd.join(".ccteam/chat/s1/active-session-id");
 
     let state = AppState::new(paths);
     let addr = spawn(state).await;
@@ -195,6 +201,7 @@ async fn chat_progress_user_prompt_refreshes_marker() {
         ))
         .header("x-ccteam-role", "alice")
         .header("x-ccteam-slug", "demo")
+        .header("x-ccteam-sid", "s1")
         .json(&json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "sid-up-heal",

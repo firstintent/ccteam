@@ -4,15 +4,19 @@
 //!
 //! ## Coverage matrix
 //!
+//! v0.8.8 F1 — the pane name + `--name`/`--resume` identifier are keyed by the
+//! ccteam session **sid** (`ccteam-chat-<slug>-<sid>`); `--agent <role>` still
+//! binds the persona separately. The matrix below reflects sid-keyed naming.
+//!
 //! 1. Fresh path (session absent): spawn argv must contain
-//!    `--name ccteam-chat-<slug>-<role>`.
+//!    `--name ccteam-chat-<slug>-<sid>` (+ `--agent <role>`).
 //! 2. Recreate path (dead pane): spawn argv must contain
-//!    `--resume ccteam-chat-<slug>-<role>`.
+//!    `--resume ccteam-chat-<slug>-<sid>` (+ `--agent <role>`).
 //! 3. Recreate path with `--resume` failure: fallback to `--name` +
 //!    emit `chat_session_reset` event carrying
 //!    `reason="resume_failed_fallback_to_fresh"`.
-//! 4. Cwd-collision: two bots in the same cwd get distinct
-//!    `--name` values (per-role) so Anthropic's
+//! 4. Same (project, role), two sids: each gets a distinct
+//!    `--name` value (per-sid) so Anthropic's
 //!    `<cwd>:<name>` lookup never crosses streams.
 //! 5. F164 alive-reattach regression guard: when pane is alive we do
 //!    NOT spawn (no argv constructed, pid unchanged). Reuses the
@@ -125,10 +129,23 @@ fn read_argv_log(tmp: &Path) -> Vec<String> {
         .collect()
 }
 
+/// v0.8.8 F1 — the ccteam session **sid** (`s<N>`) is now the key for the pane
+/// name + `--name`/`--resume` identifier (`--agent {role}` still binds the
+/// persona). Every test derives its expected pane name / session id from this
+/// sid, NOT from the role.
+const F172_SID: &str = "s1";
+
 fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
+    make_ctx_sid(slug, F172_SID, tmp)
+}
+
+/// v0.8.8 F1 — like [`make_ctx`] but with an explicit sid, so the
+/// cwd-collision test can spawn two DISTINCT sids (the post-F1 way two
+/// same-(project,role) sessions stay distinct).
+fn make_ctx_sid(slug: &str, sid: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
-        sid: "chat-f172".into(),
+        sid: sid.to_string(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -143,7 +160,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
 fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
-        sid: "chat-f172".into(),
+        sid: F172_SID.into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -228,14 +245,16 @@ fn wait_for_argv_lines(tmp: &Path, n: usize, max_ms: u64) -> Vec<String> {
 
 #[test]
 fn chat_session_id_name_uses_canonical_format() {
+    // v0.8.8 F1 — the second arg is the ccteam session sid (`s<N>`), not the
+    // role; `--agent {role}` still binds the persona separately.
     assert_eq!(
-        chat_session_id_name("dev-foo", "alice"),
-        "ccteam-chat-dev-foo-alice"
+        chat_session_id_name("dev-foo", "s1"),
+        "ccteam-chat-dev-foo-s1"
     );
     // Must agree with tmux session name (same namespace today).
     assert_eq!(
-        chat_session_id_name("dev-foo", "alice"),
-        chat_session_name("dev-foo", "alice")
+        chat_session_id_name("dev-foo", "s1"),
+        chat_session_name("dev-foo", "s1")
     );
 }
 
@@ -256,8 +275,9 @@ async fn fresh_spawn_argv_contains_name_flag() {
 
     let slug = format!("f172-fresh-{}", std::process::id());
     let role = "alpha";
-    let session_name = chat_session_name(&slug, role);
-    let expected_id = chat_session_id_name(&slug, role);
+    // v0.8.8 F1 — pane name + --name id are keyed by sid; --agent stays role.
+    let session_name = chat_session_name(&slug, F172_SID);
+    let expected_id = chat_session_id_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
@@ -328,7 +348,8 @@ async fn hitl_fresh_spawn_argv_uses_permission_mode_default_and_no_skip() {
 
     let slug = format!("hitl-fresh-{}", std::process::id());
     let role = "alpha";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — pane named by sid (matches make_ctx_hitl's sid).
+    let session_name = chat_session_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
@@ -380,8 +401,9 @@ async fn recreate_dead_pane_spawn_argv_contains_resume_flag() {
 
     let slug = format!("f172-recreate-{}", std::process::id());
     let role = "beta";
-    let session_name = chat_session_name(&slug, role);
-    let expected_id = chat_session_id_name(&slug, role);
+    // v0.8.8 F1 — pane name + --resume id are keyed by sid; --agent stays role.
+    let session_name = chat_session_name(&slug, F172_SID);
+    let expected_id = chat_session_id_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     // Pre-create a session with `remain-on-exit on` + a killed pane so
@@ -444,8 +466,10 @@ async fn resume_failure_falls_back_to_fresh_name() {
 
     let slug = format!("f172-fallback-{}", std::process::id());
     let role = "gamma";
-    let session_name = chat_session_name(&slug, role);
-    let expected_id = chat_session_id_name(&slug, role);
+    // v0.8.8 F1 — pane name + --name/--resume id are keyed by sid. The
+    // chat_session_reset progress event below still carries the `role` dim.
+    let session_name = chat_session_name(&slug, F172_SID);
+    let expected_id = chat_session_id_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     // Pre-create dead-pane session to force recreate path.
@@ -545,7 +569,11 @@ async fn alive_reattach_does_not_spawn_new_claude() {
 
     let slug = format!("f172-alive-{}", std::process::id());
     let role = "delta";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — the pane is named by sid; build the pre-created session from
+    // the SAME sid the ctx uses so start_thread actually hits the reattach
+    // path (matching an existing pane), not a fresh spawn of a differently-
+    // named session.
+    let session_name = chat_session_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     // Pre-create the session running fake-claude — pane will be alive.
@@ -592,12 +620,19 @@ async fn alive_reattach_does_not_spawn_new_claude() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: cwd-collision — two roles in same cwd get distinct --name args
+// Test 6: same (project, role) two sids → distinct pane names + --name ids
 // ---------------------------------------------------------------------------
 
+/// v0.8.8 F1 — distinctness now comes from the **sid**, not the role: the SAME
+/// role can run as two independent sessions in the same cwd, and each must get
+/// its own `ccteam-chat-<slug>-<sid>` pane name + `--name <sid-id>` so
+/// Anthropic's `<cwd>:<name>` lookup never crosses the two streams. Both spawns
+/// carry the SAME `--agent <role>` (the role binds the persona; the sid
+/// disambiguates the session). This replaces the pre-F1 "two distinct roles"
+/// framing.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn cwd_collision_two_roles_distinct_names() {
+async fn same_project_role_two_sids_get_distinct_names() {
     std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
     if !ccteam_harness::tmux_ops::tmux_available() {
         eprintln!("skip: tmux not available");
@@ -608,64 +643,70 @@ async fn cwd_collision_two_roles_distinct_names() {
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
 
     let slug = format!("f172-coll-{}", std::process::id());
-    let role_a = "roleA";
-    let role_b = "roleB";
-    let session_a = chat_session_name(&slug, role_a);
-    let session_b = chat_session_name(&slug, role_b);
-    let id_a = chat_session_id_name(&slug, role_a);
-    let id_b = chat_session_id_name(&slug, role_b);
-    kill_session_quiet(&session_a);
-    kill_session_quiet(&session_b);
+    let role = "reviewer";
+    // Two DISTINCT sids for the SAME role — the F1 way two same-role sessions
+    // stay independent.
+    let sid_1 = "s1";
+    let sid_2 = "s2";
+    let session_1 = chat_session_name(&slug, sid_1);
+    let session_2 = chat_session_name(&slug, sid_2);
+    let id_1 = chat_session_id_name(&slug, sid_1);
+    let id_2 = chat_session_id_name(&slug, sid_2);
+    kill_session_quiet(&session_1);
+    kill_session_quiet(&session_2);
 
-    let ctx = make_ctx(&slug, &tmp);
+    let ctx_1 = make_ctx_sid(&slug, sid_1, &tmp);
+    let ctx_2 = make_ctx_sid(&slug, sid_2, &tmp);
 
-    // Same cwd, two roles.
-    let h_a = ClaudeTuiAdapter::new()
+    // Same cwd, same role, two sids.
+    let h_1 = ClaudeTuiAdapter::new()
         .start_thread(
             &AgentSpecBrief {
-                role: role_a.to_string(),
+                role: role.to_string(),
             },
-            &ctx,
+            &ctx_1,
         )
         .await
-        .expect("role A spawn");
-    let h_b = ClaudeTuiAdapter::new()
+        .expect("sid_1 spawn");
+    let h_2 = ClaudeTuiAdapter::new()
         .start_thread(
             &AgentSpecBrief {
-                role: role_b.to_string(),
+                role: role.to_string(),
             },
-            &ctx,
+            &ctx_2,
         )
         .await
-        .expect("role B spawn");
+        .expect("sid_2 spawn");
 
-    assert_ne!(h_a.identity, h_b.identity);
+    // Distinct identities even though the role is identical.
+    assert_ne!(
+        h_1.identity, h_2.identity,
+        "two sids for the same role must yield distinct pane identities"
+    );
 
     let lines = wait_for_argv_lines(tmp.path(), 2, 2000);
     assert_eq!(lines.len(), 2, "two spawn calls expected; got: {lines:?}");
-    // Each line carries its own --name <id> — independent namespaces.
+    // Each line carries its own --name <sid-id> — independent namespaces.
     let combined = lines.join("\n");
     assert!(
-        combined.contains(&id_a),
-        "argv log must contain role-A id `{id_a}`; got:\n{combined}"
+        combined.contains(&id_1),
+        "argv log must contain sid-1 id `{id_1}`; got:\n{combined}"
     );
     assert!(
-        combined.contains(&id_b),
-        "argv log must contain role-B id `{id_b}`; got:\n{combined}"
+        combined.contains(&id_2),
+        "argv log must contain sid-2 id `{id_2}`; got:\n{combined}"
     );
-    // Each spawn carries its own --agent <role> binding (no crossed personas).
-    assert!(
-        combined.contains(&format!("--agent {role_a}")),
-        "argv log must carry --agent {role_a}; got:\n{combined}"
+    // Both spawns carry the SAME --agent <role> (role binds the persona; the
+    // sid disambiguates the session).
+    assert_eq!(
+        combined.matches(&format!("--agent {role}")).count(),
+        2,
+        "both spawns must carry --agent {role}; got:\n{combined}"
     );
-    assert!(
-        combined.contains(&format!("--agent {role_b}")),
-        "argv log must carry --agent {role_b}; got:\n{combined}"
-    );
-    assert_ne!(id_a, id_b, "the two role ids must differ");
+    assert_ne!(id_1, id_2, "the two sid ids must differ");
 
-    kill_session_quiet(&session_a);
-    kill_session_quiet(&session_b);
+    kill_session_quiet(&session_1);
+    kill_session_quiet(&session_2);
     std::env::remove_var(CLAUDE_BIN_ENV);
 }
 
@@ -674,9 +715,12 @@ async fn cwd_collision_two_roles_distinct_names() {
 // ---------------------------------------------------------------------------
 
 /// F172 V2 must not break F118 prerequisites. On a brand-new spawn the
-/// `<project>/.ccteam/chat/<role>/` directory must still be created so
-/// turns_mirror has somewhere to write the per-bot turns.jsonl —
+/// `<project>/.ccteam/chat/<sid>/` directory must still be created so
+/// turns_mirror has somewhere to write the per-session turns.jsonl —
 /// session_recovery::build_recovery_prompt reads from there.
+///
+/// v0.8.8 F1 — the turns mirror dir is keyed by the ccteam session sid (not
+/// the role): two same-role sessions therefore get independent mirrors.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
@@ -690,7 +734,7 @@ async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
 
     let slug = format!("f172-f118-{}", std::process::id());
     let role = "epsilon";
-    let session_name = chat_session_name(&slug, role);
+    let session_name = chat_session_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
@@ -704,11 +748,11 @@ async fn fresh_spawn_creates_turns_mirror_dir_for_f118() {
         .await
         .expect("brand-new spawn must succeed");
 
-    // F118 dir contract.
-    let chat_dir = tmp.path().join(".ccteam/chat").join(role);
+    // F118 dir contract — keyed by sid post-F1.
+    let chat_dir = tmp.path().join(".ccteam/chat").join(F172_SID);
     assert!(
         chat_dir.exists(),
-        "<project>/.ccteam/chat/<role>/ must be created for F118 turns mirror"
+        "<project>/.ccteam/chat/<sid>/ must be created for F118 turns mirror"
     );
     // Heartbeat — sanity check the broader spawn path didn't regress.
     assert!(chat_dir.join("heartbeat").exists());
@@ -739,8 +783,11 @@ async fn daemon_restart_uses_resume_route() {
 
     let slug = format!("f172-restart-{}", std::process::id());
     let role = "zeta";
-    let session_name = chat_session_name(&slug, role);
-    let expected_id = chat_session_id_name(&slug, role);
+    // v0.8.8 F1 — pane name + --name/--resume id are keyed by sid; --agent
+    // stays role. The same sid across both cycles is exactly what makes cycle 2
+    // resolve to the same pane name → the dead-pane recreate (--resume) path.
+    let session_name = chat_session_name(&slug, F172_SID);
+    let expected_id = chat_session_id_name(&slug, F172_SID);
     kill_session_quiet(&session_name);
 
     // Cycle 1: first spawn = fresh --name.

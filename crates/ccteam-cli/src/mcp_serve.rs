@@ -483,10 +483,17 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
                 .to_string(),
         ));
     }
+    // v0.8.8 F1 — also forward the firing session's ccteam sid so the daemon
+    // can resolve the SPECIFIC session's reply target (`reply_target_for(sid)`);
+    // post-dedup `(slug, role)` no longer uniquely names a session. Empty when
+    // a pre-F1 / restored pane lacks the env → the daemon falls back to the
+    // on-disk registry.
+    let sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
     let mut fwd_args = args.clone();
     if let Some(obj) = fwd_args.as_object_mut() {
         obj.insert("slug".to_string(), json!(slug));
         obj.insert("role".to_string(), json!(role));
+        obj.insert("_caller_sid".to_string(), json!(sid));
     }
     let req = json!({
         "jsonrpc": "2.0",

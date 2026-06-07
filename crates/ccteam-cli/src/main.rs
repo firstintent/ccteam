@@ -494,24 +494,24 @@ enum Command {
 /// `mcp__ccteam__admin_*` / `mcp__ccteam__chat_*` MCP tools.
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<role>`).
+    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<sid>`).
     ///
     /// Read-only control-plane enumeration: lists session names from the mux
     /// backend (never capture-pane) and reconciles them against the daemon's
     /// persisted registry, flagging orphans (live but untracked) and registered
     /// sessions that are not running. Attach one with
-    /// `ccteam session attach <slug> [role]`.
+    /// `ccteam session attach <slug> [sid]`.
     Ls,
     /// Attach to a session. Reaches a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<role>`) first; with `<slug>` alone, attaches when
+    /// (`ccteam-chat-<slug>-<sid>`) first; with `<slug>` alone, attaches when
     /// the slug has exactly one live chat session, else lists them to
     /// disambiguate. Falls back to the project session (`ccteam-<slug>`) when
     /// no live chat session matches.
     Attach {
         slug: String,
-        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
         /// Omit to auto-resolve a single live chat session for `<slug>`.
-        role: Option<String>,
+        sid: Option<String>,
     },
     /// Pause auto-dispatch for one project. Sets `user_pause_pending`
     /// so the workflow loop stops handing the project fresh work; never
@@ -785,24 +785,24 @@ enum InternalCommand {
     /// daily-driver claude sessions see the ccteam tool surface.
     McpServe,
     /// Attach to a session. Resolves a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<role>`) first: `<slug> <role>` (or a full session
+    /// (`ccteam-chat-<slug>-<sid>`) first: `<slug> <sid>` (or a full session
     /// name) is deterministic; with `<slug>` alone, attaches when the slug has
     /// exactly one live chat session, else lists them to disambiguate. Falls
     /// back to the project session (`ccteam-<slug>`) when no live chat session
     /// matches.
     Attach {
         slug: String,
-        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
         /// Omit to auto-resolve a single live chat session for `<slug>`.
-        role: Option<String>,
+        sid: Option<String>,
     },
     /// Capture the project's pane content without attaching. Resolves a
-    /// live chat session (`ccteam-chat-<slug>-<role>`) first, falling back
+    /// live chat session (`ccteam-chat-<slug>-<sid>`) first, falling back
     /// to the project pane (`ccteam-<slug>`) — same resolution as `attach`.
     Peek {
         slug: String,
-        /// Chat-mode role; omit to auto-resolve a single live chat session.
-        role: Option<String>,
+        /// Chat session id; omit to auto-resolve a single live chat session.
+        sid: Option<String>,
     },
     /// Print the project's progress.jsonl, optionally tailing.
     Progress {
@@ -1256,7 +1256,7 @@ fn run_config(args: Vec<String>) -> Result<()> {
 fn run_session(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Ls => commands::run_sessions(),
-        SessionCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
+        SessionCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
         SessionCommand::Pause { slug } => run_pause(&slug),
         SessionCommand::Resume { slug } => run_resume(&slug),
         SessionCommand::Role { slug, sid, role } => run_session_role(&slug, &sid, &role),
@@ -1392,8 +1392,8 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::McpServe => run_mcp_serve(),
-        InternalCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
-        InternalCommand::Peek { slug, role } => run_internal_peek(&slug, role.as_deref()),
+        InternalCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
+        InternalCommand::Peek { slug, sid } => run_internal_peek(&slug, sid.as_deref()),
         InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
         InternalCommand::Resume { slug } => run_resume(&slug),
         InternalCommand::Send {
@@ -1530,13 +1530,13 @@ fn run_mux_hook_emit(
 // lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
 // web). Status check is `ccteam doctor` (heartbeat file probe).
 
-/// `ccteam session attach <slug> [role]` / `ccteam internal attach <slug>
-/// [role]` — reach gateway chat-mode bot
+/// `ccteam session attach <slug> [sid]` / `ccteam internal attach <slug>
+/// [sid]` — reach gateway chat-mode bot
 /// sessions first (the project-oriented [`commands::run_attach`] cannot see
 /// `ccteam-chat-*`), then fall back to the project session when no live chat
 /// session matches `slug`.
-fn run_internal_attach(slug: &str, role: Option<&str>) -> Result<()> {
-    if commands::try_attach_chat_session(slug, role)? {
+fn run_internal_attach(slug: &str, sid: Option<&str>) -> Result<()> {
+    if commands::try_attach_chat_session(slug, sid)? {
         return Ok(());
     }
     let paths = CcteamPaths::from_env()?;
@@ -2358,30 +2358,31 @@ async fn execute_chat_send_file(
     })
 }
 
-/// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the
-/// `(slug, role)` the `chat_send_file` / `interaction/ask` args name, by
-/// looking up the gateway's in-memory session map. The gateway guard is
-/// taken and dropped INSIDE this fn (the lookup is sync + holds no `.await`)
-/// so callers never hold it across an fs read / send. `None` when no gateway
-/// handle, no `slug`/`role`, or no tracked session matches.
+/// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the firing
+/// session the `chat_send_file` args name, by looking up the gateway's
+/// in-memory session map. The gateway guard is taken and dropped INSIDE this
+/// fn (the lookup is sync + holds no `.await`) so callers never hold it across
+/// an fs read / send. `None` when no gateway handle, no firing sid, or no
+/// tracked session matches.
+///
+/// v0.8.8 F1 — keyed by the firing session's ccteam sid (`_caller_sid`,
+/// injected by the in-pane `forward_chat_send_file` forwarder from
+/// `CCTEAM_CHAT_SID`): post-dedup `(slug, role)` is no longer unique, so the
+/// sid is the only safe way to reach the SPECIFIC session's reply target.
 async fn resolve_live_reply_target(
     args: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
 ) -> Option<(String, String)> {
     let gw = gateway?;
-    let slug = args
-        .get("slug")
+    let sid = args
+        .get("_caller_sid")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let role = args
-        .get("role")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if slug.is_empty() || role.is_empty() {
+    if sid.is_empty() {
         return None;
     }
     let guard = gw.lock().await;
-    guard.reply_target_for(slug, role)
+    guard.reply_target_for(sid)
 }
 
 fn run_chat_send_file(
@@ -2564,15 +2565,24 @@ async fn execute_interaction_ask(
     }
 
     // Resolve addressing first — no point registering a pending we can't show.
-    // v0.8.7 (FIX-1) — prefer the live (project, role) session's reply target
-    // (resolve under the gateway lock, drop the guard before the long await —
-    // the lookup is sync), falling back to the on-disk registry. Lets an
+    // v0.8.7 (FIX-1) — prefer the live firing session's reply target (resolve
+    // under the gateway lock, drop the guard before the long await — the
+    // lookup is sync), falling back to the on-disk registry. Lets an
     // actively-chatting agent ask the user a question without a prior
     // `chat_register_bot`.
+    //
+    // v0.8.8 F1 — keyed by the firing session's ccteam sid (`session_sid`,
+    // forwarded by the `intercept_ask` hook from `CCTEAM_CHAT_SID`):
+    // post-dedup `(slug, role)` is no longer unique. Empty sid → skip the live
+    // lookup and fall straight to the registry.
+    let session_sid = params
+        .get("session_sid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let live_target = match gateway {
-        Some(gw) if !slug.is_empty() && !role.is_empty() => {
+        Some(gw) if !session_sid.is_empty() => {
             let guard = gw.lock().await;
-            guard.reply_target_for(slug, role)
+            guard.reply_target_for(session_sid)
         }
         _ => None,
     };
@@ -2763,16 +2773,27 @@ async fn execute_permission_ask(
         ));
     };
 
-    // Resolve the firing session's gateway sid (for the prompt label). The
-    // pane is uniquely keyed by (slug, role) — same invariant start_session
-    // dedups on. Read-only lookup; drop the gateway guard immediately (never
-    // held across the long await — lock discipline §7-1).
-    let sid_label = match gateway {
-        Some(gw) => {
+    // Resolve the firing session's gateway sid (for the prompt label).
+    //
+    // v0.8.8 F1 — the hook reports the firing session's own ccteam sid via
+    // `session_sid` (sourced from `CCTEAM_CHAT_SID` / the `X-Ccteam-Sid`
+    // header). Post-dedup `(slug, role)` is no longer unique, so we trust the
+    // hook-reported sid and only CONFIRM it against the live session map
+    // (`session_sid_for(sid)` → the canonical id when tracked). Read-only
+    // lookup; drop the gateway guard immediately (never held across the long
+    // await — lock discipline §7-1). 红线:这里用的是 ccteam 的 `s<N>` sid,
+    // 不是 Anthropic 的 `session_id` UUID。
+    let session_sid = params
+        .get("session_sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let sid_label = match (gateway, session_sid.is_empty()) {
+        (Some(gw), false) => {
             let guard = gw.lock().await;
-            guard.session_sid_for(slug, role)
+            guard.session_sid_for(session_sid)
         }
-        None => None,
+        _ => None,
     };
     let session_desc = match (&sid_label, role.is_empty()) {
         (Some(sid), false) => format!("session {sid} ({role})"),
@@ -3251,9 +3272,11 @@ async fn run_session_collect(
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
 
     // Tail the ccteam-owned transcript mirror (same source as chat_history).
+    // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
+    // not role, so read by `resolved.sid` (role is a content label only).
     let all = ccteam_harness::execution::turns_mirror::read_all_turns(
         &resolved.project_dir,
-        &resolved.role,
+        &resolved.sid,
     )
     .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
 
@@ -3902,9 +3925,9 @@ fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn run_internal_peek(slug: &str, role: Option<&str>) -> Result<()> {
+fn run_internal_peek(slug: &str, sid: Option<&str>) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    let body = commands::run_peek_with_role(&paths, slug, role)?;
+    let body = commands::run_peek_with_role(&paths, slug, sid)?;
     print!("{body}");
     Ok(())
 }

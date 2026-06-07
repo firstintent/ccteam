@@ -69,10 +69,11 @@ pub struct RecoveryPlan {
 /// ```
 pub fn build_recovery_prompt(
     project_dir: &Path,
-    bot_role: &str,
+    // v0.8.8 F1 — turns.jsonl 现按会话 sid 存储,此处第二参语义为 sid。
+    sid: &str,
     recover_last_n: usize,
 ) -> Result<RecoveryPlan> {
-    let turns = last_n_turns(project_dir, bot_role, recover_last_n)?;
+    let turns = last_n_turns(project_dir, sid, recover_last_n)?;
     if turns.is_empty() {
         return Ok(RecoveryPlan {
             recovered_turns: 0,

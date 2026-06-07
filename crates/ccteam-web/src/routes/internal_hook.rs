@@ -50,6 +50,13 @@ pub const HEADER_CHAT_ROLE: &str = "x-ccteam-role";
 /// `HEADER_CHAT_ROLE`; folded into stdin `slug` for any downstream
 /// consumer that wants it.
 pub const HEADER_CHAT_SLUG: &str = "x-ccteam-slug";
+/// v0.8.8 F1 — companion header for `CCTEAM_CHAT_SID` (the ccteam session
+/// `s<N>`). Same mechanism: `hook.sh` sets it from the firing pane's env;
+/// folded into stdin `ccteam_sid` so the sid-keyed hook readers
+/// (`chat_progress::derive_sid_from_payload`, `permission_request`,
+/// `intercept_ask`) pick it up on the HTTP fast-path (the daemon process does
+/// not inherit the pane env). NOT the Anthropic native session UUID.
+pub const HEADER_CHAT_SID: &str = "x-ccteam-sid";
 
 /// Build the `POST /internal/hook/:kind[/:action]` router.
 pub fn router() -> Router<AppState> {
@@ -93,7 +100,12 @@ fn inject_headers(mut stdin: Value, headers: &HeaderMap) -> Value {
         .get(HEADER_CHAT_SLUG)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    if role_hdr.is_none() && slug_hdr.is_none() {
+    // v0.8.8 F1 — fold the ccteam session sid header into stdin `ccteam_sid`.
+    let sid_hdr = headers
+        .get(HEADER_CHAT_SID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if role_hdr.is_none() && slug_hdr.is_none() && sid_hdr.is_none() {
         return stdin;
     }
     if matches!(stdin, Value::Null) {
@@ -108,6 +120,11 @@ fn inject_headers(mut stdin: Value, headers: &HeaderMap) -> Value {
         if let Some(slug) = slug_hdr {
             if !slug.is_empty() && !map.contains_key("slug") {
                 map.insert("slug".into(), Value::String(slug));
+            }
+        }
+        if let Some(sid) = sid_hdr {
+            if !sid.is_empty() && !map.contains_key("ccteam_sid") {
+                map.insert("ccteam_sid".into(), Value::String(sid));
             }
         }
     }

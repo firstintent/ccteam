@@ -46,10 +46,16 @@ fn fake_claude_script(tmp: &tempfile::TempDir) -> PathBuf {
     p
 }
 
-fn make_ctx(slug: &str, _role: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
+/// v0.8.8 F1 — the pane name + `--name`/`--resume` identifier are keyed by the
+/// ccteam session **sid** (`s<N>`), not the role; `--agent {role}` still binds
+/// the persona. `make_ctx` therefore takes the sid explicitly, and each test
+/// builds its pre-created tmux session name from the SAME sid so the reattach /
+/// recreate probe targets the right pane. `role` only sets the persona brief.
+fn make_ctx(slug: &str, sid: &str, role: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
+    let _ = role; // role rides on AgentSpecBrief, not the pane identity.
     SpawnCtx {
         slug: slug.to_string(),
-        sid: "chat-reattach".into(),
+        sid: sid.to_string(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -81,7 +87,10 @@ async fn start_thread_reattaches_alive_session() {
     // Use process-id in slug to avoid collisions with other parallel tests.
     let slug = format!("reattach-alive-{}", std::process::id());
     let role = "testbot";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — the pane is named by sid; build the pre-created session and
+    // the ctx from the SAME sid so the reattach probe finds this exact pane.
+    let sid = "s1";
+    let session_name = chat_session_name(&slug, sid);
     kill_session_quiet(&session_name);
 
     // Pre-create the session running our fake-claude.
@@ -114,7 +123,7 @@ async fn start_thread_reattaches_alive_session() {
     let brief = AgentSpecBrief {
         role: role.to_string(),
     };
-    let ctx = make_ctx(&slug, role, &tmp);
+    let ctx = make_ctx(&slug, sid, role, &tmp);
 
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -138,8 +147,8 @@ async fn start_thread_reattaches_alive_session() {
         "pane pid must be unchanged on reattach (no new process spawned)"
     );
 
-    // Heartbeat file should be written/updated.
-    let hb = tmp.path().join(".ccteam/chat").join(role).join("heartbeat");
+    // Heartbeat file should be written/updated. v0.8.8 F1 — keyed by sid.
+    let hb = tmp.path().join(".ccteam/chat").join(sid).join("heartbeat");
     assert!(hb.exists(), "heartbeat must be written on reattach");
 
     // Cleanup.
@@ -168,7 +177,9 @@ async fn start_thread_recreates_dead_session() {
 
     let slug = format!("reattach-dead-{}", std::process::id());
     let role = "deadbot";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — pane named by sid; same sid drives the pre-create + ctx.
+    let sid = "s1";
+    let session_name = chat_session_name(&slug, sid);
     kill_session_quiet(&session_name);
 
     // Pre-create the session with a command that exits immediately.
@@ -226,7 +237,7 @@ async fn start_thread_recreates_dead_session() {
     let brief = AgentSpecBrief {
         role: role.to_string(),
     };
-    let ctx = make_ctx(&slug, role, &tmp);
+    let ctx = make_ctx(&slug, sid, role, &tmp);
 
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -243,8 +254,8 @@ async fn start_thread_recreates_dead_session() {
     let fresh_pids = fresh_session.list_pane_pids();
     assert!(!fresh_pids.is_empty(), "fresh session must have a pane pid");
 
-    // Heartbeat file should be written.
-    let hb = tmp.path().join(".ccteam/chat").join(role).join("heartbeat");
+    // Heartbeat file should be written. v0.8.8 F1 — keyed by sid.
+    let hb = tmp.path().join(".ccteam/chat").join(sid).join("heartbeat");
     assert!(hb.exists(), "heartbeat must be written on recreate");
 
     // Cleanup.
@@ -271,14 +282,16 @@ async fn start_thread_creates_new_session_when_absent() {
 
     let slug = format!("reattach-new-{}", std::process::id());
     let role = "freshbot";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — pane named by sid; same sid drives the pre-create + ctx.
+    let sid = "s1";
+    let session_name = chat_session_name(&slug, sid);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
     let brief = AgentSpecBrief {
         role: role.to_string(),
     };
-    let ctx = make_ctx(&slug, role, &tmp);
+    let ctx = make_ctx(&slug, sid, role, &tmp);
 
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -361,14 +374,16 @@ async fn start_thread_is_idempotent_on_alive_session() {
 
     let slug = format!("reattach-idem-{}", std::process::id());
     let role = "idempotent";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — pane named by sid; same sid drives the ctx + cleanup name.
+    let sid = "s1";
+    let session_name = chat_session_name(&slug, sid);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
     let brief = AgentSpecBrief {
         role: role.to_string(),
     };
-    let ctx = make_ctx(&slug, role, &tmp);
+    let ctx = make_ctx(&slug, sid, role, &tmp);
 
     // First call — creates the session.
     let h1 = ClaudeTuiAdapter::new()

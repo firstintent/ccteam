@@ -19,7 +19,13 @@ use serial_test::serial;
 
 fn fake_claude_script(tmp: &tempfile::TempDir) -> PathBuf {
     let p = tmp.path().join("fake-claude");
-    std::fs::write(&p, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    // v0.8.8 F1 — the fresh-spawn path now runs a death/liveness probe
+    // (`pane_runs_claude` → `ps -o comm=` must contain "claude"). Sleep
+    // WITHOUT `exec` so the live process keeps comm = "fake-claude" (which
+    // contains "claude"); `exec sleep` would replace the shell with `sleep`
+    // and the probe would (correctly) report the pane as not-a-claude → spawn
+    // failure. Mirrors `claude_tui_resume_test.rs`'s `sleep 999` pattern.
+    std::fs::write(&p, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
 }
@@ -39,7 +45,10 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
     // Use unique slug so parallel runs don't collide
     let slug = format!("tui-start-{}", std::process::id());
     let role = "alice".to_string();
-    let session_name = chat_session_name(&slug, &role);
+    // v0.8.8 F1 — the pane name is keyed by the ccteam session sid, not the
+    // role (`--agent {role}` still binds the persona).
+    let sid = "s1".to_string();
+    let session_name = chat_session_name(&slug, &sid);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
@@ -47,7 +56,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
         slug: slug.clone(),
-        sid: "chat-1".into(),
+        sid: sid.clone(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -66,12 +75,9 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
         handle.raw_extras.get("role").and_then(|v| v.as_str()),
         Some(role.as_str())
     );
-    // Heartbeat file should have been written.
-    let hb = tmp
-        .path()
-        .join(".ccteam/chat")
-        .join(&role)
-        .join("heartbeat");
+    // Heartbeat file should have been written. v0.8.8 F1 — keyed by sid (same
+    // dimension as turns / cursor / marker), not role.
+    let hb = tmp.path().join(".ccteam/chat").join(&sid).join("heartbeat");
     assert!(hb.exists(), "heartbeat file should be created");
 
     // Cleanup.
@@ -88,14 +94,16 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
     let bin = fake_claude_script(&tmp);
     let slug = format!("tui-submit-{}", std::process::id());
     let role = "bob".to_string();
-    let session_name = chat_session_name(&slug, &role);
+    // v0.8.8 F1 — pane name is sid-keyed.
+    let sid = "s1".to_string();
+    let session_name = chat_session_name(&slug, &sid);
     kill_session_quiet(&session_name);
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
         slug: slug.clone(),
-        sid: "chat-1".into(),
+        sid: sid.clone(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -148,14 +156,16 @@ async fn submit_turn_artifact_uses_read_protocol() {
     let bin = fake_claude_script(&tmp);
     let slug = format!("tui-artifact-{}", std::process::id());
     let role = "carol".to_string();
-    let session_name = chat_session_name(&slug, &role);
+    // v0.8.8 F1 — pane name is sid-keyed.
+    let sid = "s1".to_string();
+    let session_name = chat_session_name(&slug, &sid);
     kill_session_quiet(&session_name);
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
         slug: slug.clone(),
-        sid: "chat-1".into(),
+        sid: sid.clone(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -230,10 +240,9 @@ async fn resume_thread_on_live_session_returns_handle() {
 
 #[test]
 fn chat_session_name_format_is_stable() {
-    assert_eq!(
-        chat_session_name("dev-foo", "alice"),
-        "ccteam-chat-dev-foo-alice"
-    );
+    // v0.8.8 F1 — the second arg is the ccteam session sid (`s<N>`), not the
+    // role; the `ccteam-chat-<slug>-<sid>` shape is otherwise unchanged.
+    assert_eq!(chat_session_name("dev-foo", "s1"), "ccteam-chat-dev-foo-s1");
 }
 
 #[test]

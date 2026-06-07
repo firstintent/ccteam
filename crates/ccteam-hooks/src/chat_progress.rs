@@ -42,10 +42,16 @@ use ccteam_harness::execution::transcript_tail::active_session_id_path;
 /// silent despite a healthy pane (the reply landed in a jsonl the tail
 /// wasn't following). Refreshing it on every turn start (`user-prompt`,
 /// which carries the same `session_id`) keeps it current and self-heals
-/// a missed/stale marker. No-op when role or session_id is absent so it
-/// never clobbers a good marker with empty data.
-fn refresh_active_session_marker(cwd: &str, role: &str, stdin: &Value) {
-    if role.is_empty() {
+/// a missed/stale marker.
+///
+/// v0.8.8 F1 — marker 路径键由 role 改为 ccteam 会话 **sid**(`ccteam_sid`,
+/// 来自 `CCTEAM_CHAT_SID` env / stdin),与 tail_loop 的读侧严格同键 ——
+/// 这是 rendezvous 的两半之一,任一滞后 → marker 永不会合 → bot 静默。
+/// **注意**:marker 的【内容】仍是 Anthropic 原生 session UUID
+/// (`payload.session_id`),它与路径键 `ccteam_sid` 是两个 ID 层,别混淆。
+/// `ccteam_sid` 或 `session_id` 为空时整个 no-op,绝不用空数据覆盖好 marker。
+fn refresh_active_session_marker(cwd: &str, ccteam_sid: &str, stdin: &Value) {
+    if ccteam_sid.is_empty() {
         return;
     }
     let Some(sid) = stdin.get("session_id").and_then(|v| v.as_str()) else {
@@ -54,10 +60,10 @@ fn refresh_active_session_marker(cwd: &str, role: &str, stdin: &Value) {
     if sid.is_empty() {
         return;
     }
-    let marker = active_session_id_path(Path::new(cwd), role);
+    let marker = active_session_id_path(Path::new(cwd), ccteam_sid);
     if let Err(err) = write_marker_atomic(&marker, sid) {
         tracing::warn!(
-            role = %role,
+            ccteam_sid = %ccteam_sid,
             session_id = %sid,
             path = %marker.display(),
             error = %err,
@@ -77,6 +83,9 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("hook stdin missing `cwd`"))?;
     let role = derive_role_from_payload(stdin).unwrap_or_default();
+    // v0.8.8 F1 — marker 路径键(会话 sid),与 tail_loop 读侧同键。
+    // progress.jsonl 事件本身仍带 role 维度(state-SoT,不动)。
+    let ccteam_sid = derive_sid_from_payload(stdin).unwrap_or_default();
 
     // Bot's project_dir is the cwd by convention (chat-mode tmux spawns
     // with `-c <project_dir>` so `cwd` lands inside the project).
@@ -91,7 +100,8 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
             // correct jsonl deterministically. Without this marker
             // three bots in one project dir all read whichever jsonl
             // was most recently modified (the F177 fan-out bug).
-            refresh_active_session_marker(cwd, &role, stdin);
+            // v0.8.8 F1 — marker 按会话 sid 寻址(键由 role 改为 sid)。
+            refresh_active_session_marker(cwd, &ccteam_sid, stdin);
             build_chat_session_started_event(&role, &project_dir)
         }
         "user-prompt" => {
@@ -100,7 +110,8 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
             // rotate mid-session (/compact, auto-compact), which otherwise
             // strands the tail on a stale jsonl and the reply is never read.
             // `user-prompt` carries the same `session_id`, so this self-heals.
-            refresh_active_session_marker(cwd, &role, stdin);
+            // v0.8.8 F1 — marker 按会话 sid 寻址。
+            refresh_active_session_marker(cwd, &ccteam_sid, stdin);
             let prompt = stdin.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             let turn_id = stdin
                 .get("session_id")
@@ -156,12 +167,13 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
                 // exit, daemon kill, network drop) do NOT rotate the
                 // sid — leave the marker alone so the next SessionStart
                 // hook overwrites with the new sid atomically.
-                if !role.is_empty() {
-                    let marker = active_session_id_path(Path::new(cwd), &role);
+                // v0.8.8 F1 — marker 按会话 sid 寻址(键由 role 改为 sid)。
+                if !ccteam_sid.is_empty() {
+                    let marker = active_session_id_path(Path::new(cwd), &ccteam_sid);
                     if marker.exists() {
                         if let Err(err) = std::fs::remove_file(&marker) {
                             tracing::warn!(
-                                role = %role,
+                                ccteam_sid = %ccteam_sid,
                                 path = %marker.display(),
                                 error = %err,
                                 "chat-progress: failed to clear active-session-id marker"
@@ -233,6 +245,26 @@ fn derive_role_from_payload(stdin: &Value) -> Option<String> {
     if let Ok(r) = std::env::var("CCTEAM_CHAT_ROLE") {
         if !r.is_empty() {
             return Some(r);
+        }
+    }
+    None
+}
+
+/// v0.8.8 F1 — recover the ccteam session **sid**(`s<N>`)from the payload.
+/// 优先读 stdin 显式 `ccteam_sid`(测试 / 未来注入),再回退到
+/// `CCTEAM_CHAT_SID` env —— 后者由 spawn 时 `chat_spawn_env_owned` 注入。
+/// sid 是 marker / turns / cursor 的存储键,与 tail_loop 读侧同源。
+/// **红线**:这是 ccteam 的 `s<N>`,绝非 Anthropic 原生 session UUID
+/// (`payload.session_id`)—— 后者只进 marker 内容,不当 ccteam 身份键。
+fn derive_sid_from_payload(stdin: &Value) -> Option<String> {
+    if let Some(s) = stdin.get("ccteam_sid").and_then(|v| v.as_str()) {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    if let Ok(s) = std::env::var("CCTEAM_CHAT_SID") {
+        if !s.is_empty() {
+            return Some(s);
         }
     }
     None

@@ -33,10 +33,14 @@ fn fake_claude_sleep_script(tmp: &tempfile::TempDir) -> PathBuf {
     p
 }
 
+/// v0.8.8 F1 — the ccteam session sid the spawn must inject as
+/// `CCTEAM_CHAT_SID` and use to name the pane (`ccteam-chat-<slug>-<sid>`).
+const F175_SID: &str = "s1";
+
 fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
-        sid: "chat-f175".into(),
+        sid: F175_SID.into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -75,7 +79,10 @@ async fn fresh_spawn_injects_chat_role_and_slug_env() {
 
     let slug = format!("f175-env-{}", std::process::id());
     let role = "alpha";
-    let session_name = chat_session_name(&slug, role);
+    // v0.8.8 F1 — the pane name is keyed by the ccteam session sid, NOT the
+    // role (`--agent {role}` still binds the persona). `show_env` must query
+    // the sid-named session or it would never find the env table.
+    let session_name = chat_session_name(&slug, F175_SID);
     kill_session_quiet(&session_name);
 
     std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
@@ -97,6 +104,14 @@ async fn fresh_spawn_injects_chat_role_and_slug_env() {
     let slug_line = show_env(&session_name, "CCTEAM_CHAT_SLUG")
         .expect("CCTEAM_CHAT_SLUG must be set on the tmux session");
     assert_eq!(slug_line, format!("CCTEAM_CHAT_SLUG={slug}"));
+
+    // v0.8.8 F1 — the spawn must also inject the ccteam session sid so the
+    // hook (PermissionRequest / chat-progress marker) + the in-pane session_*
+    // forwarder can learn the EXACT firing session's identity. Without this
+    // every downstream sid-keying degrades to (slug, role) inference.
+    let sid_line = show_env(&session_name, "CCTEAM_CHAT_SID")
+        .expect("CCTEAM_CHAT_SID must be set on the tmux session");
+    assert_eq!(sid_line, format!("CCTEAM_CHAT_SID={F175_SID}"));
 
     kill_session_quiet(&session_name);
     std::env::remove_var(CLAUDE_BIN_ENV);

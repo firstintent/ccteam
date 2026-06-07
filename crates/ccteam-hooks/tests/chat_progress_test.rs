@@ -156,15 +156,23 @@ fn session_end_with_clear_reason_emits_chat_session_reset() {
 #[test]
 #[serial]
 fn session_start_writes_active_session_id_marker() {
-    // F176 — the hook persists Anthropic's real session_id (carried
-    // in stdin) to `<project>/.ccteam/chat/<role>/active-session-id`
-    // so the chat-mode tail loop can target the correct jsonl
-    // deterministically. This is the only reliable source for the sid
-    // because `--name` is just an internal label, not the filename.
+    // F176 — the hook persists Anthropic's real session_id (carried in
+    // stdin) to a per-session marker so the chat-mode tail loop can target
+    // the correct jsonl deterministically. This is the only reliable source
+    // for the Anthropic session id because `--name` is just an internal
+    // label, not the filename.
+    //
+    // v0.8.8 F1 — the marker dir is keyed by the **ccteam session sid**
+    // (`s<N>`), not the role: two same-role sessions therefore keep
+    // independent markers. The sid reaches the hook via `CCTEAM_CHAT_SID`
+    // (spawn-injected) — set it and assert the marker lands under `<sid>/`.
+    // RED LINE: the marker *body* is still Anthropic's native session UUID
+    // (`session_id`), distinct from the path-key sid.
     let tmp = TempDir::new().unwrap();
     let slug = "tcp-marker-write";
     let (paths, project_dir) = setup_project(&tmp, slug);
     std::env::set_var("CCTEAM_CHAT_ROLE", "alice");
+    std::env::set_var("CCTEAM_CHAT_SID", "s1");
 
     let sid = "11111111-2222-3333-4444-555555555555";
     let stdin = json!({
@@ -175,16 +183,28 @@ fn session_start_writes_active_session_id_marker() {
     });
     handle_chat_progress(&paths, "session-start", &stdin).unwrap();
 
-    let marker = project_dir.join(".ccteam/chat/alice/active-session-id");
+    // Marker lands under the sid dir (`s1`), NOT the role dir (`alice`).
+    let marker = project_dir.join(".ccteam/chat/s1/active-session-id");
     assert!(
         marker.exists(),
-        "active-session-id marker must be written on session-start; expected at {}",
+        "active-session-id marker must be written under the sid dir on session-start; expected at {}",
         marker.display()
     );
     let body = std::fs::read_to_string(&marker).unwrap();
-    assert_eq!(body, sid, "marker body must be the raw sid (no JSON wrap)");
+    assert_eq!(
+        body, sid,
+        "marker body must be the raw Anthropic session UUID (no JSON wrap)"
+    );
+    // The role dir must NOT receive the marker post-F1.
+    assert!(
+        !project_dir
+            .join(".ccteam/chat/alice/active-session-id")
+            .exists(),
+        "F1: marker must not be keyed by role anymore"
+    );
 
     std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
 }
 
 #[test]
@@ -197,6 +217,8 @@ fn session_start_overwrites_marker_after_rotation() {
     let slug = "tcp-marker-rotate";
     let (paths, project_dir) = setup_project(&tmp, slug);
     std::env::set_var("CCTEAM_CHAT_ROLE", "bob");
+    // v0.8.8 F1 — marker dir is keyed by the ccteam session sid.
+    std::env::set_var("CCTEAM_CHAT_SID", "s2");
 
     let sid_old = "aaaa-old";
     handle_chat_progress(
@@ -224,10 +246,13 @@ fn session_start_overwrites_marker_after_rotation() {
     )
     .unwrap();
 
-    let marker = project_dir.join(".ccteam/chat/bob/active-session-id");
+    // Same ccteam session (sid s2) → the marker is overwritten in place with
+    // the new Anthropic UUID after the rotation.
+    let marker = project_dir.join(".ccteam/chat/s2/active-session-id");
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), sid_new);
 
     std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
 }
 
 #[test]
@@ -241,6 +266,8 @@ fn session_end_clear_removes_active_session_id_marker() {
     let slug = "tcp-marker-clear";
     let (paths, project_dir) = setup_project(&tmp, slug);
     std::env::set_var("CCTEAM_CHAT_ROLE", "carol");
+    // v0.8.8 F1 — marker dir is keyed by the ccteam session sid.
+    std::env::set_var("CCTEAM_CHAT_SID", "s3");
 
     // Plant the marker first.
     let sid = "doomed-sid";
@@ -255,7 +282,7 @@ fn session_end_clear_removes_active_session_id_marker() {
         }),
     )
     .unwrap();
-    let marker = project_dir.join(".ccteam/chat/carol/active-session-id");
+    let marker = project_dir.join(".ccteam/chat/s3/active-session-id");
     assert!(marker.exists());
 
     // Now signal /clear.
@@ -277,6 +304,7 @@ fn session_end_clear_removes_active_session_id_marker() {
     );
 
     std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
 }
 
 #[test]
@@ -289,6 +317,8 @@ fn session_end_non_clear_leaves_marker_intact() {
     let slug = "tcp-marker-exit";
     let (paths, project_dir) = setup_project(&tmp, slug);
     std::env::set_var("CCTEAM_CHAT_ROLE", "dora");
+    // v0.8.8 F1 — marker dir is keyed by the ccteam session sid.
+    std::env::set_var("CCTEAM_CHAT_SID", "s4");
 
     let sid = "surviving-sid";
     handle_chat_progress(
@@ -302,7 +332,7 @@ fn session_end_non_clear_leaves_marker_intact() {
         }),
     )
     .unwrap();
-    let marker = project_dir.join(".ccteam/chat/dora/active-session-id");
+    let marker = project_dir.join(".ccteam/chat/s4/active-session-id");
     assert!(marker.exists());
 
     handle_chat_progress(
@@ -323,6 +353,55 @@ fn session_end_non_clear_leaves_marker_intact() {
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), sid);
 
     std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
+}
+
+#[test]
+#[serial]
+fn marker_round_trip_hook_writes_sid_path_tail_reads_same_sid() {
+    // v0.8.8 F1 — the marker rendezvous: the chat-progress hook WRITES
+    // `<project>/.ccteam/chat/<sid>/active-session-id` keyed by the
+    // ccteam session sid (from `CCTEAM_CHAT_SID`), and the transcript tail
+    // READS it via `active_session_id_path(project_dir, sid)`. Both halves
+    // MUST key by the same sid or the marker never rendezvous and the bot
+    // goes silent. This test proves the write key == the read key.
+    use ccteam_harness::execution::transcript_tail::active_session_id_path;
+
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-roundtrip";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::set_var("CCTEAM_CHAT_ROLE", "reviewer");
+    std::env::set_var("CCTEAM_CHAT_SID", "s7");
+
+    let anthropic_sid = "deadbeef-anthropic-uuid";
+    handle_chat_progress(
+        &paths,
+        "session-start",
+        &json!({
+            "hook_event_name": "SessionStart",
+            "session_id": anthropic_sid,
+            "cwd": project_dir.to_string_lossy(),
+            "source": "startup",
+        }),
+    )
+    .unwrap();
+
+    // The tail's read path resolves the SAME sid-keyed marker and finds the
+    // hook-written Anthropic UUID inside it.
+    let read_path = active_session_id_path(&project_dir, "s7");
+    assert!(
+        read_path.exists(),
+        "tail read path must resolve the hook-written marker; expected {}",
+        read_path.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&read_path).unwrap(),
+        anthropic_sid,
+        "the read path must surface the exact Anthropic UUID the hook wrote"
+    );
+
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
 }
 
 #[test]
