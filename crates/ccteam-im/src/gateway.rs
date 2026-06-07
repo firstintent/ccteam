@@ -2382,23 +2382,61 @@ fn spawn_turn_timeout_watchdog(
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
+    // v0.8.9 (owner request) — the watchdog now TERMINATES a runaway turn, not
+    // just notifies. Clone the session's adapter + thread so the spawned task
+    // can send the `esc` directive (Esc to a Claude pane) when the turn stalls.
+    let adapter = Arc::clone(&session.adapter);
+    let thread = session.thread.clone();
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
         if visible_events.load(Ordering::SeqCst) != start_visible_events {
-            return;
+            return; // the turn produced a visible answer → not stuck.
         }
+        // No answer within the timeout = a stalled / infinitely-looping turn
+        // (e.g. a roleless model spinning on tool calls). INTERRUPT it via the
+        // adapter's vendor-agnostic `esc` directive (Claude → Esc keystroke).
+        // This terminates the TURN, NOT the session — the pane stays alive
+        // ("never auto-kill a long session"); the user can simply send again.
+        // Best-effort: on failure we still notify (the user can `/stop`).
+        let esc = Directive {
+            name: "esc".to_string(),
+            args: String::new(),
+            choice: None,
+        };
+        let interrupted = match adapter.handle_directive(&thread, esc).await {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %err,
+                    "turn-watchdog: failed to interrupt the runaway turn"
+                );
+                false
+            }
+        };
         let (channel, chat_id) = match reply_to.lock() {
             Ok(target) => (target.channel.clone(), target.chat_id.clone()),
             Err(_) => (owner.channel.clone(), owner.chat_id.clone()),
+        };
+        let content = if interrupted {
+            format!(
+                "⏱️ turn {turn_id} produced no reply for {timeout:?} — the watchdog \
+                 interrupted it (the session is still alive; just send again to retry). \
+                 If this recurs the model may be looping: bind a role (e.g. cto) or give a \
+                 clearer task. Tune the limit via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS."
+            )
+        } else {
+            format!(
+                "⏱️ turn {turn_id} timed out after {timeout:?} for {session_id}; the watchdog \
+                 could not interrupt it — you may need to /stop the session."
+            )
         };
         let _ = tx.send(GatewayEvent {
             id: format!("gateway-timeout-{session_id}-{turn_id}"),
             channel,
             chat_id,
             thread_ts: None,
-            content: format!(
-                "gateway error: turn timed out after {timeout:?} for {session_id} turn {turn_id}"
-            ),
+            content,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
