@@ -1076,6 +1076,14 @@ impl Gateway {
         // — that is untouched, so plain-message reuse is preserved while `/new`
         // mints fresh.) `permission_mode` is honored as requested on every fresh
         // spawn (no reuse path that could silently downgrade hitl→skip).
+        //
+        // (v0.8.8 bug-fix) A project registered via REST `POST /projects` (or
+        // `ccteam init`) AFTER the daemon started lands in config.yaml but not
+        // yet in the in-memory `projects` cache, so sync from the registry SoT
+        // before the lookup — same `ensure_project_loaded` `/cd` uses. Without
+        // it the web "new project → new session" flow fails "unknown project"
+        // immediately after a successful project create.
+        self.ensure_project_loaded(&project);
         let cwd = self
             .projects
             .get(&project)
@@ -1188,6 +1196,9 @@ impl Gateway {
         let owner = old.owner.clone();
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
+        // (v0.8.8 bug-fix) sync a possibly-registered-after-start project from
+        // the config.yaml SoT before the lookup (mirrors start_session / `/cd`).
+        self.ensure_project_loaded(&project);
         let cwd = self
             .projects
             .get(&project)
@@ -4837,6 +4848,54 @@ mod tests {
             reply.iter().any(|r| r.contains("project set to dev-gamma")),
             "expected /cd to resolve the config-only project, got {reply:?}"
         );
+    }
+
+    /// v0.8.8 bug-fix — `create_session_api` (the web `POST /sessions` path)
+    /// must resolve a project registered in config.yaml AFTER daemon start, the
+    /// same way `/cd` does. Repro: a successful web `POST /projects` (registry
+    /// write) immediately followed by `POST /sessions` used to fail "unknown
+    /// project: <slug>" because `start_session` read only the stale in-memory
+    /// cache. Mirrors `gateway_cd_dynamically_loads_project_from_config` but on
+    /// the API create path (`ensure_project_loaded` now runs before the lookup).
+    #[tokio::test]
+    async fn gateway_create_session_api_loads_project_from_config() {
+        use ccteam_core::config::{upsert_project, ProjectEntry};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // A bare project dir registered straight into config.yaml (as REST
+        // `POST /projects` does) — NOT in the gateway's in-memory snapshot.
+        let delta_dir = paths.projects_root.join("dev-delta");
+        std::fs::create_dir_all(&delta_dir).unwrap();
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: "dev-delta".to_string(),
+                path: delta_dir.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        gateway.enable_project_creation(paths);
+
+        // Before the fix this returned Err "unknown project: dev-delta".
+        let sid = gateway
+            .create_session_api(
+                "dev-delta".to_string(),
+                "cto".to_string(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .expect("create_session_api must resolve a config-registered project");
+        assert!(sid.starts_with('s'), "expected an s<N> sid, got {sid}");
     }
 
     #[tokio::test]

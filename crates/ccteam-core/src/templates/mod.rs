@@ -581,7 +581,11 @@ mod tests {
             root["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1",
             "ccteam owns this env key and overwrites the user's stale value",
         );
-        assert_eq!(root["permissions"]["allow"][0], "*");
+        // ccteam widens permissions via the valid `defaultMode` (newer Claude
+        // Code rejects a bare `"*"` in an `allow` rule). ccteam-spawned sessions
+        // pass `--dangerously-skip-permissions` / `--permission-mode default` on
+        // the CLI (which override settings), so this only governs manual runs.
+        assert_eq!(root["permissions"]["defaultMode"], "bypassPermissions");
         // ccteam owns the hooks block wholesale.
         assert!(root["hooks"]["SessionStart"].is_array());
     }
