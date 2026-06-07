@@ -32,6 +32,23 @@
 
 ---
 
+## ★★ 决策锁定(TG 2399「确认」)
+
+需求讨论收口,以下**全部确认**,据此出 dev-prompt:
+- **IA**:统一 chat shell;session 列表 = 聊天导航(无「Chat」菜单);底部 = 插件市场 / Status / Settings;顶 bar cost pill;轻量 Status 视图。
+- **插件市场**:按 `marketplace-design.md`(ccteam↔hub↔项目 三角;开源走 ingestion 进 hub;浏览→正文预览→装到项目)。
+- **scope**:全压本版(UI 改造 + 市场 + agency-agents ingestion + 清 prompt 内容 + 填 hub + 死链清理)。
+- **catalog**:索引搬 hub,ccteam 不留市场目录。
+- **cto**:留作唯一 bootstrap 例外(`cto_role.md` 留 engine)。
+- **Roles→市场**:本版**只读浏览 + 安装**(在线编辑后续)。
+- **死链清理**:并入本版(supervisor/outbound + `chat_history`/`send_input` 死工具)。
+- **运维视图**:不单留 operator UI → 轻量 Status 进 shell。
+- **市场待定项 → 取默认**:取内容 = github raw + 本地缓存;ingestion = hub 侧 GitHub Action(+ 本地命令);安装 = **项目级**;更新 = 手动。
+
+→ dev-prompt 见同目录 **`dev-prompt.md`**。
+
+---
+
 ## 一、现状(已核实 routes + 数据源,代码为 SoT)
 
 `App.tsx` 双 `<Routes>`:
@@ -95,3 +112,4 @@
 - **2026-06-07 cto 例外 + hub scaffold**:①已定 —— cto 先留作唯一 bootstrap 例外(`cto_role.md` 留 repo);`ccteam-hub` 已 scaffold(README + `agents/`/`skills/`/`workflows/` + `index.json`,提交到 hub 仓库,TG 2388/2389)。
 - **2026-06-07 scope + catalog + UI 建议**(TG 2391):②**全压进 v0.8.9**(含 hub 填充 + agency-agents ingestion 管线);③**连索引也搬 hub**(catalog 移出 ccteam,市场列举全读 hub)。UI 决策(我建议):operator 视图不单留 → 轻量 Status 面板进统一 shell;顶 bar 加紧凑 cost pill。`prototype.html` 已加 cost pill + Status 视图演示。Roles 本版只读+装、死链清理建议并入(待 user 终拍)。**dev-prompt 暂不出**(user:需求讨论清楚再出)。
 - **2026-06-07 IA 修正(TG 2394)**:① 去掉「Chat」导航项 —— **左侧点 session 即进聊天**(session 列表 = 聊天导航);② 「Roles」**砍掉、升级成「插件市场」浏览器**(role 是市场里一个类目,不再独立);③ 底部全局页 = 插件市场 / Status / Settings。`prototype.html` 重做(市场视图 = 类目 Agents/Skills/Workflows + 来源 builtin/agency-agents + 安装/已装;去掉 Chat 菜单;session-点击=聊天 的模式)。
+- **2026-06-07 决策锁定 + dev-prompt(TG 2399「确认」)**:需求收口(★★ 决策锁定段)→ 写 `dev-prompt.md`(workflow + opus、dev 直推不 PR、跨 ccteam + ccteam-hub 两仓、5 阶段:清 prompt 内容+死链 → hub 填充+ingestion → 市场后端 → web UI 改造 → 文档+版本)。出 dev-prompt,待 user launch。
