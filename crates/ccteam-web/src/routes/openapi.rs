@@ -119,6 +119,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
+        (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap)"),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
@@ -138,6 +139,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         // capabilities
         .routes(routes!(super::capabilities::handle_capabilities))
+        // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
+        .routes(routes!(super::status::handle_status))
         // projects — GET list + POST create share `/api/v1/projects`;
         // GET detail + DELETE share `/api/v1/projects/{slug}`.
         .routes(routes!(

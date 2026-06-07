@@ -53,6 +53,8 @@ async fn spawn(state: AppState) -> SocketAddr {
 fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
     [
         ("GET", "/api/v1/capabilities"),
+        // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
+        ("GET", "/api/v1/status"),
         // projects
         ("GET", "/api/v1/projects"),
         ("POST", "/api/v1/projects"),
@@ -247,6 +249,8 @@ async fn openapi_json_and_docs_served_under_auth() {
         .expect("components.schemas object");
     for name in [
         "CapabilitiesResponse",
+        // v0.8.9 Phase 4 — daemon-wide status snapshot response body.
+        "StatusResponse",
         "HarnessCapability",
         "DashboardRow",
         "AuthToken",

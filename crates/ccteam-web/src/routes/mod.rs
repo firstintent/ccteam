@@ -48,6 +48,10 @@ pub mod screenshot;
 pub mod session;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.
 pub mod sessions_api;
+// v0.8.9 Phase 4 — daemon-wide status aggregate (`GET /api/v1/status`) for the
+// unified-shell cost pill + Status view. Merged into the `/api/v1`
+// OpenApiRouter (auto auth-gated).
+pub mod status;
 // v0.8.8 B5 — 共享「sid → per-session pane 名」解析(pty_ws + pane_snapshot
 // 共用,避免 vendor 分支两份漂移)。
 pub mod session_pane;

@@ -23,6 +23,13 @@ web-bundle = []
 
 [dependencies]
 ccteam-core.workspace = true
+# v0.8.9 Phase 4 — `GET /api/v1/status` reads each project's
+# `workflow.yaml::budgets_v060` (a `ccteam_cost::Budgets`) to surface the
+# aggregate 24h budget cap for the cost pill. `ccteam-cost` is a tiny leaf
+# (chrono/serde/toml) already pulled in transitively via `ccteam-core`; the
+# direct dep avoids dragging the full `ccteam-flow` orchestrator + WorkflowSpec
+# into the web crate just to read one budget field.
+ccteam-cost.workspace = true
 # V0.6.1 F139 — share the hook dispatch with the CLI so `POST
 # /internal/hook/...` runs the same code as `ccteam internal hook ...`.
 ccteam-hooks.workspace = true

@@ -535,6 +535,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "ccteam-core",
+ "ccteam-cost",
  "ccteam-harness",
  "ccteam-hooks",
  "ccteam-im",
