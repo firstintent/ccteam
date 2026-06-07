@@ -249,13 +249,12 @@ pub fn bootstrap_project(
 /// refresh helpers; this function assumes the caller already decided
 /// "this is a new install".
 pub fn bootstrap_project_at_dir(
-    // v0.8.6 (review-fix #3): `paths` used to feed the global
-    // helper-template stamp (`write_global_helper_templates(&paths.root,
-    // …)`); that write is gone (it only ever created an empty
-    // `~/.ccteam/templates/` that tripped the doctor home-drift check),
-    // so `paths` is no longer read here. Kept in the signature for API
-    // stability so existing callers (cli / web / im / tests) don't churn.
-    _paths: &CcteamPaths,
+    // `paths` is the global `~/.ccteam/` root. It feeds the
+    // home-ensure below (`ensure_ccteam_home`) so the `hook.sh`
+    // dispatcher the project settings reference actually exists. (It no
+    // longer feeds the dead helper-template stamp removed in v0.8.6
+    // review-fix #3.)
+    paths: &CcteamPaths,
     target_dir: &Path,
     slug: &str,
     // v0.8.6: `request` is no longer persisted (no `.ccteam/spec.md`,
@@ -264,6 +263,18 @@ pub fn bootstrap_project_at_dir(
     _request: &str,
     team: &str,
 ) -> Result<PathBuf> {
+    // Materialize the global `~/.ccteam/` home (canonical dirs +
+    // `hooks/hook.sh` dispatcher) BEFORE writing the project settings:
+    // `write_project_settings` lays down a `.claude/settings.local.json`
+    // whose SessionStart hook command points at
+    // `<paths.root>/hooks/hook.sh`. Historically only `ccteam init` /
+    // `chat_register` / `doctor --install-hooks` ran `install_hooks`, so
+    // the web `POST /projects` + IM/web chat create path that flows
+    // through here referenced a hook.sh that was never written →
+    // "hook.sh: not found" at first launch. Idempotent (cheap no-op when
+    // the home is already complete).
+    crate::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home before project settings")?;
+
     let project_dir = target_dir.to_path_buf();
     let ccteam_dir = project_dir.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
@@ -1066,6 +1077,84 @@ mod tests {
         assert!(
             !cmd.contains("__CCTEAM_BIN__"),
             "retired F89 placeholder should not return, got: {cmd}",
+        );
+    }
+
+    /// Root-cause regression: a project created via the web / IM /
+    /// daemon path (which all flow through `bootstrap_project_at_dir`)
+    /// writes a `.claude/settings.local.json` SessionStart hook that
+    /// points at `<paths.root>/hooks/hook.sh` — but that dispatcher was
+    /// never materialized on this path, yielding "hook.sh: not found" at
+    /// first launch. `bootstrap_project_at_dir` now calls
+    /// `ensure_ccteam_home` up front, so hook.sh must land + be exec.
+    #[test]
+    fn bootstrap_project_at_dir_materializes_hook_sh() {
+        ensure_isolation();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = tmp.path().join("workspace").join("my-repo");
+
+        bootstrap_project_at_dir(&paths, &project_dir, "demo", "(from web/IM chat)", "dev")
+            .unwrap();
+
+        let hook_sh = paths.hooks_script();
+        assert!(
+            hook_sh.exists(),
+            "bootstrap_project_at_dir must materialize {} (the dispatcher the project settings reference)",
+            hook_sh.display(),
+        );
+        let body = std::fs::read_to_string(&hook_sh).unwrap();
+        assert_eq!(
+            body,
+            crate::HOOK_DISPATCHER_SH,
+            "materialized hook.sh must be the embedded F139 dispatcher body",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook_sh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o755,
+                "hook.sh must be chmod 0755 so Claude Code can exec it"
+            );
+        }
+        // Canonical home dirs are present too (the second half of the
+        // home-ensure contract).
+        for sub in crate::canonical_home_dirs() {
+            assert!(
+                paths.root.join(sub).is_dir(),
+                "canonical home dir {sub:?} must exist under {}",
+                paths.root.display(),
+            );
+        }
+    }
+
+    /// `ensure_ccteam_home` is the shared idempotent home-ensure: a
+    /// re-run must succeed and leave hook.sh in place (it underpins the
+    /// daemon-start + every create path, all of which may run repeatedly).
+    #[test]
+    fn ensure_ccteam_home_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        crate::ensure_ccteam_home(&paths).unwrap();
+        let hook_sh = paths.hooks_script();
+        assert!(hook_sh.exists(), "first ensure must create hook.sh");
+
+        // Second call: still Ok, hook.sh still present + unchanged.
+        crate::ensure_ccteam_home(&paths).unwrap();
+        assert!(
+            hook_sh.exists(),
+            "hook.sh must survive the idempotent re-run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hook_sh).unwrap(),
+            crate::HOOK_DISPATCHER_SH,
         );
     }
 }

@@ -217,7 +217,10 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
-pub use paths::{agent_tasks_root, agent_teams_root, canonical_home_dirs, teams_progress_path};
+pub use paths::{
+    agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,
+    teams_progress_path,
+};
 pub use plan_approval::{PlanApprovalOnTimeout, PlanApprovalSpec};
 pub use progress::{
     current_agent_sessions, escalation_count, read_all_events, workflow_cost_total,

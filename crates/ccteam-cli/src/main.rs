@@ -1672,6 +1672,17 @@ fn run_start(
 
     let paths = CcteamPaths::from_env()?;
 
+    // Ensure the global `~/.ccteam/` home (canonical dirs +
+    // `hooks/hook.sh` dispatcher) is complete BEFORE the daemon starts
+    // serving, so any session it spawns — including projects created via
+    // the web / IM path while the daemon is up — finds the hook.sh the
+    // project `.claude/settings.local.json` references. Idempotent.
+    // Best-effort: a failure here must not crash the daemon (the
+    // per-create-path `ensure_ccteam_home` is the real safety net).
+    if let Err(err) = ccteam_core::ensure_ccteam_home(&paths) {
+        tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
+    }
+
     // V0.4.0 F60: the shipped team seed writer was deleted with the
     // phase machinery (F63 will reintroduce a workflow seed). Daemon
     // start no longer self-heals — operators supply their own

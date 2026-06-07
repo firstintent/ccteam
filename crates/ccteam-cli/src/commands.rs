@@ -85,16 +85,15 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // (`phases/templates/inbox/control`) are no longer written: nothing
     // reads them post-W2, and creating them made a fresh `ccteam init`
     // immediately report self-inflicted drift.
-    for sub in ccteam_core::canonical_home_dirs() {
-        let dir = paths.root.join(sub);
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-
-    // V0.6.1 F139 — materialize the per-hook dispatcher script. This
-    // must run before `install_project_at` so the freshly-rendered
-    // `.claude/settings.json` hook commands point at a file that
-    // actually exists.
-    install_hooks(paths).context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
+    //
+    // `ensure_ccteam_home` (ccteam-core) folds that canonical-dir loop
+    // and the V0.6.1 F139 `hook.sh` dispatcher materialization into one
+    // idempotent call shared by every create/start path (init here, the
+    // web/IM `bootstrap_project_at_dir`, the daemon at `ccteam start`).
+    // The hook.sh write must precede `install_project_at` so the
+    // freshly-rendered `.claude/settings.local.json` hook commands point
+    // at a file that actually exists.
+    ccteam_core::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home (dirs + hook.sh)")?;
 
     // -- 2. Resolve project install target ---------------------------
     let target = resolve_install_target(&opts)?;
