@@ -11,6 +11,22 @@
 
 把核心环路 —— **inbound(IM/web)→ spawn/resume session → agent 干活 → turn 完通知 → 人 steer** —— 打到"无聊地可靠",用一条 golden-path **soak** 量。不是加功能,是让这条路在真实失败态下零意外。
 
+## ★ 本版具体做什么(交付物 D1–D7)—— 直白版
+
+> v0.8.10 不做新功能,做的是下面这 7 样「修 + 测 + 收口」。每样都可落地、可验收。下文 §一–§五 是它们的 spec/细节;这里是"到底写什么代码"的清单。
+
+- **D1 · golden-path soak 测试框架(本版核心交付物)**:写一套**自动化 e2e + fault-injection harness**,跑核心环路(消息→`cd`→`init`→spawn→聊 N 轮含 1 次 HITL→断开→重连→resume→stop),并注入故障:**中途 kill daemon / 断网 / host suspend / 杀 pane**;跑 **默认 rmux × {claude, codex}**;断言不变式(零丢/零串/零静默失败/零 STUCK 误报/resume 精确)。= 既是"生产级"的度量,也是 bug 发现器。落点:确定性 fake(`CCTEAM_*_BIN`)那部分进 CI;真 rmux + 真 vendor 那部分 nas-box005 专机跑。**这是把"生产级"从口号变成可跑的绿灯。**
+- **D2 · 收口 backend 抽象(病根 a)**:grep 全仓所有绕过 `ProcessBackend`/`default_backend()` 直连 tmux 的地方(BUG-1/5/6 那类),全改走抽象;加一条 **guard 测试**:非 backend 路径 shell `tmux` 就失败。(v0.8.9 修了终端那处;本版做系统性扫尾。)
+- **D3 · 收口 session 身份(病根 b)**:审计所有按 role(而非 session id)keyed 的残留路径(历史/事件/终端/列举),全部改按 gateway session-map(唯一 SoT);加测试覆盖"同 role 多会话不串"。
+- **D4 · 修 state 失同步(病根 c)**:config↔内存(unknown-project 那类)、progress↔state(STUCK 字段曾无生产写入者)—— 补单向真相 + 同步点 + 每个状态字段必有写入者;加测试。
+- **D5 · 边界可靠性工程**:给每个跨进程/网络边界(`mcp.sock`、gateway outbound、rmux daemon 调用、IM send、SSE/WS)加 **timeout + retry + 幂等**;**daemon 重启恢复**(重启后按 id 重挂所有 live session)写测试;断网重连幂等。
+- **D6 · 通知可靠(原语 3)**:根除 turn 完成通知丢/错投 —— 修 outbound-ledger flake + file-send registry gap(已知),并发下测;每个 turn-done 必达对的 chat。
+- **D7 · 核心环路 bug backlog 清零**:v0.8.9 ship 后 pull dev,把"核心环路里"还没修的 bug 列出来逐个清(实机 dogfood 持续发现的也归这)。
+
+> 一句话:**D1 建度量 + 找 bug;D2/D3/D4 收三类病根;D5/D6 硬化边界与通知;D7 清核心环路 backlog。soak(D1)全绿 = 本版完成。**
+
+---
+
 ## 一、核心环路 + 不变式(永不破)
 
 ```
@@ -72,3 +88,4 @@
 
 ## 八、变更记录
 - **2026-06-07 初版**:v0.8.10 = 核心流程生产级(production hardening)。核心环路 + 不变式 + golden-path soak gate + 从文章提炼的 6 条生产要件 + 3 类病根收口 + "不加功能"铁律。候选,待 user review。
+- **2026-06-07 +具体交付物 D1–D7(TG 2415)**:user 反馈"没看懂具体开发什么" → 加 ★ 章把原则翻成可落地工作清单:D1 soak 测试框架(核心交付,e2e+fault-injection,度量+找 bug)/ D2 收口 backend 抽象 / D3 收口 session 身份 / D4 修 state 失同步 / D5 边界 timeout+retry+幂等+daemon 重启恢复 / D6 通知可靠 / D7 核心环路 bug backlog 清零。
