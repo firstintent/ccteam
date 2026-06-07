@@ -29,8 +29,11 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
-import { MessageSquare, Plus, Send, Square, Terminal } from "lucide-react";
+import { MessageSquare, Menu, Plus, Send, Square, Terminal, X } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
+import CostPill from "../components/CostPill";
+import MarketplaceView from "./MarketplaceView";
+import StatusView from "./StatusView";
 import SettingsPage from "./SettingsPage";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
@@ -82,15 +85,27 @@ const GLOBAL_VIEW_LABEL: Record<NonNullable<GlobalView>, string> = {
 
 /** One sidebar bottom-nav row (prototype `.nav a` / `.nav a.on`). `NavLink`
  *  drives the active highlight off the current route so a deep-link lands on
- *  the right item without prop-drilling. */
-function SidebarNavLink({ to, icon, label }: { to: string; icon: string; label: string }) {
+ *  the right item without prop-drilling. `onNavigate` lets the mobile drawer
+ *  close itself when a global page is chosen. */
+function SidebarNavLink({
+  to,
+  icon,
+  label,
+  onNavigate,
+}: {
+  to: string;
+  icon: string;
+  label: string;
+  onNavigate?: () => void;
+}) {
   return (
     <NavLink
       to={to}
+      onClick={onNavigate}
       className={({ isActive }) =>
         `flex items-center gap-2.5 px-2.5 py-2 rounded-md text-xs transition-colors ${
           isActive
-            ? "bg-surface-800 text-amber-300"
+            ? "bg-surface-800 text-brand-400"
             : "text-text-secondary hover:bg-surface-800/70 hover:text-text-primary"
         }`
       }
@@ -100,57 +115,6 @@ function SidebarNavLink({ to, icon, label }: { to: string; icon: string; label: 
       </span>
       {label}
     </NavLink>
-  );
-}
-
-/** Top-bar cost-pill SLOT — a placeholder the NEXT agent wires to the live
- *  today-spend / 24h-budget rollup (`cost-budget.json`). Rendered static for
- *  now so the slot exists, is on-theme, and the layout doesn't shift when it
- *  goes live. Carries a `data-testid` so the wiring agent can target it. */
-function CostPill() {
-  return (
-    <span
-      data-testid="cost-pill"
-      title="今日花费 / 24h 预算（接入中）"
-      className="text-[11px] font-mono px-2.5 py-1 rounded-full bg-surface-800 border border-surface-700/60 text-text-dim"
-    >
-      今日 <span className="text-text-secondary">$—</span> / $—
-    </span>
-  );
-}
-
-/** Plugin-marketplace global view — PLACEHOLDER. The NEXT agent fills this
- *  with the browse/install UI (role/skill/workflow from ccteam-hub +
- *  agency-agents). Stub renders a simple "coming this phase" panel. */
-function MarketplacePlaceholder() {
-  return (
-    <div data-testid="marketplace-placeholder" className="p-6 max-w-3xl">
-      <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
-      <p className="mt-1 text-sm text-text-secondary">
-        浏览 + 一键装 role/agent、skill、workflow（来源 ccteam-hub + agency-agents 等开源）。
-      </p>
-      <div className="mt-4 rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-6 text-xs text-text-dim">
-        市场浏览器在本阶段接入中（coming in this phase）。
-      </div>
-    </div>
-  );
-}
-
-/** Lightweight Status global view — PLACEHOLDER. The NEXT agent fills this
- *  with the daemon-health / sessions / today-cost rollup that replaces the
- *  retired operator dashboard. Stub renders a simple "coming this phase"
- *  panel. */
-function StatusPlaceholder() {
-  return (
-    <div data-testid="status-placeholder" className="p-6 max-w-3xl">
-      <h2 className="text-base font-semibold text-text-primary">Status · 运维总览</h2>
-      <p className="mt-1 text-sm text-text-secondary">
-        轻量运维视图（daemon 健康 + 各 session 状态 + 今日成本），取代旧 operator dashboard。
-      </p>
-      <div className="mt-4 rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-6 text-xs text-text-dim">
-        运维总览在本阶段接入中（coming in this phase）。
-      </div>
-    </div>
   );
 }
 
@@ -170,6 +134,10 @@ export default function ChatConsole() {
   const [draft, setDraft] = useState("");
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const [modalOpen, setModalOpen] = useState(false);
+  // Mobile sidebar drawer (the fixed `w-60` rail is off-canvas under `md`; a
+  // hamburger toggles it). Closed by default; auto-closed on a session switch
+  // / global-nav pick so the chosen surface is visible without a manual close.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Per-sid transcript. Seeded from localStorage on sid change, then from
   // mirrored history, then live-appended from SSE. Keying on sid is THE
@@ -405,6 +373,7 @@ export default function ChatConsole() {
     (s: RailSession) => {
       navigate(`/chat/s/${encodeURIComponent(s.sid)}`);
       setView("chat");
+      setSidebarOpen(false);
     },
     [navigate],
   );
@@ -445,47 +414,86 @@ export default function ChatConsole() {
   return (
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
       {/* standalone app bar */}
-      <header className="h-12 shrink-0 border-b border-surface-700/40 px-4 flex items-center gap-3">
-        <MessageSquare className="h-4 w-4 text-amber-400 shrink-0" />
+      <header className="h-12 shrink-0 border-b border-surface-700/40 px-3 sm:px-4 flex items-center gap-2 sm:gap-3">
+        {/* mobile drawer toggle — hidden on md+ where the rail is always shown */}
+        <button
+          type="button"
+          onClick={() => setSidebarOpen(true)}
+          aria-label="打开会话列表"
+          className="md:hidden h-8 w-8 -ml-1 grid place-items-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-800"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+        <MessageSquare className="h-4 w-4 text-brand-400 shrink-0" />
         <span className="text-sm font-semibold">
-          ccteam <span className="text-amber-400">chat</span>
+          ccteam <span className="text-brand-400">chat</span>
         </span>
         <span className="hidden sm:inline text-[11px] font-mono text-text-dim px-1.5 py-0.5 rounded bg-surface-800">
           per-session · /api/v1
         </span>
-        <span className="flex items-center gap-1.5 text-xs text-text-dim">
+        <span className="hidden sm:flex items-center gap-1.5 text-xs text-text-dim">
           <span
             className={`h-2 w-2 rounded-full ${
-              connected ? "bg-green-400" : gatewayUnavailable || lastError ? "bg-red-500" : "bg-amber-500"
+              connected
+                ? "bg-status-running"
+                : gatewayUnavailable || lastError
+                  ? "bg-status-error"
+                  : "bg-brand-500"
             }`}
           />
           {statusText}
         </span>
         <span className="flex-1" />
-        {/* Cost-pill SLOT — wired by the next agent (today's daily-spend /
-            24h-budget rollup). Static placeholder so the slot exists + the
-            layout doesn't shift when it goes live. */}
+        {/* Cost pill — today's daily-spend / 24h-budget rollup; click → /status. */}
         <CostPill />
       </header>
 
       <div className="flex flex-1 min-h-0">
-        {/* left rail — every project's gateway sessions, grouped */}
-        <aside className="w-60 shrink-0 border-r border-surface-700/40 flex flex-col">
+        {/* mobile drawer backdrop — only when open + below md. Click to close. */}
+        {sidebarOpen ? (
+          <button
+            type="button"
+            aria-label="关闭会话列表"
+            onClick={() => setSidebarOpen(false)}
+            className="md:hidden fixed inset-0 top-12 z-30 bg-black/50"
+          />
+        ) : null}
+        {/* left rail — every project's gateway sessions, grouped. On md+ it is
+            a static `w-60` column; below md it is an off-canvas drawer toggled
+            by the header hamburger (slides in over the backdrop). */}
+        <aside
+          className={`w-60 shrink-0 border-r border-surface-700/40 flex flex-col bg-surface-900 ${
+            sidebarOpen
+              ? "fixed inset-y-0 top-12 left-0 z-40 md:static md:top-0"
+              : "hidden md:flex"
+          }`}
+        >
           <div className="h-10 shrink-0 px-3 flex items-center justify-between border-b border-surface-700/30">
             <span className="text-xs font-mono uppercase text-text-dim">所有 session</span>
-            <button
-              type="button"
-              onClick={() => {
-                // bug5 — refetch so a project created out-of-band (CLI
-                // `ccteam init`) is in the list when the modal opens.
-                void refreshSessions();
-                setModalOpen(true);
-              }}
-              className="h-6 px-2 rounded-md bg-amber-500/90 text-surface-950 hover:bg-amber-400 text-xs flex items-center gap-1"
-              title="新建 session"
-            >
-              <Plus className="h-3.5 w-3.5" /> 新建
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  // bug5 — refetch so a project created out-of-band (CLI
+                  // `ccteam init`) is in the list when the modal opens.
+                  void refreshSessions();
+                  setModalOpen(true);
+                }}
+                className="h-6 px-2 rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs flex items-center gap-1"
+                title="新建 session"
+              >
+                <Plus className="h-3.5 w-3.5" /> 新建
+              </button>
+              {/* close affordance inside the drawer (mobile only) */}
+              <button
+                type="button"
+                onClick={() => setSidebarOpen(false)}
+                aria-label="关闭"
+                className="md:hidden h-6 w-6 grid place-items-center rounded-md text-text-dim hover:text-text-primary hover:bg-surface-800"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-2">
             {projects.map((project) => {
@@ -510,20 +518,22 @@ export default function ChatConsole() {
                         >
                           <span
                             className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                              active ? "bg-green-400" : "bg-surface-500"
+                              active ? "bg-status-running" : "bg-surface-700"
                             }`}
                           />
                           <span
                             className={`font-mono px-1 rounded text-[10px] ${
-                              isClaude ? "bg-amber-500/15 text-amber-300" : "bg-sky-500/15 text-sky-300"
+                              isClaude
+                                ? "bg-vendor-claude/15 text-vendor-claude"
+                                : "bg-vendor-codex/15 text-vendor-codex"
                             }`}
                           >
                             {s.vendor}
                           </span>
-                          <span className="truncate flex-1">{s.role}</span>
+                          <span className="truncate flex-1">{s.role || "(无 role)"}</span>
                           {s.permission_mode === "hitl" ? (
                             <span
-                              className="font-mono text-[9px] text-amber-300/90"
+                              className="font-mono text-[9px] text-brand-400/90"
                               title="HITL: 非 allowlist 工具需批准"
                             >
                               hitl
@@ -555,9 +565,24 @@ export default function ChatConsole() {
               ↑ 点上面的会话 = 进入它的聊天（每个 session 一个独立对话）。下面是全局页：
             </p>
             <div className="space-y-0.5">
-              <SidebarNavLink to="/marketplace" icon="🧩" label="插件市场" />
-              <SidebarNavLink to="/status" icon="📊" label="Status" />
-              <SidebarNavLink to="/settings" icon="⚙︎" label="Settings" />
+              <SidebarNavLink
+                to="/marketplace"
+                icon="🧩"
+                label="插件市场"
+                onNavigate={() => setSidebarOpen(false)}
+              />
+              <SidebarNavLink
+                to="/status"
+                icon="📊"
+                label="Status"
+                onNavigate={() => setSidebarOpen(false)}
+              />
+              <SidebarNavLink
+                to="/settings"
+                icon="⚙︎"
+                label="Settings"
+                onNavigate={() => setSidebarOpen(false)}
+              />
             </div>
           </nav>
         </aside>
@@ -574,11 +599,13 @@ export default function ChatConsole() {
                 <span className="text-xs text-text-dim shrink-0">会话 →</span>
                 {activeView ? (
                   <span className="flex items-center gap-2 text-xs min-w-0">
-                    <span className="text-green-400">●</span>
+                    <span className="text-status-running">●</span>
                     <span className="font-semibold truncate">{activeView.project}</span>
                     <span className="text-text-dim">/</span>
                     <span
-                      className={activeView.vendor === "claude" ? "text-amber-300" : "text-sky-300"}
+                      className={
+                        activeView.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"
+                      }
                     >
                       {[activeView.vendor, activeView.role].filter(Boolean).join(" · ")}
                     </span>
@@ -599,7 +626,7 @@ export default function ChatConsole() {
                 type="button"
                 onClick={stopActive}
                 title="停止会话"
-                className="h-7 px-2 rounded text-xs flex items-center gap-1 text-text-dim hover:text-red-300 hover:bg-surface-800"
+                className="h-7 px-2 rounded text-xs flex items-center gap-1 text-text-dim hover:text-status-error hover:bg-surface-800"
               >
                 <Square className="h-3.5 w-3.5" /> 停止
               </button>
@@ -635,9 +662,9 @@ export default function ChatConsole() {
               {globalView === "settings" ? (
                 <SettingsPage />
               ) : globalView === "marketplace" ? (
-                <MarketplacePlaceholder />
+                <MarketplaceView />
               ) : (
-                <StatusPlaceholder />
+                <StatusView rail={railSessions} />
               )}
             </div>
           ) : showTerminal && activeView?.project && sid ? (
@@ -659,9 +686,9 @@ export default function ChatConsole() {
                       return (
                         <div
                           key={row.id}
-                          className="max-w-[760px] rounded-md px-3 py-2.5 text-sm bg-amber-500/10 border border-amber-500/30"
+                          className="max-w-[760px] rounded-md px-3 py-2.5 text-sm bg-brand-500/10 border border-brand-500/30"
                         >
-                          <div className="text-amber-200 mb-2">{row.content}</div>
+                          <div className="text-brand-400 mb-2">{row.content}</div>
                           <div className="flex flex-wrap gap-2">
                             {(row.options ?? []).map((opt, i) => (
                               <button
@@ -669,7 +696,7 @@ export default function ChatConsole() {
                                 type="button"
                                 disabled={row.resolved}
                                 onClick={() => resolveApproval(row, i)}
-                                className="h-7 px-3 rounded-md text-xs bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40"
+                                className="h-7 px-3 rounded-md text-xs bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40"
                               >
                                 {opt.label}
                               </button>
@@ -693,7 +720,7 @@ export default function ChatConsole() {
                         key={row.id}
                         className={`max-w-[760px] rounded-md px-3 py-2 text-sm leading-6 whitespace-pre-wrap break-words ${
                           row.kind === "user"
-                            ? "ml-auto bg-amber-500/15 border border-amber-500/20"
+                            ? "ml-auto bg-brand-dim/40 border border-brand-500/20"
                             : row.kind === "tool"
                               ? "bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
                               : "bg-surface-800 border border-surface-700/40"
@@ -717,14 +744,14 @@ export default function ChatConsole() {
                       }
                     }}
                     disabled={!sid}
-                    className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+                    className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
                     placeholder={sid ? "发消息 / 命令(/compact /clear …)…" : "先选一个 session"}
                   />
                   <button
                     type="button"
                     onClick={submit}
                     disabled={!sid}
-                    className="h-11 w-11 shrink-0 rounded-md bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40 grid place-items-center"
+                    className="h-11 w-11 shrink-0 rounded-md bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40 grid place-items-center"
                     title={sid ? "发送" : "未选择 session"}
                   >
                     <Send className="h-4 w-4" />
@@ -965,7 +992,7 @@ function NewSessionModal({
             value={project}
             onChange={(event) => setProject(event.target.value)}
             disabled={pending}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
           >
             {projects.length === 0 && !isNew ? (
               <option value="">（暂无已有项目）</option>
@@ -979,7 +1006,7 @@ function NewSessionModal({
           </select>
 
           {isNew ? (
-            <div className="space-y-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+            <div className="space-y-3 rounded-md border border-brand-500/30 bg-brand-500/5 p-3">
               <div>
                 <label className="block text-xs text-text-dim mb-1">项目名（slug）</label>
                 <input
@@ -988,10 +1015,10 @@ function NewSessionModal({
                   disabled={pending}
                   autoFocus
                   placeholder="my-project"
-                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
                 />
                 {newSlug.length > 0 && newSlugErr ? (
-                  <div className="mt-1 text-[11px] text-red-400">{newSlugErr}</div>
+                  <div className="mt-1 text-[11px] text-status-error">{newSlugErr}</div>
                 ) : null}
               </div>
               <div>
@@ -1001,10 +1028,10 @@ function NewSessionModal({
                   onChange={(event) => setNewPath(event.target.value)}
                   disabled={pending}
                   placeholder="~/code/my-project 或 /abs/path"
-                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-amber-500 disabled:opacity-40"
+                  className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm font-mono outline-none focus:border-brand-500 disabled:opacity-40"
                 />
                 {newPath.length > 0 && newPathErr ? (
-                  <div className="mt-1 text-[11px] text-red-400">{newPathErr}</div>
+                  <div className="mt-1 text-[11px] text-status-error">{newPathErr}</div>
                 ) : null}
               </div>
             </div>
@@ -1037,7 +1064,7 @@ function NewSessionModal({
             value={selectedRole}
             onChange={(event) => setRole(event.target.value)}
             disabled={pending || roleLoading}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-amber-500 disabled:opacity-40"
+            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
           >
             {roleChoices.map((c) => (
               <option key={c.value} value={c.value}>
@@ -1052,7 +1079,7 @@ function NewSessionModal({
               checked={hitl}
               disabled={pending}
               onChange={(event) => setHitl(event.target.checked)}
-              className="accent-amber-500"
+              className="accent-brand-500"
             />
             HITL 批准（非 allowlist 工具需在此点同意/拒绝）
           </label>
@@ -1091,7 +1118,7 @@ function NewSessionModal({
             type="button"
             disabled={!ready}
             onClick={submit}
-            className="h-9 px-3 rounded-md text-sm bg-amber-500 text-surface-950 hover:bg-amber-400 disabled:opacity-40 flex items-center gap-1.5"
+            className="h-9 px-3 rounded-md text-sm bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40 flex items-center gap-1.5"
           >
             {pending ? (
               <>

@@ -1,0 +1,684 @@
+// v0.8.9 Phase 4 — plugin-marketplace browser (the global view that replaces
+// the retired read-only Roles page; prototype `#v-market`).
+//
+// Browse + one-click install role/agent · skill · workflow from ccteam-hub
+// (curated + ingested agency-agents etc.). Flow (marketplace-design §五):
+//   底部点市场 → 选类目/来源/搜 → 点卡看正文 → 安装到当前项目 → 立刻能在新建
+//   session 里选用.
+//
+// Data: a PROJECT PICKER selects the install target; the decorated
+// `GET /api/v1/projects/{slug}/marketplace` gives per-project `installed_status`
+// so cards can flip to 已装/更新. With no project selected (none exist, or
+// none picked) we show the UNDECORATED global catalog (browse-only) and the
+// install button is disabled with a "pick a project" hint.
+//
+// Four states per the v0.8.8 web UI quality baseline: loading / error /
+// empty (no plugins in this category) / success. Install → POST → toast →
+// re-fetch the decorated catalog → card flips. The detail drawer fetches the
+// body lazily (marked-rendered markdown = review-before-install) + upstream +
+// license + an install button.
+//
+// Theme discipline: surface-*/brand-*/text-*/status-* + the vendor-* tokens
+// only — NO bare Tailwind color literals (mirrors SettingsPage).
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+import { ExternalLink, RefreshCw, X } from "lucide-react";
+import { fetchDashboard } from "../lib/dashboardApi";
+import {
+  getMarketplace,
+  getPluginBody,
+  getProjectMarketplace,
+  installPlugin,
+  type HubPlugin,
+  type InstalledStatus,
+} from "../lib/marketplaceApi";
+import {
+  CATEGORIES,
+  cardInstallNeedsPreview,
+  distinctSources,
+  filterPlugins,
+  installable,
+  installedStatusLabel,
+} from "../lib/marketplaceFormat";
+import { toastBus } from "../lib/toastBus";
+
+/** A catalog plugin enriched with an (optional) per-project install status —
+ *  the global catalog has none (browse-only), the decorated one does. */
+type CatalogPlugin = HubPlugin & { installed_status?: InstalledStatus };
+
+type LoadState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; plugins: CatalogPlugin[]; generatedAt: string };
+
+const SRC_ALL = "__all";
+
+export default function MarketplaceView() {
+  // ---- install-target project picker -------------------------------------
+  const [projects, setProjects] = useState<string[]>([]);
+  const [project, setProject] = useState<string>("");
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+
+  // ---- catalog -----------------------------------------------------------
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [refreshing, setRefreshing] = useState(false);
+
+  // ---- filters -----------------------------------------------------------
+  const [category, setCategory] = useState<HubPlugin["type"]>("agent");
+  const [source, setSource] = useState<string>(SRC_ALL);
+  const [query, setQuery] = useState("");
+
+  // ---- detail drawer -----------------------------------------------------
+  const [detailId, setDetailId] = useState<string | null>(null);
+
+  // Load the install-target project list once (cross-shell, like the rail).
+  useEffect(() => {
+    let cancelled = false;
+    fetchDashboard()
+      .then((rows) => {
+        if (cancelled) return;
+        const slugs = rows.map((r) => r.slug).sort();
+        setProjects(slugs);
+        // Default to the first project so the common case (one project) needs
+        // no extra click; an empty list leaves us in browse-only mode.
+        setProject((cur) => cur || slugs[0] || "");
+        setProjectsLoaded(true);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+        setProjectsLoaded(true); // browse-only fallback (global catalog)
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch the catalog — decorated when a project is selected, global otherwise.
+  // The actual network + state-transition core; state is only ever set inside
+  // the async `.then`/`.catch` (never synchronously in the effect body) so the
+  // react-hooks/set-state-in-effect rule stays clean. `refresh` bypasses the
+  // hub cache (the "刷新目录" button + a post-install re-fetch).
+  const fetchCatalog = useCallback(
+    (refresh: boolean) => {
+      const decorate = project.length > 0;
+      const req = decorate ? getProjectMarketplace(project, refresh) : getMarketplace(refresh);
+      return req
+        .then((index) => {
+          setState({
+            kind: "ready",
+            plugins: index.plugins as CatalogPlugin[],
+            generatedAt: index.generated_at,
+          });
+        })
+        .catch((e) => {
+          if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+          const message = e instanceof Error ? e.message : "加载市场失败";
+          setState({ kind: "error", message });
+        });
+    },
+    [project],
+  );
+
+  // Event-handler reload (refresh button / project switch / post-install): we
+  // CAN reset to a loading/refreshing state synchronously here because this
+  // runs from a user gesture, not an effect body.
+  const reload = useCallback(
+    (refresh: boolean) => {
+      if (!projectsLoaded) return;
+      if (refresh) setRefreshing(true);
+      else setState({ kind: "loading" });
+      void fetchCatalog(refresh).finally(() => setRefreshing(false));
+    },
+    [fetchCatalog, projectsLoaded],
+  );
+
+  // Initial / dependency-driven load. We fetch directly (no synchronous
+  // setState in the effect body); the initial `state` is already `loading`, so
+  // there's nothing to reset on the first run. On a later `project` switch this
+  // effect re-fires (fetchCatalog deps on `project`) to fetch the new catalog;
+  // the select's onChange shows the loading state synchronously for feedback.
+  useEffect(() => {
+    if (!projectsLoaded) return;
+    void fetchCatalog(false);
+  }, [fetchCatalog, projectsLoaded]);
+
+  // Distinct sources for the filter — derived from whatever the catalog holds.
+  const sources = useMemo(
+    () => (state.kind === "ready" ? distinctSources(state.plugins) : []),
+    [state],
+  );
+
+  // The cards to show = category + source + search filtered.
+  const visible = useMemo(() => {
+    if (state.kind !== "ready") return [];
+    return filterPlugins(state.plugins, {
+      type: category,
+      source: source === SRC_ALL ? null : source,
+      query,
+    });
+  }, [state, category, source, query]);
+
+  // Counts per category (so the seg tabs can show non-empty categories even
+  // when the active one is empty) + to drive the empty-state copy.
+  const countByType = useMemo(() => {
+    const counts: Record<string, number> = {};
+    if (state.kind === "ready") {
+      for (const p of state.plugins) counts[p.type] = (counts[p.type] ?? 0) + 1;
+    }
+    return counts;
+  }, [state]);
+
+  const detailPlugin = useMemo(
+    () =>
+      state.kind === "ready" ? state.plugins.find((p) => p.id === detailId) ?? null : null,
+    [state, detailId],
+  );
+
+  // ---- install -----------------------------------------------------------
+  const [installing, setInstalling] = useState<string | null>(null);
+  const doInstall = useCallback(
+    (plugin: CatalogPlugin) => {
+      if (!project) {
+        toastBus.handler?.error("先选一个安装目标项目");
+        return;
+      }
+      // An update (sha differs) overwrites → pass force; a fresh install does
+      // not (a 409 then means a stray file we shouldn't clobber silently).
+      const force = plugin.installed_status === "update_available";
+      setInstalling(plugin.id);
+      installPlugin(project, plugin.id, force)
+        .then((res) => {
+          toastBus.handler?.info(
+            `已安装 ${res.id} → ${project}${res.overwrote ? "（已更新）" : ""}`,
+          );
+          // Re-fetch the decorated catalog so the card flips to 已装 — quietly
+          // (no loading flash; only the resolved result updates the grid).
+          void fetchCatalog(false);
+          setDetailId(null);
+        })
+        .catch((e) => {
+          if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+          toastBus.handler?.error(
+            `安装失败: ${e instanceof Error ? e.message : "unknown"}`,
+          );
+        })
+        .finally(() => setInstalling(null));
+    },
+    [project, fetchCatalog],
+  );
+
+  return (
+    <div data-testid="marketplace-view" className="p-6 max-w-[1000px] mx-auto">
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
+          <p className="mt-1 text-sm text-text-secondary">
+            浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents
+            等开源。装到所选项目。
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => reload(true)}
+          disabled={refreshing || state.kind === "loading"}
+          title="刷新目录（重新拉 hub index）"
+          className="shrink-0 h-8 px-2.5 rounded-md text-xs flex items-center gap-1.5 border border-surface-700/60 text-text-secondary hover:text-text-primary hover:bg-surface-800 disabled:opacity-40"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
+          刷新目录
+        </button>
+      </div>
+
+      {/* filter bar: project target · category seg · source · search */}
+      <div className="mt-4 flex flex-wrap items-center gap-2.5">
+        <label className="flex items-center gap-1.5 text-xs text-text-dim">
+          安装到
+          <select
+            value={project}
+            onChange={(e) => {
+              // Switching the install target re-fetches (the load effect keys
+              // on `project`); show the loading state immediately for feedback.
+              setProject(e.target.value);
+              setState({ kind: "loading" });
+            }}
+            className="h-8 rounded-md bg-surface-800 border border-surface-700 px-2.5 text-xs text-text-primary outline-none focus:border-brand-500"
+            aria-label="安装目标项目"
+          >
+            {projects.length === 0 ? <option value="">（无项目 · 仅浏览）</option> : null}
+            {projects.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="flex items-center gap-0.5 rounded-md bg-surface-800 p-0.5" role="tablist">
+          {CATEGORIES.map((c) => (
+            <button
+              key={c.type}
+              type="button"
+              role="tab"
+              aria-selected={category === c.type}
+              onClick={() => setCategory(c.type)}
+              className={`h-7 px-3 rounded text-xs ${
+                category === c.type
+                  ? "bg-surface-700 text-text-primary"
+                  : "text-text-dim hover:text-text-secondary"
+              }`}
+            >
+              {c.label}
+              {countByType[c.type] ? (
+                <span className="ml-1.5 text-[10px] text-text-dim">{countByType[c.type]}</span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+
+        <select
+          value={source}
+          onChange={(e) => setSource(e.target.value)}
+          className="h-8 rounded-md bg-surface-800 border border-surface-700 px-2.5 text-xs text-text-primary outline-none focus:border-brand-500"
+          aria-label="来源筛选"
+        >
+          <option value={SRC_ALL}>全部来源</option>
+          {sources.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="搜索插件（id / 名称 / 描述 / tag）…"
+          aria-label="搜索插件"
+          className="flex-1 min-w-[140px] h-8 rounded-md bg-surface-800 border border-surface-700 px-3 text-xs text-text-primary placeholder:text-text-dim outline-none focus:border-brand-500"
+        />
+      </div>
+
+      {/* four states */}
+      <div className="mt-4">
+        {state.kind === "loading" ? (
+          <div
+            data-testid="marketplace-loading"
+            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
+          >
+            加载市场目录中…
+          </div>
+        ) : state.kind === "error" ? (
+          <div
+            data-testid="marketplace-error"
+            role="alert"
+            className="rounded-lg border border-status-error/40 bg-status-error/10 px-4 py-4 text-sm text-status-error"
+          >
+            <div>加载市场失败: {state.message}</div>
+            <button
+              type="button"
+              onClick={() => reload(true)}
+              className="mt-2 h-7 px-2.5 rounded-md text-xs border border-surface-700/60 text-text-secondary hover:text-text-primary hover:bg-surface-800"
+            >
+              重试
+            </button>
+          </div>
+        ) : visible.length === 0 ? (
+          <div
+            data-testid="marketplace-empty"
+            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
+          >
+            {query.trim()
+              ? `没有匹配「${query.trim()}」的插件。`
+              : "该类目暂无插件。"}
+          </div>
+        ) : (
+          <div
+            data-testid="marketplace-grid"
+            className="grid gap-3"
+            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" }}
+          >
+            {visible.map((plugin) => (
+              <PluginCard
+                key={plugin.id}
+                plugin={plugin}
+                installing={installing === plugin.id}
+                canInstall={project.length > 0}
+                onOpen={() => setDetailId(plugin.id)}
+                // review-before-install (装前 review): a NEVER-installed persona
+                // must be previewable before it lands (it executes as an agent
+                // once installed), so first-install routes through the drawer
+                // (where the body preview + the real Install button live). An
+                // `update_available` plugin was already reviewed once → install
+                // directly from the card. (see cardInstallNeedsPreview)
+                onInstall={() =>
+                  cardInstallNeedsPreview(plugin.installed_status)
+                    ? setDetailId(plugin.id)
+                    : doInstall(plugin)
+                }
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {detailPlugin ? (
+        <PluginDrawer
+          key={detailPlugin.id}
+          plugin={detailPlugin}
+          project={project}
+          installing={installing === detailPlugin.id}
+          onClose={() => setDetailId(null)}
+          onInstall={() => doInstall(detailPlugin)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------
+// Card
+// --------------------------------------------------------------------------
+
+/** Vendor-neutral source badge. `builtin` = the muted "none" badge; anything
+ *  else (an ingested open-source source) = the accent badge. Theme tokens
+ *  only. */
+function SourceBadge({ source }: { source: string }) {
+  const builtin = source === "builtin" || source === "";
+  return (
+    <span
+      className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+        builtin
+          ? "bg-surface-700 text-text-dim"
+          : "bg-accent-500/15 text-accent-500"
+      }`}
+    >
+      {source || "builtin"}
+    </span>
+  );
+}
+
+/** The install button / state pill driven by `installed_status`. When no
+ *  install target is selected the action is disabled with a hint. */
+export function InstallButton({
+  status,
+  installing,
+  canInstall,
+  onInstall,
+}: {
+  status: InstalledStatus | undefined;
+  installing: boolean;
+  canInstall: boolean;
+  onInstall: () => void;
+}) {
+  // No per-project decoration (global browse) → treat as not_installed.
+  const st: InstalledStatus = status ?? "not_installed";
+  if (st === "installed") {
+    return (
+      <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">
+        已装
+      </span>
+    );
+  }
+  const label = installedStatusLabel(st);
+  return (
+    <button
+      type="button"
+      disabled={installing || !canInstall}
+      onClick={(e) => {
+        e.stopPropagation();
+        onInstall();
+      }}
+      title={canInstall ? undefined : "先选一个安装目标项目"}
+      className={`text-xs font-medium px-3 py-1 rounded-md disabled:opacity-40 disabled:cursor-not-allowed ${
+        st === "update_available"
+          ? "bg-brand-500/15 text-brand-400 hover:bg-brand-500/25"
+          : "bg-brand-500 text-surface-950 hover:bg-brand-400"
+      }`}
+    >
+      {installing ? "安装中…" : label}
+    </button>
+  );
+}
+
+export function PluginCard({
+  plugin,
+  installing,
+  canInstall,
+  onOpen,
+  onInstall,
+}: {
+  plugin: CatalogPlugin;
+  installing: boolean;
+  canInstall: boolean;
+  onOpen: () => void;
+  onInstall: () => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className="text-left flex flex-col gap-2 rounded-lg bg-surface-900 border border-surface-700/60 hover:border-brand-500/50 p-3.5 cursor-pointer transition-colors"
+    >
+      <div className="flex items-center gap-2">
+        <b className="text-sm text-text-primary truncate">{plugin.name || plugin.id}</b>
+        <SourceBadge source={plugin.source} />
+      </div>
+      <p className="text-xs text-text-secondary flex-1 line-clamp-3">{plugin.description}</p>
+      <div className="flex items-center gap-2">
+        {plugin.license ? (
+          <span className="text-[10px] font-mono text-text-dim">{plugin.license}</span>
+        ) : null}
+        {plugin.tags.slice(0, 2).map((t) => (
+          <span key={t} className="text-[10px] font-mono text-text-dim/80">
+            {`#${t}`}
+          </span>
+        ))}
+        <span className="ml-auto">
+          <InstallButton
+            status={plugin.installed_status}
+            installing={installing}
+            canInstall={canInstall}
+            onInstall={onInstall}
+          />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------
+// Detail drawer (review-before-install)
+// --------------------------------------------------------------------------
+
+type BodyState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; html: string };
+
+/** Render hub markdown to SANITIZED HTML for the body preview.
+ *
+ *  The hub ingests THIRD-PARTY open-source `.md` (agency-agents etc.) verbatim
+ *  and `marked@18` does NOT sanitize, so a malicious/compromised upstream body
+ *  could smuggle `<img onerror=…>` / `javascript:` as stored-XSS at full
+ *  same-origin (web-token) privilege. We run the rendered HTML through
+ *  DOMPurify (defense-in-depth) before it ever reaches `dangerouslySetInnerHTML`.
+ *
+ *  DOMPurify needs a DOM: in the browser bundle its default export is a ready
+ *  instance, so `.sanitize` exists and strips the dangerous markup. In a
+ *  non-DOM env (e.g. the node-based vitest renderer importing this module) the
+ *  default export is an uninstantiated factory with no `.sanitize`; we guard so
+ *  the import path never throws — the un-sanitized fallback is harmless there
+ *  because nothing renders it (the drawer is browser-only). */
+function renderBody(markdown: string): string {
+  const html = marked.parse(markdown, { async: false }) as string;
+  return typeof DOMPurify.sanitize === "function" ? DOMPurify.sanitize(html) : html;
+}
+
+export function PluginDrawer({
+  plugin,
+  project,
+  installing,
+  onClose,
+  onInstall,
+}: {
+  plugin: CatalogPlugin;
+  project: string;
+  installing: boolean;
+  onClose: () => void;
+  onInstall: () => void;
+}) {
+  // Initial state is `loading`; the drawer is keyed on `plugin.id` at its
+  // call-site, so opening a different plugin REMOUNTS this component and the
+  // initializer is the reset — no synchronous setState in the effect body
+  // (keeps react-hooks/set-state-in-effect clean).
+  const [body, setBody] = useState<BodyState>({ kind: "loading" });
+
+  useEffect(() => {
+    let cancelled = false;
+    getPluginBody(plugin.id)
+      .then((res) => {
+        if (cancelled) return;
+        // marked is sync for a string input; DOMPurify then strips any XSS the
+        // ingested third-party markdown could carry (see renderBody).
+        setBody({ kind: "ready", html: renderBody(res.body) });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+        setBody({
+          kind: "error",
+          message: e instanceof Error ? e.message : "加载正文失败",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [plugin.id]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/50 flex justify-end"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label={`插件详情 ${plugin.name || plugin.id}`}
+    >
+      <div
+        className="w-full max-w-xl h-full bg-surface-900 border-l border-surface-700 shadow-xl flex flex-col animate-slide-in-right"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onClose();
+          }
+        }}
+      >
+        <div className="h-12 shrink-0 px-4 flex items-center gap-2 border-b border-surface-700/50">
+          <b className="text-sm text-text-primary truncate">{plugin.name || plugin.id}</b>
+          <SourceBadge source={plugin.source} />
+          <span className="flex-1" />
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="关闭"
+            className="text-text-dim hover:text-text-primary p-1"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+          <p className="text-sm text-text-secondary">{plugin.description}</p>
+          <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-text-dim">
+            <span>id: {plugin.id}</span>
+            <span>type: {plugin.type}</span>
+            {plugin.license ? <span>license: {plugin.license}</span> : null}
+            {plugin.upstream ? (
+              <a
+                href={plugin.upstream}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="flex items-center gap-1 text-brand-400 hover:text-brand-500 underline"
+              >
+                <ExternalLink className="h-3 w-3" /> upstream
+              </a>
+            ) : null}
+          </div>
+          {plugin.tags.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5">
+              {plugin.tags.map((t) => (
+                <span
+                  key={t}
+                  className="text-[10px] font-mono text-text-dim bg-surface-800 px-1.5 py-0.5 rounded"
+                >
+                  {`#${t}`}
+                </span>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="pt-1">
+            <div className="text-[11px] uppercase tracking-wide text-text-dim mb-1.5">
+              正文预览（装前 review）
+            </div>
+            {body.kind === "loading" ? (
+              <div className="text-xs text-text-dim py-4">加载正文中…</div>
+            ) : body.kind === "error" ? (
+              <div role="alert" className="text-xs text-status-error py-2">
+                加载正文失败: {body.message}
+              </div>
+            ) : (
+              <div
+                className="cockpit-markdown text-sm text-text-secondary rounded-md border border-surface-700/50 bg-surface-950/40 p-3"
+                // body.html is DOMPurify-sanitized (renderBody) — third-party
+                // hub markdown stripped of XSS before it reaches the DOM.
+                dangerouslySetInnerHTML={{ __html: body.html }}
+              />
+            )}
+          </div>
+        </div>
+
+        <div className="shrink-0 px-4 py-3 border-t border-surface-700/50 flex items-center gap-2">
+          <span className="text-[11px] text-text-dim truncate">
+            {project ? (
+              <>
+                安装到 <span className="font-mono text-text-secondary">{project}</span>
+              </>
+            ) : (
+              "先选一个安装目标项目"
+            )}
+          </span>
+          <span className="flex-1" />
+          {plugin.installed_status === "installed" ? (
+            <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">
+              已装
+            </span>
+          ) : (
+            <button
+              type="button"
+              disabled={installing || !project || !installable(plugin.installed_status ?? "not_installed")}
+              onClick={onInstall}
+              className="h-8 px-3 rounded-md text-sm bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {installing
+                ? "安装中…"
+                : plugin.installed_status === "update_available"
+                  ? `更新到 ${project || "项目"}`
+                  : `安装到 ${project || "项目"}`}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

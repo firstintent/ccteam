@@ -45,6 +45,15 @@
   --color-brand-500: #f59e0b;
   --color-brand-600: #d97706;
   --color-brand-700: #b45309;
+  /* A dim amber wash — user-message bubble fill + over-budget chip background
+     (prototype `--amber-dim`). Sits between surface and brand on a dark bg. */
+  --color-brand-dim: #7a5012;
+
+  /* Vendor accents (v0.8.9) — the per-vendor badge colors from the prototype.
+     Claude = copper, Codex = teal-green. Used only on the vendor pills/badges
+     so the two agents read distinct at a glance. */
+  --color-vendor-claude: #d97757;
+  --color-vendor-codex: #10a37f;
 
   /* Accent -- Muted Teal (used sparingly) */
   --color-accent-500: #14b8a6;
