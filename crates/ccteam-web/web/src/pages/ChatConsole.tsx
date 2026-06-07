@@ -28,9 +28,10 @@
 // per-session chat is the additive `s{n}` surface.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
 import { MessageSquare, Plus, Send, Square, Terminal } from "lucide-react";
 import { TerminalView } from "../components/TerminalView";
+import SettingsPage from "./SettingsPage";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
 import {
@@ -59,10 +60,108 @@ import {
 /** A switcher entry — one live gateway session, grouped under its project. */
 type RailSession = SessionView;
 
+/** The three bottom-nav global views — each is a full route the shell hosts
+ *  in its main area (sidebar persists, Chat|终端 tabs hide). `null` = a
+ *  session-chat surface (a selected session or the empty state). */
+type GlobalView = "marketplace" | "status" | "settings" | null;
+
+function globalViewFor(pathname: string): GlobalView {
+  if (pathname.startsWith("/marketplace")) return "marketplace";
+  if (pathname.startsWith("/status")) return "status";
+  if (pathname.startsWith("/settings")) return "settings";
+  return null;
+}
+
+/** Crumb label for each global view (shown in the top bar in place of the
+ *  session crumb). */
+const GLOBAL_VIEW_LABEL: Record<NonNullable<GlobalView>, string> = {
+  marketplace: "插件市场",
+  status: "Status",
+  settings: "Settings",
+};
+
+/** One sidebar bottom-nav row (prototype `.nav a` / `.nav a.on`). `NavLink`
+ *  drives the active highlight off the current route so a deep-link lands on
+ *  the right item without prop-drilling. */
+function SidebarNavLink({ to, icon, label }: { to: string; icon: string; label: string }) {
+  return (
+    <NavLink
+      to={to}
+      className={({ isActive }) =>
+        `flex items-center gap-2.5 px-2.5 py-2 rounded-md text-xs transition-colors ${
+          isActive
+            ? "bg-surface-800 text-amber-300"
+            : "text-text-secondary hover:bg-surface-800/70 hover:text-text-primary"
+        }`
+      }
+    >
+      <span className="w-4 text-center" aria-hidden>
+        {icon}
+      </span>
+      {label}
+    </NavLink>
+  );
+}
+
+/** Top-bar cost-pill SLOT — a placeholder the NEXT agent wires to the live
+ *  today-spend / 24h-budget rollup (`cost-budget.json`). Rendered static for
+ *  now so the slot exists, is on-theme, and the layout doesn't shift when it
+ *  goes live. Carries a `data-testid` so the wiring agent can target it. */
+function CostPill() {
+  return (
+    <span
+      data-testid="cost-pill"
+      title="今日花费 / 24h 预算（接入中）"
+      className="text-[11px] font-mono px-2.5 py-1 rounded-full bg-surface-800 border border-surface-700/60 text-text-dim"
+    >
+      今日 <span className="text-text-secondary">$—</span> / $—
+    </span>
+  );
+}
+
+/** Plugin-marketplace global view — PLACEHOLDER. The NEXT agent fills this
+ *  with the browse/install UI (role/skill/workflow from ccteam-hub +
+ *  agency-agents). Stub renders a simple "coming this phase" panel. */
+function MarketplacePlaceholder() {
+  return (
+    <div data-testid="marketplace-placeholder" className="p-6 max-w-3xl">
+      <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
+      <p className="mt-1 text-sm text-text-secondary">
+        浏览 + 一键装 role/agent、skill、workflow（来源 ccteam-hub + agency-agents 等开源）。
+      </p>
+      <div className="mt-4 rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-6 text-xs text-text-dim">
+        市场浏览器在本阶段接入中（coming in this phase）。
+      </div>
+    </div>
+  );
+}
+
+/** Lightweight Status global view — PLACEHOLDER. The NEXT agent fills this
+ *  with the daemon-health / sessions / today-cost rollup that replaces the
+ *  retired operator dashboard. Stub renders a simple "coming this phase"
+ *  panel. */
+function StatusPlaceholder() {
+  return (
+    <div data-testid="status-placeholder" className="p-6 max-w-3xl">
+      <h2 className="text-base font-semibold text-text-primary">Status · 运维总览</h2>
+      <p className="mt-1 text-sm text-text-secondary">
+        轻量运维视图（daemon 健康 + 各 session 状态 + 今日成本），取代旧 operator dashboard。
+      </p>
+      <div className="mt-4 rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-6 text-xs text-text-dim">
+        运维总览在本阶段接入中（coming in this phase）。
+      </div>
+    </div>
+  );
+}
+
 export default function ChatConsole() {
   const { sid: routeSid } = useParams<{ sid: string }>();
   const sid = routeSid ?? null;
   const navigate = useNavigate();
+  const location = useLocation();
+  // On a global route (插件市场 / Status / Settings) the shell hosts that
+  // view in its main area instead of the per-session chat/terminal.
+  const globalView = globalViewFor(location.pathname);
 
   // The switcher's session list (gateway `s{n}`), fanned out across every
   // project from /api/v1/projects → /api/v1/projects/{slug}/sessions.
@@ -363,9 +462,10 @@ export default function ChatConsole() {
           {statusText}
         </span>
         <span className="flex-1" />
-        <Link to="/" className="text-xs text-text-dim hover:text-text-primary transition-colors">
-          Dashboard ↗
-        </Link>
+        {/* Cost-pill SLOT — wired by the next agent (today's daily-spend /
+            24h-budget rollup). Static placeholder so the slot exists + the
+            layout doesn't shift when it goes live. */}
+        <CostPill />
       </header>
 
       <div className="flex flex-1 min-h-0">
@@ -446,29 +546,55 @@ export default function ChatConsole() {
               </div>
             ) : null}
           </div>
+
+          {/* bottom global-nav (prototype `.nav` / `.navhint`): the session
+              list above IS the chat navigation (click a session = its chat),
+              so there's NO "Chat" item — only the 3 global views. */}
+          <nav className="border-t border-surface-700/40 p-2">
+            <p className="px-2 pb-2 pt-1 text-[11px] leading-snug text-text-dim/80">
+              ↑ 点上面的会话 = 进入它的聊天（每个 session 一个独立对话）。下面是全局页：
+            </p>
+            <div className="space-y-0.5">
+              <SidebarNavLink to="/marketplace" icon="🧩" label="插件市场" />
+              <SidebarNavLink to="/status" icon="📊" label="Status" />
+              <SidebarNavLink to="/settings" icon="⚙︎" label="Settings" />
+            </div>
+          </nav>
         </aside>
 
         {/* main: crumb + view toggle + transcript/terminal + composer */}
         <main className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
-            <span className="text-xs text-text-dim shrink-0">会话 →</span>
-            {activeView ? (
-              <span className="flex items-center gap-2 text-xs min-w-0">
-                <span className="text-green-400">●</span>
-                <span className="font-semibold truncate">{activeView.project}</span>
-                <span className="text-text-dim">/</span>
-                <span className={activeView.vendor === "claude" ? "text-amber-300" : "text-sky-300"}>
-                  {[activeView.vendor, activeView.role].filter(Boolean).join(" · ")}
-                </span>
-                <span className="font-mono text-text-dim">{activeView.sid}</span>
+            {globalView ? (
+              <span className="text-xs font-semibold text-text-primary">
+                {GLOBAL_VIEW_LABEL[globalView]}
               </span>
-            ) : sid ? (
-              <span className="text-xs text-text-dim font-mono">{sid}</span>
             ) : (
-              <span className="text-xs text-text-dim">从左侧选一个 session</span>
+              <>
+                <span className="text-xs text-text-dim shrink-0">会话 →</span>
+                {activeView ? (
+                  <span className="flex items-center gap-2 text-xs min-w-0">
+                    <span className="text-green-400">●</span>
+                    <span className="font-semibold truncate">{activeView.project}</span>
+                    <span className="text-text-dim">/</span>
+                    <span
+                      className={activeView.vendor === "claude" ? "text-amber-300" : "text-sky-300"}
+                    >
+                      {[activeView.vendor, activeView.role].filter(Boolean).join(" · ")}
+                    </span>
+                    <span className="font-mono text-text-dim">{activeView.sid}</span>
+                  </span>
+                ) : sid ? (
+                  <span className="text-xs text-text-dim font-mono">{sid}</span>
+                ) : (
+                  <span className="text-xs text-text-dim">从左侧选一个 session</span>
+                )}
+              </>
             )}
             <span className="flex-1" />
-            {sid ? (
+            {/* Stop + Chat|终端 tabs are session-context only — hidden on a
+                global view (插件市场 / Status / Settings), per the prototype. */}
+            {!globalView && sid ? (
               <button
                 type="button"
                 onClick={stopActive}
@@ -478,31 +604,43 @@ export default function ChatConsole() {
                 <Square className="h-3.5 w-3.5" /> 停止
               </button>
             ) : null}
-            <div className="flex items-center gap-1 rounded-md bg-surface-800 p-0.5">
-              <button
-                type="button"
-                onClick={() => setView("chat")}
-                className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
-                  !showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
-                }`}
-              >
-                <MessageSquare className="h-3.5 w-3.5" /> Chat
-              </button>
-              <button
-                type="button"
-                disabled={!canTerminal}
-                onClick={() => canTerminal && setView("terminal")}
-                title={canTerminal ? "终端(tmux pane)" : "仅 Claude/tmux session 有终端"}
-                className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
-                  showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
-                } ${canTerminal ? "" : "opacity-40 cursor-not-allowed"}`}
-              >
-                <Terminal className="h-3.5 w-3.5" /> 终端
-              </button>
-            </div>
+            {!globalView ? (
+              <div className="flex items-center gap-1 rounded-md bg-surface-800 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setView("chat")}
+                  className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
+                    !showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
+                  }`}
+                >
+                  <MessageSquare className="h-3.5 w-3.5" /> Chat
+                </button>
+                <button
+                  type="button"
+                  disabled={!canTerminal}
+                  onClick={() => canTerminal && setView("terminal")}
+                  title={canTerminal ? "终端(tmux pane)" : "仅 Claude/tmux session 有终端"}
+                  className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
+                    showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
+                  } ${canTerminal ? "" : "opacity-40 cursor-not-allowed"}`}
+                >
+                  <Terminal className="h-3.5 w-3.5" /> 终端
+                </button>
+              </div>
+            ) : null}
           </div>
 
-          {showTerminal && activeView?.project && sid ? (
+          {globalView ? (
+            <div className="flex-1 min-h-0 overflow-y-auto">
+              {globalView === "settings" ? (
+                <SettingsPage />
+              ) : globalView === "marketplace" ? (
+                <MarketplacePlaceholder />
+              ) : (
+                <StatusPlaceholder />
+              )}
+            </div>
+          ) : showTerminal && activeView?.project && sid ? (
             <TerminalView slug={activeView.project} sid={sid} className="flex-1 min-h-0" />
           ) : (
             <>
