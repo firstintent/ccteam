@@ -11,6 +11,27 @@
 
 现在 SPA 是**两套分叉布局**:新的 chat 风格 `ChatConsole`(`/chat`、`/chat/s/:sid`)vs 旧的 operator 壳(`/` Dashboard、`/p/:slug`、`/sessions`、`/teams/*` + 新加的 Roles/Settings)。v0.8.9:**收敛成一个统一的 chat 风格 shell** —— 删掉旧界面里没用的(agent-team / orchestrator-era operator 视图),把有用的迁进 chat 壳,统一 UI 风格。
 
+## ★ 架构决策(2026-06-07,TG 2385):插件市场 + ccteam-hub + repo 零提示词内容
+
+> v0.8.9 UI 方向 **user 已批,继续**。在此之上追加一条**架构级决策**(影响 F5 + C1,且立新红线):
+
+1. **roles / skills / workflows → 一个「插件市场」**:F5 的 role 浏览页升级成**插件市场 UI** —— 浏览 + 一键装 role/agent、skill、workflow;**agency-agents 等开源可直接接入**(在线浏览 + 装)。
+2. **ccteam 仓库内不再包含任何「提示词类型」插件**:subagent/role agents、skills、workflow 的**内容**一律不进 ccteam repo。**ccteam = 纯引擎**(新红线;CLAUDE.md §三 实现时补)。
+3. **`ccteam-hub` 仓库**:自建 + 开源插件(skills / agents·role / workflow)都放 hub;ccteam 从 hub(+ 开源源如 agency-agents)拉取 + 安装。**路径(TG 2386)= `/home/ubuntu/workplace/ccteam/ccteam-hub`**(已 `git init`、目前仅 stub README;**注意它嵌在 ccteam 工作目录内、有独立 `.git`** → ccteam 的 `.gitignore` 必须加 `/ccteam-hub/`,防止误纳入 ccteam,违"零提示词内容"红线)。建议 hub 布局:`skills/`、`agents/`(role/subagent .md)、`workflows/`、+ 一个 `index.json`/manifest 供市场列举。
+
+**要清出 ccteam repo 的现存提示词内容(已核实清单)**:
+- `crates/ccteam-core/src/templates/cto_role.md`(种 cto 的 persona 文本)← **见开放问题①**
+- `crates/ccteam-core/src/templates/meta_agent_role.md` + `workflow.agent-team.yaml` + `squad_roster.rs`(meta-agent / agent-team 模板·花名册,legacy)
+- 根 `agents/`(__lead/explorer)+ `workflows/`(dev-flow/qa-autoloop)← **v0.8.8 C1 漏删的两个,现在必删**
+- `crates/ccteam-core/src/templates/agency_agents_catalog.json`(catalog **索引/指针**,非 prompt body)← 见开放问题③
+
+**开放问题(要 user 拍)**:
+- **① 种 cto 怎么办**:"零提示词内容"后,`ccteam init` 的默认 cto persona 从哪来?(a) cto 成为 hub 插件、init 拉取(需 hub 在线);(b) cto = **唯一 bootstrap 例外**(引擎自带默认管家 persona,算"引擎配置"非"插件");(c) init 种最小空壳、用户从市场装真 cto。**建议 (b)**(否则离线/首装就没管家、体验断)。
+- **② scope 切分**:v0.8.9 做到哪?**建议**:v0.8.9 = UI 整体改造(已批)+ F5 升级成**市场形态 UI**(壳/接口就位、数据源指向 hub/开源)+ **从 repo 清出提示词内容**(上面清单,cto 按①定);**ccteam-hub 建库 + 填充(自建迁入 + 开源 ingestion 管线)= 并行/后续轨**(它得先有 hub repo + 拉取/安装协议)。要不要把"建 hub + 接 agency-agents"也压进 v0.8.9?
+- **③ catalog 索引**:`agency_agents_catalog.json`(192 条索引)留 repo 作指针,还是连索引也搬 hub?
+
+---
+
 ## 一、现状(已核实 routes + 数据源,代码为 SoT)
 
 `App.tsx` 双 `<Routes>`:
@@ -20,7 +41,7 @@
 | 页面 | 数据源 | 性质 | 处置 |
 |---|---|---|---|
 | `ChatConsole`(/chat) | gateway per-session(`/projects/{slug}/sessions`、SSE、PTY WS) | **新 chat 核心** | **KEEP** → 升级成全站统一 shell |
-| `RolesPage`(/roles) | `/projects/{slug}/roles`(v0.8.8 F5) | 新、有用 | **MIGRATE** → 并进统一 shell 导航 |
+| `RolesPage`(/roles) | `/projects/{slug}/roles`(v0.8.8 F5) | 新、有用 | **MIGRATE + 升级** → 统一导航里的**插件市场**(见 ★ 架构决策:浏览+装 role/skill/workflow,接 ccteam-hub + agency-agents) |
 | `SettingsPage`(/settings) | `/api/v1/config/im`(v0.8.8 F4) | 新、有用 | **MIGRATE** → 并进统一 shell 导航 |
 | `Dashboard`(/) | `/api/v1/projects` | 旧 operator 首页;项目列表 chat sidebar 已有 | **REMOVE**(项目列表迁 sidebar;cost/health 看 §三 决策) |
 | `SessionsListPage`(/sessions) | `/api/v1/sessions/active`(旧 claude-N 命名空间) | 旧;被 gateway per-session + sidebar 取代 | **REMOVE** |
@@ -36,7 +57,7 @@
 **一个 shell 承载全部**(删掉 `/chat` 与 operator 壳的分叉):
 - **左 sidebar**:workspace → projects → sessions 树(每 session 显示 role + vendor 徽标 + 状态点,呼应 v0.8.8 的独立 session);底部导航 **Chat / Roles / Settings**;顶部 **＋新建**(session / 项目)。
 - **顶 bar**:面包屑(项目 / role · vendor · sid)+ 连接状态 + 视图切换 **Chat | 终端** + Stop。
-- **中区**:per-session **Chat**(transcript + composer + HITL 审批气泡)/ **终端**(xterm 实时 pane);切到 **Roles** = role 浏览(F5);切到 **Settings** = IM 配置(F4)。
+- **中区**:per-session **Chat**(transcript + composer + HITL 审批气泡)/ **终端**(xterm 实时 pane);切到 **市场(Plugins/Roles)** = 插件市场(浏览 + 装 role/skill/workflow,接 ccteam-hub + 开源,见 ★ 架构决策);切到 **Settings** = IM 配置(F4)。
 - **风格**:深色 + amber 强调,一套设计 token,全站一致(落实 v0.8.8 §二 web UI 质量基线 + deferred「ChatConsole 配色统一」)。
 
 详见 `prototype.html`(目标外观 + 四个视图态:Chat / 终端 / Roles / Settings)。
@@ -66,3 +87,4 @@
 
 - doc-first → user review 原型 + PRD → scope 冻结 → dev-plan → dev session 实现(workflow,延续 v0.8.8 模式)。
 - **2026-06-07 初版**:UI 改造范围(统一 chat shell + 删旧 + 迁有用 + 统一风格)+ 现状 keep/migrate/remove 表 + 目标 IA + `prototype.html`。
+- **2026-06-07 +★ 架构决策(TG 2385/2386)**:user 批 UI 方向、继续;追加 = roles/skills/workflows 做成**插件市场**(F5 升级,接 agency-agents 等开源)+ **ccteam repo 零提示词内容**(新红线,清单含 cto_role.md/meta_agent_role.md/workflow.agent-team.yaml/squad_roster + 根 agents//workflows/ + catalog.json)+ 新 **ccteam-hub** 仓库(路径 `…/ccteam/ccteam-hub`,已 stub)。3 个开放问题待 user 拍(种 cto 来源 / v0.8.9 scope 切分 / catalog 索引去留)。
