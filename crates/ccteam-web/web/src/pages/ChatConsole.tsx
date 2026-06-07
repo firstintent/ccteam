@@ -110,6 +110,20 @@ export default function ChatConsole() {
     void refreshSessions();
   }, [refreshSessions]);
 
+  // v0.8.8 bug5 — pick up projects/sessions registered out-of-band (a CLI
+  // `ccteam init` while this tab is open) without a manual page refresh. The
+  // backend list (GET /api/v1/projects → collect_projects) reads config.yaml
+  // live, so a refetch when the tab regains focus surfaces them; the
+  // new-session modal also refetches on open (see the ＋ button) for the
+  // create-a-session flow.
+  useEffect(() => {
+    const onFocus = () => {
+      void refreshSessions();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshSessions]);
+
   // ---- per-sid transcript: seed on sid change ----------------------------
   useEffect(() => {
     if (!sid) {
@@ -361,7 +375,12 @@ export default function ChatConsole() {
             <span className="text-xs font-mono uppercase text-text-dim">所有 session</span>
             <button
               type="button"
-              onClick={() => setModalOpen(true)}
+              onClick={() => {
+                // bug5 — refetch so a project created out-of-band (CLI
+                // `ccteam init`) is in the list when the modal opens.
+                void refreshSessions();
+                setModalOpen(true);
+              }}
               className="h-6 px-2 rounded-md bg-amber-500/90 text-surface-950 hover:bg-amber-400 text-xs flex items-center gap-1"
               title="新建 session"
             >
