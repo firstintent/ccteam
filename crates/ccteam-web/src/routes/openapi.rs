@@ -125,6 +125,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
         (name = "teams", description = "Read-only Anthropic Agent Teams mirror"),
         (name = "auth", description = "Web-token introspection"),
+        (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
     ),
 )]
 struct ApiDoc;
@@ -173,6 +174,13 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::sessions_api::handle_session_resolve))
         .routes(routes!(super::sessions_api::handle_session_events))
         .routes(routes!(super::sessions_api::handle_session_stop))
+        // v0.8.8 F4 — IM credential config (masked read + validate-before-persist
+        // PUTs + async telegram chat_id capture). All inside the web-token gate.
+        .routes(routes!(super::im_config::handle_get_im_config))
+        .routes(routes!(super::im_config::handle_put_telegram))
+        .routes(routes!(super::im_config::handle_telegram_chat_id_start))
+        .routes(routes!(super::im_config::handle_telegram_chat_id_poll))
+        .routes(routes!(super::im_config::handle_put_lark))
         // teams
         .routes(routes!(super::teams_api::handle_list))
         .routes(routes!(super::teams_api::handle_detail))

@@ -80,6 +80,12 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/sessions/{sid}/resolve"),
         ("GET", "/api/v1/sessions/{sid}/events"),
         ("POST", "/api/v1/sessions/{sid}/stop"),
+        // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
+        ("GET", "/api/v1/config/im"),
+        ("PUT", "/api/v1/config/im/telegram"),
+        ("POST", "/api/v1/config/im/telegram/chat-id/start"),
+        ("GET", "/api/v1/config/im/telegram/chat-id"),
+        ("PUT", "/api/v1/config/im/lark"),
         // teams
         ("GET", "/api/v1/teams"),
         ("GET", "/api/v1/teams/{name}"),

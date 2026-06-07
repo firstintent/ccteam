@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createSession,
   getHistory,
+  getRoleDetail,
   listProjectRoles,
   listSessions,
   resolveApproval,
@@ -15,6 +16,7 @@ import {
   sessionsUrl,
   stopSession,
   submitTurn,
+  type RoleDetail,
   type RoleSummary,
   type SessionView,
 } from "./sessionsApi";
@@ -211,5 +213,39 @@ describe("listProjectRoles", () => {
     await expect(listProjectRoles("ghost")).rejects.toThrow("NOT_FOUND");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
     await expect(listProjectRoles("x")).rejects.toThrow("UNAUTHENTICATED");
+  });
+});
+
+describe("getRoleDetail", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("GETs /api/v1/projects/{slug}/roles/{role} with encoded slug + role", async () => {
+    const detail: RoleDetail = {
+      role: "code-reviewer",
+      frontmatter: { description: "reviews diffs", model: "sonnet" },
+      body: "# Reviewer\nYou review code.",
+    };
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, detail));
+    const got = await getRoleDetail("a b", "code-reviewer");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/projects/a%20b/roles/code-reviewer",
+      { headers: { Accept: "application/json" }, credentials: "same-origin" },
+    );
+    expect(got).toEqual(detail);
+    expect(got.frontmatter.model).toBe("sonnet");
+  });
+
+  it("maps 404 (unknown role) → NOT_FOUND and 401 → UNAUTHENTICATED", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "no role" }));
+    await expect(getRoleDetail("p", "ghost")).rejects.toThrow("NOT_FOUND");
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
+    await expect(getRoleDetail("p", "x")).rejects.toThrow("UNAUTHENTICATED");
   });
 });

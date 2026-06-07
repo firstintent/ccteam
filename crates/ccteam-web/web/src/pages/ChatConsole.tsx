@@ -45,7 +45,7 @@ import {
   type SessionView,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
-import { DEFAULT_ROLE, ROLE_SUGGESTIONS } from "./chatDefaults";
+import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import {
   appendRow,
   eventToRow,
@@ -606,8 +606,11 @@ export default function ChatConsole() {
 //     as the fallback/seed (FIX-2). A brand-new project has no roles yet, so
 //     that branch uses the static fallback and does NOT fetch (would 404).
 //
-// Roleless (empty role) stays out of scope: effectiveRole still falls back to
-// DEFAULT_ROLE (cto).
+//   - F2-web: the role dropdown now offers an explicit "(无角色 / 裸 claude)"
+//     choice (the ROLELESS sentinel). Picking it sends an empty role (a
+//     bare-claude session that self-reads the project CLAUDE.md);
+//     `resolveRole` (chatDefaults) maps the sentinel → "" while an
+//     un-touched modal still falls back to DEFAULT_ROLE (cto), never roleless.
 
 /** Sentinel project value selecting the "create a new project" branch. */
 const NEW_PROJECT = "__new";
@@ -706,14 +709,22 @@ function NewSessionModal({
   // (new project / empty / error / still-loading) we fall back to the static
   // ROLE_SUGGESTIONS-seeded list so the user always has cto + the usual hints.
   // `isNew` shortcuts to the fallback regardless of any stale `roleState`.
+  // F2-web — the explicit "no role / bare claude" choice leads every option
+  // set (existing + new project), so a roleless session is always reachable
+  // and never the silent default (resolveRole keeps `cto` as the no-pick
+  // fallback).
   const roleChoices: { value: string; label: string }[] = useMemo(() => {
+    const roleless = { value: ROLELESS, label: "(无角色 / 裸 claude)" };
     if (!isNew && roleState.kind === "ready" && roleState.roles.length > 0) {
-      return roleState.roles.map((r) => ({
-        value: r.role,
-        label: r.description ? `${r.role} — ${r.description}` : r.role,
-      }));
+      return [
+        roleless,
+        ...roleState.roles.map((r) => ({
+          value: r.role,
+          label: r.description ? `${r.role} — ${r.description}` : r.role,
+        })),
+      ];
     }
-    return fallbackRoles.map((r) => ({ value: r, label: r }));
+    return [roleless, ...fallbackRoles.map((r) => ({ value: r, label: r }))];
   }, [isNew, roleState, fallbackRoles]);
 
   const roleLoading = !isNew && roleState.kind === "loading";
@@ -721,11 +732,23 @@ function NewSessionModal({
   // The role <select>'s controlled value, DERIVED (not effect-synced) so the
   // option set changing (project switch / fetch resolve) can't desync state:
   // honor the user's explicit pick while it's still on offer, otherwise fall
-  // back to the first choice. `role===""` means "no explicit pick yet".
-  const selectedRole =
-    role && roleChoices.some((c) => c.value === role) ? role : roleChoices[0]?.value ?? "";
+  // back to a sensible default. `role===""` means "no explicit pick yet".
+  //
+  // F2-web: with ROLELESS now leading every option set, the no-pick fallback
+  // must NOT be `roleChoices[0]` (that would silently default to roleless and
+  // break FIX-2). Prefer DEFAULT_ROLE (`cto`) when it's on offer, else the
+  // first concrete (non-roleless) option, else roleless as the last resort.
+  const selectedRole = role && roleChoices.some((c) => c.value === role)
+    ? role
+    : roleChoices.find((c) => c.value === DEFAULT_ROLE)?.value ??
+      roleChoices.find((c) => c.value !== ROLELESS)?.value ??
+      roleChoices[0]?.value ??
+      "";
 
-  const effectiveRole = selectedRole.trim() || DEFAULT_ROLE;
+  // The wire role: ROLELESS → "" (roleless passthrough), a concrete pick →
+  // that role, blank → DEFAULT_ROLE. See chatDefaults.resolveRole (pure +
+  // unit-tested for the sentinel semantics).
+  const effectiveRole = resolveRole(selectedRole);
 
   // ---- submit gating -----------------------------------------------------
   const newSlugErr = isNew ? slugError(newSlug.trim()) : null;
@@ -889,7 +912,11 @@ function NewSessionModal({
               POST /api/v1/projects/{(isNew ? newSlug.trim() : project) || "<project>"}/sessions
             </span>
             <br />
-            → role=<span className="text-text-secondary">{effectiveRole}</span> vendor=
+            → role=
+            <span className="text-text-secondary">
+              {effectiveRole || "(无角色 / 裸 claude)"}
+            </span>{" "}
+            vendor=
             <span className="text-text-secondary">{vendor}</span> mode=
             <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>
           </div>

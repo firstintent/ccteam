@@ -21,6 +21,8 @@ import Dashboard from "./pages/Dashboard";
 import ProjectDetail from "./pages/ProjectDetail";
 import SessionDetail from "./pages/SessionDetail";
 import SessionsListPage from "./pages/SessionsListPage";
+import SettingsPage from "./pages/SettingsPage";
+import RolesPage from "./pages/RolesPage";
 import TeamsListPage from "./pages/TeamsListPage";
 import TeamDetailPage from "./pages/TeamDetailPage";
 import ChatConsole from "./pages/ChatConsole";
@@ -96,6 +98,10 @@ function PrimaryTabs() {
     ? "teams"
     : path.startsWith("/chat")
       ? "chat"
+    : path.startsWith("/roles")
+      ? "roles"
+    : path.startsWith("/settings")
+      ? "settings"
     : path.startsWith("/s/") || path.startsWith("/sessions")
       ? "sessions"
       : "projects";
@@ -104,6 +110,8 @@ function PrimaryTabs() {
     { key: "chat", label: "Chat", to: "/chat" },
     { key: "teams", label: "Teams", to: "/teams" },
     { key: "sessions", label: "Sessions", to: "/sessions" },
+    { key: "roles", label: "Roles", to: "/roles" },
+    { key: "settings", label: "Settings", to: "/settings" },
   ];
   return (
     <nav
@@ -178,6 +186,8 @@ function AppShell() {
                 <Route path="/teams" element={<TeamsListPage />} />
                 <Route path="/teams/:name" element={<TeamDetailPage />} />
                 <Route path="/sessions" element={<SessionsListPage />} />
+                <Route path="/roles" element={<RolesPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
                 <Route path="*" element={<PlaceholderPage label="route" />} />
               </Routes>
             }

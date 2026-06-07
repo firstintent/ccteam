@@ -164,10 +164,12 @@ pub struct CreateSessionForm {
 ///
 /// Creates a new session via the spine. v0.8.8 F1 — ALWAYS mints a fresh sid
 /// (no `(project, role)` dedup), so a project can run multiple same-role
-/// sessions side by side. 201 `{sid}` on success. 400 on a bad vendor token or
-/// empty role. 422 when the named role has no `.claude/agents/<role>.md` (a
-/// caller mistake, R-M6). 503 with no gateway. 500 if the gateway create fails
-/// for a genuine internal reason (project not registered / adapter spawn error).
+/// sessions side by side. v0.8.8 F2-web — an empty `role` is a valid roleless
+/// session (bare claude). 201 `{sid}` on success. 400 on a bad vendor token or
+/// bad permission_mode. 422 when a NAMED role has no `.claude/agents/<role>.md`
+/// (a caller mistake, R-M6; an empty role is NOT this case). 503 with no
+/// gateway. 500 if the gateway create fails for a genuine internal reason
+/// (project not registered / adapter spawn error).
 #[utoipa::path(
     post,
     path = "/api/v1/projects/{slug}/sessions",
@@ -176,8 +178,8 @@ pub struct CreateSessionForm {
     request_body(content = CreateSessionForm, description = "Session to create (JSON or x-www-form-urlencoded)"),
     responses(
         (status = 201, description = "Created; `{sid}`", body = serde_json::Value),
-        (status = 400, description = "Empty role / bad vendor / bad permission_mode"),
-        (status = 422, description = "Unknown role (no `.claude/agents/<role>.md`)"),
+        (status = 400, description = "Bad vendor / bad permission_mode"),
+        (status = 422, description = "Unknown NAMED role (no `.claude/agents/<role>.md`); empty role is allowed (roleless)"),
         (status = 503, description = "No live gateway (standalone web)"),
         (status = 500, description = "Gateway create failed (internal)"),
     ),
@@ -190,14 +192,11 @@ pub(crate) async fn handle_create_session(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
+    // v0.8.8 F2-web — an EMPTY role is now a valid "roleless" session (bare
+    // claude that self-reads the project CLAUDE.md): pass the trimmed string
+    // through verbatim. The gateway's `create_session_api` accepts "" (its
+    // `ensure_role_exists` short-circuits on empty), so we no longer 400 here.
     let role = form.role.trim().to_string();
-    if role.is_empty() {
-        return create_error(
-            StatusCode::BAD_REQUEST,
-            "role must not be empty".into(),
-            mode,
-        );
-    }
     let vendor_raw = form.vendor.as_deref().unwrap_or("claude");
     let vendor = match parse_vendor(vendor_raw) {
         Ok(v) => v,

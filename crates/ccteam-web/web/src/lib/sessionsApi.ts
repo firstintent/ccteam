@@ -56,6 +56,18 @@ export interface RoleSummary {
   model: string;
 }
 
+/** Full single-role payload from `GET /api/v1/projects/{slug}/roles/{role}`
+ *  (`ccteam_core::RoleDetail` → `crates/ccteam-web/src/routes/roles.rs`).
+ *  `frontmatter` is a free-form JSON object (empty object when the `.md` has
+ *  no frontmatter fence; values may be non-string, so render them
+ *  defensively); `body` is the markdown after the closing fence. Drives the
+ *  read-only Roles page detail view. */
+export interface RoleDetail {
+  role: string;
+  frontmatter: Record<string, unknown>;
+  body: string;
+}
+
 /** Build the per-project sessions URL (gateway `s{n}` list). */
 export function sessionsUrl(slug: string): string {
   return `/api/v1/projects/${encodeURIComponent(slug)}/sessions`;
@@ -123,6 +135,16 @@ export function getHistory(sid: string): Promise<SessionHistory> {
 export function listProjectRoles(slug: string): Promise<RoleSummary[]> {
   return getJson<RoleSummary[]>(
     `/api/v1/projects/${encodeURIComponent(slug)}/roles`,
+  );
+}
+
+/** `GET /api/v1/projects/{slug}/roles/{role}` — one role's frontmatter + body
+ *  (`.claude/agents/<role>.md`), for the read-only Roles page detail view.
+ *  404 (unknown project or role) maps to NOT_FOUND, 401 to UNAUTHENTICATED,
+ *  a bad role name to `HTTP 400`. */
+export function getRoleDetail(slug: string, role: string): Promise<RoleDetail> {
+  return getJson<RoleDetail>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/roles/${encodeURIComponent(role)}`,
   );
 }
 

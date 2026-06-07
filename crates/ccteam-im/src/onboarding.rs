@@ -78,16 +78,47 @@ pub async fn telegram_setup(
 }
 
 /// Test-friendly variant that lets callers override the API base.
+///
+/// Composed from the two reusable steps below so the CLI keeps its
+/// one-shot "validate + capture chat_id" flow while the web config
+/// backend (F4) can call the steps independently (validate the token on
+/// `PUT`, then poll for the `chat_id` in a separate background task).
 pub async fn telegram_setup_with_base(
     token: &str,
     poll_seconds: u64,
     api_base: &str,
 ) -> Result<TelegramSetupResult, OnboardingError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(poll_seconds + 10))
-        .build()?;
-
     // Step 1: getMe — token validation + bot username capture.
+    let bot_username = telegram_validate_token_with_base(token, api_base).await?;
+    // Step 2: getUpdates long-poll for first chat_id.
+    let owner_chat_id = telegram_poll_chat_id_with_base(token, api_base, poll_seconds).await?;
+
+    Ok(TelegramSetupResult {
+        creds: TelegramCreds {
+            bot_token: token.into(),
+            allowed_chat_ids: vec![owner_chat_id.to_string()],
+        },
+        bot_username,
+    })
+}
+
+/// Step 1 of the Telegram flow, exposed for reuse: validate the bot token
+/// via `getMe` and return the bot handle (incl. leading `@`). A `200` with
+/// `ok: false` (e.g. an invalid token) surfaces as
+/// [`OnboardingError::ApiNotOk`]; a `200` missing the `result` block is
+/// [`OnboardingError::BadResponse`]. No long-poll — returns immediately.
+///
+/// The web config backend calls this on `PUT /config/im/telegram` to fail
+/// a bad token before it ever lands on disk.
+pub async fn telegram_validate_token_with_base(
+    token: &str,
+    api_base: &str,
+) -> Result<String, OnboardingError> {
+    // getMe is a single short request; a 30s budget is plenty and avoids
+    // the long-poll timeout the combined flow uses.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let me: GetMeResponse = client
         .get(format!("{api_base}/bot{token}/getMe"))
         .send()
@@ -100,18 +131,25 @@ pub async fn telegram_setup_with_base(
     let bot_user = me
         .result
         .ok_or_else(|| OnboardingError::BadResponse("getMe.result missing".into()))?;
-    let bot_username = format!("@{}", bot_user.username);
+    Ok(format!("@{}", bot_user.username))
+}
 
-    // Step 2: getUpdates long-poll for first chat_id.
-    let owner_chat_id = poll_first_chat_id(&client, token, api_base, poll_seconds).await?;
-
-    Ok(TelegramSetupResult {
-        creds: TelegramCreds {
-            bot_token: token.into(),
-            allowed_chat_ids: vec![owner_chat_id.to_string()],
-        },
-        bot_username,
-    })
+/// Step 2 of the Telegram flow, exposed for reuse: long-poll `getUpdates`
+/// until the owner DMs the bot, capturing their `chat_id`. Times out as
+/// [`OnboardingError::NoIncomingMessage`] after `poll_seconds`.
+///
+/// The web config backend calls this from a background task (the
+/// `POST .../chat-id/start` → `GET .../chat-id` async capture), so it
+/// builds its own client (rather than borrowing the combined flow's).
+pub async fn telegram_poll_chat_id_with_base(
+    token: &str,
+    api_base: &str,
+    poll_seconds: u64,
+) -> Result<i64, OnboardingError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(poll_seconds + 10))
+        .build()?;
+    poll_first_chat_id(&client, token, api_base, poll_seconds).await
 }
 
 async fn poll_first_chat_id(

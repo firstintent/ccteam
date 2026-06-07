@@ -22,6 +22,9 @@ pub mod chat_ws;
 pub mod dashboard;
 pub mod harness_sse;
 pub mod health;
+// v0.8.8 F4 — web IM credential configuration (Telegram + Lark; masked
+// read that never echoes secrets; validate-before-persist; restart-required).
+pub mod im_config;
 // V0.6.1 F139 — `POST /internal/hook/:kind[/:action]` daemon-side hook
 // dispatcher (replaces per-hook `ccteam internal hook ...` cold spawn).
 pub mod internal_hook;

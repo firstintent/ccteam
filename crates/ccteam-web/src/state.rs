@@ -83,6 +83,33 @@ pub struct AppState {
     /// coupling is a direct crate dep (`ccteam-web -> ccteam-im`), acyclic
     /// because `ccteam-im` does not depend on `ccteam-web`.
     pub gateway: Option<Arc<Mutex<ccteam_im::gateway::Gateway>>>,
+    /// v0.8.8 F4 — IM credentials file path the `config/im/*` handlers
+    /// read + write. Defaults to `ccteam_im::credentials::default_path()`
+    /// (`~/.ccteam/im/credentials.json`); integration tests override it via
+    /// [`AppState::with_creds_path`] to a tempdir so they never touch the
+    /// real user creds (CLAUDE.md test-isolation discipline).
+    pub creds_path: Arc<PathBuf>,
+    /// v0.8.8 F4 — single-slot status for the async Telegram `chat_id`
+    /// capture (`POST .../chat-id/start` spawns a background poll; the
+    /// `GET .../chat-id` poller reads this). `None` = no capture has been
+    /// started this process. Single slot is enough: the web config flow is
+    /// one operator binding one chat at a time.
+    pub im_poll: Arc<Mutex<Option<TelegramChatIdPoll>>>,
+}
+
+/// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
+/// (the async `POST .../chat-id/start` → `GET .../chat-id` flow).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TelegramChatIdPoll {
+    /// A background poll is running; the owner hasn't DMed the bot yet.
+    Pending,
+    /// Captured the owner's `chat_id` (persisted into
+    /// `credentials.telegram.allowed_chat_ids` by the GET poller).
+    Captured(i64),
+    /// The poll window elapsed with no incoming message.
+    Timeout,
+    /// The poll failed (HTTP / API error); carries a human reason.
+    Error(String),
 }
 
 /// Shared map of `chat_id` → live web-chat socket count.
@@ -150,6 +177,8 @@ impl AppState {
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
+            creds_path: Arc::new(ccteam_im::credentials::default_path()),
+            im_poll: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -174,6 +203,8 @@ impl AppState {
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
+            creds_path: Arc::new(ccteam_im::credentials::default_path()),
+            im_poll: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -215,6 +246,17 @@ impl AppState {
     /// endpoints return 503.
     pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
         self.gateway = Some(gateway);
+        self
+    }
+
+    /// v0.8.8 F4 — point the `config/im/*` handlers at a non-default
+    /// credentials file. Integration tests pass a tempdir path so reading
+    /// and writing IM creds never touches the real
+    /// `~/.ccteam/im/credentials.json` (CLAUDE.md test-isolation rule). Not
+    /// `#[cfg(test)]` because `ccteam-web` tests live in a separate crate
+    /// (own compilation unit) and can't see `cfg(test)` items.
+    pub fn with_creds_path(mut self, path: PathBuf) -> Self {
+        self.creds_path = Arc::new(path);
         self
     }
 }
