@@ -1,6 +1,5 @@
-//! Unit tests for the chat-handle resolution rules shared by
-//! `build_handle_map`, the unknown-handle reply path, and the
-//! `@ccteam list bots` admin keyword.
+//! Unit tests for the chat-handle resolution rules shared by the
+//! unknown-handle reply path and the `@ccteam list bots` admin keyword.
 //!
 //! Covers:
 //! - `chat_handle` absent → handle falls back to `role`
@@ -10,7 +9,6 @@
 //!   suffixed token end-to-end)
 //! - sort order is deterministic regardless of input order
 //! - `available_handles_for_chat` filters by `(channel, chat_id)`
-//! - the suffixed handle actually routes end-to-end via `router::route`
 
 use ccteam_harness::AgentVendor;
 use ccteam_im::router::{available_handles_for_chat, format_unknown_handle_reply};
@@ -121,36 +119,4 @@ fn format_unknown_handle_reply_when_no_bots_says_none() {
     let s = format_unknown_handle_reply("ghost", &[]);
     assert!(s.contains("@ghost"));
     assert!(s.contains("No bots registered in this chat"));
-}
-
-#[test]
-fn route_resolves_collision_suffix_handle_end_to_end() {
-    // Regression for the @-as-separator bug: `parse_first_mention`
-    // accepts `[a-zA-Z0-9_-]` for handle chars and *terminates* at any
-    // other byte. An `@` separator would split the typed handle so the
-    // suffixed claimant becomes unreachable. The `__<slug>` form keeps
-    // the whole token inside the parser's charset.
-    use ccteam_im::daemon::build_handle_map_from_bots;
-    use ccteam_im::router::{route, Route};
-
-    let bots = vec![
-        mk("alpha", "lead", Some("curie"), "telegram", "@g1"),
-        mk("beta", "lead", Some("curie"), "telegram", "@g1"),
-    ];
-    let map = build_handle_map_from_bots(&bots);
-    match route("@curie__beta payload", &map, 0) {
-        Route::Bot { slug, role, .. } => {
-            assert_eq!(slug, "beta");
-            assert_eq!(role, "lead");
-        }
-        other => panic!("expected Bot, got {other:?}"),
-    }
-    // Bare handle still routes the first claimant.
-    match route("@curie payload", &map, 0) {
-        Route::Bot { slug, role, .. } => {
-            assert_eq!(slug, "alpha");
-            assert_eq!(role, "lead");
-        }
-        other => panic!("expected Bot, got {other:?}"),
-    }
 }

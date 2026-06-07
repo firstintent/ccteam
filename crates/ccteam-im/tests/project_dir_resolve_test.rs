@@ -1,9 +1,8 @@
 //! F185 + V0.6.8 F190 — `BotRegistration.project_dir` /
 //! `~/.ccteam/config.yaml::projects[]` path-resolution coverage.
 //!
-//! Anchors the contract `supervisor::bot_dir` /
-//! `inbound::DefaultMailboxResolver::inbox_dir` /
-//! `outbound::{turns_jsonl_path, outbound_cursor_path}` honor on top of
+//! Anchors the contract `chat_inbox_dir` / `turns_jsonl_path` /
+//! `inbound::DefaultMailboxResolver::inbox_dir` honor on top of
 //! the F185 optional field + F190 three-tier priority chain:
 //!
 //! 1. When the registration carries an explicit `project_dir`, every
@@ -25,7 +24,6 @@ use std::path::PathBuf;
 
 use ccteam_harness::AgentVendor;
 use ccteam_im::inbound::{DefaultMailboxResolver, MailboxResolver};
-use ccteam_im::supervisor::{bot_dir, bot_dir_with_config};
 use ccteam_im::{chat_inbox_dir, resolve_project_dir, turns_jsonl_path, BotRegistration};
 
 fn mk_reg(slug: &str, role: &str, project_dir: Option<PathBuf>) -> BotRegistration {
@@ -40,31 +38,6 @@ fn mk_reg(slug: &str, role: &str, project_dir: Option<PathBuf>) -> BotRegistrati
         project_dir,
         created_at: chrono::Utc::now(),
     }
-}
-
-#[test]
-fn bot_dir_honors_explicit_project_dir() {
-    let reg = mk_reg(
-        "research-squad",
-        "tech-helper",
-        Some(PathBuf::from("/vol4/1000/nasworkspace/ccteam")),
-    );
-    // projects_root is irrelevant when project_dir is set — assert that.
-    let dir = bot_dir(std::path::Path::new("/home/ubuntu/projects"), &reg);
-    assert_eq!(
-        dir,
-        PathBuf::from("/vol4/1000/nasworkspace/ccteam/.ccteam/chat/tech-helper")
-    );
-}
-
-#[test]
-fn bot_dir_falls_back_to_projects_root_when_project_dir_none() {
-    let reg = mk_reg("dev-foo", "lead", None);
-    let dir = bot_dir(std::path::Path::new("/home/user/projects"), &reg);
-    assert_eq!(
-        dir,
-        PathBuf::from("/home/user/projects/dev-foo/.ccteam/chat/lead")
-    );
 }
 
 #[test]
@@ -240,31 +213,6 @@ fn resolve_project_dir_falls_through_with_unrelated_config_entries() {
     cfg.insert("other-project".into(), PathBuf::from("/srv/other"));
     let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
     assert_eq!(got, PathBuf::from("/home/u/projects/orphan"));
-}
-
-#[test]
-fn bot_dir_with_config_uses_config_when_reg_none() {
-    let reg = mk_reg("legacy-bot", "lead", None);
-    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
-    cfg.insert("legacy-bot".into(), PathBuf::from("/srv/legacy"));
-    let dir = bot_dir_with_config(std::path::Path::new("/home/u/projects"), &reg, &cfg);
-    assert_eq!(dir, PathBuf::from("/srv/legacy/.ccteam/chat/lead"));
-}
-
-#[test]
-fn bot_dir_with_config_explicit_wins_over_config() {
-    let reg = mk_reg(
-        "any-slug",
-        "lead",
-        Some(PathBuf::from("/from/explicit/project")),
-    );
-    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
-    cfg.insert("any-slug".into(), PathBuf::from("/from/config"));
-    let dir = bot_dir_with_config(std::path::Path::new("/home/u/projects"), &reg, &cfg);
-    assert_eq!(
-        dir,
-        PathBuf::from("/from/explicit/project/.ccteam/chat/lead")
-    );
 }
 
 #[test]

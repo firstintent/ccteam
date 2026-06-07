@@ -21,8 +21,22 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::list_bots;
-use crate::supervisor::{DRAIN_SIGNAL, SHUTDOWN_SIGNAL};
 use crate::BotRegistration;
+
+/// Signal filename written under `<project>/.ccteam/chat/<role>/signals/`
+/// to request a graceful final stop of a bot session. The admin `stop`
+/// / `stop everything` verbs drop this file; a user can also write it
+/// directly. (Formerly `supervisor::SHUTDOWN_SIGNAL` — relocated here
+/// when the dead per-bot supervisor was removed; this NL-admin path is
+/// the sole remaining writer.)
+const SHUTDOWN_SIGNAL: &str = "shutdown.signal";
+
+/// Signal filename written under `<project>/.ccteam/chat/<role>/signals/`
+/// to pause a bot (stop accepting new turns; let inflight finish). The
+/// admin `pause` verb writes it; `resume` removes it. (Formerly
+/// `supervisor::DRAIN_SIGNAL` — relocated here when the dead per-bot
+/// supervisor was removed.)
+const DRAIN_SIGNAL: &str = "drain.signal";
 
 /// Parsed admin command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -27,7 +27,6 @@
 #![warn(missing_docs)]
 
 pub mod acl;
-pub mod bot_mpsc;
 pub mod credentials;
 pub mod daemon;
 pub mod gateway;
@@ -38,7 +37,6 @@ pub mod nl_admin;
 // owner chat_id capture). Wrapped by `ccteam config` (the IM-token menu
 // item); the former `ccteam-im-setup` skill's job moves into the CLI.
 pub mod onboarding;
-pub mod outbound;
 pub mod outbound_format;
 pub mod pending;
 pub mod progress;
@@ -50,7 +48,6 @@ pub mod rate_limit;
 pub mod role_import;
 pub mod router;
 pub mod sanitize;
-pub mod supervisor;
 pub mod three_layer_sec;
 pub mod transport;
 
@@ -258,12 +255,10 @@ pub fn chat_inbox_dir(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
 }
 
 /// V0.6.5 F147 — resolve `<project>/.ccteam/chat/<role>/turns.jsonl`
-/// for this bot. Source-of-truth file `chat_history` tails. Re-exports
-/// [`outbound::turns_jsonl_path`] under a top-level name so MCP /
-/// integration callers don't have to reach into the outbound module.
-/// Honors `reg.project_dir` (F185).
+/// for this bot. Source-of-truth file `chat_history` tails. Honors
+/// `reg.project_dir` (F185).
 pub fn turns_jsonl_path(projects_root: &Path, reg: &BotRegistration) -> PathBuf {
-    outbound::turns_jsonl_path(projects_root, reg)
+    reg.chat_dir(projects_root).join("turns.jsonl")
 }
 
 impl BotRegistration {
@@ -301,11 +296,10 @@ impl BotRegistration {
     /// 3. `<projects_root>/<workflow_slug>/` (historical layout).
     ///
     /// The daemon hands a populated `config_projects` to
-    /// [`DefaultMailboxResolver::with_config_projects`] and
-    /// [`BotSupervisor::new_with_config`] so legacy registrations (no
-    /// `project_dir`) whose project lives outside the home tree
-    /// (NAS shares, dir basename ≠ workflow slug) still route correctly
-    /// without re-registering every bot.
+    /// `DefaultMailboxResolver::with_config_projects` so legacy
+    /// registrations (no `project_dir`) whose project lives outside the
+    /// home tree (NAS shares, dir basename ≠ workflow slug) still route
+    /// correctly without re-registering every bot.
     pub fn project_root_with_config(
         &self,
         projects_root: &Path,
@@ -355,9 +349,9 @@ impl BotRegistration {
 /// 3. `projects_root.join(reg.workflow_slug)` — historical
 ///    `<projects_root>/<slug>/` layout used by pre-F185 registrations.
 ///
-/// MailboxResolver, BotSupervisor, and gateway template registration
-/// funnel through this helper so the same priority chain applies
-/// everywhere; resolvers don't re-implement the logic.
+/// MailboxResolver and gateway template registration funnel through
+/// this helper so the same priority chain applies everywhere; resolvers
+/// don't re-implement the logic.
 pub fn resolve_project_dir(
     reg: &BotRegistration,
     projects_root: &Path,
