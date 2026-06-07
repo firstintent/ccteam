@@ -40,3 +40,4 @@ graphify-out/
 # ccteam_core::config::config_path resolve to <repo>/config.yaml. Repo root
 # is never the real config home (runtime config = ~/.ccteam/config.yaml).
 /config.yaml
+ccteam-hub/
