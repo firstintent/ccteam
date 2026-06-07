@@ -1,6 +1,6 @@
 # v0.8.9 — rmux 0.3→0.5 升级 + 裸字节终端(W2b)
 
-> **⚠️ 落地修正(SHIPPED 实况 — 本前提已被推翻)**:实现时发现**前提错了** —— ccteam pin 的 **rmux-sdk 0.3.1 本就已带裸字节 API**(`PaneOutputStream` / `PaneOutputChunk::Bytes` / 订阅起点 `Oldest`)。故 v0.8.9 **没有做 dep bump**(根 `Cargo.toml` rmux 仍 `0.3`,`Cargo.lock` 解析到 **0.3.1**),只把 `rmux_backend` 的 subscribe/capture 切到这套已有的 byte API 即拿到逐字节保真终端。下文标题「0.3→0.5 升级」、§二「rmux 0.5 已解决」、§三第 1 条「依赖 bump 0.3→0.5」等表述**已作废** —— 把它们读作「切到 rmux-sdk 0.3.1 已有的裸字节流(无 dep bump、无 `rmux_types_compile_link` 改版)」。其余设计(裸流替换有损行流、`Oldest` 回放、pattern-matching 消费者不退、tmux backend 不变)均按本文落地。
+> **⚠️ 落地实况(两步)**:① **byte API 本就在 rmux-sdk 0.3.1**(`PaneOutputStream` / `PaneOutputChunk::Bytes` / 订阅起点 `Oldest`)—— 原「需 0.5 才有裸流」前提错了;Phase 3 先在 **0.3.1** 上把 `rmux_backend` 的 subscribe/capture 切到这套已有 byte API,即拿到逐字节保真终端(保真**不依赖** 0.5)。② 收尾后按用户要求**仍 bump 到 0.5**(根 `Cargo.toml` rmux `0.3→0.5`,`Cargo.lock` 0.5.0)—— clean additive、call-site 0.3→0.5 **byte-identical**、实测**零漂移**(`cargo build --workspace` 直接过),取 0.5 的 tmux-compat / window APIs。故下文「0.3→0.5 升级」标题准确;§三第 1 条「预期 API 漂移」**实测为零**。其余设计(裸流替换有损行流、`Oldest` 回放、pattern-matching 消费者不退、tmux backend 不变)均按本文落地。
 >
 > **状态:已落地(v0.8.9 Phase 3)**。原文为规划稿(doc-first),保留作设计记录;实况见上方修正。
 > **来源**:v0.8.8 ship 后实机(TG 2026-06-07)发现 web 终端保真问题(bug4 连上空白、bug6 换行不对齐)→ 切裸字节流根治。排进 v0.8.9(与 web UI 改造同 wave)。

@@ -32,17 +32,17 @@ ccteam-flow = { path = "crates/ccteam-flow" }
 ccteam-harness = { path = "crates/ccteam-harness" }
 ccteam-web = { path = "crates/ccteam-web" }
 
-# V0.8 W0 spike — rmux as the future unified-mux execution surface for
-# mode 2 / 3a / 3b child supervision (design doc:
-# `docs/research/embedded-mux-unified-architecture.md` §四). Pinned at
-# the 0.3 minor; published on crates.io v0.3.1. Internal crates
-# (rmux-pty / rmux-ipc / rmux-os / rmux-types) flow in transitively —
-# do NOT add them as direct deps. `ratatui-rmux` is intentionally NOT
-# pulled (ccteam owns its own TUI rendering, if any).
-rmux-sdk = "0.3"
-rmux-client = "0.3"
-rmux-server = "0.3"
-rmux-proto = "0.3"
+# rmux — the unified-mux execution surface (tmux-compatible daemon SDK).
+# Pinned at the 0.5 minor (crates.io v0.5.0). The byte-faithful web
+# terminal uses `PaneOutputStream`/`PaneOutputChunk::Bytes` (present since
+# 0.3.1; 0.5 adds window-creation APIs + tmux-compat/terminal-event fixes).
+# Internal crates (rmux-pty / rmux-ipc / rmux-os / rmux-types) flow in
+# transitively — do NOT add them as direct deps. `ratatui-rmux` is
+# intentionally NOT pulled (ccteam owns its own TUI rendering, if any).
+rmux-sdk = "0.5"
+rmux-client = "0.5"
+rmux-server = "0.5"
+rmux-proto = "0.5"
 
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }

@@ -179,7 +179,7 @@ fn drain_lines_into(
     }
 }
 
-/// `RmuxBackend` — ccteam's ProcessBackend impl over rmux-sdk 0.3.
+/// `RmuxBackend` — ccteam's ProcessBackend impl over rmux-sdk 0.5.
 ///
 /// The SDK `Rmux` handle is lazily connected on first use and cached in
 /// a [`Mutex`]-guarded `Option<Arc<Rmux>>` so the daemon spawn cost
