@@ -15,7 +15,7 @@
 
 > v0.8.9 UI 方向 **user 已批,继续**。在此之上追加一条**架构级决策**(影响 F5 + C1,且立新红线):
 
-1. **roles / skills / workflows → 一个「插件市场」**:F5 的 role 浏览页升级成**插件市场 UI** —— 浏览 + 一键装 role/agent、skill、workflow;**agency-agents 等开源可直接接入**(在线浏览 + 装)。
+1. **roles / skills / workflows → 一个「插件市场」**:F5 的 role 浏览页升级成**插件市场 UI** —— 浏览 + 一键装 role/agent、skill、workflow;**agency-agents 等开源可直接接入**(在线浏览 + 装)。**逻辑 / 开源 ingestion / UI 交互 详见同目录 [`marketplace-design.md`](marketplace-design.md)**(ccteam↔hub↔项目 三角 + ingestion 进 hub + 浏览→预览→装到项目 流程)。
 2. **ccteam 仓库内不再包含任何「提示词类型」插件**:subagent/role agents、skills、workflow 的**内容**一律不进 ccteam repo。**ccteam = 纯引擎**(新红线;CLAUDE.md §三 实现时补)。
 3. **`ccteam-hub` 仓库**:自建 + 开源插件(skills / agents·role / workflow)都放 hub;ccteam 从 hub(+ 开源源如 agency-agents)拉取 + 安装。**路径(TG 2386)= `/home/ubuntu/workplace/ccteam/ccteam-hub`**(已 `git init`、目前仅 stub README;嵌在 ccteam 工作目录内、有独立 `.git` + remote `git@github.com:firstintent/ccteam-hub.git`;ccteam 的 `.gitignore` **已含** `ccteam-hub/`(v0.8.8 C1 一并加的)→ 不会误纳入 ccteam)。hub 布局(已 scaffold,TG 2389):`agents/`(role/subagent .md)、`skills/`、`workflows/`、`index.json`(市场目录索引)。
 
