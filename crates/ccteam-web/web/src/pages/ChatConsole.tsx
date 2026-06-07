@@ -1,68 +1,51 @@
-// v0.8.7 W4 (DD.1) — per-session web chat console.
+// v0.8.9 — the persistent chat SHELL.
 //
-// Rewired from the v0.8.3 single global WS + flat session-mixing
-// transcript into a PER-SESSION console keyed by the gateway `s{n}` id:
+// ChatConsole is the long-lived shell; the PER-SID session view is a keyed
+// child, `<SessionView key={sid} sid={sid} />` (see ./SessionView.tsx). The
+// `key` is the structural fix: React remounts a fresh SessionView on every
+// session switch, so all per-sid state (transcript rows / SSE buffer / draft /
+// chat|terminal view / scroll / HITL) resets ATOMICALLY — no state survives a
+// switch (kills the "fresh session briefly shows the previous session's
+// messages" bug + the latent `saveRows(newSid, oldRows)` persist race at once).
 //
-//   - ROUTE  `/chat/s/:sid` (nested in App.tsx) — `useParams` gives the
-//            one session this view drives; `/chat` (no sid) is the
-//            switcher with nothing selected.
-//   - DATA   drives `/api/v1` exclusively (sessionsApi): listSessions for
-//            the switcher, getHistory to seed a reopened page, submitTurn
-//            to send, stopSession to stop, createSession for new sessions.
-//   - STREAM live events via `useSessionEvents(sid)` (the W2-tagged
-//            per-sid SSE at `/api/v1/sessions/{sid}/events`).
-//   - STORE  each sid owns its OWN transcript (per-sid localStorage key via
-//            `chatTranscript`), so switching sessions NEVER mixes streams.
-//   - APPROVE W2 ChoicePrompt events (tagged with sid + options + token)
-//            render as "session sX wants to run … [option chips]"; clicking
-//            POSTs {token, selection=id} to /resolve (R-H1) — the SAME
-//            gateway pending machinery an IM click uses, NOT a turn — so the
-//            blocked tool actually runs on Approve / denies on Deny.
+// What the SHELL owns (persists across switches):
+//   - ROUTE  `/chat/s/:sid` (App.tsx) — `useParams` gives the active sid; the
+//            shell routes globalView (插件市场/Status/Settings) vs sid vs empty.
+//   - RAIL   the cross-project session list (listSessions fanned over
+//            /api/v1/projects) + the registered-project union (config.yaml SoT,
+//            so a session-less project still lists) — the sidebar + switcher.
+//   - CHROME the app bar + CostPill + bottom global-nav + the NewSessionModal
+//            (create a session / a brand-new project inline).
+//
+// What moved OUT to SessionView (per-sid): the transcript rows + localStorage
+// seed/persist, `useSessionEvents(sid)` + its fold, the draft + submitTurn, the
+// chat|terminal toggle + TerminalView, stopSession, and HITL approval resolve.
 //
 // Red lines: reads structured turn/SSE frames (never scrapes a pane); the
-// terminal view is the existing `ccteam-pty.v1` byte relay; the new-session
-// default role stays `cto` (chatDefaults.DEFAULT_ROLE, FIX-2).
-//
-// LEGACY (unrepointed): SessionsListPage / SessionDetail + `/sessions/active`
-// remain the operator/bg view in the `claude-N`/`codex-N` namespace — this
-// per-session chat is the additive `s{n}` surface.
+// new-session default role stays `cto` (chatDefaults.DEFAULT_ROLE, FIX-2).
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
-import { MessageSquare, Menu, Plus, Send, Square, Terminal, X } from "lucide-react";
-import { TerminalView } from "../components/TerminalView";
+import { MessageSquare, Menu, Plus, X } from "lucide-react";
 import CostPill from "../components/CostPill";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
 import SettingsPage from "./SettingsPage";
-import { useSessionEvents } from "../hooks/useSessionEvents";
+import SessionView from "./SessionView";
 import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
 import {
   createSession as apiCreateSession,
-  getHistory,
   listProjectRoles,
   listSessions,
-  resolveApproval as apiResolveApproval,
-  stopSession as apiStopSession,
-  submitTurn,
   type RoleSummary,
-  type SessionView,
+  type SessionView as SessionSummary,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
 import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import { mergeProjectSlugs } from "./projectList";
-import {
-  appendRow,
-  eventToRow,
-  historyToRows,
-  loadRows,
-  nextRowId,
-  saveRows,
-  type TranscriptRow,
-} from "./chatTranscript";
 
 /** A switcher entry — one live gateway session, grouped under its project. */
-type RailSession = SessionView;
+type RailSession = SessionSummary;
 
 /** The three bottom-nav global views — each is a full route the shell hosts
  *  in its main area (sidebar persists, Chat|终端 tabs hide). `null` = a
@@ -139,8 +122,6 @@ export default function ChatConsole() {
   // could never create its first session (chicken-and-egg).
   const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
   const [railError, setRailError] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-  const [view, setView] = useState<"chat" | "terminal">("chat");
   const [modalOpen, setModalOpen] = useState(false);
   // When the new-session modal is opened from a specific project's "还没有
   // session" hint, pre-select that project; `null` falls back to the active
@@ -151,15 +132,11 @@ export default function ChatConsole() {
   // / global-nav pick so the chosen surface is visible without a manual close.
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Per-sid transcript. Seeded from localStorage on sid change, then from
-  // mirrored history, then live-appended from SSE. Keying on sid is THE
-  // fix: two sessions never share one buffer.
-  const [rows, setRows] = useState<TranscriptRow[]>([]);
-
-  const { events, connected, lastError, gatewayUnavailable } = useSessionEvents(sid);
-
-  // The active session's view (vendor/role/project) for the crumb + terminal
-  // gating — read from the rail list.
+  // The active session's rail entry (vendor/role/project), passed to the
+  // per-sid SessionView for its crumb + terminal gating. All per-sid state
+  // (transcript rows, the SSE buffer, the draft, the chat|terminal toggle,
+  // HITL approval) now lives in <SessionView key={sid}>, which the shell
+  // remounts on every switch — so no per-sid state survives a session change.
   const activeView = useMemo(
     () => railSessions.find((s) => s.sid === sid) ?? null,
     [railSessions, sid],
@@ -173,9 +150,7 @@ export default function ChatConsole() {
       // no session yet still shows up — don't discard it after the fan-out.
       setRegisteredProjects(projects.map((p) => p.slug));
       const lists = await Promise.all(
-        projects.map((p) =>
-          listSessions(p.slug).catch(() => [] as SessionView[]),
-        ),
+        projects.map((p) => listSessions(p.slug).catch(() => [] as SessionSummary[])),
       );
       setRailSessions(lists.flat());
       setRailError(null);
@@ -205,128 +180,6 @@ export default function ChatConsole() {
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [refreshSessions]);
-
-  // ---- per-sid transcript: seed on sid change ----------------------------
-  useEffect(() => {
-    if (!sid) {
-      setRows([]);
-      return;
-    }
-    // 1) instant: persisted rows for this sid (refresh/reopen continuity).
-    setRows(loadRows(sid));
-    // 2) authoritative: mirrored history seeds (or replaces an empty) buffer.
-    let cancelled = false;
-    getHistory(sid)
-      .then((h) => {
-        if (cancelled) return;
-        const seeded = historyToRows(h.events);
-        if (seeded.length > 0) setRows(seeded);
-      })
-      .catch(() => {
-        // best-effort — keep the localStorage rows (or empty) on error.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sid]);
-
-  // ---- live SSE → append into the active sid's transcript ----------------
-  // We track how many events we've folded so a re-render doesn't re-append.
-  const foldedRef = useRef(0);
-  useEffect(() => {
-    foldedRef.current = 0;
-  }, [sid]);
-  useEffect(() => {
-    if (!sid) return;
-    if (events.length <= foldedRef.current) return;
-    const fresh = events.slice(foldedRef.current);
-    foldedRef.current = events.length;
-    setRows((current) => {
-      let next = current;
-      for (const ev of fresh) {
-        const row = eventToRow(ev);
-        if (row) next = appendRow(next, row);
-      }
-      return next;
-    });
-  }, [events, sid]);
-
-  // ---- persist the active sid's transcript -------------------------------
-  useEffect(() => {
-    if (sid) saveRows(sid, rows);
-  }, [sid, rows]);
-
-  const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
-    setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
-  }, []);
-
-  // ---- send a turn -------------------------------------------------------
-  const submit = useCallback(() => {
-    const content = draft.trim();
-    if (!content || !sid) return;
-    pushRow({ kind: "user", content });
-    setDraft("");
-    submitTurn(sid, content).catch((e) => {
-      pushRow({
-        kind: "system",
-        content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
-      });
-    });
-  }, [draft, sid, pushRow]);
-
-  // ---- resolve a W2 approval prompt (R-H1) -------------------------------
-  // The per-sid SSE tags the ChoicePrompt with sid + each option's {label,id}
-  // + the pending-resolution token. Clicking POSTs {token, selection=id} to
-  // `/resolve`, which routes through the gateway's SAME pending machinery an
-  // IM click uses (take_by_token → apply_pending) — NOT a turn. So [Approve]
-  // makes the blocked tool actually run and [Deny] denies immediately (no
-  // 600s timeout). A row with no token (or a chosen option with no id) can't
-  // be resolved this way; we surface that rather than misfire a fake turn.
-  const resolveApproval = useCallback(
-    (row: TranscriptRow, optionIndex: number) => {
-      if (!sid) return;
-      const option = row.options?.[optionIndex];
-      if (!row.token || !option?.id) {
-        pushRow({
-          kind: "system",
-          content: "无法批准: 该提示缺少 token/选项 id(请在 IM 批准,或重开会话)",
-        });
-        return;
-      }
-      // mark the row resolved so the chips disable.
-      setRows((current) =>
-        current.map((r) => (r.id === row.id ? { ...r, resolved: true } : r)),
-      );
-      pushRow({ kind: "user", content: `→ ${option.label}` });
-      apiResolveApproval(sid, row.token, option.id).catch((e) => {
-        // Re-enable the chips so the user can retry on a transient failure.
-        setRows((current) =>
-          current.map((r) => (r.id === row.id ? { ...r, resolved: false } : r)),
-        );
-        pushRow({
-          kind: "system",
-          content: `批准提交失败: ${e instanceof Error ? e.message : "unknown"}`,
-        });
-      });
-    },
-    [sid, pushRow],
-  );
-
-  // ---- stop the session --------------------------------------------------
-  const stopActive = useCallback(() => {
-    if (!sid) return;
-    apiStopSession(sid)
-      .then(() => {
-        pushRow({ kind: "system", content: "会话已停止" });
-        void refreshSessions();
-      })
-      .catch((e) => {
-        pushRow({
-          kind: "system",
-          content: `停止失败: ${e instanceof Error ? e.message : "unknown"}`,
-        });
-      });
-  }, [sid, pushRow, refreshSessions]);
 
   // ---- create a new session (optionally a brand-new project first) -------
   // `newProjectPath` present ⇒ B2: POST /projects to scaffold+register `slug`
@@ -389,45 +242,13 @@ export default function ChatConsole() {
 
   const switchTo = useCallback(
     (s: RailSession) => {
+      // Navigate only — the remounted <SessionView key={sid}> resets its own
+      // view to "chat" (a fresh instance), so the shell no longer tracks it.
       navigate(`/chat/s/${encodeURIComponent(s.sid)}`);
-      setView("chat");
       setSidebarOpen(false);
     },
     [navigate],
   );
-
-  // v0.8.8 B5 — claude-only for now. The PTY backend now resolves per-sid panes
-  // for BOTH vendors (codex pane name = ccteam-{slug}-{sid}, wired in
-  // routes/session_pane.rs), so the codex terminal is backend-ready. But it is
-  // unverified on a real codex pane (the daemon currently wires the codex
-  // app-server adapter, which owns no tmux/rmux pane), so we don't promise a
-  // codex terminal in the UI yet. TODO: flip to allow codex once the codex
-  // per-session pane is dogfooded on a real box.
-  const canTerminal = activeView?.vendor === "claude" && !!sid;
-  const showTerminal = view === "terminal" && canTerminal;
-
-  // Auto-scroll to the newest message only when already near the bottom.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const atBottomRef = useRef(true);
-  const onTranscriptScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-  }, []);
-  useLayoutEffect(() => {
-    if (!showTerminal && atBottomRef.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [rows, showTerminal]);
-
-  const statusText = gatewayUnavailable
-    ? "无可用 gateway"
-    : connected
-      ? "已连接"
-      : lastError
-        ? "连接失败"
-        : sid
-          ? "连接中…"
-          : "未选择 session";
 
   return (
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
@@ -448,18 +269,6 @@ export default function ChatConsole() {
         </span>
         <span className="hidden sm:inline text-[11px] font-mono text-text-dim px-1.5 py-0.5 rounded bg-surface-800">
           per-session · /api/v1
-        </span>
-        <span className="hidden sm:flex items-center gap-1.5 text-xs text-text-dim">
-          <span
-            className={`h-2 w-2 rounded-full ${
-              connected
-                ? "bg-status-running"
-                : gatewayUnavailable || lastError
-                  ? "bg-status-error"
-                  : "bg-brand-500"
-            }`}
-          />
-          {statusText}
         </span>
         <span className="flex-1" />
         {/* Cost pill — today's daily-spend / 24h-budget rollup; click → /status. */}
@@ -621,176 +430,40 @@ export default function ChatConsole() {
           </nav>
         </aside>
 
-        {/* main: crumb + view toggle + transcript/terminal + composer */}
+        {/* main area: a global view (插件市场/Status/Settings), else the per-sid
+            SessionView (keyed by sid → remounts on every switch, so all per-sid
+            state resets atomically), else the no-session empty state. */}
         <main className="flex-1 min-w-0 min-h-0 flex flex-col">
-          <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
-            {globalView ? (
-              <span className="text-xs font-semibold text-text-primary">
-                {GLOBAL_VIEW_LABEL[globalView]}
-              </span>
-            ) : (
-              <>
-                <span className="text-xs text-text-dim shrink-0">会话 →</span>
-                {activeView ? (
-                  <span className="flex items-center gap-2 text-xs min-w-0">
-                    <span className="text-status-running">●</span>
-                    <span className="font-semibold truncate">{activeView.project}</span>
-                    <span className="text-text-dim">/</span>
-                    <span
-                      className={
-                        activeView.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"
-                      }
-                    >
-                      {[activeView.vendor, activeView.role].filter(Boolean).join(" · ")}
-                    </span>
-                    <span className="font-mono text-text-dim">{activeView.sid}</span>
-                  </span>
-                ) : sid ? (
-                  <span className="text-xs text-text-dim font-mono">{sid}</span>
-                ) : (
-                  <span className="text-xs text-text-dim">从左侧选一个 session</span>
-                )}
-              </>
-            )}
-            <span className="flex-1" />
-            {/* Stop + Chat|终端 tabs are session-context only — hidden on a
-                global view (插件市场 / Status / Settings), per the prototype. */}
-            {!globalView && sid ? (
-              <button
-                type="button"
-                onClick={stopActive}
-                title="停止会话"
-                className="h-7 px-2 rounded text-xs flex items-center gap-1 text-text-dim hover:text-status-error hover:bg-surface-800"
-              >
-                <Square className="h-3.5 w-3.5" /> 停止
-              </button>
-            ) : null}
-            {!globalView ? (
-              <div className="flex items-center gap-1 rounded-md bg-surface-800 p-0.5">
-                <button
-                  type="button"
-                  onClick={() => setView("chat")}
-                  className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
-                    !showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
-                  }`}
-                >
-                  <MessageSquare className="h-3.5 w-3.5" /> Chat
-                </button>
-                <button
-                  type="button"
-                  disabled={!canTerminal}
-                  onClick={() => canTerminal && setView("terminal")}
-                  title={canTerminal ? "终端(tmux pane)" : "仅 Claude/tmux session 有终端"}
-                  className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
-                    showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
-                  } ${canTerminal ? "" : "opacity-40 cursor-not-allowed"}`}
-                >
-                  <Terminal className="h-3.5 w-3.5" /> 终端
-                </button>
-              </div>
-            ) : null}
-          </div>
-
           {globalView ? (
-            <div className="flex-1 min-h-0 overflow-y-auto">
-              {globalView === "settings" ? (
-                <SettingsPage />
-              ) : globalView === "marketplace" ? (
-                <MarketplaceView />
-              ) : (
-                <StatusView rail={railSessions} />
-              )}
-            </div>
-          ) : showTerminal && activeView?.project && sid ? (
-            <TerminalView slug={activeView.project} sid={sid} className="flex-1 min-h-0" />
+            <>
+              <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
+                <span className="text-xs font-semibold text-text-primary">
+                  {GLOBAL_VIEW_LABEL[globalView]}
+                </span>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto">
+                {globalView === "settings" ? (
+                  <SettingsPage />
+                ) : globalView === "marketplace" ? (
+                  <MarketplaceView />
+                ) : (
+                  <StatusView rail={railSessions} />
+                )}
+              </div>
+            </>
+          ) : sid ? (
+            // KEY={sid}: a fresh SessionView mounts on every session switch, so
+            // its per-sid state (rows / SSE buffer / draft / chat|terminal view
+            // / scroll / HITL) resets atomically — no state survives a switch.
+            <SessionView key={sid} sid={sid} session={activeView} onSessionChanged={refreshSessions} />
           ) : (
             <>
-              <div
-                ref={scrollRef}
-                onScroll={onTranscriptScroll}
-                className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
-              >
-                {!sid ? (
-                  <div className="h-full grid place-items-center text-xs text-text-dim">
-                    选一个 session 或点「＋ 新建」开始。
-                  </div>
-                ) : (
-                  rows.map((row) => {
-                    if (row.kind === "approval") {
-                      return (
-                        <div
-                          key={row.id}
-                          className="max-w-[760px] rounded-md px-3 py-2.5 text-sm bg-brand-500/10 border border-brand-500/30"
-                        >
-                          <div className="text-brand-400 mb-2">{row.content}</div>
-                          <div className="flex flex-wrap gap-2">
-                            {(row.options ?? []).map((opt, i) => (
-                              <button
-                                key={`${row.id}-${i}`}
-                                type="button"
-                                disabled={row.resolved}
-                                onClick={() => resolveApproval(row, i)}
-                                className="h-7 px-3 rounded-md text-xs bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40"
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                          {row.resolved ? (
-                            <div className="mt-1.5 text-[10px] text-text-dim">已回应</div>
-                          ) : null}
-                        </div>
-                      );
-                    }
-                    if (row.kind === "system") {
-                      return (
-                        <div key={row.id} className="text-center text-[11px] text-text-dim">
-                          {row.content}
-                        </div>
-                      );
-                    }
-                    return (
-                      <div
-                        key={row.id}
-                        className={`max-w-[760px] rounded-md px-3 py-2 text-sm leading-6 whitespace-pre-wrap break-words ${
-                          row.kind === "user"
-                            ? "ml-auto bg-brand-dim/40 border border-brand-500/20"
-                            : row.kind === "tool"
-                              ? "bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
-                              : "bg-surface-800 border border-surface-700/40"
-                        }`}
-                      >
-                        {row.content}
-                      </div>
-                    );
-                  })
-                )}
+              <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
+                <span className="text-xs text-text-dim shrink-0">会话 →</span>
+                <span className="text-xs text-text-dim">从左侧选一个 session</span>
               </div>
-              <div className="border-t border-surface-700/40 p-3">
-                <div className="flex gap-2">
-                  <textarea
-                    value={draft}
-                    onChange={(event) => setDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        submit();
-                      }
-                    }}
-                    disabled={!sid}
-                    className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
-                    placeholder={sid ? "发消息 / 命令(/compact /clear …)…" : "先选一个 session"}
-                  />
-                  <button
-                    type="button"
-                    onClick={submit}
-                    disabled={!sid}
-                    className="h-11 w-11 shrink-0 rounded-md bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40 grid place-items-center"
-                    title={sid ? "发送" : "未选择 session"}
-                  >
-                    <Send className="h-4 w-4" />
-                  </button>
-                </div>
+              <div className="flex-1 min-h-0 grid place-items-center text-xs text-text-dim">
+                选一个 session 或点「＋ 新建」开始。
               </div>
             </>
           )}

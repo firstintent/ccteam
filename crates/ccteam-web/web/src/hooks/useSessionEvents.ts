@@ -134,6 +134,20 @@ export function useSessionEvents(
   const [lastError, setLastError] = useState<string | null>(null);
   const [gatewayUnavailable, setGatewayUnavailable] = useState(false);
 
+  // Reset the event buffer SYNCHRONOUSLY when the sid changes (React's
+  // "adjust state during render" pattern). The subscribe effect below also
+  // `setEvents([])`, but that lags one render: on the first render after a
+  // sid flip, `events` would still expose the PREVIOUS sid's stream. A
+  // consumer that folds `events` into a per-sid transcript (ChatConsole)
+  // then grafts the old session's messages onto the freshly-opened one. By
+  // clearing here, a brand-new sid is observed with an empty buffer from its
+  // very first render — streams never mix across a switch.
+  const [streamedSid, setStreamedSid] = useState<string | null>(sid);
+  if (sid !== streamedSid) {
+    setStreamedSid(sid);
+    setEvents([]);
+  }
+
   const esRef = useRef<EventSource | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
