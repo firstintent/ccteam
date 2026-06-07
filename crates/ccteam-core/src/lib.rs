@@ -48,7 +48,6 @@ pub mod hot_config;
 pub mod hooks_dispatcher;
 pub mod inbox;
 pub mod memory_bridge;
-pub mod meta_agent;
 // V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
 pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
@@ -181,10 +180,6 @@ pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge, InstallMemoryBridgeOptions,
     MemoryBridgeAction, MemoryBridgeReport,
 };
-pub use meta_agent::{
-    bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,
-    render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
-};
 pub use migration::{
     migrate_v041_to_v042, migrate_workflow_to_ccteam_dir, render_migration_report,
     render_workflow_migration_report, MigrationReport as V042MigrationReport,
@@ -265,12 +260,12 @@ pub use team_resolver::{
 pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
     merge_project_mcp_json, probe_project, render_project_mcp_json, render_project_settings,
-    render_project_settings_agent_team, render_squad_roster_en, render_squad_roster_zh,
-    render_workflow_agents_block, render_workflow_template, write_global_helper_templates,
-    write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, Language,
-    ProjectKind, ProjectProbe, SettingsEnv, TeammateInfo, WorkflowAgentEntry, WorkflowPreset,
-    WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS,
-    CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
+    render_project_settings_agent_team, render_workflow_agents_block, render_workflow_template,
+    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
+    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
+    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
+    CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
+    PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

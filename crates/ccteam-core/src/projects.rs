@@ -128,10 +128,6 @@ pub fn slugify_brief(input: &str) -> String {
 /// `--slug ccteam-ui`) should use [`pick_unused_slug_verbatim`] which
 /// skips token filtering and only enforces team prefix + collision
 /// retry.
-///
-/// Meta-agent projects don't go through this function — they use
-/// `meta_slug(handle)` which hand-crafts `meta-<handle>` so the
-/// directory aligns with the `ccteam-meta-<handle>` tmux session.
 pub fn pick_unused_slug(paths: &CcteamPaths, base: &str, team: &str) -> Result<String> {
     let base = slugify_brief(base);
     pick_unused_under_team_prefix(paths, &base, team)

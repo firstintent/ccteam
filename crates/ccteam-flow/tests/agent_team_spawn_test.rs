@@ -7,16 +7,15 @@
 //!
 //! Coverage matrix:
 //!   1. `mode` field default + agent-team round-trip
-//!   2. Parsing the shipped workflow.agent-team.yaml template
-//!   3. Validation of agent-team mode (team_name + lead_seed required)
-//!   4. Ad-hoc teammate requires adhoc_model
-//!   5. Mode missing → defaults to artifact-driven (V0.4.6 compat)
-//!   6. Agent team mode accepts empty agents map
-//!   7. Artifact-driven mode rejects agent_team block
-//!   8. Settings template for agent-team has 3 new hooks
-//!   9. PROJECT_SETTINGS_AGENT_TEAM_JSON contains all 3 hook entries
-//!   10. F94 hook progress-append accepts the 3 new event_type strings
-//!       (delegated to progress_append unit; tested in ccteam-hooks)
+//!   2. Validation of agent-team mode (team_name + lead_seed required)
+//!   3. Ad-hoc teammate requires adhoc_model
+//!   4. Mode missing → defaults to artifact-driven (V0.4.6 compat)
+//!   5. Agent team mode accepts empty agents map
+//!   6. Artifact-driven mode rejects agent_team block
+//!   7. Settings template for agent-team has 3 new hooks
+//!   8. PROJECT_SETTINGS_AGENT_TEAM_JSON contains all 3 hook entries
+//!   9. F94 hook progress-append accepts the 3 new event_type strings
+//!      (delegated to progress_append unit; tested in ccteam-hooks)
 
 use std::path::Path;
 
@@ -223,26 +222,6 @@ agents: {}
     std::fs::write(&path, yaml).unwrap();
     let err = WorkflowSpec::load(&path).unwrap_err();
     assert!(format!("{err}").contains("adhoc_model"));
-}
-
-#[test]
-fn agent_team_workflow_yaml_template_parses() {
-    // The bundled template (ccteam-core/src/templates/
-    // workflow.agent-team.yaml) must round-trip through the schema.
-    // This is the file `ccteam init --mode agent-team` writes.
-    let template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../ccteam-core/src/templates/workflow.agent-team.yaml");
-    let spec =
-        WorkflowSpec::load(&template_path).expect("shipped workflow.agent-team.yaml must parse");
-    assert_eq!(spec.mode, WorkflowMode::AgentTeam);
-    let team = spec.agent_team.as_ref().unwrap();
-    assert_eq!(team.team_name, "my-agent-team");
-    assert!(!team.auto_spawn_teammates);
-    // At least the one shown (uncommented) definition example.
-    assert!(team
-        .suggested_teammates
-        .iter()
-        .any(|t| t.role == "code-reviewer"));
 }
 
 #[test]

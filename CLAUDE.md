@@ -38,7 +38,7 @@
 - **配置**:每项目 `workflow.yaml` 声明 agent 拓扑(**无 prompt**,只 trigger + 并发上限 + `vendor`);role 行为 = 项目级 `.claude/agents/<role>.md`(`ccteam init` 种默认 `cto`)。**项目知识层(`CLAUDE.md`/`AGENTS.md`)归 vendor + 项目自己,ccteam 不生成/不桥接/不抑制**。
 - **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session(按持久 sid):Claude 走 `claude [--agent <role>]` tmux 长 session(send-keys + transcript + hook;空 role = roleless 裸 claude),Codex best-effort;两 vendor 归一成中立 `CanonicalEvent`。
 - **状态 SoT**:`progress.jsonl` 业务事件(`harness/progress_bridge` 单一权威);chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(按 sid;不依赖 Anthropic 内部 `~/.claude/projects/`)。
-- **接口**:17 个 MCP 工具 `mcp__ccteam__{admin_,chat_,advise_,session_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ 标准资源 API `/api/v1`(含 `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/pair /cd /use /new /role @handle @ccteam`)+ web(含 per-session `/chat/s/:sid` + Settings + Roles 页)。
+- **接口**:15 个 MCP 工具 `mcp__ccteam__{admin_,chat_,advise_,session_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ 标准资源 API `/api/v1`(含 `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/pair /cd /use /new /role @handle @ccteam`)+ web(含 per-session `/chat/s/:sid` + Settings + Roles 页)。
 - **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ Claude `/plugin install ccteam` OR Codex `codex plugin marketplace add firstintent/ccteam`;`cargo install --git …` 是 fallback。
 
 详 `docs/tech-design.md`。
@@ -75,6 +75,7 @@
 | **会话 = resume-by-session-id** | spawn-on-demand + 按 **sid** resume(粒度从 `(项目,role)` 升到 session id)+ 空闲释放 + 扛 daemon 重启,**非**常驻吊着;chat 复用 context 是 feature |
 | **ccteam 不生成/桥接项目 `CLAUDE.md`/`AGENTS.md`** | 项目知识层归 vendor 原生(Claude 读 `CLAUDE.md`、Codex 读 `AGENTS.md`)+ 项目自己;ccteam 唯一管的指令面 = `.claude/agents/<role>.md`(role 库) |
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
+| **ccteam repo 零提示词类型插件** | role/agent/skill/workflow 的**内容**一律不进 ccteam repo —— **唯一例外 `cto_role.md`**(引擎自带默认管家,算引擎配置非插件);其余(自建 + agency-agents 等开源)住 **ccteam-hub**(`firstintent/ccteam-hub`),ccteam 从 hub 读 `index.json` + 取内容 + 装进用户项目 `.claude/{agents,skills}/`/workflow 目录;legacy agent-team / meta-agent prompt 模板(`meta_agent_role.md`/`workflow.agent-team.yaml`/`squad_roster.rs`)+ 根 `agents/`/`workflows/` 已删,`InitMode::AgentTeam` init 模式已退役 |
 | **跨项目记忆走官方接口** | Claude `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex `~/.codex/AGENTS.md` —— ccteam 只**读**,不代项目生成 |
 | **init 布局** | 项目 `.ccteam/` 只 `state.json` + `workflow.yaml`;role 库 `.claude/agents/<role>.md`(种 cto);ccteam 托管设置(hook + base)写 `.claude/settings.local.json`(**绝不碰用户 `.claude/settings.json`**);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor home-drift 检查)|
 | **新建项目 slug = 目录名 + 数字累加** | `slugify(目录名)`,撞名累加 `demo`/`demo2`/`demo3`(弃 `-{4hex}`);`ccteam init` 可在任意现有目录**就地**初始化;`--slug` 显式覆盖 |
@@ -96,7 +97,7 @@
 |---|---|
 | **role 库**(`.claude/agents/<role>.md`)| ccteam 唯一管的指令面;`ccteam init` 种默认 `cto`(管家);work-role 用户自建 / 从 agency-agents(Claude 原生 .md,MIT)选 —— `ccteam role search/add/list`(catalog 192 entries,`role add` verbatim 写入 `.claude/agents/`)或手动丢入,`/role <role>` 原地换(daemon 内存态) |
 | **CLAUDE.md / AGENTS.md** | 项目 / 用户级持久指令,**vendor 原生**(ccteam 只读,不生成)|
-| **MCP** | `ccteam` **17 工具**,0 STUB(`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):admin 3(`ls`/`change_persona`/`add_tool`)· chat 6(`register_bot`/`unregister_bot`/`list_bots`/`send_input`/`history`/`send_file`)· advise 2(`vote`/`parallel`)· **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon 校验 per-session secret + project 维度)· screenshot 1;前缀 `mcp__ccteam__*`;wire 纪律:`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr |
+| **MCP** | `ccteam` **15 工具**,0 STUB(`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):admin 3(`ls`/`change_persona`/`add_tool`)· chat 4(`register_bot`/`unregister_bot`/`list_bots`/`send_file`;`send_input`/`history` 已删 —— 死写入/死读取路径)· advise 2(`vote`/`parallel`)· **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon 校验 per-session secret + project 维度)· screenshot 1;前缀 `mcp__ccteam__*`;wire 纪律:`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr |
 | **Skills** | **0 个 ccteam 自带**(repo 根 `skills/` 目录已删;原 skill 功能落 MCP 工具 + cto role + work-role + `config` CLI)。项目自有 skill 仍可放各项目 `.claude/skills/`(vendor 原生,ccteam 不管)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流(work-role 可自带)|
 | **Hooks** | `ccteam internal hook progress-append / load-context` 等(隐藏);写 `.claude/settings.local.json` 的 ccteam hook 段 |

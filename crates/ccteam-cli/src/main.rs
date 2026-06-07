@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use ccteam_core::CcteamPaths;
-use commands::{InitMode, InitOptions, OutputFormat};
+use commands::{InitOptions, OutputFormat};
 
 /// Version string shown by `ccteam --version`: the crate version plus the
 /// git commit it was built from (e.g. `0.8.4 (<commit>)`), so a running
@@ -67,7 +67,7 @@ enum Command {
     /// `.claude/agents/*.md` (use `--force` to overwrite them).
     ///
     /// V0.4.1: pass `-i` / `--interactive` to prompt y/n for optional
-    /// global installs (MCP, skill, meta-agent), or `-y` / `--yes`
+    /// global installs (MCP, skill), or `-y` / `--yes`
     /// to install all of them without prompting.
     Init {
         /// V0.4.2 F72: install in this directory instead of the cwd.
@@ -107,34 +107,13 @@ enum Command {
         /// would ask. Useful in scripts / CI.
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
-        /// V0.5.0 F93b: workflow mode for the scaffolded workflow.yaml.
-        /// `artifact-driven` (default) writes the V0.4.6 trigger-graph
-        /// template. `agent-team` writes the `workflow.agent-team.yaml`
-        /// template + `__lead.md` scaffold + `.ccteam/inbox/`.
-        #[arg(long, value_enum, default_value_t = InitMode::ArtifactDriven)]
-        mode: InitMode,
     },
     /// Run the v8.1 gateway daemon (IM gateway plus, by default, the
     /// web UI in the same process). Foreground is the only supported
     /// mode — `ccteam start` is enough; the `--foreground` flag is
     /// accepted for back-compat but no longer required.
     /// Pass `--no-web` to run the gateway without web.
-    ///
-    /// V0.5.0 F93b: when a positional `<slug>` is supplied AND that
-    /// project's workflow.yaml has `mode: agent-team`, `ccteam start`
-    /// switches into "spawn the lead session" flow:
-    ///   - prints a spawn preview (workflow.yaml summary + lead spec)
-    ///   - prompts `[Y/n/attach]` (TTY interactive)
-    ///   - on Y → spawn lead bg session + print attach hint
-    ///   - on attach → spawn + exec `claude attach <id>`
-    ///   - on n → cancel, no side effects
-    ///
-    /// Use `--no-confirm`/`-y` / `--attach` / `--dry-run` to skip the
-    /// prompt in scripted callers.
     Start {
-        /// V0.5.0 F93b: project slug to spawn an agent-team lead for.
-        /// Omit to run the v8.1 gateway daemon.
-        slug: Option<String>,
         /// Back-compat no-op: foreground is the only mode.
         #[arg(long, default_value_t = false, hide = true)]
         foreground: bool,
@@ -188,31 +167,6 @@ enum Command {
         /// flag in CI / headless / unattended runs to skip the probe.
         #[arg(long, default_value_t = false)]
         no_clipboard: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
-        /// `[Y/n/attach]` confirmation prompt and proceed with the
-        /// default `Y` (spawn + print attach hint). Useful for CI /
-        /// scripts.
-        #[arg(short = 'y', long, default_value_t = false)]
-        no_confirm: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
-        /// prompt and go straight to the `attach` branch (spawn + exec
-        /// `claude attach <id>`).
-        #[arg(long, default_value_t = false)]
-        attach: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, print
-        /// the spawn preview + exit. Does not spawn anything.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-        /// V0.5.0 F97: revive an agent-team mode project after a
-        /// `ccteam stop --cleanup leave-running` (or after the host
-        /// rebooted while the lead was still alive). Reads
-        /// `.ccteam/team-snapshot.json::lead_session_id`, probes the
-        /// `claude --bg` job's `state.json`, and re-arms the F95 watch
-        /// without spawning a new lead. If the prior lead is terminal,
-        /// emits a WARN and falls through to the normal
-        /// `--mode agent-team` spawn flow.
-        #[arg(long, default_value_t = false)]
-        restart_team: bool,
     },
     /// V0.4.1: one-screen aggregate health view. Reports daemon
     /// heartbeat age, every project's slug + age + last-event time with
@@ -220,9 +174,9 @@ enum Command {
     /// underneath, and the embedded-web token + LAN URL. Replaces having
     /// to grep `ls` + `session ls` + multiple `doctor` checks.
     Status,
-    /// Internal commands — hook handlers + meta-agent / MCP integration
+    /// Internal commands — hook handlers + MCP integration
     /// points + low-level utilities (mux hook-emit, probe-project, web).
-    /// Not user-facing day to day; meta-agent and the `ccteam-control`
+    /// Not user-facing day to day; the `ccteam-control`
     /// skill drive these. Hidden from top-level help; run
     /// `ccteam internal --help` for the list.
     #[command(hide = true)]
@@ -248,8 +202,8 @@ enum Command {
     ///     `force-kill` with a WARN.
     ///   - `leave-running`: drop the F95 watch entries + mark the
     ///     project `detached: true` in `state.json`, but leave the lead
-    ///     bg job + teammates alive. Subsequent `ccteam start <slug>`
-    ///     refuses unless `--restart-team` is set.
+    ///     bg job + teammates alive (re-attach later via
+    ///     `claude attach <lead_id>`).
     Stop {
         /// V0.5.0 F97: per-slug stop. Reads
         /// `<project>/.ccteam/workflow.yaml::agent_team.cleanup_on_stop`
@@ -311,8 +265,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
         // v0.8.6 Item 4 — the setup actions formerly exposed here
-        // (`--install-mcp` / `--install-skill` / `--install-meta-agent` /
-        // `--install-all`) moved to `ccteam config`. `doctor` is now
+        // (`--install-mcp` / `--install-skill` / `--install-all`) moved to
+        // `ccteam config`. `doctor` is now
         // diagnostics / self-check / repair only.
         /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
@@ -764,8 +718,8 @@ enum RoleCommand {
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
 /// server, low-level session utilities (peek / progress / send / spawn /
 /// resume / attach), the mux hook-emit client, the project probe, and the
-/// standalone web server. Not user-facing day to day; the meta-agent and
-/// the `ccteam-control` skill drive these.
+/// standalone web server. Not user-facing day to day; the
+/// `ccteam-control` skill drives these.
 #[derive(Subcommand)]
 enum InternalCommand {
     /// Hook handlers invoked by Claude Code per project settings.json.
@@ -1002,7 +956,6 @@ fn main() -> Result<()> {
             reset_agents,
             interactive,
             yes,
-            mode,
         } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
@@ -1015,14 +968,12 @@ fn main() -> Result<()> {
                     reset_agents,
                     interactive,
                     yes,
-                    mode,
                 },
             )?;
             print!("{report}");
             Ok(())
         }
         Command::Start {
-            slug,
             foreground: _,
             tick_seconds,
             skip_tool_check,
@@ -1033,47 +984,19 @@ fn main() -> Result<()> {
             web_no_auth,
             web_token_file,
             no_clipboard,
-            no_confirm,
-            attach,
-            dry_run,
-            restart_team,
-        } => match slug {
-            Some(s) => {
-                // V0.5.0 F93b: per-slug spawn flow. Reads workflow.yaml
-                // to decide; agent-team mode does the [Y/n/attach]
-                // spawn; artifact-driven mode bails with friendly hint.
-                // V0.5.0 F97: --restart-team revives a `leave-running`
-                // detached lead by re-arming the watch without spawning.
-                let paths = CcteamPaths::from_env()?;
-                let body = commands::run_start_agent_team(
-                    &paths,
-                    &s,
-                    commands::StartAgentTeamOptions {
-                        no_confirm,
-                        attach,
-                        dry_run,
-                        restart_team,
-                    },
-                )?;
-                if dry_run {
-                    print!("{body}");
-                }
-                Ok(())
-            }
-            None => run_start(
-                tick_seconds,
-                skip_tool_check,
-                claude_argv,
-                StartWebOpts {
-                    disabled: no_web,
-                    bind: web_bind,
-                    no_auth: web_no_auth,
-                    token_file: web_token_file,
-                    no_clipboard,
-                },
-                StartImdOpts { disabled: no_imd },
-            ),
-        },
+        } => run_start(
+            tick_seconds,
+            skip_tool_check,
+            claude_argv,
+            StartWebOpts {
+                disabled: no_web,
+                bind: web_bind,
+                no_auth: web_no_auth,
+                token_file: web_token_file,
+                no_clipboard,
+            },
+            StartImdOpts { disabled: no_imd },
+        ),
         Command::Status => run_status(),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
