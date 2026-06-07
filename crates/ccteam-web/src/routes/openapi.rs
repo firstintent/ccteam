@@ -48,8 +48,8 @@ pub const SCALAR_JS_PATH: &str = "/api/docs/scalar-standalone.js";
 ///
 /// Pinned version: **`@scalar/api-reference@1.58.0`** (`dist/browser/
 /// standalone.js`). Refresh = chore: re-fetch the pinned tarball build and
-/// overwrite the vendored file (mirrors the `workflow_templates/` /
-/// `agency_agents_catalog.json` vendoring pattern). The standalone build
+/// overwrite the vendored file (mirrors the `workflow_templates/` vendoring
+/// pattern). The standalone build
 /// auto-bootstraps from the `<script id="api-reference" type="application/
 /// json">` spec block on load (`window.Scalar` self-init).
 pub const SCALAR_JS: &str = include_str!("../../assets/scalar-standalone.js");

@@ -4172,20 +4172,43 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
         .with_context(|| format!("canonicalize project dir `{}`", dir.display()))
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role search <q>`. Offline substring search
-/// over the bundled agency-agents catalog (no network). Empty query lists
-/// the whole catalog. Text output prints `id` + division + description so
-/// the user can copy an `id` into `ccteam role add`.
-pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
-    let hits = ccteam_core::catalog_search(query)?;
+/// v0.8.9 Phase 2 — `ccteam role search <q>`. Substring search over the
+/// curated ccteam-hub marketplace `index.json` (loaded via the
+/// `~/.ccteam/hub-cache/` cache; first run fetches it). Matches the
+/// (case-insensitive) query against each plugin's id / name / description /
+/// tags. An empty query lists everything, sorted by id. Text output prints
+/// `id` + type + description so the user can copy an `id` into
+/// `ccteam role add`. The async load is driven on a throwaway current-thread
+/// runtime ([`block_on_async`]) since `main()` is sync.
+pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -> Result<String> {
+    let index = block_on_async(ccteam_im::hub::load_catalog(
+        &ccteam_im::hub::hub_base(),
+        paths,
+        false,
+    ))??;
+    let q = query.trim().to_lowercase();
+    let mut hits: Vec<&ccteam_im::hub::HubPlugin> = index
+        .plugins
+        .iter()
+        .filter(|p| {
+            if q.is_empty() {
+                return true;
+            }
+            p.id.to_lowercase().contains(&q)
+                || p.name.to_lowercase().contains(&q)
+                || p.description.to_lowercase().contains(&q)
+                || p.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        })
+        .collect();
+    hits.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(match format {
         OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
         OutputFormat::Text => {
             if hits.is_empty() {
-                format!("no catalog roles match `{query}`.\n")
+                format!("no plugins match `{query}` in the ccteam-hub marketplace.\n")
             } else {
                 let mut out = format!(
-                    "{} role(s) in the agency-agents catalog{}:\n\n",
+                    "{} plugin(s) in the ccteam-hub marketplace{}:\n\n",
                     hits.len(),
                     if query.trim().is_empty() {
                         String::new()
@@ -4193,11 +4216,11 @@ pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
                         format!(" matching `{query}`")
                     }
                 );
-                for e in &hits {
-                    out.push_str(&format!("  {}  [{}]\n", e.id, e.division));
-                    if !e.description.is_empty() {
+                for p in &hits {
+                    out.push_str(&format!("  {}  [{}]\n", p.id, p.type_));
+                    if !p.description.is_empty() {
                         // One-line, truncated description for the list view.
-                        let desc: String = e.description.chars().take(96).collect();
+                        let desc: String = p.description.chars().take(96).collect();
                         out.push_str(&format!("      {desc}\n"));
                     }
                 }
@@ -4210,11 +4233,11 @@ pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
     })
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role add <id> [--as <role>] [--project <slug>]
-/// [--force]`. Imports a catalog role into the project's `.claude/agents/`
-/// (fetch over HTTP → verbatim write) and prints a `/role <role>` hint.
-/// The async fetch is driven on a throwaway current-thread runtime
-/// ([`block_on_async`]) since `main()` is sync.
+/// v0.8.9 Phase 2 — `ccteam role add <id> [--as <role>] [--project <slug>]
+/// [--force]`. Installs a curated ccteam-hub plugin into the project's
+/// `.claude/` (fetch over HTTPS + sha256 verify → verbatim write) and prints a
+/// `/role <role>` hint. The async load + fetch is driven on a throwaway
+/// current-thread runtime ([`block_on_async`]) since `main()` is sync.
 pub fn run_role_add(
     paths: &CcteamPaths,
     id: &str,
@@ -4223,16 +4246,31 @@ pub fn run_role_add(
     force: bool,
 ) -> Result<String> {
     let project_dir = resolve_project_dir(paths, project)?;
-    let result = block_on_async(ccteam_im::role_import::import_role_from_catalog(
+    let base = ccteam_im::hub::hub_base();
+    let index = block_on_async(ccteam_im::hub::load_catalog(&base, paths, false))??;
+    let plugin = index.find(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no plugin `{id}` in the ccteam-hub marketplace — try `ccteam role search <q>`"
+        )
+    })?;
+    let result = block_on_async(ccteam_im::hub::install_plugin(
         &project_dir,
-        id,
+        plugin,
         as_role,
         force,
-    ))??;
+        &base,
+    ))?
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The installed file stem (the `/role` name) is the sanitized override or
+    // the plugin id — the same derivation `install_plugin` used. Recovered here
+    // for the hint (the path is `.../skills/<stem>/SKILL.md` for a skill, so a
+    // raw `file_stem()` would be `SKILL`).
+    let stem = ccteam_core::sanitize_role_stem(as_role.unwrap_or(&result.id))
+        .unwrap_or_else(|_| result.id.clone());
     let mut out = format!(
-        "Installed role `{}` from catalog `{}`{}.\n  {}\n",
-        result.role,
-        result.catalog_id,
+        "Installed {} `{}` from the ccteam-hub marketplace{}.\n  {}\n",
+        result.type_,
+        result.id,
         if result.overwrote {
             " (overwrote existing)"
         } else {
@@ -4241,15 +4279,13 @@ pub fn run_role_add(
         result.path.display(),
     );
     out.push_str(&format!(
-        "\nSwitch to it in a chat with `/role {}` (or spawn a session with that role).\n",
-        result.role
+        "\nSwitch to it in a chat with `/role {stem}` (or spawn a session with that role).\n",
     ));
-    // v0.8.7 review-fix (R-L6) — the body is third-party content (MIT
-    // agency-agents) fetched verbatim. Persona text steers an agent that runs
-    // with `--dangerously-skip-permissions`, so prompt the operator to read it
-    // before use rather than trusting it blind.
+    // The body is third-party content fetched verbatim. Persona text steers an
+    // agent that runs with `--dangerously-skip-permissions`, so prompt the
+    // operator to read it before use rather than trusting it blind.
     out.push_str(&format!(
-        "\nNote: this role .md is third-party content fetched verbatim — review {} before use.\n",
+        "\nNote: this plugin is third-party content fetched verbatim — review {} before use.\n",
         result.path.display()
     ));
     Ok(out)

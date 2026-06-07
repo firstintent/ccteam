@@ -241,14 +241,14 @@ enum Command {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
-    /// Role catalog group: `ccteam role <search|add|list>`.
+    /// Role / plugin marketplace group: `ccteam role <search|add|list>`.
     ///
-    /// Browse the bundled agency-agents role catalog (`search`, offline —
-    /// no network), one-shot install a role into the project's
-    /// `.claude/agents/` (`add <id>`, fetches the role `.md` over HTTP), or
-    /// list the roles already installed in a project (`list`, wraps the
-    /// resource-API reader). This is a different noun from `session role`
-    /// (which switches a *live* chat session's role inside the daemon).
+    /// Browse the curated ccteam-hub marketplace (`search`), one-shot install
+    /// a plugin into the project's `.claude/` (`add <id>`, fetches + sha256-
+    /// verifies the body over HTTPS), or list the roles already installed in a
+    /// project (`list`, wraps the resource-API reader). This is a different
+    /// noun from `session role` (which switches a *live* chat session's role
+    /// inside the daemon).
     Role {
         #[command(subcommand)]
         cmd: RoleCommand,
@@ -667,16 +667,16 @@ enum ProjectCommand {
     },
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role` subcommand group. Browse the bundled
-/// agency-agents catalog and one-shot install a role into a project's
-/// `.claude/agents/`. Distinct from `session role` (the live in-daemon role
-/// switch): these are one-shot project-file catalog/import operations.
+/// v0.8.9 Phase 2 — `ccteam role` subcommand group. Browse the curated
+/// ccteam-hub marketplace and one-shot install a plugin into a project's
+/// `.claude/`. Distinct from `session role` (the live in-daemon role switch):
+/// these are one-shot project-file marketplace/install operations.
 #[derive(Subcommand)]
 enum RoleCommand {
-    /// Search the bundled agency-agents catalog (offline — no network).
-    /// Matches the query (case-insensitive) against id / division /
-    /// name / description. An empty query lists the whole catalog. Each
-    /// row prints the catalog `id` to pass to `ccteam role add <id>`.
+    /// Search the curated ccteam-hub marketplace. Matches the query
+    /// (case-insensitive) against each plugin's id / name / description /
+    /// tags. An empty query lists everything. Each row prints the plugin
+    /// `id` to pass to `ccteam role add <id>`.
     Search {
         /// Substring query. Omit (or pass "") to list everything.
         #[arg(default_value = "")]
@@ -684,15 +684,15 @@ enum RoleCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install a catalog role into a project's `.claude/agents/`. Fetches
-    /// the role `.md` from the upstream raw host and writes it verbatim
-    /// (the file is already Claude-native — no conversion). On success,
-    /// prints a hint to `/role <role>` to switch to it in a chat.
+    /// Install a ccteam-hub plugin into a project's `.claude/`. Fetches the
+    /// body from the hub, verifies its sha256 against the index, and writes it
+    /// verbatim (the file is already Claude-native — no conversion). On
+    /// success, prints a hint to `/role <role>` to switch to it in a chat.
     Add {
-        /// Catalog id (as shown by `ccteam role search`).
+        /// Plugin id (as shown by `ccteam role search`).
         id: String,
-        /// Rename the installed role (file stem). Default: the catalog
-        /// entry's name. Sanitized to `[a-z0-9_-]`.
+        /// Rename the installed plugin (file stem). Default: the plugin
+        /// `id`. Sanitized to `[a-z0-9_-]`.
         #[arg(long = "as", value_name = "ROLE")]
         as_role: Option<String>,
         /// Target project slug (resolved via `~/.ccteam/config.yaml`).
@@ -1262,7 +1262,8 @@ fn run_session_role(slug: &str, sid: &str, role: &str) -> Result<()> {
 fn run_role(cmd: RoleCommand) -> Result<()> {
     match cmd {
         RoleCommand::Search { query, format } => {
-            let out = commands::run_role_search(&query, format)?;
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_role_search(&paths, &query, format)?;
             print!("{out}");
             Ok(())
         }

@@ -10,23 +10,22 @@
 //!
 //! ## Why here (not `ccteam-core`)
 //!
-//! Same split the agency-agents catalog/importer uses: the raw-content base
-//! URL constant ([`ccteam_core::HUB_RAW_BASE`]) and the cache *directory* path
-//! ([`ccteam_core::CcteamPaths::hub_cache_dir`]) live in the primitives leaf,
-//! but the **network fetch + sha256 integrity check + install** live here
-//! because `ccteam-core` is the topology leaf (`core -> harness -> cost`) and
-//! must not take an async HTTP + sha2 dependency. `ccteam-im` already depends
-//! on `reqwest`, so this is at home next to [`crate::role_import`] and reuses
-//! its hardened-fetch posture verbatim (30s timeout, redirects refused, 1 MiB
-//! cap, Content-Length pre-check + bounded streaming read).
+//! The raw-content base URL constant ([`ccteam_core::HUB_RAW_BASE`]) and the
+//! cache *directory* path ([`ccteam_core::CcteamPaths::hub_cache_dir`]) live in
+//! the primitives leaf, but the **network fetch + sha256 integrity check +
+//! install** live here because `ccteam-core` is the topology leaf
+//! (`core -> harness -> cost`) and must not take an async HTTP + sha2
+//! dependency. `ccteam-im` already depends on `reqwest`, so this is at home
+//! next to [`crate::onboarding`] and applies a hardened-fetch posture (30s
+//! timeout, redirects refused, 1 MiB cap, Content-Length pre-check + bounded
+//! streaming read).
 //!
 //! ## Test seam
 //!
 //! Every public fn takes a `base` parameter and the live wrappers pass
 //! [`ccteam_core::HUB_RAW_BASE`] (overridable via the [`HUB_BASE_ENV`] env
 //! var). Tests point `base` at an in-process fake hub (`spawn_oneshot_http`)
-//! so `cargo test` never touches github. Mirrors `role_import`'s
-//! `*_with_base` seam.
+//! so `cargo test` never touches github.
 
 use std::path::{Path, PathBuf};
 
@@ -37,13 +36,13 @@ use thiserror::Error;
 /// Upper bound on a fetched body (catalog `index.json` or plugin body). Hub
 /// agents are a few KiB; 1 MiB is huge headroom while still capping a
 /// misconfigured / hostile endpoint that would otherwise stream an unbounded
-/// body into memory. Mirrors [`crate::role_import::MAX_ROLE_BODY_BYTES`].
+/// body into memory.
 pub const MAX_HUB_BODY_BYTES: usize = 1024 * 1024;
 
 /// Env var overriding the ccteam-hub raw-content base, for deterministic
 /// tests (an in-process fake hub stands in for github). Mirrors the
-/// `role_import` `*_with_base` seam, exposed as an env knob so non-test
-/// callers (CLI / web) can also repoint the hub without a code change.
+/// `base`-override test seam, exposed as an env knob so non-test callers
+/// (CLI / web) can also repoint the hub without a code change.
 pub const HUB_BASE_ENV: &str = "CCTEAM_HUB_BASE";
 
 /// Resolve the active hub raw-content base: [`HUB_BASE_ENV`] when set,
@@ -153,7 +152,7 @@ pub enum InstalledStatus {
 }
 
 /// Errors from [`fetch_index`] / [`load_catalog`] / [`fetch_plugin_body`] /
-/// [`install_plugin`]. Modeled on [`crate::role_import::ImportError`].
+/// [`install_plugin`].
 #[derive(Debug, Error)]
 pub enum HubError {
     /// No plugin with the given id in the (fetched / cached) index.
@@ -223,7 +222,7 @@ pub enum HubError {
 /// and **redirects refused** (`Policy::none()`). A 3xx to an arbitrary host
 /// (open-redirect / typo-squat) becomes a non-success status the caller
 /// rejects as [`HubError::BadStatus`] rather than silently fetching attacker
-/// content. Copied posture from [`crate::role_import`].
+/// content.
 fn hardened_client(what: &str) -> Result<reqwest::Client, HubError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -382,7 +381,7 @@ pub async fn fetch_plugin_body(base: &str, plugin: &HubPlugin) -> Result<String,
 
 /// Install a hub plugin's content into `project_dir`.
 ///
-/// 5-step (mirrors [`crate::role_import::import_role_from_catalog_with_base`]):
+/// 5-step:
 /// 1. derive + sanitize the install stem — `target_stem` override, else
 ///    `plugin.id` — to `[a-z0-9_-]`,
 /// 2. refuse to clobber an existing file at the target unless `force`,

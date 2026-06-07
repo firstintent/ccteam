@@ -2,9 +2,9 @@
 //! (`ccteam_im::hub`).
 //!
 //! The backend fetches `index.json` + plugin bodies from the hub raw host and
-//! installs them into a project's `.claude/`. Like `role_import_test.rs`,
-//! these tests stand a tiny in-process HTTP/1.1 responder in for
-//! `raw.githubusercontent.com` (the `base` parameter is the seam) so the
+//! installs them into a project's `.claude/`. These tests stand a tiny
+//! in-process HTTP/1.1 responder in for `raw.githubusercontent.com` (the
+//! `base` parameter is the seam) so the
 //! round-trip is real HTTP but never touches the network. The project dir is a
 //! `TempDir`; `CCTEAM_HOME` is pointed at another `TempDir` so the hub cache
 //! writes under a throwaway root, not the real `~/.ccteam`.
@@ -20,10 +20,9 @@ use ccteam_im::hub::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-/// Single-shot HTTP/1.1 responder (one connection, then exit). Identical in
-/// spirit to `role_import_test::spawn_oneshot_http` — used as the FAKE HUB for
-/// single-request cases (the body fetch, or a 404/empty index). Returns
-/// `http://127.0.0.1:<port>` to pass as the hub `base`.
+/// Single-shot HTTP/1.1 responder (one connection, then exit) — used as the
+/// FAKE HUB for single-request cases (the body fetch, or a 404/empty index).
+/// Returns `http://127.0.0.1:<port>` to pass as the hub `base`.
 fn spawn_oneshot_http(status_line: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -45,8 +44,7 @@ fn spawn_oneshot_http(status_line: &'static str, body: &'static str) -> String {
 }
 
 /// One-shot responder with a runtime-built body + arbitrary extra headers
-/// (e.g. a `Location:` for the redirect test). Mirrors
-/// `role_import_test::spawn_oneshot_http_dyn`.
+/// (e.g. a `Location:` for the redirect test).
 fn spawn_oneshot_http_dyn(status_line: &str, extra_headers: &str, body: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

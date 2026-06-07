@@ -34,8 +34,8 @@ pub mod gateway;
 // backend. Reads the hub `index.json` over HTTPS + a `~/.ccteam/hub-cache/`
 // local cache, verifies each plugin body's sha256 against the index, and
 // installs into a project's `.claude/agents|skills/`. Lives here (not core)
-// so the primitives leaf stays free of an async HTTP + sha2 dependency —
-// same split as `role_catalog` (core, offline) ↔ `role_import` (im, HTTP).
+// so the primitives leaf stays free of an async HTTP + sha2 dependency (the
+// `core` half is just the base-URL constant + path utils in `ccteam_core::hub`).
 pub mod hub;
 pub mod inbound;
 pub mod latency;
@@ -48,11 +48,6 @@ pub mod outbound_format;
 pub mod pending;
 pub mod progress;
 pub mod rate_limit;
-// v0.8.7 W3 DC.2 — network import of an agency-agents role into a project's
-// `.claude/agents/`. The offline catalog (browse/search) lives in
-// `ccteam-core`; the HTTP fetch lives here (next to `onboarding`) so the
-// primitives leaf stays free of an async HTTP dependency.
-pub mod role_import;
 pub mod router;
 pub mod sanitize;
 pub mod three_layer_sec;
