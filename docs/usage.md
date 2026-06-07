@@ -7,8 +7,8 @@
 
 - **chat**:Telegram / 飞书(Lark)私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
 - **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
-- **session**:一个可继续上下文的 agent 会话(spawn-on-demand、按 id resume、空闲释放),属于某个 chat + 某个 project。
-- **role**:session 启动时绑定的角色(`.claude/agents/<role>.md` 定义 persona + 工具)。session 以 `claude --agent <role>` 启动,**就 become 该 role**。默认 role 是 `cto`(chat-first 管家)。换 role = IM 里 `/role <role>`(底层 = 带新 `--agent` 重启该 session)。
+- **session**:一个**独立**的 agent 会话(spawn-on-demand、按 id resume、空闲释放),像 Claude Code 原生 session 一样自带上下文,属于某个 chat + 某个 project。一个项目可同时开多个会话,**互不串台**——哪怕同一个 role 开两个,也各聊各的。每个会话有持久句柄 `s<N>`(单调递增、扛 daemon 重启、不复用)。
+- **role**:session 启动时绑定的角色(`.claude/agents/<role>.md` 定义 persona + 工具)。session 以 `claude --agent <role>` 启动,**就 become 该 role**;role 可留空 = 裸 `claude`(不带 `--agent`,brain 走项目 `CLAUDE.md`)。默认 role 是 `cto`(chat-first 管家)。换 role = IM 里 `/role <role>`(底层 = 带新 `--agent` 原地重启该会话,**句柄 `s<N>` 不变**)。
 
 两类命令别混:
 
@@ -65,6 +65,8 @@ codex plugin marketplace add firstintent/ccteam
 ```
 
 > 注册 MCP 服务用 `ccteam config`(见 §3),不再用 `doctor --install-mcp`。
+
+> **从旧版本升级(须知)**:本版的独立 session 模型与旧的 per-role 会话状态**不兼容**。升级前请**清掉旧状态**再重新初始化 —— `ccteam stop` → 删 `~/.ccteam` 以及各项目里的 `.ccteam/` → 各项目重跑 `ccteam init` → `ccteam config` → `ccteam start`。旧的 per-role 历史会丢(pre-v1.0 阶段可接受,无兼容迁移)。**不碰你的业务代码 / `CLAUDE.md` / `.env` / `.git`**。
 
 ---
 
@@ -239,16 +241,20 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 **多 session + 切换 + 查看**:
 
 ```text
-/new claude reviewer        建新 session(vendor = claude|codex;role 可选,默认 cto)
-/new claude reviewer hitl   建一个开了「人工批准」的 session(尾 token hitl;默认是 skip)
-/use s1                     切到 session s1
-/sessions                   列当前 chat 的 session(每行带 role + model + 上下文用量)
+/new                        铸一个新会话(默认 vendor=claude / role=cto),回新句柄 s<N>
+/new claude reviewer        建新会话(vendor = claude|codex;role 可选,默认 cto)
+/new claude reviewer hitl   建一个开了「人工批准」的会话(尾 token hitl;默认是 skip)
+/use s1                     切到会话 s1(同一项目里多会话间切换)
+/role reviewer              把**当前**会话改成 reviewer 角色(原地重启、同句柄 s<N>)
+/sessions                   列当前 chat 的会话(每行带 vendor + role + model + 上下文用量)
 /projects                   列 daemon 已知项目(= 已 init 且 daemon 已加载)
 ```
 
+`/new` 每次都**铸一个全新会话**(新 `s<N>`,绝不复用旧的),回一个句柄给你;`/use s<N>` 在已有会话间切。同一项目可并存任意多会话,各自独立——开两个 `reviewer` 也是两条互不串台的对话。**roleless**:IM 的 `/new` 至少给 cto;要起一个**裸 claude(无角色)**会话,用 web 控制台新建会话弹窗里的「(无角色 / 裸 claude)」选项,或资源 API `POST …/sessions` 传空 role(brain 走项目 `CLAUDE.md`)。
+
 **人工批准模式(HITL,可选,默认关)**:`/new <vendor> <role> hitl` 建的 session 跑**非自动放行**的工具时,会先把「session sX(role) 要跑:`<tool> <摘要>`」+ `[✅ 同意] [⛔ 拒绝]` 两个按钮弹到你 chat,点同意才执行、拒绝则只挡这一次工具(不杀整个 turn)。allowlist 内 / 自动放行的工具永不弹。不带 `hitl`(默认 `skip`)的 session 维持 YOLO(直接执行,不弹)。`/role` 切换 + daemon 重启都保留 session 的批准模式。(Codex session 忽略此模式 —— 自带 sandbox。)
 
-`/sessions` 每行形如 `s1:demo-app:claude:reviewer  claude-opus-4-8[1m] · ctx 188k / 1M (19%)` —— 末尾是该 session 的 **model + 上下文用量**(绝对值 + 百分比;窗口 1M 来自 model id 的 `[1m]` 后缀,否则按 200k 基线)。用量是回合后值:空闲时准,turn 跑到一半偏旧。
+`/sessions` 每行形如 `s1:demo-app:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)` —— 形如 `句柄:项目:vendor:role`,末尾是该 session 的 **model + 上下文用量**(绝对值 + 百分比;窗口 1M 来自 model id 的 `[1m]` 后缀,否则按 200k 基线)。用量是回合后值:空闲时准,turn 跑到一半偏旧。
 
 **发消息 + slash 透传**(`@handle` 决定路由并设为当前 session;不带 `@` 时发给当前 session):
 
@@ -308,7 +314,7 @@ cto 背后用的是 5 个 `mcp__ccteam__session_*` 工具:`session_spawn`(建子
 ccteam project ls                  # 列已知项目
 ccteam project show demo-app       # 看一个项目的完整状态 + 近期事件
 ccteam project new demo --team dev # 在 <projects_root>/dev-demo/ 下新建并 init
-ccteam project stop demo-app       # 停该项目所有 session(kill tmux,可 resume;非删)
+ccteam project stop demo-app       # 停该项目所有会话(走当前 mux backend 真停掉,可按 id resume;非删)
 ccteam project rm demo-app         # 注销项目(只摘 config 注册 + 清 ~/.ccteam 内 per-slug 状态)
 ```
 
@@ -388,6 +394,16 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 
 **每个 session 独立页(per-session web)**:打开 `http://<host>:7331/app/chat/s/<sid>`(`<sid>` = `s1`/`s2`…,与 IM 的 `/use s1` 同命名空间)进入某个 session 的独立视图 —— 自己的历史(读该 session 的 `turns.jsonl`)、按 sid 过滤的实时事件流、干净不混流的切换。HITL 批准也会在这里渲染成「session sX 要跑…」+ 每个选项一个按钮(web 点击 resolve 是 best-effort,稳妥批准走 IM 按钮)。
 
+**控制台页签**(浏览器里点点就能用,不必记命令):
+
+- **新建项目**:新建会话弹窗里选「＋ 新建项目…」,填 slug(名)+ 路径即可在任意目录 scaffold 一个项目(走 `POST /api/v1/projects`),建好直接在里头起会话。
+- **新建会话弹窗**:role 是从该项目 `.claude/agents/` 拉的**真实 role 下拉**(显示 role + 说明),外加一个「(无角色 / 裸 claude)」选项起 roleless 会话;不选则默认 cto。
+- **Roles 页**:浏览当前项目**已装的 role**(只读)—— 列表 + 点开看详情(frontmatter + 正文)。装新 role 仍走 CLI `ccteam role add`(见 §7)。
+- **Settings 页**:在浏览器里配 IM 凭证 —— Telegram(bot token + 异步抓 chat_id:存好 token 后给 bot 发条消息,页面轮询自动捕获)与 Lark/飞书(App ID / Secret / region / allowlist)。**秘密只显示掩码**(`…last4`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅 daemon 启动时加载一次,无热重载)—— 页面会提示 `restart required`,照 §5 `ccteam stop && ccteam start`。
+- **web 终端**(per-session):按会话解析到对应 pane,稳定连(不再秒断重连)。注:默认 mux backend(rmux)下终端是**行文本**(re-assembled lines);要**裸 ANSI 完整保真**得用 `CCTEAM_MUX_BACKEND=tmux` 起 daemon。终端 UI 当前只对 claude 会话开放。
+
+> **安全**:web 默认绑 `0.0.0.0:7331` 且**无 TLS**,token / IM 凭证走 LAN **明文**传输 —— 只在可信局域网用,**别暴露公网**;要更严就 `--web-bind 127.0.0.1:7331` 只绑环回(并用 SSH 隧道远程访问)。
+
 **交互式 API 文档**:浏览器开 `http://<host>:7331/api/docs` 是 `/api/v1` 全量端点的 **Scalar 交互式文档**(可直接在页面里试调);机读 spec 在 `GET /api/v1/openapi.json`(OpenAPI 3.1)。两者与 `/api/v1` 同一 web-token 鉴权(非环回 bind 需带 token)。
 
 ### 标准资源 API(`/api/v1`,给集成方)
@@ -429,12 +445,21 @@ GET    /api/docs                              Scalar 交互式 API 文档(浏览
 ## 9. 运维
 
 ```bash
-ccteam status                  # daemon 心跳 + 每个项目 OK/warn/STUCK + 活跃 session
-ccteam session ls              # 列活的网关 chat-mode session,并标出 orphan
+ccteam status                  # daemon 心跳 + 每个项目(嵌套列其会话)+ 两行 web token/url
+ccteam session ls              # 列网关会话(SLUG·SID·ROLE·VENDOR·STATUS),并标出 orphan
 ccteam doctor                  # 安装 / 依赖体检
 ccteam doctor --verify-mcp     # MCP 表面验收(active 17 / stubs 0,drift 退出码 1)
 ccteam stop                    # 优雅停 daemon(保留 tmux session)
 ```
+
+`ccteam status` 一眼看全:daemon 心跳 → **每个项目**(slug · age · last-event · OK/STUCK)下**嵌套列出它的会话**(role / vendor / status / sid / last-event;roleless 会话 role 显示 `-`)→ 末尾两行 web 访问信息:
+
+```text
+  web token: <hex>                                   # 裸 hex(给自己加前缀的工具)
+  web url:   http://<局域网ip>:7331/?token=ccteam:<hex>   # 直接能开的完整 URL(带 ccteam: 前缀)
+```
+
+`ccteam session ls` 列网关会话,带 **VENDOR** 列;daemon 在线时 tracked 会话(含 **codex**)状态正确显示 `live`(此前 codex 会被误报 `registered, not running`);daemon 不在线降级标 `registered (daemon down)`;有 pane 活着但不在 tracked 的标 `orphan`。
 
 成本(按 vendor 记账):
 

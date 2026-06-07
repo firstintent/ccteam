@@ -2,7 +2,7 @@
 
 > 本文档基于 [requirements.md](./requirements.md)(已确认的用户痛点)给出 ccteam 当前的技术架构、组件分解、数据协议、扩展点映射。
 >
-> **产品定位**:「云 Claude Code(+ Codex)+ IM + Web」—— 把一个常驻 gateway daemon 架在你机器上的真实 agentic CLI 之上,让你在 IM(Telegram 等)或 web 控制台里像用一台终端一样,跨多个项目、多个 session、多个 **role** 操作真实 agent。
+> **产品定位**:「云 Claude Code(+ Codex)+ IM + Web」—— 把一个常驻 gateway daemon 架在你机器上的真实 agentic CLI 之上,让你在 IM(Telegram 等)或 web 控制台里像用一台终端一样,跨多个项目、多个**独立 session**(各有持久 sid,role 是 session 的属性)操作真实 agent。
 
 ---
 
@@ -12,9 +12,9 @@
 
 **R-code 速查**(简写 ↔ CLAUDE.md §三):
 
-- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反)· `R4` 会话 = resume-by-id · `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目走 `<projects_root>/<team>-<slug>/`(slug 撞名数字累加)· `R11` root README.md 英文且不含版本进展
+- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目走 `<projects_root>/<team>-<slug>/`(slug 撞名数字累加)· `R11` root README.md 英文且不含版本进展
 
-> **已退役的旧红线**(v0.8.6 架构打破,勿再引用):「每次 spawn = fresh 1M context」(chat 复用 context 是 feature;仅 autonomous bg 适用)、「fix-loop 撞 3 次 escalate / AgentPath depth」(属推后的 `ccteam-flow` 引擎)、「HITL approval state SoT / 第 4 mode」(**编排级**批准仍推后,`ApprovalIR` 仅类型占位;**per-session** HITL 已 v0.8.7 落地,走 `PermissionMode::Hitl` + `PermissionRequest` hook,见 §6.5;非 hitl session 仍 `--dangerously-skip-permissions`)、「`ccteam init` 落 AGENTS.md → CLAUDE.md symlink」(v0.8.6 起 ccteam **不**生成/接管项目 CLAUDE.md/AGENTS.md)。
+> **已退役的旧红线**(新架构打破,勿再引用):**「session = role」keystone**(session 已升为**独立一等实体 + 持久 sid**、role 是属性;同 role 可并存多 session、pane/turns 按 sid —— 见 §2.1)、「每次 spawn = fresh 1M context」(chat 复用 context 是 feature;仅 autonomous bg 适用)、「fix-loop 撞 3 次 escalate / AgentPath depth」(属推后的 `ccteam-flow` 引擎)、「HITL approval state SoT / 第 4 mode」(**编排级**批准仍推后,`ApprovalIR` 仅类型占位;**per-session** HITL 已落地,走 `PermissionMode::Hitl` + `PermissionRequest` hook,见 §6.5;非 hitl session 仍 `--dangerously-skip-permissions`)、「`ccteam init` 落 AGENTS.md → CLAUDE.md symlink」(ccteam **不**生成/接管项目 CLAUDE.md/AGENTS.md)。
 
 ---
 
@@ -25,10 +25,10 @@
 | 原则 | 对应痛点 | 落地约束 |
 |---|---|---|
 | **守护进程化** | 痛点 9:AI 团队需要人来主持 | gateway daemon(`ccteam start`)独立于任何 Claude Code 主对话,systemd / 后台长跑;SIGTERM / `ccteam stop` → daemon 优雅 drain(web / IM gateway / MCP socket,每任务 ≤ 5s)。**不 tick、无 orchestrator 循环**。 |
-| **文件即状态机** | 痛点 7:进度永远不透明 | 一切状态可从文件系统恢复:`progress.jsonl` 业务事件 SoT + chat 原文 `turns.jsonl` + Claude session jsonl + Codex thread;daemon 重启按持久化 session id 续接,不丢上下文 |
-| **session = role** | 痛点 12 + 痛点 13 | 一个 chat/IM session 以某个 **role** 启动(`claude --agent <role> --name|--resume <sid>`),session **即 become** 该 role;role 库住项目级 `.claude/agents/<role>.md`(Claude Code first-class spec)。ccteam **不注入** system prompt —— 只决定「消息路由到哪个 session」+「以哪个 role 启动」(详 §2) |
-| **vendor 原生项目知识** | 痛点 10 + 痛点 13 | 项目知识层归 vendor:Claude session 自动读项目 `CLAUDE.md`,Codex 自动读 `AGENTS.md`。ccteam **不生成、不修改、不抑制**这些文件(R8);ccteam 的自定义只在 **role** 层 |
-| **resume-by-id 会话** | 痛点 8/9 | session 按需 spawn(首条消息触发)+ 按 session id resume + 空闲释放;不常驻吊着(state 落盘,重启后 reconnect),避免影子 SoT(R4) |
+| **文件即状态机** | 痛点 7:进度永远不透明 | 一切状态可从文件系统恢复:`progress.jsonl` 业务事件 SoT + chat 原文 `turns.jsonl`(按 sid)+ Claude session jsonl + Codex thread;daemon 重启按持久化 sid 续接,不丢上下文 |
+| **session = 独立一等实体** | 痛点 12 + 痛点 13 | 一个 chat/IM session 是**独立一等实体**,有持久 `sid`(`s<N>`,单调、扛重启、不复用);**role 是 session 的属性**(spawn 时绑 `claude [--agent <role>] --name|--resume <session-name>`),**同一 role 可并存多 session**。role 库住项目级 `.claude/agents/<role>.md`(Claude Code first-class spec);空 role = roleless(省略 `--agent`)。ccteam **不注入** system prompt —— 只决定「消息路由到哪个 sid」+「以哪个 role 启动」(详 §2) |
+| **vendor 原生项目知识** | 痛点 10 + 痛点 13 | 项目知识层归 vendor:Claude session 自动读项目 `CLAUDE.md`,Codex 自动读 `AGENTS.md`。ccteam **不生成、不修改、不抑制**这些文件(R8);ccteam 的自定义只在 **role** 层(roleless session 则纯靠项目知识层当 brain)|
+| **resume-by-session-id 会话** | 痛点 8/9 | session 按需 spawn(首条消息触发)+ 按持久 sid resume + 空闲释放;不常驻吊着(state 落盘,重启后 reconnect),避免影子 SoT(R4) |
 | **零交互沙盒** | 痛点 8:每一步都点允许 | IM 路径的 Claude session 走 `--dangerously-skip-permissions`;只把 bot 暴露给可信 chat(`allowed_chat_ids` allowlist) |
 | **失败必须可见** | 痛点 7 + 痛点 11 | gateway 的原则是失败不能静默挂住:submit/turn 超时、Claude tmux pane 死、Codex app-server 断,都翻成 `gateway error: ...` 回到 IM / web |
 | **预算硬上限** | 痛点 5 + 自激励 loop 防失控 | 成本 per-vendor 记账(`ccteam-cost`);`budgets.{claude,codex}.max_cost_usd_per_24h` per-vendor cap;CLAUDE.md $200 全 ccteam 物理上限兜底 |
@@ -38,25 +38,25 @@
 
 ## 2. 总体架构
 
-### 2.1 核心模型:chat ⇄ project ⇄ session ⇄ role
+### 2.1 核心模型:chat ⇄ project ⇄ session(role 是 session 的属性)
 
-ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。核心对象有四个:
+ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。核心对象有三个 + 一个属性:
 
 | 对象 | 含义 |
 |---|---|
 | **chat** | 一个 IM 私聊、群聊或 web chat。每个 chat 有自己的当前项目、当前 session 和 session 列表。 |
 | **project** | 本地一个已 `ccteam init` 的项目目录,用 slug 标识。 |
-| **session** | 一个可继续上下文的 agent 会话,属于某个 chat × project × vendor × **role**。它是一个常驻的 `ThreadHandle`,有自己独立的 context(`/compact` `/clear` 各自独立),用 gateway 命名空间的 `s{n}` 标识。 |
-| **role** | 一个可复用的 persona/定义 = 项目级 `.claude/agents/<role>.md`(frontmatter:persona + tools + disallowedTools + skills + mcpServers + model + effort + permissionMode + initialPrompt + memory)。session 启动时 `claude --agent <role>` 让 vendor **自读**该文件 → session 即 become 该 role。 |
+| **session** | **独立一等实体** —— 一个可继续上下文的 agent 会话,有持久 `sid`(gateway 命名空间 `s<N>`,单调、扛 daemon 重启、不复用)。属于某个 chat × project × vendor,**以某个 role 为属性**启动。它是一个常驻 `ThreadHandle`,有独立 context(`/compact` `/clear` 各自独立);pane=`ccteam-chat-<slug>-<sid>`、turns=`.ccteam/chat/<sid>/turns.jsonl` 都按 sid。**同一 role 可并存多 session**(无 `(project,role)` dedup)。 |
+| **role**(session 属性)| 一个可复用的 persona 定义 = 项目级 `.claude/agents/<role>.md`(frontmatter:persona + tools + disallowedTools + skills + mcpServers + model + effort + permissionMode + initialPrompt + memory)。session spawn 时 `claude --agent <role>` 让 vendor **自读**该文件 → session 以该 role 的 persona 跑。**空 role = roleless**:省略 `--agent`,裸 claude 自读项目 `CLAUDE.md`/`AGENTS.md` 当 brain。 |
 
-一个 chat 可以同时活多个项目、多个 session;另一个 chat 状态独立,不会串。
+一个 chat 可以同时活多个项目、多个 session(含同 role 的多个);另一个 chat 状态独立,不会串。
 
-**两层 session 模型**(v0.8.6 keystone):
+**两层知识/控制模型**:
 
-- **① 项目知识层(vendor 原生,ccteam 不碰)**:Claude session 自动读项目 `CLAUDE.md`;Codex 自动读 `AGENTS.md`。老项目用自己的,新项目有啥读啥 —— ccteam 既不生成也不抑制(R8)。
-- **② role / persona 层(ccteam 控制面)**:session 启动走 `claude --agent <role> --name <sid>`。`ccteam init` 种一个默认 role **`cto`**(chat-first「CTO 管家」persona);用户用 `/role <role>` 换角色干活。
+- **① 项目知识层(vendor 原生,ccteam 不碰)**:Claude session 自动读项目 `CLAUDE.md`;Codex 自动读 `AGENTS.md`。老项目用自己的,新项目有啥读啥 —— ccteam 既不生成也不抑制(R8)。roleless session 纯靠这层当 brain。
+- **② role / persona 层(ccteam 控制面)**:session 启动走 `claude [--agent <role>] --name <session-name>`。`ccteam init` 种一个默认 role **`cto`**(chat-first「CTO 管家」persona);用户用 `/role <role>` 换角色干活。role 只是 spawn 时绑的属性,不再是 session 的身份。
 
-**默认 role `cto`** 三职责(行为全写进 `.claude/agents/cto.md` 正文,**不靠 skill**):① 懂 ccteam(知识 + MCP 工具自描述);② 为用户**推荐**合适的 work-role;③ 调度 role-session —— **v0.8.6 只推荐,用户自己切 role**(主动 spawn/派活的 B 档与开 Claude Task 子 agent 均推后)。work-role 来源 = 用户自建 .md 或从 [agency-agents](https://github.com)(Claude 原生 .md 库)选,落同一 `.claude/agents/`;v0.8.6 选 role = 手动丢 .md,picker/import UI 推后下版。
+**默认 role `cto`** 三职责(行为全写进 `.claude/agents/cto.md` 正文,**不靠 skill**):① 懂 ccteam(知识 + MCP 工具自描述);② 为用户**推荐**合适的 work-role;③ 调度 role-session(cto 经 `session_*` MCP 工具 spawn/dispatch work-role session,daemon 校验 per-session secret,best-effort 非硬边界,详 §6.4)。work-role 来源 = 用户自建 .md 或从 [agency-agents](https://github.com)(Claude 原生 .md 库)选,落同一 `.claude/agents/`;装 role 走 `ccteam role search/add/list`(catalog 192 entries,verbatim 写入)或手动丢 .md。
 
 **chat-local 路由命令**(由 gateway 路由表 `is_gateway_command` 拦截,源自单表 `GATEWAY_COMMANDS`):
 
@@ -65,16 +65,16 @@ ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。�
 | `/pair <code>` | 将当前 chat 建立为可用入口,并确保默认 session 存在 |
 | `/cd <project>` | 当前 chat 切到项目(只切当前 chat) |
 | `/newproject <slug> <path>` | 现场注册并建一个新项目 |
-| `/new [vendor] [role]` | 在当前项目创建新 session(默认 vendor=claude、role=cto) |
-| `/use <session-id>` | 当前 chat 切到已有 session |
-| `/role <role>` | **原地换当前 session 的 role**(底层 = 带新 `--agent` 重启,**保持同一 sid**) |
+| `/new [vendor] [role]` | 在当前项目创建新 session(默认 vendor=claude、role=cto;**总铸新 sid**,同 role 也不复用)|
+| `/use <session-id>` | 当前 chat 切到已有 session(按 sid)|
+| `/role <role>` | **原地换当前 session 的 role**(底层 = 带新 `--agent` 重启,**保持同一 sid + pane**)|
 | `/sessions` / `/projects` | 列当前 chat 的 session / daemon 已知项目 |
 | `@handle <text>` | 路由到指定 session 并设为当前;不带 `@handle` 则发给当前 session |
 | `@ccteam <NL>` | IM admin(status / pause / resume / list / cost / stop) |
 
 `/compact` `/review` `/clear` 这类**不是** gateway 命令,会作为一个普通 turn / directive 透传给当前 session 的 adapter,由 adapter 翻译成 vendor-native 操作(详 §2.5)。
 
-> **`/role` 的实现**(`switch_current_role`,gateway.rs):abort 旧 event pump + `close_thread` 旧 pane,以新 `--agent <role>` `start_thread`,**保持同一 gateway sid**(`/use <sid>` 不失效);无活动 session → 报错;同 role → no-op(不白扔 live context);保留原 vendor。`--agent` 是**启动期绑定**,换 role = fresh-spawn 该 session。
+> **`/role` 的实现**(`switch_current_role`,gateway.rs):carry-context 原地换 —— 同 sid + 同 pane 名(`ccteam-chat-<slug>-<sid>`)以新 `--agent <role>` re-spawn,**保持同一 gateway sid**(`/use <sid>` 不失效);fresh-spawn 分支带 death-probe(失败不误报成功);无活动 session → 报错;同 role → no-op(不白扔 live context);保留原 vendor。`--agent` 是**启动期绑定**,换 role = re-spawn 该 session 的 persona。
 
 ### 2.2 daemon = IM/web⇄session 路由网关
 
@@ -84,11 +84,11 @@ ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。�
 |---|---|
 | IM gateway | `ccteam-im::run_daemon_with_shutdown`;Telegram(等)long-poll 入站 + 出站发送;chat⇄project⇄session⇄role 路由表 |
 | Web chat WS | `GET /ws/chat`(`ccteam-chat.v1`);CLI 层 mpsc bridge 把 browser frame 翻成 `ChannelMessage{channel:"web"}` 后接入同一个 Gateway |
-| 标准资源 API | `/api/v1/*`(web-token auth);project / role / session 三资源 + `/capabilities`(详 §2.6) |
+| 标准资源 API | `/api/v1/*`(web-token auth);project / role / session 三资源 + `config/im`(IM 凭证)+ `/capabilities`(详 §2.6) |
 | MCP socket | `~/.ccteam/run/mcp.sock` —— daemon-local line-delimited JSON-RPC handler,供 Claude/Codex plugin 调 ccteam 工具 |
 | Web server | axum + SSE,默认 `http://127.0.0.1:7331`,服务 SPA bundle |
 
-**关键约束**:此路径**不构造** `ccteam-flow::Orchestrator`,**不跑** supervisor tick(`ccteam-flow` 是推后的编排层,当前未接进运行中的 daemon,详 §7)。daemon 退出时**不 kill** tmux session(R5):下次 `ccteam start` 按持久化 session id 重新接管(Claude 按 deterministic session 名 reattach;dead pane recreate 走 `--resume` lossless);未发送 / 失败的 IM 出站回复保存在 `~/.ccteam/imd/outbound.jsonl`,启动后重放。
+**关键约束**:此路径**不构造** `ccteam-flow::Orchestrator`,**不跑** supervisor tick(`ccteam-flow` 是推后的编排层,当前未接进运行中的 daemon,详 §7)。daemon 退出时**不 kill** tmux session(R5):下次 `ccteam start` 按持久化 sid 重新接管(Claude 按 deterministic 的 sid pane 名 `ccteam-chat-<slug>-<sid>` reattach;dead pane recreate 走 `--resume` lossless);未发送 / 失败的 IM 出站回复保存在 `~/.ccteam/imd/outbound.jsonl`,启动后重放。
 
 ### 2.3 执行层两轴:HarnessAdapter × ProcessBackend
 
@@ -117,10 +117,10 @@ pub trait HarnessAdapter: Send + Sync {
 }
 ```
 
-- **`AgentSpecBrief`** 携带 `role`(spawn argv 用它拼 `--agent <role>`)+ slug + cwd + session-id-name。session=role 模型的落点就在这里:`spec.role` → claude argv 的 `--agent` 槽位。
+- **`AgentSpecBrief`** 携带 `role`(spawn argv 用它拼 `--agent <role>`,**空 role = roleless 省略 `--agent`**)+ slug + cwd + sid(session-name 按 sid)。role-as-attribute 的落点就在这里:`spec.role` → claude argv 的 `--agent` 槽位(可空)。
 - **`CanonicalEvent`** 是 `ThreadEvent` 的中立别名(`ThreadStarted` / `TurnStarted` / `TurnCompleted{usage}` / `TurnFailed` / `Item{Started,Updated,Completed}` / `Error`);schema 对齐 Codex `ThreadEvent`,两 vendor 的 emitter 1:1 映射进 gateway。`events()` 守 **final-only 契约**(rustdoc 钉死):一个 turn 的最终 agent 文本**恰好一次**经 `ItemCompleted(AgentMessage)` 吐出,`ItemUpdated` 仅 delta/presentation、consumer 可丢;token usage / plan / rate-limit 等非终态遥测**不**进此流(旁路镜像 `progress.jsonl`,经 `thread_status` 查询)。gateway 的取文本逻辑依赖此契约,故契约住 adapter trait。
 - **`ExecutionMode`** 三态(`ThreadHandle::mode`):`InProc`(in-process subagent,占位)/ `Bg`(`claude --bg` / `codex exec --json` 单轮 fresh-context)/ `Chat`(tmux + claude TUI / `codex app-server` UDS,多轮 context 复用 —— IM/web 路径全走这个)。
-- **resume 语义**:`Chat` 形态 resume-by-id —— Claude 用 deterministic session 名 lossless 续接,Codex 用 thread id app-server resume;`Bg` 形态每次 spawn fresh,`resume_thread` 返回 `NotImplemented`。
+- **resume 语义**:`Chat` 形态 resume-by-session-id —— Claude 用 deterministic 的 sid session 名 lossless 续接,Codex 用 thread id app-server resume;`Bg` 形态每次 spawn fresh,`resume_thread` 返回 `NotImplemented`。
 - **`close_thread`** 是唯一杀长 session 的路径:正常只由用户主动触发(`project stop` / `project rm`、`/role` 换角色),绝不静默(R5)。
 
 **Vendor-seam forward-compat**:ccteam 读 sub-harness 吐出的 `state.json` / `codex app-server` JSON-RPC 通知 —— 这些是 vendor 自有 schema,按自家节奏新增字段 / enum 值,ccteam 清不掉也管不了(与「不做历史迁移」红线只管 ccteam 自有 state 不冲突)。`ccteam-harness::warn_unknown_vendor_token(seam, token, detail)` 是 process-wide warn-once helper(`(seam, token)` 作 dedup key);未知 token → skip + warn,不中断 event stream。
@@ -169,20 +169,21 @@ per-adapter best-fit,不强行统一:
 |---|---|---|
 | **project** | `GET /projects`、`GET /projects/{slug}`(`api_v1.rs`,只读)· `POST /projects`、`DELETE /projects/{slug}`(`routes/projects.rs`) | `DELETE` = **注销 + 停 session(deregister),不 file-purge**;破坏性 purge 留 CLI `project rm --purge`(§4) |
 | **role** | `GET /projects/{slug}/roles`、`GET/PUT /projects/{slug}/roles/{role}`(`routes/roles.rs`) | 读 `.claude/agents` 库;core `ccteam_core::roles::{list_roles,read_role}` 解析 frontmatter |
-| **session** | `GET/POST /projects/{slug}/sessions`、`GET /sessions/{sid}`、`POST /sessions/{sid}/turn`、`POST /sessions/{sid}/resolve`(HITL token-resolve)、`GET /sessions/{sid}/events`(SSE)、`POST /sessions/{sid}/stop`(`routes/sessions_api.rs`) | session = project × role × harness(+provider),resume-by-id;`{sid}` = gateway `s{n}`;`/resolve {token,selection}` 走 `Gateway::resolve_web_selection`(= IM 点击同路,**非** turn) |
+| **session** | `GET/POST /projects/{slug}/sessions`、`GET /sessions/{sid}`、`POST /sessions/{sid}/turn`、`POST /sessions/{sid}/resolve`(HITL token-resolve)、`GET /sessions/{sid}/events`(SSE)、`POST /sessions/{sid}/stop`(`routes/sessions_api.rs`) | session = 独立一等实体(role 是属性),resume-by-session-id;`{sid}` = gateway `s{n}`(持久);POST 空 role = roleless;`/resolve {token,selection}` 走 `Gateway::resolve_web_selection`(= IM 点击同路,**非** turn) |
+| **config/im** | `GET /config/im`(masked)、`PUT /config/im/{telegram,lark}`、`POST /config/im/telegram/chat-id/start` + `GET /config/im/telegram/chat-id`(异步轮询)(`routes/im_config.rs`) | **REST 配置面,非 MCP 工具**;GET 响应类型**根本不含** bot_token/app_secret(类型层杜绝明文回显,只 `*_last4`+counts);PUT 先 getMe / tenant_access_token 验过再落盘 0600;telegram chat_id 走背景 long-poll task 捕获;所有写返回 `restart_required`(creds 仅 daemon 启动时 load,无热生效) |
 | **facet** | `GET /capabilities`(`routes/capabilities.rs`) | 动态列当前可用 harness(×provider):`HarnessCapability{id,vendor,available,providers}`;`available` = PATH probe(`<bin> --version` exit 0,进程级缓存) |
 
 **gateway spine**(`crates/ccteam-im/src/gateway.rs`)—— 标准 API 的 drive 路径不动 `HarnessAdapter` trait,而是在 gateway 上加薄方法:
 
-- `pub struct SessionView{ sid, ... }` + `session_views()` —— 列 daemon 内所有 tracked session;
-- `create_session_api(...)` —— API 建 session(等价于 IM `/new`);
+- `pub struct SessionView{ sid, ... }` + `session_views()` —— 列 daemon 内所有 tracked session;`tracked_chat_sessions(state_path)` → `TrackedSessionRow{slug,sid,role,vendor,...}` 从持久化 gateway state 文件读(CLI `session ls` / `status` 共用,无新 RPC);
+- `create_session_api(...)` —— API 建 session(等价于 IM `/new`;空 role = roleless);
 - `submit_to_sid(sid, text)` —— 向指定 sid 发 turn(等价于 `@handle`);
-- `stop_session(sid)` —— 停指定 session;
+- `stop_session(sid)` —— 停指定 session;`session_resolve(sid)` → `SessionResolve{sid,role,vendor,project,project_dir}`(404 闸 + per-session pane/turns 解析);
 - `GatewayEvent.sid: Option<String>` —— **SSE 过滤键**:per-session SSE handler 只保留 `sid` 匹配自己的事件。`None` = 不绑 session 的事件(如 `chat_send_file` MCP 路径、D6 `interaction/ask` hook prompt);IM 投递路径**忽略** `sid`(按 channel + chat_id 路由),故这是 additive。
 
 **依赖方向(acyclic)**:共享 `Arc<Mutex<Gateway>>` 从 daemon 注入 ccteam-web `AppState`(**web → im 单向依赖**,无环);standalone `internal web`(无 daemon)→ gateway None → session 端点优雅 **503**(`gateway_unavailable`),只读 project/role/capabilities 仍可用。
 
-> **前端 follow-up(已记录)**:per-session SPA UI 改造推后 —— 既有 SPA 会话页走旧 project-sid 路径(`/ws/chat` 混流),新 API 用 gateway-sid(`s{n}`),两 sid 命名空间不兼容,改造 = 重设计。**API 已 live + 真实 HTTP smoke 过**,留前端 handoff。
+> **前端落地**:per-session SPA UI 已落地(`/chat/s/:sid`,§6.6),走 gateway-sid(`s{n}`);外加 Settings(IM config,§6.6)+ Roles(只读浏览)两个 tab。standalone `internal web`(无 daemon)→ gateway None → session/config 端点优雅 **503**,只读 project/role/capabilities 仍可用。
 
 ---
 
@@ -211,7 +212,7 @@ ccteam-cli (bin)
 
 > 拓扑只能是 `core -> harness -> cost`,**不要**翻成 `harness -> core`。`cargo tree` 验环:`ccteam-web` → `ccteam-im` 单向(`tests/dep_graph_test.rs` 锁)。
 
-**progress 写入权威**:`ccteam-harness::progress_bridge` 是 `progress.jsonl` 业务事件 schema 的单一权威,`ccteam-core` 只 re-export(R2)。chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<bot>/turns.jsonl`,**不**依赖 Anthropic 内部 `~/.claude/projects/`。
+**progress 写入权威**:`ccteam-harness::progress_bridge` 是 `progress.jsonl` 业务事件 schema 的单一权威,`ccteam-core` 只 re-export(R2)。chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(**按 sid**),**不**依赖 Anthropic 内部 `~/.claude/projects/`;live daemon 的唯一 turns writer 是 gateway `spawn_event_pump` 的 ANSWER 分支(按 sid `append_turn`)。
 
 ### 3.2 项目布局与初始化
 
@@ -282,9 +283,9 @@ ccteam-cli (bin)
    │
    ▼  IM gateway 收入站(经 allowed_chat_ids allowlist 校验)/ web `/ws/chat` 收入站(web token auth)
    │
-   ▼  Gateway::handle_text:解析 @reviewer → 定位/创建 chat 当前 project 的 reviewer session
-   │     (首条消息触发 HarnessAdapter::start_thread,以 `claude --agent reviewer --name <sid>` 启动;
-   │      已存在则复用 ThreadHandle)
+   ▼  Gateway::handle_text:解析 @reviewer → 定位/创建 chat 当前 project 的 reviewer session(分配新 sid)
+   │     (首条消息触发 HarnessAdapter::start_thread,以 `claude --agent reviewer --name <session-name>` 启动;
+   │      已存在则按 sid 复用 ThreadHandle)
    │
    ▼  HarnessAdapter::submit_turn(handle, TurnInput::UserText("看一下..."))
    │     Claude: tmux send-keys -l "<text>" Enter
@@ -293,13 +294,13 @@ ccteam-cli (bin)
    │
    ▼  HarnessAdapter::events 流(Claude: hooks fast event + transcript tail;Codex: JSON-RPC)
    │     → CanonicalEvent::ItemCompleted{AgentMessage} / TurnCompleted{usage}
-   │     → 镜像写 turns.jsonl(R2)+ progress.jsonl 业务事件 + cost ledger(per-vendor)
+   │     → 镜像写 .ccteam/chat/<sid>/turns.jsonl(R2,gateway spawn_event_pump 按 sid)+ progress.jsonl + cost ledger
    │     → GatewayEvent{ sid: Some("s3"), ... } 兼供 IM 投递 + per-session SSE
    │
    ▼  outbound ledger 把 assistant 文本发回 IM / web(at-least-once;失败重放)
 ```
 
-> **session=role 实证细节**(W1 smoke):`--agent <role>` 顶层 turn 触发 `Stop`(→ `chat_turn_completed`,turn 完成检测命根)+ `SessionStart`/`UserPromptSubmit`/`Pre+PostToolUse`;有时**也**触发 `SubagentStop`(顶层被建模为 implicit-main 的 subagent)—— 但**不会双发 IM 回复**:回复只走 transcript-content track(`ItemCompleted{AgentMessage}`),hook track(stop/subagent-stop)只写 `progress.jsonl`,两轨解耦。
+> **turn 完成检测实证细节**(smoke):`--agent <role>` 顶层 turn 触发 `Stop`(→ `chat_turn_completed`,turn 完成检测命根)+ `SessionStart`/`UserPromptSubmit`/`Pre+PostToolUse`;有时**也**触发 `SubagentStop`(顶层被建模为 implicit-main 的 subagent)—— 但**不会双发 IM 回复**:回复只走 transcript-content track(`ItemCompleted{AgentMessage}`),hook track(stop/subagent-stop)只写 `progress.jsonl`,两轨解耦。roleless session(无 `--agent`)同样触发这套 hooks。
 
 ### 4.2 失败与恢复
 
@@ -328,7 +329,7 @@ gateway 的原则:失败必须可见,不能静默挂住。
 | 全局目录布局 | `~/.ccteam/` 单一根;`canonical_home_dirs()` 是布局 manifest | `ccteam-core::paths`(`CcteamPaths` / `canonical_home_dirs`) |
 | 项目级 state.json | 原子写(`.tmp` + rename);per-project 元数据;损坏走 backup | `ccteam-core`(`ProjectState`) |
 | progress.jsonl | **唯一业务状态事实来源** —— 写 schema 单一权威 = `ccteam-harness::progress_bridge`,core re-export;终端输出不参与状态判定 | `ccteam-harness::progress_bridge` / `enriched_event::EventKind` |
-| turns.jsonl | chat 对话原文 SoT,ccteam-owned `<project>/.ccteam/chat/<bot>/` | `ccteam-im`(turns mirror) |
+| turns.jsonl | chat 对话原文 SoT,ccteam-owned `<project>/.ccteam/chat/<sid>/`(**按 sid**)| `ccteam-harness`(turns mirror)+ gateway `spawn_event_pump`(唯一 live writer)|
 | role 定义 | `.claude/agents/<role>.md` frontmatter | `ccteam-core::roles`(`list_roles` / `read_role`) |
 | outbound ledger | `~/.ccteam/imd/outbound.jsonl`;at-least-once IM 投递,daemon 启动后重放 | — |
 
@@ -338,28 +339,30 @@ gateway 的原则:失败必须可见,不能静默挂住。
 
 ## 6. Claude Code / Codex 扩展点映射
 
-### 6.1 Tmux 长 session(Claude chat session = role)
+### 6.1 Tmux 长 session(Claude chat session = 独立 sid)
 
-chat session = per-bot 一个 tmux session + `claude --agent <role>` TUI 长跑;dual-track 观测,**不 scrape pane**(R6)。
+chat session = per-sid 一个 tmux session + `claude [--agent <role>]` TUI 长跑;dual-track 观测,**不 scrape pane**(R6)。
 
 ```bash
-SESSION="ccteam-chat-<slug>-<role>"      # tmux session deterministic 命名
-# fresh spawn:--agent <role> 让 vendor 自读 .claude/agents/<role>.md(R3 兑现);
-#             --name 让 Anthropic 把 session jsonl 落在 deterministic 名下,
-#             使日后 recreate 能 --resume(argv 顺序以 claude_tui.rs spec_for_new 为准)
+SESSION="ccteam-chat-<slug>-<sid>"       # tmux session 按 sid deterministic 命名
+# fresh spawn:--agent <role> 让 vendor 自读 .claude/agents/<role>.md(R3 兑现;
+#             空 role = roleless → 省略 --agent,裸 claude 读项目 CLAUDE.md);
+#             --name 让 Anthropic 把 session jsonl 落在 deterministic 名下(按 sid),
+#             使日后 recreate 能 --resume(argv 顺序以 claude_tui.rs spec_for_new 为准);
+#             CCTEAM_CHAT_SID/CCTEAM_CHAT_SECRET 注入 pane env(chat_spawn_env_owned)
 tmux new-session -d -s "${SESSION}" -c "${PROJECT_DIR}" \
-  "claude --agent <role> --dangerously-skip-permissions --name <session-id-name>"
+  "claude [--agent <role>] --dangerously-skip-permissions --name <session-name>"
 # 输入面:tmux send-keys -l 直送 user content + Enter(literal 模式,0 escape 雷区);
 #         /compact /new /clear 经 handle_directive 透传(§2.5)
 # 输出面 Track A:官方 hooks(SessionStart/UserPromptSubmit/Stop/SubagentStop/PostToolUse)
-#                 作 fast event 通道(低延迟 turn boundary)
+#                 作 fast event 通道(低延迟 turn boundary;hook 从 CCTEAM_CHAT_SID 取 sid)
 # 输出面 Track B:byte-offset 增量读 transcript jsonl → 抽 full message content →
-#                 镜像写 ccteam-owned turns.jsonl(R2 SoT)
+#                 镜像写 ccteam-owned .ccteam/chat/<sid>/turns.jsonl(R2 SoT,按 sid)
 ```
 
-**关键约束**:✅ 用 `--dangerously-skip-permissions`(消灭弹窗,痛点 8);✅ `--agent <role>`(session=role,R3 兑现);❌ **不**用 `claude -p`(失去 attach + 每 turn 冷启 cache 失效);❌ **不**设 `--max-turns`(长跑,由超时 + 成本上限兜底)。
+**关键约束**:✅ 用 `--dangerously-skip-permissions`(消灭弹窗,痛点 8;hitl session 例外用 `--permission-mode default`,见 §6.5);✅ `--agent <role>` = role-as-attribute 的 persona 绑定(R3 兑现;空 role 合法省略);❌ **不**用 `claude -p`(失去 attach + 每 turn 冷启 cache 失效);❌ **不**设 `--max-turns`(长跑,由超时 + 成本上限兜底)。
 
-**daemon-restart 上下文恢复**:dead-pane recreate 走 `claude --agent <role> --dangerously-skip-permissions --resume <session-id-name>` lossless lookup(`spec_for_resume`,resume 路径**也带** `--agent`)—— Anthropic 自己 reload session jsonl,cache + 推理链续接;失败才 fallback fresh spawn(`spec_for_fresh` 委托 `spec_for_new`,继承 `--agent`)+ emit `chat_session_reset{bot, reason}`(user-visible degraded,不冒充 resume)。tmux 命令包在 `tokio::process::Command` 异步 spawn —— 单 binary 零额外运行时依赖。
+**daemon-restart 上下文恢复**:dead-pane recreate 走 `claude [--agent <role>] --dangerously-skip-permissions --resume <session-name>` lossless lookup(`spec_for_resume`,resume 路径**也带** `--agent`,roleless 时同样省略)—— Anthropic 自己 reload session jsonl,cache + 推理链续接;失败才 fallback fresh spawn(`spec_for_fresh` 委托 `spec_for_new`,继承同样的 `--agent` 条件)+ emit `chat_session_reset{reason}`(user-visible degraded,不冒充 resume)。tmux 命令包在 `tokio::process::Command` 异步 spawn —— 单 binary 零额外运行时依赖。
 
 ### 6.2 Role 库(`.claude/agents/<role>.md`)
 
@@ -376,7 +379,7 @@ model: claude-opus-4-5
 You are a reviewer agent. ...
 ```
 
-`ccteam init` 种默认 `cto.md`(管家 role,3 职责见 §2.1);work-role 由用户自建 / 从 agency-agents 选,落同一目录。**这是 ccteam 唯一管理的"指令面"** —— 与「No prompt injection」红线不冲突:ccteam 不向 pane / app-server 注入 system prompt,而是让 vendor 用原生 `--agent` 机制自读 role.md(R3 兑现)。`session persona` / API `PUT /roles/{role}` 改写 role.md body(保留 frontmatter),下次该 session fresh start 生效。
+`ccteam init` 种默认 `cto.md`(管家 role,3 职责见 §2.1);work-role 由用户自建 / 从 agency-agents 选,落同一目录。**这是 ccteam 唯一管理的"指令面"** —— 与「No prompt injection」红线不冲突:ccteam 不向 pane / app-server 注入 system prompt,而是让 vendor 用原生 `--agent` 机制自读 role.md(R3 兑现)。**roleless session 省略 `--agent`**(空 role 短路 `ensure_role_exists`),裸 claude 读项目知识层当 brain —— 同样不违反红线(不注入 ≠ 必须有 role)。`session persona` / API `PUT /roles/{role}` 改写 role.md body(保留 frontmatter),下次该 session fresh start 生效。
 
 ### 6.3 Hooks 配置
 
@@ -402,7 +405,7 @@ You are a reviewer agent. ...
 
 #### 提供的 MCP:`ccteam`(**17 工具**,0 STUB)
 
-v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 + `chat_reset`);v0.8.7 W1 为 cto 调度新增 `session_` group 5 工具 → 共 17。所有工具加 group 子前缀,**server name 不变**(`ccteam`):
+MCP 工具共 **17**(早期瘦身退役了推后编排的 `workflow_*` 套件 + `chat_reset`,后为 cto 调度补 `session_` group 5 工具)。所有工具加 group 子前缀,**server name 不变**(`ccteam`):
 
 | Group(子前缀) | 工具数 | 工具 |
 |---|---|---|
@@ -427,7 +430,7 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 
 ### 6.5 安全
 
-- **per-session 权限模式(v0.8.7 W2)**:每个 session 有 `PermissionMode { Skip(默认), Hitl }`(`ccteam-harness/adapter.rs`,挂 `SpawnCtx.permission_mode`,穿所有创建路径:IM `/new claude cto hitl` 尾 token、web `POST /sessions` `permission_mode`、cto `session_spawn` param;`/role` 切换 + 重启 resume 保留)。
+- **per-session 权限模式**:每个 session 有 `PermissionMode { Skip(默认), Hitl }`(`ccteam-harness/adapter.rs`,挂 `SpawnCtx.permission_mode`,穿所有创建路径:IM `/new claude cto hitl` 尾 token、web `POST /sessions` `permission_mode`、cto `session_spawn` param;`/role` 切换 + 重启 resume 保留)。
   - **`Skip`** → spawn 走 `--dangerously-skip-permissions`(YOLO,无手机批准门;agent 按本机 Claude Code 权限直接执行)。
   - **`Hitl`** → spawn 走 `--permission-mode default`(**绝不** skip,否则 ask-path 被白嫖)+ per-session 注入 vendor 原生 `PermissionRequest` hook(无 matcher = 全工具、无 timeout 让长审批不被杀)→ 非 allowlist 工具触发 hook → `ccteam-hooks/permission_request.rs` 经 `permission/ask` JSON-RPC 走 mcp.sock → daemon `execute_permission_ask` 建 Approve/Deny ChoicePrompt(token-keyed External pending)弹到绑定 chat → 用户点同意才放行。**回应路两条同源**:IM 点击 = `resolve_selection`,web 点击 = `POST /sessions/{sid}/resolve` → `resolve_web_selection`,两者都 `take_by_token`→`apply_pending` 同一 pending(非 turn)。**FAIL-SAFE = deny**;permission prompt 用比 600s interaction/ask **更短的 TTL**(`PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT`,env `CCTEAM_PERMISSION_PROMPT_TTL_SECS`)+ outstanding 时写一行 `chat_permission_prompt_outstanding` progress(operator 知道 parked);deny **只挡该次工具、不带 `interrupt`、不 kill turn**(守 R5)。**不注入 system prompt**(R3:批准门是 vendor 原生 hook,非注入)。Codex 忽略该 lever(自有 sandbox)。
 - **Telegram allowlist**:`~/.ccteam/im/credentials.json` 的 `allowed_chat_ids` 是第一层边界,生产不留空;bot token 不进 git;daemon 只跑在你控制的机器上;Web UI 只绑 `127.0.0.1` 除非明确配反代 + 鉴权。Lark/Feishu allowlist `allowed_user_ids`(open_id)**fail-closed**(空=拒绝所有人,与 telegram 相反)。
@@ -440,9 +443,13 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 
 **Chat 控制台**:`/app/chat` 通过 `GET /ws/chat` + 子协议 `ccteam-chat.v1` 进入 Gateway。`ccteam-web` 持有 web-local JSON 帧和 mpsc 端点;`ccteam-cli::web_chat_bridge` 在 `run_start` 装配处把它翻译成 `ccteam-im::transport::ChannelMessage` / `SendMessage`,所以 web 与 IM **共用同一个 `Gateway::handle_text`、同一批 session、同一个 outbound ledger**。
 
-**per-session web 视图(v0.8.7 W4)**:`/chat/s/:sid`(`ChatConsole.tsx` 按 `s{n}` keyed)= 每个 gateway session 独立页 + 历史 + 干净切换(不混流):历史走 `GET /api/v1/sessions/{sid}`(`session_resolve(sid)` 作 404 闸 → 读 `<project_dir>/.ccteam/chat/<role>/turns.jsonl`,**非**按 `session_id==s{n}` 过滤 progress.jsonl);事件走 `GET /api/v1/sessions/{sid}/events`(按 `ev.sid==Some(s{n})` 过滤的 gateway broadcast SSE);per-sid localStorage(`ccteam.chat.rows.v2.${sid}`),sid 变即 reseed + 重订阅。HITL 审批 ChoicePrompt 经 SSE 带 `sid`+`token`+每 option `{label,id}` 渲染成 per-session 琥珀色行;点击 `[Approve]`/`[Deny]` → `POST /sessions/{sid}/resolve {token,selection=id}` → `Gateway::resolve_web_selection`(`take_by_token`→`apply_pending`,= IM 点击同路,**非** turn)→ 阻塞的 `permission/ask` hook 即收 allow/deny(工具真跑 / 即时拒,无 600s 超时)。
+**per-session web 视图**:`/chat/s/:sid`(`ChatConsole.tsx` 按 `s{n}` keyed)= 每个 gateway session 独立页 + 历史 + 干净切换(不混流):历史走 `GET /api/v1/sessions/{sid}`(`session_resolve(sid)` 作 404 闸 → 读 `<project_dir>/.ccteam/chat/<sid>/turns.jsonl`,**按 sid**、**非**按 `session_id==s{n}` 过滤 progress.jsonl);事件走 `GET /api/v1/sessions/{sid}/events`(按 `ev.sid==Some(s{n})` 过滤的 gateway broadcast SSE);per-sid localStorage(`ccteam.chat.rows.v2.${sid}`),sid 变即 reseed + 重订阅。HITL 审批 ChoicePrompt 经 SSE 带 `sid`+`token`+每 option `{label,id}` 渲染成 per-session 琥珀色行;点击 `[Approve]`/`[Deny]` → `POST /sessions/{sid}/resolve {token,selection=id}` → `Gateway::resolve_web_selection`(`take_by_token`→`apply_pending`,= IM 点击同路,**非** turn)→ 阻塞的 `permission/ask` hook 即收 allow/deny(工具真跑 / 即时拒,无 600s 超时)。终端(`ccteam-pty.v1`)经 `resolve_session_pane(sid)` 共享 helper 解析 per-session pane(claude=`chat_session_name`/codex=`codex_chat_session_name`;no-gateway→503、unknown sid→404),`send_keys`/`resize` 走 `default_backend()`;终端 UI 当前 claude-only(codex pane 后端已支持,真机验后再放开)。NewSessionModal 含「(无角色 / 裸 claude)」选项(`ROLELESS` sentinel + `resolveRole` 守显式 roleless 不 fallback cto)。
 
-**OpenAPI 自动文档(v0.8.7 W5)**:`GET /api/docs`(`utoipa-scalar` 交互式 UI)+ `GET /api/v1/openapi.json`(OpenAPI 3.1 spec)。spec 由**同一套路由注册**生成(单聚合 `OpenApiRouter`,`routes/openapi.rs` `split_for_parts()` 既出 live `Router` 又出 spec → 单源、anti-drift);每 `/api/v1` handler 挂 `#[utoipa::path]`,加/删路由不注解会改 op 数、drift 测试红(强制 dual-edit)。两者 mount 在同一 `auth::auth_layer` web-token 门后(无公开未鉴权 spec)。**Scalar UI 自托管(去 CDN)**:vendored `@scalar/api-reference` standalone JS(`crates/ccteam-web/assets/scalar-standalone.js`,pin 版本)经同源 `GET /api/docs/scalar-standalone.js` 提供,custom-html loader 指向它而非 `cdn.jsdelivr.net` —— `/api/docs` 离线/锁网机可渲染,零外部 host(产品主打自托管)。
+**OpenAPI 自动文档**:`GET /api/docs`(`utoipa-scalar` 交互式 UI)+ `GET /api/v1/openapi.json`(OpenAPI 3.1 spec)。spec 由**同一套路由注册**生成(单聚合 `OpenApiRouter`,`routes/openapi.rs` `split_for_parts()` 既出 live `Router` 又出 spec → 单源、anti-drift);每 `/api/v1` handler 挂 `#[utoipa::path]`,加/删路由不注解会改 op 数、drift 测试红(强制 dual-edit)。两者 mount 在同一 `auth::auth_layer` web-token 门后(无公开未鉴权 spec)。**Scalar UI 自托管(去 CDN)**:vendored `@scalar/api-reference` standalone JS(`crates/ccteam-web/assets/scalar-standalone.js`,pin 版本)经同源 `GET /api/docs/scalar-standalone.js` 提供,custom-html loader 指向它而非 `cdn.jsdelivr.net` —— `/api/docs` 离线/锁网机可渲染,零外部 host(产品主打自托管)。
+
+**Settings(IM config)页**:`SettingsPage.tsx`(独立 tab)配 telegram + lark 凭证,经 `/api/v1/config/im`(§2.6,web-token 门后)—— GET 永不回显明文(响应类型不含 secret 字段,只 `*_last4`);token/secret input 永 password + **不预填**已存值,覆盖已配 secret = 内联两态确认(非 `window.confirm`);telegram chat_id 走背景 long-poll task 捕获 + 前端 cheap status 轮询(可取消);所有写提示 `restart_required`(creds 仅 daemon 启动时 load,无热生效);LAN 明文警示 + lark 空 allowlist fail-closed 警示。复用 onboarding 拆出的 `telegram_validate_token_with_base` + `telegram_poll_chat_id_with_base` 两 pub fn。**这是 REST 配置面,不增 MCP 工具**(MCP 仍 17)。
+
+**Roles(只读浏览)页**:`RolesPage.tsx`(独立 tab)选项目 → 列 roles(`GET /projects/{slug}/roles`)→ 详情(`getRoleDetail` → `RoleDetail` frontmatter key/value + body `marked` 渲染 `.cockpit-markdown`)。**只读已装 role**(catalog 在线浏览/装 = stretch,本版不做);后端已具备,纯前端。
 
 **架构红线**:web 守 R2(SSE watcher 仅读 progress.jsonl)/ R5(不 kill 长 session)/ R6(不解析 tmux 终端;裸终端字节只走 `ccteam-pty.v1`)/ R8(不写跨项目记忆)。写控制走跟 IM channel **完全相同**的 gateway dispatch 路径。ccteam 核心是 **headless 状态引擎** —— 任何前端**不得**引入新 LLM 层:web/API 输入 = 经 gateway 写控制,不经任何 ccteam 中介 LLM;LLM 推理只发生在 agent session 内部。
 
@@ -450,7 +457,8 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 
 | 你要看 | 命令 / 文件 |
 |---|---|
-| daemon 是否活着 | `ccteam status` |
+| daemon 活性 + 所有 project/session(role/vendor/status/sid/last-event)+ web token/url | `ccteam status`(嵌套列每 project 各自 sessions;两行 web token + url 带 LAN ip)|
+| 每 session 一行(SLUG/SID/ROLE/VENDOR/STATUS,从 gateway tracked map)| `ccteam session ls` |
 | 安装和依赖 | `ccteam doctor` / `ccteam doctor --verify-mcp` |
 | 最近 daemon 日志 | `tail -120 /tmp/ccteam.log` |
 | outbound ledger | `~/.ccteam/imd/outbound.jsonl` |
@@ -478,7 +486,7 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 
 | 风险 | 影响 | 应对 |
 |---|---|---|
-| **`--agent <role> --name/--resume` 在 tmux send-keys 路径** | session=role 模型不成立 | W1 smoke gate 已实证(交互 + resume + hooks 全触发);见 §4.1 |
+| **`--agent <role> --name/--resume` 在 tmux send-keys 路径** | role-as-attribute 模型不成立 | smoke gate 已实证(交互 + resume + hooks 全触发;roleless 省略 `--agent` 同样跑通);见 §4.1 |
 | **agent session 卡死 / turn 超时** | 用户等不到回复 | submit/turn 超时阈值 → `gateway error` 回 IM;stall 软告警;per-vendor cap 兜底 |
 | **daemon 死了消息沉默** | 命令写到磁盘但永不消费 | action 工具在 daemon 不健康时直接返回 error,绝不假装成功;`ccteam status` 看 liveness |
 | **成本失控** | 一夜烧光 | per-vendor `max_cost_usd_per_24h` + 全 ccteam $200 物理上限;不限 max_turns;`doctor --check-cost-orphan` 对账 |
@@ -512,25 +520,30 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 | role 库读取 | `crates/ccteam-core/src/roles.rs`(`list_roles` / `read_role` / `RoleSummary` / `RoleDetail`,frontmatter 解析) | `cargo test -p ccteam-core roles` |
 | 默认 cto role 模板 | `crates/ccteam-core/src/templates/cto_role.md`(导出 `ccteam_core::CTO_ROLE_MD`)+ `commands.rs::DEFAULT_AGENT_SCAFFOLDS` | — |
 | progress.jsonl 事件 schema | `crates/ccteam-harness/src/execution/progress_bridge.rs` + `enriched_event.rs`(`EventKind`) | schema 单一权威 |
-| chat turns.jsonl | `crates/ccteam-im`(turns mirror) | — |
+| chat turns.jsonl(按 sid)| `crates/ccteam-harness/src/execution/turns_mirror.rs`(`append_turn`/`read_all_turns`,目录键 = sid)+ live writer = `ccteam-im/src/gateway.rs`(`spawn_event_pump` ANSWER 分支按 `session.id` append) | `cargo test -p ccteam-im event_pump_writes_turns` |
 | CLI 命令 / flag(分组) | `crates/ccteam-cli/src/main.rs`(clap `Command` / `Project` / `Session` / `Internal`)+ `commands.rs` | `ccteam --help` |
 | `config` setup hub | `crates/ccteam-cli/src/commands.rs`(`run_config_menu` + `config <key> <value>`/`get`/`show`/`mcp`;包 `ccteam_im::onboarding::telegram_setup`) | `ccteam config show`;`cargo test -p ccteam-cli config` |
-| 删除/停止引擎 | `crates/ccteam-cli/src/commands.rs`(`run_remove`/`RemoveOptions`/`RemoveReport` + `run_project_stop` + `stop_project_chat_sessions` + `purge_project_managed_paths`) | `cargo test -p ccteam-cli --test remove_test` |
+| 删除/停止引擎 | `crates/ccteam-cli/src/commands.rs`(`run_remove`/`RemoveOptions`/`RemoveReport` + `run_project_stop` + `stop_project_chat_sessions`(注入 `&dyn ProcessBackend` → 默认 rmux backend 真停,去 tmux-only)+ `purge_project_managed_paths`) | `cargo test -p ccteam-cli --test remove_test` |
 | settings.local.json hook merge/scrub | `crates/ccteam-core/src/tool_surface.rs`(`ensure_chat_hooks_installed` / `remove_chat_hooks`) | `cargo test -p ccteam-core tool_surface` |
 | MCP 工具清单 / schema(17) | `crates/ccteam-cli/src/mcp_tool_groups.rs`(`STUB_TOOLS` / `ToolGroup`,含 `Session`)+ `mcp_serve.rs::tool_definitions` + `mcp_{admin,chat,advise,session}_tools.rs` | `ccteam doctor --verify-mcp`(drift → exit 1) |
 | cto 调度 `session_*`(spawn/dispatch/collect/list/stop)+ secret 门 + project 维度 | `crates/ccteam-cli/src/mcp_session_tools.rs`(5 工具 + forwarder 转发 `_caller_secret`)+ `main.rs`(`execute_session_tool` + role 预筛 `session_caller_authorized` + project 维度 `assert_caller_owns_session`,best-effort 非硬边界);secret = `ccteam-core/src/session_secret.rs`(`mint`/`ct_eq`);认证 + 解析 = `ccteam-im/src/gateway.rs`(`verify_session_caller` 校验 `(role,secret)` 对;`session_resolve` → project 维度 + tail 子 `turns.jsonl`) | `cargo test -p ccteam-cli session_tool_tests`;`cargo test -p ccteam-im verify_session_caller`;`ccteam doctor --verify-mcp`(session 5/0) |
 | HITL 权限模式(per-session) | `crates/ccteam-harness/src/adapter.rs`(`PermissionMode { Skip, Hitl }` + `SpawnCtx.permission_mode`);spawn argv + hook 安装 = `execution/claude_tui.rs`(`permission_args` → skip 用 `--dangerously-skip-permissions`、hitl 用 `--permission-mode default` + 注入 `PermissionRequest` hook) | `cargo test -p ccteam-harness claude_tui` |
 | HITL 批准回路 `permission/ask` | hook 端 = `crates/ccteam-hooks/src/permission_request.rs`(读 stdin → `permission/ask` JSON-RPC over mcp.sock,FAIL-SAFE deny,**无 `interrupt`**);daemon 端 = `crates/ccteam-cli/src/main.rs`(`execute_permission_ask` 建 Approve/Deny ChoicePrompt + `summarize_tool_input` + `gateway.session_sid_for` + 短 TTL `permission_prompt_timeout_secs` + `emit_permission_prompt_outstanding` parked-signal);回应两路同源 = IM `resolve_selection` / web `Gateway::resolve_web_selection`,都复用 `ccteam-im/src/pending.rs` `take_by_token` | `cargo test -p ccteam-cli permission`;`cargo test -p ccteam-im web_resolve`;`#[ignore]` `claude_agent_hitl_*` smoke(真 binary) |
 | role catalog / import(`ccteam role`) | catalog(离线 parse/search/find)= `crates/ccteam-core/src/role_catalog.rs` + `templates/agency_agents_catalog.json`(192 entries)+ `sanitize_role_stem`;网络 import = `crates/ccteam-im/src/role_import.rs`(`import_role_from_catalog{,_with_base}`,`AGENCY_RAW_BASE` HEAD,verbatim `write_role`);CLI = `ccteam-cli/src/main.rs`(`Command::Role`)+ `commands.rs`(`run_role_{search,add,list}`) | `cargo test -p ccteam-core role_catalog`;`cargo test -p ccteam-im role_import` |
-| per-session web 历史 / SSE / 审批渲染 / 批准 | 历史 = `crates/ccteam-web/src/routes/sessions_api.rs`(`GET /sessions/{sid}` → `session_resolve` → `collect_session_turns` 读 `turns.jsonl`;按 sid 过滤 SSE `event_matches_sid`;审批 SSE frame 带 `token`+option `{label,id}` via `session_event_payload`/`approval_token`;`POST /sessions/{sid}/resolve` → `handle_session_resolve` → `Gateway::resolve_web_selection`);SPA = `web/src/pages/ChatConsole.tsx`(`/chat/s/:sid` keyed,`resolveApproval` 调 `/resolve`)+ `lib/sessionsApi.ts`(`resolveApproval`)+ `hooks/useSessionEvents.ts` + `pages/chatTranscript.ts` | `cargo test -p ccteam-web sessions_api`;`cargo test -p ccteam-web --test openapi_test`;vitest |
+| per-session web 历史 / SSE / 审批 / 终端 pane(按 sid)| 历史 = `crates/ccteam-web/src/routes/sessions_api.rs`(`GET /sessions/{sid}` → `session_resolve` → `collect_session_turns` 读 `.ccteam/chat/<sid>/turns.jsonl`;按 sid 过滤 SSE `event_matches_sid`;审批 SSE frame 带 `token`+option `{label,id}`;`POST /sessions/{sid}/resolve` → `handle_session_resolve` → `Gateway::resolve_web_selection`;POST 空 role = roleless);终端 pane = `routes/session_pane.rs`(`resolve_session_pane(sid)` 共享 helper,`pty_ws.rs` + `pane_snapshot.rs` 共用,no-gateway→503/unknown→404);SPA = `web/src/pages/ChatConsole.tsx`(`/chat/s/:sid` keyed)+ `pages/chatDefaults.ts`(`ROLELESS`/`resolveRole`)+ `lib/sessionsApi.ts` + `hooks/useSessionEvents.ts` | `cargo test -p ccteam-web sessions_api`;`cargo test -p ccteam-web --test openapi_test`;vitest |
 | OpenAPI spec / `/api/docs` | `crates/ccteam-web/src/routes/openapi.rs`(单聚合 `OpenApiRouter` `split_for_parts()` + `Scalar` UI + `openapi.json` serve);各 handler `#[utoipa::path]` 注解(`api_v1.rs`/`projects.rs`/`roles.rs`/`sessions_api.rs`/`capabilities.rs`/`teams_*`);spec.version = `env!(CARGO_PKG_VERSION)` | `cargo test -p ccteam-web --test openapi_test`(op-count drift 测试) |
 | Hooks impl / settings | `crates/ccteam-hooks` + `ccteam internal hook` 子命令;`ccteam init` 落 `.claude/settings.local.json` | — |
 | Web 路由总装 | `crates/ccteam-web/src/routes/mod.rs`(router 合并) | — |
 | 标准 API:project | `crates/ccteam-web/src/routes/projects.rs`(POST/DELETE)+ `api_v1.rs`(GET list/show) | 真实 HTTP smoke(W5b) |
 | 标准 API:role | `crates/ccteam-web/src/routes/roles.rs`(GET list / GET·PUT one) | — |
-| 标准 API:session | `crates/ccteam-web/src/routes/sessions_api.rs`(GET/POST + `{sid}` + `/turn` + `/resolve` + `/events` SSE + `/stop`) | `cargo test -p ccteam-web --test openapi_test`(op-count drift) |
+| 标准 API:session | `crates/ccteam-web/src/routes/sessions_api.rs`(GET/POST + `{sid}` + `/turn` + `/resolve` + `/events` SSE + `/stop`;POST 接受空 role = roleless,无 422) | `cargo test -p ccteam-web --test openapi_test`(op-count drift) |
+| 标准 API:config/im | `crates/ccteam-web/src/routes/im_config.rs`(详上方「web config/im」行;`AppState.im_poll` 背景轮询态)| `cargo test -p ccteam-web --test im_config_test` |
 | 标准 API:capabilities | `crates/ccteam-web/src/routes/capabilities.rs`(`HarnessCapability` + `probe_available` PATH probe) | — |
 | gateway spine(标准 API drive) | `crates/ccteam-im/src/gateway.rs`(`SessionView` + `session_views` / `create_session_api` / `submit_to_sid` / `stop_session`;`GatewayEvent.sid` = SSE 过滤键) | `cargo test -p ccteam-im gateway` |
+| tracked session reader(`session ls` / `status` 共用)| `crates/ccteam-im/src/gateway.rs`(`tracked_chat_sessions(state_path) → Vec<TrackedSessionRow{slug,sid,role,vendor,...}>`,读持久化 gateway state 文件,无新 RPC、不碰 cto-gate) | `cargo test -p ccteam-im tracked_chat_sessions` |
+| `ccteam status` / `session ls`(F3/B4)| `status` = `crates/ccteam-cli/src/main.rs`(`run_status` 嵌套列 project+sessions + `first_lan_ipv4`/`is_lan_ipv4` getifaddrs FFI,删 `--tail`);`session ls` = `commands.rs`(`run_sessions` + `render_sessions_table`,列 SLUG/SID/ROLE/VENDOR/STATUS;tracked→live、orphan=live-pane∧¬tracked、daemon-down 降级)| `cargo test -p ccteam-cli --test status_view_test`;`cargo test -p ccteam-cli render_sessions_table` |
+| web config/im(REST,非 MCP)| `crates/ccteam-web/src/routes/im_config.rs`(GET masked `handle_get_im_config` 响应类型不含 secret + `mask_last4` · PUT telegram/lark 先验后落盘 0600 · telegram chat-id 背景 long-poll task + GET 轮询 + `AppState.im_poll`;全写返 `restart_required`);onboarding 拆出 = `crates/ccteam-im/src/onboarding.rs`(`telegram_validate_token_with_base` + `telegram_poll_chat_id_with_base`);test seam = `AppState::with_creds_path` + `CCTEAM_{TELEGRAM,LARK}_API_BASE` | `cargo test -p ccteam-web --test im_config_test`;`cargo test -p ccteam-web --test openapi_test` |
+| web Settings / Roles 页 | Settings = `web/src/pages/SettingsPage.tsx` + `lib/configApi.ts`(IM config,token 永 password 不预填 + 内联确认 + chat_id 可取消轮询);Roles(只读)= `web/src/pages/RolesPage.tsx` + `rolesView.ts` + `lib/sessionsApi.ts`(`getRoleDetail`/`RoleDetail`,frontmatter + `marked` body);两 tab 注册 = `web/src/App.tsx` | vitest(`configApi.test` / `rolesView` / `SettingsPage.test`)|
 | Web chat WS (`ccteam-chat.v1`) | `crates/ccteam-web/src/chat_protocol.rs` + `routes/chat_ws.rs`;CLI bridge = `crates/ccteam-cli/src/web_chat_bridge.rs` | `cargo test -p ccteam-web chat_frame` |
 | PTY WS (`ccteam-pty.v1`) | `crates/ccteam-web/src/routes/pty_ws.rs` + SPA `useTerminal` | `cargo test -p ccteam-web --test pty_ws_test`(env-gated) |
 | IM transport / 凭证 | `crates/ccteam-im/src/transport/`(`Channel` trait + providers)+ `im/credentials.json` 解析 | — |
@@ -538,9 +551,9 @@ v0.8.6 把 MCP 工具瘦身到 12 个(退役推后编排的 `workflow_*` 套件 
 | IM 进度 status | `progress::ProgressFold` + `Channel::edit_message` + `gateway::spawn_event_pump` + `GatewayEventKind::Progress` | `cargo test -p ccteam-im --test im_progress_test` |
 | IM 附件 I/O | 入站:`transport::{ChannelAttachment,AttachmentKind}` + telegram `getFile`;出站:`transport::{OutboundFile,OutboundFileKind}` + `chat_send_file` 走 `mcp.sock` | `cargo test -p ccteam-im` |
 | HarnessAdapter / ProcessBackend / AgentVendor | `crates/ccteam-harness/src/adapter.rs`(trait + `AgentVendor` enum + `ExecutionMode`)+ `lib.rs` | `cargo test -p ccteam-harness adapter` |
-| Claude spawn argv(session=role) | `crates/ccteam-harness/src/execution/claude_tui.rs`(`spec_for_new` / `spec_for_resume` / `spec_for_fresh`,均含 `--agent <role>`) | `cargo test -p ccteam-harness --test claude_tui_resume_test` |
+| Claude spawn argv(role-as-attribute + roleless)+ pane/turns 按 sid | `crates/ccteam-harness/src/execution/claude_tui.rs`(`spec_for_new` / `spec_for_resume` / `spec_for_fresh` —— **非空 role 才 push `--agent`**,空=roleless;`chat_session_name(slug, sid)` → pane / `--name`;`chat_spawn_env_owned(role,slug,secret,sid)` 注入 `CCTEAM_CHAT_SID`/`CCTEAM_CHAT_SECRET`;`parse_chat_session_name → Option<(slug, sid)>`;`/role` death-probe) | `cargo test -p ccteam-harness --test claude_tui_resume_test`;`cargo test -p ccteam-harness --test claude_tui_env_test`(env-gated) |
 | 命令面中立词汇 | `Directive` / `DirectiveOutcome`(5 值)/ `ChoicePrompt` / `ChoiceOption` / `ChoiceSelection` / `ContextUsage` / `ThreadStatus` + `handle_directive` / `thread_status`(无 default impl)= `crates/ccteam-harness/src/adapter.rs` | `cargo test -p ccteam-harness adapter` |
-| gateway 纯路由 + 命令菜单 + `/role` | slash→`Directive`→`handle_directive`→渲染 outcome + `GATEWAY_COMMANDS` 单表 + `resolve_selection`(token-global)+ `switch_current_role`(`/role` 原地换、保持同一 sid)+ `render_sessions` = `crates/ccteam-im/src/gateway.rs` | `cargo test -p ccteam-im gateway` |
+| gateway 纯路由 + 命令菜单 + `/role` + session 模型(sid/去 dedup/roleless)| slash→`Directive`→`handle_directive`→渲染 outcome + `GATEWAY_COMMANDS` 单表 + `resolve_selection`(token-global)+ `switch_current_role`(`/role` 原地换、保持同一 sid+pane)+ `render_sessions`;session 持久态 = `SessionResolve{sid,role,vendor,project,project_dir}` + `session_resolve`/`session_sid_for`/`reply_target_for`(全按 sid)+ `ensure_role_exists`(空 role 短路);**去 `(project,role)` dedup**(同 role 多 session)= `crates/ccteam-im/src/gateway.rs` | `cargo test -p ccteam-im gateway`;`cargo test -p ccteam-im session_sid_for` |
 | pending interaction 注册表 | `PendingInteractions`(自己的锁 / 双 origin / 单飞 per(chat,session) / TTL / `take_by_token`)= `crates/ccteam-im/src/pending.rs` | `cargo test -p ccteam-im pending` |
 | transport 选项/回填/菜单 | `MessageOption` / `ChoiceReply` / `SendMessage.options` / `ChannelMessage.selection` / `Channel::register_commands`(全 `#[serde(default)]`)= `crates/ccteam-im/src/transport/mod.rs`;TG inline keyboard + `callback_query` = `transport/providers/telegram.rs` | `cargo test -p ccteam-im` |
 | Claude 命令面 gate | 四通道 `handle_directive`(prompt 透传 / BRIDGE_SAFE local / arg-popup `NeedsChoice` / panel-only `Rejected`)+ `/esc`→Escape + `ensure_chat_hooks_installed` 追加 `AskUserQuestion` matcher = `crates/ccteam-harness/src/execution/claude_tui.rs` | `cargo test -p ccteam-harness --test claude_tui_test` |
