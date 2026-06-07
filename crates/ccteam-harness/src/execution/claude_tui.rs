@@ -908,9 +908,18 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         let (tx, rx) = mpsc::channel::<ThreadEvent>(64);
 
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
-            if !role.is_empty() {
-                // sid 为空(旧 handle / 测试)时回退到 role,保持向后可读。
-                let key = if sid.is_empty() { role.clone() } else { sid };
+            // v0.8.9 — roleless sessions (empty role) ALSO need the transcript
+            // tail loop: answer-forwarding reads the transcript regardless of
+            // persona, so gate on a usable KEY (the sid), NOT on a non-empty
+            // role. The previous `if !role.is_empty()` guard was a
+            // "session = role"-era leftover that v0.8.8-F2's roleless spawn
+            // missed — it silently dropped EVERY roleless reply: `events()`
+            // spawned no tail loop, so its stream stayed empty and the gateway
+            // pump never observed an ANSWER. The tail key is the sid (turns /
+            // cursor / marker 真实键); the `role` fallback covers only an empty
+            // sid (legacy handle / tests).
+            let key = if sid.is_empty() { role.clone() } else { sid };
+            if !key.is_empty() {
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
                 tokio::spawn(tail_loop(pdir, cwd, slug, role, key, tx, dispatch));
             }

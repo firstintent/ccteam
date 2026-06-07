@@ -195,3 +195,71 @@ async fn three_bots_one_project_only_target_bot_observes_turn() {
 
     std::env::remove_var("HOME");
 }
+
+/// Assemble a ROLELESS `ThreadHandle` (empty role, non-empty `sid`) — the
+/// v0.8.8-F2 roleless shape. `events()` must key the tail loop on the sid.
+fn make_roleless_handle(project_dir: &Path, cwd: &Path, sid: &str) -> ThreadHandle {
+    ThreadHandle {
+        vendor: AgentVendor::Claude,
+        mode: ExecutionMode::Chat,
+        identity: format!("ccteam-chat-roleless-{sid}"),
+        started_at: chrono::Utc::now(),
+        raw_extras: json!({
+            "tmux_session": format!("ccteam-chat-roleless-{sid}"),
+            "role": "",
+            "sid": sid,
+            "project_dir": project_dir.to_string_lossy(),
+            "cwd": cwd.to_string_lossy(),
+            "slug": "roleless",
+        }),
+    }
+}
+
+/// v0.8.9 regression — a ROLELESS session (empty role, non-empty sid) must
+/// still spawn the transcript tail loop so its assistant replies forward to
+/// the gateway pump. Before the fix, `ClaudeTuiAdapter::events` gated the tail
+/// loop on `!role.is_empty()`, so a roleless session's event stream stayed
+/// empty and EVERY reply was silently dropped (web chat saw nothing).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn roleless_session_forwards_assistant_replies() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let project_dir = tmp.path().join("proj");
+    let cwd = project_dir.clone();
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let anth_dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_project_cwd(&cwd));
+    std::fs::create_dir_all(&anth_dir).unwrap();
+
+    // Roleless: the marker is keyed by the SID (not role); its content is the
+    // Anthropic transcript UUID the tail loop should target.
+    let sid = "s1";
+    let uuid = "uuid-roleless-1";
+    plant_marker(&project_dir, sid, uuid);
+    let path = transcript_path(&home, &cwd, uuid);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "").unwrap();
+
+    let adapter = ClaudeTuiAdapter::new();
+    let h = make_roleless_handle(&project_dir, &cwd, sid);
+    let stream = adapter.events(&h);
+
+    // Let the watcher arm, then deliver the reply.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    append_assistant_turn(&path, uuid, "hello from roleless");
+
+    let msgs = collect_agent_messages(stream, 2000).await;
+    assert!(
+        msgs.iter().any(|t| t == "hello from roleless"),
+        "roleless session must forward its assistant reply (regression: the \
+         `!role.is_empty()` guard dropped it); got: {msgs:?}"
+    );
+
+    std::env::remove_var("HOME");
+}
