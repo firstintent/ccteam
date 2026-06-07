@@ -34,6 +34,12 @@ tracing = { workspace = true }
 
 libc = "0.2"
 
+# v0.8.9 — `capture(with_ansi=false)` renders the raw byte backlog
+# through a vt100 state machine to plain text (consuming mouse / alt-screen
+# / color / cursor sequences) so `peek` never leaks control codes to the
+# user's terminal. Same version ccteam-core's screenshot pipeline pins.
+vt100 = "0.15"
+
 # W2b — the refcounted `tmux pipe-pane` FIFO relay ported out of
 # `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `fs` is the only
 # feature required.

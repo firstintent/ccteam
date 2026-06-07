@@ -26,8 +26,11 @@
 //!   broadcast.
 //! - `capture` — best-effort raw-byte drain of the daemon's retained
 //!   output backlog via `output_stream_starting_at(Oldest)` +
-//!   `poll_once`. Returns raw ANSI bytes (so `with_ansi` is honored —
-//!   raw either way), NOT the rendered `snapshot()` grid.
+//!   `poll_once`. `with_ansi` is honored: `true` → raw byte-faithful
+//!   ANSI (web terminal / snapshot / screenshot depend on it); `false`
+//!   → the drained bytes rendered through a vt100 state machine to
+//!   plain text (so `peek`/CLI never leak control sequences to the
+//!   user's terminal). NOT the rendered `snapshot()` grid.
 //! - `register_pattern` — compiles + stores into a shared
 //!   [`crate::patterns::PatternMatcher`] per session; `subscribe`
 //!   snapshots it (same type the TmuxBackend uses).
@@ -68,6 +71,11 @@ const BACKLOG_BYTES_PER_LINE: usize = 512;
 /// across many tiny batches from spinning unbounded. The normal exit is
 /// an empty batch (backlog exhausted) or hitting the byte budget.
 const BACKLOG_DRAIN_MAX_POLLS: usize = 64;
+
+/// Fallback grid width (columns) for `capture(with_ansi=false)` when the
+/// live pane dims can't be queried. Wide enough that a typical TUI's
+/// content isn't truncated when re-rendered to plain text.
+const CAPTURE_PLAIN_FALLBACK_COLS: u16 = 200;
 
 /// Default UDS path for the ccteam-hosted rmux daemon. Resolves to
 /// `$HOME/.ccteam/run/mux.sock` on Unix; on Windows callers fall back
@@ -619,14 +627,24 @@ impl PaneBackend for RmuxBackend {
     /// exactly one cursor round trip that never sleeps, so it returns the
     /// immediately-available batch and we stop as soon as a batch comes
     /// back empty (backlog exhausted → we'd be blocking on live tail).
-    /// The collected bytes are concatenated and returned **raw** (full
-    /// ANSI), so `with_ansi` is honored — the bytes are raw either way.
+    ///
+    /// `with_ansi` is **honored** (it gates the drained bytes' shape):
+    /// - `true` → the concatenated bytes are returned **raw** (full,
+    ///   byte-faithful ANSI). The web terminal / pane-snapshot /
+    ///   screenshot callers all pass `true` and depend on this.
+    /// - `false` → the raw bytes are rendered through a vt100 state
+    ///   machine ([`ansi_bytes_to_plain_text`]) to **plain text** with
+    ///   every control sequence (mouse-tracking, alt-screen, color,
+    ///   cursor) consumed — matching the tmux path's rendered-then-
+    ///   stripped semantics, so `peek`/CLI never dump control sequences
+    ///   into the user's terminal (which would leave it in
+    ///   mouse-reporting mode → garbage on scroll).
     ///
     /// `lines` is now an *approximate* cap on how much backlog to return
     /// (converted to a loose byte budget); it is intentionally inexact.
     /// `PaneSnapshot` has no raw-bytes accessor (it is a parsed cell
     /// grid), so the backlog stream is the only byte-faithful source.
-    async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
+    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>> {
         let name = self.session_name(id).await?;
         let label = format!("capture `{}`", id.0);
         // Loose byte budget derived from the line cap. Pane lines are
@@ -634,47 +652,66 @@ impl PaneBackend for RmuxBackend {
         // keeps a full screen of backlog while bounding pathological
         // scrollback. Capping is approximate by contract.
         let byte_budget = lines.saturating_mul(BACKLOG_BYTES_PER_LINE).max(1);
-        self.call(&label, |rmux| {
-            let name = name.clone();
-            async move {
-                let session = rmux.session(name).await?;
-                let mut stream = session
-                    .pane(0, 0)
-                    .output_stream_starting_at(PaneOutputStart::Oldest)
-                    .await?;
-                let mut out: Vec<u8> = Vec::new();
-                // Bounded drain: collect the retained backlog batches.
-                // `poll_once` never blocks on live output — an empty
-                // batch means the backlog is exhausted (we'd otherwise be
-                // tailing). The iteration guard caps work if the daemon
-                // trickles the backlog across many small batches.
-                for _ in 0..BACKLOG_DRAIN_MAX_POLLS {
-                    let batch = stream.poll_once().await?;
-                    if batch.is_empty() {
-                        break;
-                    }
-                    for chunk in batch {
-                        if let PaneOutputChunk::Bytes { bytes, .. } = chunk {
-                            out.extend_from_slice(&bytes);
+        let raw = self
+            .call(&label, |rmux| {
+                let name = name.clone();
+                async move {
+                    let session = rmux.session(name).await?;
+                    let mut stream = session
+                        .pane(0, 0)
+                        .output_stream_starting_at(PaneOutputStart::Oldest)
+                        .await?;
+                    let mut out: Vec<u8> = Vec::new();
+                    // Bounded drain: collect the retained backlog batches.
+                    // `poll_once` never blocks on live output — an empty
+                    // batch means the backlog is exhausted (we'd otherwise be
+                    // tailing). The iteration guard caps work if the daemon
+                    // trickles the backlog across many small batches.
+                    for _ in 0..BACKLOG_DRAIN_MAX_POLLS {
+                        let batch = stream.poll_once().await?;
+                        if batch.is_empty() {
+                            break;
                         }
-                        // Lag chunks carry no replayable payload here;
-                        // skip them (a backlog drain races no live tail).
+                        for chunk in batch {
+                            if let PaneOutputChunk::Bytes { bytes, .. } = chunk {
+                                out.extend_from_slice(&bytes);
+                            }
+                            // Lag chunks carry no replayable payload here;
+                            // skip them (a backlog drain races no live tail).
+                        }
+                        if out.len() >= byte_budget {
+                            break;
+                        }
                     }
-                    if out.len() >= byte_budget {
-                        break;
+                    // Keep the most recent `byte_budget` bytes (the tail is
+                    // what a terminal seed wants). The drop guard on `stream`
+                    // unsubscribes on drop here.
+                    if out.len() > byte_budget {
+                        let start = out.len() - byte_budget;
+                        out.drain(..start);
                     }
+                    Ok(out)
                 }
-                // Keep the most recent `byte_budget` bytes (the tail is
-                // what a terminal seed wants). The drop guard on `stream`
-                // unsubscribes on drop here.
-                if out.len() > byte_budget {
-                    let start = out.len() - byte_budget;
-                    out.drain(..start);
-                }
-                Ok(out)
-            }
-        })
-        .await
+            })
+            .await?;
+
+        if with_ansi {
+            // Byte-faithful path: return the raw backlog UNCHANGED. The web
+            // terminal / pane-snapshot / screenshot callers depend on this.
+            return Ok(raw);
+        }
+
+        // Plain-text path (peek/CLI): render the raw backlog through a
+        // vt100 state machine so EVERY control sequence (mouse-tracking,
+        // alt-screen, color, cursor) is consumed and none can leak into
+        // the user's terminal. Size the grid from the live pane dims when
+        // available; otherwise fall back to a sane wide default with the
+        // row count clamped from the `lines` cap.
+        let (rows, cols) = match self.pane_dims(id).await {
+            Ok(Some((r, c))) if r > 0 && c > 0 => (r, c),
+            _ => (lines.clamp(1, 1000) as u16, CAPTURE_PLAIN_FALLBACK_COLS),
+        };
+        Ok(ansi_bytes_to_plain_text(&raw, cols, rows))
     }
 
     async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
@@ -722,11 +759,87 @@ impl PaneBackend for RmuxBackend {
     }
 }
 
+/// Render a raw terminal byte stream (full ANSI) to **plain text** by
+/// feeding it through a vt100 state machine and reading back the rendered
+/// screen contents.
+///
+/// This is the seam that lets `capture(with_ansi=false)` return stripped
+/// text on the rmux backend (matching the tmux path's rendered-then-
+/// stripped semantics). `vt100` interprets and *consumes* every control
+/// sequence — mouse-tracking enable (`\x1b[?1000h` / `?1006h`),
+/// alt-screen (`\x1b[?1049h`), bracketed paste (`\x1b[?2004h`), SGR color,
+/// cursor moves — so none can leak through into the returned bytes. This
+/// is exactly why `peek` must use it: dumping the raw backlog instead
+/// would leave the user's terminal in mouse-reporting mode.
+///
+/// `cols`/`rows` size the parser grid (clamped to ≥1). Trailing blank
+/// lines from the rendered grid are trimmed so the output isn't padded
+/// with empty rows. Pure + side-effect free → unit-testable without a
+/// live daemon.
+fn ansi_bytes_to_plain_text(raw: &[u8], cols: u16, rows: u16) -> Vec<u8> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    // scrollback = 0: we render only the current screen grid (the tail),
+    // mirroring screenshot.rs's `Parser::new(rows, cols, 0)`.
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(raw);
+    // `Screen::contents` returns the rendered grid as plain text (one
+    // `\n` per row, no trailing newline), with all escape sequences
+    // already consumed by the parser.
+    let mut text = parser.screen().contents();
+    // Trim trailing blank lines so peek output isn't padded with the
+    // empty rows of the fixed-height grid.
+    let trimmed_len = text.trim_end_matches(['\n', ' ', '\t']).len();
+    text.truncate(trimmed_len);
+    text.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::patterns::{PatternMatcher, PatternVendor};
     use std::io;
+
+    /// `capture(with_ansi=false)`'s plain-text seam must STRIP every
+    /// control sequence — most importantly the inner TUI's
+    /// mouse-tracking-enable + alt-screen + bracketed-paste, whose raw
+    /// leak into the user's terminal was the v0.8.9 peek regression
+    /// ("乱码" on scroll). vt100 consumes them all; only visible text
+    /// survives, and not a single `0x1b` (ESC) byte remains.
+    #[test]
+    fn ansi_bytes_to_plain_text_strips_all_control_sequences() {
+        // mouse-enable (1000/1006), alt-screen (1049), SGR red (31),
+        // bracketed-paste (2004), interleaved with visible text.
+        let raw = b"\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b[31mhello\r\n\x1b[?2004hworld\x1b[0m";
+        let out = ansi_bytes_to_plain_text(raw, 80, 24);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"), "visible text `hello` survives: {s:?}");
+        assert!(s.contains("world"), "visible text `world` survives: {s:?}");
+        // No ESC byte may leak (mouse-reporting mode never gets enabled).
+        assert!(
+            !out.contains(&0x1b),
+            "no 0x1b (ESC) byte may leak through: {out:?}"
+        );
+        // The mouse-tracking enable in particular must be gone.
+        assert!(
+            !s.contains("[?1000"),
+            "mouse-tracking-enable must not leak: {s:?}"
+        );
+        assert!(!s.contains("[?1049"), "alt-screen must not leak: {s:?}");
+    }
+
+    /// Plain visible text round-trips: no escapes to consume, the text
+    /// comes back intact (modulo grid trimming).
+    #[test]
+    fn ansi_bytes_to_plain_text_roundtrips_plain_text() {
+        let out = ansi_bytes_to_plain_text(b"hello\r\nworld", 80, 24);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"), "plain `hello` round-trips: {s:?}");
+        assert!(s.contains("world"), "plain `world` round-trips: {s:?}");
+        assert!(!out.contains(&0x1b));
+        // Trailing blank grid rows are trimmed (no padding to row 24).
+        assert!(!s.ends_with('\n'), "trailing blank lines trimmed: {s:?}");
+    }
 
     fn collect_pattern_ids(out: &VecDeque<MuxEvent>) -> Vec<String> {
         out.iter()
