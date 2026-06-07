@@ -126,6 +126,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "teams", description = "Read-only Anthropic Agent Teams mirror"),
         (name = "auth", description = "Web-token introspection"),
         (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
+        (name = "marketplace", description = "ccteam-hub plugin catalog (browse / body preview / per-project install)"),
     ),
 )]
 struct ApiDoc;
@@ -181,6 +182,12 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::im_config::handle_telegram_chat_id_start))
         .routes(routes!(super::im_config::handle_telegram_chat_id_poll))
         .routes(routes!(super::im_config::handle_put_lark))
+        // v0.8.9 Phase 2 — ccteam-hub plugin marketplace: global catalog +
+        // body preview, plus per-project decorated catalog + install.
+        .routes(routes!(super::marketplace::handle_marketplace))
+        .routes(routes!(super::marketplace::handle_marketplace_body))
+        .routes(routes!(super::marketplace::handle_project_marketplace))
+        .routes(routes!(super::marketplace::handle_project_marketplace_install))
         // teams
         .routes(routes!(super::teams_api::handle_list))
         .routes(routes!(super::teams_api::handle_detail))

@@ -86,6 +86,11 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/config/im/telegram/chat-id/start"),
         ("GET", "/api/v1/config/im/telegram/chat-id"),
         ("PUT", "/api/v1/config/im/lark"),
+        // v0.8.9 Phase 2 — ccteam-hub plugin marketplace.
+        ("GET", "/api/v1/marketplace"),
+        ("GET", "/api/v1/marketplace/{id}/body"),
+        ("GET", "/api/v1/projects/{slug}/marketplace"),
+        ("POST", "/api/v1/projects/{slug}/marketplace/install"),
         // teams
         ("GET", "/api/v1/teams"),
         ("GET", "/api/v1/teams/{name}"),
@@ -252,6 +257,8 @@ async fn openapi_json_and_docs_served_under_auth() {
         "TurnForm",
         "ResolveForm",
         "RoleContentForm",
+        // v0.8.9 Phase 2 — marketplace install request body.
+        "InstallForm",
     ] {
         assert!(
             schemas.contains_key(name),

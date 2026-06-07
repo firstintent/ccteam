@@ -28,6 +28,10 @@ pub mod im_config;
 // V0.6.1 F139 — `POST /internal/hook/:kind[/:action]` daemon-side hook
 // dispatcher (replaces per-hook `ccteam internal hook ...` cold spawn).
 pub mod internal_hook;
+// v0.8.9 Phase 2 — ccteam-hub plugin marketplace REST surface (global +
+// per-project catalog, body preview, install). The network face of
+// `ccteam_im::hub`; merged into the `/api/v1` OpenApiRouter (auto auth-gated).
+pub mod marketplace;
 // v0.8.7 W5 (Item E) — OpenAPI auto-docs. Aggregates every `/api/v1`
 // handler into one `OpenApiRouter` (single source with the route table)
 // + serves the spec (`/api/v1/openapi.json`) and Scalar UI (`/api/docs`).
