@@ -211,8 +211,12 @@ pub enum HubError {
     /// The plugin `type` is recognised but not yet installable (workflow).
     #[error("plugin type `{0}` is not yet supported for install")]
     UnsupportedType(String),
-    /// The install stem (from the plugin id or a caller override) is invalid,
-    /// or the underlying write failed / read of the cache failed. Wraps the
+    /// The install stem (from the plugin id or a caller `--as` override)
+    /// sanitizes to an invalid/empty filename — a client error (bad input),
+    /// distinct from a disk write failure.
+    #[error("{0}")]
+    BadStem(String),
+    /// A local disk write / cache read/write failed (our side). Wraps the
     /// underlying message.
     #[error("{0}")]
     Write(String),
@@ -405,8 +409,8 @@ pub async fn install_plugin(
     // 1. Derive + sanitize the install stem (filename normalization only — the
     //    body is Claude-native and written verbatim).
     let raw_stem = target_stem.unwrap_or(&plugin.id);
-    let stem =
-        ccteam_core::sanitize_role_stem(raw_stem).map_err(|e| HubError::Write(format!("{e:#}")))?;
+    let stem = ccteam_core::sanitize_role_stem(raw_stem)
+        .map_err(|e| HubError::BadStem(format!("{e:#}")))?;
 
     // Resolve the target path by type up front so the clobber check and the
     // write agree, and an unsupported type fails before any network I/O.

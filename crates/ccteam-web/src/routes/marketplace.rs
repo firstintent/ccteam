@@ -68,14 +68,14 @@ fn reject_unknown_project(app: &AppState, slug: &str) -> Option<Response> {
 ///   → `502` — the upstream hub failed us (transport, non-success status,
 ///   malformed/empty/oversized body, or a failed integrity check). Bad Gateway
 ///   is the honest code: ccteam is healthy, its upstream is not.
-/// - [`HubError::Write`] → `500` — a local disk write / cache read failed (our
-///   side), **except** when it is a bad install stem (sanitize failure), which
-///   [`install_error_status`] reclassifies as `400`.
+/// - [`HubError::BadStem`] → `400` — the install stem (plugin id / `--as`
+///   override) sanitizes to an invalid name (client error).
+/// - [`HubError::Write`] → `500` — a local disk write / cache read failed (our side).
 fn hub_error_status(err: &HubError) -> StatusCode {
     match err {
         HubError::UnknownId(_) => StatusCode::NOT_FOUND,
         HubError::Exists(_) => StatusCode::CONFLICT,
-        HubError::UnsupportedType(_) => StatusCode::BAD_REQUEST,
+        HubError::UnsupportedType(_) | HubError::BadStem(_) => StatusCode::BAD_REQUEST,
         HubError::ShaMismatch { .. }
         | HubError::Http { .. }
         | HubError::BadStatus { .. }
@@ -271,7 +271,7 @@ pub(crate) async fn handle_project_marketplace(
 ///
 /// `reject_unknown_project` (404) → resolve `id` in the catalog (404 unknown
 /// plugin) → [`ccteam_im::hub::install_plugin`] (default stem = the plugin id).
-/// Maps the outcome via [`install_error_status`]: Ok → `201 {id,type,path,
+/// Maps the outcome via [`hub_error_status`]: Ok → `201 {id,type,path,
 /// overwrote}`; `Exists` → `409`; `UnsupportedType`/bad-stem → `400`;
 /// integrity/transport → `502`; local write → `500`.
 #[utoipa::path(
@@ -329,27 +329,9 @@ pub(crate) async fn handle_project_marketplace_install(
         }
         Err(err) => {
             tracing::warn!(%slug, id = %form.id, %err, "marketplace install failed");
-            install_error(install_error_status(&err), format!("{err}"), mode)
+            install_error(hub_error_status(&err), format!("{err}"), mode)
         }
     }
-}
-
-/// Install-time status mapping. Identical to [`hub_error_status`] EXCEPT a
-/// [`HubError::Write`] that is actually a bad install stem (the sanitize step
-/// rejects the plugin id) is a client error (`400`), not a `500`. The backend
-/// folds a stem-sanitize failure into `Write`, so we sniff its message: it is
-/// the only `Write` produced *before* any disk I/O, and the install handler is
-/// the only caller that can hit it.
-fn install_error_status(err: &HubError) -> StatusCode {
-    if let HubError::Write(msg) = err {
-        // `sanitize_role_stem` failures carry "stem" in their message; a true
-        // write/cache-read failure names the file/op instead. Treat a stem
-        // problem as a 400 (bad input), everything else as a 500 (our disk).
-        if msg.contains("stem") {
-            return StatusCode::BAD_REQUEST;
-        }
-    }
-    hub_error_status(err)
 }
 
 /// Shared install error responder honoring the [`FormOrJson`] mode convention
@@ -380,6 +362,12 @@ mod tests {
         );
         assert_eq!(
             hub_error_status(&HubError::UnsupportedType("workflow".into())),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            hub_error_status(&HubError::BadStem(
+                "role name `!!!` sanitizes to empty".into()
+            )),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
@@ -416,27 +404,6 @@ mod tests {
         assert_eq!(
             hub_error_status(&HubError::Write("write hub cache foo: oops".into())),
             StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn install_error_status_reclassifies_bad_stem_as_400() {
-        // A stem-sanitize failure (carries "stem") is a client error.
-        assert_eq!(
-            install_error_status(&HubError::Write(
-                "install stem must match [a-z0-9_-]".into()
-            )),
-            StatusCode::BAD_REQUEST
-        );
-        // A genuine disk write failure stays a 500.
-        assert_eq!(
-            install_error_status(&HubError::Write("write .claude/agents/x.md: oops".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        // Non-Write variants are unchanged from `hub_error_status`.
-        assert_eq!(
-            install_error_status(&HubError::Exists("x".into())),
-            StatusCode::CONFLICT
         );
     }
 }
