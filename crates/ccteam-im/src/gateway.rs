@@ -1538,6 +1538,44 @@ impl Gateway {
         Ok(())
     }
 
+    /// v0.8.8 bug-fix — persist the USER side of a turn to
+    /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump only observes ANSWER
+    /// events, so it writes assistant-only records; without this the user's
+    /// prompts never land in the mirror and a session reopened from history
+    /// (`GET /sessions/{sid}`) shows only the agent's replies (the user's
+    /// messages "disappear" on session switch). Appended at submit time as a
+    /// user-only record; the pump later appends the assistant-only record for
+    /// the same turn, and `historyToRows` renders them as a user row then an
+    /// assistant row in append order. Best-effort: warns on failure, never
+    /// blocks the turn; holds no gateway lock (O_APPEND atomic write).
+    fn mirror_user_turn(&self, session: &GatewaySession, user_text: &str, turn_id: &str) {
+        if user_text.is_empty() {
+            return;
+        }
+        let Some(project_dir) = self.projects.get(&session.project).cloned() else {
+            return;
+        };
+        let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: turn_id.to_string(),
+            ts: chrono::Utc::now(),
+            vendor: vendor_str(session.vendor).to_string(),
+            role: session.role.clone(),
+            user: user_text.to_string(),
+            assistant: String::new(),
+            usage: serde_json::Value::Null,
+            tool_calls: Vec::new(),
+        };
+        if let Err(err) =
+            ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
+        {
+            tracing::warn!(
+                session = %session.id,
+                error = %err,
+                "ccteam-im: failed to mirror user turn to turns.jsonl"
+            );
+        }
+    }
+
     async fn submit_to_current(&self, chat: &ChatKey, payload: String) -> Result<Vec<String>> {
         let session_id = self
             .current_session
@@ -1560,6 +1598,11 @@ impl Gateway {
             *target = chat.clone();
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        // v0.8.8 bug-fix — keep the user's prompt so it can be mirrored into
+        // turns.jsonl after a successful submit (the pump records only the
+        // assistant side, so without this the user's message is lost on a
+        // history reseed / session switch).
+        let user_text = payload.clone();
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(
             submit_wait,
@@ -1569,6 +1612,7 @@ impl Gateway {
         )
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
+        self.mirror_user_turn(session, &user_text, &turn_id.0);
         self.after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await
     }
@@ -2086,6 +2130,10 @@ impl Gateway {
             *target = web_api_chat();
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        // v0.8.8 bug-fix — mirror the user's prompt to turns.jsonl (the pump
+        // records only the assistant side); without it a web session reopened
+        // from history shows the agent's replies but not the user's messages.
+        let user_text = text.clone();
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(
             submit_wait,
@@ -2095,6 +2143,7 @@ impl Gateway {
         )
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {sid}"))??;
+        self.mirror_user_turn(session, &user_text, &turn_id.0);
         // Arm the same async-turn machinery the inbound path uses (turn
         // watchdog when a sink is wired; otherwise this is a no-op drain).
         let _ = self
@@ -3373,6 +3422,40 @@ mod tests {
         assert_eq!(turns2[0].assistant, "from-sid2");
     }
 
+    /// v0.8.8 bug-fix (bug3) — `submit_to_sid` MIRRORS THE USER'S PROMPT to
+    /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump records only the
+    /// assistant side, so without this user-side mirror a session reopened from
+    /// history (`GET /sessions/{sid}` → `historyToRows`) showed only the agent's
+    /// replies — the user's own messages "disappeared" on a session switch.
+    #[tokio::test]
+    async fn submit_to_sid_mirrors_the_user_prompt() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "what does this repo do?".into())
+            .await
+            .unwrap();
+
+        let turns = read_all_turns(&project_dir, &sid).unwrap();
+        assert!(
+            turns.iter().any(|t| t.user == "what does this repo do?"),
+            "the user's prompt must be persisted to turns.jsonl, got {turns:?}"
+        );
+    }
+
     /// v0.8.8 F1 (regression — closes the BUG-3 blind spot) — the gateway's
     /// live event pump WRITES `.ccteam/chat/<sid>/turns.jsonl`. Before F1 the
     /// ONLY non-test `append_turn` caller was the dead BotSupervisor (never
@@ -3410,25 +3493,35 @@ mod tests {
 
         // The pump is a detached task — poll the sid-keyed mirror until the row
         // appears (bounded, so a real failure still fails the test).
+        // v0.8.8 bug3 — submit_to_sid mirrors the USER side synchronously; the
+        // detached pump then appends the ASSISTANT side. Poll until the
+        // assistant record lands (the user record appears first, at submit).
         let mut found = None;
         for _ in 0..100 {
             let turns = read_all_turns(&project_dir, &sid).unwrap_or_default();
-            if !turns.is_empty() {
+            if turns.iter().any(|t| !t.assistant.is_empty()) {
                 found = Some(turns);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let turns = found.expect("event pump must mirror the assistant turn to turns.jsonl");
-        assert_eq!(turns.len(), 1, "exactly one assistant turn mirrored");
         assert!(
-            turns[0].assistant.contains("echo: review the diff"),
-            "the mirrored turn carries the assistant reply text: {:?}",
-            turns[0].assistant
+            turns.iter().any(|t| t.user == "review the diff"),
+            "the user's prompt is mirrored to turns.jsonl: {turns:?}"
         );
-        assert_eq!(turns[0].vendor, "claude");
+        let assistant = turns
+            .iter()
+            .find(|t| !t.assistant.is_empty())
+            .expect("the pump mirrors the assistant reply");
+        assert!(
+            assistant.assistant.contains("echo: review the diff"),
+            "the mirrored turn carries the assistant reply text: {:?}",
+            assistant.assistant
+        );
+        assert_eq!(assistant.vendor, "claude");
         assert_eq!(
-            turns[0].role, "reviewer",
+            assistant.role, "reviewer",
             "content-label role on the record"
         );
     }
@@ -4000,9 +4093,14 @@ mod tests {
         .unwrap();
 
         let turns = read_all_turns(&resolved.project_dir, &resolved.sid).unwrap();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].assistant, "LGTM, two nits inline.");
-        assert_eq!(turns[0].turn_id, "t1");
+        // v0.8.8 bug3 — submit_to_sid also mirrors the user prompt, so the
+        // manually-simulated answer ("t1") is one of (at least) two records;
+        // find it by turn_id rather than asserting a single-record file.
+        let answer = turns
+            .iter()
+            .find(|t| t.turn_id == "t1")
+            .expect("the simulated answer turn is present");
+        assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
     /// P3 — `/sessions` appends each session's model + ctx from
