@@ -50,6 +50,7 @@ import {
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
 import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
+import { mergeProjectSlugs } from "./projectList";
 import {
   appendRow,
   eventToRow,
@@ -130,10 +131,21 @@ export default function ChatConsole() {
   // The switcher's session list (gateway `s{n}`), fanned out across every
   // project from /api/v1/projects → /api/v1/projects/{slug}/sessions.
   const [railSessions, setRailSessions] = useState<RailSession[]>([]);
+  // v0.8.8 bug — every config.yaml-registered project's slug (the
+  // /api/v1/projects SoT), kept SEPARATELY from railSessions so a project
+  // with NO session yet is still listed (sidebar group + new-session modal
+  // dropdown). Without this, the project list was derived purely from
+  // sessions → a freshly `ccteam init`-ed project was invisible and you
+  // could never create its first session (chicken-and-egg).
+  const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
   const [railError, setRailError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [view, setView] = useState<"chat" | "terminal">("chat");
   const [modalOpen, setModalOpen] = useState(false);
+  // When the new-session modal is opened from a specific project's "还没有
+  // session" hint, pre-select that project; `null` falls back to the active
+  // session's project / the first project (the header ＋ button path).
+  const [modalProject, setModalProject] = useState<string | null>(null);
   // Mobile sidebar drawer (the fixed `w-60` rail is off-canvas under `md`; a
   // hamburger toggles it). Closed by default; auto-closed on a session switch
   // / global-nav pick so the chosen surface is visible without a manual close.
@@ -157,6 +169,9 @@ export default function ChatConsole() {
   const refreshSessions = useCallback(async () => {
     try {
       const projects = await fetchDashboard();
+      // Keep the registered-project list (config.yaml SoT) so a project with
+      // no session yet still shows up — don't discard it after the fan-out.
+      setRegisteredProjects(projects.map((p) => p.slug));
       const lists = await Promise.all(
         projects.map((p) =>
           listSessions(p.slug).catch(() => [] as SessionView[]),
@@ -359,9 +374,12 @@ export default function ChatConsole() {
     [refreshSessions, navigate],
   );
 
+  // The project list = ALL registered projects (config.yaml SoT) ∪ the
+  // projects that have a live session. The union (not sessions alone) is THE
+  // fix so a session-less, freshly-registered project is still listed.
   const projects = useMemo(
-    () => Array.from(new Set(railSessions.map((s) => s.project))).sort(),
-    [railSessions],
+    () => mergeProjectSlugs(registeredProjects, railSessions),
+    [registeredProjects, railSessions],
   );
   const roleOptions = useMemo(() => {
     const seen = new Set(ROLE_SUGGESTIONS);
@@ -477,6 +495,7 @@ export default function ChatConsole() {
                   // bug5 — refetch so a project created out-of-band (CLI
                   // `ccteam init`) is in the list when the modal opens.
                   void refreshSessions();
+                  setModalProject(null);
                   setModalOpen(true);
                 }}
                 className="h-6 px-2 rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs flex items-center gap-1"
@@ -544,7 +563,22 @@ export default function ChatConsole() {
                       );
                     })}
                     {items.length === 0 ? (
-                      <div className="px-2 py-1 text-[10px] text-text-dim/60">无 session</div>
+                      // A registered project with no session yet (e.g. just
+                      // `ccteam init`-ed). Render an inviting hint that opens
+                      // the new-session modal pre-selected to this project so
+                      // the user can create its FIRST session in one click.
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void refreshSessions();
+                          setModalProject(project);
+                          setModalOpen(true);
+                        }}
+                        className="w-full text-left px-2 py-1 rounded-md flex items-center gap-1 text-[10px] text-text-dim/70 hover:text-brand-400 hover:bg-surface-800/70"
+                        title={`为 ${project} 创建第一个 session`}
+                      >
+                        <Plus className="h-3 w-3" /> 还没有 session — 新建
+                      </button>
                     ) : null}
                   </div>
                 </div>
@@ -767,8 +801,11 @@ export default function ChatConsole() {
         <NewSessionModal
           projects={projects}
           fallbackRoles={roleOptions}
-          defaultProject={activeView?.project ?? projects[0] ?? ""}
-          onCancel={() => setModalOpen(false)}
+          defaultProject={modalProject ?? activeView?.project ?? projects[0] ?? ""}
+          onCancel={() => {
+            setModalOpen(false);
+            setModalProject(null);
+          }}
           onCreate={createSession}
         />
       ) : null}
@@ -824,7 +861,7 @@ type RoleFetchState =
   | { kind: "ready"; roles: RoleSummary[] }
   | { kind: "error" };
 
-function NewSessionModal({
+export function NewSessionModal({
   projects,
   fallbackRoles,
   defaultProject,
