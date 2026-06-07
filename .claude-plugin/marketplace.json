@@ -9,7 +9,7 @@
     {
       "name": "ccteam",
       "description": "Multi-vendor (Claude + Codex) AI team orchestration on Claude Code — MCP-driven, file-system-as-control-plane, chat-mode 24/7 IM bots.",
-      "version": "0.8.8",
+      "version": "0.8.9",
       "author": {
         "name": "FirstIntent"
       },
@@ -26,5 +26,5 @@
       ]
     }
   ],
-  "version": "0.8.8"
+  "version": "0.8.9"
 }

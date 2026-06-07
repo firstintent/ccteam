@@ -67,6 +67,8 @@ codex plugin marketplace add firstintent/ccteam
 > 注册 MCP 服务用 `ccteam config`(见 §3),不再用 `doctor --install-mcp`。
 
 > **从旧版本升级(须知)**:本版的独立 session 模型与旧的 per-role 会话状态**不兼容**。升级前请**清掉旧状态**再重新初始化 —— `ccteam stop` → 删 `~/.ccteam` 以及各项目里的 `.ccteam/` → 各项目重跑 `ccteam init` → `ccteam config` → `ccteam start`。旧的 per-role 历史会丢(pre-v1.0 阶段可接受,无兼容迁移)。**不碰你的业务代码 / `CLAUDE.md` / `.env` / `.git`**。
+>
+> 另外两处变化:① **role/skill/workflow 的内容现在住 ccteam 插件市场(ccteam-hub),不再随 ccteam 内置** —— 旧的内置 role catalog 已移除,`ccteam role search/add` 改从市场(经 HTTPS + `~/.ccteam/hub-cache/`)拉取(见 §7)。② **`ccteam init` 不再有 `--mode` 选项**(旧的 agent-team 模式已退役),始终就地初始化 artifact 型项目。
 
 ---
 
@@ -236,7 +238,7 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 `/role` 原地换角色:同一个 session id(`/use <id>` 不失效),用新 `--agent <role>` 重启;同 role = no-op(不白扔上下文)。role 必须在项目 `.claude/agents/<role>.md` 有对应文件。
 
-> **work-role 从哪来**:自己写 `.claude/agents/<role>.md`,或从 **agency-agents**(Claude 原生 .md 角色库,MIT)用 `ccteam role search/add` 一键装(见 §7「装 role」);也可手动丢 .md。装完 `/role <role>` 即用。
+> **work-role 从哪来**:自己写 `.claude/agents/<role>.md`,或从 **ccteam 插件市场**(ccteam-hub,含 agency-agents 等开源 Claude 原生 .md 角色库,MIT)用 `ccteam role search/add` 一键装(见 §7「装 role」)或 web 控制台「插件市场」页装(见 §8);也可手动丢 .md。装完 `/role <role>` 即用。
 
 **多 session + 切换 + 查看**:
 
@@ -356,19 +358,19 @@ ccteam session unregister --slug demo-app --role reviewer
 
 > `session role` 是个**指针命令**:真正换 session 的 role 需要 daemon 的内存态,走 IM `/role <role>`;CLI 这条只打印指引。单 session 粒度删(`session rm`)本版未做。
 
-**装 role(`ccteam role`)= 从 agency-agents 角色库挑现成的 work-role**:
+**装 role(`ccteam role`)= 从 ccteam 插件市场(ccteam-hub)挑现成的 work-role**:
 
 ```bash
-ccteam role search backend          # 离线搜 catalog(192 个 Claude 原生 role,MIT);带 --format json 可机读
+ccteam role search backend          # 搜插件市场 catalog(含 agency-agents 等开源 Claude 原生 role,MIT);带 --format json 可机读
 ccteam role add backend-architect   # 拉取该 role 的 .md verbatim 写进当前项目 .claude/agents/
 ccteam role add backend-architect --as be   # 用 --as 改落地文件名(消歧 / 起短名)
 ccteam role add data-scientist --project demo-app   # 装到指定项目(默认当前目录)
 ccteam role list                    # 列当前项目已装的 role(= /role 可切的)
 ```
 
-- `role search` 纯离线(catalog 是内置 manifest,不联网);无匹配会给提示、exit 0。
-- `role add` 会 GET 该 role 的 markdown 原文写入 `.claude/agents/<role>.md`(零改写;agency 的 .md 本就 Claude 原生)。已存在同名 → 拒绝覆盖,加 `--force` 才覆盖。装完打印 `/role <role>` 提示,IM 里直接 `/role <role>` 切过去用。
-- catalog 是某时点快照,钉 upstream HEAD;个别 id 若 upstream 改名/删文件,`role add` 会响亮报 404(重刷 catalog 即可)。
+- `role search` / `add` 读 **ccteam-hub 插件市场** 的 `index.json`(经 HTTPS 拉取 + 本地缓存 `~/.ccteam/hub-cache/`;首次访问联网,之后走缓存)。`search` 无匹配会给提示、exit 0。
+- `role add` 会取该 role 的 markdown 原文、**sha256 校验内容完整性**后写入 `.claude/agents/<role>.md`(零改写;agency 的 .md 本就 Claude 原生)。已存在同名 → 拒绝覆盖,加 `--force` 才覆盖。装完打印 `/role <role>` 提示,IM 里直接 `/role <role>` 切过去用。
+- 插件内容住独立的 `firstintent/ccteam-hub`(curated marketplace),开源插件 verbatim vendor 进 hub(pinned sha)；ccteam repo 本身不带任何 role/skill 内容(唯一例外默认 `cto`)。web 控制台的「插件市场」页是同一来源的图形入口(见 §8)。
 
 ---
 
@@ -394,13 +396,16 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 
 **每个 session 独立页(per-session web)**:打开 `http://<host>:7331/app/chat/s/<sid>`(`<sid>` = `s1`/`s2`…,与 IM 的 `/use s1` 同命名空间)进入某个 session 的独立视图 —— 自己的历史(读该 session 的 `turns.jsonl`)、按 sid 过滤的实时事件流、干净不混流的切换。HITL 批准也会在这里渲染成「session sX 要跑…」+ 每个选项一个按钮(web 点击 resolve 是 best-effort,稳妥批准走 IM 按钮)。
 
+**统一界面**:本版 web 是**一个 chat 风格外壳** —— 顶栏有面包屑 + 连接状态 + **cost pill**(今日成本 / 预算,实时);每个 session 有 **Chat | 终端** 两个 tab;底部全局导航三页 = **插件市场 / Status / Settings**(旧的多页 operator 仪表盘已收敛掉)。
+
 **控制台页签**(浏览器里点点就能用,不必记命令):
 
 - **新建项目**:新建会话弹窗里选「＋ 新建项目…」,填 slug(名)+ 路径即可在任意目录 scaffold 一个项目(走 `POST /api/v1/projects`),建好直接在里头起会话。
 - **新建会话弹窗**:role 是从该项目 `.claude/agents/` 拉的**真实 role 下拉**(显示 role + 说明),外加一个「(无角色 / 裸 claude)」选项起 roleless 会话;不选则默认 cto。
-- **Roles 页**:浏览当前项目**已装的 role**(只读)—— 列表 + 点开看详情(frontmatter + 正文)。装新 role 仍走 CLI `ccteam role add`(见 §7)。
+- **插件市场页**:浏览 ccteam-hub 的 role/skill/workflow 插件(含 agency-agents 等开源),**点开看正文预览**(install 前 review),**一键装进当前项目**(sha256 校验,带「已装」状态标)。取代了旧的只读 Roles 页 —— 装完 IM 里 `/role <role>` 即用。
+- **Status 页**:轻量状态总览 —— daemon 健康 + 会话 live/idle 数 + 今日成本/预算(同 `GET /api/v1/status`,也是 cost pill 的来源)。
 - **Settings 页**:在浏览器里配 IM 凭证 —— Telegram(bot token + 异步抓 chat_id:存好 token 后给 bot 发条消息,页面轮询自动捕获)与 Lark/飞书(App ID / Secret / region / allowlist)。**秘密只显示掩码**(`…last4`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅 daemon 启动时加载一次,无热重载)—— 页面会提示 `restart required`,照 §5 `ccteam stop && ccteam start`。
-- **web 终端**(per-session):按会话解析到对应 pane,稳定连(不再秒断重连)。注:默认 mux backend(rmux)下终端是**行文本**(re-assembled lines);要**裸 ANSI 完整保真**得用 `CCTEAM_MUX_BACKEND=tmux` 起 daemon。终端 UI 当前只对 claude 会话开放。
+- **web 终端**(per-session):按会话解析到对应 pane,稳定连(不再秒断重连)。**本版默认 mux backend(rmux)即逐字节保真**(裸 ANSI / 光标 / 换行/对齐都对,连上回放当前屏幕),不再需要 `CCTEAM_MUX_BACKEND=tmux`。终端 UI 当前只对 claude 会话开放。
 
 > **安全**:web 默认绑 `0.0.0.0:7331` 且**无 TLS**,token / IM 凭证走 LAN **明文**传输 —— 只在可信局域网用,**别暴露公网**;要更严就 `--web-bind 127.0.0.1:7331` 只绑环回(并用 SSH 隧道远程访问)。
 
@@ -427,6 +432,12 @@ POST   /api/v1/sessions/{sid}/turn           发一个 turn
 GET    /api/v1/sessions/{sid}/events         按 sid 过滤的事件流(SSE)
 POST   /api/v1/sessions/{sid}/stop           停 session
 
+GET    /api/v1/marketplace                   插件市场 catalog(ccteam-hub)
+GET    /api/v1/marketplace/{id}/body         插件正文预览(install 前 review)
+GET    /api/v1/projects/{slug}/marketplace   catalog + 该项目「已装」状态
+POST   /api/v1/projects/{slug}/marketplace/install   装一个插件进项目(sha256 校验)
+
+GET    /api/v1/status                        daemon 健康 + 会话 live/idle + 今日 cost/budget
 GET    /api/v1/capabilities                  当前可用 harness(× provider)动态列表(PATH 探测)
 
 GET    /api/v1/openapi.json                   OpenAPI 3.1 spec(由同一套路由注册生成,防漂移)
@@ -448,7 +459,7 @@ GET    /api/docs                              Scalar 交互式 API 文档(浏览
 ccteam status                  # daemon 心跳 + 每个项目(嵌套列其会话)+ 两行 web token/url
 ccteam session ls              # 列网关会话(SLUG·SID·ROLE·VENDOR·STATUS),并标出 orphan
 ccteam doctor                  # 安装 / 依赖体检
-ccteam doctor --verify-mcp     # MCP 表面验收(active 17 / stubs 0,drift 退出码 1)
+ccteam doctor --verify-mcp     # MCP 表面验收(active 15 / stubs 0,drift 退出码 1)
 ccteam stop                    # 优雅停 daemon(保留 tmux session)
 ```
 

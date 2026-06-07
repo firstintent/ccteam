@@ -1,8 +1,10 @@
 # v0.8.9 — rmux 0.3→0.5 升级 + 裸字节终端(W2b)
 
-> **状态:规划(v0.8.9 scope)**。doc-first —— 本文是需求/设计,实现交 dev session,user review 后动代码。
-> **来源**:v0.8.8 ship 后实机(TG 2026-06-07)发现 web 终端保真问题(bug4 连上空白、bug6 换行不对齐),查 rmux 上游确认 **0.5 已提供裸字节流** → 升级根治。user 选 B:排进 v0.8.9(与 web UI 改造同 wave)。
-> **代码基线**:dev(v0.8.8 已落,ccteam pin rmux **0.3**)。相关:同目录 `prd.md`(v0.8.9 web UI 统一 chat 壳 —— 终端住在该壳里);v0.8.8 `bug.md` 的终端两条 + `wave-3-handoff.md`(B5)。
+> **⚠️ 落地修正(SHIPPED 实况 — 本前提已被推翻)**:实现时发现**前提错了** —— ccteam pin 的 **rmux-sdk 0.3.1 本就已带裸字节 API**(`PaneOutputStream` / `PaneOutputChunk::Bytes` / 订阅起点 `Oldest`)。故 v0.8.9 **没有做 dep bump**(根 `Cargo.toml` rmux 仍 `0.3`,`Cargo.lock` 解析到 **0.3.1**),只把 `rmux_backend` 的 subscribe/capture 切到这套已有的 byte API 即拿到逐字节保真终端。下文标题「0.3→0.5 升级」、§二「rmux 0.5 已解决」、§三第 1 条「依赖 bump 0.3→0.5」等表述**已作废** —— 把它们读作「切到 rmux-sdk 0.3.1 已有的裸字节流(无 dep bump、无 `rmux_types_compile_link` 改版)」。其余设计(裸流替换有损行流、`Oldest` 回放、pattern-matching 消费者不退、tmux backend 不变)均按本文落地。
+>
+> **状态:已落地(v0.8.9 Phase 3)**。原文为规划稿(doc-first),保留作设计记录;实况见上方修正。
+> **来源**:v0.8.8 ship 后实机(TG 2026-06-07)发现 web 终端保真问题(bug4 连上空白、bug6 换行不对齐)→ 切裸字节流根治。排进 v0.8.9(与 web UI 改造同 wave)。
+> **代码基线**:dev(v0.8.8 已落,ccteam pin rmux **0.3** → 解析 **0.3.1**)。相关:同目录 `prd.md`(v0.8.9 web UI 统一 chat 壳 —— 终端住在该壳里);v0.8.8 `bug.md` 的终端两条 + `wave-3-handoff.md`(B5)。
 
 ---
 
