@@ -1,19 +1,21 @@
 //! Read-only xterm.js pane snapshot endpoint.
 //!
 //! `GET /api/<slug>/pane-snapshot.ansi` captures the active pane (project
-//! session name) with ANSI escapes preserved (under the tmux backend) and
-//! returns the bytes for browser-side rendering by the vendored
-//! `@xterm/xterm` widget. This deliberately stays snapshot-only: no
-//! WebSocket, no input forwarding, and no PTY resize path. The existing PNG
-//! `/screenshot/<slug>.png` route remains as a fallback.
+//! session name) with ANSI escapes preserved and returns the bytes for
+//! browser-side rendering by the vendored `@xterm/xterm` widget. Both mux
+//! backends are byte-faithful here: tmux via `capture-pane -e`, rmux via a
+//! raw-byte backlog drain (`output_stream`). This deliberately stays
+//! snapshot-only: no WebSocket, no input forwarding, and no PTY resize
+//! path. The existing PNG `/screenshot/<slug>.png` route remains as a
+//! fallback.
 //!
 //! `GET /api/<slug>/<sid>/pane-snapshot.ansi` is the **per-session** variant.
 //! v0.8.8 B5: F1 removed the project-level pane, so the sid is resolved via the
 //! live gateway to the per-session pane name (claude = `ccteam-chat-{slug}-{sid}`,
 //! codex = `ccteam-{slug}-{sid}`) using the shared [`super::session_pane`] helper
 //! — the same resolution `pty_ws` uses. No live gateway → 503; a sid the gateway
-//! does not track → 404. (Under the default rmux backend, `capture(with_ansi)`
-//! returns rendered text, not byte-level ANSI — the rmux ANSI gap below.)
+//! does not track → 404. `capture(with_ansi)` returns raw ANSI bytes under both
+//! backends (rmux drains its retained raw-byte backlog).
 
 use axum::{
     extract::{Path, State},
@@ -76,10 +78,10 @@ async fn serve_pane_snapshot(slug: String, sid: Option<String>, session_name: St
     // `tmux capture-pane / display-message` calls under
     // `spawn_blocking`, so the latency profile is unchanged.
     //
-    // rmux ANSI gap: under rmux, `capture(.., with_ansi=true)` returns
-    // rendered plain text (no byte-level capture-pane shim yet) — the
-    // xterm.js widget renders the text without color fidelity. See
-    // `TODO(V0.9-rmux-ansi-capture)` in `ccteam-harness::rmux_backend`.
+    // Both backends are byte-faithful: `capture(.., with_ansi=true)`
+    // returns raw ANSI bytes — tmux via `capture-pane -e`, rmux via a
+    // raw-byte backlog drain (`output_stream`) — so the xterm.js widget
+    // renders with full color fidelity under either.
     let backend = match ccteam_harness::from_env() {
         Ok(b) => b,
         Err(err) => {

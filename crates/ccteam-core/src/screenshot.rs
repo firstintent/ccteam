@@ -134,14 +134,10 @@ where
 /// (TmuxBackend wraps the same `tmux capture-pane -e` / `display-message`
 /// calls).
 ///
-/// **rmux ANSI gap** — under `CCTEAM_MUX_BACKEND=rmux`,
-/// `PaneBackend::capture(.., with_ansi=true)` currently returns rendered
-/// PLAIN TEXT (rmux's `PaneSnapshot` is a parsed cell grid; no public
-/// byte-level capture-pane shim exists yet). The PNG still renders the
-/// text, just without color/attribute fidelity. Cell-grid→ANSI
-/// re-serialization belongs in `ccteam-harness::rmux_backend` — see
-/// `TODO(V0.9-rmux-ansi-capture)` there. We accept degraded screenshots
-/// under rmux for V0.8: degraded-but-working beats silently-broken.
+/// Both backends are byte-faithful: rmux `capture(with_ansi=true)` returns
+/// raw ANSI bytes via the daemon's retained byte backlog
+/// (`PaneOutputStream` / `PaneOutputStart::Oldest`), so the PNG renders with
+/// full color/attribute fidelity under rmux as well as tmux.
 ///
 /// **Runtime note** — this sync fn drives the async trait via
 /// [`block_on_isolated`], which runs the backend calls on a dedicated
@@ -196,8 +192,7 @@ pub fn render_screenshot(
         }
     };
 
-    // 1. capture pane output (ANSI escapes preserved on tmux; plain
-    //    text under rmux — see rmux ANSI gap above).
+    // 1. capture pane output (raw ANSI escapes preserved on both backends).
     let ansi_bytes = match capture_res {
         Ok(b) if !b.is_empty() => b,
         Ok(_) => {

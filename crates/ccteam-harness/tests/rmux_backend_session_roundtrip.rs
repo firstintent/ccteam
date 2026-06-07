@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccteam_harness::{MuxSessionId, MuxSessionSpec, PaneBackend, RmuxBackend};
+use ccteam_harness::{MuxEvent, MuxSessionId, MuxSessionSpec, PaneBackend, RmuxBackend};
+use futures::StreamExt;
 
 fn random_session_name(base: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -176,6 +177,90 @@ async fn kill_is_idempotent_on_missing_session() {
     let socket_path = tmpdir.path().join("mux.sock");
     let backend: Arc<dyn PaneBackend> = Arc::new(RmuxBackend::with_socket_path(socket_path));
     let id = MuxSessionId::new(random_session_name("absent"));
+    backend.kill(&id).await.unwrap();
+}
+
+/// Byte-faithfulness smoke (Phase 3): the rmux backend's `subscribe`
+/// must surface RAW pane bytes (ANSI escapes intact, no `from_utf8_lossy`
+/// mangling, no `\n` re-append) and `capture` must return raw backlog
+/// bytes — NOT a rendered grid. `#[ignore]` (needs a real rmux daemon);
+/// run with `cargo test -p ccteam-harness --test
+/// rmux_backend_session_roundtrip -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn subscribe_and_capture_are_byte_faithful() {
+    let Some(bin) = locate_ccteam_binary() else {
+        eprintln!("SKIP: ccteam binary not found; build with `cargo build --bin ccteam` first.");
+        return;
+    };
+    std::env::set_var("RMUX_SDK_DAEMON_BINARY", &bin);
+
+    let tmpdir = tempfile::tempdir().expect("create tempdir for socket");
+    let socket_path = tmpdir.path().join("mux.sock");
+    let backend: Arc<dyn PaneBackend> =
+        Arc::new(RmuxBackend::with_socket_path(socket_path.clone()));
+
+    let session_name = random_session_name("byte-faithful");
+    // `printf` emits a literal ESC (\033) + SGR color sequence + text.
+    // A rendered/line-stream path would strip the raw ESC bytes; the
+    // byte-faithful path keeps them.
+    let spec = MuxSessionSpec::new(
+        &session_name,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            // \033[31m = red, \033[0m = reset. Loop so capture's backlog
+            // and the live subscribe both have raw ESC bytes to observe.
+            "printf '\\033[31mRED\\033[0m\\n'; sleep 30".into(),
+        ],
+        PathBuf::from("/tmp"),
+    );
+
+    let id = backend.spawn(spec).await.expect("spawn must succeed");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // capture → raw backlog bytes must contain the ESC byte (0x1b).
+    let captured = backend.capture(&id, 50, true).await.expect("capture ok");
+    eprintln!(
+        "captured ({} bytes): {:?}",
+        captured.len(),
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        captured.contains(&0x1b),
+        "capture must return RAW ANSI bytes (ESC 0x1b present); got {captured:?}"
+    );
+
+    // subscribe → drive the pane to emit fresh bytes, assert a raw
+    // OutputChunk carries the ESC byte verbatim.
+    let mut stream = backend.subscribe(&id).await.expect("subscribe ok");
+    // Emit a fresh colored line on the live tail.
+    backend
+        .send_text(&id, "printf '\\033[32mGREEN\\033[0m\\n'")
+        .await
+        .unwrap();
+    backend.send_enter(&id).await.unwrap();
+
+    let mut saw_raw_esc = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(MuxEvent::OutputChunk(bytes))) => {
+                if bytes.contains(&0x1b) {
+                    saw_raw_esc = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {} // per-poll timeout — keep waiting until deadline
+        }
+    }
+    assert!(
+        saw_raw_esc,
+        "subscribe must yield a byte-verbatim OutputChunk containing ESC 0x1b"
+    );
+
     backend.kill(&id).await.unwrap();
 }
 

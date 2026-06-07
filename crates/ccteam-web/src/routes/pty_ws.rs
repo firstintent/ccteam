@@ -26,16 +26,16 @@
 //! - **Client → server, text frame** (control):
 //!   `{"type":"resize","cols":C,"rows":R}` — invokes the backend's `resize`.
 //!
-//! ## Fidelity caveat (v0.8.8 B5)
+//! ## Fidelity
 //!
-//! Raw-byte faithfulness holds ONLY under the `tmux` backend
-//! (`CCTEAM_MUX_BACKEND=tmux`, which streams real `pipe-pane` bytes). The
-//! **default** backend is `rmux`, whose `subscribe` re-emits re-assembled lines
-//! (strips `\r`, re-appends `\n`) — adequate for display + pattern-matching but
-//! NOT byte-exact ANSI replay. So "looks exactly like a local terminal / full
-//! raw ANSI" is a `tmux`-backend-only property; under default rmux it degrades
-//! to line-text. TODO: a byte-faithful rmux capture shim (the ANSI gap noted in
-//! `ccteam_harness::rmux_backend`'s `subscribe`).
+//! Raw-byte faithfulness holds under BOTH backends. The `tmux` backend
+//! (`CCTEAM_MUX_BACKEND=tmux`) streams real `pipe-pane` bytes; the
+//! **default** `rmux` backend now drives the SDK's raw `output_stream()`,
+//! emitting each pane byte chunk verbatim (no `\r` strip, no `\n`
+//! re-append, no lossy UTF-8). So "looks exactly like a local terminal /
+//! full raw ANSI" holds under either backend; line-level pattern matching
+//! is derived alongside (buffered split on `\n`) without touching the raw
+//! byte stream the WS forwards.
 //!
 //! ## Auth
 //!

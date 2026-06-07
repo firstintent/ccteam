@@ -97,10 +97,10 @@ impl PtyRegistry {
         // byte. Capture the pane ONCE *before* subscribing (so the snapshot is
         // never reordered against buffered deltas) and seed it as the first
         // frame. Best-effort: a capture error / empty result just skips the
-        // replay and the live stream proceeds as before. Fidelity: under the
-        // default rmux backend `capture` returns rendered text (legible, not a
-        // byte-faithful TUI) — a faithful raw-ANSI terminal needs
-        // `CCTEAM_MUX_BACKEND=tmux` (raw capture-pane + pipe-pane).
+        // replay and the live stream proceeds as before. Fidelity: both
+        // backends now return RAW ANSI bytes from `capture` — tmux via
+        // `capture-pane -e`, rmux via a raw-byte backlog drain
+        // (`output_stream`) — so the seed is a byte-faithful TUI under either.
         if let Ok(screen) = self.backend.capture(&id, SCREEN_REPLAY_LINES, true).await {
             if !screen.is_empty() {
                 let _ = tx.send(screen);
