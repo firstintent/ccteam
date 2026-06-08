@@ -112,6 +112,10 @@ fn try_permission_request(paths: &CcteamPaths, stdin: &Value) -> Option<bool> {
     // session_id + cwd let the daemon map this firing back to a gateway sid
     // (for richer "session sX (role) wants to run …" addressing). Optional —
     // the daemon falls back to slug/role addressing when absent.
+    //
+    // 红线:`session_id` 是 Anthropic 原生 session UUID,**绝不**当 ccteam
+    // 身份键 —— 仅作旁路信息转发。ccteam 的真实身份键是下面的
+    // `session_sid`(`s<N>`)。
     let session_id = stdin
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -119,6 +123,21 @@ fn try_permission_request(paths: &CcteamPaths, stdin: &Value) -> Option<bool> {
     let cwd = stdin
         .get("cwd")
         .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    // v0.8.8 F1 — the firing session's ccteam sid (`s<N>`). Post-dedup
+    // `(slug, role)` is no longer a unique key, so the daemon needs the sid
+    // to label the approval prompt with the EXACT firing session and resolve
+    // its gateway entry (`session_sid_for(sid)`). Source priority mirrors
+    // `chat_progress::derive_sid_from_payload`: stdin `ccteam_sid` (HTTP
+    // fast-path folds `X-Ccteam-Sid` here) → `CCTEAM_CHAT_SID` env (cold CLI
+    // path inside the pane, injected by `chat_spawn_env_owned`). Empty when
+    // unavailable → the daemon falls back to a sid-less label.
+    let session_sid = stdin
+        .get("ccteam_sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| non_empty_env("CCTEAM_CHAT_SID"))
         .unwrap_or_default();
 
     let request = json!({
@@ -132,6 +151,7 @@ fn try_permission_request(paths: &CcteamPaths, stdin: &Value) -> Option<bool> {
             "tool_input": tool_input,
             "session_id": session_id,
             "cwd": cwd,
+            "session_sid": session_sid,
         },
     });
 

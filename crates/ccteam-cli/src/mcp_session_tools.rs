@@ -80,7 +80,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "ccteam__session_spawn",
-            "description": "Spawn (or reuse) a work-role session in the gateway and return its `s{n}` id. Privileged: only the `cto` role may call this (the daemon authenticates the caller's per-session secret; the cto agent's tool allow-list is a secondary discouragement). The new session runs `<role>` from `.claude/agents/<role>.md` and is ALWAYS created in the caller's OWN bound project (there is no project parameter — a cto bound to project A cannot spawn into another project). `vendor` defaults to `claude`. Idempotent on (project, role): a second spawn of the same role reuses the existing pane + sid. After spawning, drive it with session_dispatch and read its answer with session_collect.",
+            "description": "Spawn a work-role session in the gateway and return its `s{n}` id. Privileged: only the `cto` role may call this (the daemon authenticates the caller's per-session secret; the cto agent's tool allow-list is a secondary discouragement). The new session runs `<role>` from `.claude/agents/<role>.md` and is ALWAYS created in the caller's OWN bound project (there is no project parameter — a cto bound to project A cannot spawn into another project). `vendor` defaults to `claude`. Always mints a NEW sid: a second spawn of the same role creates a SEPARATE session (its own pane + sid + independent transcript), so you can run several instances of one role in parallel. After spawning, drive it with session_dispatch and read its answer with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -113,7 +113,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_collect",
-            "description": "Collect (poll) a child session's transcript by `sid`. Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<role>/turns.jsonl` (the ccteam-owned mirror the child's answers are written to) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for collecting incremental results. MVP = polled (push-back-as-turn, where the child's result is injected straight into cto's context, is v0.8.8). Returns an empty `turns` array when the child hasn't answered yet.",
+            "description": "Collect (poll) a child session's transcript by `sid`. Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror the child's answers are written to, keyed by sid so parallel same-role sessions never bleed) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for collecting incremental results. MVP = polled (push-back-as-turn, where the child's result is injected straight into cto's context, is v0.8.8). Returns an empty `turns` array when the child hasn't answered yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -186,6 +186,10 @@ async fn forward_session_tool(paths: &CcteamPaths, name: &str, args: &Value) -> 
     // before this change (restored, no secret) → the daemon fails the check
     // closed, which is the intended fail-safe.
     let secret = std::env::var("CCTEAM_CHAT_SECRET").unwrap_or_default();
+    // v0.8.8 F1 — the caller (cto) session's own ccteam sid. Forwarded so the
+    // daemon can resolve the SPECIFIC caller session post-dedup (`(slug, role)`
+    // is no longer unique). Empty for a pre-F1 / restored pane.
+    let caller_sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
     if slug.is_empty() || role.is_empty() {
         return Ok(vec![json!({
             "type": "text",
@@ -202,6 +206,7 @@ async fn forward_session_tool(paths: &CcteamPaths, name: &str, args: &Value) -> 
         obj.insert("_caller_slug".to_string(), json!(slug));
         obj.insert("_caller_role".to_string(), json!(role));
         obj.insert("_caller_secret".to_string(), json!(secret));
+        obj.insert("_caller_sid".to_string(), json!(caller_sid));
     }
     let req = json!({
         "jsonrpc": "2.0",
@@ -266,7 +271,7 @@ mod tests {
     #[test]
     fn session_spawn_schema_carries_permission_mode_param() {
         // v0.8.7 W2 (DB.1) — session_spawn gains an optional permission_mode
-        // param (a schema change to an EXISTING tool — tool count stays 17).
+        // param (a schema change to an EXISTING tool — tool count unchanged).
         let spawn = session_tool_definitions()
             .into_iter()
             .find(|t| t["name"] == "ccteam__session_spawn")
@@ -295,7 +300,7 @@ mod tests {
     fn is_session_tool_recognizes_group_and_rejects_others() {
         assert!(is_session_tool("ccteam__session_spawn"));
         assert!(is_session_tool("ccteam__session_stop"));
-        assert!(!is_session_tool("ccteam__chat_send_input"));
+        assert!(!is_session_tool("ccteam__chat_register_bot"));
         assert!(!is_session_tool("ccteam__advise_vote"));
         assert!(!is_session_tool("ccteam__session_bogus"));
     }
@@ -307,7 +312,7 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        assert!(dispatch(&paths, "ccteam__chat_send_input", &json!({}))
+        assert!(dispatch(&paths, "ccteam__chat_register_bot", &json!({}))
             .await
             .unwrap()
             .is_none());

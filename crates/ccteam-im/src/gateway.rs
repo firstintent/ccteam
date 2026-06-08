@@ -230,17 +230,22 @@ impl GatewayEventSink {
 }
 
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
-/// a survivor of a prior daemon. The process name carries only slug+role (not
+/// a survivor of a prior daemon. The process name carries only slug+sid (not
 /// the owning chat), so orphans are a global concern and are never attributed
 /// to a single chat's `/sessions`.
+///
+/// v0.8.8 F1 — the name's trailing segment is now the gateway `sid` (`s<N>`),
+/// not a role: an orphan/untracked pane cannot recover a role attribute from
+/// its name, so display shows the sid (accepted UX cost of sid-keyed panes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanSession {
-    /// Full process/tmux session name (`ccteam-chat-<slug>-<role>`).
+    /// Full process/tmux session name (`ccteam-chat-<slug>-<sid>`).
     pub name: String,
     /// Project slug parsed from the name.
     pub slug: String,
-    /// Role parsed from the name.
-    pub role: String,
+    /// Gateway session id (`s<N>`) parsed from the name (post-F1 the trailing
+    /// segment is the sid, not a role).
+    pub sid: String,
 }
 
 /// Reconciliation of live chat-mode processes against this gateway's tracked
@@ -285,39 +290,42 @@ pub struct SessionView {
     pub status: String,
 }
 
-/// v0.8.7 review-fix (R-M2) — what [`Gateway::start_session`] reports back so
-/// a receipt can tell the truth about the session it actually got. A `/new …
-/// hitl` onto an already-live `(project, role)` pane reuses that pane WITHOUT
-/// changing its spawn-time posture (the live process can't switch the
-/// `--dangerously-skip-permissions` flag), so the receipt must reflect the
-/// pane's *actual* mode, never the requested one — otherwise it falsely claims
-/// "hitl" while a skip pane keeps running unsupervised (the dangerous-direction
-/// bug: thinking you're supervised when you are not).
+/// What [`Gateway::start_session`] reports back so a receipt can name the
+/// session it created and its posture.
+///
+/// v0.8.8 F1 — sessions are keyed by sid (one `(project, role)` can host many),
+/// so every `start_session` is a FRESH spawn: there is no longer a reuse path
+/// that could silently downgrade a requested `hitl` to a live pane's `skip`.
+/// `permission_mode` is therefore always exactly the requested mode (the prior
+/// R-M2 "actual vs requested" divergence + the `reused` flag are gone with the
+/// dedup).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartOutcome {
-    /// The gateway session id (`s{n}`) — new or reused.
+    /// The gateway session id (`s{n}`) — always freshly minted.
     pub id: String,
-    /// The session's ACTUAL permission posture (the reused pane's stored mode,
-    /// or the requested mode on a fresh spawn) — never the requested mode on a
-    /// reuse that couldn't honor it.
+    /// The session's permission posture (always the requested mode on a fresh
+    /// spawn).
     pub permission_mode: PermissionMode,
-    /// True when an existing `(project, role)` pane was reused (dedup hit)
-    /// rather than a fresh spawn.
-    pub reused: bool,
 }
 
 /// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
-/// tail a child session's `.ccteam/chat/<role>/turns.jsonl` without reaching
-/// into the gateway's private session map. Pure data (no adapter handle).
+/// tail a child session's transcript without reaching into the gateway's
+/// private session map. Pure data (no adapter handle).
+///
+/// v0.8.8 F1 — the transcript path is now `.ccteam/chat/<sid>/turns.jsonl`
+/// (keyed by `sid`, not role), so collectors read via `sid`; `role` stays as
+/// a content/display label, and `vendor` is added for the collect acceptance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionResolve {
-    /// Gateway session id (`s{n}`).
+    /// Gateway session id (`s{n}`) — the transcript directory key.
     pub sid: String,
-    /// Agent role — the `<bot>` segment of the transcript path.
+    /// Agent role — display/content label only (no longer the transcript key).
     pub role: String,
+    /// Vendor, stringified (`"claude"` / `"codex"`).
+    pub vendor: String,
     /// Project slug the session runs in.
     pub project: String,
-    /// Absolute working dir hosting `.ccteam/chat/<role>/turns.jsonl`.
+    /// Absolute working dir hosting `.ccteam/chat/<sid>/turns.jsonl`.
     pub project_dir: PathBuf,
 }
 
@@ -850,7 +858,7 @@ impl Gateway {
                 let outcome = self
                     .start_session(chat.clone(), project, vendor, role, handle, permission_mode)
                     .await?;
-                Ok(Some(Self::new_session_receipt(&outcome, permission_mode)))
+                Ok(Some(Self::new_session_receipt(&outcome)))
             }
             "/role" => {
                 let role = parts
@@ -1015,27 +1023,17 @@ impl Gateway {
         Ok(())
     }
 
-    /// v0.8.7 review-fix (R-M2) — build the `/new` receipt from the session's
-    /// ACTUAL posture, not the requested one. A fresh hitl spawn says hitl; a
-    /// reuse that couldn't honor a hitl request (live skip pane) says so
-    /// explicitly so the user never thinks a skip pane is being supervised.
-    fn new_session_receipt(outcome: &StartOutcome, requested: PermissionMode) -> String {
+    /// Build the `/new` receipt. v0.8.8 F1 — every `/new` mints a fresh sid
+    /// (no more `(project, role)` reuse), so the posture is always exactly the
+    /// requested one; the receipt just names the new session + flags hitl.
+    fn new_session_receipt(outcome: &StartOutcome) -> String {
         let id = &outcome.id;
-        let verb = if outcome.reused { "复用" } else { "created" };
-        let actual = outcome.permission_mode;
-        // The dangerous case: hitl was asked for but the reused pane is still
-        // skip — be loud, and tell the user how to actually get hitl.
-        if requested.is_hitl() && !actual.is_hitl() {
-            return format!(
-                "{verb} session {id}(仍 skip — 该 pane 已在裸跑,需先 `ccteam session stop {id}` 再重建才能 hitl)"
-            );
-        }
-        let suffix = if actual.is_hitl() {
+        let suffix = if outcome.permission_mode.is_hitl() {
             " (hitl: non-allowlist tools need IM approval)"
         } else {
             ""
         };
-        format!("{verb} session {id}{suffix}")
+        format!("created session {id}{suffix}")
     }
 
     async fn start_template_session(
@@ -1068,39 +1066,24 @@ impl Gateway {
         handle: String,
         permission_mode: PermissionMode,
     ) -> Result<StartOutcome> {
-        // A chat session's tmux pane is named `ccteam-chat-<project>-<role>`,
-        // so one (project, role) == one pane + transcript. Reuse an existing
-        // record instead of spawning a duplicate that would share the pane and
-        // run a second event pump over the same transcript (which doubles every
-        // reply and clutters the session list). Point it at the new driver.
+        // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
+        // pane/--name/turns/marker all key on `s<N>`, so one (project, role) can
+        // host multiple INDEPENDENT sessions (each its own pane + transcript).
+        // `/new` (and the API / cto-spawn) therefore ALWAYS mints a fresh sid —
+        // no (project, role) dedup here. (The spawn-storm guard is NOT this
+        // dedup: it is `ensure_current_session`'s `contains_key` early-return,
+        // which only spawns a session for a plain message when the chat has none
+        // — that is untouched, so plain-message reuse is preserved while `/new`
+        // mints fresh.) `permission_mode` is honored as requested on every fresh
+        // spawn (no reuse path that could silently downgrade hitl→skip).
         //
-        // v0.8.7 W2 (DB.1) — `permission_mode` is FIXED at first spawn: the
-        // reused pane is already running with its original posture, so a later
-        // `/new … hitl` on a live `skip` pane keeps `skip` (the pane would have
-        // to be restarted to change the spawn flag). We don't silently mutate
-        // the stored mode here to avoid claiming a posture the live process
-        // isn't actually running under.
-        if let Some(existing) = self
-            .sessions
-            .values()
-            .find(|s| s.project == project && s.role == role)
-        {
-            let id = existing.id.clone();
-            // R-M2: report the pane's ACTUAL stored mode, not the requested one
-            // — a `/new … hitl` onto a live skip pane keeps skip (the spawn flag
-            // is fixed at first launch), so the receipt must not claim hitl.
-            let actual_mode = existing.permission_mode;
-            if let Ok(mut target) = existing.reply_to.lock() {
-                *target = owner.clone();
-            }
-            self.current_session.insert(owner, id.clone());
-            self.persist_state()?;
-            return Ok(StartOutcome {
-                id,
-                permission_mode: actual_mode,
-                reused: true,
-            });
-        }
+        // (v0.8.8 bug-fix) A project registered via REST `POST /projects` (or
+        // `ccteam init`) AFTER the daemon started lands in config.yaml but not
+        // yet in the in-memory `projects` cache, so sync from the registry SoT
+        // before the lookup — same `ensure_project_loaded` `/cd` uses. Without
+        // it the web "new project → new session" flow fails "unknown project"
+        // immediately after a successful project create.
+        self.ensure_project_loaded(&project);
         let cwd = self
             .projects
             .get(&project)
@@ -1119,6 +1102,15 @@ impl Gateway {
         ensure_role_exists(&cwd, &role)?;
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
+        // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
+        // 而空 handle 会让 @handle 路由(session_by_handle / template_by_handle)
+        // 误匹配/互撞。空 handle 时回退到 sid(全局唯一,绝不撞),保证 @handle
+        // 寻址始终非空且确定。非空 handle(常规 role)原样保留。
+        let handle = if handle.is_empty() {
+            id.clone()
+        } else {
+            handle
+        };
         // v0.8.7 review-fix (R-M1) — mint the per-session cto-gate secret and
         // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
         // in-pane stdio forwarder can authenticate `session_*` calls against
@@ -1164,16 +1156,16 @@ impl Gateway {
             id,
             // Fresh spawn ran with exactly the requested posture.
             permission_mode,
-            reused: false,
         })
     }
 
-    /// Switch the chat's CURRENT session to run `role` (W1 `/role`). Start-time
-    /// binding: the pane is `(project, role)`, so a role change is a *different*
-    /// pane — close the old one and re-spawn a fresh `--agent <role>` thread,
-    /// reusing the SAME gateway session id so `/use <sid>` keeps resolving. No
-    /// dedup here (unlike `start_session`): the new pane never collides with the
-    /// old role's pane, and an explicit `/role` always wants a fresh agent.
+    /// Switch the chat's CURRENT session to run `role` (W1 `/role`). Role binds
+    /// the persona (`--agent <role>`), so a role change re-spawns a fresh thread
+    /// — close the old pane and start a new `--agent <role>` one, reusing the
+    /// SAME gateway session id so `/use <sid>` keeps resolving. v0.8.8 F1 — the
+    /// pane/--name key on the sid (not the role), so the re-spawn reuses the
+    /// identical pane name; `start_session` no longer dedups, so the only reuse
+    /// here is the deliberate same-sid identity.
     ///
     /// The target role is validated (name charset + `.claude/agents/<role>.md`
     /// existence under the session's project dir) BEFORE any teardown, so a bad
@@ -1204,6 +1196,9 @@ impl Gateway {
         let owner = old.owner.clone();
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
+        // (v0.8.8 bug-fix) sync a possibly-registered-after-start project from
+        // the config.yaml SoT before the lookup (mirrors start_session / `/cd`).
+        self.ensure_project_loaded(&project);
         let cwd = self
             .projects
             .get(&project)
@@ -1226,8 +1221,8 @@ impl Gateway {
         }
 
         // Tear down the old pane + its event pump before re-spawning so the
-        // single (project, role) pane invariant holds and no stale pump keeps
-        // draining the retired transcript.
+        // same-sid pane is recreated cleanly and no stale pump keeps draining
+        // the retired transcript.
         if let Some(pump) = self.event_pumps.remove(&sid) {
             pump.abort();
         }
@@ -1290,6 +1285,11 @@ impl Gateway {
         let Some(session) = self.sessions.get(session_id).cloned() else {
             return;
         };
+        // v0.8.8 F1 — 捕获项目根供 detached pump 写 turns.jsonl(生产唯一 live
+        // writer:历史 read 侧从 `.ccteam/chat/<sid>/turns.jsonl` 取,没有这个写
+        // 入 SPA/collect 历史永远为空)。spawn-on-demand 时项目已 register,缺失
+        // 才退化(pump 仍跑、只是不落盘),所以 None 不阻断 ANSWER 投递。
+        let project_dir = self.projects.get(&session.project).cloned();
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
         let handle = tokio::spawn(async move {
@@ -1342,6 +1342,40 @@ impl Gateway {
 
                             seq = seq.saturating_add(1);
                             session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            // v0.8.8 F1 — 落盘这条 assistant 回复到
+                            // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
+                            // writer)。这是 SPA / cto session_collect 历史读侧的
+                            // 数据源,缺它历史永远为空。`append_turn` 是 O_APPEND
+                            // 原子单写(PIPE_BUF-atomic)、不持 gateway 锁,放热路
+                            // 径安全;目录已按 sid 隔离,故 TurnRecord 不带
+                            // session_id 字段。turn_id 用 pump 内单调 `seq`(每条
+                            // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
+                            // 只 warn,绝不阻断回复投递。
+                            if let Some(dir) = project_dir.as_ref() {
+                                let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+                                    turn_id: format!("{session_id}-{seq}"),
+                                    ts: chrono::Utc::now(),
+                                    vendor: vendor_str(session.vendor).to_string(),
+                                    // 仅内容标签(state-SoT 的 role 维度在
+                                    // progress.jsonl,这里只为历史可读)。
+                                    role: session.role.clone(),
+                                    user: String::new(),
+                                    assistant: text.clone(),
+                                    usage: serde_json::Value::Null,
+                                    tool_calls: Vec::new(),
+                                };
+                                if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                    dir,
+                                    &session_id,
+                                    &record,
+                                ) {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        error = %err,
+                                        "ccteam-im: failed to mirror turn to turns.jsonl"
+                                    );
+                                }
+                            }
                             let (channel, chat_id) = pump_target(&session);
                             // `GatewayEventSink::send` returns false only when the
                             // mpsc consumer is gone (daemon exited) → stop the pump.
@@ -1421,15 +1455,11 @@ impl Gateway {
             .collect();
         self.next_session = saved.next_session;
         self.sessions.clear();
-        // Collapse legacy duplicate records that share a tmux pane (same
-        // project+role) — keep the first, drop the rest. Without this, each
-        // duplicate would resume its own pump over the same transcript and
-        // re-deliver every reply.
-        let mut seen_panes = std::collections::HashSet::new();
+        // v0.8.8 F1 — restore ALL saved sessions: each is keyed by its own sid
+        // (pane/--name/turns all key on `s<N>`), so multiple same-(project,role)
+        // records are now legitimately independent sessions, NOT duplicates to
+        // collapse. The prior seen-panes collapse is gone with the dedup.
         for saved_session in saved.sessions {
-            if !seen_panes.insert((saved_session.project.clone(), saved_session.role.clone())) {
-                continue;
-            }
             let adapter = (self.adapter_factory)(saved_session.vendor);
             self.sessions.insert(
                 saved_session.id.clone(),
@@ -1451,8 +1481,10 @@ impl Gateway {
                 },
             );
         }
-        // Drop current-session routes that pointed at a dropped duplicate; the
-        // next message re-resolves to the kept record via start_session's dedup.
+        // Defensive dead-route cleanup: drop current-session routes that point
+        // at a sid with no restored session record (e.g. a state file edited or
+        // truncated out-of-band). With sid-keying nothing is collapsed here, but
+        // a dangling route would otherwise address a non-existent session.
         let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
         self.current_session.retain(|_, sid| live.contains(sid));
         Ok(())
@@ -1506,6 +1538,44 @@ impl Gateway {
         Ok(())
     }
 
+    /// v0.8.8 bug-fix — persist the USER side of a turn to
+    /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump only observes ANSWER
+    /// events, so it writes assistant-only records; without this the user's
+    /// prompts never land in the mirror and a session reopened from history
+    /// (`GET /sessions/{sid}`) shows only the agent's replies (the user's
+    /// messages "disappear" on session switch). Appended at submit time as a
+    /// user-only record; the pump later appends the assistant-only record for
+    /// the same turn, and `historyToRows` renders them as a user row then an
+    /// assistant row in append order. Best-effort: warns on failure, never
+    /// blocks the turn; holds no gateway lock (O_APPEND atomic write).
+    fn mirror_user_turn(&self, session: &GatewaySession, user_text: &str, turn_id: &str) {
+        if user_text.is_empty() {
+            return;
+        }
+        let Some(project_dir) = self.projects.get(&session.project).cloned() else {
+            return;
+        };
+        let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: turn_id.to_string(),
+            ts: chrono::Utc::now(),
+            vendor: vendor_str(session.vendor).to_string(),
+            role: session.role.clone(),
+            user: user_text.to_string(),
+            assistant: String::new(),
+            usage: serde_json::Value::Null,
+            tool_calls: Vec::new(),
+        };
+        if let Err(err) =
+            ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
+        {
+            tracing::warn!(
+                session = %session.id,
+                error = %err,
+                "ccteam-im: failed to mirror user turn to turns.jsonl"
+            );
+        }
+    }
+
     async fn submit_to_current(&self, chat: &ChatKey, payload: String) -> Result<Vec<String>> {
         let session_id = self
             .current_session
@@ -1528,6 +1598,11 @@ impl Gateway {
             *target = chat.clone();
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        // v0.8.8 bug-fix — keep the user's prompt so it can be mirrored into
+        // turns.jsonl after a successful submit (the pump records only the
+        // assistant side, so without this the user's message is lost on a
+        // history reseed / session switch).
+        let user_text = payload.clone();
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(
             submit_wait,
@@ -1537,6 +1612,7 @@ impl Gateway {
         )
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
+        self.mirror_user_turn(session, &user_text, &turn_id.0);
         self.after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await
     }
@@ -1856,11 +1932,16 @@ impl Gateway {
     /// Matching is by *computed* canonical name (not by parsing the live name),
     /// so dash-containing slugs are unambiguous; parsing is only used to
     /// describe orphans for display.
+    ///
+    /// v0.8.8 F1 — the canonical name keys on the `sid` (`ccteam-chat-<slug>-
+    /// <sid>`), so the tracked set MUST be computed from `(project, id)` to
+    /// match the pane name the adapter actually spawns; using role here would
+    /// misjudge every live pane as an orphan.
     pub fn reconcile_chat_sessions(&self, live_chat_names: &[String]) -> SessionInventory {
         let tracked_names: std::collections::BTreeSet<String> = self
             .sessions
             .values()
-            .map(|s| chat_session_name(&s.project, &s.role))
+            .map(|s| chat_session_name(&s.project, &s.id))
             .collect();
         // Bare-path call binds to the free function below, not this method.
         reconcile_chat_sessions(&tracked_names, live_chat_names)
@@ -1893,8 +1974,8 @@ impl Gateway {
         lines.sort();
         for orphan in &inventory.orphans {
             lines.push(format!(
-                "orphan {} (slug={} role={}) — untracked, reclaim explicitly",
-                orphan.name, orphan.slug, orphan.role
+                "orphan {} (slug={} sid={}) — untracked, reclaim explicitly",
+                orphan.name, orphan.slug, orphan.sid
             ));
         }
         if lines.is_empty() {
@@ -1946,6 +2027,7 @@ impl Gateway {
         Some(SessionResolve {
             sid: session.id.clone(),
             role: session.role.clone(),
+            vendor: vendor_str(session.vendor).to_string(),
             project: session.project.clone(),
             project_dir,
         })
@@ -1975,37 +2057,33 @@ impl Gateway {
         })
     }
 
-    /// v0.8.7 W2 (DB.3) — resolve a `(project_slug, role)` to its gateway
-    /// session id for the HITL approval prompt label ("session sX (role)
-    /// wants to run …"). A chat pane is uniquely keyed by `(project, role)`
-    /// (same invariant `start_session` dedups on), so this is the gateway-sid
-    /// for the firing session. Returns `None` when no tracked session matches
-    /// (the approval prompt then falls back to a sid-less label). Read-only,
-    /// holds no `.await`.
-    pub fn session_sid_for(&self, project: &str, role: &str) -> Option<String> {
-        self.sessions
-            .values()
-            .find(|s| s.project == project && s.role == role)
-            .map(|s| s.id.clone())
+    /// v0.8.8 F1 — confirm a HITL-firing `sid` maps to a live tracked session,
+    /// returning its canonical id for the approval prompt label ("session sX
+    /// wants to run …"). The firing session reports its own sid via the
+    /// `CCTEAM_CHAT_SID` pane env (post-dedup `(project, role)` is no longer a
+    /// unique key, so the sid is the only safe identity). Returns `None` when
+    /// the sid is not tracked (the prompt then falls back to a sid-less label).
+    /// Read-only, holds no `.await`.
+    pub fn session_sid_for(&self, sid: &str) -> Option<String> {
+        self.sessions.get(sid).map(|s| s.id.clone())
     }
 
     /// v0.8.7 (FIX-1) — resolve the live reply target `(channel, chat_id)` for
-    /// the session currently running `(project, role)`. This is the outbound
-    /// addressing the IM `chat_send_file` / `interaction/ask` paths need so an
-    /// agent the user is actively chatting with can push a file back to that
-    /// same chat WITHOUT a prior `chat_register_bot` (the on-disk registry is
-    /// only written by an explicit register, so the inbound spawn path never
-    /// populates it). Mirrors [`session_sid_for`](Self::session_sid_for)'s
-    /// `(project, role)` dedup find, then resolves the session's `reply_to`
-    /// (whoever last drove it) → `owner` fallback exactly like the private
-    /// [`pump_target`] free fn. Returns `None` when no tracked session matches
-    /// (the caller then falls back to the on-disk `resolve_home_chat`
-    /// registry). Read-only, holds no `.await`.
-    pub fn reply_target_for(&self, project: &str, role: &str) -> Option<(String, String)> {
-        let session = self
-            .sessions
-            .values()
-            .find(|s| s.project == project && s.role == role)?;
+    /// the session addressed by `sid`. This is the outbound addressing the IM
+    /// `chat_send_file` / `interaction/ask` paths need so an agent the user is
+    /// actively chatting with can push a file back to that same chat WITHOUT a
+    /// prior `chat_register_bot` (the on-disk registry is only written by an
+    /// explicit register, so the inbound spawn path never populates it).
+    ///
+    /// v0.8.8 F1 — keyed by `sid` (the firing session reports its own
+    /// `CCTEAM_CHAT_SID`): post-dedup `(project, role)` is no longer unique, so
+    /// resolving by sid is the only way to reach the SPECIFIC session's reply
+    /// target. Resolves the session's `reply_to` (whoever last drove it) →
+    /// `owner` fallback exactly like the private [`pump_target`] free fn.
+    /// Returns `None` when the sid is not tracked (the caller then falls back to
+    /// the on-disk `resolve_home_chat` registry). Read-only, holds no `.await`.
+    pub fn reply_target_for(&self, sid: &str) -> Option<(String, String)> {
+        let session = self.sessions.get(sid)?;
         Some(pump_target(session))
     }
 
@@ -2015,8 +2093,9 @@ impl Gateway {
     /// role name (the established convention from `/new`). Returns the new
     /// `s{n}` id. The `owner` is a synthetic `web` chat key so replies route
     /// to the web console; an SSE handler then filters the outbound stream by
-    /// `sid`. Reuses an existing (project, role) pane if one is already
-    /// tracked (same dedup as `/new`), so a duplicate API call is idempotent.
+    /// `sid`. v0.8.8 F1 — always mints a NEW sid (sessions are sid-keyed, so a
+    /// repeat call for the same `(project, role)` is a distinct session, NOT a
+    /// reuse), consistent with `/new`.
     pub async fn create_session_api(
         &mut self,
         project: String,
@@ -2025,6 +2104,8 @@ impl Gateway {
         permission_mode: PermissionMode,
     ) -> Result<String> {
         let owner = web_api_chat();
+        // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
+        // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
         self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
@@ -2049,6 +2130,10 @@ impl Gateway {
             *target = web_api_chat();
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
+        // v0.8.8 bug-fix — mirror the user's prompt to turns.jsonl (the pump
+        // records only the assistant side); without it a web session reopened
+        // from history shows the agent's replies but not the user's messages.
+        let user_text = text.clone();
         let submit_wait = gateway_submit_timeout_duration();
         let turn_id = tokio::time::timeout(
             submit_wait,
@@ -2058,6 +2143,7 @@ impl Gateway {
         )
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {sid}"))??;
+        self.mirror_user_turn(session, &user_text, &turn_id.0);
         // Arm the same async-turn machinery the inbound path uses (turn
         // watchdog when a sink is wired; otherwise this is a no-op drain).
         let _ = self
@@ -2178,11 +2264,12 @@ pub fn reconcile_chat_sessions(
     for name in live_chat_names {
         if tracked_names.contains(name) {
             inventory.tracked.push(name.clone());
-        } else if let Some((slug, role)) = parse_chat_session_name(name) {
+        } else if let Some((slug, sid)) = parse_chat_session_name(name) {
+            // v0.8.8 F1 — `parse_chat_session_name` now yields (slug, sid).
             inventory.orphans.push(OrphanSession {
                 name: name.clone(),
                 slug,
-                role,
+                sid,
             });
         }
     }
@@ -2192,7 +2279,7 @@ pub fn reconcile_chat_sessions(
     inventory
 }
 
-/// Load the set of canonical chat-session names (`ccteam-chat-<slug>-<role>`)
+/// Load the set of canonical chat-session names (`ccteam-chat-<slug>-<sid>`)
 /// the gateway has tracked, from its persisted route table at `state_path`
 /// (see [`default_gateway_state_path`](crate::default_gateway_state_path)).
 ///
@@ -2211,7 +2298,64 @@ pub fn tracked_chat_session_names(state_path: &Path) -> Result<std::collections:
     Ok(saved
         .sessions
         .into_iter()
-        .map(|s| chat_session_name(&s.project, &s.role))
+        // v0.8.8 F1 — canonical name keys on the sid (`s<N>`), matching the
+        // pane name the adapter spawns; computing from role here would make
+        // every live pane reconcile as an orphan.
+        .map(|s| chat_session_name(&s.project, &s.id))
+        .collect())
+}
+
+/// v0.8.8 B4/F3 — one tracked gateway session, flattened for out-of-process
+/// readers (the `ccteam session ls` / `ccteam status` CLI). The gateway's
+/// in-memory [`SessionView`] lives inside the daemon process; the CLI is a
+/// separate process and can only reach the persisted [`SavedGatewayState`]
+/// file. This projection exposes exactly the columns those views render
+/// (sid · project · role · vendor · permission_mode) without leaking the
+/// persisted struct's private fields (`secret` / `handle` / `thread`).
+#[derive(Debug, Clone)]
+pub struct TrackedSessionRow {
+    /// Gateway session id (`s<N>`) — the unique session key (F1).
+    pub sid: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Agent role (display label).
+    pub role: String,
+    /// Vendor, stringified (`"claude"` / `"codex"`).
+    pub vendor: String,
+    /// Permission posture wire string (`"skip"` / `"hitl"`).
+    pub permission_mode: String,
+}
+
+/// Load the gateway's tracked sessions as flat [`TrackedSessionRow`]s from the
+/// persisted route table at `state_path` (see
+/// [`default_gateway_state_path`](crate::default_gateway_state_path)).
+///
+/// Shares the exact read path of [`tracked_chat_session_names`] (same
+/// [`SavedGatewayState`] file; **absent ⇒ empty `Vec`**, never an error) so
+/// the two daemon-independent CLI views (`session ls` reconcile + `status`
+/// nesting) never drift on what the daemon has persisted. Strictly read-only.
+///
+/// The sub-second drift between the in-memory gateway map and this on-disk
+/// snapshot is accepted for the status / ls views (they're a glance, not a
+/// liveness gate).
+pub fn tracked_chat_sessions(state_path: &Path) -> Result<Vec<TrackedSessionRow>> {
+    if !state_path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(state_path)
+        .with_context(|| format!("read gateway state {}", state_path.display()))?;
+    let saved: SavedGatewayState = serde_json::from_str(&raw)
+        .with_context(|| format!("parse gateway state {}", state_path.display()))?;
+    Ok(saved
+        .sessions
+        .into_iter()
+        .map(|s| TrackedSessionRow {
+            sid: s.id,
+            project: s.project,
+            role: s.role,
+            vendor: vendor_str(s.vendor).to_string(),
+            permission_mode: s.permission_mode.as_str().to_string(),
+        })
         .collect())
 }
 
@@ -2238,23 +2382,61 @@ fn spawn_turn_timeout_watchdog(
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
+    // v0.8.9 (owner request) — the watchdog now TERMINATES a runaway turn, not
+    // just notifies. Clone the session's adapter + thread so the spawned task
+    // can send the `esc` directive (Esc to a Claude pane) when the turn stalls.
+    let adapter = Arc::clone(&session.adapter);
+    let thread = session.thread.clone();
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
         if visible_events.load(Ordering::SeqCst) != start_visible_events {
-            return;
+            return; // the turn produced a visible answer → not stuck.
         }
+        // No answer within the timeout = a stalled / infinitely-looping turn
+        // (e.g. a roleless model spinning on tool calls). INTERRUPT it via the
+        // adapter's vendor-agnostic `esc` directive (Claude → Esc keystroke).
+        // This terminates the TURN, NOT the session — the pane stays alive
+        // ("never auto-kill a long session"); the user can simply send again.
+        // Best-effort: on failure we still notify (the user can `/stop`).
+        let esc = Directive {
+            name: "esc".to_string(),
+            args: String::new(),
+            choice: None,
+        };
+        let interrupted = match adapter.handle_directive(&thread, esc).await {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %err,
+                    "turn-watchdog: failed to interrupt the runaway turn"
+                );
+                false
+            }
+        };
         let (channel, chat_id) = match reply_to.lock() {
             Ok(target) => (target.channel.clone(), target.chat_id.clone()),
             Err(_) => (owner.channel.clone(), owner.chat_id.clone()),
+        };
+        let content = if interrupted {
+            format!(
+                "⏱️ turn {turn_id} produced no reply for {timeout:?} — the watchdog \
+                 interrupted it (the session is still alive; just send again to retry). \
+                 If this recurs the model may be looping: bind a role (e.g. cto) or give a \
+                 clearer task. Tune the limit via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS."
+            )
+        } else {
+            format!(
+                "⏱️ turn {turn_id} timed out after {timeout:?} for {session_id}; the watchdog \
+                 could not interrupt it — you may need to /stop the session."
+            )
         };
         let _ = tx.send(GatewayEvent {
             id: format!("gateway-timeout-{session_id}-{turn_id}"),
             channel,
             chat_id,
             thread_ts: None,
-            content: format!(
-                "gateway error: turn timed out after {timeout:?} for {session_id} turn {turn_id}"
-            ),
+            content,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
@@ -2317,6 +2499,12 @@ fn wrap_inbound(
 /// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
 /// routing, not personas, and shouldn't be forced to scaffold a role tree.
 fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+    // v0.8.8 F2 — 空 role = 显式 roleless(裸 claude 自读项目 CLAUDE.md):跳过
+    // 存在性校验。必须在 `read_role` 之前(`read_role("")` 会因 charset 校验
+    // bail → `.ok().flatten()` 折成 None → 误报 RoleNotFound)。
+    if role.is_empty() {
+        return Ok(());
+    }
     // No agents dir → uninitialized / test project; skip (see doc comment).
     if !ccteam_core::agents_dir(cwd).exists() {
         return Ok(());
@@ -3167,6 +3355,215 @@ mod tests {
         assert!(!gateway.verify_session_caller("ghost", &secret));
     }
 
+    /// v0.8.8 F1 — with the (project, role) dedup removed, two sessions can run
+    /// the SAME role; each is minted its own per-session secret. The gate's
+    /// `(role, secret)` pair STILL isolates correctly: each session's secret
+    /// authenticates as that role, and a bogus secret is rejected even though
+    /// the role is live (twice). This proves verify_session_caller stays sound
+    /// — it was NOT weakened to role-only when dedup was dropped.
+    #[tokio::test]
+    async fn verify_session_caller_isolates_two_same_role_secrets() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify2");
+        let sid1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sid2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_ne!(sid1, sid2, "two same-role sessions are distinct sids");
+        let secret1 = gateway.sessions.get(&sid1).unwrap().secret.clone();
+        let secret2 = gateway.sessions.get(&sid2).unwrap().secret.clone();
+        assert_ne!(secret1, secret2, "each session mints its own secret");
+
+        // Each session's secret authenticates as the (live) cto role.
+        assert!(gateway.verify_session_caller("cto", &secret1));
+        assert!(gateway.verify_session_caller("cto", &secret2));
+        // A bogus secret is rejected even though cto is live (twice).
+        assert!(!gateway.verify_session_caller("cto", "deadbeefdeadbeefdeadbeefdeadbeef"));
+    }
+
+    /// v0.8.8 F1 (acceptance a) — two same-role `create_session_api` calls yield
+    /// distinct sids, two tracked SessionViews, and INDEPENDENT per-sid turns
+    /// mirrors (a turn written under sid1 is invisible under sid2). This is the
+    /// keystone "a chat can run multiple same-role sessions" guarantee.
+    #[tokio::test]
+    async fn two_same_role_sessions_have_distinct_sids_and_independent_turns() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+
+        let sid1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sid2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_ne!(sid1, sid2, "same (project, role) → distinct sids");
+        assert_eq!(
+            gateway.session_views().len(),
+            2,
+            "two independent same-role sessions tracked"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "each session spawns its own pane"
+        );
+
+        // Per-sid turns mirrors are independent: a turn written under sid1 is
+        // not visible under sid2 (BUG-3 root: role-keyed reads bled history).
+        let mk = |id: &str, who: &str| TurnRecord {
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: "reviewer".into(),
+            user: String::new(),
+            assistant: who.into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
+        };
+        append_turn(&project_dir, &sid1, &mk("t1", "from-sid1")).unwrap();
+        append_turn(&project_dir, &sid2, &mk("t2", "from-sid2")).unwrap();
+
+        let turns1 = read_all_turns(&project_dir, &sid1).unwrap();
+        let turns2 = read_all_turns(&project_dir, &sid2).unwrap();
+        assert_eq!(turns1.len(), 1);
+        assert_eq!(turns1[0].assistant, "from-sid1");
+        assert_eq!(turns2.len(), 1);
+        assert_eq!(turns2[0].assistant, "from-sid2");
+    }
+
+    /// v0.8.8 bug-fix (bug3) — `submit_to_sid` MIRRORS THE USER'S PROMPT to
+    /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump records only the
+    /// assistant side, so without this user-side mirror a session reopened from
+    /// history (`GET /sessions/{sid}` → `historyToRows`) showed only the agent's
+    /// replies — the user's own messages "disappeared" on a session switch.
+    #[tokio::test]
+    async fn submit_to_sid_mirrors_the_user_prompt() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "what does this repo do?".into())
+            .await
+            .unwrap();
+
+        let turns = read_all_turns(&project_dir, &sid).unwrap();
+        assert!(
+            turns.iter().any(|t| t.user == "what does this repo do?"),
+            "the user's prompt must be persisted to turns.jsonl, got {turns:?}"
+        );
+    }
+
+    /// v0.8.8 F1 (regression — closes the BUG-3 blind spot) — the gateway's
+    /// live event pump WRITES `.ccteam/chat/<sid>/turns.jsonl`. Before F1 the
+    /// ONLY non-test `append_turn` caller was the dead BotSupervisor (never
+    /// wired by daemon.rs), so the SPA / cto-collect history read by sid found a
+    /// PERMANENTLY EMPTY file even after the read-side BUG-3 fix. The absence of
+    /// THIS test is exactly why that root hid. FakeAdapter emits one
+    /// AgentMessage on submit → assert the row lands under the sid's mirror.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_pump_writes_turns_to_sid_mirror() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+        // The pump only runs (and only writes) when an event sink is wired —
+        // mirror the production daemon path.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // Create a session (spawns the detached pump) and drive one turn; the
+        // FakeAdapter enqueues an AgentMessage event the pump will fold + write.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "review the diff".into())
+            .await
+            .unwrap();
+
+        // The pump is a detached task — poll the sid-keyed mirror until the row
+        // appears (bounded, so a real failure still fails the test).
+        // v0.8.8 bug3 — submit_to_sid mirrors the USER side synchronously; the
+        // detached pump then appends the ASSISTANT side. Poll until the
+        // assistant record lands (the user record appears first, at submit).
+        let mut found = None;
+        for _ in 0..100 {
+            let turns = read_all_turns(&project_dir, &sid).unwrap_or_default();
+            if turns.iter().any(|t| !t.assistant.is_empty()) {
+                found = Some(turns);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let turns = found.expect("event pump must mirror the assistant turn to turns.jsonl");
+        assert!(
+            turns.iter().any(|t| t.user == "review the diff"),
+            "the user's prompt is mirrored to turns.jsonl: {turns:?}"
+        );
+        let assistant = turns
+            .iter()
+            .find(|t| !t.assistant.is_empty())
+            .expect("the pump mirrors the assistant reply");
+        assert!(
+            assistant.assistant.contains("echo: review the diff"),
+            "the mirrored turn carries the assistant reply text: {:?}",
+            assistant.assistant
+        );
+        assert_eq!(assistant.vendor, "claude");
+        assert_eq!(
+            assistant.role, "reviewer",
+            "content-label role on the record"
+        );
+    }
+
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
     /// the daemon gate uses to enforce same-project scope. Confirm it reports
     /// the project a session was created in (so a project-A caller can be told
@@ -3194,8 +3591,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(gateway.session_resolve(&sa).unwrap().project, "alpha");
-        assert_eq!(gateway.session_resolve(&sb).unwrap().project, "beta");
+        let ra = gateway.session_resolve(&sa).unwrap();
+        let rb = gateway.session_resolve(&sb).unwrap();
+        assert_eq!(ra.project, "alpha");
+        assert_eq!(rb.project, "beta");
+        // v0.8.8 F1 (acceptance c) — the resolve also carries the vendor.
+        assert_eq!(ra.vendor, "claude");
+        assert_eq!(rb.vendor, "claude");
     }
 
     /// v0.8.7 review-fix (R-M6) — creating a session for a role with no
@@ -3252,7 +3654,12 @@ mod tests {
     /// spawning a second thread over the same transcript (same dedup `/new`
     /// relies on).
     #[tokio::test]
-    async fn gateway_resource_api_create_dedups_pane() {
+    async fn gateway_resource_api_create_mints_distinct_sids() {
+        // v0.8.8 F1 — create_session_api no longer dedups on (project, role):
+        // two creates of the same role mint two DISTINCT sids, each backed by
+        // its own pane/pump. The web/cto "spawn another reviewer" flow relies
+        // on this (and the session_spawn tool description was updated to
+        // "always mints a new sid").
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         let a = gateway
@@ -3273,12 +3680,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(a, b, "same (project, role) reuses the session id");
-        assert_eq!(gateway.session_views().len(), 1);
+        assert_ne!(
+            a, b,
+            "F1: same (project, role) must mint distinct sids, not reuse one"
+        );
+        assert_eq!(
+            gateway.session_views().len(),
+            2,
+            "two independent sessions tracked"
+        );
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
-            1,
-            "the pane is started exactly once"
+            2,
+            "each session spawns its own pane"
         );
     }
 
@@ -3311,52 +3725,51 @@ mod tests {
         assert_eq!(views[0].permission_mode, "hitl");
     }
 
-    /// v0.8.7 review-fix (R-M2) — `/new claude cto hitl` onto an already-live
-    /// skip cto pane must NOT claim hitl in the receipt. The first plain
-    /// message auto-spawns a skip cto; the subsequent `/new … hitl` hits the
-    /// dedup branch (same (project, cto) pane), which CANNOT change the live
-    /// process's spawn flag — so the receipt must say it's still skip, never
-    /// falsely report hitl (the dangerous "you think it's supervised but it
-    /// isn't" direction). Only ONE spawn happened, and it was skip.
+    /// v0.8.8 F1 — the R-M2 "false-hitl on a reused skip pane" footgun is
+    /// STRUCTURALLY GONE: there is no (project, role) reuse path anymore, so a
+    /// `/new … hitl` after a live skip session ALWAYS mints a SECOND, genuinely
+    /// hitl session (its own pane spawned with the hitl flag). The receipt is
+    /// therefore honestly hitl — there is no live skip process being silently
+    /// re-labeled. This supersedes the pre-F1
+    /// `new_hitl_onto_live_skip_pane_receipt_does_not_claim_hitl` (whose
+    /// premise — reuse — no longer exists).
     #[tokio::test]
-    async fn new_hitl_onto_live_skip_pane_receipt_does_not_claim_hitl() {
+    async fn new_hitl_after_live_skip_spawns_second_honest_hitl_session() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2");
 
-        // First message auto-spawns the default cto in SKIP mode.
+        // First message auto-spawns the default cto in SKIP mode (s1).
         gateway
             .handle_text("mock", "chat-1", "alice", "hello")
             .await
             .unwrap();
 
-        // Now ask for hitl on the same (project, cto) — reuses the skip pane.
+        // Now `/new … cto hitl` — post-F1 this mints a SECOND, distinct hitl
+        // session (s2), it does NOT reuse the live skip pane.
         let receipt = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
             .await
             .unwrap();
         assert_eq!(receipt.len(), 1);
-        assert!(
-            !receipt[0].contains("non-allowlist tools need IM approval"),
-            "must NOT falsely promise hitl supervision on a reused skip pane: {receipt:?}"
-        );
-        assert!(
-            receipt[0].contains("skip"),
-            "receipt must tell the truth that the pane is still skip: {receipt:?}"
+        assert_eq!(
+            receipt[0], "created session s2 (hitl: non-allowlist tools need IM approval)",
+            "F1: a fresh hitl session is spawned + honestly reported, got: {receipt:?}"
         );
 
-        // Exactly one spawn, and it was skip — the hitl request did not (and
-        // could not) restart the pane with the hitl flag.
+        // TWO spawns: the original skip s1 + the new hitl s2 — the hitl request
+        // genuinely started its own pane with the hitl flag (no false labeling
+        // of a skip process).
         assert_eq!(
             fake.spawn_modes.lock().await.as_slice(),
-            &[PermissionMode::Skip],
-            "no second spawn; the live skip pane was reused as-is"
+            &[PermissionMode::Skip, PermissionMode::Hitl],
+            "the hitl /new spawns a second, genuinely-hitl pane"
         );
         let views = gateway.session_views();
-        assert_eq!(views.len(), 1, "one (project, cto) session, reused");
-        assert_eq!(
-            views[0].permission_mode, "skip",
-            "the live posture is still skip"
-        );
+        assert_eq!(views.len(), 2, "two independent cto sessions (skip + hitl)");
+        // The two same-role sessions carry their requested postures faithfully.
+        let mut modes: Vec<&str> = views.iter().map(|v| v.permission_mode.as_str()).collect();
+        modes.sort_unstable();
+        assert_eq!(modes, vec!["hitl", "skip"]);
     }
 
     /// v0.8.7 review-fix (R-M2) — the inverse honest case: a FRESH `/new …
@@ -3452,9 +3865,10 @@ mod tests {
         assert_eq!(views[0].permission_mode, "hitl");
     }
 
-    /// v0.8.7 W2 (DB.3) — `session_sid_for(slug, role)` maps a firing
-    /// session's (project, role) back to its gateway sid (for the HITL
-    /// approval prompt label).
+    /// v0.8.8 F1 — `session_sid_for(sid)` confirms a HITL-firing sid maps to a
+    /// live tracked session (for the approval prompt label). Post-dedup the sid
+    /// is the only safe identity (the firing session reports its own
+    /// `CCTEAM_CHAT_SID`); an untracked sid is `None`.
     #[tokio::test]
     async fn session_sid_for_maps_project_role_to_sid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -3468,16 +3882,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(gateway.session_sid_for("alpha", "reviewer"), Some(sid));
-        assert_eq!(gateway.session_sid_for("alpha", "ghost"), None);
-        assert_eq!(gateway.session_sid_for("other", "reviewer"), None);
+        assert_eq!(gateway.session_sid_for(&sid), Some(sid.clone()));
+        assert_eq!(gateway.session_sid_for("s99"), None);
     }
 
-    /// v0.8.7 (FIX-1) — `reply_target_for(project, role)` resolves a live
-    /// session's reply target from the in-memory map, with NO on-disk registry
-    /// involved. After a `/new` + a driving message the session's `reply_to`
-    /// points at the chat that last drove it, so an outbound `chat_send_file`
-    /// can deliver back to that chat without a prior `chat_register_bot`.
+    /// v0.8.8 F1 — `reply_target_for(sid)` resolves a live session's reply
+    /// target from the in-memory map, with NO on-disk registry involved. After
+    /// a `/new` + a driving message the session's `reply_to` points at the chat
+    /// that last drove it, so an outbound `chat_send_file` can deliver back to
+    /// that chat without a prior `chat_register_bot`. Keyed by sid (the firing
+    /// session reports its own `CCTEAM_CHAT_SID`).
     #[tokio::test]
     async fn reply_target_for_resolves_live_session_without_registry() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -3491,14 +3905,15 @@ mod tests {
             .handle_text("telegram", "chat-99", "alice", "hello")
             .await
             .unwrap();
+        // First (only) session is deterministically s1.
+        let sid = gateway.session_views()[0].sid.clone();
         // The live target is the driving chat — resolved purely from memory.
         assert_eq!(
-            gateway.reply_target_for("alpha", "reviewer"),
+            gateway.reply_target_for(&sid),
             Some(("telegram".to_string(), "chat-99".to_string()))
         );
-        // No tracked session for these → None (caller falls back to registry).
-        assert_eq!(gateway.reply_target_for("alpha", "ghost"), None);
-        assert_eq!(gateway.reply_target_for("other", "reviewer"), None);
+        // An untracked sid → None (caller falls back to registry).
+        assert_eq!(gateway.reply_target_for("s99"), None);
     }
 
     /// v0.8.7 (FIX-2) — when the project HAS a `.claude/agents/` dir, a create
@@ -3550,6 +3965,51 @@ mod tests {
             .unwrap();
         assert_eq!(sid, "s1");
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// v0.8.8 F2 — an EMPTY role is explicit "roleless" (bare claude reads the
+    /// project's own `CLAUDE.md`), NOT a typo: `create_session_api` returns
+    /// `Ok(sid)` even when the project HAS a `.claude/agents/` dir (the strict
+    /// path that rejects a non-empty unseeded role). This is the mirror of
+    /// `create_session_unknown_role_is_role_not_found` for the empty case.
+    /// Also confirms the handle falls back to the sid (never empty, so @handle
+    /// addressing can't collide / mis-match).
+    #[tokio::test]
+    async fn create_session_empty_role_is_ok() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // Real project dir WITH an agents dir → strict validation applies to a
+        // non-empty role; an EMPTY role must still slip through (roleless).
+        let proj = tempfile::TempDir::new().unwrap();
+        seed_role(proj.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .expect("empty role (roleless) must create Ok, not RoleNotFound");
+        assert_eq!(sid, "s1");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "roleless still spawns"
+        );
+
+        // The session is tracked with an EMPTY role label …
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].role, "", "roleless session reports an empty role");
+        // … but the handle fell back to the sid (non-empty), so @handle routing
+        // resolves it deterministically and never collides on "".
+        assert_eq!(
+            gateway.session_by_handle(&web_api_chat(), &sid),
+            Some(sid.clone()),
+            "roleless handle must fall back to the sid (addressable, non-empty)"
+        );
     }
 
     /// v0.8.7 (FIX-2) — the test-dir exemption: a bare project dir with NO
@@ -3646,13 +4106,17 @@ mod tests {
         assert_eq!(resolved.role, "reviewer");
         assert_eq!(resolved.project, "alpha");
         assert_eq!(resolved.project_dir, project_dir);
+        // v0.8.8 F1 (acceptance c) — session_resolve now carries the vendor so
+        // a collector / API can label the session without a second lookup.
+        assert_eq!(resolved.vendor, "claude");
 
         // Simulate the child's answer being mirrored to turns.jsonl (in
-        // production the event pump + turns_mirror consumer write this; the
-        // collect tool only READS it).
+        // production the event pump's turns writer does this; the collect tool
+        // only READS it). v0.8.8 F1 — the mirror is keyed by the session sid,
+        // NOT the role (BUG-3 root: reading by role bled same-role histories).
         append_turn(
             &resolved.project_dir,
-            &resolved.role,
+            &resolved.sid,
             &TurnRecord {
                 turn_id: "t1".into(),
                 ts: chrono::Utc::now(),
@@ -3666,10 +4130,15 @@ mod tests {
         )
         .unwrap();
 
-        let turns = read_all_turns(&resolved.project_dir, &resolved.role).unwrap();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].assistant, "LGTM, two nits inline.");
-        assert_eq!(turns[0].turn_id, "t1");
+        let turns = read_all_turns(&resolved.project_dir, &resolved.sid).unwrap();
+        // v0.8.8 bug3 — submit_to_sid also mirrors the user prompt, so the
+        // manually-simulated answer ("t1") is one of (at least) two records;
+        // find it by turn_id rather than asserting a single-record file.
+        let answer = turns
+            .iter()
+            .find(|t| t.turn_id == "t1")
+            .expect("the simulated answer turn is present");
+        assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
     /// P3 — `/sessions` appends each session's model + ctx from
@@ -4163,10 +4632,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new codex api")
             .await
             .unwrap();
-        // chat-2 uses a DISTINCT role → a distinct tmux pane / session. (Same
-        // (project, role) would be the same pane, so it dedups to one session;
-        // isolation between chats comes from distinct roles, not duplicate
-        // records over a shared pane.)
+        // chat-2 spawns its own session (here a distinct role). v0.8.8 F1 — every
+        // /new mints a fresh sid regardless of (project, role), so cross-chat
+        // isolation is per-session by construction; this test happens to use
+        // distinct roles for readable echo assertions.
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude qa")
             .await
@@ -4235,6 +4704,78 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
+    /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
+    /// daemon restart, even after a session is stopped. Concretely: spawn two
+    /// SAME-role sessions (s1 + s2), stop s1, then rebuild the Gateway from the
+    /// persisted state. The reload must (1) restore s2 (proving the load_state
+    /// seen-panes collapse is gone — both same-role records survive) and (2)
+    /// resume the monotonic counter so the NEXT create is s3, never recycling
+    /// the freed s1. (next_session is persisted, so non-reuse holds by
+    /// construction.)
+    #[tokio::test]
+    async fn sid_stable_and_not_reused_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("gateway-state.json");
+        let fake = Arc::new(FakeAdapter::default());
+
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-reuse");
+            gateway.enable_persistence(&state_path).unwrap();
+            // Two SAME-role sessions → s1 + s2 (no dedup post-F1).
+            let s1 = gateway
+                .create_session_api(
+                    "alpha".into(),
+                    "reviewer".into(),
+                    AgentVendor::Claude,
+                    ccteam_harness::PermissionMode::Skip,
+                )
+                .await
+                .unwrap();
+            let s2 = gateway
+                .create_session_api(
+                    "alpha".into(),
+                    "reviewer".into(),
+                    AgentVendor::Claude,
+                    ccteam_harness::PermissionMode::Skip,
+                )
+                .await
+                .unwrap();
+            assert_eq!((s1.as_str(), s2.as_str()), ("s1", "s2"));
+            // Free s1 (persists the removal + the bumped counter).
+            gateway.stop_session("s1").await.unwrap();
+            assert!(gateway.session_resolve("s1").is_none());
+            assert!(gateway.session_resolve("s2").is_some());
+        }
+
+        // Rebuild from the same on-disk state.
+        let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-reuse");
+        restored.enable_persistence(&state_path).unwrap();
+        // s2 survived the restart (both same-role records were persisted; only
+        // s1 was explicitly stopped).
+        assert!(
+            restored.session_resolve("s2").is_some(),
+            "the surviving same-role session must restore after restart"
+        );
+        assert!(
+            restored.session_resolve("s1").is_none(),
+            "the stopped session must not resurrect"
+        );
+        // The NEXT create resumes the counter → s3, NEVER recycling s1.
+        let s3 = restored
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s3, "s3",
+            "the monotonic sid counter must persist — the freed s1 is never reused"
+        );
+    }
+
     #[test]
     fn reconcile_chat_sessions_free_fn_splits_tracked_and_orphans() {
         let tracked: std::collections::BTreeSet<String> =
@@ -4250,7 +4791,8 @@ mod tests {
         assert_eq!(inv.tracked, vec!["ccteam-chat-dev-foo-alice".to_string()]);
         assert_eq!(inv.orphans.len(), 1);
         assert_eq!(inv.orphans[0].slug, "ghost-proj");
-        assert_eq!(inv.orphans[0].role, "zombie");
+        // v0.8.8 F1 — the trailing segment parses as the sid (not a role).
+        assert_eq!(inv.orphans[0].sid, "zombie");
         assert_eq!(inv.orphans[0].name, "ccteam-chat-ghost-proj-zombie");
     }
 
@@ -4279,11 +4821,59 @@ mod tests {
             .await
             .unwrap();
 
+        // v0.8.8 F1 — the canonical pane name is keyed by the session sid
+        // (`s1`), not the role: a same-role second session would otherwise
+        // collide on one name. The first `/new` minted s1.
         let names = tracked_chat_session_names(&state_path).unwrap();
         assert!(
-            names.contains("ccteam-chat-beta-reviewer"),
-            "expected canonical chat-session name, got {names:?}"
+            names.contains("ccteam-chat-beta-s1"),
+            "expected sid-keyed canonical chat-session name, got {names:?}"
         );
+    }
+
+    #[test]
+    fn tracked_chat_sessions_empty_when_state_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.json");
+        assert!(tracked_chat_sessions(&missing).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracked_chat_sessions_projects_vendor_role_sid() {
+        // v0.8.8 B4/F3 — spawn one claude + one codex session through the
+        // gateway, persist, then read the flat rows back out-of-process.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("gateway-state.json");
+        let fake = Arc::new(FakeAdapter::default());
+
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway.enable_persistence(&state_path).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex builder")
+            .await
+            .unwrap();
+
+        let rows = tracked_chat_sessions(&state_path).unwrap();
+        assert_eq!(rows.len(), 2, "expected two tracked rows, got {rows:?}");
+
+        let claude = rows
+            .iter()
+            .find(|r| r.role == "reviewer")
+            .expect("reviewer row");
+        assert_eq!(claude.vendor, "claude");
+        assert_eq!(claude.permission_mode, "skip");
+        assert!(claude.sid.starts_with('s'), "sid shape: {}", claude.sid);
+        assert_eq!(claude.project, "alpha");
+
+        let codex = rows
+            .iter()
+            .find(|r| r.role == "builder")
+            .expect("builder row");
+        assert_eq!(codex.vendor, "codex");
     }
 
     #[tokio::test]
@@ -4394,6 +4984,54 @@ mod tests {
             reply.iter().any(|r| r.contains("project set to dev-gamma")),
             "expected /cd to resolve the config-only project, got {reply:?}"
         );
+    }
+
+    /// v0.8.8 bug-fix — `create_session_api` (the web `POST /sessions` path)
+    /// must resolve a project registered in config.yaml AFTER daemon start, the
+    /// same way `/cd` does. Repro: a successful web `POST /projects` (registry
+    /// write) immediately followed by `POST /sessions` used to fail "unknown
+    /// project: <slug>" because `start_session` read only the stale in-memory
+    /// cache. Mirrors `gateway_cd_dynamically_loads_project_from_config` but on
+    /// the API create path (`ensure_project_loaded` now runs before the lookup).
+    #[tokio::test]
+    async fn gateway_create_session_api_loads_project_from_config() {
+        use ccteam_core::config::{upsert_project, ProjectEntry};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // A bare project dir registered straight into config.yaml (as REST
+        // `POST /projects` does) — NOT in the gateway's in-memory snapshot.
+        let delta_dir = paths.projects_root.join("dev-delta");
+        std::fs::create_dir_all(&delta_dir).unwrap();
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: "dev-delta".to_string(),
+                path: delta_dir.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        gateway.enable_project_creation(paths);
+
+        // Before the fix this returned Err "unknown project: dev-delta".
+        let sid = gateway
+            .create_session_api(
+                "dev-delta".to_string(),
+                "cto".to_string(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .expect("create_session_api must resolve a config-registered project");
+        assert!(sid.starts_with('s'), "expected an s<N> sid, got {sid}");
     }
 
     #[tokio::test]
@@ -4512,20 +5150,21 @@ mod tests {
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
 
-        // One tracked session: s1 = alpha/lead → ccteam-chat-alpha-lead.
+        // v0.8.8 F1 — the tracked pane is keyed by sid: s1 = alpha/lead →
+        // ccteam-chat-alpha-s1 (NOT ...-lead). The first /new mints s1.
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude lead")
             .await
             .unwrap();
 
         // Two live ccteam-chat-* processes injected via a fake ProcessBackend:
-        // one matches the tracked session, the other is an orphan that outlived
-        // a prior daemon (dashed slug to exercise the parser).
+        // one matches the tracked session (by sid), the other is an orphan that
+        // outlived a prior daemon (dashed slug to exercise the parser).
         let backend = InProcBackend::new();
         let spec =
             |name: &str| MuxSessionSpec::new(name, vec!["true".into()], PathBuf::from("/tmp"));
         backend
-            .spawn(spec(&chat_session_name("alpha", "lead")))
+            .spawn(spec(&chat_session_name("alpha", "s1")))
             .await
             .unwrap();
         backend
@@ -4534,16 +5173,14 @@ mod tests {
             .unwrap();
 
         let inventory = gateway.inventory_via_backend(&backend).await.unwrap();
-        assert_eq!(
-            inventory.tracked,
-            vec!["ccteam-chat-alpha-lead".to_string()]
-        );
+        assert_eq!(inventory.tracked, vec!["ccteam-chat-alpha-s1".to_string()]);
         assert_eq!(
             inventory.orphans,
             vec![OrphanSession {
                 name: "ccteam-chat-ghost-proj-zombie".to_string(),
                 slug: "ghost-proj".to_string(),
-                role: "zombie".to_string(),
+                // v0.8.8 F1 — trailing segment is the sid.
+                sid: "zombie".to_string(),
             }]
         );
 
@@ -4554,8 +5191,11 @@ mod tests {
             rendered.contains("s1:alpha:Claude:lead"),
             "rendered: {rendered}"
         );
+        // v0.8.8 F1 — the orphan render labels the trailing segment as the sid
+        // (a daemon-outliving pane cannot recover a role from the sid-keyed
+        // name, so the display shows sid — accepted UX cost).
         assert!(
-            rendered.contains("orphan ccteam-chat-ghost-proj-zombie (slug=ghost-proj role=zombie)"),
+            rendered.contains("orphan ccteam-chat-ghost-proj-zombie (slug=ghost-proj sid=zombie)"),
             "rendered: {rendered}"
         );
     }
@@ -4640,9 +5280,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_dedupes_sessions_by_project_and_role() {
-        // One (project, role) == one tmux pane, so a repeat /new reuses the
-        // record instead of spawning a duplicate pump over the same transcript.
+    async fn two_same_role_sessions_get_distinct_sids() {
+        // v0.8.8 F1 — the (project, role) dedup is GONE: every `/new` mints a
+        // fresh sid, so two `/new claude assistant` calls yield s1 + s2 (two
+        // independent panes / pumps), NOT a reused s1. This is the keystone
+        // behavior change — a chat can now run multiple same-role sessions
+        // side by side. (The spawn-storm guard is ensure_current_session's
+        // contains_key early-return for PLAIN messages, not this dedup — see
+        // plain_messages_reuse_current_session_no_storm.)
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
 
@@ -4651,30 +5296,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first, vec!["created session s1"]);
-        // Same project + role → reuse s1, not a new sid. v0.8.7 review-fix
-        // (R-M2): the receipt now truthfully says it REUSED the pane (both
-        // requests are skip, so no false-hitl concern here).
+        // Same project + role → a SECOND, distinct session s2 (no reuse).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(again, vec!["复用 session s1"]);
-        // A different role → a genuinely distinct pane/session.
+        assert_eq!(
+            again,
+            vec!["created session s2"],
+            "F1: a repeat /new of the same role must mint a NEW sid, not reuse s1"
+        );
+        // A third /new (different role) → s3.
         let other_role = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(other_role, vec!["created session s2"]);
+        assert_eq!(other_role, vec!["created session s3"]);
 
-        // Exactly two sessions tracked (one per project+role pane).
+        // Three sessions tracked — two same-role (s1, s2) + one (s3).
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             listing[0].lines().count(),
-            2,
-            "expected 2 deduped sessions: {}",
+            3,
+            "expected 3 distinct sessions (no dedup): {}",
             listing[0]
         );
     }

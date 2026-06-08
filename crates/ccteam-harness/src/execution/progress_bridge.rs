@@ -5,6 +5,8 @@
 //! and row-builder subset needed by execution adapters here.
 
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -53,10 +55,49 @@ pub fn append_event(path: &Path, event: &Value) -> Result<()> {
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    serde_json::to_writer(&mut file, event).context("serialize progress event")?;
-    file.write_all(b"\n")
-        .with_context(|| format!("write newline to {}", path.display()))?;
+
+    let _lock =
+        ProgressFileLock::lock(&file).with_context(|| format!("lock {}", path.display()))?;
+
+    let mut line = Vec::new();
+    serde_json::to_writer(&mut line, event).context("serialize progress event")?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .with_context(|| format!("write event to {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+struct ProgressFileLock(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl ProgressFileLock {
+    fn lock(file: &std::fs::File) -> std::io::Result<Self> {
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc == 0 {
+            Ok(Self(fd))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProgressFileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0, libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+struct ProgressFileLock;
+
+#[cfg(not(unix))]
+impl ProgressFileLock {
+    fn lock(_file: &std::fs::File) -> std::io::Result<Self> {
+        Ok(Self)
+    }
 }
 
 pub fn build_chat_tool_call_started_event(role: &str, tool: &str) -> Value {
@@ -332,4 +373,27 @@ pub fn build_codex_rate_limit_event(snapshot: Value) -> Value {
         "snapshot": snapshot,
         "ts": Utc::now().to_rfc3339(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_event_writes_exactly_one_jsonl_record_for_multiline_values() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let event = json!({
+            "event": "chat_tool_use",
+            "tool": "Bash",
+            "cmd": "printf 'a\\nb\\n'",
+        });
+
+        append_event(&path, &event).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(serde_json::from_str::<Value>(lines[0]).unwrap(), event);
+    }
 }

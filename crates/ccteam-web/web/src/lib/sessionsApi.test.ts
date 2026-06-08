@@ -8,12 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createSession,
   getHistory,
+  getRoleDetail,
+  listProjectRoles,
   listSessions,
   resolveApproval,
   sessionUrl,
   sessionsUrl,
   stopSession,
   submitTurn,
+  type RoleDetail,
+  type RoleSummary,
   type SessionView,
 } from "./sessionsApi";
 
@@ -172,5 +176,76 @@ describe("sessionsApi", () => {
     await expect(listSessions("x")).rejects.toThrow("UNAUTHENTICATED");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "nope" }));
     await expect(getHistory("sX")).rejects.toThrow("NOT_FOUND");
+  });
+});
+
+describe("listProjectRoles", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("GETs /api/v1/projects/{slug}/roles with same-origin creds + encoded slug", async () => {
+    const roles: RoleSummary[] = [
+      { role: "cto", description: "chat-first manager", model: "" },
+      { role: "reviewer", description: "", model: "sonnet" },
+    ];
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, roles));
+    const got = await listProjectRoles("a b");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/a%20b/roles", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual(roles);
+  });
+
+  it("returns [] for a project with no agents/", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(200, []));
+    expect(await listProjectRoles("empty")).toEqual([]);
+  });
+
+  it("maps 404 (unknown project) → NOT_FOUND and 401 → UNAUTHENTICATED", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "no project" }));
+    await expect(listProjectRoles("ghost")).rejects.toThrow("NOT_FOUND");
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
+    await expect(listProjectRoles("x")).rejects.toThrow("UNAUTHENTICATED");
+  });
+});
+
+describe("getRoleDetail", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("GETs /api/v1/projects/{slug}/roles/{role} with encoded slug + role", async () => {
+    const detail: RoleDetail = {
+      role: "code-reviewer",
+      frontmatter: { description: "reviews diffs", model: "sonnet" },
+      body: "# Reviewer\nYou review code.",
+    };
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, detail));
+    const got = await getRoleDetail("a b", "code-reviewer");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/projects/a%20b/roles/code-reviewer",
+      { headers: { Accept: "application/json" }, credentials: "same-origin" },
+    );
+    expect(got).toEqual(detail);
+    expect(got.frontmatter.model).toBe("sonnet");
+  });
+
+  it("maps 404 (unknown role) → NOT_FOUND and 401 → UNAUTHENTICATED", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "no role" }));
+    await expect(getRoleDetail("p", "ghost")).rejects.toThrow("NOT_FOUND");
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
+    await expect(getRoleDetail("p", "x")).rejects.toThrow("UNAUTHENTICATED");
   });
 });

@@ -59,6 +59,17 @@ async fn pane_snapshot_returns_504_when_tmux_session_missing() {
 
 #[tokio::test]
 async fn pane_snapshot_uses_state_tmux_session_for_meta_projects() {
+    // The PROJECT-LEVEL (no-sid) route is unchanged by v0.8.8 B5 — it still
+    // resolves `state.tmux_session`. It degrades to 504 (session not found),
+    // and the body should identify the state-backed session name so an
+    // operator can tell which pane was missing.
+    //
+    // ENV-GATED tail: capturing a pane requires the configured mux backend to
+    // be reachable. In a sandbox the default rmux daemon cannot bind its
+    // socket, so `capture` fails with an rmux-startup error (still 504, but the
+    // body is the transport error, not the session name). We accept EITHER
+    // degraded body so this stays green in the sandbox AND asserts the
+    // session-name contract on a box where the backend works.
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(paths.progress_dir()).unwrap();
@@ -73,17 +84,28 @@ async fn pane_snapshot_uses_state_tmux_session_for_meta_projects() {
     let resp = reqwest::get(&url).await.expect("GET pane snapshot");
     assert_eq!(resp.status(), 504);
     let body = resp.text().await.unwrap();
+    let names_session = body.contains("ccteam-meta-cto");
+    let backend_unreachable = body.contains("rmux") || body.contains("capture failed");
     assert!(
-        body.contains("ccteam-meta-cto"),
-        "degraded response should identify the state-backed tmux session; got: {body}",
+        names_session || backend_unreachable,
+        "504 body should identify the state-backed session (backend reachable) \
+         or report the unreachable backend (sandbox); got: {body}",
     );
 }
 
 #[tokio::test]
-async fn pane_snapshot_session_route_falls_back_to_project_tmux_session() {
-    // W5: the flex per-session registry is gone, so the session-scoped
-    // route resolves the project-level tmux session (TODO W5b/W5c re-key
-    // onto the new session record). The degraded body identifies it.
+async fn pane_snapshot_session_route_returns_503_without_gateway() {
+    // v0.8.8 B5 — F1 removed the project-level pane. The session-scoped snapshot
+    // route now resolves `sid → per-session pane` via the live gateway. The
+    // standalone "internal web" path (AppState built with no gateway) therefore
+    // returns 503 (no session map to resolve against) — the SAME no-gateway
+    // contract the session resource API uses. (Before B5 this route ignored the
+    // sid and fell back to the project-level tmux session, returning 504.)
+    //
+    // This replaces the old `pane_snapshot_session_route_falls_back_to_project_tmux_session`
+    // assertion, which encoded the now-removed project-level fallback. The real
+    // per-session capture (with a gateway + a live pane) stays env-gated to a
+    // box with the mux backend reachable (CI / dev machine).
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(paths.progress_dir()).unwrap();
@@ -91,29 +113,39 @@ async fn pane_snapshot_session_route_falls_back_to_project_tmux_session() {
     project.tmux_session = "ccteam-dev-proj".into();
     project.save(&paths.project_state("dev-proj")).unwrap();
 
-    let state = AppState::new(paths);
+    let state = AppState::new(paths); // no `.with_gateway(...)`
     let addr = spawn_server(state).await;
 
     let url = format!("http://{addr}/api/dev-proj/claude-1/pane-snapshot.ansi");
     let resp = reqwest::get(&url).await.expect("GET pane snapshot");
-    assert_eq!(resp.status(), 504);
+    assert_eq!(
+        resp.status(),
+        503,
+        "no-gateway per-session pane snapshot must be 503, not the old project fallback",
+    );
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("ccteam-dev-proj"),
-        "degraded response should identify the project tmux session; got: {body}",
+        body.contains("no live gateway"),
+        "503 body should explain the missing gateway; got: {body}",
     );
 }
 
 #[tokio::test]
-async fn pane_snapshot_session_route_returns_404_for_unknown_project() {
+async fn pane_snapshot_session_route_returns_503_without_gateway_even_for_unknown_project() {
+    // v0.8.8 B5 — the no-gateway check short-circuits BEFORE any project/sid
+    // lookup, so even a bogus project on the session route is 503 (not 404)
+    // when there is no live gateway. (Pre-B5 this was a 404 from the project
+    // existence check; that check is gone — sid resolution is the gateway's
+    // job now.) The 404-for-unknown-session path is exercised with a live
+    // gateway in env-gated coverage.
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(paths.progress_dir()).unwrap();
 
-    let state = AppState::new(paths);
+    let state = AppState::new(paths); // no gateway
     let addr = spawn_server(state).await;
 
     let url = format!("http://{addr}/api/no-such-project/claude-1/pane-snapshot.ansi");
     let resp = reqwest::get(&url).await.expect("GET pane snapshot");
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 503);
 }

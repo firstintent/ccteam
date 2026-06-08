@@ -342,9 +342,9 @@ fn tools_list_response() -> Value {
 }
 
 /// Single source of truth for the MCP tool surface. admin has 3 (`ls` +
-/// `change_persona` + `add_tool`); chat has 6; advise has 2; session has 5
+/// `change_persona` + `add_tool`); chat has 4; advise has 2; session has 5
 /// (v0.8.7 W1 cto scheduling); `ccteam__screenshot` is its own
-/// single-member group → **17 total**. All tools carry a group sub-prefix
+/// single-member group → **15 total**. All tools carry a group sub-prefix
 /// (`admin_`, `chat_`, `advise_`, `session_`) except `ccteam__screenshot`
 /// which keeps its single-member-group name for V0.5 muscle memory.
 pub(crate) fn tool_definitions() -> Vec<Value> {
@@ -373,12 +373,13 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             }),
         }),
     ];
-    // V0.6.0 Wave 1 (F108 / F112) — append chat (6) + advise (2)
-    // tools. V0.6.5 F146 / F147 turned all 6 chat stubs into real
-    // implementations; V0.6.5 F152 / F153 turned both advise stubs
-    // into real implementations against the `ccteam_core::advise`
-    // entry points (Claude + Codex parallel one-shot advisors +
-    // per-vendor budget ledger).
+    // V0.6.0 Wave 1 (F108 / F112) — append chat (4) + advise (2)
+    // tools. V0.6.5 F146 / F147 turned all chat stubs into real
+    // implementations; the dead `chat_send_input` / `chat_history` pair
+    // (defunct role-keyed control plane) was later dropped. V0.6.5
+    // F152 / F153 turned both advise stubs into real implementations
+    // against the `ccteam_core::advise` entry points (Claude + Codex
+    // parallel one-shot advisors + per-vendor budget ledger).
     tools.extend(mcp_chat_tools::chat_tool_definitions());
     tools.extend(mcp_advise_tools::advise_tool_definitions());
     // v0.8.7 W1 — session group (5): spawn / dispatch / collect / list /
@@ -483,10 +484,17 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
                 .to_string(),
         ));
     }
+    // v0.8.8 F1 — also forward the firing session's ccteam sid so the daemon
+    // can resolve the SPECIFIC session's reply target (`reply_target_for(sid)`);
+    // post-dedup `(slug, role)` no longer uniquely names a session. Empty when
+    // a pre-F1 / restored pane lacks the env → the daemon falls back to the
+    // on-disk registry.
+    let sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
     let mut fwd_args = args.clone();
     if let Some(obj) = fwd_args.as_object_mut() {
         obj.insert("slug".to_string(), json!(slug));
         obj.insert("role".to_string(), json!(role));
+        obj.insert("_caller_sid".to_string(), json!(sid));
     }
     let req = json!({
         "jsonrpc": "2.0",
@@ -764,9 +772,9 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17.
+        // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
         // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 17);
+        assert_eq!(tool_definitions().len(), 15);
     }
 
     #[test]
@@ -775,7 +783,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 17, "tool names must be unique");
+        assert_eq!(names.len(), 15, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -940,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // admin 3 + screenshot 1 + chat 6 + advise 2 + session 5 = 17.
+        // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -954,13 +962,12 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ccteam__admin_ls"));
         assert!(names.contains(&"ccteam__screenshot"));
         assert!(names.contains(&"ccteam__chat_send_file"));
-        // V0.6.0 Wave 1 — chat / advise stubs present.
-        assert!(names.contains(&"ccteam__chat_send_input"));
+        // V0.6.0 Wave 1 — chat / advise present.
         assert!(names.contains(&"ccteam__advise_vote"));
         // v0.8.7 W1 — session group (cto scheduling).
         assert!(names.contains(&"ccteam__session_spawn"));

@@ -78,27 +78,35 @@ impl ClaudeTuiAdapter {
 pub const CHAT_SESSION_PREFIX: &str = "ccteam-chat-";
 
 /// Compose the canonical tmux session name for a chat-mode bot.
-pub fn chat_session_name(slug: &str, role: &str) -> String {
-    format!("{CHAT_SESSION_PREFIX}{slug}-{role}")
+///
+/// v0.8.8 F1 — 第二参的【语义】由 role 改为 **sid**(`s<N>`):同一
+/// `(project, role)` 可有多个独立会话,唯一键是 sid,所以 pane 名按 sid
+/// 命名。函数签名(两参 `&str`)不变 —— 编译器**不会**列出调用点,改值的
+/// 责任在调用方(必须传 `s.id` / `ctx.sid` 而非 role)。
+pub fn chat_session_name(slug: &str, sid: &str) -> String {
+    format!("{CHAT_SESSION_PREFIX}{slug}-{sid}")
 }
 
 /// Inverse of [`chat_session_name`]: parse a chat-mode session name back into
-/// `(slug, role)`. The role is the final dash-delimited segment; the slug is
-/// everything between the prefix and it (slugs may themselves contain dashes,
-/// e.g. `team-proj`). Returns `None` when `name` is not a chat-mode session
-/// name or is missing a slug/role.
+/// `(slug, sid)`. sid 是末尾 dash 分段;slug 是 prefix 与它之间的全部
+/// (slug 自身可含 dash,如 `team-proj`)。`rsplit_once('-')` 在 sid=`s<N>`
+/// 不含 dash 时更稳健。`name` 非 chat-mode 名或缺 slug/sid 时返回 `None`。
 pub fn parse_chat_session_name(name: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix(CHAT_SESSION_PREFIX)?;
-    let (slug, role) = rest.rsplit_once('-')?;
-    (!slug.is_empty() && !role.is_empty()).then(|| (slug.to_string(), role.to_string()))
+    let (slug, sid) = rest.rsplit_once('-')?;
+    (!slug.is_empty() && !sid.is_empty()).then(|| (slug.to_string(), sid.to_string()))
 }
 
 /// V0.6.6 F172 V2 — compose the deterministic Anthropic `--name` /
 /// `--resume` argument for a chat-mode bot. Same identifier as the tmux
 /// session name; kept as a separate function so the two namespaces can
 /// diverge in the future without grepping callers.
-pub fn chat_session_id_name(slug: &str, role: &str) -> String {
-    chat_session_name(slug, role)
+///
+/// v0.8.8 F1 — 第二参语义同 [`chat_session_name`](role→sid):pane 名与
+/// `--name`/`--resume` 标识保持同源(按 sid),与既有先例对齐
+/// (`claude_bg.rs` 的 `ccteam-bg-{slug}-{sid}` / `codex_exec.rs`)。
+pub fn chat_session_id_name(slug: &str, sid: &str) -> String {
+    chat_session_name(slug, sid)
 }
 
 /// v0.8.6 W2b — write / merge the chat-progress hooks into
@@ -284,13 +292,22 @@ fn claude_bin() -> String {
 /// forwarder can authenticate `session_*` calls to the daemon's
 /// `sid -> {role, secret}` map. An empty secret (tests / legacy) omits the
 /// var entirely, preserving prior spawn env exactly.
-fn chat_spawn_env_owned(role: &str, slug: &str, secret: &str) -> Vec<(String, String)> {
+///
+/// v0.8.8 F1 — 同样转发 `CCTEAM_CHAT_SID`(非空才加,镜像 secret 的纪律),
+/// 它是 hook(`PermissionRequest` / `chat-progress` marker)与 in-pane
+/// `session_*` forwarder 学到 ccteam 会话 sid 的唯一通道。空 sid(测试 /
+/// 旧路径)整个略过该 var,逐字保持原 spawn env。**注意**:这是 ccteam
+/// 的 `s<N>` sid,绝非 Anthropic 的原生 session UUID(红线:二者不可混淆)。
+fn chat_spawn_env_owned(role: &str, slug: &str, secret: &str, sid: &str) -> Vec<(String, String)> {
     let mut env = vec![
         ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
         ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
     ];
     if !secret.is_empty() {
         env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
+    }
+    if !sid.is_empty() {
+        env.push(("CCTEAM_CHAT_SID".to_string(), sid.to_string()));
     }
     env
 }
@@ -339,55 +356,84 @@ fn permission_args(mode: PermissionMode) -> Vec<String> {
 fn spec_for_resume(
     role: &str,
     slug: &str,
+    sid: &str,
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
     secret: &str,
 ) -> MuxSessionSpec {
-    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
+    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。
+    let mut argv = vec![claude_bin()];
+    if !role.is_empty() {
+        argv.push("--agent".to_string());
+        argv.push(role.to_string());
+    }
     argv.extend(permission_args(permission_mode));
     argv.push("--resume".to_string());
     argv.push(session_id_name.to_string());
-    MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug, secret))
+    // v0.8.8 F1 — pane 名按 sid(`--agent` 仍按 role 绑 persona)。
+    MuxSessionSpec::new(chat_session_name(slug, sid), argv, cwd.to_path_buf())
+        .with_env(chat_spawn_env_owned(role, slug, secret, sid))
         .with_kind(MuxSessionKind::LongLived)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
-/// `claude --agent <role> --name <session_id_name>` (no context carry-over;
+/// `claude [--agent <role>] --name <session_id_name>` (no context carry-over;
 /// pairs with the `chat_session_reset` event the caller emits). Delegates to
-/// [`spec_for_new`], so it inherits the `--agent <role>` persona binding
-/// (v0.8.6 W1 session-is-the-role keystone).
+/// [`spec_for_new`], so it inherits the same `--agent <role>` persona binding
+/// (v0.8.6 W1 session-is-the-role keystone) — or, when `role` is empty
+/// (v0.8.8 F2 roleless), the same `--agent`-omitted bare-claude shape.
 fn spec_for_fresh(
     role: &str,
     slug: &str,
+    sid: &str,
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
     secret: &str,
 ) -> MuxSessionSpec {
-    spec_for_new(role, slug, cwd, session_id_name, permission_mode, secret)
+    spec_for_new(
+        role,
+        slug,
+        sid,
+        cwd,
+        session_id_name,
+        permission_mode,
+        secret,
+    )
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
-/// `claude --agent <role> --name <session_id_name>` so Anthropic files the
+/// `claude [--agent <role>] --name <session_id_name>` so Anthropic files the
 /// session jsonl under a deterministic name (enabling future recreate-path
 /// `--resume`) AND binds the role persona from `.claude/agents/<role>.md` —
-/// the session-is-the-role keystone (v0.8.6 W1).
+/// the session-is-the-role keystone (v0.8.6 W1). v0.8.8 F2 — an empty `role`
+/// (roleless) OMITS `--agent` so bare claude reads the project's own
+/// `CLAUDE.md`; the `--name`/sid segment is unconditional.
 fn spec_for_new(
     role: &str,
     slug: &str,
+    sid: &str,
     cwd: &Path,
     session_id_name: &str,
     permission_mode: PermissionMode,
     secret: &str,
 ) -> MuxSessionSpec {
-    let mut argv = vec![claude_bin(), "--agent".to_string(), role.to_string()];
+    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
+    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。`--name`/
+    // sid 段恒在,roleless 仍要确定性 session jsonl 名供后续 `--resume`。
+    let mut argv = vec![claude_bin()];
+    if !role.is_empty() {
+        argv.push("--agent".to_string());
+        argv.push(role.to_string());
+    }
     argv.extend(permission_args(permission_mode));
     argv.push("--name".to_string());
     argv.push(session_id_name.to_string());
-    MuxSessionSpec::new(chat_session_name(slug, role), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug, secret))
+    // v0.8.8 F1 — pane 名按 sid(`--agent` 仍按 role 绑 persona)。
+    MuxSessionSpec::new(chat_session_name(slug, sid), argv, cwd.to_path_buf())
+        .with_env(chat_spawn_env_owned(role, slug, secret, sid))
         .with_kind(MuxSessionKind::LongLived)
 }
 
@@ -499,11 +545,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
-        if spec.role.is_empty() {
-            return Err(HarnessError::SpawnFailed(
-                "claude-tui requires a non-empty role (AgentSpecBrief::role)".into(),
-            ));
-        }
+        // v0.8.8 F2 — roleless session 合法:空 role → spawn 不加 `--agent`
+        // (vendor 原生裸 claude 自读项目 CLAUDE.md)。这是红线允许的(红线只禁
+        // 注入 system prompt,不禁省略 `--agent`),故移除原先的非空 role 硬挡。
         // 1. Install chat-progress hooks into
         //    <project>/.claude/settings.local.json (ccteam-managed local
         //    layer; never dirties the user's committed settings.json).
@@ -512,8 +556,10 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             &ccteam_bin_for_hooks(),
             ctx.permission_mode,
         )?;
-        // 2. Make sure the bot's chat dir exists (turns.jsonl + cursor).
-        turns_mirror::ensure_dir(&ctx.project_dir, &spec.role)
+        // 2. Make sure the session's chat dir exists (turns.jsonl + cursor).
+        //    v0.8.8 F1 — 按 sid 建目录(同 turns / marker / cursor 维度),
+        //    所以同 (project, role) 多会话各自独立、不互相覆盖。
+        turns_mirror::ensure_dir(&ctx.project_dir, &ctx.sid)
             .map_err(|e| HarnessError::Io(e.to_string()))?;
 
         // 3. Spawn (or reattach) the tmux session running
@@ -532,7 +578,10 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         //       not a running bot — not a violation of the "永不主动 kill
         //       长 session" red line), then fall through to new-session.
         //    c) Session absent → normal new-session path.
-        let session_name = chat_session_name(&ctx.slug, &spec.role);
+        // v0.8.8 F1 — pane 名按 ctx.sid(`--agent` 仍按 spec.role 绑 persona)。
+        // /role 切换不变 sid → pane 名不变 → 命中 dead-pane recreate 路径
+        // (carry-context 语义,决策 1A)。
+        let session_name = chat_session_name(&ctx.slug, &ctx.sid);
         // V0.8 W2c — route all session lifecycle through the ProcessBackend
         // trait (default = TmuxBackend, behavior unchanged vs V0.6.x).
         // Hold the backend once; pass `&*backend` to the liveness probe.
@@ -543,7 +592,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         // identifier so the dead-pane recreate path can ask Claude itself
         // to reload the prior session jsonl (lossless context restore
         // via Anthropic's own CLI surface; R10 守).
-        let session_id_name = chat_session_id_name(&ctx.slug, &spec.role);
+        let session_id_name = chat_session_id_name(&ctx.slug, &ctx.sid);
         if backend
             .exists(&id)
             .await
@@ -588,6 +637,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     .spawn(spec_for_resume(
                         &spec.role,
                         &ctx.slug,
+                        &ctx.sid,
                         &ctx.cwd,
                         &session_id_name,
                         ctx.permission_mode,
@@ -619,6 +669,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                         .spawn(spec_for_fresh(
                             &spec.role,
                             &ctx.slug,
+                            &ctx.sid,
                             &ctx.cwd,
                             &session_id_name,
                             ctx.permission_mode,
@@ -645,7 +696,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 }
             }
         } else {
-            // (c) Absent — first spawn for this (slug, role). F172 V2:
+            // (c) Absent — first spawn for this (slug, sid). F172 V2:
             // add `--name <session_id_name>` so Anthropic's session jsonl
             // is filed under a deterministic name, enabling future
             // recreate-path `--resume`. F118 brand-new spawn recovery
@@ -655,6 +706,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 .spawn(spec_for_new(
                     &spec.role,
                     &ctx.slug,
+                    &ctx.sid,
                     &ctx.cwd,
                     &session_id_name,
                     ctx.permission_mode,
@@ -662,6 +714,30 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 ))
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
+
+            // v0.8.8 F1(决策 1)— fresh-spawn 也加 death/liveness probe
+            // (镜像 branch (b) 的 `--resume` 探测)。/role 切换在 pane 已
+            // 死时走的就是这条 fresh-spawn 路径(同 sid → 同 --name → 复用
+            // 既有 session jsonl,carry-context 语义);若 `claude --name`
+            // 因 jsonl 名冲突 / 启动失败而快速退出,不能误报成功 → 探测
+            // 到 pane 死则 kill 残壳并 SpawnFailed,而非假装会话健在。
+            // 400ms 与 branch (b) 同窗口:够 OS 调度 claude 启动 + 首读 +
+            // 失败退出,又远低于用户可感延迟。
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if !pane_runs_claude(&*backend, &id).await {
+                tracing::warn!(
+                    event = "session_fresh_spawn_died",
+                    session = %session_name,
+                    slug = %ctx.slug,
+                    sid = %ctx.sid,
+                    role = %spec.role,
+                    "claude-tui: fresh `claude --name <name>` died on startup; reporting spawn failure"
+                );
+                let _ = backend.kill(&id).await;
+                return Err(HarnessError::SpawnFailed(format!(
+                    "claude --name {session_id_name} died on startup (fresh spawn)"
+                )));
+            }
         }
 
         // V0.8 rmux Slice 1 — all three branches above (reattach /
@@ -684,10 +760,12 @@ impl HarnessAdapter for ClaudeTuiAdapter {
 
         // 4. Heartbeat file — lightweight liveness marker the imd watch
         //    + meta-agent dashboard can poll.
+        //    v0.8.8 F1 — heartbeat 目录按 sid,与 turns / cursor / marker
+        //    同维度,使同 (project, role) 多会话各自独立。
         let heartbeat = ctx
             .project_dir
             .join(".ccteam/chat")
-            .join(&spec.role)
+            .join(&ctx.sid)
             .join("heartbeat");
         if let Some(parent) = heartbeat.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -702,6 +780,10 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             raw_extras: json!({
                 "tmux_session": session_name,
                 "role": spec.role,
+                // v0.8.8 F1 — sid 是 turns / cursor / marker 的真实键;
+                // events() 从此处取出传给 tail_loop,使 tail 按 sid 定位
+                // (而非按 role 推断,后者在同 role 多会话下会串台)。
+                "sid": ctx.sid,
                 "project_dir": ctx.project_dir.to_string_lossy(),
                 "cwd": ctx.cwd.to_string_lossy(),
                 "slug": ctx.slug,
@@ -803,6 +885,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // v0.8.8 F1 — sid 是 turns / cursor / marker 的真实键。tail_loop
+        // 用它算 cursor_path / active_session_id_path,使同 (project, role)
+        // 多会话各跟各自的 jsonl,绝不串台。空 sid(旧 handle)回退到 role。
+        let sid = h
+            .raw_extras
+            .get("sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let project_dir = h
             .raw_extras
             .get("project_dir")
@@ -817,9 +908,20 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         let (tx, rx) = mpsc::channel::<ThreadEvent>(64);
 
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
-            if !role.is_empty() {
+            // v0.8.9 — roleless sessions (empty role) ALSO need the transcript
+            // tail loop: answer-forwarding reads the transcript regardless of
+            // persona, so gate on a usable KEY (the sid), NOT on a non-empty
+            // role. The previous `if !role.is_empty()` guard was a
+            // "session = role"-era leftover that v0.8.8-F2's roleless spawn
+            // missed — it silently dropped EVERY roleless reply: `events()`
+            // spawned no tail loop, so its stream stayed empty and the gateway
+            // pump never observed an ANSWER. The tail key is the sid (turns /
+            // cursor / marker 真实键); the `role` fallback covers only an empty
+            // sid (legacy handle / tests).
+            let key = if sid.is_empty() { role.clone() } else { sid };
+            if !key.is_empty() {
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                tokio::spawn(tail_loop(pdir, cwd, slug, role, tx, dispatch));
+                tokio::spawn(tail_loop(pdir, cwd, slug, role, key, tx, dispatch));
             }
         }
 
@@ -978,8 +1080,8 @@ impl HarnessAdapter for ClaudeTuiAdapter {
 
 impl ClaudeTuiAdapter {
     /// Resolve the active transcript jsonl for a handle (P3), reusing the
-    /// tail loop's discovery: read `cwd` + `role` from `raw_extras`, prefer
-    /// the bot's `active-session-id` marker, fall back to the
+    /// tail loop's discovery: read `cwd` + `sid` from `raw_extras`, prefer
+    /// the session's `active-session-id` marker, fall back to the
     /// most-recently-modified main-session jsonl under
     /// `~/.claude/projects/<encoded-cwd>/`. `None` when there is no project
     /// context (e.g. a bare resumed handle) or no transcript exists yet.
@@ -994,17 +1096,17 @@ impl ClaudeTuiAdapter {
             .get("project_dir")
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
-        let role = h
-            .raw_extras
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // v0.8.8 F1 — marker 现按 sid 存储,与 events()/tail_loop 同键。
+        // 空 sid(旧 handle)回退到 role,保持向后可读。
+        let sid = h.raw_extras.get("sid").and_then(|v| v.as_str());
+        let role = h.raw_extras.get("role").and_then(|v| v.as_str());
+        let marker_key = sid.filter(|s| !s.is_empty()).or(role).unwrap_or("");
         let parent_dir = anthropic_project_dir(&cwd)?;
-        // Marker sid first (deterministic per-bot target, set by the
+        // Marker sid first (deterministic per-session target, set by the
         // chat-progress hook); only trust it if the file actually exists.
         if let Some(pdir) = project_dir.as_ref() {
-            if !role.is_empty() {
-                if let Some(sid) = read_marker_sid(&active_session_id_path(pdir, role)) {
+            if !marker_key.is_empty() {
+                if let Some(sid) = read_marker_sid(&active_session_id_path(pdir, marker_key)) {
                     let p = parent_dir.join(format!("{sid}.jsonl"));
                     if p.exists() {
                         return Some(p);
@@ -1049,10 +1151,14 @@ async fn tail_loop(
     cwd: PathBuf,
     slug: String,
     role: String,
+    // v0.8.8 F1 — cursor / marker 的存储键(`s<N>`),非 Anthropic 原生
+    // UUID。`role` 仍保留给 observe_marker 的 (slug,role) MarkerReporter
+    // 注册表 + 日志上下文;cursor_path / active_session_id_path 一律按 sid。
+    sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
 ) {
-    let cursor_file = cursor_path(&project_dir, &role);
+    let cursor_file = cursor_path(&project_dir, &sid);
     let mut cursor = TranscriptCursor::load(&cursor_file).unwrap_or_default();
     let mut pending = PendingTools::new();
 
@@ -1098,7 +1204,7 @@ async fn tail_loop(
             );
             // Best-effort fallback to the legacy polling path —
             // shouldn't realistically happen on supported platforms.
-            tail_loop_polling(project_dir, cwd, slug, role, tx, dispatch).await;
+            tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
             return;
         }
     };
@@ -1109,7 +1215,7 @@ async fn tail_loop(
             "claude-tui tail: watch() failed; falling back to plain polling"
         );
         drop(watcher);
-        tail_loop_polling(project_dir, cwd, slug, role, tx, dispatch).await;
+        tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
         return;
     }
     tracing::info!(
@@ -1120,12 +1226,11 @@ async fn tail_loop(
 
     // F177 — initial sweep targets the marker's sid. The marker is
     // written by the chat-progress hook on SessionStart and carries
-    // Anthropic's real session_id. Each bot in a squad has its own
-    // marker under `<project>/.ccteam/chat/<role>/active-session-id`
-    // so three bots in one project dir never cross-fire (the V0.6.7
-    // fan-out bug — three tail loops all read whichever jsonl was
-    // most recently modified).
-    let marker_file = active_session_id_path(&project_dir, &role);
+    // Anthropic's real session_id. v0.8.8 F1 — 每个会话有自己的 marker
+    // `<project>/.ccteam/chat/<sid>/active-session-id`(键由 role 改为
+    // sid),所以同 (project, role) 多会话也不会串台(各 tail 各跟各的
+    // jsonl)。marker 内容仍是 Anthropic 原生 session_id(内层不动)。
+    let marker_file = active_session_id_path(&project_dir, &sid);
     // F187 — surface a stuck loop with one WARN at ~60s; suppressed
     // once the marker appears (resets on first marker-found read).
     let mut silence = MarkerSilenceWatch::from_env();
@@ -1444,11 +1549,14 @@ async fn tail_loop_polling(
     cwd: PathBuf,
     slug: String,
     role: String,
+    // v0.8.8 F1 — 同 tail_loop:cursor / marker 按 sid;role 仅供
+    // observe_marker 注册表 + 日志。
+    sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
 ) {
-    let cursor_file = cursor_path(&project_dir, &role);
-    let marker_file = active_session_id_path(&project_dir, &role);
+    let cursor_file = cursor_path(&project_dir, &sid);
+    let marker_file = active_session_id_path(&project_dir, &sid);
     let parent_dir = match anthropic_project_dir(&cwd) {
         Some(p) => p,
         None => {
@@ -1571,17 +1679,25 @@ mod tests {
     fn spec_for_new_argv_reflects_permission_mode() {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
         // Skip: carries the skip flag, not --permission-mode.
-        let skip = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
+        // v0.8.8 F1 — 第三参为 sid。
+        let skip = spec_for_new("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
         assert!(skip
             .argv
             .iter()
             .any(|a| a == "--dangerously-skip-permissions"));
         assert!(!skip.argv.iter().any(|a| a == "--permission-mode"));
-        // Still the keystone --agent + --name.
-        assert!(skip.argv.iter().any(|a| a == "--agent"));
+        // Still the keystone --agent + --name (v0.8.8 F2: non-empty role path
+        // is unchanged — `--agent` is present and immediately followed by the
+        // role token "dev", so roleless's `--agent` omission never regresses a
+        // named-role spawn).
+        let agent_at = skip.argv.iter().position(|a| a == "--agent");
+        assert_eq!(
+            skip.argv.get(agent_at.unwrap() + 1).map(String::as_str),
+            Some("dev")
+        );
         assert!(skip.argv.iter().any(|a| a == "--name"));
         // Hitl: drops the skip flag, carries --permission-mode default.
-        let hitl = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
+        let hitl = spec_for_new("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Hitl, "");
         assert!(!hitl
             .argv
             .iter()
@@ -1594,7 +1710,8 @@ mod tests {
     #[test]
     fn spec_for_resume_argv_reflects_permission_mode() {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
-        let hitl = spec_for_resume("dev", "slug", cwd, "sid-1", PermissionMode::Hitl, "");
+        // v0.8.8 F1 — 第三参为 sid。
+        let hitl = spec_for_resume("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Hitl, "");
         assert!(!hitl
             .argv
             .iter()
@@ -1604,15 +1721,54 @@ mod tests {
         assert!(hitl.argv.iter().any(|a| a == "--resume"));
     }
 
+    /// v0.8.8 F2 — roleless: 空 role 的 spawn argv **不含** `--agent`(裸 claude
+    /// 自读项目 CLAUDE.md),但 `--name`+sid+skip 段恒在(确定性 session jsonl
+    /// 名供后续 resume)。
+    #[test]
+    fn spec_for_new_roleless_omits_agent() {
+        let cwd = std::path::Path::new("/tmp/cc-roleless");
+        let spec = spec_for_new("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !spec.argv.iter().any(|a| a == "--agent"),
+            "roleless spawn must omit --agent, got: {:?}",
+            spec.argv
+        );
+        // The `--name`/sid + skip segment stays put.
+        assert!(spec.argv.iter().any(|a| a == "--name"));
+        assert!(spec.argv.iter().any(|a| a == "sid-1"));
+        assert!(spec
+            .argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    /// v0.8.8 F2 — roleless resume:空 role 的 resume argv 同样 **不含**
+    /// `--agent`,且保留 `--resume`+sid。
+    #[test]
+    fn spec_for_resume_roleless_omits_agent() {
+        let cwd = std::path::Path::new("/tmp/cc-roleless");
+        let spec = spec_for_resume("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        assert!(
+            !spec.argv.iter().any(|a| a == "--agent"),
+            "roleless resume must omit --agent, got: {:?}",
+            spec.argv
+        );
+        assert!(spec.argv.iter().any(|a| a == "--resume"));
+        assert!(spec.argv.iter().any(|a| a == "sid-1"));
+    }
+
     /// v0.8.7 review-fix (R-M1) — a non-empty per-session secret is injected
     /// into the pane env as `CCTEAM_CHAT_SECRET`; an empty secret omits the var
     /// entirely (preserving prior spawn env for tests / legacy callers).
+    ///
+    /// v0.8.8 F1 — 同理 `CCTEAM_CHAT_SID`:非空 sid 注入、空 sid 略过。
     #[test]
     fn spec_env_carries_secret_only_when_present() {
         let cwd = std::path::Path::new("/tmp/cc-secret");
         let with = spec_for_new(
             "dev",
             "slug",
+            "s1",
             cwd,
             "sid-1",
             PermissionMode::Skip,
@@ -1626,11 +1782,18 @@ mod tests {
         assert_eq!(pairs.get("CCTEAM_CHAT_SECRET"), Some(&"deadbeef"));
         assert_eq!(pairs.get("CCTEAM_CHAT_ROLE"), Some(&"dev"));
         assert_eq!(pairs.get("CCTEAM_CHAT_SLUG"), Some(&"slug"));
+        assert_eq!(pairs.get("CCTEAM_CHAT_SID"), Some(&"s1"));
 
-        let without = spec_for_new("dev", "slug", cwd, "sid-1", PermissionMode::Skip, "");
+        // 空 secret 略过 CCTEAM_CHAT_SECRET;空 sid 略过 CCTEAM_CHAT_SID。
+        let without = spec_for_new("dev", "slug", "", cwd, "sid-1", PermissionMode::Skip, "");
         assert!(
             !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SECRET"),
             "empty secret must omit CCTEAM_CHAT_SECRET, got: {:?}",
+            without.env
+        );
+        assert!(
+            !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SID"),
+            "empty sid must omit CCTEAM_CHAT_SID, got: {:?}",
             without.env
         );
     }

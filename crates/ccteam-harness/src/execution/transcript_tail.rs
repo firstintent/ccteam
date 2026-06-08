@@ -200,20 +200,26 @@ fn resolve_project_dir_in(base: &Path, cwd: &Path) -> PathBuf {
 }
 
 /// Resolve the cursor file path.
-pub fn cursor_path(project_dir: &Path, bot_role: &str) -> PathBuf {
-    super::turns_mirror::chat_dir(project_dir, bot_role).join("transcript-cursor.json")
+///
+/// v0.8.8 F1 — 第二参语义为 ccteam 会话 **sid**(`s<N>`),非 role:
+/// cursor 与 turns / marker 同维度按 sid 隔离。
+pub fn cursor_path(project_dir: &Path, sid: &str) -> PathBuf {
+    super::turns_mirror::chat_dir(project_dir, sid).join("transcript-cursor.json")
 }
 
-/// Path to the marker file holding the bot's currently-active Anthropic
+/// Path to the marker file holding the session's currently-active Anthropic
 /// session_id (the `<sid>.jsonl` basename under
 /// `~/.claude/projects/<encoded-cwd>/`). The `chat-progress` hook
 /// rewrites this on every `SessionStart` and clears it on
 /// `SessionEnd { reason: "clear" }`. The chat-mode tail loop reads it
-/// to target the correct jsonl deterministically — three bots in one
-/// project dir each get their own marker, so the tail loops can't
-/// cross-fire.
-pub fn active_session_id_path(project_dir: &Path, bot_role: &str) -> PathBuf {
-    super::turns_mirror::chat_dir(project_dir, bot_role).join("active-session-id")
+/// to target the correct jsonl deterministically.
+///
+/// v0.8.8 F1 — 第二参是 ccteam 会话 **sid**(`s<N>`),非 role;每个会话
+/// 各有 `<project>/.ccteam/chat/<sid>/active-session-id`,所以同
+/// `(project, role)` 多会话也不会串台。**注意**:marker 的【内容】仍是
+/// Anthropic 原生 session UUID,二者别混淆(红线)。
+pub fn active_session_id_path(project_dir: &Path, sid: &str) -> PathBuf {
+    super::turns_mirror::chat_dir(project_dir, sid).join("active-session-id")
 }
 
 /// Pick the most recently-modified **main-session** `<sid>.jsonl`

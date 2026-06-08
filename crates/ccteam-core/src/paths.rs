@@ -58,6 +58,17 @@ impl CcteamPaths {
         self.root.join("progress")
     }
 
+    /// `~/.ccteam/hub-cache/` — v0.8.9 Phase 2 local cache of the
+    /// ccteam-hub catalog. `ccteam_im::hub::load_catalog` writes
+    /// `index.json` here (atomic tmp + rename) on a refresh and reads it
+    /// back for offline browse. Part of [`canonical_home_dirs`] so the
+    /// `ccteam doctor` home-drift check does not flag it. Honours
+    /// `CCTEAM_HOME` via [`CcteamPaths::from_env`] like every other
+    /// `~/.ccteam/` subdir.
+    pub fn hub_cache_dir(&self) -> PathBuf {
+        self.root.join("hub-cache")
+    }
+
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join("inbox")
     }
@@ -232,9 +243,41 @@ pub struct ProjectSessionContext {
 /// Kept minimal on purpose: only directories the current architecture
 /// actually writes — `hooks/` (hook.sh dispatcher), `progress/`
 /// (per-project jsonl streams), `run/` (daemon socket / runtime files),
-/// `state/` (daemon pidfile).
+/// `state/` (daemon pidfile), and `hub-cache/` (v0.8.9 Phase 2 ccteam-hub
+/// catalog cache — the marketplace's offline `index.json`).
 pub fn canonical_home_dirs() -> &'static [&'static str] {
-    &["hooks", "progress", "run", "state"]
+    &["hooks", "progress", "run", "state", "hub-cache"]
+}
+
+/// Idempotently materialize the global `~/.ccteam/` home so any
+/// downstream session a project references can actually run.
+///
+/// Two steps, both idempotent and cheap:
+///
+/// 1. Create exactly the [`canonical_home_dirs`] manifest under
+///    `paths.root` (`std::fs::create_dir_all` — a no-op when present).
+/// 2. [`install_hooks`](crate::hooks_dispatcher::install_hooks)
+///    materializes `~/.ccteam/hooks/hook.sh`, the dispatcher the
+///    project-level `.claude/settings.local.json` SessionStart hook
+///    commands point at. Re-running returns
+///    [`InstallHooksAction::Unchanged`](crate::hooks_dispatcher::InstallHooksAction::Unchanged).
+///
+/// This is the single home-ensure every create/start path calls so the
+/// home is never half-built. Historically only `ccteam init`, the
+/// `chat_register` MCP tool, and `ccteam doctor --install-hooks` ran
+/// `install_hooks`; the web `POST /projects` + IM/web chat create path
+/// (`projects::bootstrap_project_at_dir`) wrote a project settings file
+/// that *references* `hook.sh` without ever materializing it, yielding a
+/// "hook.sh: not found" at the first SessionStart. Calling this from
+/// every create/start path closes that gap.
+pub fn ensure_ccteam_home(paths: &CcteamPaths) -> Result<()> {
+    for sub in canonical_home_dirs() {
+        let dir = paths.root.join(sub);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    crate::hooks_dispatcher::install_hooks(paths)
+        .context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
+    Ok(())
 }
 
 /// V0.5.0 F95 — resolve the **global** Anthropic Agent Teams progress

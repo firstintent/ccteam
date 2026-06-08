@@ -1,5 +1,7 @@
-//! `RmuxBackend` — V0.8 W2a implementation of [`ProcessBackend`] backed by
-//! the `rmux-sdk` 0.3 daemon.
+//! `RmuxBackend` — implementation of [`ProcessBackend`] backed by the
+//! `rmux-sdk` 0.3 daemon. **Byte-faithful**: `subscribe` and `capture`
+//! route raw pane bytes verbatim through the SDK's raw-byte
+//! `output_stream()` (NOT the lossy rendered `line_stream()`/`snapshot()`).
 //!
 //! Daemon spawn protocol: ccteam re-hosts the rmux daemon inside its
 //! own binary via the `--__internal-daemon <socket>` argv form (see
@@ -9,26 +11,29 @@
 //! `std::env::current_exe()` so the SDK spawns ccteam itself rather
 //! than a separate `rmux` artifact.
 //!
-//! W2b scope (this revision):
+//! Surface:
 //!
 //! - `spawn` / `exists` / `send_text` / `send_enter` / `capture` /
 //!   `pane_dims` / `pane_pid` / `list_pane_pids` / `resize` / `kill` /
-//!   `list_sessions` — all wired through SDK primitives (W2a).
-//! - `subscribe` — drives the SDK `pane.line_stream()`: each
-//!   `PaneLineItem::Line` becomes a `MuxEvent::OutputChunk` plus a
-//!   `MuxEvent::PatternMatched` per registered-regex hit; a
-//!   `PaneLineItem::Lag` becomes `MuxEvent::OutputDropped`. No FIFO
-//!   machinery — the daemon owns the broadcast.
+//!   `list_sessions` — all wired through SDK primitives.
+//! - `subscribe` — drives the SDK `pane.output_stream()` (raw bytes,
+//!   live tail): each `PaneOutputChunk::Bytes` becomes one
+//!   **byte-verbatim** `MuxEvent::OutputChunk` plus a
+//!   `MuxEvent::PatternMatched` per registered-regex hit (the bytes are
+//!   also buffered into completed lines for the matcher, exactly as the
+//!   `TmuxBackend` does); a `PaneOutputChunk::Lag` becomes
+//!   `MuxEvent::OutputDropped`. No FIFO machinery — the daemon owns the
+//!   broadcast.
+//! - `capture` — best-effort raw-byte drain of the daemon's retained
+//!   output backlog via `output_stream_starting_at(Oldest)` +
+//!   `poll_once`. `with_ansi` is honored: `true` → raw byte-faithful
+//!   ANSI (web terminal / snapshot / screenshot depend on it); `false`
+//!   → the drained bytes rendered through a vt100 state machine to
+//!   plain text (so `peek`/CLI never leak control sequences to the
+//!   user's terminal). NOT the rendered `snapshot()` grid.
 //! - `register_pattern` — compiles + stores into a shared
 //!   [`crate::patterns::PatternMatcher`] per session; `subscribe`
 //!   snapshots it (same type the TmuxBackend uses).
-//!
-//! Known gap (W2b followup): [`crate::PaneBackend::capture`]'s `with_ansi=true`
-//! cannot be honored from the SDK's `PaneSnapshot` cell grid — ANSI
-//! escape bytes are gone after the daemon parses the grid. W2a's impl
-//! returns rendered plain-text bytes for both branches and documents
-//! the gap; ccteam-web consumers that need raw bytes continue routing
-//! through `ccteam-web::pty::PtyRegistry` until W2b ports the registry.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -38,13 +43,13 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream;
-use rmux_sdk::PaneLineStream;
+use rmux_sdk::PaneOutputStream;
 use tokio::sync::Mutex;
 
 use rmux_sdk::{
     bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneInfo,
-    PaneLineItem, PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, RmuxError, SessionName,
-    TerminalSizeSpec,
+    PaneOutputChunk, PaneOutputStart, PaneProcessState, ProcessSpec, Rmux, RmuxEndpoint, RmuxError,
+    SessionName, TerminalSizeSpec,
 };
 
 use crate::patterns::{PatternMatcher, PatternVendor};
@@ -54,6 +59,23 @@ use crate::{
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+/// Loose per-line byte estimate used to turn `capture`'s `lines` cap into
+/// an approximate byte budget. Generous (raw ANSI lines run wider than
+/// their visible columns); the cap is inexact by contract.
+const BACKLOG_BYTES_PER_LINE: usize = 512;
+
+/// Upper bound on `poll_once` round trips when draining the retained
+/// backlog in `capture`. Each poll pulls up to one daemon batch (256
+/// events); this guards against a daemon that trickles a huge scrollback
+/// across many tiny batches from spinning unbounded. The normal exit is
+/// an empty batch (backlog exhausted) or hitting the byte budget.
+const BACKLOG_DRAIN_MAX_POLLS: usize = 64;
+
+/// Fallback grid width (columns) for `capture(with_ansi=false)` when the
+/// live pane dims can't be queried. Wide enough that a typical TUI's
+/// content isn't truncated when re-rendered to plain text.
+const CAPTURE_PLAIN_FALLBACK_COLS: u16 = 200;
 
 /// Default UDS path for the ccteam-hosted rmux daemon. Resolves to
 /// `$HOME/.ccteam/run/mux.sock` on Unix; on Windows callers fall back
@@ -128,16 +150,44 @@ fn is_dead_transport(err: &RmuxError) -> bool {
 /// snapshots the matcher (`Arc::clone`) into the line-stream translator.
 type PatternRegistry = Arc<Mutex<HashMap<MuxSessionId, Arc<PatternMatcher>>>>;
 
-/// State threaded through `subscribe`'s `unfold` over the SDK line
-/// stream. `pending` holds the `PatternMatched` events derived from the
-/// most recent line, yielded after its `OutputChunk`.
+/// State threaded through `subscribe`'s `unfold` over the SDK raw-byte
+/// output stream. `line_buffer` accumulates bytes across chunks so the
+/// matcher runs on completed lines (split on `\n`); `pending` holds the
+/// `PatternMatched` events derived from the most recent chunk, yielded
+/// after its (byte-verbatim) `OutputChunk`.
 struct RmuxStreamState {
-    line_stream: PaneLineStream,
+    output_stream: PaneOutputStream,
+    line_buffer: Vec<u8>,
     matcher: Arc<PatternMatcher>,
     pending: VecDeque<MuxEvent>,
 }
 
-/// `RmuxBackend` — ccteam's ProcessBackend impl over rmux-sdk 0.3.
+/// Append `bytes` to `line_buffer`, splitting on `\n`. For each completed
+/// line, run the matcher and push a `PatternMatched` for each hit onto
+/// `out`. Partial trailing bytes stay buffered for the next chunk. This
+/// is the rmux mirror of `tmux_backend::subscribe::drain_lines_into` —
+/// the raw OutputChunk bytes are forwarded verbatim by the caller; this
+/// only derives the (dormant-by-default) line-level pattern matches.
+fn drain_lines_into(
+    line_buffer: &mut Vec<u8>,
+    bytes: &[u8],
+    matcher: &PatternMatcher,
+    out: &mut VecDeque<MuxEvent>,
+) {
+    for &b in bytes {
+        if b == b'\n' {
+            let line_bytes = std::mem::take(line_buffer);
+            let line = String::from_utf8_lossy(&line_bytes);
+            for (regex_id, captured) in matcher.match_line(&line) {
+                out.push_back(MuxEvent::PatternMatched { regex_id, captured });
+            }
+        } else {
+            line_buffer.push(b);
+        }
+    }
+}
+
+/// `RmuxBackend` — ccteam's ProcessBackend impl over rmux-sdk 0.5.
 ///
 /// The SDK `Rmux` handle is lazily connected on first use and cached in
 /// a [`Mutex`]-guarded `Option<Arc<Rmux>>` so the daemon spawn cost
@@ -436,25 +486,31 @@ impl ProcessBackend for RmuxBackend {
         };
         let name = self.session_name(id).await?;
         let label = format!("subscribe `{}`", id.0);
-        // The returned `PaneLineStream` owns a cloned transport, so it
+        // The returned `PaneOutputStream` owns a cloned transport, so it
         // outlives the `Rmux` handle and the lock — safe to construct
-        // inside `call` and return past the closure.
-        let line_stream = self
+        // inside `call` and return past the closure. `output_stream()`
+        // anchors at `PaneOutputStart::Now` (live tail) and delivers raw
+        // pane bytes verbatim (no `from_utf8_lossy`, no line reassembly).
+        let output_stream = self
             .call(&label, |rmux| {
                 let name = name.clone();
                 async move {
                     let session = rmux.session(name).await?;
-                    session.pane(0, 0).line_stream().await
+                    session.pane(0, 0).output_stream().await
                 }
             })
             .await?;
 
-        // unfold over (line_stream, matcher, pending). One `Line` may
-        // yield 1 OutputChunk + N PatternMatched; `pending` holds the
-        // extras between `next` calls. No FIFO/refcount — the daemon
-        // owns the broadcast and the stream's own drop guard unsubs.
+        // unfold over (output_stream, line_buffer, matcher, pending).
+        // Mirrors `tmux_backend::subscribe`: one raw `Bytes` chunk yields
+        // 1 byte-verbatim OutputChunk + N PatternMatched (the chunk's
+        // bytes are buffered into completed lines for the matcher). The
+        // OutputChunk is emitted FIRST. `pending` holds the extras between
+        // `next` calls. No FIFO/refcount — the daemon owns the broadcast
+        // and the stream's own drop guard unsubs.
         let state = RmuxStreamState {
-            line_stream,
+            output_stream,
+            line_buffer: Vec::new(),
             matcher,
             pending: VecDeque::new(),
         };
@@ -463,24 +519,24 @@ impl ProcessBackend for RmuxBackend {
                 if let Some(ev) = st.pending.pop_front() {
                     return Some((ev, st));
                 }
-                match st.line_stream.next().await {
-                    Ok(Some(PaneLineItem::Line { text })) => {
-                        for (regex_id, captured) in st.matcher.match_line(&text) {
-                            st.pending
-                                .push_back(MuxEvent::PatternMatched { regex_id, captured });
-                        }
-                        // Emit the rendered line as a chunk, re-appending
-                        // a `\n` the line stream stripped. This is an
-                        // *approximate* reconstruction (the stream also
-                        // strips any `\r`), so it is NOT byte-faithful to
-                        // the original pane bytes — adequate for SSE
-                        // display + pattern matching (which fires off the
-                        // rendered line above), not for byte-exact replay.
-                        let mut bytes = text.into_bytes();
-                        bytes.push(b'\n');
-                        return Some((MuxEvent::OutputChunk(bytes), st));
+                match st.output_stream.next().await {
+                    Ok(Some(PaneOutputChunk::Bytes { bytes, .. })) => {
+                        // Feed the raw bytes into the line buffer + matcher
+                        // (queues N PatternMatched into `pending`), then
+                        // emit the chunk VERBATIM first by pushing it to
+                        // the front. `loop` → `pop_front` yields it first,
+                        // the pattern hits after — exactly the tmux path.
+                        drain_lines_into(&mut st.line_buffer, &bytes, &st.matcher, &mut st.pending);
+                        st.pending.push_front(MuxEvent::OutputChunk(bytes));
+                        // loop → pop_front yields the OutputChunk first.
                     }
-                    Ok(Some(PaneLineItem::Lag(notice))) => {
+                    Ok(Some(PaneOutputChunk::Lag(notice))) => {
+                        // Drop the partial-line buffer: the byte stream is
+                        // discontinuous after a lag (next bytes may not
+                        // begin on a line boundary), so concatenating would
+                        // synthesize a bogus line. Mirrors the SDK line
+                        // stream + tmux lag handling.
+                        st.line_buffer.clear();
                         return Some((
                             MuxEvent::OutputDropped {
                                 behind: notice.missed_events,
@@ -489,7 +545,7 @@ impl ProcessBackend for RmuxBackend {
                         ));
                     }
                     Ok(Some(_)) => {
-                        // PaneLineItem is #[non_exhaustive]; a future
+                        // PaneOutputChunk is #[non_exhaustive]; a future
                         // variant we don't model is skipped (loop).
                         continue;
                     }
@@ -562,25 +618,100 @@ impl ProcessBackend for RmuxBackend {
 
 #[async_trait]
 impl PaneBackend for RmuxBackend {
-    async fn capture(&self, id: &MuxSessionId, lines: usize, _with_ansi: bool) -> Result<Vec<u8>> {
-        // W2b followup: PaneSnapshot is the parsed grid — ANSI escape
-        // bytes are not recoverable from cells. W2a returns the rendered
-        // plain-text bytes for both `with_ansi=true` and `false`.
+    /// Capture is a **best-effort raw-byte drain** of the daemon's
+    /// retained output backlog — NOT the rendered `snapshot()` grid.
+    ///
+    /// We open a fresh `output_stream_starting_at(Oldest)` (which replays
+    /// the daemon's retained byte backlog, then would tail live) and drain
+    /// only the *retained backlog* via `poll_once()`: each `poll_once` is
+    /// exactly one cursor round trip that never sleeps, so it returns the
+    /// immediately-available batch and we stop as soon as a batch comes
+    /// back empty (backlog exhausted → we'd be blocking on live tail).
+    ///
+    /// `with_ansi` is **honored** (it gates the drained bytes' shape):
+    /// - `true` → the concatenated bytes are returned **raw** (full,
+    ///   byte-faithful ANSI). The web terminal / pane-snapshot /
+    ///   screenshot callers all pass `true` and depend on this.
+    /// - `false` → the raw bytes are rendered through a vt100 state
+    ///   machine ([`ansi_bytes_to_plain_text`]) to **plain text** with
+    ///   every control sequence (mouse-tracking, alt-screen, color,
+    ///   cursor) consumed — matching the tmux path's rendered-then-
+    ///   stripped semantics, so `peek`/CLI never dump control sequences
+    ///   into the user's terminal (which would leave it in
+    ///   mouse-reporting mode → garbage on scroll).
+    ///
+    /// `lines` is now an *approximate* cap on how much backlog to return
+    /// (converted to a loose byte budget); it is intentionally inexact.
+    /// `PaneSnapshot` has no raw-bytes accessor (it is a parsed cell
+    /// grid), so the backlog stream is the only byte-faithful source.
+    async fn capture(&self, id: &MuxSessionId, lines: usize, with_ansi: bool) -> Result<Vec<u8>> {
         let name = self.session_name(id).await?;
         let label = format!("capture `{}`", id.0);
-        self.call(&label, |rmux| {
-            let name = name.clone();
-            async move {
-                let session = rmux.session(name).await?;
-                let snapshot = session.pane(0, 0).snapshot().await?;
-                let visible_lines = snapshot.visible_lines();
-                let take = lines.min(visible_lines.len());
-                let start = visible_lines.len().saturating_sub(take);
-                let slice = &visible_lines[start..];
-                Ok(slice.join("\n").into_bytes())
-            }
-        })
-        .await
+        // Loose byte budget derived from the line cap. Pane lines are
+        // ~80-200 cols; with ANSI escapes a generous per-line estimate
+        // keeps a full screen of backlog while bounding pathological
+        // scrollback. Capping is approximate by contract.
+        let byte_budget = lines.saturating_mul(BACKLOG_BYTES_PER_LINE).max(1);
+        let raw = self
+            .call(&label, |rmux| {
+                let name = name.clone();
+                async move {
+                    let session = rmux.session(name).await?;
+                    let mut stream = session
+                        .pane(0, 0)
+                        .output_stream_starting_at(PaneOutputStart::Oldest)
+                        .await?;
+                    let mut out: Vec<u8> = Vec::new();
+                    // Bounded drain: collect the retained backlog batches.
+                    // `poll_once` never blocks on live output — an empty
+                    // batch means the backlog is exhausted (we'd otherwise be
+                    // tailing). The iteration guard caps work if the daemon
+                    // trickles the backlog across many small batches.
+                    for _ in 0..BACKLOG_DRAIN_MAX_POLLS {
+                        let batch = stream.poll_once().await?;
+                        if batch.is_empty() {
+                            break;
+                        }
+                        for chunk in batch {
+                            if let PaneOutputChunk::Bytes { bytes, .. } = chunk {
+                                out.extend_from_slice(&bytes);
+                            }
+                            // Lag chunks carry no replayable payload here;
+                            // skip them (a backlog drain races no live tail).
+                        }
+                        if out.len() >= byte_budget {
+                            break;
+                        }
+                    }
+                    // Keep the most recent `byte_budget` bytes (the tail is
+                    // what a terminal seed wants). The drop guard on `stream`
+                    // unsubscribes on drop here.
+                    if out.len() > byte_budget {
+                        let start = out.len() - byte_budget;
+                        out.drain(..start);
+                    }
+                    Ok(out)
+                }
+            })
+            .await?;
+
+        if with_ansi {
+            // Byte-faithful path: return the raw backlog UNCHANGED. The web
+            // terminal / pane-snapshot / screenshot callers depend on this.
+            return Ok(raw);
+        }
+
+        // Plain-text path (peek/CLI): render the raw backlog through a
+        // vt100 state machine so EVERY control sequence (mouse-tracking,
+        // alt-screen, color, cursor) is consumed and none can leak into
+        // the user's terminal. Size the grid from the live pane dims when
+        // available; otherwise fall back to a sane wide default with the
+        // row count clamped from the `lines` cap.
+        let (rows, cols) = match self.pane_dims(id).await {
+            Ok(Some((r, c))) if r > 0 && c > 0 => (r, c),
+            _ => (lines.clamp(1, 1000) as u16, CAPTURE_PLAIN_FALLBACK_COLS),
+        };
+        Ok(ansi_bytes_to_plain_text(&raw, cols, rows))
     }
 
     async fn pane_dims(&self, id: &MuxSessionId) -> Result<Option<(u16, u16)>> {
@@ -628,10 +759,126 @@ impl PaneBackend for RmuxBackend {
     }
 }
 
+/// Render a raw terminal byte stream (full ANSI) to **plain text** by
+/// feeding it through a vt100 state machine and reading back the rendered
+/// screen contents.
+///
+/// This is the seam that lets `capture(with_ansi=false)` return stripped
+/// text on the rmux backend (matching the tmux path's rendered-then-
+/// stripped semantics). `vt100` interprets and *consumes* every control
+/// sequence — mouse-tracking enable (`\x1b[?1000h` / `?1006h`),
+/// alt-screen (`\x1b[?1049h`), bracketed paste (`\x1b[?2004h`), SGR color,
+/// cursor moves — so none can leak through into the returned bytes. This
+/// is exactly why `peek` must use it: dumping the raw backlog instead
+/// would leave the user's terminal in mouse-reporting mode.
+///
+/// `cols`/`rows` size the parser grid (clamped to ≥1). Trailing blank
+/// lines from the rendered grid are trimmed so the output isn't padded
+/// with empty rows. Pure + side-effect free → unit-testable without a
+/// live daemon.
+fn ansi_bytes_to_plain_text(raw: &[u8], cols: u16, rows: u16) -> Vec<u8> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    // scrollback = 0: we render only the current screen grid (the tail),
+    // mirroring screenshot.rs's `Parser::new(rows, cols, 0)`.
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(raw);
+    // `Screen::contents` returns the rendered grid as plain text (one
+    // `\n` per row, no trailing newline), with all escape sequences
+    // already consumed by the parser.
+    let mut text = parser.screen().contents();
+    // Trim trailing blank lines so peek output isn't padded with the
+    // empty rows of the fixed-height grid.
+    let trimmed_len = text.trim_end_matches(['\n', ' ', '\t']).len();
+    text.truncate(trimmed_len);
+    text.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patterns::{PatternMatcher, PatternVendor};
     use std::io;
+
+    /// `capture(with_ansi=false)`'s plain-text seam must STRIP every
+    /// control sequence — most importantly the inner TUI's
+    /// mouse-tracking-enable + alt-screen + bracketed-paste, whose raw
+    /// leak into the user's terminal was the v0.8.9 peek regression
+    /// ("乱码" on scroll). vt100 consumes them all; only visible text
+    /// survives, and not a single `0x1b` (ESC) byte remains.
+    #[test]
+    fn ansi_bytes_to_plain_text_strips_all_control_sequences() {
+        // mouse-enable (1000/1006), alt-screen (1049), SGR red (31),
+        // bracketed-paste (2004), interleaved with visible text.
+        let raw = b"\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b[31mhello\r\n\x1b[?2004hworld\x1b[0m";
+        let out = ansi_bytes_to_plain_text(raw, 80, 24);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"), "visible text `hello` survives: {s:?}");
+        assert!(s.contains("world"), "visible text `world` survives: {s:?}");
+        // No ESC byte may leak (mouse-reporting mode never gets enabled).
+        assert!(
+            !out.contains(&0x1b),
+            "no 0x1b (ESC) byte may leak through: {out:?}"
+        );
+        // The mouse-tracking enable in particular must be gone.
+        assert!(
+            !s.contains("[?1000"),
+            "mouse-tracking-enable must not leak: {s:?}"
+        );
+        assert!(!s.contains("[?1049"), "alt-screen must not leak: {s:?}");
+    }
+
+    /// Plain visible text round-trips: no escapes to consume, the text
+    /// comes back intact (modulo grid trimming).
+    #[test]
+    fn ansi_bytes_to_plain_text_roundtrips_plain_text() {
+        let out = ansi_bytes_to_plain_text(b"hello\r\nworld", 80, 24);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"), "plain `hello` round-trips: {s:?}");
+        assert!(s.contains("world"), "plain `world` round-trips: {s:?}");
+        assert!(!out.contains(&0x1b));
+        // Trailing blank grid rows are trimmed (no padding to row 24).
+        assert!(!s.ends_with('\n'), "trailing blank lines trimmed: {s:?}");
+    }
+
+    fn collect_pattern_ids(out: &VecDeque<MuxEvent>) -> Vec<String> {
+        out.iter()
+            .filter_map(|e| match e {
+                MuxEvent::PatternMatched { regex_id, .. } => Some(regex_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A completed line runs the matcher; no partial bytes are left.
+    /// Mirrors the tmux backend's `drain_lines_into` contract so rmux's
+    /// (now byte-faithful) subscribe still derives line-level pattern
+    /// matches identically.
+    #[test]
+    fn drain_lines_runs_matcher_on_complete_line() {
+        let m = PatternMatcher::base(PatternVendor::Claude);
+        let mut buf = Vec::new();
+        let mut out = VecDeque::new();
+        // `\xe2\x97\x8f` is the UTF-8 for `●`.
+        drain_lines_into(&mut buf, b"\xe2\x97\x8f Read(/foo)\n", &m, &mut out);
+        assert!(collect_pattern_ids(&out).contains(&"tool_call_started".to_string()));
+        assert!(buf.is_empty(), "no partial bytes left after a full line");
+    }
+
+    /// Bytes without a trailing `\n` stay buffered across chunks; the
+    /// match fires only once the newline arrives.
+    #[test]
+    fn drain_lines_buffers_partial_until_newline() {
+        let m = PatternMatcher::base(PatternVendor::Claude);
+        let mut buf = Vec::new();
+        let mut out = VecDeque::new();
+        drain_lines_into(&mut buf, b"> implement ", &m, &mut out);
+        assert!(out.is_empty());
+        assert!(!buf.is_empty());
+        drain_lines_into(&mut buf, b"login\n", &m, &mut out);
+        assert!(collect_pattern_ids(&out).contains(&"user_prompt_submit".to_string()));
+        assert!(buf.is_empty());
+    }
 
     /// `is_dead_transport` must fire for the closed/dead-connection
     /// `io::ErrorKind`s that a fresh `connect_or_start` can recover from

@@ -27,6 +27,7 @@ fn main() {
     // churn or playwright runs do not.
     println!("cargo:rerun-if-changed=web/src");
     println!("cargo:rerun-if-changed=web/package.json");
+    println!("cargo:rerun-if-changed=web/package-lock.json");
     println!("cargo:rerun-if-changed=web/vite.config.ts");
     println!("cargo:rerun-if-changed=web/index.html");
     println!("cargo:rerun-if-env-changed=CCTEAM_SKIP_WEB_BUILD");
@@ -63,7 +64,7 @@ fn main() {
     }
 
     let node_modules = web_dir.join("node_modules");
-    if !node_modules.exists() {
+    if needs_npm_install(&web_dir, &node_modules) {
         eprintln!("ccteam-web: running `npm install` in {}", web_dir.display());
         let status = Command::new("npm")
             .args(["install", "--no-audit", "--no-fund", "--silent"])
@@ -121,6 +122,34 @@ fn main() {
         );
         std::process::exit(1);
     }
+}
+
+/// Whether `npm install` must run before `npm run build`. True when
+/// `node_modules/` is absent OR the lockfile changed since the last
+/// install — npm records the installed tree in `node_modules/.package-lock.json`,
+/// so a `package-lock.json` newer than that marker means a pulled dependency
+/// bump (e.g. a newly-added package) that the existing-but-stale `node_modules`
+/// doesn't have yet. Without this, `npm run build` (tsc) fails with
+/// "Cannot find module" on the new dep on any machine that already had a
+/// `node_modules/` from before the bump.
+fn needs_npm_install(web_dir: &Path, node_modules: &Path) -> bool {
+    if !node_modules.exists() {
+        return true;
+    }
+    let lock = web_dir.join("package-lock.json");
+    let marker = node_modules.join(".package-lock.json");
+    match (file_mtime(&lock), file_mtime(&marker)) {
+        // Lockfile newer than the recorded install → deps changed, reinstall.
+        (Some(lock_t), Some(marker_t)) => lock_t > marker_t,
+        // node_modules exists but npm left no install marker → reinstall to be safe.
+        (Some(_), None) => true,
+        // No lockfile to compare against → trust the existing node_modules.
+        _ => false,
+    }
+}
+
+fn file_mtime(p: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 /// Write a minimal valid `dist/index.html` + `.gitkeep` so `rust-embed`

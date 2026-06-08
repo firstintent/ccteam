@@ -22,9 +22,16 @@ pub mod chat_ws;
 pub mod dashboard;
 pub mod harness_sse;
 pub mod health;
+// v0.8.8 F4 — web IM credential configuration (Telegram + Lark; masked
+// read that never echoes secrets; validate-before-persist; restart-required).
+pub mod im_config;
 // V0.6.1 F139 — `POST /internal/hook/:kind[/:action]` daemon-side hook
 // dispatcher (replaces per-hook `ccteam internal hook ...` cold spawn).
 pub mod internal_hook;
+// v0.8.9 Phase 2 — ccteam-hub plugin marketplace REST surface (global +
+// per-project catalog, body preview, install). The network face of
+// `ccteam_im::hub`; merged into the `/api/v1` OpenApiRouter (auto auth-gated).
+pub mod marketplace;
 // v0.8.7 W5 (Item E) — OpenAPI auto-docs. Aggregates every `/api/v1`
 // handler into one `OpenApiRouter` (single source with the route table)
 // + serves the spec (`/api/v1/openapi.json`) and Scalar UI (`/api/docs`).
@@ -41,6 +48,13 @@ pub mod screenshot;
 pub mod session;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.
 pub mod sessions_api;
+// v0.8.9 Phase 4 — daemon-wide status aggregate (`GET /api/v1/status`) for the
+// unified-shell cost pill + Status view. Merged into the `/api/v1`
+// OpenApiRouter (auto auth-gated).
+pub mod status;
+// v0.8.8 B5 — 共享「sid → per-session pane 名」解析(pty_ws + pane_snapshot
+// 共用,避免 vendor 分支两份漂移)。
+pub mod session_pane;
 pub mod sse;
 // V0.5.0 F96 — Agent Teams JSON API + SSE channel.
 pub mod teams_api;

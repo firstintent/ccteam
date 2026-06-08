@@ -35,3 +35,9 @@ graphify-out/
 # Local-only connection config (real host/IP). Keep .env.example tracked.
 .env
 !.env.example
+
+# Smoke-run artifact: a CWD-rooted `CCTEAM_HOME=<repo>` smoke makes
+# ccteam_core::config::config_path resolve to <repo>/config.yaml. Repo root
+# is never the real config home (runtime config = ~/.ccteam/config.yaml).
+/config.yaml
+ccteam-hub/

@@ -173,7 +173,7 @@ mod tests {
         assert!(dispatch(&paths, "ccteam__workflow_ls", &json!({}))
             .unwrap()
             .is_none());
-        assert!(dispatch(&paths, "ccteam__chat_send_input", &json!({}))
+        assert!(dispatch(&paths, "ccteam__chat_register_bot", &json!({}))
             .unwrap()
             .is_none());
     }

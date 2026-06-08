@@ -46,6 +46,28 @@ export interface SessionHistory {
   events: SessionHistoryEvent[];
 }
 
+/** One role summary from `GET /api/v1/projects/{slug}/roles`
+ *  (`crates/ccteam-core` `RoleSummary` → `crates/ccteam-web/src/routes/roles.rs`).
+ *  `description`/`model` default to `""` server-side when absent. Drives the
+ *  new-session modal's role dropdown (real project roles, not static hints). */
+export interface RoleSummary {
+  role: string;
+  description: string;
+  model: string;
+}
+
+/** Full single-role payload from `GET /api/v1/projects/{slug}/roles/{role}`
+ *  (`ccteam_core::RoleDetail` → `crates/ccteam-web/src/routes/roles.rs`).
+ *  `frontmatter` is a free-form JSON object (empty object when the `.md` has
+ *  no frontmatter fence; values may be non-string, so render them
+ *  defensively); `body` is the markdown after the closing fence. Drives the
+ *  read-only Roles page detail view. */
+export interface RoleDetail {
+  role: string;
+  frontmatter: Record<string, unknown>;
+  body: string;
+}
+
 /** Build the per-project sessions URL (gateway `s{n}` list). */
 export function sessionsUrl(slug: string): string {
   return `/api/v1/projects/${encodeURIComponent(slug)}/sessions`;
@@ -104,6 +126,26 @@ export function listSessions(slug: string): Promise<SessionView[]> {
 /** `GET /api/v1/sessions/{sid}` — mirrored history to seed a reopened page. */
 export function getHistory(sid: string): Promise<SessionHistory> {
   return getJson<SessionHistory>(sessionUrl(sid));
+}
+
+/** `GET /api/v1/projects/{slug}/roles` — the project's real roles
+ *  (`.claude/agents/<role>.md`), used to populate the new-session role
+ *  dropdown. Empty array for a project with no agents/. 404 (unknown
+ *  project) maps to NOT_FOUND, 401 to UNAUTHENTICATED. */
+export function listProjectRoles(slug: string): Promise<RoleSummary[]> {
+  return getJson<RoleSummary[]>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/roles`,
+  );
+}
+
+/** `GET /api/v1/projects/{slug}/roles/{role}` — one role's frontmatter + body
+ *  (`.claude/agents/<role>.md`), for the read-only Roles page detail view.
+ *  404 (unknown project or role) maps to NOT_FOUND, 401 to UNAUTHENTICATED,
+ *  a bad role name to `HTTP 400`. */
+export function getRoleDetail(slug: string, role: string): Promise<RoleDetail> {
+  return getJson<RoleDetail>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/roles/${encodeURIComponent(role)}`,
+  );
 }
 
 /** `POST /api/v1/sessions/{sid}/turn` — submit a user turn. 202

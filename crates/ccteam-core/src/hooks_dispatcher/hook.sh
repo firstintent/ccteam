@@ -47,11 +47,18 @@ fi
 # (F175 covers that). POSIX `${VAR:-}` keeps `set -u` safe.
 ROLE_HDR_ARGS=""
 SLUG_HDR_ARGS=""
+SID_HDR_ARGS=""
 if [ -n "${CCTEAM_CHAT_ROLE:-}" ]; then
     ROLE_HDR_ARGS="-H X-Ccteam-Role:${CCTEAM_CHAT_ROLE}"
 fi
 if [ -n "${CCTEAM_CHAT_SLUG:-}" ]; then
     SLUG_HDR_ARGS="-H X-Ccteam-Slug:${CCTEAM_CHAT_SLUG}"
+fi
+# v0.8.8 F1: forward the ccteam session sid (s<N>) so the daemon can key
+# marker / turns / HITL-label / reply-target by the SPECIFIC firing session
+# (post-dedup (role,slug) is no longer unique). NOT the Anthropic session UUID.
+if [ -n "${CCTEAM_CHAT_SID:-}" ]; then
+    SID_HDR_ARGS="-H X-Ccteam-Sid:${CCTEAM_CHAT_SID}"
 fi
 
 # Try the daemon fast path when a token is on disk. Buffer stdin to a
@@ -64,11 +71,11 @@ if [ -r "$TOKEN_FILE" ]; then
         # shellcheck disable=SC2064  # we want $TMP expanded now
         trap "rm -f \"$TMP\"" EXIT INT TERM
         cat > "$TMP"
-        # shellcheck disable=SC2086  # word-split $ROLE_HDR_ARGS / $SLUG_HDR_ARGS so curl sees -H + value
+        # shellcheck disable=SC2086  # word-split $ROLE_HDR_ARGS / $SLUG_HDR_ARGS / $SID_HDR_ARGS so curl sees -H + value
         if curl -sS --max-time 5 --connect-timeout 1 -f \
                 -H "Authorization: Bearer ccteam:${TOKEN}" \
                 -H "Content-Type: application/json" \
-                $ROLE_HDR_ARGS $SLUG_HDR_ARGS \
+                $ROLE_HDR_ARGS $SLUG_HDR_ARGS $SID_HDR_ARGS \
                 --data-binary "@${TMP}" \
                 "$URL" 2>/dev/null; then
             exit 0

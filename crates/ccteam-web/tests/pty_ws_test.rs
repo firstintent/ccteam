@@ -549,63 +549,54 @@ async fn ws_last_client_disconnect_stops_pipe_pane() {
 }
 
 // ---------------------------------------------------------------------------
-// Sid-scoped route happy path. W5: the flex per-session registry is gone,
-// so `/ws/{slug}/{sid}/pty` relays the project-level tmux pane (keyed
-// `{slug}/{sid}` for the FIFO). Exercises the same byte relay.
+// Sid-scoped route, v0.8.8 B5: F1 removed the project-level pane, so
+// `/ws/{slug}/{sid}/pty` now resolves the per-session pane via the LIVE
+// GATEWAY. The standalone path (AppState built with no gateway) therefore
+// refuses the upgrade with 503 — there is no session map to resolve the sid
+// against. This is sandbox-deterministic (no tmux needed): the upgrade is
+// rejected pre-handshake, NOT accepted-then-silently-dropped (the bug B5
+// fixes — falling back to a project pane that no longer exists made the SPA
+// 1s-reconnect loop).
+//
+// (Replaces the old `ws_sid_scoped_route_relays_bytes`, which asserted the
+// now-removed project-level fallback by relaying the project pane.)
+//
+// The real per-session BYTE RELAY (gateway-attached + a live per-sid pane:
+// claude=ccteam-chat-{slug}-{sid} / codex=ccteam-{slug}-{sid}, byte-faithful
+// only under CCTEAM_MUX_BACKEND=tmux) is env-gated to a daemon box — building
+// a live Gateway with a real pane is out of scope for this web-only test
+// crate (the gateway's adapter fakes live in ccteam-im). See
+// `ccteam-im::gateway` session tests + manual dogfooding.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
-async fn ws_sid_scoped_route_relays_bytes() {
-    if !tmux_available() {
-        eprintln!("[skip] ws_sid_scoped_route_relays_bytes: tmux not on PATH");
-        return;
-    }
+async fn ws_sid_scoped_route_without_gateway_rejects_503() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let slug = unique_slug("sid-scoped");
-    let sid = "claude-1";
-    let tmux_name = format!("ccteam-{slug}");
-    fixture_workflow_project(&paths, &slug, &tmux_name);
+    let slug = unique_slug("sid-no-gateway");
+    let sid = "s1";
+    // A project on disk is irrelevant now: the sid is resolved by the gateway,
+    // not by ProjectState. With no gateway the route 503s regardless.
+    fixture_workflow_project(&paths, &slug, &format!("ccteam-{slug}"));
 
-    let scoped = ScopedSession::from_name(&tmux_name);
-    scoped
-        .session
-        .start(&paths.project_dir(&slug), &["sh", "-i"])
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let state = AppState::with_auth(paths.clone(), AuthState::disabled());
+    let state = AppState::with_auth(paths, AuthState::disabled()); // no `.with_gateway`
     let addr = spawn(state).await;
+
     let req = ws_request_with_subprotocol(addr, &format!("/ws/{slug}/{sid}/pty"));
-    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-
-    let ts = tmux_name.clone();
-    let attached = wait_for(Duration::from_secs(2), || pane_pipe_status(&ts) == "1").await;
-    assert!(
-        attached,
-        "pipe-pane should attach within 2s after WS connect"
-    );
-
-    let _ = std::process::Command::new("tmux")
-        .args([
-            "send-keys",
-            "-t",
-            &format!("{tmux_name}:0.0"),
-            "echo F56SIDTAG",
-            "Enter",
-        ])
-        .status();
-
-    let saw = wait_for_marker(&mut ws, b"F56SIDTAG", Duration::from_secs(5)).await;
-    assert!(saw, "expected to see F56SIDTAG bytes from sid-scoped pane");
-
-    // FIFO name uses '-' instead of '/' from the key.
-    let fifo_path = paths.pty_dir().join(format!("{slug}-{sid}.fifo"));
-    assert!(fifo_path.exists(), "expected FIFO {}", fifo_path.display());
-
-    let _ = ws.close(None).await;
+    let err = tokio_tungstenite::connect_async(req)
+        .await
+        .expect_err("no-gateway per-session WS must be refused, not upgraded");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no-gateway per-session WS upgrade must be 503 (not 101-then-silent)",
+            );
+        }
+        other => panic!("expected HTTP 503 error, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

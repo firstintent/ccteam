@@ -28,22 +28,6 @@ pub enum OutputFormat {
 // alongside the rest of core's bootstrap-template machinery.
 pub use ccteam_core::{install_hooks, InstallHooksAction, HOOK_DISPATCHER_SH};
 
-/// V0.5.0 F93b — `ccteam init --mode <variant>` selector.
-///
-/// Default is `ArtifactDriven` (V0.4.6 behavior preserved). `AgentTeam`
-/// switches the init scaffold to the agent-team mode: the
-/// `workflow.agent-team.yaml` template, the `__lead.md` agent
-/// scaffold, and the `settings.agent-team.json` settings template
-/// (with F94 hooks).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum InitMode {
-    /// V0.4.0 default. ArtifactWatcher + trigger graph drive spawns.
-    #[default]
-    ArtifactDriven,
-    /// V0.5.0 F93b. `__lead` session under Anthropic Agent Teams.
-    AgentTeam,
-}
-
 /// Options passed from the `ccteam init` argument parser.
 #[derive(Debug, Clone, Default)]
 pub struct InitOptions {
@@ -71,11 +55,6 @@ pub struct InitOptions {
     /// V0.4.1: assume `yes` for every install-step prompt. Implies
     /// `interactive` but skips actual stdin.
     pub yes: bool,
-    /// V0.5.0 F93b — workflow mode for the scaffolded workflow.yaml.
-    /// Defaults to `ArtifactDriven`. `AgentTeam` writes the
-    /// `workflow.agent-team.yaml` template + `__lead.md` scaffold +
-    /// `settings.agent-team.json` (with F94 hooks).
-    pub mode: InitMode,
 }
 
 /// V0.4.2 F72: unified install command.
@@ -106,16 +85,15 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // (`phases/templates/inbox/control`) are no longer written: nothing
     // reads them post-W2, and creating them made a fresh `ccteam init`
     // immediately report self-inflicted drift.
-    for sub in ccteam_core::canonical_home_dirs() {
-        let dir = paths.root.join(sub);
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-
-    // V0.6.1 F139 — materialize the per-hook dispatcher script. This
-    // must run before `install_project_at` so the freshly-rendered
-    // `.claude/settings.json` hook commands point at a file that
-    // actually exists.
-    install_hooks(paths).context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
+    //
+    // `ensure_ccteam_home` (ccteam-core) folds that canonical-dir loop
+    // and the V0.6.1 F139 `hook.sh` dispatcher materialization into one
+    // idempotent call shared by every create/start path (init here, the
+    // web/IM `bootstrap_project_at_dir`, the daemon at `ccteam start`).
+    // The hook.sh write must precede `install_project_at` so the
+    // freshly-rendered `.claude/settings.local.json` hook commands point
+    // at a file that actually exists.
+    ccteam_core::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home (dirs + hook.sh)")?;
 
     // -- 2. Resolve project install target ---------------------------
     let target = resolve_install_target(&opts)?;
@@ -383,20 +361,8 @@ fn install_project_at(
             "(installed via `ccteam init`)",
             team,
         )?;
-        scaffold_workflow_yaml(target, false, opts.mode)?;
-        let agent_count = scaffold_default_agents(target, false, opts.mode)?;
-        if matches!(opts.mode, InitMode::AgentTeam) {
-            scaffold_agent_team_inbox(target)?;
-            // V0.5.0 F94: agent-team mode needs the variant
-            // `.claude/settings.json` (TeammateIdle / TaskCreated /
-            // TaskCompleted hooks). `bootstrap_project_at_dir` already
-            // wrote the V0.4.6 settings.json; overwrite it with the
-            // agent-team variant.
-            ccteam_core::write_project_settings_agent_team(
-                target,
-                &ccteam_core::EnabledPluginsSetting::default(),
-            )?;
-        }
+        scaffold_workflow_yaml(target, false)?;
+        let agent_count = scaffold_default_agents(target, false)?;
         state_action = "created";
         workflow_action = "scaffolded";
         agents_action = if agent_count > 0 {
@@ -418,14 +384,14 @@ fn install_project_at(
         state_action = "refreshed";
 
         workflow_action = if opts.force {
-            scaffold_workflow_yaml(target, true, opts.mode)?;
+            scaffold_workflow_yaml(target, true)?;
             "overwritten (--force)"
         } else {
             "preserved"
         };
 
         agents_action = if opts.force || opts.reset_agents {
-            scaffold_default_agents(target, true, opts.mode)?;
+            scaffold_default_agents(target, true)?;
             if opts.force {
                 "overwritten (--force)"
             } else {
@@ -434,15 +400,6 @@ fn install_project_at(
         } else {
             "preserved"
         };
-        // V0.5.0 F94: same as fresh-install branch — agent-team mode
-        // needs the agent-team settings.json hook set. Idempotent
-        // overwrite under `--force` only (preserve user edits otherwise).
-        if matches!(opts.mode, InitMode::AgentTeam) && opts.force {
-            ccteam_core::write_project_settings_agent_team(
-                target,
-                &ccteam_core::EnabledPluginsSetting::default(),
-            )?;
-        }
     }
 
     Ok(ProjectInstallReport {
@@ -461,10 +418,7 @@ fn install_project_at(
 /// business tree. Returns silently if the file already exists and
 /// `force` is false.
 ///
-/// V0.5.0 F93b: `mode` selects between the V0.4.6 default template
-/// (`DEFAULT_WORKFLOW_YAML`) and the `workflow.agent-team.yaml`
-/// template (advanced agent-team mode).
-fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode) -> Result<()> {
+fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
     let ccteam_dir = target.join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir)
         .with_context(|| format!("create {}", ccteam_dir.display()))?;
@@ -472,11 +426,8 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode)
     if path.exists() && !force {
         return Ok(());
     }
-    let body = match mode {
-        InitMode::ArtifactDriven => DEFAULT_WORKFLOW_YAML,
-        InitMode::AgentTeam => DEFAULT_AGENT_TEAM_WORKFLOW_YAML,
-    };
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -485,9 +436,7 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool, mode: InitMode)
 /// preserved; with `force=true`, the shipped scaffolds always
 /// overwrite.
 ///
-/// V0.5.0 F93b: `mode == AgentTeam` additionally writes `__lead.md`
-/// (the ccteam-managed lead agent spec).
-fn scaffold_default_agents(target: &std::path::Path, force: bool, mode: InitMode) -> Result<usize> {
+fn scaffold_default_agents(target: &std::path::Path, force: bool) -> Result<usize> {
     let agents_dir = target.join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir)
         .with_context(|| format!("create {}", agents_dir.display()))?;
@@ -500,30 +449,7 @@ fn scaffold_default_agents(target: &std::path::Path, force: bool, mode: InitMode
         std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
         written += 1;
     }
-    if matches!(mode, InitMode::AgentTeam) {
-        let path = agents_dir.join("__lead.md");
-        if !path.exists() || force {
-            std::fs::write(&path, AGENT_TEAM_LEAD_MD)
-                .with_context(|| format!("write {}", path.display()))?;
-            written += 1;
-        }
-    }
     Ok(written)
-}
-
-/// V0.5.0 F93b: create the `.ccteam/inbox/` directory + a `.gitkeep`
-/// sentinel so an empty inbox round-trips through `git`. This is the
-/// dir the lead writes outbox messages into (and the user's
-/// `ccteam send <slug>` writes inbox messages into for the lead to
-/// poll). Idempotent.
-fn scaffold_agent_team_inbox(target: &std::path::Path) -> Result<()> {
-    let inbox = target.join(".ccteam").join("inbox");
-    std::fs::create_dir_all(&inbox).with_context(|| format!("create {}", inbox.display()))?;
-    let sentinel = inbox.join(".gitkeep");
-    if !sentinel.exists() {
-        std::fs::write(&sentinel, "").with_context(|| format!("write {}", sentinel.display()))?;
-    }
-    Ok(())
 }
 
 const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
@@ -536,8 +462,6 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
 #   schedule                      # periodic; needs `schedule:` 5-field cron
 #   gate                          # waits for `trigger_gate` MCP / CLI call
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
-#
-# Examples: examples/workflows/*.yaml
 name: default-workflow
 description: |
   Minimal starter workflow. Edit me — the manual `cto` is a safe
@@ -565,29 +489,7 @@ agents:
 /// 3. Update `DEFAULT_WORKFLOW_YAML` to declare the role if it's a
 ///    default-shipped agent
 /// 4. `cargo build --workspace` + `cargo test --workspace`
-///
-/// See `agents/README.md` for the agent spec + naming conventions.
-///
-/// V0.5.0 F93b note: `__lead.md` is NOT in this list — it ships with
-/// agent-team mode only and is conditionally written by
-/// `scaffold_default_agents` when `mode == AgentTeam`. `doctor
-/// --install-agents` (V0.5.x F93x) will pull it from
-/// [`AGENT_TEAM_LEAD_MD`] independently.
 pub(crate) const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[("cto.md", ccteam_core::CTO_ROLE_MD)];
-
-/// V0.5.0 F93b — embedded `__lead.md` body (ccteam-managed agent-team
-/// lead spec). Written into `.claude/agents/__lead.md` by
-/// `ccteam init --mode agent-team`. The body is treated as
-/// ccteam-owned; `ccteam doctor --validate-team` (V0.5.x) will warn
-/// if the user has hand-modified it.
-pub(crate) const AGENT_TEAM_LEAD_MD: &str = include_str!("../../../agents/__lead.md");
-
-/// V0.5.0 F93b — embedded `workflow.agent-team.yaml` body. Written by
-/// `ccteam init --mode agent-team`. Contains the `mode: agent-team` +
-/// `agent_team:` schema with one definition + one commented ad-hoc
-/// teammate example.
-pub(crate) const DEFAULT_AGENT_TEAM_WORKFLOW_YAML: &str =
-    include_str!("../../ccteam-core/src/templates/workflow.agent-team.yaml");
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
@@ -654,381 +556,9 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
     })
 }
 
-/// V0.5.0 F93b — `ccteam start <slug>` flags. Drives the
-/// `[Y/n/attach]` confirmation prompt + the `--no-confirm` / `--attach`
-/// / `--dry-run` script-mode bypasses.
-#[derive(Debug, Clone, Default)]
-pub struct StartAgentTeamOptions {
-    /// Skip the `[Y/n/attach]` prompt; default to `Y` behaviour
-    /// (spawn + print attach hint). Matches `--no-confirm` / `-y`.
-    pub no_confirm: bool,
-    /// Skip the `[Y/n/attach]` prompt and go straight to the `attach`
-    /// branch (spawn + exec `claude attach <id>`).
-    pub attach: bool,
-    /// Print spawn preview + exit; do not spawn. Useful for previews
-    /// / CI / docs.
-    pub dry_run: bool,
-    /// V0.5.0 F97 — revive a `leave-running` detached project. Reads
-    /// `.ccteam/team-snapshot.json::lead_session_id`, probes the bg
-    /// job's `state.json` for liveness, and:
-    /// - **Running**: re-arms F95 watch entries, clears `detached`
-    ///   marker in `state.json`, prints attach hint. NO new spawn.
-    /// - **Terminal**: WARN + fall through to the normal spawn flow.
-    pub restart_team: bool,
-}
-
-/// V0.5.0 F93b — `ccteam start <slug>` for agent-team mode projects.
-///
-/// 1. Load `<slug>`'s `workflow.yaml`; bail if `mode != agent-team`.
-/// 2. Print spawn preview (workflow.yaml summary, `__lead.md` model,
-///    suggested teammates count, spawn argv preview).
-/// 3. Prompt `[Y/n/attach]` (TTY interactive) unless `no_confirm` /
-///    `attach` / `dry_run` selected.
-/// 4. On Y: spawn `claude --bg --agent __lead`, write
-///    `.ccteam/team-snapshot.json::lead_session_id`, print attach hint.
-/// 5. On attach: spawn (same as Y), then exec `claude attach <id>`.
-/// 6. On n: cancel, no side effects.
-///
-/// **Returns the formatted preview/report** so unit tests can inspect
-/// the rendered output without going through TTY. Production caller
-/// in main.rs just prints + exits.
-pub fn run_start_agent_team(
-    paths: &CcteamPaths,
-    slug: &str,
-    opts: StartAgentTeamOptions,
-) -> Result<String> {
-    let project_dir = paths.project_dir(slug);
-    if !project_dir.exists() {
-        bail!(
-            "no project at `{slug}`: {} not found. \
-             Run `ccteam init --mode agent-team --slug {slug}` first.",
-            project_dir.display(),
-        );
-    }
-    let spec = ccteam_flow::WorkflowSpec::load_for_project(&project_dir)
-        .with_context(|| format!("load workflow.yaml for {slug}"))?;
-    let team_spec = match (&spec.mode, &spec.agent_team) {
-        (ccteam_flow::WorkflowMode::AgentTeam, Some(t)) => t,
-        (ccteam_flow::WorkflowMode::AgentTeam, None) => {
-            bail!("workflow.yaml mode: agent-team but agent_team block missing — schema bug?",)
-        }
-        (ccteam_flow::WorkflowMode::ArtifactDriven, _) => bail!(
-            "project `{slug}` is in artifact-driven mode; `ccteam start <slug>` is only\n  \
-             implemented for agent-team mode. For artifact-driven projects run\n  \
-             `ccteam start` (no slug) to start the daemon.",
-        ),
-        (ccteam_flow::WorkflowMode::Chat, _) => bail!(
-            "project `{slug}` is in chat mode (V0.6.0 F108); `ccteam start <slug>` is not\n  \
-             the chat-mode entry point. Bots are launched via the IM channel + \n  \
-             `ccteam-im` daemon, not the agent-team start flow.",
-        ),
-        (ccteam_flow::WorkflowMode::HumanApproval, _) => bail!(
-            "project `{slug}` is in human-approval mode (V0.6.1 F124); `ccteam start <slug>`\n  \
-             is only implemented for agent-team mode. For human-approval projects run\n  \
-             `ccteam start` (no slug) to start the daemon — the HITL gate fires on each\n  \
-             agent_done via the F98 plan-approval IM round-trip.",
-        ),
-    };
-
-    // ---- V0.5.0 F97 — `--restart-team` revive path -----------------------
-    let mut restart_prelude = String::new();
-    if opts.restart_team {
-        let outcome = run_restart_team(paths, slug, &project_dir, team_spec)?;
-        match outcome {
-            RestartTeamOutcome::ResumedAlive(body) => return Ok(body),
-            RestartTeamOutcome::FellThroughToSpawn(prelude) => {
-                // Lead is terminal; print the WARN prelude then continue
-                // with the normal spawn flow below. Stash a copy so the
-                // returned body (dry-run / test inspection) includes it.
-                print!("{prelude}");
-                restart_prelude = prelude;
-            }
-        }
-    } else {
-        // V0.5.0 F97 — refuse plain `ccteam start <slug>` when the project
-        // is in the `leave-running` detached state. The user must
-        // explicitly invoke `--restart-team` (avoids accidentally
-        // spawning a second lead while the first is still alive).
-        let state_path = paths.project_state(slug);
-        if let Ok(state) = ccteam_core::ProjectState::load(&state_path) {
-            if state.detached {
-                bail!(
-                    "project `{slug}` is in detached state \
-                     (last `ccteam stop` used `cleanup_on_stop: leave-running`).\n  \
-                     To re-attach the existing lead: `ccteam start --restart-team {slug}`\n  \
-                     To force a fresh lead (and orphan the old one): edit \
-                     state.json::detached → false, then re-run.",
-                );
-            }
-        }
-    }
-
-    let lead_md_path = project_dir.join(".claude").join("agents").join("__lead.md");
-    let lead_md_exists = lead_md_path.exists();
-    let teammate_mode = team_spec
-        .teammate_mode
-        .clone()
-        .unwrap_or_else(|| "in-process".to_string());
-
-    // ---- 1. Render preview ---------------------------------------------
-    let mut preview = String::new();
-    preview.push_str(&format!("ccteam start {slug} — agent-team mode\n\n"));
-    preview.push_str(&format!(
-        "  ✓ Loaded {}\n",
-        project_dir.join(".ccteam").join("workflow.yaml").display(),
-    ));
-    preview.push_str(&format!(
-        "      mode=agent-team team_name={}\n",
-        team_spec.team_name,
-    ));
-    if lead_md_exists {
-        preview.push_str(&format!("  ✓ Loaded {}\n", lead_md_path.display(),));
-    } else {
-        preview.push_str(&format!(
-            "  ! Missing {} — re-run `ccteam init --mode agent-team --slug {slug} --force`\n",
-            lead_md_path.display(),
-        ));
-    }
-    let (def_count, adhoc_count) =
-        team_spec
-            .suggested_teammates
-            .iter()
-            .fold((0u32, 0u32), |(d, a), t| match t.kind {
-                ccteam_flow::SuggestedTeammateKind::Definition => (d + 1, a),
-                ccteam_flow::SuggestedTeammateKind::AdHoc => (d, a + 1),
-            });
-    preview.push_str(&format!(
-        "  ✓ Suggested teammates: {def_count} definition + {adhoc_count} ad-hoc\n",
-    ));
-    preview.push_str("\n  About to spawn lead session:\n");
-    preview.push_str(&format!(
-        "    env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\\n        CLAUDE_CODE_TEAMMATE_MODE={teammate_mode} \\\n      claude --bg --agent __lead --dangerously-skip-permissions <lead_seed>\n",
-    ));
-    // Truncate the lead_seed preview to 200 chars for the console.
-    let seed_preview: String = team_spec
-        .lead_seed
-        .chars()
-        .take(200)
-        .collect::<String>()
-        .replace('\n', " ");
-    let seed_preview = if team_spec.lead_seed.chars().count() > 200 {
-        format!("{seed_preview}…")
-    } else {
-        seed_preview
-    };
-    preview.push_str(&format!(
-        "    Initial user-turn (lead_seed):\n      \"{seed_preview}\"\n",
-    ));
-
-    // ---- 2. Dry-run / non-interactive bypasses --------------------------
-    if opts.dry_run {
-        preview.push_str("\n  --dry-run set — preview only, lead not spawned.\n");
-        return Ok(format!("{restart_prelude}{preview}"));
-    }
-
-    let choice = resolve_start_choice(&opts)?;
-
-    // ---- 3. Confirm or fall through to spawn ----------------------------
-    print!("{preview}");
-    let action = match choice {
-        StartChoice::Confirmed => "default",
-        StartChoice::AttachAfterSpawn => "attach",
-        StartChoice::Cancelled => {
-            return Ok(format!(
-                "{restart_prelude}{preview}\n  Cancelled. No side effects.\n"
-            ));
-        }
-    };
-
-    // ---- 4. Spawn the lead ----------------------------------------------
-    let mut report = String::new();
-    let lead_id = spawn_agent_team_lead(paths, slug, team_spec, &teammate_mode)
-        .with_context(|| format!("spawn __lead for {slug}"))?;
-    report.push_str(&format!("  ✓ Lead session spawned: {lead_id}\n"));
-    report.push_str("\n  Manage the team with:\n");
-    report.push_str(&format!("    ccteam attach {slug}    # interactive\n",));
-    report.push_str(&format!(
-        "    ccteam internal send {slug} \"go\"   # async\n",
-    ));
-    report.push_str(&format!(
-        "    ccteam web                          # http://localhost:7331/teams/{}\n",
-        team_spec.team_name,
-    ));
-    report.push_str(
-        "    ccteam internal hook progress-append … (advanced path 3 hooks already installed)\n",
-    );
-    report.push_str(&format!("    ccteam stop {slug}    # cleanup\n",));
-
-    print!("{report}");
-    if action == "attach" {
-        eprintln!("→ claude attach {lead_id}");
-        let status = Command::new("claude")
-            .args(["attach", &lead_id])
-            .status()
-            .context("spawn claude attach (--attach branch)")?;
-        if !status.success() {
-            bail!("claude attach exited with {status}");
-        }
-    }
-    Ok(format!("{restart_prelude}{preview}{report}"))
-}
-
-/// V0.5.0 F93b — `[Y/n/attach]` prompt resolution. Returns the
-/// resolved action without performing any side effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartChoice {
-    /// `Y` branch — spawn + print attach hint.
-    Confirmed,
-    /// `attach` branch — spawn + exec `claude attach <id>`.
-    AttachAfterSpawn,
-    /// `n` branch — cancel, no side effects.
-    Cancelled,
-}
-
-fn resolve_start_choice(opts: &StartAgentTeamOptions) -> Result<StartChoice> {
-    if opts.attach {
-        return Ok(StartChoice::AttachAfterSpawn);
-    }
-    if opts.no_confirm {
-        return Ok(StartChoice::Confirmed);
-    }
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() {
-        // Non-tty without explicit flag: default to confirmed to keep
-        // scripted callers (CI smoke tests, doctor smoke flow) from
-        // hanging on stdin.
-        eprintln!(
-            "  · stdin is not a tty + no --no-confirm/--attach/--dry-run set;\n  \
-             defaulting to confirmed spawn. Pass --dry-run to preview.",
-        );
-        return Ok(StartChoice::Confirmed);
-    }
-    print!("\n  Proceed? [Y/n/attach]: ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("read [Y/n/attach] answer from stdin")?;
-    let trimmed = line.trim().to_ascii_lowercase();
-    Ok(match trimmed.as_str() {
-        "" | "y" | "yes" | "ok" => StartChoice::Confirmed,
-        "attach" | "a" => StartChoice::AttachAfterSpawn,
-        "n" | "no" | "cancel" => StartChoice::Cancelled,
-        other => bail!(
-            "unrecognized answer `{other}`: expected one of \
-             `Y` / `n` / `attach` (default `Y`)",
-        ),
-    })
-}
-
-/// V0.5.0 F93b — spawn the `__lead` Claude bg session for a project.
-///
-/// The exact argv form is:
-///
-/// ```text
-/// env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
-///     CLAUDE_CODE_TEAMMATE_MODE=<mode> \
-///   claude --bg --agent __lead --dangerously-skip-permissions \
-///     "<lead_seed body>"
-/// ```
-///
-/// `lead_seed` is passed as the positional user-turn message (NOT as a
-/// system prompt — CLAUDE.md §三 红线). The harness's
-/// `--dangerously-skip-permissions` is set per the existing
-/// [`ClaudeCodeAdapter`] pattern. Team-mode env vars are set on the
-/// spawned process via `Command::env()` — V0.5.0 F93b initially used
-/// `--env KEY=VAL` argv flags but Claude Code's CLI does not accept
-/// those, causing the spawn to exit-1 before init (host probe 2026-05-18).
-///
-/// Returns the `daemonShort` job id from `claude --bg`'s stdout
-/// (first line `backgrounded · <id>`). Writes
-/// `.ccteam/team-snapshot.json` containing the lead id + the resolved
-/// (frozen) `AgentTeamSpec`.
-///
-/// Test override: `$CCTEAM_CLAUDE_BIN` swaps in a fake script, same
-/// pattern as the regular `ClaudeCodeAdapter`.
-fn spawn_agent_team_lead(
-    paths: &CcteamPaths,
-    slug: &str,
-    team_spec: &ccteam_flow::AgentTeamSpec,
-    teammate_mode: &str,
-) -> Result<String> {
-    let project_dir = paths.project_dir(slug);
-    let bin =
-        std::env::var(ccteam_harness::CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string());
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--bg")
-        .arg("--agent")
-        .arg("__lead")
-        .arg("--dangerously-skip-permissions")
-        .arg(&team_spec.lead_seed);
-    cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
-        .env("CLAUDE_CODE_TEAMMATE_MODE", teammate_mode)
-        .current_dir(&project_dir);
-    let output = cmd
-        .output()
-        .with_context(|| format!("invoke `{bin} --bg --agent __lead`"))?;
-    if !output.status.success() {
-        bail!(
-            "claude --bg --agent __lead exited non-zero ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lead_id = parse_backgrounded_short_id(&stdout).ok_or_else(|| {
-        anyhow::anyhow!(
-            "claude --bg stdout missing `backgrounded · <id>` line: {}",
-            stdout.trim(),
-        )
-    })?;
-
-    // Write snapshot.
-    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
-    let snapshot = serde_json::json!({
-        "slug": slug,
-        "lead_session_id": lead_id,
-        "team_name": team_spec.team_name,
-        "teammate_mode": teammate_mode,
-        "cleanup_on_stop": team_spec.cleanup_on_stop.as_str(),
-        "auto_spawn_teammates": team_spec.auto_spawn_teammates,
-        "suggested_teammates": team_spec.suggested_teammates,
-        "spawned_at": chrono::Utc::now().to_rfc3339(),
-    });
-    if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&snapshot_path, serde_json::to_string_pretty(&snapshot)?)
-        .with_context(|| format!("write {}", snapshot_path.display()))?;
-
-    Ok(lead_id)
-}
-
-/// V0.5.0 F93b — duplicated locally from
-/// `ccteam_harness::parse_backgrounded_short_id` because that
-/// fn is `pub(crate)`. The format is "backgrounded · <id>" on the
-/// first non-empty line.
-fn parse_backgrounded_short_id(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Match `backgrounded · <id>` (Anthropic uses U+00B7 MIDDLE DOT).
-        if let Some(rest) = trimmed.strip_prefix("backgrounded · ") {
-            return Some(rest.trim().to_string());
-        }
-        // Forwards-compat: also accept ascii fallback for stub scripts.
-        if let Some(rest) = trimmed.strip_prefix("backgrounded ") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
-}
-
 // =====================================================================
-// V0.5.0 F97 — Advanced path lifecycle: cleanup_on_stop strategies
-// + --restart-team revive + hot-reload cold/hot diff
+// `ccteam stop <slug>` agent-team teardown: cleanup_on_stop strategies
+// (force-kill / ask-lead / leave-running).
 // =====================================================================
 
 /// V0.5.0 F97 — `ccteam stop <slug>` flags.
@@ -1289,8 +819,8 @@ fn leave_running(
     lead_id: Option<&str>,
     report: &mut String,
 ) -> Result<()> {
-    // We keep the snapshot file in place because --restart-team needs to
-    // read lead_session_id back. Instead we set a `detached` marker in
+    // We keep the snapshot file in place for reference (lead_session_id).
+    // We set a `detached` marker in
     // state.json so a fresh `ccteam start <slug>` refuses. We also do
     // NOT kill the lead. The F95 watcher is global and reacts to the
     // teams root; the daemon-side per-project state we toggle is the
@@ -1299,12 +829,12 @@ fn leave_running(
     if let Some(id) = lead_id {
         report.push_str(&format!("  ✓ Lead session id: {id} (still running)\n",));
         report.push_str(&format!(
-            "    Reconnect with `ccteam start --restart-team {slug}` or `claude attach {id}`\n",
+            "    Reconnect the lead with `claude attach {id}`\n"
         ));
     } else {
         report.push_str("  · No lead_session_id in snapshot — nothing to leave running.\n");
     }
-    let _ = snapshot_path; // snapshot is preserved (used by --restart-team)
+    let _ = snapshot_path; // snapshot is preserved for reference
     Ok(())
 }
 
@@ -1374,95 +904,6 @@ fn count_workflow_done(progress_path: &std::path::Path) -> usize {
                 .unwrap_or(false)
         })
         .count()
-}
-
-/// V0.5.0 F97 — `ccteam start --restart-team <slug>` outcome variants.
-#[derive(Debug)]
-enum RestartTeamOutcome {
-    /// Lead bg job is still alive; watch re-armed without spawning.
-    /// Contained body is the full rendered report for the caller.
-    ResumedAlive(String),
-    /// Lead bg job has exited; caller should fall through to the
-    /// normal spawn flow. Contained string is the rendered WARN
-    /// prelude that should be printed before the spawn preview.
-    FellThroughToSpawn(String),
-}
-
-/// V0.5.0 F97 — execute the `--restart-team` revive logic. Reads
-/// `.ccteam/team-snapshot.json`, probes the bg job's `state.json` for
-/// liveness, and either:
-/// - Returns `ResumedAlive` after re-arming the F95 watch + clearing
-///   `state.json::detached`. No spawn.
-/// - Returns `FellThroughToSpawn` (with a WARN body) so the caller
-///   continues to the normal spawn flow.
-fn run_restart_team(
-    paths: &CcteamPaths,
-    slug: &str,
-    project_dir: &std::path::Path,
-    _team_spec: &ccteam_flow::AgentTeamSpec,
-) -> Result<RestartTeamOutcome> {
-    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
-    if !snapshot_path.exists() {
-        bail!(
-            "--restart-team requires a prior team-snapshot.json at {}.\n  \
-             This file is written on the first `ccteam start {slug}` spawn.\n  \
-             If this is a fresh project, drop `--restart-team` and run \
-             `ccteam start {slug}` to spawn a new lead.",
-            snapshot_path.display(),
-        );
-    }
-    let raw = std::fs::read_to_string(&snapshot_path)
-        .with_context(|| format!("read {}", snapshot_path.display()))?;
-    let snapshot: Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", snapshot_path.display()))?;
-    let lead_id = snapshot
-        .get("lead_session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "team-snapshot.json at {} missing `lead_session_id` field; \
-                 cannot restart without a lead id.",
-                snapshot_path.display(),
-            )
-        })?;
-    let liveness = ccteam_core::probe_job(Some(lead_id));
-    match liveness {
-        ccteam_core::JobLiveness::Running => {
-            // Lead is alive; re-arm the watch (clear detached marker).
-            let mut report = String::new();
-            report.push_str(&format!(
-                "ccteam start --restart-team {slug} — agent-team mode\n\n",
-            ));
-            report.push_str(&format!(
-                "  ✓ team-snapshot.json found; lead_session_id={lead_id}\n",
-            ));
-            report.push_str("  ✓ probe_job() == Running; lead bg job alive. Skipping spawn.\n");
-            // Clear detached marker if set (F97 LeaveRunning recovery).
-            clear_detached_marker(paths, slug, &mut report)?;
-            report.push_str("\n  Manage the team with:\n");
-            report.push_str(&format!("    ccteam attach {slug}    # interactive\n",));
-            report.push_str(&format!(
-                "    ccteam internal send {slug} \"...\"   # async\n",
-            ));
-            report.push_str(&format!("    ccteam stop {slug}    # cleanup\n",));
-            print!("{report}");
-            Ok(RestartTeamOutcome::ResumedAlive(report))
-        }
-        ccteam_core::JobLiveness::Terminal { status, .. } => {
-            // Lead is terminal — render a WARN prelude and let the
-            // caller fall through to the spawn flow.
-            let mut prelude = String::new();
-            prelude.push_str(&format!(
-                "ccteam start --restart-team {slug} — agent-team mode\n\n",
-            ));
-            prelude.push_str(&format!(
-                "  ! WARN: Previous lead exited (status={status}); spawning fresh lead.\n",
-            ));
-            // Clear stale detached marker before the new spawn.
-            clear_detached_marker(paths, slug, &mut prelude)?;
-            Ok(RestartTeamOutcome::FellThroughToSpawn(prelude))
-        }
-    }
 }
 
 /// `ccteam attach <slug>`. Resolves the underlying session medium and
@@ -1600,49 +1041,53 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
 /// session matches `slug_or_name`, so the caller may fall back to the
 /// project-oriented attach. Read-only enumeration (R6) — never captures panes.
 /// Resolve a chat-session reference to its canonical tmux name
-/// (`ccteam-chat-<slug>-<role>`):
+/// (`ccteam-chat-<slug>-<sid>`):
 /// - a full `ccteam-chat-…` name passes through verbatim;
-/// - an explicit role yields the deterministic name;
+/// - an explicit `sid` yields the deterministic name;
 /// - otherwise live chat sessions are enumerated and filtered by slug.
 ///
 /// Returns `Ok(None)` when nothing matches (the caller falls back to the
 /// project pane `ccteam-<slug>`); `Err` when `<slug>` is ambiguous across
-/// roles. Shared by `attach` and `peek` so both resolve identically.
-pub fn resolve_chat_session_name(slug_or_name: &str, role: Option<&str>) -> Result<Option<String>> {
+/// sessions. Shared by `attach` and `peek` so both resolve identically.
+///
+/// v0.8.8 F1 — the disambiguator is now the **sid** (`s<N>`), not a role: the
+/// pane name's trailing segment is the sid, and the same `(project, role)` can
+/// host several independent sessions, so a role no longer uniquely names one.
+pub fn resolve_chat_session_name(slug_or_name: &str, sid: Option<&str>) -> Result<Option<String>> {
     if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
         return Ok(Some(slug_or_name.to_string()));
     }
-    if let Some(role) = role {
-        return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, role)));
+    if let Some(sid) = sid {
+        return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, sid)));
     }
     let backend = ccteam_harness::default_process_backend();
     let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
     let mut matches: Vec<(String, String)> = live
         .iter()
         .filter_map(|name| {
-            let (slug, role) = ccteam_harness::parse_chat_session_name(name)?;
-            (slug == slug_or_name).then(|| (role, name.clone()))
+            let (slug, sid) = ccteam_harness::parse_chat_session_name(name)?;
+            (slug == slug_or_name).then(|| (sid, name.clone()))
         })
         .collect();
     matches.sort();
     match matches.as_slice() {
         [] => Ok(None),
-        [(_role, name)] => Ok(Some(name.clone())),
+        [(_sid, name)] => Ok(Some(name.clone())),
         many => {
             let mut msg = format!(
-                "`{slug_or_name}` has {} live chat sessions; specify a role:",
+                "`{slug_or_name}` has {} live chat sessions; specify a sid:",
                 many.len()
             );
-            for (role, name) in many {
-                msg.push_str(&format!("\n  {slug_or_name} {role}   # {name}"));
+            for (sid, name) in many {
+                msg.push_str(&format!("\n  {slug_or_name} {sid}   # {name}"));
             }
             bail!("{msg}")
         }
     }
 }
 
-pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result<bool> {
-    match resolve_chat_session_name(slug_or_name, role)? {
+pub fn try_attach_chat_session(slug_or_name: &str, sid: Option<&str>) -> Result<bool> {
+    match resolve_chat_session_name(slug_or_name, sid)? {
         Some(name) => {
             attach_interactive_by_name(&name)?;
             Ok(true)
@@ -1651,93 +1096,141 @@ pub fn try_attach_chat_session(slug_or_name: &str, role: Option<&str>) -> Result
     }
 }
 
-/// `ccteam sessions` — read-only snapshot of gateway chat-mode bot sessions
-/// (`ccteam-chat-<slug>-<role>`). Enumerates live sessions from the mux backend
-/// (R6: names only, never capture-pane) and reconciles them against the
-/// daemon's persisted registry, flagging orphans (live but untracked) and
-/// registered sessions that are no longer running. Never spawns or kills.
+/// `ccteam session ls` — read-only snapshot of gateway chat-mode bot sessions.
+///
+/// v0.8.8 B4 — the row source is now the daemon's **persisted** session records
+/// (sid · project · role · vendor · permission_mode) via
+/// [`ccteam_im::gateway::tracked_chat_sessions`], not a process-name enumeration.
+/// A tracked record means the daemon owns the session, so it shows **live** —
+/// this is the BUG-5 fix: codex sessions (which the process backend can't always
+/// confirm by name) are live whenever the gateway tracks them, instead of the
+/// old false "registered, not running". Live OS panes (`ccteam-chat-*`) that are
+/// **not** in the tracked set are surfaced as orphans (a process that outlived
+/// the daemon that spawned it). Reading the mux backend is name-enumeration only
+/// (R6: never capture-pane); never spawns or kills.
 pub fn run_sessions() -> Result<()> {
-    let backend = ccteam_harness::default_process_backend();
-    let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
-    let live_set: std::collections::BTreeSet<&str> = live.iter().map(String::as_str).collect();
+    let paths = CcteamPaths::from_env()?;
+    let daemon_up = ccteam_core::daemon::daemon_reachable(&paths);
 
+    // Live OS pane names (for orphan detection). Best-effort: a backend error
+    // just means we can't flag orphans, not that we refuse to list tracked rows.
+    let live = block_on_async(ccteam_harness::list_chat_sessions(
+        ccteam_harness::default_process_backend().as_ref(),
+    ))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    // A missing / unreadable registry is non-fatal: no tracked rows, every live
+    // pane is then an orphan.
     let state_path = ccteam_im::default_gateway_state_path();
-    // A missing / unreadable registry is non-fatal: treat every live session as
-    // an orphan rather than refusing to list anything.
-    let tracked = ccteam_im::gateway::tracked_chat_session_names(&state_path).unwrap_or_default();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
 
-    // Reuse the gateway's reconcile classification (orphan = live ∧ untracked).
-    let inventory = ccteam_im::gateway::reconcile_chat_sessions(&tracked, &live);
-    let orphan_names: std::collections::BTreeSet<&str> =
-        inventory.orphans.iter().map(|o| o.name.as_str()).collect();
+    print!("{}", render_sessions_table(&tracked, &live, daemon_up));
+    Ok(())
+}
 
-    // Row set = union of live + tracked, deterministically ordered by name.
-    let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    names.extend(live.iter().map(String::as_str));
-    names.extend(tracked.iter().map(String::as_str));
-
-    if names.is_empty() {
-        println!("no chat sessions (none live, none registered).");
-        println!(
-            "  Gateway chat sessions appear here once a bot is spawned \
-             (e.g. via Telegram `/new`)."
-        );
-        return Ok(());
-    }
+/// Pure renderer for `ccteam session ls` (testable without a daemon / terminal).
+///
+/// `tracked` = persisted gateway session records (each shows **live** when the
+/// daemon is up, else `registered (daemon down)`); `live_panes` = live
+/// `ccteam-chat-*` OS pane names used only to flag **orphans** (live pane ∧ not
+/// tracked). Columns: SLUG · SID · ROLE · VENDOR · STATUS. An orphan has no
+/// role/vendor (the pane name only carries slug+sid post-F1) → `-`.
+fn render_sessions_table(
+    tracked: &[ccteam_im::gateway::TrackedSessionRow],
+    live_panes: &[String],
+    daemon_up: bool,
+) -> String {
+    // Canonical names the daemon tracks, to subtract from live panes → orphans.
+    let tracked_names: std::collections::BTreeSet<String> = tracked
+        .iter()
+        .map(|r| ccteam_harness::chat_session_name(&r.project, &r.sid))
+        .collect();
 
     struct Row {
         slug: String,
+        sid: String,
         role: String,
-        name: String,
-        alive: bool,
-        note: &'static str,
+        vendor: String,
+        status: String,
     }
-    let rows: Vec<Row> = names
+
+    let tracked_status = if daemon_up {
+        "live"
+    } else {
+        "registered (daemon down)"
+    };
+
+    let mut rows: Vec<Row> = tracked
         .iter()
-        .map(|name| {
-            let (slug, role) = ccteam_harness::parse_chat_session_name(name)
-                .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-            let alive = live_set.contains(name);
-            let note = if orphan_names.contains(name) {
-                "orphan (untracked)"
-            } else if !alive {
-                "registered, not running"
-            } else {
-                ""
-            };
-            Row {
-                slug,
-                role,
-                name: (*name).to_string(),
-                alive,
-                note,
-            }
+        .map(|r| Row {
+            slug: r.project.clone(),
+            sid: r.sid.clone(),
+            role: r.role.clone(),
+            vendor: r.vendor.clone(),
+            status: tracked_status.to_string(),
         })
         .collect();
 
-    let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
-    let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
-    let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(7);
+    // Orphans: a live pane whose canonical name the daemon doesn't track.
+    for name in live_panes {
+        if tracked_names.contains(name) {
+            continue;
+        }
+        if let Some((slug, sid)) = ccteam_harness::parse_chat_session_name(name) {
+            rows.push(Row {
+                slug,
+                sid,
+                role: "-".to_string(),
+                vendor: "-".to_string(),
+                status: "orphan (untracked live pane)".to_string(),
+            });
+        }
+    }
 
+    // Deterministic order: slug, then sid.
+    rows.sort_by(|a, b| a.slug.cmp(&b.slug).then(a.sid.cmp(&b.sid)));
+
+    if rows.is_empty() {
+        let mut out = String::new();
+        out.push_str("no chat sessions (none tracked, none live).\n");
+        out.push_str(
+            "  Gateway chat sessions appear here once a bot is spawned \
+             (e.g. via Telegram `/new`).\n",
+        );
+        return out;
+    }
+
+    // Column widths mirror the existing `w_sid` algorithm (header-floor max).
+    let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
+    let w_sid = rows.iter().map(|r| r.sid.len()).max().unwrap_or(0).max(3);
+    let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
+    let w_vendor = rows
+        .iter()
+        .map(|r| r.vendor.len())
+        .max()
+        .unwrap_or(0)
+        .max(6);
+
+    let mut out = String::new();
     let header = format!(
-        "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  NOTE",
-        "SLUG", "ROLE", "SESSION", "ALIVE"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  STATUS",
+        "SLUG", "SID", "ROLE", "VENDOR"
     );
-    println!("{}", header.trim_end());
+    out.push_str(header.trim_end());
+    out.push('\n');
     for r in &rows {
         let line = format!(
-            "{:<w_slug$}  {:<w_role$}  {:<w_name$}  {:<5}  {}",
-            r.slug,
-            r.role,
-            r.name,
-            if r.alive { "yes" } else { "no" },
-            r.note,
+            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {}",
+            r.slug, r.sid, r.role, r.vendor, r.status,
         );
-        println!("{}", line.trim_end());
+        out.push_str(line.trim_end());
+        out.push('\n');
     }
-    println!();
-    println!("attach: `ccteam internal attach <slug> [role]`  (Telegram: `/sessions`)");
-    Ok(())
+    out.push('\n');
+    out.push_str("attach: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)\n");
+    out
 }
 
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
@@ -1934,17 +1427,20 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// the same primitive `TmuxBackend::capture` calls under the hood).
 /// Keeps the peek path sync per the W1 "sync sites stay sync" decision.
 ///
-/// `ccteam internal peek <slug> [role]`. Resolves a live chat session
-/// (`ccteam-chat-<slug>-<role>`) first — mirroring `attach` — and falls
+/// `ccteam internal peek <slug> [sid]`. Resolves a live chat session
+/// (`ccteam-chat-<slug>-<sid>`) first — mirroring `attach` — and falls
 /// back to the project pane (`ccteam-<slug>`) when none matches. This is
 /// why a bare `peek <slug>` against a chat session used to fail with
 /// "rmux session not running: ccteam-<slug>" while `attach` worked.
+///
+/// v0.8.8 F1 — the optional disambiguator is the session **sid** (`s<N>`),
+/// not a role (the pane's trailing segment is the sid post-F1).
 pub fn run_peek_with_role(
     paths: &CcteamPaths,
     slug_or_name: &str,
-    role: Option<&str>,
+    sid: Option<&str>,
 ) -> Result<String> {
-    let session_name = match resolve_chat_session_name(slug_or_name, role)? {
+    let session_name = match resolve_chat_session_name(slug_or_name, sid)? {
         Some(name) => name,
         None => session_name_for_project(paths, slug_or_name),
     };
@@ -4675,20 +4171,43 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
         .with_context(|| format!("canonicalize project dir `{}`", dir.display()))
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role search <q>`. Offline substring search
-/// over the bundled agency-agents catalog (no network). Empty query lists
-/// the whole catalog. Text output prints `id` + division + description so
-/// the user can copy an `id` into `ccteam role add`.
-pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
-    let hits = ccteam_core::catalog_search(query)?;
+/// v0.8.9 Phase 2 — `ccteam role search <q>`. Substring search over the
+/// curated ccteam-hub marketplace `index.json` (loaded via the
+/// `~/.ccteam/hub-cache/` cache; first run fetches it). Matches the
+/// (case-insensitive) query against each plugin's id / name / description /
+/// tags. An empty query lists everything, sorted by id. Text output prints
+/// `id` + type + description so the user can copy an `id` into
+/// `ccteam role add`. The async load is driven on a throwaway current-thread
+/// runtime ([`block_on_async`]) since `main()` is sync.
+pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -> Result<String> {
+    let index = block_on_async(ccteam_im::hub::load_catalog(
+        &ccteam_im::hub::hub_base(),
+        paths,
+        false,
+    ))??;
+    let q = query.trim().to_lowercase();
+    let mut hits: Vec<&ccteam_im::hub::HubPlugin> = index
+        .plugins
+        .iter()
+        .filter(|p| {
+            if q.is_empty() {
+                return true;
+            }
+            p.id.to_lowercase().contains(&q)
+                || p.name.to_lowercase().contains(&q)
+                || p.description.to_lowercase().contains(&q)
+                || p.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        })
+        .collect();
+    hits.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(match format {
         OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
         OutputFormat::Text => {
             if hits.is_empty() {
-                format!("no catalog roles match `{query}`.\n")
+                format!("no plugins match `{query}` in the ccteam-hub marketplace.\n")
             } else {
                 let mut out = format!(
-                    "{} role(s) in the agency-agents catalog{}:\n\n",
+                    "{} plugin(s) in the ccteam-hub marketplace{}:\n\n",
                     hits.len(),
                     if query.trim().is_empty() {
                         String::new()
@@ -4696,11 +4215,11 @@ pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
                         format!(" matching `{query}`")
                     }
                 );
-                for e in &hits {
-                    out.push_str(&format!("  {}  [{}]\n", e.id, e.division));
-                    if !e.description.is_empty() {
+                for p in &hits {
+                    out.push_str(&format!("  {}  [{}]\n", p.id, p.type_));
+                    if !p.description.is_empty() {
                         // One-line, truncated description for the list view.
-                        let desc: String = e.description.chars().take(96).collect();
+                        let desc: String = p.description.chars().take(96).collect();
                         out.push_str(&format!("      {desc}\n"));
                     }
                 }
@@ -4713,11 +4232,11 @@ pub fn run_role_search(query: &str, format: OutputFormat) -> Result<String> {
     })
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role add <id> [--as <role>] [--project <slug>]
-/// [--force]`. Imports a catalog role into the project's `.claude/agents/`
-/// (fetch over HTTP → verbatim write) and prints a `/role <role>` hint.
-/// The async fetch is driven on a throwaway current-thread runtime
-/// ([`block_on_async`]) since `main()` is sync.
+/// v0.8.9 Phase 2 — `ccteam role add <id> [--as <role>] [--project <slug>]
+/// [--force]`. Installs a curated ccteam-hub plugin into the project's
+/// `.claude/` (fetch over HTTPS + sha256 verify → verbatim write) and prints a
+/// `/role <role>` hint. The async load + fetch is driven on a throwaway
+/// current-thread runtime ([`block_on_async`]) since `main()` is sync.
 pub fn run_role_add(
     paths: &CcteamPaths,
     id: &str,
@@ -4726,16 +4245,31 @@ pub fn run_role_add(
     force: bool,
 ) -> Result<String> {
     let project_dir = resolve_project_dir(paths, project)?;
-    let result = block_on_async(ccteam_im::role_import::import_role_from_catalog(
+    let base = ccteam_im::hub::hub_base();
+    let index = block_on_async(ccteam_im::hub::load_catalog(&base, paths, false))??;
+    let plugin = index.find(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no plugin `{id}` in the ccteam-hub marketplace — try `ccteam role search <q>`"
+        )
+    })?;
+    let result = block_on_async(ccteam_im::hub::install_plugin(
         &project_dir,
-        id,
+        plugin,
         as_role,
         force,
-    ))??;
+        &base,
+    ))?
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The installed file stem (the `/role` name) is the sanitized override or
+    // the plugin id — the same derivation `install_plugin` used. Recovered here
+    // for the hint (the path is `.../skills/<stem>/SKILL.md` for a skill, so a
+    // raw `file_stem()` would be `SKILL`).
+    let stem = ccteam_core::sanitize_role_stem(as_role.unwrap_or(&result.id))
+        .unwrap_or_else(|_| result.id.clone());
     let mut out = format!(
-        "Installed role `{}` from catalog `{}`{}.\n  {}\n",
-        result.role,
-        result.catalog_id,
+        "Installed {} `{}` from the ccteam-hub marketplace{}.\n  {}\n",
+        result.type_,
+        result.id,
         if result.overwrote {
             " (overwrote existing)"
         } else {
@@ -4744,15 +4278,13 @@ pub fn run_role_add(
         result.path.display(),
     );
     out.push_str(&format!(
-        "\nSwitch to it in a chat with `/role {}` (or spawn a session with that role).\n",
-        result.role
+        "\nSwitch to it in a chat with `/role {stem}` (or spawn a session with that role).\n",
     ));
-    // v0.8.7 review-fix (R-L6) — the body is third-party content (MIT
-    // agency-agents) fetched verbatim. Persona text steers an agent that runs
-    // with `--dangerously-skip-permissions`, so prompt the operator to read it
-    // before use rather than trusting it blind.
+    // The body is third-party content fetched verbatim. Persona text steers an
+    // agent that runs with `--dangerously-skip-permissions`, so prompt the
+    // operator to read it before use rather than trusting it blind.
     out.push_str(&format!(
-        "\nNote: this role .md is third-party content fetched verbatim — review {} before use.\n",
+        "\nNote: this plugin is third-party content fetched verbatim — review {} before use.\n",
         result.path.display()
     ));
     Ok(out)
@@ -5129,7 +4661,8 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // sessions is part of the explicit, user-requested removal (the
     // allowed exception to "never PROACTIVELY kill a long session").
     // `--dry-run` lists the sessions it would stop and kills nothing.
-    let chat_stop = stop_project_chat_sessions(slug, opts.dry_run)?;
+    let backend = ccteam_harness::default_process_backend();
+    let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, opts.dry_run)?;
     if opts.dry_run {
         for name in &chat_stop.would_stop {
             report
@@ -5288,34 +4821,48 @@ struct ChatSessionStop {
     would_stop: Vec<String>,
 }
 
-/// Enumerate the live tmux sessions belonging to `slug`'s chat-mode role
-/// sessions (`ccteam-chat-<slug>-<role>`) and, unless `dry_run`, kill
-/// each one.
+/// Enumerate the live chat-mode role sessions belonging to `slug`
+/// (`ccteam-chat-<slug>-<role>`) and, unless `dry_run`, kill each one.
 ///
-/// Process-independent on purpose: the CLI is a separate process from
-/// the daemon, so we never consult daemon in-memory state. We list every
-/// live tmux session ([`tmux_ops::list_sessions`]) and keep the ones
-/// whose parsed slug equals `slug` — parsing via
-/// [`parse_chat_session_name`] rather than a raw `starts_with` so a slug
-/// that itself contains dashes (e.g. `dev-foo`) matches its own
+/// Backend-agnostic: enumeration + kill both go through the injected
+/// [`ProcessBackend`] (`list_sessions` / `kill`), so the teardown sees
+/// whatever mux is live under `CCTEAM_MUX_BACKEND` — the bundled `rmux`
+/// daemon by default, or `tmux` when opted in. (The old tmux-only path
+/// shelled out to `tmux list-sessions` directly and so saw nothing under
+/// the default rmux backend.) The CLI threads `default_process_backend()`
+/// in; tests inject a deterministic [`InProcBackend`].
+///
+/// Process-independent on purpose: the CLI is a separate process from the
+/// daemon, so we never consult daemon in-memory state — only the live mux
+/// session names. We reuse [`list_chat_sessions`] (names only, never
+/// capture-pane) and keep the ones whose parsed slug equals `slug`,
+/// parsing via [`parse_chat_session_name`] rather than a raw `starts_with`
+/// so a slug that itself contains dashes (e.g. `dev-foo`) matches its own
 /// `ccteam-chat-dev-foo-<role>` sessions and not a sibling
-/// `ccteam-chat-dev-<role>` one.
+/// `ccteam-chat-dev-<role>` one. The slug is always the *first* parsed
+/// element, so this stays correct even if the trailing segment changes
+/// meaning (role → sid).
 ///
 /// **Red line.** `project stop` / `rm` are EXPLICIT user commands, the
 /// allowed exception to "never PROACTIVELY kill a long session": the
 /// teardown is user-requested and resumable (the daemon recreates the
 /// pane via `--resume` on the next interaction). The kill is idempotent
-/// ([`TmuxSession::kill`] tolerates a vanished session).
-fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionStop> {
-    use ccteam_harness::parse_chat_session_name;
-    use ccteam_harness::tmux_ops::{self, TmuxSession};
+/// ([`ProcessBackend::kill`] is `Ok(())` for a vanished session).
+fn stop_project_chat_sessions(
+    backend: &dyn ccteam_harness::ProcessBackend,
+    slug: &str,
+    dry_run: bool,
+) -> Result<ChatSessionStop> {
+    use ccteam_harness::{list_chat_sessions, parse_chat_session_name, MuxSessionId};
 
-    // Match + stable-sort so output / kill order is deterministic.
-    let mut matches: Vec<String> = tmux_ops::list_sessions()
+    // Enumerate live chat sessions via the backend, keep ours, stable-sort
+    // so output / kill order is deterministic.
+    let live = block_on_async(list_chat_sessions(backend))??;
+    let mut matches: Vec<String> = live
         .into_iter()
         .filter(|name| {
             parse_chat_session_name(name)
-                .map(|(s, _role)| s == slug)
+                .map(|(s, _last)| s == slug)
                 .unwrap_or(false)
         })
         .collect();
@@ -5327,8 +4874,7 @@ fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionSt
         return Ok(out);
     }
     for name in matches {
-        TmuxSession::from_name(name.clone())
-            .kill()
+        block_on_async(backend.kill(&MuxSessionId::new(name.clone())))?
             .with_context(|| format!("stop chat session `{name}`"))?;
         out.stopped.push(name);
     }
@@ -5346,7 +4892,8 @@ fn stop_project_chat_sessions(slug: &str, dry_run: bool) -> Result<ChatSessionSt
 /// Returns a one-line-per-session render (and a tail count); stopping 0
 /// sessions is a success, not an error.
 pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
-    let stop = stop_project_chat_sessions(slug, false)?;
+    let backend = ccteam_harness::default_process_backend();
+    let stop = stop_project_chat_sessions(backend.as_ref(), slug, false)?;
 
     let mut out = String::new();
     use std::fmt::Write as _;
@@ -5695,6 +5242,129 @@ mod tests {
         );
     }
 
+    /// v0.8.8 B1 — `stop_project_chat_sessions` consults the *injected*
+    /// [`ProcessBackend`], not shell `tmux` directly. The deterministic
+    /// list+kill+absent semantics (which need a single live tokio runtime
+    /// across spawn→list→kill) are verified in the harness layer
+    /// (`ccteam_harness::stop_chat_sessions_for_slug_kills_only_that_slug`);
+    /// here we only assert the CLI bridge is wired to the backend — an empty
+    /// backend yields an empty result with no `tmux list-sessions` shell-out
+    /// and no panic (the bug was the old tmux-only path returning nothing
+    /// under the default rmux backend).
+    ///
+    /// (We can't drive the kill end-to-end here: `block_on_async` builds a
+    /// fresh current-thread runtime per call, so an `InProcBackend`'s parked
+    /// `tokio::spawn` task — its liveness signal — dies with the runtime that
+    /// spawned it. A single-runtime harness test is the right home.)
+    #[test]
+    fn stop_project_chat_sessions_consults_injected_backend() {
+        use ccteam_harness::InProcBackend;
+
+        let backend = InProcBackend::new();
+        // Empty backend → no matches, both modes, no error / no tmux shell-out.
+        let dry = stop_project_chat_sessions(&backend, "dev-foo", true).unwrap();
+        assert!(dry.would_stop.is_empty() && dry.stopped.is_empty());
+        let stop = stop_project_chat_sessions(&backend, "dev-foo", false).unwrap();
+        assert!(stop.would_stop.is_empty() && stop.stopped.is_empty());
+    }
+
+    /// v0.8.8 B4 — a tracked row from a fixture gateway state renders one row
+    /// per session with its VENDOR + SID, and a **codex** session shows
+    /// `live` (the BUG-5 fix: tracked ⇒ live regardless of vendor, no more
+    /// false "registered, not running").
+    #[test]
+    fn render_sessions_table_codex_tracked_is_live_with_vendor() {
+        let tracked = vec![
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s1".into(),
+                project: "alpha".into(),
+                role: "reviewer".into(),
+                vendor: "claude".into(),
+                permission_mode: "skip".into(),
+            },
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s2".into(),
+                project: "alpha".into(),
+                role: "builder".into(),
+                vendor: "codex".into(),
+                permission_mode: "hitl".into(),
+            },
+        ];
+        let out = render_sessions_table(&tracked, &[], true);
+
+        // Header carries the new VENDOR column alongside SLUG/SID/ROLE.
+        assert!(out.contains("SLUG"));
+        assert!(out.contains("SID"));
+        assert!(out.contains("ROLE"));
+        assert!(out.contains("VENDOR"));
+
+        // Both rows present with their sid + vendor.
+        let claude_line = out.lines().find(|l| l.contains("s1")).expect("claude row");
+        assert!(claude_line.contains("reviewer"), "{claude_line}");
+        assert!(claude_line.contains("claude"), "{claude_line}");
+        assert!(claude_line.contains("live"), "{claude_line}");
+
+        let codex_line = out.lines().find(|l| l.contains("s2")).expect("codex row");
+        assert!(codex_line.contains("builder"), "{codex_line}");
+        assert!(codex_line.contains("codex"), "{codex_line}");
+        // BUG-5: codex tracked session is live, never "registered, not running".
+        assert!(codex_line.contains("live"), "{codex_line}");
+        assert!(
+            !out.contains("registered, not running"),
+            "BUG-5 regression: false not-running note returned: {out}"
+        );
+    }
+
+    /// v0.8.8 B4 — a live `ccteam-chat-*` pane the daemon does not track is an
+    /// orphan (role/vendor `-`); daemon-down degrades tracked rows to
+    /// `registered (daemon down)` rather than erroring.
+    #[test]
+    fn render_sessions_table_orphan_and_daemon_down() {
+        let tracked = vec![ccteam_im::gateway::TrackedSessionRow {
+            sid: "s1".into(),
+            project: "alpha".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+        }];
+        // One untracked live pane → orphan; the tracked s1's own pane is NOT
+        // listed, so it must not double as an orphan.
+        let live = vec!["ccteam-chat-ghost-zombie".to_string()];
+        let out = render_sessions_table(&tracked, &live, false);
+
+        let tracked_line = out.lines().find(|l| l.contains("s1")).expect("tracked");
+        assert!(
+            tracked_line.contains("registered (daemon down)"),
+            "{tracked_line}"
+        );
+
+        let orphan_line = out
+            .lines()
+            .find(|l| l.contains("zombie"))
+            .expect("orphan row");
+        assert!(orphan_line.contains("ghost"), "{orphan_line}");
+        assert!(orphan_line.contains("orphan"), "{orphan_line}");
+    }
+
+    /// v0.8.8 B4 — a tracked session's own live pane is reconciled (matched by
+    /// canonical name), never re-listed as an orphan.
+    #[test]
+    fn render_sessions_table_tracked_pane_not_an_orphan() {
+        let tracked = vec![ccteam_im::gateway::TrackedSessionRow {
+            sid: "s1".into(),
+            project: "alpha".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+        }];
+        // The live pane name matches the canonical name of the tracked s1.
+        let live = vec!["ccteam-chat-alpha-s1".to_string()];
+        let out = render_sessions_table(&tracked, &live, true);
+        assert!(!out.contains("orphan"), "tracked pane misflagged: {out}");
+        // Exactly one data row (s1), not two.
+        assert_eq!(out.matches("s1").count(), 1, "{out}");
+    }
+
     #[test]
     fn stall_verdict_classifies_silence_tiers() {
         // 0s → OK, 5m → warn, 15m+/30m+ both collapse to STUCK so the
@@ -6005,72 +5675,6 @@ mod tests {
         assert_eq!(cfg.projects[0].team, "dev");
     }
 
-    /// V0.5.0 F93b — `ccteam init --mode agent-team` scaffolds the
-    /// 4 required artifacts: `workflow.yaml` (with `mode: agent-team`),
-    /// `__lead.md`, `.ccteam/inbox/`, and registers in config.yaml.
-    /// Also writes the F94 `settings.agent-team.json` template
-    /// (with `TeammateIdle` / `TaskCreated` / `TaskCompleted` hooks).
-    #[test]
-    fn run_init_agent_team_mode_writes_four_files() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let target = tmp.path().join("my-debate");
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target.clone()),
-                slug: Some("my-debate".into()),
-                mode: InitMode::AgentTeam,
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        // 1. workflow.yaml exists with mode: agent-team
-        let wf = target.join(".ccteam").join("workflow.yaml");
-        assert!(wf.is_file(), "workflow.yaml must land in .ccteam/");
-        let body = std::fs::read_to_string(&wf).unwrap();
-        assert!(
-            body.contains("mode: agent-team"),
-            "workflow.yaml must declare mode: agent-team; got: {body}",
-        );
-        // 2. __lead.md scaffold
-        let lead = target.join(".claude").join("agents").join("__lead.md");
-        assert!(
-            lead.is_file(),
-            "__lead.md must be scaffolded in agent-team mode"
-        );
-        let lead_body = std::fs::read_to_string(&lead).unwrap();
-        assert!(
-            lead_body.contains("name: __lead"),
-            "__lead.md must have Anthropic frontmatter",
-        );
-        // 3. .ccteam/inbox/.gitkeep sentinel
-        let inbox = target.join(".ccteam").join("inbox");
-        assert!(inbox.is_dir(), "inbox dir must be created");
-        assert!(
-            inbox.join(".gitkeep").is_file(),
-            ".ccteam/inbox/.gitkeep sentinel must be written",
-        );
-        // 4. config.yaml registry entry
-        let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
-        assert_eq!(cfg.projects.len(), 1);
-        assert_eq!(cfg.projects[0].slug, "my-debate");
-        // 5. F94: settings.agent-team.json template wrote 3 hooks.
-        // v0.8.6 W2b — ccteam writes its managed base/hooks to the
-        // local layer (settings.local.json), never the user-committed
-        // settings.json.
-        let settings_path = target.join(".claude").join("settings.local.json");
-        assert!(settings_path.is_file());
-        let settings_body = std::fs::read_to_string(&settings_path).unwrap();
-        for hook in ["TeammateIdle", "TaskCreated", "TaskCompleted"] {
-            assert!(
-                settings_body.contains(hook),
-                "settings.local.json (agent-team) must include `{hook}` hook; got: {settings_body}",
-            );
-        }
-    }
-
     /// V0.5.0 F93b — `ccteam init` without `--mode` defaults to
     /// artifact-driven; no `__lead.md` is scaffolded.
     #[test]
@@ -6108,115 +5712,6 @@ mod tests {
         );
     }
 
-    /// V0.5.0 F93b — `ccteam start <slug> --dry-run` prints the spawn
-    /// preview without spawning. The `<slug>` must point at an
-    /// agent-team mode project.
-    #[test]
-    fn run_start_agent_team_dry_run_prints_preview() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let target = tmp.path().join("dry-run-team");
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target.clone()),
-                slug: Some("dry-run-team".into()),
-                mode: InitMode::AgentTeam,
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        // Point projects_root at the install target via config.yaml
-        // entry (run_init already upserts it). For run_start, the slug
-        // must resolve via `paths.project_dir(slug)`.
-        // Our test paths.projects_root is `tmp/projects/`, but the
-        // install went into `tmp/dry-run-team/`. We need either to
-        // install under projects_root OR override paths to point there.
-        // Re-init under projects_root for proper slug resolution:
-        let target2 = paths.projects_root.join("dry-run-team-2");
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target2.clone()),
-                slug: Some("dry-run-team-2".into()),
-                mode: InitMode::AgentTeam,
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        // Customize the workflow.yaml lead_seed for assertion clarity.
-        let wf = target2.join(".ccteam").join("workflow.yaml");
-        let raw = std::fs::read_to_string(&wf).unwrap();
-        std::fs::write(
-            &wf,
-            raw.replace(
-                "<describe the team's mission here>",
-                "INVESTIGATE THE BUG IN AUTH",
-            ),
-        )
-        .unwrap();
-        let out = run_start_agent_team(
-            &paths,
-            "dry-run-team-2",
-            StartAgentTeamOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(out.contains("mode=agent-team"), "preview must mention mode");
-        assert!(
-            out.contains("INVESTIGATE THE BUG IN AUTH") || out.contains("Suggested teammates"),
-            "preview must echo lead_seed; got: {out}",
-        );
-        assert!(
-            out.contains("dry-run set"),
-            "dry-run preview must include the cancellation note; got: {out}",
-        );
-        // Snapshot must NOT have been written (dry-run).
-        let snapshot = target2.join(".ccteam").join("team-snapshot.json");
-        assert!(
-            !snapshot.exists(),
-            "dry-run must not write team-snapshot.json",
-        );
-    }
-
-    /// V0.5.0 F93b — `ccteam start <slug>` against an artifact-driven
-    /// project returns a friendly error pointing at `ccteam start`
-    /// (no slug, daemon mode).
-    #[test]
-    fn run_start_agent_team_rejects_artifact_driven_project() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "artifact-rej";
-        let target = paths.projects_root.join(slug);
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target),
-                slug: Some(slug.into()),
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        let err = run_start_agent_team(
-            &paths,
-            slug,
-            StartAgentTeamOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("artifact-driven"),
-            "error must mention artifact-driven; got: {msg}",
-        );
-    }
-
     /// V0.5.0 F93b — `ccteam attach <slug>` against an agent-team
     /// project without a written snapshot returns a friendly error
     /// telling the user to run `ccteam start <slug>` first.
@@ -6230,11 +5725,21 @@ mod tests {
         run_init(
             &paths,
             InitOptions {
-                install_in: Some(target),
+                install_in: Some(target.clone()),
                 slug: Some(slug.into()),
-                mode: InitMode::AgentTeam,
                 ..InitOptions::default()
             },
+        )
+        .unwrap();
+        // `run_attach`'s agent-team branch keys off `mode: agent-team` in
+        // workflow.yaml; `ccteam init` scaffolds artifact-driven, so
+        // overwrite with a minimal agent-team spec for this teardown test.
+        std::fs::write(
+            target.join(".ccteam").join("workflow.yaml"),
+            format!(
+                "name: {slug}\nmode: agent-team\nagent_team:\n  team_name: {slug}\n  \
+                 lead_seed: |\n    test mission\n  cleanup_on_stop: force-kill\nagents: {{}}\n"
+            ),
         )
         .unwrap();
         let err = run_attach(&paths, slug).unwrap_err();
@@ -6262,9 +5767,19 @@ mod tests {
             InitOptions {
                 install_in: Some(target.clone()),
                 slug: Some(slug.into()),
-                mode: InitMode::AgentTeam,
                 ..InitOptions::default()
             },
+        )
+        .unwrap();
+        // `read_agent_team_lead_session_id` keys off `mode: agent-team` in
+        // workflow.yaml; `ccteam init` scaffolds artifact-driven, so
+        // overwrite with a minimal agent-team spec.
+        std::fs::write(
+            target.join(".ccteam").join("workflow.yaml"),
+            format!(
+                "name: {slug}\nmode: agent-team\nagent_team:\n  team_name: {slug}\n  \
+                 lead_seed: |\n    test mission\n  cleanup_on_stop: force-kill\nagents: {{}}\n"
+            ),
         )
         .unwrap();
         // Fake snapshot writeup.
@@ -6819,7 +6334,7 @@ mod tests {
     }
 
     // =====================================================================
-    // V0.5.0 F97 — `ccteam stop <slug>` + `--restart-team` lifecycle tests
+    // `ccteam stop <slug>` cleanup-on-stop lifecycle tests
     // =====================================================================
 
     /// Build a `cleanup_on_stop: <strategy>` agent-team project at
@@ -6831,19 +6346,21 @@ mod tests {
             InitOptions {
                 install_in: Some(target.clone()),
                 slug: Some(slug.into()),
-                mode: InitMode::AgentTeam,
                 ..InitOptions::default()
             },
         )
         .unwrap();
-        // Replace cleanup_on_stop line in the scaffolded workflow.yaml.
+        // `ccteam init` scaffolds an artifact-driven workflow.yaml; the
+        // `ccteam stop <slug>` agent-team teardown path (`run_stop_slug`)
+        // needs a `mode: agent-team` spec. Overwrite the scaffold with a
+        // minimal agent-team workflow.yaml parameterized by cleanup
+        // strategy (the only field these teardown tests vary).
         let wf = target.join(".ccteam").join("workflow.yaml");
-        let raw = std::fs::read_to_string(&wf).unwrap();
-        let replaced = raw.replace(
-            "cleanup_on_stop: force-kill",
-            &format!("cleanup_on_stop: {cleanup}"),
+        let body = format!(
+            "name: {slug}\nmode: agent-team\nagent_team:\n  team_name: {slug}\n  \
+             lead_seed: |\n    test mission\n  cleanup_on_stop: {cleanup}\nagents: {{}}\n"
         );
-        std::fs::write(&wf, replaced).unwrap();
+        std::fs::write(&wf, body).unwrap();
         target
     }
 
@@ -7050,192 +6567,22 @@ mod tests {
 
         let report = run_stop_slug(&paths, slug, StopSlugOptions::default()).unwrap();
 
-        // Snapshot MUST still exist (used by --restart-team).
+        // Snapshot MUST still exist (preserved for reference).
         let snap = project_dir.join(".ccteam").join("team-snapshot.json");
         assert!(
             snap.exists(),
-            "leave-running must NOT clear team-snapshot.json (needed for restart-team)",
+            "leave-running must NOT clear team-snapshot.json (preserved for reference)",
         );
-        // Report mentions restart-team hint.
+        // Report mentions how to reconnect the still-running lead.
         assert!(
-            report.contains("--restart-team"),
-            "leave-running report should reference --restart-team; got: {report}",
+            report.contains("claude attach"),
+            "leave-running report should tell the user how to reconnect the lead; got: {report}",
         );
         // state.json::detached must be set.
         let state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
         assert!(
             state.detached,
             "leave-running must set state.json::detached = true",
-        );
-    }
-
-    #[test]
-    fn restart_team_resumes_alive_lead_without_spawning() {
-        ensure_isolation();
-        let _g = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "restart-alive";
-        let project_dir = install_team_project(&paths, slug, "leave-running");
-        write_fake_snapshot(&project_dir, slug, "stillAlive4", "leave-running");
-
-        // Plant a "Running" state.json so probe_job returns
-        // JobLiveness::Running.
-        let jobs_root = tmp.path().join("claude-jobs");
-        std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
-        let dir = jobs_root.join("stillAlive4");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("state.json"),
-            r#"{"state":"working","pid":99999,"daemonShort":"stillAlive4"}"#,
-        )
-        .unwrap();
-
-        // Mark detached so --restart-team has something to clear.
-        let mut state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
-        state.detached = true;
-        state.save(&paths.project_state(slug)).unwrap();
-
-        // Set CCTEAM_CLAUDE_BIN to a non-existent path so any attempt to
-        // spawn would fail loudly (proves we never even tried).
-        std::env::set_var("CCTEAM_CLAUDE_BIN", "/nonexistent/should-never-run");
-
-        let report = run_start_agent_team(
-            &paths,
-            slug,
-            StartAgentTeamOptions {
-                restart_team: true,
-                no_confirm: true,
-                ..Default::default()
-            },
-        );
-        std::env::remove_var("CCTEAM_CLAUDE_BIN");
-        std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
-
-        let body = report.unwrap();
-        assert!(
-            body.contains("Skipping spawn") || body.contains("lead bg job alive"),
-            "report must indicate no spawn happened; got: {body}",
-        );
-        assert!(
-            body.contains("stillAlive4"),
-            "report must mention lead id; got: {body}",
-        );
-        // detached marker must be cleared.
-        let state_after = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
-        assert!(
-            !state_after.detached,
-            "restart-team must clear detached marker on success",
-        );
-    }
-
-    #[test]
-    fn restart_team_falls_through_to_spawn_when_lead_terminal() {
-        ensure_isolation();
-        let _g = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "restart-dead";
-        let project_dir = install_team_project(&paths, slug, "leave-running");
-        write_fake_snapshot(&project_dir, slug, "deadLead5", "leave-running");
-
-        // Plant a "Terminal" state.json (job_id has no state.json file
-        // at all → probe_job returns Terminal { status: "killed" }).
-        let jobs_root = tmp.path().join("claude-jobs");
-        std::env::set_var("CCTEAM_CLAUDE_JOBS_DIR", &jobs_root);
-        // Do NOT create the file — absent file → Terminal.
-
-        // Use --dry-run so we don't actually try to spawn (we only
-        // want to verify the WARN prelude + dry-run preview happens
-        // after the fall-through).
-        let report = run_start_agent_team(
-            &paths,
-            slug,
-            StartAgentTeamOptions {
-                restart_team: true,
-                dry_run: true,
-                ..Default::default()
-            },
-        );
-        std::env::remove_var("CCTEAM_CLAUDE_JOBS_DIR");
-
-        let body = report.unwrap();
-        assert!(
-            body.contains("Previous lead exited") || body.contains("spawning fresh lead"),
-            "should print fall-through WARN; got: {body}",
-        );
-        assert!(
-            body.contains("mode=agent-team"),
-            "should fall through to standard preview; got: {body}",
-        );
-    }
-
-    #[test]
-    fn restart_team_fails_when_snapshot_missing() {
-        ensure_isolation();
-        let _g = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "restart-no-snapshot";
-        install_team_project(&paths, slug, "force-kill");
-        // No snapshot written.
-
-        let err = run_start_agent_team(
-            &paths,
-            slug,
-            StartAgentTeamOptions {
-                restart_team: true,
-                ..Default::default()
-            },
-        )
-        .expect_err("--restart-team without snapshot must fail");
-
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("team-snapshot.json"),
-            "error must mention snapshot; got: {msg}",
-        );
-        assert!(
-            msg.contains("ccteam start") || msg.contains("--restart-team"),
-            "error must hint at recovery; got: {msg}",
-        );
-    }
-
-    #[test]
-    fn plain_start_refuses_when_project_is_detached() {
-        ensure_isolation();
-        let _g = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "detached-refuse";
-        let project_dir = install_team_project(&paths, slug, "leave-running");
-        write_fake_snapshot(&project_dir, slug, "leadX6", "leave-running");
-
-        // Mark detached (simulates a prior leave-running stop).
-        let mut state = ccteam_core::ProjectState::load(&paths.project_state(slug)).unwrap();
-        state.detached = true;
-        state.save(&paths.project_state(slug)).unwrap();
-
-        // Plain `ccteam start <slug>` (no --restart-team) must refuse.
-        let err = run_start_agent_team(
-            &paths,
-            slug,
-            StartAgentTeamOptions {
-                restart_team: false,
-                no_confirm: true,
-                ..Default::default()
-            },
-        )
-        .expect_err("plain start on detached project must refuse");
-
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("detached"),
-            "error must mention detached state; got: {msg}",
-        );
-        assert!(
-            msg.contains("--restart-team"),
-            "error must point at --restart-team; got: {msg}",
         );
     }
 
@@ -7255,7 +6602,7 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 17, "ships 17 tools");
+        assert_eq!(report.total_tools, 15, "ships 15 tools");
     }
 
     #[test]

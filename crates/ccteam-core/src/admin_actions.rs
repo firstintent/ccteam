@@ -100,6 +100,49 @@ pub fn write_role(project_dir: &Path, role: &str, content: &str) -> Result<PathB
     Ok(path)
 }
 
+/// `<project_dir>/.claude/skills/<skill>/SKILL.md` — v0.8.9 Phase 2.
+///
+/// The Anthropic-native skill layout is a *directory* per skill (the skill
+/// may carry sibling resources), with `SKILL.md` (frontmatter + body) as the
+/// entry doc. ccteam-hub has zero skill plugins today, but the marketplace
+/// installer (`ccteam_im::hub::install_plugin`) builds the path so a future
+/// `type: "skill"` hub entry installs cleanly.
+pub fn skill_md_path(project_dir: &Path, skill: &str) -> PathBuf {
+    project_dir
+        .join(".claude")
+        .join("skills")
+        .join(skill)
+        .join("SKILL.md")
+}
+
+/// v0.8.9 Phase 2 — create-or-replace a skill's `SKILL.md`.
+///
+/// The skill sibling of [`write_role`]: writes
+/// `<project_dir>/.claude/skills/<skill>/SKILL.md`, creating the
+/// `.claude/skills/<skill>/` parent chain when absent, with the same atomic
+/// tmp + rename so a concurrent reader can't race a half-written file. Same
+/// validation posture as `write_role` — refuses an empty body or a `skill`
+/// name outside `[a-z0-9_-]` (which also forbids path-traversal: `/`, `\`,
+/// `..`, leading `.` are all rejected, so a hostile id can never escape
+/// `.claude/skills/`). Returns the absolute path written.
+pub fn write_skill(project_dir: &Path, skill: &str, content: &str) -> Result<PathBuf> {
+    validate_bot_name(skill)?;
+    if content.trim().is_empty() {
+        bail!("write_skill: content is empty");
+    }
+    let path = skill_md_path(project_dir, skill);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("skill SKILL.md path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
 /// Return value from [`add_tool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddToolResult {
@@ -364,6 +407,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         assert!(write_role(tmp.path(), "reviewer", "   \n").is_err());
         assert!(write_role(tmp.path(), "Bad Name", "---\nx\n---\n").is_err());
+    }
+
+    #[test]
+    fn write_skill_creates_nested_skill_md() {
+        let tmp = TempDir::new().unwrap();
+        let content = "---\nname: do-thing\ndescription: does a thing\n---\nbody\n";
+        let written = write_skill(tmp.path(), "do-thing", content).unwrap();
+        assert_eq!(written, skill_md_path(tmp.path(), "do-thing"));
+        // Lands under .claude/skills/<id>/SKILL.md, verbatim.
+        assert!(written.ends_with(".claude/skills/do-thing/SKILL.md"));
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), content);
+    }
+
+    #[test]
+    fn write_skill_replaces_existing() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(tmp.path(), "do-thing", "---\nname: do-thing\n---\nold\n").unwrap();
+        let new = "---\nname: do-thing\n---\nnew body\n";
+        write_skill(tmp.path(), "do-thing", new).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(skill_md_path(tmp.path(), "do-thing")).unwrap(),
+            new
+        );
+    }
+
+    #[test]
+    fn write_skill_rejects_empty_and_bad_name() {
+        let tmp = TempDir::new().unwrap();
+        assert!(write_skill(tmp.path(), "do-thing", "   \n").is_err());
+        // Path-traversal / charset escapes are rejected by validate_bot_name.
+        assert!(write_skill(tmp.path(), "../escape", "---\nx\n---\n").is_err());
+        assert!(write_skill(tmp.path(), "Bad Name", "---\nx\n---\n").is_err());
     }
 
     #[test]

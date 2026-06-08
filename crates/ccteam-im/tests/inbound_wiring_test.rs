@@ -1006,10 +1006,16 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     // V0.8.4 P1 (F1): no folded "submitted … turn …" ack → created + timeout.
     assert_eq!(contents.len(), 2, "created + timeout (ack folded away)");
     assert_eq!(contents[0], "created session s1");
+    // v0.8.9: the watchdog now INTERRUPTS the stalled turn (handle_directive
+    // `esc` → Ok here) and notifies with the "interrupted it" message.
     assert!(
-        contents[1]
-            .starts_with("gateway error: turn timed out after 50ms for s1 turn failing-stub-turn"),
+        contents[1].starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms"),
         "unexpected timeout content: {:?}",
+        contents[1]
+    );
+    assert!(
+        contents[1].contains("interrupted it"),
+        "watchdog must report it interrupted the turn: {:?}",
         contents[1]
     );
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1017,9 +1023,9 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     let rows = read_durable_outbound_rows();
     assert!(rows.iter().any(|row| {
         row["state"] == "sent"
-            && row["message"]["content"]
-                .as_str()
-                .is_some_and(|s| s.starts_with("gateway error: turn timed out after 50ms"))
+            && row["message"]["content"].as_str().is_some_and(|s| {
+                s.starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms")
+            })
     }));
 }
 

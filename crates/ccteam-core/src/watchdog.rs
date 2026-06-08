@@ -38,7 +38,6 @@ use crate::inbox::{
     outbox_filename, OutboxEventKind, OutboxFrontMatter, OutboxMessage, OutboxPriority,
     LATEST_SCHEMA_VERSION,
 };
-use crate::meta_agent::meta_slug;
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
 
@@ -470,7 +469,7 @@ fn keep(alert: &WatchdogAlert, config: &WatchdogConfig) -> bool {
 /// softer `AutoLoopCycle` / `PhaseDurationOverrun` (they describe state,
 /// no action mandated).
 pub fn push_alert_to_meta_outbox(paths: &CcteamPaths, alert: &WatchdogAlert) -> Result<PathBuf> {
-    let slug = meta_slug();
+    let slug = "meta".to_string();
     let outbox_dir = paths.project_ccteam_dir(&slug).join("outbox");
     std::fs::create_dir_all(&outbox_dir)
         .with_context(|| format!("create {}", outbox_dir.display()))?;

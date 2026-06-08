@@ -39,6 +39,12 @@ pub mod defaults;
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
+// v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) raw-content base
+// URL + the pure path/filename utils the installer reuses. Leaf-crate part
+// only: the async fetch + sha256-verify + install backend lives in
+// `ccteam-im::hub` so this primitives leaf stays free of an async HTTP + sha2
+// dependency.
+pub mod hub;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;
@@ -48,7 +54,6 @@ pub mod hot_config;
 pub mod hooks_dispatcher;
 pub mod inbox;
 pub mod memory_bridge;
-pub mod meta_agent;
 // V0.4.2 F74 — one-shot migration (V0.4.1 → V0.4.2 config.yaml fold).
 pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
@@ -70,10 +75,6 @@ pub mod plugin_resolution;
 pub mod progress;
 pub mod projects;
 pub mod queries;
-// v0.8.7 W3 DC.1 — offline, vendored agency-agents role catalog (manifest
-// parse + search + find). Pure data, no network: the HTTP importer lives in
-// `ccteam-im` so this leaf crate stays free of an async HTTP dependency.
-pub mod role_catalog;
 // v0.8.6 W5b ResDisk — read-side reader for project-scoped agent roles
 // (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
 pub mod roles;
@@ -110,8 +111,12 @@ pub use actions::{
     DecisionInput, SendOptions, SendResult,
 };
 // V0.6.1 F128 + v0.8.6 W5b — agent .md write primitives. `write_role` is
-// the create-or-replace PUT primitive the resource API uses.
-pub use admin_actions::{agent_md_path, change_persona, write_role, AddToolResult};
+// the create-or-replace PUT primitive the resource API uses. v0.8.9 Phase 2
+// adds the skill sibling `write_skill` (`.claude/skills/<id>/SKILL.md`) used
+// by the hub installer.
+pub use admin_actions::{
+    agent_md_path, change_persona, skill_md_path, write_role, write_skill, AddToolResult,
+};
 // V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
 // (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
 pub use advise::{
@@ -166,6 +171,11 @@ pub use handoff::{
     WriteHandoffOptions, DEFAULT_INCLUDE_LAST_N as DEFAULT_HANDOFF_INCLUDE_LAST_N,
     HANDOFFS_DIRNAME, HANDOFF_TEMPLATE,
 };
+// v0.8.9 Phase 2 — ccteam-hub raw-content base (curated marketplace) + the two
+// pure path/filename utilities the `ccteam_im::hub` installer reuses:
+// `raw_url` (joins base + repo-relative path; re-exported as `catalog_raw_url`)
+// and `sanitize_role_stem` (normalizes an install stem to `[a-z0-9_-]`).
+pub use hub::{raw_url as catalog_raw_url, sanitize_role_stem, HUB_RAW_BASE};
 // v0.8.6 — generic config hot-reload wrapper (used by the IM gateway for
 // config.yaml; reusable for any future config file).
 pub use hot_config::HotConfig;
@@ -180,10 +190,6 @@ pub use inbox::{
 pub use memory_bridge::{
     install_into as install_memory_bridge_into, install_memory_bridge, InstallMemoryBridgeOptions,
     MemoryBridgeAction, MemoryBridgeReport,
-};
-pub use meta_agent::{
-    bootstrap_meta_project, clean_stale_meta_layouts, meta_session_name, meta_slug,
-    render_meta_role_prompt, MetaBootstrapReport, META_SESSION_NAME, META_SLUG, META_TEAM_NAME,
 };
 pub use migration::{
     migrate_v041_to_v042, migrate_workflow_to_ccteam_dir, render_migration_report,
@@ -211,7 +217,10 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
-pub use paths::{agent_tasks_root, agent_teams_root, canonical_home_dirs, teams_progress_path};
+pub use paths::{
+    agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,
+    teams_progress_path,
+};
 pub use plan_approval::{PlanApprovalOnTimeout, PlanApprovalSpec};
 pub use progress::{
     current_agent_sessions, escalation_count, read_all_events, workflow_cost_total,
@@ -229,12 +238,6 @@ pub use queries::{
     count_agent_spawns_within, job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus,
     ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
     WorkflowSummary,
-};
-// v0.8.7 W3 DC.1 — offline agency-agents catalog browse/resolve.
-pub use role_catalog::{
-    all as catalog_all, find_by_id as catalog_find_by_id, raw_url as catalog_raw_url,
-    sanitize_role_stem, search as catalog_search, CatalogEntry, AGENCY_AGENTS_CATALOG,
-    AGENCY_RAW_BASE,
 };
 pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
 pub use screenshot::{
@@ -265,12 +268,12 @@ pub use team_resolver::{
 pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
     merge_project_mcp_json, probe_project, render_project_mcp_json, render_project_settings,
-    render_project_settings_agent_team, render_squad_roster_en, render_squad_roster_zh,
-    render_workflow_agents_block, render_workflow_template, write_global_helper_templates,
-    write_project_settings, write_project_settings_agent_team, EnabledPluginsSetting, Language,
-    ProjectKind, ProjectProbe, SettingsEnv, TeammateInfo, WorkflowAgentEntry, WorkflowPreset,
-    WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS,
-    CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON, PROJECT_SETTINGS_JSON,
+    render_project_settings_agent_team, render_workflow_agents_block, render_workflow_template,
+    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
+    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
+    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
+    CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
+    PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

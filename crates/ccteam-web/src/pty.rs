@@ -37,6 +37,11 @@ use tokio::task::JoinHandle;
 /// historical F56 value so lag behavior downstream is unchanged.
 pub const BROADCAST_CAPACITY: usize = 256;
 
+/// v0.8.8 bug4 — how many lines of the current pane to replay as the first
+/// frame on connect so an idle pane isn't blank. ~one terminal height plus a
+/// little context before the live stream takes over.
+const SCREEN_REPLAY_LINES: usize = 200;
+
 /// Adapter registry. Kept so [`crate::state::AppState`] construction
 /// (`PtyRegistry::new()`) and its `Clone` shape stay stable; all
 /// refcount/FIFO state lives backend-side.
@@ -84,9 +89,24 @@ impl PtyRegistry {
         _paths: &CcteamPaths,
     ) -> Result<Subscription> {
         let id = MuxSessionId::new(tmux_session.to_string());
-        let mut stream = self.backend.subscribe(&id).await?;
 
         let (tx, rx) = broadcast::channel::<Vec<u8>>(BROADCAST_CAPACITY);
+        // v0.8.8 bug4 — replay the current screen on connect. `subscribe`
+        // streams only NEW pane output, so attaching to a live-but-idle pane
+        // (a claude TUI parked at its prompt) renders BLANK until the next
+        // byte. Capture the pane ONCE *before* subscribing (so the snapshot is
+        // never reordered against buffered deltas) and seed it as the first
+        // frame. Best-effort: a capture error / empty result just skips the
+        // replay and the live stream proceeds as before. Fidelity: both
+        // backends now return RAW ANSI bytes from `capture` — tmux via
+        // `capture-pane -e`, rmux via a raw-byte backlog drain
+        // (`output_stream`) — so the seed is a byte-faithful TUI under either.
+        if let Ok(screen) = self.backend.capture(&id, SCREEN_REPLAY_LINES, true).await {
+            if !screen.is_empty() {
+                let _ = tx.send(screen);
+            }
+        }
+        let mut stream = self.backend.subscribe(&id).await?;
         // Forwarder: drain the MuxEventStream, fan OutputChunk bytes
         // into the compat channel. The stream owns the backend-side
         // RAII relay guard — when this task is aborted (on Subscription

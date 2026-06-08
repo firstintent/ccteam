@@ -49,3 +49,61 @@ export async function fetchDashboard(): Promise<DashboardRow[]> {
   }
   return (await resp.json()) as DashboardRow[];
 }
+
+/** The created-project resource returned by a 201 from `POST /api/v1/projects`
+ *  (`crates/ccteam-web/src/routes/projects.rs::CreatedProject`). */
+export interface CreatedProject {
+  slug: string;
+  path: string;
+}
+
+/** `POST /api/v1/projects` — scaffold + register a brand-new project so the
+ *  per-session chat "新建项目" flow can then create a session under it.
+ *
+ *  Body `{slug, path}` (team is intentionally omitted so the backend defaults
+ *  it to `dev`). On 2xx returns the created `{slug, path}`.
+ *
+ *  Unlike `sessionsApi.postJson`, this DOES read the JSON error envelope
+ *  (`{ok:false, error}`) on a non-2xx so the caller gets a human-readable
+ *  message — critically, a 409 surfaces "project already exists: <slug>"
+ *  rather than a bare `HTTP 409`. 401 still throws `Error("UNAUTHENTICATED")`
+ *  so the global TokenEntryGate can branch on it. */
+export async function createProject(
+  slug: string,
+  path: string,
+  team?: string,
+): Promise<CreatedProject> {
+  const body: Record<string, unknown> = { slug, path };
+  if (team) body.team = team;
+  let resp: Response;
+  try {
+    resp = await fetch("/api/v1/projects", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
+  }
+  if (resp.status === 401) {
+    throw new Error("UNAUTHENTICATED");
+  }
+  if (!resp.ok) {
+    // The backend returns `{ok:false, error:<msg>}`; lift the message so the
+    // user sees "project already exists: <slug>" / the slug/path complaint,
+    // not just the status code. Fall back to the status if the body is
+    // missing or unparseable.
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const data = (await resp.json()) as { error?: string };
+      if (data && typeof data.error === "string" && data.error.length > 0) {
+        detail = data.error;
+      }
+    } catch {
+      // keep the status-code fallback
+    }
+    throw new Error(detail);
+  }
+  return (await resp.json()) as CreatedProject;
+}

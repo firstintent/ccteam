@@ -107,6 +107,19 @@ fn try_intercept_ask_chat(paths: &CcteamPaths, stdin: &Value) -> Option<Value> {
         .map(str::to_owned)
         .or_else(|| non_empty_env("CCTEAM_CHAT_ROLE"))
         .unwrap_or_default();
+    // v0.8.8 F1 — the firing session's ccteam sid (`s<N>`), so the daemon can
+    // resolve the SPECIFIC session's reply target (post-dedup `(slug, role)`
+    // is no longer unique). Same source priority as the slug/role above:
+    // stdin `ccteam_sid` (HTTP fast-path folds `X-Ccteam-Sid` here) →
+    // `CCTEAM_CHAT_SID` env (cold CLI path). 红线:ccteam `s<N>`,非 Anthropic
+    // session UUID. Empty → the daemon falls back to the on-disk registry.
+    let session_sid = stdin
+        .get("ccteam_sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| non_empty_env("CCTEAM_CHAT_SID"))
+        .unwrap_or_default();
 
     let tool_input = stdin.get("tool_input")?;
     // AskUserQuestion tool_input: { questions: [{ question, header?,
@@ -145,6 +158,7 @@ fn try_intercept_ask_chat(paths: &CcteamPaths, stdin: &Value) -> Option<Value> {
         "params": {
             "slug": slug,
             "role": role,
+            "session_sid": session_sid,
             "question": question,
             "options": options,
             "multi": multi,

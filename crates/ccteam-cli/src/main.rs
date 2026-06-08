@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use ccteam_core::CcteamPaths;
-use commands::{InitMode, InitOptions, OutputFormat};
+use commands::{InitOptions, OutputFormat};
 
 /// Version string shown by `ccteam --version`: the crate version plus the
 /// git commit it was built from (e.g. `0.8.4 (<commit>)`), so a running
@@ -67,7 +67,7 @@ enum Command {
     /// `.claude/agents/*.md` (use `--force` to overwrite them).
     ///
     /// V0.4.1: pass `-i` / `--interactive` to prompt y/n for optional
-    /// global installs (MCP, skill, meta-agent), or `-y` / `--yes`
+    /// global installs (MCP, skill), or `-y` / `--yes`
     /// to install all of them without prompting.
     Init {
         /// V0.4.2 F72: install in this directory instead of the cwd.
@@ -107,34 +107,13 @@ enum Command {
         /// would ask. Useful in scripts / CI.
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
-        /// V0.5.0 F93b: workflow mode for the scaffolded workflow.yaml.
-        /// `artifact-driven` (default) writes the V0.4.6 trigger-graph
-        /// template. `agent-team` writes the `workflow.agent-team.yaml`
-        /// template + `__lead.md` scaffold + `.ccteam/inbox/`.
-        #[arg(long, value_enum, default_value_t = InitMode::ArtifactDriven)]
-        mode: InitMode,
     },
     /// Run the v8.1 gateway daemon (IM gateway plus, by default, the
     /// web UI in the same process). Foreground is the only supported
     /// mode — `ccteam start` is enough; the `--foreground` flag is
     /// accepted for back-compat but no longer required.
     /// Pass `--no-web` to run the gateway without web.
-    ///
-    /// V0.5.0 F93b: when a positional `<slug>` is supplied AND that
-    /// project's workflow.yaml has `mode: agent-team`, `ccteam start`
-    /// switches into "spawn the lead session" flow:
-    ///   - prints a spawn preview (workflow.yaml summary + lead spec)
-    ///   - prompts `[Y/n/attach]` (TTY interactive)
-    ///   - on Y → spawn lead bg session + print attach hint
-    ///   - on attach → spawn + exec `claude attach <id>`
-    ///   - on n → cancel, no side effects
-    ///
-    /// Use `--no-confirm`/`-y` / `--attach` / `--dry-run` to skip the
-    /// prompt in scripted callers.
     Start {
-        /// V0.5.0 F93b: project slug to spawn an agent-team lead for.
-        /// Omit to run the v8.1 gateway daemon.
-        slug: Option<String>,
         /// Back-compat no-op: foreground is the only mode.
         #[arg(long, default_value_t = false, hide = true)]
         foreground: bool,
@@ -188,45 +167,16 @@ enum Command {
         /// flag in CI / headless / unattended runs to skip the probe.
         #[arg(long, default_value_t = false)]
         no_clipboard: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
-        /// `[Y/n/attach]` confirmation prompt and proceed with the
-        /// default `Y` (spawn + print attach hint). Useful for CI /
-        /// scripts.
-        #[arg(short = 'y', long, default_value_t = false)]
-        no_confirm: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, skip the
-        /// prompt and go straight to the `attach` branch (spawn + exec
-        /// `claude attach <id>`).
-        #[arg(long, default_value_t = false)]
-        attach: bool,
-        /// V0.5.0 F93b: when used with a positional `<slug>`, print
-        /// the spawn preview + exit. Does not spawn anything.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-        /// V0.5.0 F97: revive an agent-team mode project after a
-        /// `ccteam stop --cleanup leave-running` (or after the host
-        /// rebooted while the lead was still alive). Reads
-        /// `.ccteam/team-snapshot.json::lead_session_id`, probes the
-        /// `claude --bg` job's `state.json`, and re-arms the F95 watch
-        /// without spawning a new lead. If the prior lead is terminal,
-        /// emits a WARN and falls through to the normal
-        /// `--mode agent-team` spawn flow.
-        #[arg(long, default_value_t = false)]
-        restart_team: bool,
     },
     /// V0.4.1: one-screen aggregate health view. Reports daemon
-    /// heartbeat age, every project's slug + age + recent-event time,
-    /// the last N progress events merged across projects, and the
-    /// embedded-web token (file path + value). Replaces having to grep
-    /// `ls` + `progress` + multiple `doctor` checks.
-    Status {
-        /// How many recent progress events to merge + print.
-        #[arg(long, default_value_t = 5)]
-        tail: usize,
-    },
-    /// Internal commands — hook handlers + meta-agent / MCP integration
+    /// heartbeat age, every project's slug + age + last-event time with
+    /// its tracked sessions (role · vendor · status · sid) nested
+    /// underneath, and the embedded-web token + LAN URL. Replaces having
+    /// to grep `ls` + `session ls` + multiple `doctor` checks.
+    Status,
+    /// Internal commands — hook handlers + MCP integration
     /// points + low-level utilities (mux hook-emit, probe-project, web).
-    /// Not user-facing day to day; meta-agent and the `ccteam-control`
+    /// Not user-facing day to day; the `ccteam-control`
     /// skill drive these. Hidden from top-level help; run
     /// `ccteam internal --help` for the list.
     #[command(hide = true)]
@@ -252,8 +202,8 @@ enum Command {
     ///     `force-kill` with a WARN.
     ///   - `leave-running`: drop the F95 watch entries + mark the
     ///     project `detached: true` in `state.json`, but leave the lead
-    ///     bg job + teammates alive. Subsequent `ccteam start <slug>`
-    ///     refuses unless `--restart-team` is set.
+    ///     bg job + teammates alive (re-attach later via
+    ///     `claude attach <lead_id>`).
     Stop {
         /// V0.5.0 F97: per-slug stop. Reads
         /// `<project>/.ccteam/workflow.yaml::agent_team.cleanup_on_stop`
@@ -291,14 +241,14 @@ enum Command {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
-    /// Role catalog group: `ccteam role <search|add|list>`.
+    /// Role / plugin marketplace group: `ccteam role <search|add|list>`.
     ///
-    /// Browse the bundled agency-agents role catalog (`search`, offline —
-    /// no network), one-shot install a role into the project's
-    /// `.claude/agents/` (`add <id>`, fetches the role `.md` over HTTP), or
-    /// list the roles already installed in a project (`list`, wraps the
-    /// resource-API reader). This is a different noun from `session role`
-    /// (which switches a *live* chat session's role inside the daemon).
+    /// Browse the curated ccteam-hub marketplace (`search`), one-shot install
+    /// a plugin into the project's `.claude/` (`add <id>`, fetches + sha256-
+    /// verifies the body over HTTPS), or list the roles already installed in a
+    /// project (`list`, wraps the resource-API reader). This is a different
+    /// noun from `session role` (which switches a *live* chat session's role
+    /// inside the daemon).
     Role {
         #[command(subcommand)]
         cmd: RoleCommand,
@@ -315,8 +265,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         tool_surface: bool,
         // v0.8.6 Item 4 — the setup actions formerly exposed here
-        // (`--install-mcp` / `--install-skill` / `--install-meta-agent` /
-        // `--install-all`) moved to `ccteam config`. `doctor` is now
+        // (`--install-mcp` / `--install-skill` / `--install-all`) moved to
+        // `ccteam config`. `doctor` is now
         // diagnostics / self-check / repair only.
         /// M4.2: write `~/.claude/rules/ccteam-lessons-<team>.md`
         /// with `<!-- ccteam-managed:lessons begin/end -->` markers + `paths:`
@@ -494,24 +444,24 @@ enum Command {
 /// `mcp__ccteam__admin_*` / `mcp__ccteam__chat_*` MCP tools.
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<role>`).
+    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<sid>`).
     ///
     /// Read-only control-plane enumeration: lists session names from the mux
     /// backend (never capture-pane) and reconciles them against the daemon's
     /// persisted registry, flagging orphans (live but untracked) and registered
     /// sessions that are not running. Attach one with
-    /// `ccteam session attach <slug> [role]`.
+    /// `ccteam session attach <slug> [sid]`.
     Ls,
     /// Attach to a session. Reaches a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<role>`) first; with `<slug>` alone, attaches when
+    /// (`ccteam-chat-<slug>-<sid>`) first; with `<slug>` alone, attaches when
     /// the slug has exactly one live chat session, else lists them to
     /// disambiguate. Falls back to the project session (`ccteam-<slug>`) when
     /// no live chat session matches.
     Attach {
         slug: String,
-        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
         /// Omit to auto-resolve a single live chat session for `<slug>`.
-        role: Option<String>,
+        sid: Option<String>,
     },
     /// Pause auto-dispatch for one project. Sets `user_pause_pending`
     /// so the workflow loop stops handing the project fresh work; never
@@ -717,16 +667,16 @@ enum ProjectCommand {
     },
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role` subcommand group. Browse the bundled
-/// agency-agents catalog and one-shot install a role into a project's
-/// `.claude/agents/`. Distinct from `session role` (the live in-daemon role
-/// switch): these are one-shot project-file catalog/import operations.
+/// v0.8.9 Phase 2 — `ccteam role` subcommand group. Browse the curated
+/// ccteam-hub marketplace and one-shot install a plugin into a project's
+/// `.claude/`. Distinct from `session role` (the live in-daemon role switch):
+/// these are one-shot project-file marketplace/install operations.
 #[derive(Subcommand)]
 enum RoleCommand {
-    /// Search the bundled agency-agents catalog (offline — no network).
-    /// Matches the query (case-insensitive) against id / division /
-    /// name / description. An empty query lists the whole catalog. Each
-    /// row prints the catalog `id` to pass to `ccteam role add <id>`.
+    /// Search the curated ccteam-hub marketplace. Matches the query
+    /// (case-insensitive) against each plugin's id / name / description /
+    /// tags. An empty query lists everything. Each row prints the plugin
+    /// `id` to pass to `ccteam role add <id>`.
     Search {
         /// Substring query. Omit (or pass "") to list everything.
         #[arg(default_value = "")]
@@ -734,15 +684,15 @@ enum RoleCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install a catalog role into a project's `.claude/agents/`. Fetches
-    /// the role `.md` from the upstream raw host and writes it verbatim
-    /// (the file is already Claude-native — no conversion). On success,
-    /// prints a hint to `/role <role>` to switch to it in a chat.
+    /// Install a ccteam-hub plugin into a project's `.claude/`. Fetches the
+    /// body from the hub, verifies its sha256 against the index, and writes it
+    /// verbatim (the file is already Claude-native — no conversion). On
+    /// success, prints a hint to `/role <role>` to switch to it in a chat.
     Add {
-        /// Catalog id (as shown by `ccteam role search`).
+        /// Plugin id (as shown by `ccteam role search`).
         id: String,
-        /// Rename the installed role (file stem). Default: the catalog
-        /// entry's name. Sanitized to `[a-z0-9_-]`.
+        /// Rename the installed plugin (file stem). Default: the plugin
+        /// `id`. Sanitized to `[a-z0-9_-]`.
         #[arg(long = "as", value_name = "ROLE")]
         as_role: Option<String>,
         /// Target project slug (resolved via `~/.ccteam/config.yaml`).
@@ -768,8 +718,8 @@ enum RoleCommand {
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
 /// server, low-level session utilities (peek / progress / send / spawn /
 /// resume / attach), the mux hook-emit client, the project probe, and the
-/// standalone web server. Not user-facing day to day; the meta-agent and
-/// the `ccteam-control` skill drive these.
+/// standalone web server. Not user-facing day to day; the
+/// `ccteam-control` skill drives these.
 #[derive(Subcommand)]
 enum InternalCommand {
     /// Hook handlers invoked by Claude Code per project settings.json.
@@ -785,24 +735,24 @@ enum InternalCommand {
     /// daily-driver claude sessions see the ccteam tool surface.
     McpServe,
     /// Attach to a session. Resolves a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<role>`) first: `<slug> <role>` (or a full session
+    /// (`ccteam-chat-<slug>-<sid>`) first: `<slug> <sid>` (or a full session
     /// name) is deterministic; with `<slug>` alone, attaches when the slug has
     /// exactly one live chat session, else lists them to disambiguate. Falls
     /// back to the project session (`ccteam-<slug>`) when no live chat session
     /// matches.
     Attach {
         slug: String,
-        /// Chat-mode role (the trailing segment of `ccteam-chat-<slug>-<role>`).
+        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
         /// Omit to auto-resolve a single live chat session for `<slug>`.
-        role: Option<String>,
+        sid: Option<String>,
     },
     /// Capture the project's pane content without attaching. Resolves a
-    /// live chat session (`ccteam-chat-<slug>-<role>`) first, falling back
+    /// live chat session (`ccteam-chat-<slug>-<sid>`) first, falling back
     /// to the project pane (`ccteam-<slug>`) — same resolution as `attach`.
     Peek {
         slug: String,
-        /// Chat-mode role; omit to auto-resolve a single live chat session.
-        role: Option<String>,
+        /// Chat session id; omit to auto-resolve a single live chat session.
+        sid: Option<String>,
     },
     /// Print the project's progress.jsonl, optionally tailing.
     Progress {
@@ -1006,7 +956,6 @@ fn main() -> Result<()> {
             reset_agents,
             interactive,
             yes,
-            mode,
         } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
@@ -1019,14 +968,12 @@ fn main() -> Result<()> {
                     reset_agents,
                     interactive,
                     yes,
-                    mode,
                 },
             )?;
             print!("{report}");
             Ok(())
         }
         Command::Start {
-            slug,
             foreground: _,
             tick_seconds,
             skip_tool_check,
@@ -1037,48 +984,20 @@ fn main() -> Result<()> {
             web_no_auth,
             web_token_file,
             no_clipboard,
-            no_confirm,
-            attach,
-            dry_run,
-            restart_team,
-        } => match slug {
-            Some(s) => {
-                // V0.5.0 F93b: per-slug spawn flow. Reads workflow.yaml
-                // to decide; agent-team mode does the [Y/n/attach]
-                // spawn; artifact-driven mode bails with friendly hint.
-                // V0.5.0 F97: --restart-team revives a `leave-running`
-                // detached lead by re-arming the watch without spawning.
-                let paths = CcteamPaths::from_env()?;
-                let body = commands::run_start_agent_team(
-                    &paths,
-                    &s,
-                    commands::StartAgentTeamOptions {
-                        no_confirm,
-                        attach,
-                        dry_run,
-                        restart_team,
-                    },
-                )?;
-                if dry_run {
-                    print!("{body}");
-                }
-                Ok(())
-            }
-            None => run_start(
-                tick_seconds,
-                skip_tool_check,
-                claude_argv,
-                StartWebOpts {
-                    disabled: no_web,
-                    bind: web_bind,
-                    no_auth: web_no_auth,
-                    token_file: web_token_file,
-                    no_clipboard,
-                },
-                StartImdOpts { disabled: no_imd },
-            ),
-        },
-        Command::Status { tail } => run_status(tail),
+        } => run_start(
+            tick_seconds,
+            skip_tool_check,
+            claude_argv,
+            StartWebOpts {
+                disabled: no_web,
+                bind: web_bind,
+                no_auth: web_no_auth,
+                token_file: web_token_file,
+                no_clipboard,
+            },
+            StartImdOpts { disabled: no_imd },
+        ),
+        Command::Status => run_status(),
         Command::Internal { cmd } => run_internal(cmd),
         Command::Stop { slug, stop_timeout } => match slug {
             // V0.5.0 F97 — per-slug agent-team cleanup.
@@ -1256,7 +1175,7 @@ fn run_config(args: Vec<String>) -> Result<()> {
 fn run_session(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Ls => commands::run_sessions(),
-        SessionCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
+        SessionCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
         SessionCommand::Pause { slug } => run_pause(&slug),
         SessionCommand::Resume { slug } => run_resume(&slug),
         SessionCommand::Role { slug, sid, role } => run_session_role(&slug, &sid, &role),
@@ -1343,7 +1262,8 @@ fn run_session_role(slug: &str, sid: &str, role: &str) -> Result<()> {
 fn run_role(cmd: RoleCommand) -> Result<()> {
     match cmd {
         RoleCommand::Search { query, format } => {
-            let out = commands::run_role_search(&query, format)?;
+            let paths = CcteamPaths::from_env()?;
+            let out = commands::run_role_search(&paths, &query, format)?;
             print!("{out}");
             Ok(())
         }
@@ -1392,8 +1312,8 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::McpServe => run_mcp_serve(),
-        InternalCommand::Attach { slug, role } => run_internal_attach(&slug, role.as_deref()),
-        InternalCommand::Peek { slug, role } => run_internal_peek(&slug, role.as_deref()),
+        InternalCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
+        InternalCommand::Peek { slug, sid } => run_internal_peek(&slug, sid.as_deref()),
         InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
         InternalCommand::Resume { slug } => run_resume(&slug),
         InternalCommand::Send {
@@ -1530,13 +1450,13 @@ fn run_mux_hook_emit(
 // lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
 // web). Status check is `ccteam doctor` (heartbeat file probe).
 
-/// `ccteam session attach <slug> [role]` / `ccteam internal attach <slug>
-/// [role]` — reach gateway chat-mode bot
+/// `ccteam session attach <slug> [sid]` / `ccteam internal attach <slug>
+/// [sid]` — reach gateway chat-mode bot
 /// sessions first (the project-oriented [`commands::run_attach`] cannot see
 /// `ccteam-chat-*`), then fall back to the project session when no live chat
 /// session matches `slug`.
-fn run_internal_attach(slug: &str, role: Option<&str>) -> Result<()> {
-    if commands::try_attach_chat_session(slug, role)? {
+fn run_internal_attach(slug: &str, sid: Option<&str>) -> Result<()> {
+    if commands::try_attach_chat_session(slug, sid)? {
         return Ok(());
     }
     let paths = CcteamPaths::from_env()?;
@@ -1751,6 +1671,17 @@ fn run_start(
     );
 
     let paths = CcteamPaths::from_env()?;
+
+    // Ensure the global `~/.ccteam/` home (canonical dirs +
+    // `hooks/hook.sh` dispatcher) is complete BEFORE the daemon starts
+    // serving, so any session it spawns — including projects created via
+    // the web / IM path while the daemon is up — finds the hook.sh the
+    // project `.claude/settings.local.json` references. Idempotent.
+    // Best-effort: a failure here must not crash the daemon (the
+    // per-create-path `ensure_ccteam_home` is the real safety net).
+    if let Err(err) = ccteam_core::ensure_ccteam_home(&paths) {
+        tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
+    }
 
     // V0.4.0 F60: the shipped team seed writer was deleted with the
     // phase machinery (F63 will reintroduce a workflow seed). Daemon
@@ -2358,30 +2289,31 @@ async fn execute_chat_send_file(
     })
 }
 
-/// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the
-/// `(slug, role)` the `chat_send_file` / `interaction/ask` args name, by
-/// looking up the gateway's in-memory session map. The gateway guard is
-/// taken and dropped INSIDE this fn (the lookup is sync + holds no `.await`)
-/// so callers never hold it across an fs read / send. `None` when no gateway
-/// handle, no `slug`/`role`, or no tracked session matches.
+/// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the firing
+/// session the `chat_send_file` args name, by looking up the gateway's
+/// in-memory session map. The gateway guard is taken and dropped INSIDE this
+/// fn (the lookup is sync + holds no `.await`) so callers never hold it across
+/// an fs read / send. `None` when no gateway handle, no firing sid, or no
+/// tracked session matches.
+///
+/// v0.8.8 F1 — keyed by the firing session's ccteam sid (`_caller_sid`,
+/// injected by the in-pane `forward_chat_send_file` forwarder from
+/// `CCTEAM_CHAT_SID`): post-dedup `(slug, role)` is no longer unique, so the
+/// sid is the only safe way to reach the SPECIFIC session's reply target.
 async fn resolve_live_reply_target(
     args: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
 ) -> Option<(String, String)> {
     let gw = gateway?;
-    let slug = args
-        .get("slug")
+    let sid = args
+        .get("_caller_sid")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let role = args
-        .get("role")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if slug.is_empty() || role.is_empty() {
+    if sid.is_empty() {
         return None;
     }
     let guard = gw.lock().await;
-    guard.reply_target_for(slug, role)
+    guard.reply_target_for(sid)
 }
 
 fn run_chat_send_file(
@@ -2564,15 +2496,24 @@ async fn execute_interaction_ask(
     }
 
     // Resolve addressing first — no point registering a pending we can't show.
-    // v0.8.7 (FIX-1) — prefer the live (project, role) session's reply target
-    // (resolve under the gateway lock, drop the guard before the long await —
-    // the lookup is sync), falling back to the on-disk registry. Lets an
+    // v0.8.7 (FIX-1) — prefer the live firing session's reply target (resolve
+    // under the gateway lock, drop the guard before the long await — the
+    // lookup is sync), falling back to the on-disk registry. Lets an
     // actively-chatting agent ask the user a question without a prior
     // `chat_register_bot`.
+    //
+    // v0.8.8 F1 — keyed by the firing session's ccteam sid (`session_sid`,
+    // forwarded by the `intercept_ask` hook from `CCTEAM_CHAT_SID`):
+    // post-dedup `(slug, role)` is no longer unique. Empty sid → skip the live
+    // lookup and fall straight to the registry.
+    let session_sid = params
+        .get("session_sid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let live_target = match gateway {
-        Some(gw) if !slug.is_empty() && !role.is_empty() => {
+        Some(gw) if !session_sid.is_empty() => {
             let guard = gw.lock().await;
-            guard.reply_target_for(slug, role)
+            guard.reply_target_for(session_sid)
         }
         _ => None,
     };
@@ -2763,16 +2704,27 @@ async fn execute_permission_ask(
         ));
     };
 
-    // Resolve the firing session's gateway sid (for the prompt label). The
-    // pane is uniquely keyed by (slug, role) — same invariant start_session
-    // dedups on. Read-only lookup; drop the gateway guard immediately (never
-    // held across the long await — lock discipline §7-1).
-    let sid_label = match gateway {
-        Some(gw) => {
+    // Resolve the firing session's gateway sid (for the prompt label).
+    //
+    // v0.8.8 F1 — the hook reports the firing session's own ccteam sid via
+    // `session_sid` (sourced from `CCTEAM_CHAT_SID` / the `X-Ccteam-Sid`
+    // header). Post-dedup `(slug, role)` is no longer unique, so we trust the
+    // hook-reported sid and only CONFIRM it against the live session map
+    // (`session_sid_for(sid)` → the canonical id when tracked). Read-only
+    // lookup; drop the gateway guard immediately (never held across the long
+    // await — lock discipline §7-1). 红线:这里用的是 ccteam 的 `s<N>` sid,
+    // 不是 Anthropic 的 `session_id` UUID。
+    let session_sid = params
+        .get("session_sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let sid_label = match (gateway, session_sid.is_empty()) {
+        (Some(gw), false) => {
             let guard = gw.lock().await;
-            guard.session_sid_for(slug, role)
+            guard.session_sid_for(session_sid)
         }
-        None => None,
+        _ => None,
     };
     let session_desc = match (&sid_label, role.is_empty()) {
         (Some(sid), false) => format!("session {sid} ({role})"),
@@ -3250,10 +3202,12 @@ async fn run_session_collect(
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
 
-    // Tail the ccteam-owned transcript mirror (same source as chat_history).
+    // Tail the ccteam-owned transcript mirror.
+    // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
+    // not role, so read by `resolved.sid` (role is a content label only).
     let all = ccteam_harness::execution::turns_mirror::read_all_turns(
         &resolved.project_dir,
-        &resolved.role,
+        &resolved.sid,
     )
     .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
 
@@ -3545,28 +3499,57 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
     })
 }
 
-fn run_status(tail: usize) -> Result<()> {
+fn run_status() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     use ccteam_core::check_daemon_health;
 
     println!("ccteam status");
     println!();
 
-    // Daemon health
+    // ① Daemon health.
     let health = check_daemon_health(&paths);
+    let daemon_up = health.is_healthy();
     println!("  daemon:  {}", health.describe());
     println!();
 
-    // Projects
+    // ② Projects, each with its tracked sessions nested underneath.
+    //
+    // v0.8.8 F3 — the old flat "projects" / "running sessions" / "recent
+    // events" trio is collapsed into one tree: a project row (slug · age ·
+    // last-event · STUCK/OK verdict) followed by its sessions, grouped from
+    // the daemon's persisted records via `tracked_chat_sessions` (same
+    // out-of-process source `session ls` uses, so the two never drift).
     let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
+
+    // Group tracked sessions by project slug. A missing / unreadable registry
+    // is non-fatal — just an empty map (no sessions shown).
+    let state_path = ccteam_im::default_gateway_state_path();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
+    let mut sessions_by_project: std::collections::BTreeMap<
+        String,
+        Vec<ccteam_im::gateway::TrackedSessionRow>,
+    > = std::collections::BTreeMap::new();
+    for row in tracked {
+        sessions_by_project
+            .entry(row.project.clone())
+            .or_default()
+            .push(row);
+    }
+
+    // tracked ⇒ live when the daemon is up; else degrade (matches `session ls`).
+    let session_status = if daemon_up {
+        "live"
+    } else {
+        "registered (daemon down)"
+    };
+
     if projects.is_empty() {
         println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
     } else {
         println!("  projects ({}):", projects.len());
         // Classify each project's silence into a short verdict so the
         // operator reads "STUCK" instead of decoding raw seconds. Reuses
-        // the same `commands::stall_level` tiers the `--json` path emits,
-        // keeping the human + machine views consistent.
+        // `commands::stall_verdict` so the human + JSON views stay consistent.
         let mut needs_attention: Vec<(&str, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
@@ -3579,6 +3562,24 @@ fn run_status(tail: usize) -> Result<()> {
                 "    {:<32}  age {:>8}  last-event {:>8}  {}",
                 p.state.slug, age, silent, verdict
             );
+
+            // Nested session rows for this project. The gateway state carries
+            // no per-session timestamp, so the session "last-event" reuses the
+            // project-level silence (a glance-level proxy); `-` when unknown.
+            if let Some(rows) = sessions_by_project.get(&p.state.slug) {
+                let last_event = if p.stall_silent_seconds > 0 {
+                    silent.clone()
+                } else {
+                    "-".to_string()
+                };
+                for s in rows {
+                    let role = if s.role.is_empty() { "-" } else { &s.role };
+                    println!(
+                        "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
+                        role, s.vendor, session_status, s.sid, last_event
+                    );
+                }
+            }
         }
         // One actionable hint line per warn-or-higher project so the
         // operator knows the exact peek → attach takeover sequence.
@@ -3588,84 +3589,24 @@ fn run_status(tail: usize) -> Result<()> {
     }
     println!();
 
-    // V0.4.7 — running sessions across all projects. Reuses the
-    // same `active_sessions` core function the web dashboard reads,
-    // so CLI / SPA never drift on what they think is alive.
-    if !projects.is_empty() {
-        let mut rows: Vec<(String, ccteam_core::ActiveSessionInfo)> = Vec::new();
-        for p in &projects {
-            match ccteam_core::active_sessions(&p.state.slug, &paths) {
-                Ok(list) => rows.extend(list.into_iter().map(|s| (p.state.slug.clone(), s))),
-                Err(_) => continue,
-            }
-        }
-        if !rows.is_empty() {
-            println!("  running sessions ({}):", rows.len());
-            for (slug, s) in &rows {
-                let model = s.model.as_deref().unwrap_or("—");
-                let ctx = s
-                    .context_remaining_pct
-                    .map(|p| format!("ctx {:>3.0}%", p))
-                    .unwrap_or_else(|| "ctx   —".into());
-                let age = parse_rfc3339_age_secs(&s.started_at)
-                    .map(humanize_secs)
-                    .unwrap_or_else(|| "?".into());
-                let short_job = s
-                    .job_id
-                    .as_deref()
-                    .map(|j| j.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "—".into());
-                println!(
-                    "    {:<24}  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} ago",
-                    slug, s.role, short_job, model, ctx, s.cost_usd, age
-                );
-            }
-            println!("    tip: `claude attach <id>` to take over a session live");
-            println!();
-        }
-    }
-
-    // Recent events across all projects (merged)
-    if tail > 0 && !projects.is_empty() {
-        println!("  recent events (last {}):", tail);
-        let mut all_events: Vec<(String, serde_json::Value)> = Vec::new();
-        for p in &projects {
-            let evs = ccteam_core::progress::read_all_events(&paths.progress_jsonl(&p.state.slug))
-                .unwrap_or_default();
-            for e in evs {
-                all_events.push((p.state.slug.clone(), e));
-            }
-        }
-        // Sort by event ts string (RFC3339 sorts lexicographically).
-        all_events.sort_by_key(|(_, e)| {
-            e.get("ts")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default()
-        });
-        for (slug, evt) in all_events.iter().rev().take(tail).rev() {
-            let kind = evt.get("event").and_then(|v| v.as_str()).unwrap_or("?");
-            let ts = evt.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-            let role = evt.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let role_s = if role.is_empty() {
-                String::new()
-            } else {
-                format!(" role={role}")
-            };
-            println!("    [{ts}] {slug} {kind}{role_s}");
-        }
-        println!();
-    }
-
-    // Web token
+    // ④ Web token + URL (two lines).
+    //
+    // - `web token:` prints the BARE hex (no `ccteam:` prefix) so it can be
+    //   copy-pasted into tools that add their own prefixing.
+    // - `web url:` embeds the token WITH the `ccteam:` prefix (the form the web
+    //   console expects in the query string) at the LAN IP + port 7331.
     let token_path = ccteam_web::token::default_token_path(&paths);
     if token_path.exists() {
-        match std::fs::read_to_string(&token_path) {
-            Ok(hex) => println!(
-                "  web token: ccteam:{}  ({})",
-                hex.trim(),
-                token_path.display()
-            ),
+        match ccteam_web::token::load_existing(&token_path) {
+            Ok(hex) => {
+                println!("  web token: {hex}");
+                match first_lan_ipv4() {
+                    Some(ip) => {
+                        println!("  web url:   http://{ip}:7331/?token=ccteam:{hex}")
+                    }
+                    None => println!("  web url:   <no LAN ip detected> (use http://localhost:7331/?token=ccteam:{hex})"),
+                }
+            }
             Err(_) => println!("  web token: <unreadable> ({})", token_path.display()),
         }
     } else {
@@ -3677,19 +3618,62 @@ fn run_status(tail: usize) -> Result<()> {
     Ok(())
 }
 
-/// Parse an RFC3339 timestamp + return seconds-since for the
-/// status / show table. Returns None on unparseable input.
-fn parse_rfc3339_age_secs(ts: &str) -> Option<u64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    let now = chrono::Utc::now();
-    let secs = now
-        .signed_duration_since(dt.with_timezone(&chrono::Utc))
-        .num_seconds();
-    if secs < 0 {
-        Some(0)
-    } else {
-        Some(secs as u64)
+/// v0.8.8 F3 — predicate for a LAN-reachable IPv4: a private
+/// (RFC1918) address that is neither loopback (`127.0.0.0/8`) nor
+/// link-local (`169.254.0.0/16`). Pure so the interface-walk in
+/// [`first_lan_ipv4`] can be unit-tested without real interfaces.
+fn is_lan_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_link_local() && ip.is_private()
+}
+
+/// v0.8.8 F3 — first non-loopback, non-link-local, private IPv4 of any local
+/// interface, for the `ccteam status` web URL line (so the operator gets a
+/// LAN-reachable address, not `127.0.0.1`). Returns `None` when no private
+/// IPv4 is configured (the URL line then degrades to a localhost hint).
+///
+/// Uses `getifaddrs(3)` directly — `ccteam-cli` already depends on `libc`
+/// (zero new deps). The unsafe FFI is fully contained here: it walks the
+/// linked list, reads only `AF_INET` entries, converts the network-order
+/// `s_addr` to host order for `Ipv4Addr`, and always `freeifaddrs`-frees the
+/// list before returning.
+#[cfg(unix)]
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+
+    // SAFETY: `getifaddrs` writes a heap-allocated linked list into `ifap` on
+    // success (returns 0) which we must `freeifaddrs`. We only read fields
+    // through valid non-null pointers and free exactly once before returning.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut found: Option<Ipv4Addr> = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            let addr = ifa.ifa_addr;
+            if !addr.is_null() && (*addr).sa_family as i32 == libc::AF_INET {
+                // The generic `sockaddr` for an AF_INET entry is really a
+                // `sockaddr_in`; read its network-order `s_addr`.
+                let sin = &*(addr as *const libc::sockaddr_in);
+                let be = sin.sin_addr.s_addr; // network byte order
+                let ip = Ipv4Addr::from(u32::from_be(be));
+                if is_lan_ipv4(&ip) {
+                    found = Some(ip);
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found
     }
+}
+
+#[cfg(not(unix))]
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    None
 }
 
 fn humanize_secs(s: u64) -> String {
@@ -3902,9 +3886,9 @@ fn run_show(slug: &str, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn run_internal_peek(slug: &str, role: Option<&str>) -> Result<()> {
+fn run_internal_peek(slug: &str, sid: Option<&str>) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
-    let body = commands::run_peek_with_role(&paths, slug, role)?;
+    let body = commands::run_peek_with_role(&paths, slug, sid)?;
     print!("{body}");
     Ok(())
 }
@@ -4341,7 +4325,7 @@ mod session_tool_tests {
         )));
         // Foreign tool name.
         assert!(!is_session_tool_call(&call(
-            "ccteam__chat_send_input",
+            "ccteam__chat_register_bot",
             json!({})
         )));
         // Right name, wrong method.
@@ -4608,5 +4592,36 @@ mod session_tool_tests {
         let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20);
         assert_eq!(rows_u.len(), 3);
         assert!(!trunc_u);
+    }
+}
+
+#[cfg(test)]
+mod lan_ip_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// v0.8.8 F3 — the LAN predicate accepts only private addresses and
+    /// rejects loopback / link-local. Exercises the exact tiers the recon
+    /// test plan named (192.168 / 127.0.0.1 / 169.254).
+    #[test]
+    fn is_lan_ipv4_filters_loopback_and_linklocal() {
+        // Private (RFC1918) → accepted.
+        assert!(is_lan_ipv4(&Ipv4Addr::new(192, 168, 1, 5)));
+        assert!(is_lan_ipv4(&Ipv4Addr::new(10, 0, 0, 7)));
+        assert!(is_lan_ipv4(&Ipv4Addr::new(172, 16, 3, 9)));
+        // Loopback / link-local / public → rejected.
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(169, 254, 10, 10)));
+        assert!(!is_lan_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    /// v0.8.8 F3 — querying real interfaces must never panic, and any
+    /// address it returns must satisfy the LAN predicate (no loopback /
+    /// link-local / public leaking into the web URL).
+    #[test]
+    fn first_lan_ipv4_does_not_panic_and_is_lan() {
+        if let Some(ip) = first_lan_ipv4() {
+            assert!(is_lan_ipv4(&ip), "returned non-LAN ip: {ip}");
+        }
     }
 }

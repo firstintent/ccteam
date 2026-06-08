@@ -181,20 +181,20 @@ fn legacy_v05_unprefixed_names_are_gone() {
 
 #[test]
 fn chat_and_advise_real_tools_dispatch_through_server() {
-    // V0.6.5 F147 + F152 — both `chat_send_input` (F147) and
-    // `advise_vote` (F152) are real tools backed by file-system
-    // control plane (chat) / per-vendor advisor calls + budget ledger
-    // (advise). Spot-check both group shapes:
+    // V0.6.5 F152 + F146 — both `advise_vote` (F152) and the chat
+    // lifecycle tools (F146) are real tools backed by per-vendor advisor
+    // calls + budget ledger (advise) / file-system control plane (chat).
+    // Spot-check both group shapes:
     //
     // - Schema is listed.
     // - `tools/call advise_vote` with a pre-seeded budget-exceeded
     //   ledger returns a structured `ok:false, error:budget_exceeded`
     //   body without invoking any vendor subprocess (so the test is
     //   hermetic — no `claude` / `codex` binary required on PATH).
-    // - `tools/call chat_send_input` exercises the happy path so we
-    //   can be sure the dispatcher is still wired.
+    // - `tools/call chat_list_bots` exercises the happy path so we
+    //   can be sure the chat dispatcher is still wired.
     let names = list_tool_names();
-    assert!(names.contains(&"ccteam__chat_send_input".to_string()));
+    assert!(names.contains(&"ccteam__chat_list_bots".to_string()));
     assert!(names.contains(&"ccteam__advise_vote".to_string()));
     assert!(names.contains(&"ccteam__advise_parallel".to_string()));
 
@@ -233,31 +233,28 @@ fn chat_and_advise_real_tools_dispatch_through_server() {
         "advise_vote body should carry ok:false; got: {text}"
     );
 
-    // chat_send_input — F147 real tool. Exercise the happy path so
-    // we can be sure the dispatcher is wired (no NotImplemented).
+    // chat_list_bots — F146 real tool. Exercise the happy path so we
+    // can be sure the chat dispatcher is wired (file-system control
+    // plane, no daemon required). Empty registry → `ok:true, bots:[]`.
     srv.send(&json!({
         "jsonrpc": "2.0", "id": 3,
         "method": "tools/call",
         "params": {
-            "name": "ccteam__chat_send_input",
-            "arguments": {
-                "workflow_slug": "demo",
-                "role": "helper",
-                "content": "hello",
-            }
+            "name": "ccteam__chat_list_bots",
+            "arguments": {}
         }
     }));
     let resp = srv.recv();
     assert_eq!(
         resp["result"]["isError"], false,
-        "real chat_send_input should land as result not isError"
+        "real chat_list_bots should land as result not isError"
     );
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("content[0].text");
     assert!(
         text.contains("\"ok\": true"),
-        "chat_send_input body should report ok:true; got: {text}"
+        "chat_list_bots body should report ok:true; got: {text}"
     );
     srv.shutdown();
 }

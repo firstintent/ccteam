@@ -48,8 +48,8 @@ pub const SCALAR_JS_PATH: &str = "/api/docs/scalar-standalone.js";
 ///
 /// Pinned version: **`@scalar/api-reference@1.58.0`** (`dist/browser/
 /// standalone.js`). Refresh = chore: re-fetch the pinned tarball build and
-/// overwrite the vendored file (mirrors the `workflow_templates/` /
-/// `agency_agents_catalog.json` vendoring pattern). The standalone build
+/// overwrite the vendored file (mirrors the `workflow_templates/` vendoring
+/// pattern). The standalone build
 /// auto-bootstraps from the `<script id="api-reference" type="application/
 /// json">` spec block on load (`window.Scalar` self-init).
 pub const SCALAR_JS: &str = include_str!("../../assets/scalar-standalone.js");
@@ -119,12 +119,15 @@ async fn serve_scalar_js() -> impl IntoResponse {
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
+        (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap)"),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
         (name = "teams", description = "Read-only Anthropic Agent Teams mirror"),
         (name = "auth", description = "Web-token introspection"),
+        (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
+        (name = "marketplace", description = "ccteam-hub plugin catalog (browse / body preview / per-project install)"),
     ),
 )]
 struct ApiDoc;
@@ -136,6 +139,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         // capabilities
         .routes(routes!(super::capabilities::handle_capabilities))
+        // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
+        .routes(routes!(super::status::handle_status))
         // projects — GET list + POST create share `/api/v1/projects`;
         // GET detail + DELETE share `/api/v1/projects/{slug}`.
         .routes(routes!(
@@ -173,6 +178,19 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::sessions_api::handle_session_resolve))
         .routes(routes!(super::sessions_api::handle_session_events))
         .routes(routes!(super::sessions_api::handle_session_stop))
+        // v0.8.8 F4 — IM credential config (masked read + validate-before-persist
+        // PUTs + async telegram chat_id capture). All inside the web-token gate.
+        .routes(routes!(super::im_config::handle_get_im_config))
+        .routes(routes!(super::im_config::handle_put_telegram))
+        .routes(routes!(super::im_config::handle_telegram_chat_id_start))
+        .routes(routes!(super::im_config::handle_telegram_chat_id_poll))
+        .routes(routes!(super::im_config::handle_put_lark))
+        // v0.8.9 Phase 2 — ccteam-hub plugin marketplace: global catalog +
+        // body preview, plus per-project decorated catalog + install.
+        .routes(routes!(super::marketplace::handle_marketplace))
+        .routes(routes!(super::marketplace::handle_marketplace_body))
+        .routes(routes!(super::marketplace::handle_project_marketplace))
+        .routes(routes!(super::marketplace::handle_project_marketplace_install))
         // teams
         .routes(routes!(super::teams_api::handle_list))
         .routes(routes!(super::teams_api::handle_detail))

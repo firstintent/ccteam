@@ -72,34 +72,36 @@ pub struct ToolCallSummary {
     pub summary: Option<String>,
 }
 
-/// Default subdirectory under `<project>/.ccteam/chat/<bot>/`.
+/// Default subdirectory under `<project>/.ccteam/chat/<sid>/`.
+///
+/// v0.8.8 F1 — 这一层的键由 bot_role 改为 **sid**(`s<N>`):同
+/// `(project, role)` 可有多个独立会话,turns / cursor / marker 一律按
+/// sid 隔离,所以两个同 role 会话的历史不互相污染。函数签名(`&str`)不变
+/// —— 调用方负责传 sid 而非 role。
 const CHAT_BASE: &str = ".ccteam/chat";
 
-/// Resolve `<project>/.ccteam/chat/<bot>/turns.jsonl`.
-pub fn turns_jsonl_path(project_dir: &Path, bot_role: &str) -> PathBuf {
-    project_dir
-        .join(CHAT_BASE)
-        .join(bot_role)
-        .join("turns.jsonl")
+/// Resolve `<project>/.ccteam/chat/<sid>/turns.jsonl`.
+pub fn turns_jsonl_path(project_dir: &Path, sid: &str) -> PathBuf {
+    project_dir.join(CHAT_BASE).join(sid).join("turns.jsonl")
 }
 
-/// Resolve `<project>/.ccteam/chat/<bot>/`. Created by [`ensure_dir`].
-pub fn chat_dir(project_dir: &Path, bot_role: &str) -> PathBuf {
-    project_dir.join(CHAT_BASE).join(bot_role)
+/// Resolve `<project>/.ccteam/chat/<sid>/`. Created by [`ensure_dir`].
+pub fn chat_dir(project_dir: &Path, sid: &str) -> PathBuf {
+    project_dir.join(CHAT_BASE).join(sid)
 }
 
-/// `mkdir -p <project>/.ccteam/chat/<bot>/`. Idempotent.
-pub fn ensure_dir(project_dir: &Path, bot_role: &str) -> Result<()> {
-    let p = chat_dir(project_dir, bot_role);
+/// `mkdir -p <project>/.ccteam/chat/<sid>/`. Idempotent.
+pub fn ensure_dir(project_dir: &Path, sid: &str) -> Result<()> {
+    let p = chat_dir(project_dir, sid);
     fs::create_dir_all(&p).with_context(|| format!("create {}", p.display()))?;
     Ok(())
 }
 
 /// Append `record` as one JSONL line. Creates parent dir + file when
 /// missing. Returns the absolute path written for caller logging.
-pub fn append_turn(project_dir: &Path, bot_role: &str, record: &TurnRecord) -> Result<PathBuf> {
-    ensure_dir(project_dir, bot_role)?;
-    let path = turns_jsonl_path(project_dir, bot_role);
+pub fn append_turn(project_dir: &Path, sid: &str, record: &TurnRecord) -> Result<PathBuf> {
+    ensure_dir(project_dir, sid)?;
+    let path = turns_jsonl_path(project_dir, sid);
     let line = serde_json::to_string(record)? + "\n";
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -111,10 +113,10 @@ pub fn append_turn(project_dir: &Path, bot_role: &str, record: &TurnRecord) -> R
     Ok(path)
 }
 
-/// Read every parseable record from the bot's turns.jsonl. Returns an
+/// Read every parseable record from the session's turns.jsonl. Returns an
 /// empty Vec when the file is absent (V0.6.0 F108 first-turn case).
-pub fn read_all_turns(project_dir: &Path, bot_role: &str) -> Result<Vec<TurnRecord>> {
-    let path = turns_jsonl_path(project_dir, bot_role);
+pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> {
+    let path = turns_jsonl_path(project_dir, sid);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -138,11 +140,11 @@ pub fn read_all_turns(project_dir: &Path, bot_role: &str) -> Result<Vec<TurnReco
 /// Return the last `n` parseable turns, in chronological order. F118
 /// `rebuild_from_turns_jsonl` uses this to bound the conversation
 /// history it injects into a fresh tmux session.
-pub fn last_n_turns(project_dir: &Path, bot_role: &str, n: usize) -> Result<Vec<TurnRecord>> {
+pub fn last_n_turns(project_dir: &Path, sid: &str, n: usize) -> Result<Vec<TurnRecord>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let all = read_all_turns(project_dir, bot_role)?;
+    let all = read_all_turns(project_dir, sid)?;
     let start = all.len().saturating_sub(n);
     Ok(all[start..].to_vec())
 }

@@ -15,7 +15,7 @@
 //!   `cargo test -p ccteam-harness smoke_rmux_sdk -- --ignored --nocapture`.
 //!
 //! The smoke test does **not** ride on `connect_or_start_with_launcher`
-//! — that API does not exist in `rmux-sdk` 0.3.1. The published SDK
+//! — that API does not exist in `rmux-sdk` 0.5.0. The published SDK
 //! auto-spawns the hidden daemon by invoking `rmux_os::daemon::daemon_binary()`
 //! against the `rmux` binary on `PATH`. ccteam will need a launcher
 //! escape hatch when `ccteam mux daemon` lands in W2 (either upstream
@@ -25,7 +25,8 @@
 use std::time::Duration;
 
 use rmux_sdk::{
-    EnsureSession, EnsureSessionPolicy, ProcessSpec, Rmux, SessionName, TerminalSizeSpec,
+    EnsureSession, EnsureSessionPolicy, PaneOutputChunk, PaneOutputStart, ProcessSpec, Rmux,
+    SessionName, TerminalSizeSpec,
 };
 
 /// Pure compile-link semver-drift canary. Runs on every `cargo test`.
@@ -62,6 +63,24 @@ fn rmux_types_compile_link() {
         .detached(true)
         .size(TerminalSizeSpec::new(200, 50))
         .process(ProcessSpec::shell("echo hello"));
+
+    // Byte-faithful pane-output types `RmuxBackend::{subscribe,capture}`
+    // now depend on. Locking their shape here makes the canary flag any
+    // semver drift the day the bumped lockfile lands:
+    //   - `PaneOutputStart` (the cursor anchor — `Now` for the live tail
+    //     in `subscribe`, `Oldest` for the backlog drain in `capture`),
+    //   - `PaneOutputChunk::Bytes { sequence, bytes }` (the raw byte
+    //     chunk that becomes a verbatim `MuxEvent::OutputChunk`).
+    let _start_now = PaneOutputStart::Now;
+    let _start_oldest = PaneOutputStart::Oldest;
+    let chunk = PaneOutputChunk::Bytes {
+        sequence: 1,
+        bytes: vec![0x1b, b'[', b'0', b'm'],
+    };
+    if let PaneOutputChunk::Bytes { sequence, bytes } = chunk {
+        assert_eq!(sequence, 1);
+        assert_eq!(bytes, vec![0x1b, b'[', b'0', b'm']);
+    }
 }
 
 /// End-to-end smoke against a real rmux daemon. `#[ignore]` because it

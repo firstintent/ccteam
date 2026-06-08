@@ -58,13 +58,6 @@ pub use workflow_templates::{
 pub mod project_probe;
 pub use project_probe::{probe as probe_project, Language, ProjectKind, ProjectProbe};
 
-// Squad teammate roster block appended to chat-squad personas'
-// `.claude/agents/<role>.md` so each bot knows the other bots in its
-// workflow and can `@`-mention them directly (via the daemon-internal
-// mpsc cross-bot channel) instead of trying to spawn Task subagents.
-pub mod squad_roster;
-pub use squad_roster::{render_squad_roster_en, render_squad_roster_zh, TeammateInfo};
-
 /// Per-project ccteam settings template.
 ///
 /// v0.8.6 W2b: rendered output is written to the **local** settings layer
@@ -581,7 +574,11 @@ mod tests {
             root["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1",
             "ccteam owns this env key and overwrites the user's stale value",
         );
-        assert_eq!(root["permissions"]["allow"][0], "*");
+        // ccteam widens permissions via the valid `defaultMode` (newer Claude
+        // Code rejects a bare `"*"` in an `allow` rule). ccteam-spawned sessions
+        // pass `--dangerously-skip-permissions` / `--permission-mode default` on
+        // the CLI (which override settings), so this only governs manual runs.
+        assert_eq!(root["permissions"]["defaultMode"], "bypassPermissions");
         // ccteam owns the hooks block wholesale.
         assert!(root["hooks"]["SessionStart"].is_array());
     }

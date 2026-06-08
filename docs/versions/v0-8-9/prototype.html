@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccteam v0.8.9 — 统一 chat 风格 UI 原型</title>
+<style>
+  /* ---- design tokens (深色 + amber,呼应现有 Tailwind surface-*/amber) ---- */
+  :root{
+    --bg:#0e1014; --s900:#14171d; --s800:#1b1f27; --s700:#262b34; --border:#2a3039;
+    --text:#e7e9ec; --dim:#9aa3ad; --faint:#6b7480;
+    --amber:#f59e0b; --amber-dim:#7a5012; --green:#34d399; --red:#f87171;
+    --claude:#d97757; --codex:#10a37f; --radius:10px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif;
+  }
+  *{box-sizing:border-box} html,body{height:100%}
+  body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+  .app{display:grid;grid-template-columns:248px 1fr;height:100vh}
+  /* ---- sidebar ---- */
+  .side{background:var(--s900);border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+  .brand{height:52px;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid var(--border);font-weight:700}
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--amber)}
+  .brand small{color:var(--faint);font-weight:500;font-size:11px;background:var(--s700);padding:1px 6px;border-radius:6px}
+  .newbtn{margin:12px;padding:9px;border:0;border-radius:var(--radius);background:var(--amber);color:#1a1205;font-weight:700;cursor:pointer}
+  .newbtn:hover{filter:brightness(1.08)}
+  .tree{flex:1;overflow:auto;padding:4px 8px}
+  .proj{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:10px 8px 4px}
+  .sess{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;margin:2px 0}
+  .sess:hover{background:var(--s800)}
+  .sess.active{background:var(--s800);box-shadow:inset 2px 0 0 var(--amber)}
+  .sess .live{width:7px;height:7px;border-radius:50%;background:var(--green);flex:none}
+  .sess .live.off{background:var(--faint)}
+  .sess .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess .sid{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .badge{font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;flex:none}
+  .badge.claude{color:var(--claude);background:#2a1c17}
+  .badge.codex{color:var(--codex);background:#0e2420}
+  .badge.none{color:var(--faint);background:var(--s700)}
+  .nav{border-top:1px solid var(--border);padding:8px}
+  .nav a{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;color:var(--dim);text-decoration:none;cursor:pointer}
+  .nav a:hover{background:var(--s800);color:var(--text)}
+  .nav a.on{background:var(--s800);color:var(--amber)}
+  .nav .ico{width:16px;text-align:center}
+  /* ---- main ---- */
+  .main{display:flex;flex-direction:column;min-width:0;min-height:0}
+  .top{height:52px;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--border);background:var(--s900)}
+  .crumb{font-weight:600;display:flex;align-items:center;gap:8px;min-width:0}
+  .crumb .sep{color:var(--faint)} .crumb .muted{color:var(--dim);font-weight:500}
+  .conn{display:flex;align-items:center;gap:6px;color:var(--green);font-size:12px}
+  .conn .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+  .cost{font-size:12px;font-family:var(--mono);padding:3px 10px;border-radius:20px;background:var(--s800);border:1px solid var(--border);color:var(--dim);cursor:pointer}
+  .cost b{color:var(--text)} .cost.warn{border-color:var(--amber);color:var(--amber)}
+  .spacer{flex:1}
+  .tabs{display:flex;background:var(--s800);border-radius:8px;padding:2px}
+  .tabs button{border:0;background:transparent;color:var(--dim);padding:5px 14px;border-radius:6px;cursor:pointer;font-weight:600}
+  .tabs button.on{background:var(--s700);color:var(--text)}
+  .stop{border:1px solid var(--border);background:transparent;color:var(--dim);padding:6px 12px;border-radius:8px;cursor:pointer}
+  .body{flex:1;overflow:auto;min-height:0}
+  .view{display:none;height:100%} .view.on{display:block}
+  /* ---- chat ---- */
+  .chat{display:flex;flex-direction:column;height:100%}
+  .scroll{flex:1;overflow:auto;padding:20px 22px;display:flex;flex-direction:column;gap:14px}
+  .msg{max-width:760px;padding:11px 14px;border-radius:12px}
+  .msg.u{align-self:flex-end;background:var(--amber-dim);color:#fde9c8;border-bottom-right-radius:4px}
+  .msg.a{align-self:flex-start;background:var(--s800);border:1px solid var(--border);border-bottom-left-radius:4px}
+  .msg .who{font-size:11px;color:var(--faint);margin-bottom:3px}
+  .msg code{font-family:var(--mono);background:#0008;padding:1px 5px;border-radius:4px;font-size:12px}
+  .approve{align-self:flex-start;max-width:760px;border:1px solid var(--amber);background:#1f1707;border-radius:12px;padding:12px 14px}
+  .approve .q{margin-bottom:10px} .approve .q b{color:var(--amber)}
+  .approve .btns{display:flex;gap:8px}
+  .approve button{border:0;border-radius:8px;padding:7px 16px;cursor:pointer;font-weight:700}
+  .ok{background:var(--green);color:#04231a} .no{background:var(--s700);color:var(--text)}
+  .composer{border-top:1px solid var(--border);padding:12px 16px;display:flex;gap:10px;background:var(--s900)}
+  .composer input{flex:1;background:var(--s800);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:11px 14px;outline:none}
+  .composer input:focus{border-color:var(--amber)}
+  .composer .send{background:var(--amber);color:#1a1205;border:0;border-radius:10px;padding:0 18px;font-weight:700;cursor:pointer}
+  /* ---- terminal ---- */
+  .term{height:100%;background:#07090c;padding:16px 18px;font-family:var(--mono);font-size:13px;color:#cdd3da;overflow:auto;white-space:pre-wrap}
+  .term .p{color:var(--green)} .term .c{color:var(--amber)} .term .cur{background:var(--text);color:#07090c}
+  /* ---- generic page (roles/settings) ---- */
+  .page{padding:22px 26px;max-width:880px}
+  .page h2{margin:0 0 4px;font-size:18px} .page .sub{color:var(--dim);margin-bottom:18px}
+  .card{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:12px}
+  .card.row{display:flex;align-items:center;gap:14px;cursor:pointer} .card.row:hover{border-color:var(--amber)}
+  .card .t{font-weight:600} .card .d{color:var(--dim);font-size:13px;margin-top:2px}
+  .field{margin:12px 0} .field label{display:block;color:var(--dim);font-size:12px;margin-bottom:5px}
+  .field input{width:100%;background:var(--s800);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 12px;outline:none;font-family:var(--mono)}
+  .field input:focus{border-color:var(--amber)}
+  .pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px}
+  .pill.ok{color:var(--green);background:#0e2420} .pill.warn{color:var(--amber);background:#231806}
+  .seg{display:inline-flex;background:var(--s800);border-radius:8px;padding:2px;margin-left:auto}
+  .seg button{border:0;background:transparent;color:var(--dim);padding:5px 12px;border-radius:6px;cursor:pointer}
+  .seg button.on{background:var(--s700);color:var(--text)}
+  .save{margin-top:8px;background:var(--amber);color:#1a1205;border:0;border-radius:8px;padding:9px 18px;font-weight:700;cursor:pointer}
+  .hint{color:var(--faint);font-size:12px;margin-top:6px}
+  .note{margin:14px 26px;padding:10px 14px;border-left:3px solid var(--amber);background:var(--s900);color:var(--dim);font-size:12px;border-radius:0 8px 8px 0}
+  /* ---- nav hint + marketplace ---- */
+  .navhint{color:var(--faint);font-size:11px;padding:6px 10px 8px;line-height:1.4}
+  .badge.oss{color:#a78bfa;background:#221c3a}
+  .mkt-bar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+  .mkt-bar .src{background:var(--s800);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;outline:none}
+  .mkt-bar .search{flex:1;min-width:140px;background:var(--s800);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 12px;outline:none}
+  .mkt-bar .search:focus,.mkt-bar .src:focus{border-color:var(--amber)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+  .mkt{background:var(--s900);border:1px solid var(--border);border-radius:var(--radius);padding:13px 15px;display:flex;flex-direction:column;gap:7px}
+  .mkt-h{display:flex;align-items:center;gap:8px} .mkt-h b{font-size:14px}
+  .mkt .d{color:var(--dim);font-size:12px;flex:1}
+  .mkt-f{display:flex;align-items:center}
+  .install{margin-left:auto;border:0;background:var(--amber);color:#1a1205;font-weight:700;border-radius:7px;padding:5px 14px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ sidebar ============ -->
+  <aside class="side">
+    <div class="brand"><span class="dot"></span>ccteam<small>v0.8.9</small></div>
+    <button class="newbtn">＋ 新建会话 / 项目</button>
+    <div class="tree">
+      <div class="proj">▾ ideas</div>
+      <div class="sess active" onclick="pick(this,'architect · claude','s5')"><span class="live"></span><span class="nm">architect</span><span class="badge claude">claude</span><span class="sid">s5</span></div>
+      <div class="sess" onclick="pick(this,'cto · codex','s7')"><span class="live"></span><span class="nm">cto</span><span class="badge codex">codex</span><span class="sid">s7</span></div>
+      <div class="sess" onclick="pick(this,'cto · claude','s9')"><span class="live"></span><span class="nm">cto</span><span class="badge claude">claude</span><span class="sid">s9</span></div>
+      <div class="sess" onclick="pick(this,'(无 role) · claude','s11')"><span class="live off"></span><span class="nm" style="color:var(--faint)">(无 role)</span><span class="badge none">bare</span><span class="sid">s11</span></div>
+      <div class="proj">▾ demo2</div>
+      <div class="sess" onclick="pick(this,'reviewer · claude','s3')"><span class="live off"></span><span class="nm">reviewer</span><span class="badge claude">claude</span><span class="sid">s3</span></div>
+    </div>
+    <nav class="nav">
+      <div class="navhint">↑ 点上面的会话 = 进入它的聊天(每个 session 一个独立对话)。下面是全局页:</div>
+      <a data-nav="market" onclick="go('market',this)"><span class="ico">🧩</span>插件市场</a>
+      <a data-nav="status" onclick="go('status',this)"><span class="ico">📊</span>Status</a>
+      <a data-nav="settings" onclick="go('settings',this)"><span class="ico">⚙︎</span>Settings</a>
+    </nav>
+  </aside>
+
+  <!-- ============ main ============ -->
+  <section class="main">
+    <header class="top">
+      <div class="crumb"><span>ideas</span><span class="sep">/</span><span class="muted" id="crumb">architect · claude</span><span class="sep">·</span><span class="sid muted" id="crumbsid" style="font-family:var(--mono)">s5</span></div>
+      <div class="conn" id="conn"><span class="dot"></span>已连接</div>
+      <span class="cost warn" title="今日花费 / 24h 预算(点开看 per-vendor)">今日 <b>$2.14</b> / $20</span>
+      <div class="spacer"></div>
+      <div class="tabs" id="tabs">
+        <button class="on" onclick="tab('chat',this)">Chat</button>
+        <button onclick="tab('term',this)">终端</button>
+      </div>
+      <button class="stop">停止</button>
+    </header>
+
+    <div class="body">
+      <!-- chat view -->
+      <div class="view on" id="v-chat">
+        <div class="chat">
+          <div class="scroll">
+            <div class="msg u"><div class="who">你</div>把 pty_ws 的 per-session 路由按 sid 解析到对的 pane,别退回项目级。</div>
+            <div class="msg a"><div class="who">architect · claude · s5</div>已定位:<code>handle_session_ws</code> 现在退回 <code>ProjectState.tmux_session</code>。改成经 gateway <code>session_resolve(sid)</code> → <code>ccteam-chat-&lt;slug&gt;-&lt;sid&gt;</code> 再 subscribe,并把 send_keys/resize 切到 <code>default_backend()</code>。</div>
+            <div class="approve">
+              <div class="q"><b>需要批准</b> · architect(hitl)想运行:<code>cargo test -p ccteam-web pty_ws</code></div>
+              <div class="btns"><button class="ok">✅ 同意</button><button class="no">⛔ 拒绝</button></div>
+            </div>
+            <div class="msg u"><div class="who">你</div>同意。</div>
+            <div class="msg a"><div class="who">architect · claude · s5</div>测试通过(6/0)。这条会话的历史只属于 <code>s5</code> —— 同 role 的 <code>s9</code> 各聊各的、互不串。</div>
+          </div>
+          <div class="composer">
+            <input placeholder="发消息 / 命令(/compact /clear /role /new …)…">
+            <button class="send">发送</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- terminal view -->
+      <div class="view" id="v-term">
+        <div class="term"><span class="p">rob@nas-box005</span>:<span class="c">~/nasworkspace/ideas</span>$ claude --agent architect --name ccteam-chat-ideas-s5
+  ▐ Claude Code — architect (s5)
+  ▐ reading .claude/agents/architect.md …
+  ▐ ready. 1M context · skip-permissions
+
+› 实时 pane 字节中继(xterm.js)。统一 shell 里 Chat / 终端 是同一会话的两个 tab。
+<span class="cur"> </span>
+</div>
+      </div>
+
+      <!-- marketplace view (= 原 Roles 升级成「市场浏览器」) -->
+      <div class="view" id="v-market">
+        <div class="page" style="max-width:1000px">
+          <h2>插件市场</h2>
+          <div class="sub">浏览 + 一键装 role/agent、skill、workflow。来源:ccteam-hub(自建)+ agency-agents 等开源(192+)。装到当前项目。</div>
+          <div class="mkt-bar">
+            <div class="seg"><button class="on">Agents / Roles</button><button>Skills</button><button>Workflows</button></div>
+            <select class="src"><option>全部来源</option><option>builtin</option><option>agency-agents</option></select>
+            <input class="search" placeholder="搜索插件…">
+          </div>
+          <div class="grid">
+            <div class="mkt"><div class="mkt-h"><b>cto</b><span class="badge none">builtin</span></div><div class="d">Chat-first 管家(引擎自带例外)。</div><div class="mkt-f"><span class="pill ok">已装</span></div></div>
+            <div class="mkt"><div class="mkt-h"><b>architect</b><span class="badge none">builtin</span></div><div class="d">系统设计 + 重构、读码定位。</div><div class="mkt-f"><span class="pill ok">已装</span></div></div>
+            <div class="mkt"><div class="mkt-h"><b>reviewer</b><span class="badge none">builtin</span></div><div class="d">对抗式代码复审。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>code-reviewer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · 逐行 review + 安全。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>pr-describer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · 生成 PR 描述。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+            <div class="mkt"><div class="mkt-h"><b>doc-writer</b><span class="badge oss">agency-agents</span></div><div class="d">开源 · README / 文档。MIT。</div><div class="mkt-f"><button class="install">安装</button></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- settings view -->
+      <div class="view" id="v-settings">
+        <div class="page">
+          <h2>Settings · IM 配置</h2>
+          <div class="sub">配置 Telegram / Lark 接入。秘密只显示状态 + 末几位,绝不回显明文。</div>
+          <div class="card">
+            <div style="display:flex;align-items:center"><div class="t">Telegram</div><span class="pill ok" style="margin-left:10px">已配置</span></div>
+            <div class="field"><label>Bot Token</label><input value="•••••••••••••••••••••••••••3c2dc5b5f1" readonly></div>
+            <div class="hint">改 token:粘贴新 token → 提示「现在去给 bot 发条消息」→ 自动抓 chat_id。</div>
+          </div>
+          <div class="card">
+            <div style="display:flex;align-items:center"><div class="t">Lark / 飞书</div><span class="pill warn" style="margin-left:10px">未配置</span><div class="seg"><button class="on">Lark(国际)</button><button>飞书(CN)</button></div></div>
+            <div class="field"><label>App ID</label><input placeholder="cli_xxxxxxxx"></div>
+            <div class="field"><label>App Secret</label><input type="password" placeholder="••••••••"></div>
+            <button class="save">校验并保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- status view (轻量运维,取代旧 operator dashboard) -->
+      <div class="view" id="v-status">
+        <div class="page">
+          <h2>Status · 运维总览</h2>
+          <div class="sub">轻量运维视图(取代旧 operator dashboard)—— 守 24/7 云端团队,不再单独一套 operator skin。</div>
+          <div class="card" style="display:flex;align-items:center;gap:10px"><span class="live"></span><div class="t">daemon healthy</div><span class="pill ok" style="margin-left:auto">MCP sock OK</span></div>
+          <div class="card">
+            <div class="t" style="margin-bottom:8px">会话(3 live · 1 idle)</div>
+            <div class="d">ideas / architect · claude · s5 &nbsp;<span class="pill ok">live</span> · 7s</div>
+            <div class="d">ideas / cto · codex · s7 &nbsp;<span class="pill ok">live</span> · 1m</div>
+            <div class="d">ideas / cto · claude · s9 &nbsp;<span class="pill ok">live</span> · 12m</div>
+            <div class="d">demo2 / reviewer · claude · s3 &nbsp;<span class="pill warn">idle</span> · 1h</div>
+          </div>
+          <div class="card">
+            <div style="display:flex;align-items:center"><div class="t">今日成本</div><b style="margin-left:auto;font-family:var(--mono)">$2.14 / $20.00</b></div>
+            <div class="d" style="margin-top:6px">claude $1.62 · codex $0.52 · 距 24h 预算 89%(接近上限会自停 — 红线)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="note">原型说明(按 TG 2394 修正):一个统一 chat 风格 shell。<b>左侧 项目→会话 = 聊天导航</b> —— 点哪个 session 就进哪个的聊天(每个 session 独立对话),<b>所以没有单独的「Chat」菜单</b>。底部 3 个全局页:<b>插件市场</b>(原 Roles 升级 = 浏览+装 role/skill/workflow,接 ccteam-hub + agency-agents)/ <b>Status</b>(轻量运维)/ <b>Settings</b>(IM 配置)。顶 bar 有 cost pill。删掉旧 Dashboard / SessionsList / SessionDetail / Teams operator 视图。深色 + amber 一套 token。点左侧会话、底部导航、顶部 Chat|终端 tab 可切换演示。</div>
+
+<script>
+  // 全局页(市场/Status/Settings)—— 离开会话上下文,隐藏 Chat|终端 tab
+  function go(v, el){
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
+    el.classList.add('on');
+    var map = {market:'v-market', settings:'v-settings', status:'v-status'};
+    show(map[v]);
+    document.getElementById('tabs').style.visibility = 'hidden';
+  }
+  // 会话内的 Chat | 终端
+  function tab(t, el){
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
+    el.classList.add('on');
+    show(t==='chat'?'v-chat':'v-term');
+  }
+  function show(id){
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
+    document.getElementById(id).classList.add('on');
+  }
+  // 点会话 = 进入它的聊天(= 这就是"chat",没有单独的 Chat 菜单)
+  function pick(el, label, sid){
+    document.querySelectorAll('.sess').forEach(s=>s.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on')); // 离开全局页
+    document.getElementById('crumb').textContent = label;
+    document.getElementById('crumbsid').textContent = sid;
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('on'));
+    document.querySelector('#tabs button').classList.add('on');
+    document.getElementById('tabs').style.visibility = 'visible';
+    show('v-chat');
+  }
+</script>
+</body>
+</html>
