@@ -64,6 +64,16 @@ fn isolate_home() -> TempDir {
     tmp
 }
 
+fn seed_role(project_dir: &std::path::Path, role: &str) {
+    let agents_dir = project_dir.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join(format!("{role}.md")),
+        format!("---\nname: {role}\n---\n{role} smoke role\n"),
+    )
+    .unwrap();
+}
+
 // ----- stub adapter — records submit_turn -----------------------------
 
 #[derive(Debug, Default)]
@@ -1380,6 +1390,8 @@ async fn real_ws_dual_harness_smoke() {
     let paths = ccteam_core::CcteamPaths::from_env().unwrap();
     ccteam_core::bootstrap_project_at_dir(&paths, project.path(), &slug, "", "real-ws").unwrap();
     ccteam_core::install_hooks(&paths).unwrap();
+    seed_role(project.path(), "api");
+    seed_role(project.path(), "reviewer");
     if let Some(bin) = workspace_ccteam_bin() {
         let hook = paths.hooks_script();
         std::fs::write(
