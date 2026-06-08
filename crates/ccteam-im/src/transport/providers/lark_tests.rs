@@ -396,7 +396,29 @@ fn lark_decode_group_requires_at_mention() {
 }
 
 #[test]
-fn lark_decode_non_text_message_skipped() {
+fn lark_decode_unsupported_type_skipped() {
+    // image/file/audio/media are now ingested (covered below); a genuinely
+    // unsupported type (sticker / system) is still dropped.
+    let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true);
+    let payload = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_user" } },
+            "message": {
+                "message_id": "om_1",
+                "message_type": "sticker",
+                "content": "{}",
+                "chat_id": "oc_chat"
+            }
+        }
+    });
+    assert!(ch.decode_event_value(&payload).is_none());
+}
+
+#[test]
+fn lark_decode_image_without_key_skipped() {
+    // A malformed image event missing its image_key is skipped, not surfaced
+    // as an empty-content turn.
     let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true);
     let payload = serde_json::json!({
         "header": { "event_type": "im.message.receive_v1" },
@@ -722,4 +744,171 @@ fn should_respond_in_group_requires_nonempty_mentions() {
     assert!(should_respond_in_group(&[
         serde_json::json!({"key": "val"})
     ]));
+}
+
+// ── attachments: pick_lark_attachment (inbound resource descriptor) ─────
+
+#[test]
+fn pick_lark_attachment_image_keys_on_image_key() {
+    let p = pick_lark_attachment("image", r#"{"image_key":"img_v2_abc"}"#).expect("image pending");
+    assert_eq!(p.key, "img_v2_abc");
+    assert_eq!(p.kind, AttachmentKind::Image);
+    // Images carry no usable wire name; the real extension is sniffed later.
+    assert_eq!(p.file_name, "image");
+}
+
+#[test]
+fn pick_lark_attachment_file_keeps_real_name() {
+    let p = pick_lark_attachment(
+        "file",
+        r#"{"file_key":"file_v2_xyz","file_name":"report.pdf"}"#,
+    )
+    .expect("file pending");
+    assert_eq!(p.key, "file_v2_xyz");
+    assert_eq!(p.kind, AttachmentKind::File);
+    assert_eq!(p.file_name, "report.pdf");
+}
+
+#[test]
+fn pick_lark_attachment_audio_media_default_names() {
+    // audio/media key on file_key and fall back to a typed default name when
+    // the event omits file_name.
+    let a = pick_lark_attachment("audio", r#"{"file_key":"file_a"}"#).expect("audio pending");
+    assert_eq!(a.kind, AttachmentKind::File);
+    assert_eq!(a.file_name, "audio.opus");
+    let m = pick_lark_attachment("media", r#"{"file_key":"file_m"}"#).expect("media pending");
+    assert_eq!(m.file_name, "video.mp4");
+}
+
+#[test]
+fn pick_lark_attachment_none_for_text_or_missing_key() {
+    assert!(pick_lark_attachment("text", r#"{"text":"hi"}"#).is_none());
+    assert!(pick_lark_attachment("image", "{}").is_none());
+    assert!(pick_lark_attachment("file", "{}").is_none());
+    assert!(pick_lark_attachment("sticker", "{}").is_none());
+}
+
+// ── attachments: decode → DecodedMessage.pending (the live byte seam) ───
+
+#[test]
+fn lark_decode_image_yields_pending_no_text() {
+    let ch = make_channel();
+    let event = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+            "message": {
+                "message_id": "om_img",
+                "message_type": "image",
+                "content": "{\"image_key\":\"img_v2_x\"}",
+                "chat_id": "oc_c",
+                "create_time": "1000"
+            }
+        }
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let decoded = ch.decode_event(&bytes).expect("image decoded");
+    assert!(decoded.text.is_empty(), "a bare image carries no text");
+    let p = decoded.pending.expect("image yields a pending download");
+    assert_eq!(p.key, "img_v2_x");
+    assert_eq!(p.kind, AttachmentKind::Image);
+}
+
+#[test]
+fn lark_decode_file_yields_pending() {
+    let ch = make_channel();
+    let event = serde_json::json!({
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+            "message": {
+                "message_id": "om_file",
+                "message_type": "file",
+                "content": "{\"file_key\":\"file_v2_y\",\"file_name\":\"log.txt\"}",
+                "chat_id": "oc_c",
+                "create_time": "1000"
+            }
+        }
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let decoded = ch.decode_event(&bytes).expect("file decoded");
+    let p = decoded.pending.expect("file yields a pending download");
+    assert_eq!(p.key, "file_v2_y");
+    assert_eq!(p.kind, AttachmentKind::File);
+    assert_eq!(p.file_name, "log.txt");
+}
+
+#[test]
+fn lark_decode_group_image_requires_at_mention() {
+    // The group @-mention gate applies to attachments too.
+    let ch = LarkChannel::new("id".into(), "secret".into(), vec!["*".into()], true);
+    let event = |mentions: serde_json::Value| {
+        serde_json::to_vec(&serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_id": "om_gi",
+                    "message_type": "image",
+                    "content": "{\"image_key\":\"img_v2_g\"}",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "mentions": mentions,
+                    "create_time": "1000"
+                }
+            }
+        }))
+        .unwrap()
+    };
+    assert!(ch.decode_event(&event(serde_json::json!([]))).is_none());
+    assert!(ch
+        .decode_event(&event(serde_json::json!([{"key": "@_user_1"}])))
+        .is_some());
+}
+
+// ── attachments: upload-response + magic-byte helpers (pure) ────────────
+
+#[test]
+fn parse_resource_key_extracts_data_key() {
+    let v = serde_json::json!({ "code": 0, "data": { "image_key": "img_v2_z" } });
+    assert_eq!(
+        parse_resource_key(&v, "image_key").as_deref(),
+        Some("img_v2_z")
+    );
+    let f = serde_json::json!({ "code": 0, "data": { "file_key": "file_v2_z" } });
+    assert_eq!(
+        parse_resource_key(&f, "file_key").as_deref(),
+        Some("file_v2_z")
+    );
+}
+
+#[test]
+fn parse_resource_key_none_when_missing() {
+    assert!(parse_resource_key(&serde_json::json!({"data": {}}), "image_key").is_none());
+    assert!(parse_resource_key(&serde_json::json!({}), "file_key").is_none());
+}
+
+#[test]
+fn json_content_str_double_parses_stringified_content() {
+    // Feishu message `content` is itself a JSON string.
+    assert_eq!(
+        json_content_str(r#"{"file_name":"a.pdf"}"#, "file_name").as_deref(),
+        Some("a.pdf")
+    );
+    assert!(json_content_str("not json", "x").is_none());
+    assert!(json_content_str(r#"{"a":1}"#, "missing").is_none());
+}
+
+#[test]
+fn image_ext_sniffs_magic_bytes() {
+    assert_eq!(image_ext(&[0x89, b'P', b'N', b'G', 0x0d]), ".png");
+    assert_eq!(image_ext(&[0xFF, 0xD8, 0xFF, 0xE0]), ".jpg");
+    assert_eq!(image_ext(b"GIF89a"), ".gif");
+    let mut webp = b"RIFF".to_vec();
+    webp.extend_from_slice(&[0, 0, 0, 0]);
+    webp.extend_from_slice(b"WEBP");
+    assert_eq!(image_ext(&webp), ".webp");
+    // Unknown/empty defaults to .jpg (Feishu images are usually JPEG).
+    assert_eq!(image_ext(b"\x00\x01\x02"), ".jpg");
+    assert_eq!(image_ext(&[]), ".jpg");
 }

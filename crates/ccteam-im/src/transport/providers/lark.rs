@@ -9,9 +9,12 @@
 //! **Path A only.** The daemon opens an outbound WSS long-connection
 //! (`POST /callback/ws/endpoint` -> `wss://…`); there is no public HTTPS
 //! endpoint and no webhook/axum receive path. Inbound is text + `post`
-//! rich-text; every other `message_type` is debug-logged and skipped
-//! (image ingest / outbound files are an explicit out-of-scope
-//! follow-up). Outbound replies go via tenant-token `im/v1/messages`.
+//! rich-text + image/file/audio/media (the resource is downloaded via
+//! `im/v1/messages/{id}/resources/{key}` and staged to disk like telegram's,
+//! then named in the turn text for the agent to `Read`); every other
+//! `message_type` is debug-logged and skipped. Outbound replies go via
+//! tenant-token `im/v1/messages` — text directly, files by uploading to
+//! `im/v1/{images,files}` first and then sending an image/file message.
 //!
 //! Two independent allowlist layers, by design (mirrors telegram's
 //! two-layer model). Both key on the sender **`open_id`** (`ou_…`): the WS
@@ -30,13 +33,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-use crate::transport::{Channel, ChannelMessage, SendMessage};
+use crate::transport::{
+    inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
+    ChannelMessage, OutboundFile, OutboundFileKind, SendMessage,
+};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -50,6 +57,13 @@ const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 /// the daemon reads it polymorphically via [`Channel::max_message_len`]
 /// and calls `split_for_channel`; no `"lark"`/number branch leaks up.
 const LARK_MAX_TEXT_UTF16: usize = 4000;
+
+/// Inbound/outbound attachment size ceiling, in bytes. Feishu's own caps
+/// are 10 MB for `im/v1/images` and 30 MB for `im/v1/files`; we stage
+/// inbound downloads up to this ceiling and let the upload endpoints
+/// surface their own over-limit error verbatim. Mirrors telegram's
+/// `MAX_ATTACHMENT_BYTES` discipline (one constant, here only).
+const LARK_MAX_ATTACHMENT_BYTES: u64 = 30 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feishu WebSocket long-connection: pbbp2.proto frame codec
@@ -191,12 +205,34 @@ struct DecodedMessage {
     open_id: String,
     /// Conversation id (`oc_…`). Becomes [`ChannelMessage::reply_target`].
     chat_id: String,
-    /// Stable message id; becomes `lark-{message_id}`.
+    /// Stable message id; becomes `lark-{message_id}`. Also the path
+    /// component for the `im/v1/messages/{id}/resources/{key}` download.
     message_id: String,
-    /// Decoded, `@`-placeholder-stripped, trimmed body (never empty).
+    /// Decoded, `@`-placeholder-stripped, trimmed body. Empty is allowed
+    /// **only** when `pending` is set (a bare image/file carries no text).
     text: String,
     /// Lark send time in seconds (from `create_time` ms, or wall-clock).
     timestamp: u64,
+    /// Set for `image`/`file`/`audio`/`media` messages: the resource the WS
+    /// loop must download + stage into a [`ChannelAttachment`]. `None` for
+    /// plain text/`post`. Decoding stays pure (no `&self`/network); the
+    /// actual download happens in [`LarkChannel::stage_lark_attachment`].
+    pending: Option<LarkPending>,
+}
+
+/// A Lark message resource (image or file) the WS loop should download.
+/// Produced purely from the event by [`pick_lark_attachment`]; the
+/// `message_id` it pairs with lives on the [`DecodedMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LarkPending {
+    /// `image_key` (images) or `file_key` (file/audio/media) — both the
+    /// `{key}` path component and what selects `type=image` vs `type=file`.
+    key: String,
+    /// Image vs. generic file (drives [`AttachmentKind`] + the `type` query).
+    kind: AttachmentKind,
+    /// Best-known name from the event (real `file_name` for files; a
+    /// placeholder for images, whose real extension is sniffed post-download).
+    file_name: String,
 }
 
 /// Decode a single `im.message.receive_v1` event into a [`DecodedMessage`],
@@ -218,16 +254,25 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
 
     let msg = &recv.message;
 
-    // Decode the body by message type. Path A is text/`post`-only.
-    let text = match msg.message_type.as_str() {
+    // Decode the body by message type. Text/`post` carry a text body;
+    // image/file/audio/media carry a downloadable resource and no text.
+    let (text, pending) = match msg.message_type.as_str() {
         "text" => {
             let v = serde_json::from_str::<serde_json::Value>(&msg.content).ok()?;
-            v.get("text")
+            let t = v
+                .get("text")
                 .and_then(|t| t.as_str())
                 .filter(|s| !s.is_empty())?
-                .to_string()
+                .to_string();
+            (t, None)
         }
-        "post" => parse_post_content(&msg.content)?,
+        "post" => (parse_post_content(&msg.content)?, None),
+        "image" | "file" | "audio" | "media" => {
+            // `?`: a malformed event missing its image_key/file_key is
+            // skipped exactly as an unsupported type would be.
+            let pending = pick_lark_attachment(&msg.message_type, &msg.content)?;
+            (String::new(), Some(pending))
+        }
         other => {
             tracing::debug!("Lark: skipping unsupported message type '{other}'");
             return None;
@@ -236,11 +281,15 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
 
     // Strip the `@_user_N` placeholders Feishu injects, then trim.
     let text = strip_at_placeholders(&text).trim().to_string();
-    if text.is_empty() {
+    // A bare image/file carries no text — only reject when there is neither
+    // text nor a downloadable attachment.
+    if text.is_empty() && pending.is_none() {
         return None;
     }
 
-    // Group chat: only respond when explicitly @-mentioned.
+    // Group chat: only respond when explicitly @-mentioned. Applies to
+    // attachments too (a group image with no @-mention is ignored, matching
+    // the text rule).
     if msg.chat_type == "group" && !should_respond_in_group(&msg.mentions) {
         return None;
     }
@@ -259,6 +308,7 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
         message_id: msg.message_id.clone(),
         text,
         timestamp,
+        pending,
     })
 }
 
@@ -590,7 +640,33 @@ impl LarkChannel {
                         seen.insert(decoded.message_id.clone(), now);
                     }
 
-                    let channel_msg = decoded.into_channel_message();
+                    // Pull the resource descriptor + raw message id out before
+                    // the move: the download needs `&self` + the cached token,
+                    // so it can't live in the pure decode.
+                    let pending = decoded.pending.clone();
+                    let raw_message_id = decoded.message_id.clone();
+                    let mut channel_msg = decoded.into_channel_message();
+                    if let Some(p) = pending {
+                        match self.stage_lark_attachment(&channel_msg.id, &raw_message_id, &p).await {
+                            Ok(Some(att)) => channel_msg.attachments.push(att),
+                            Ok(None) => {
+                                let mb = LARK_MAX_ATTACHMENT_BYTES / (1024 * 1024);
+                                let _ = self.send(&SendMessage::new(
+                                    format!("⚠️ 附件 {} 超过 {mb}MB 上限,已拒收", p.file_name),
+                                    channel_msg.reply_target.clone(),
+                                )).await;
+                                if channel_msg.content.is_empty() { continue; }
+                            }
+                            Err(e) => {
+                                tracing::warn!(message_id = %raw_message_id, error = %e, "Lark: attachment download failed");
+                                let _ = self.send(&SendMessage::new(
+                                    format!("⚠️ 附件 {} 下载失败", p.file_name),
+                                    channel_msg.reply_target.clone(),
+                                )).await;
+                                if channel_msg.content.is_empty() { continue; }
+                            }
+                        }
+                    }
                     tracing::debug!("Lark WS: message in {}", channel_msg.reply_target);
                     if tx.send(channel_msg).await.is_err() { break; }
                 }
@@ -688,6 +764,226 @@ impl LarkChannel {
         Ok(build(&new_token).send().await?)
     }
 
+    /// Issue a tenant-token-authorized **GET** with the same one-shot
+    /// 401-refresh-retry as [`Self::send_json_with_token_retry`]. Used for
+    /// the inbound resource download (`im/v1/messages/{id}/resources/{key}`),
+    /// which returns raw bytes rather than JSON.
+    async fn get_with_token_retry(&self, url: &str) -> anyhow::Result<reqwest::Response> {
+        let token = self.get_tenant_access_token().await?;
+        let resp = self.http.get(url).bearer_auth(&token).send().await?;
+        if resp.status().as_u16() != 401 {
+            return Ok(resp);
+        }
+        self.invalidate_token().await;
+        let new_token = self.get_tenant_access_token().await?;
+        Ok(self.http.get(url).bearer_auth(&new_token).send().await?)
+    }
+
+    /// Issue a tenant-token-authorized **multipart POST** with the same
+    /// one-shot 401-refresh-retry. `make_form` is invoked once per attempt
+    /// because `reqwest::multipart::Form` isn't `Clone` (it's consumed on
+    /// send), so the retry rebuilds it. Backs the `im/v1/{images,files}`
+    /// uploads.
+    async fn post_multipart_with_token_retry(
+        &self,
+        url: &str,
+        make_form: impl Fn() -> reqwest::multipart::Form,
+    ) -> anyhow::Result<reqwest::Response> {
+        let token = self.get_tenant_access_token().await?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(&token)
+            .multipart(make_form())
+            .send()
+            .await?;
+        if resp.status().as_u16() != 401 {
+            return Ok(resp);
+        }
+        self.invalidate_token().await;
+        let new_token = self.get_tenant_access_token().await?;
+        Ok(self
+            .http
+            .post(url)
+            .bearer_auth(&new_token)
+            .multipart(make_form())
+            .send()
+            .await?)
+    }
+
+    /// Download one inbound [`LarkPending`] resource and stage it to disk as
+    /// a [`ChannelAttachment`]. Returns `Ok(None)` when the payload exceeds
+    /// [`LARK_MAX_ATTACHMENT_BYTES`] (rejected, not an error). Images get a
+    /// magic-byte-sniffed extension so the agent's `Read` renders them; files
+    /// keep their event-supplied (sanitized) name. The staged file lives at
+    /// `<staging>/<cid>-<sanitized_name>`, identical to telegram's layout.
+    async fn stage_lark_attachment(
+        &self,
+        cid: &str,
+        message_id: &str,
+        pending: &LarkPending,
+    ) -> anyhow::Result<Option<ChannelAttachment>> {
+        let type_param = match pending.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::File => "file",
+        };
+        let url = format!(
+            "{}/im/v1/messages/{}/resources/{}?type={}",
+            self.api_base(),
+            message_id,
+            pending.key,
+            type_param
+        );
+        let resp = self.get_with_token_retry(&url).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Lark resource download {message_id}/{} → {status}: {body}",
+                pending.key
+            );
+        }
+        let bytes = resp.bytes().await?.to_vec();
+        if bytes.len() as u64 > LARK_MAX_ATTACHMENT_BYTES {
+            return Ok(None);
+        }
+        // Images carry no usable name/extension on the wire; sniff it so the
+        // staged path is `image.png`/`.jpg`/… and `Read` renders it. Files
+        // keep the real event name.
+        let raw_name = match pending.kind {
+            AttachmentKind::Image => format!("image{}", image_ext(&bytes)),
+            AttachmentKind::File => pending.file_name.clone(),
+        };
+        let safe_name = sanitize_attachment_name(&raw_name);
+        let dir = inbound_staging_dir();
+        tokio::fs::create_dir_all(&dir).await?;
+        let dest = dir.join(format!("{cid}-{safe_name}"));
+        tokio::fs::write(&dest, &bytes).await?;
+        Ok(Some(ChannelAttachment {
+            kind: pending.kind,
+            file_name: safe_name,
+            local_path: dest.to_string_lossy().into_owned(),
+            mime: None,
+            size: Some(bytes.len() as u64),
+        }))
+    }
+
+    /// Send one already-built message: `msg_type` + the Feishu-stringified
+    /// `content` JSON. The single outbound funnel for text and media — both
+    /// route through [`Self::send_json_with_token_retry`] (so a stale tenant
+    /// token self-heals) and [`parse_sent_message_id`].
+    async fn send_raw(
+        &self,
+        recipient: &str,
+        msg_type: &str,
+        content: String,
+    ) -> anyhow::Result<Option<String>> {
+        let url = self.send_message_url();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": msg_type,
+            "content": content,
+        });
+        let resp = self
+            .send_json_with_token_retry(reqwest::Method::POST, &url, &body)
+            .await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark send ({msg_type}) failed: {err}");
+        }
+        Ok(parse_sent_message_id(resp).await)
+    }
+
+    /// Outbound files (V0.8.4 P2b — `chat_send_file`). Feishu image/file
+    /// messages carry no inline caption, so the effective caption (the
+    /// attachment's own, else the message text on the first file — matching
+    /// telegram's rule) is delivered as its own preceding text message.
+    /// Returns the first sent message id.
+    async fn send_with_attachments(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let mut first_id = None;
+        for (i, att) in message.attachments.iter().enumerate() {
+            let caption = att.caption.clone().or_else(|| {
+                if i == 0 && !message.content.is_empty() {
+                    Some(message.content.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(cap) = caption.filter(|c| !c.is_empty()) {
+                let content = serde_json::json!({ "text": cap }).to_string();
+                let id = self.send_raw(&message.recipient, "text", content).await?;
+                first_id = first_id.or(id);
+            }
+            let id = self.send_one_attachment(&message.recipient, att).await?;
+            first_id = first_id.or(id);
+        }
+        Ok(first_id)
+    }
+
+    /// Upload one [`OutboundFile`] then post it as an `image`/`file` message.
+    async fn send_one_attachment(
+        &self,
+        recipient: &str,
+        att: &OutboundFile,
+    ) -> anyhow::Result<Option<String>> {
+        let bytes = tokio::fs::read(&att.path)
+            .await
+            .with_context(|| format!("read outbound file {}", att.path))?;
+        let file_name = std::path::Path::new(&att.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let (msg_type, content) = match att.kind {
+            OutboundFileKind::Photo => {
+                let image_key = self.upload_image(&bytes).await?;
+                ("image", serde_json::json!({ "image_key": image_key }))
+            }
+            OutboundFileKind::Document => {
+                let file_key = self.upload_file(&bytes, &file_name).await?;
+                ("file", serde_json::json!({ "file_key": file_key }))
+            }
+        };
+        self.send_raw(recipient, msg_type, content.to_string())
+            .await
+    }
+
+    /// Upload an image to `im/v1/images` (`image_type=message`) → `image_key`.
+    async fn upload_image(&self, bytes: &[u8]) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/images", self.api_base());
+        let make_form = || {
+            reqwest::multipart::Form::new()
+                .text("image_type", "message")
+                .part(
+                    "image",
+                    reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("image"),
+                )
+        };
+        let resp = self
+            .post_multipart_with_token_retry(&url, make_form)
+            .await?;
+        parse_upload_key(resp, "image_key").await
+    }
+
+    /// Upload a file to `im/v1/files` (`file_type=stream`) → `file_key`.
+    async fn upload_file(&self, bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
+        let url = format!("{}/im/v1/files", self.api_base());
+        let name = file_name.to_string();
+        let make_form = || {
+            reqwest::multipart::Form::new()
+                .text("file_type", "stream")
+                .text("file_name", name.clone())
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(name.clone()),
+                )
+        };
+        let resp = self
+            .post_multipart_with_token_retry(&url, make_form)
+            .await?;
+        parse_upload_key(resp, "file_key").await
+    }
+
     /// Decode one `im.message.receive_v1` event into the [`ChannelMessage`]
     /// the daemon receives, applying the provider-layer allowlist — i.e.
     /// the exact `decode → map → ACL` the live WS loop runs, minus dedup
@@ -752,26 +1048,15 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        let url = self.send_message_url();
-
+        // V0.8.4 P2b — files go via `im/v1/{images,files}` upload + an
+        // image/file message; the caption rides the first attachment.
+        if !message.attachments.is_empty() {
+            return self.send_with_attachments(message).await;
+        }
         // Feishu quirk: `content` is a STRING containing JSON, not a
         // nested object.
         let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
-
-        let resp = self
-            .send_json_with_token_retry(reqwest::Method::POST, &url, &body)
-            .await?;
-        if !resp.status().is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Lark send failed: {err}");
-        }
-
-        Ok(parse_sent_message_id(resp).await)
+        self.send_raw(&message.recipient, "text", content).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -848,6 +1133,90 @@ async fn parse_sent_message_id(resp: reqwest::Response) -> Option<String> {
     v.pointer("/data/message_id")
         .and_then(|m| m.as_str())
         .map(String::from)
+}
+
+/// Consume an `im/v1/{images,files}` upload response and return the resource
+/// key (`image_key`/`file_key`). Feishu replies HTTP 200 with a `code` field,
+/// so a non-zero `code` is the real error signal (surfaced with its `msg`).
+async fn parse_upload_key(resp: reqwest::Response, key: &str) -> anyhow::Result<String> {
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("Lark upload ({key}) → {status}: {v}");
+    }
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("Lark upload ({key}) failed: {msg}");
+    }
+    parse_resource_key(&v, key).ok_or_else(|| anyhow::anyhow!("Lark upload: missing {key}"))
+}
+
+/// Pure: pluck `data.{key}` (an `image_key`/`file_key`) from an upload body.
+fn parse_resource_key(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.pointer(&format!("/data/{key}"))
+        .and_then(|k| k.as_str())
+        .map(String::from)
+}
+
+/// Pure: parse a Feishu message `content` (itself a JSON *string*) and pluck
+/// a string field. Feishu stringifies message content, so this double-parses.
+fn json_content_str(content: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(String::from)
+}
+
+/// Pure: map an inbound media message (`message_type` + stringified
+/// `content`) to the [`LarkPending`] resource to download, or `None` when the
+/// required key is absent. Images key on `image_key`; file/audio/media key on
+/// `file_key` (with the optional `file_name`).
+fn pick_lark_attachment(message_type: &str, content: &str) -> Option<LarkPending> {
+    match message_type {
+        "image" => Some(LarkPending {
+            key: json_content_str(content, "image_key")?,
+            kind: AttachmentKind::Image,
+            file_name: "image".to_string(),
+        }),
+        "file" | "audio" | "media" => Some(LarkPending {
+            key: json_content_str(content, "file_key")?,
+            kind: AttachmentKind::File,
+            file_name: json_content_str(content, "file_name")
+                .unwrap_or_else(|| default_media_name(message_type)),
+        }),
+        _ => None,
+    }
+}
+
+/// Fallback name for a file/audio/media message that omitted `file_name`.
+fn default_media_name(message_type: &str) -> String {
+    match message_type {
+        "audio" => "audio.opus".to_string(),
+        "media" => "video.mp4".to_string(),
+        _ => "file".to_string(),
+    }
+}
+
+/// Pure: sniff a common image format from its magic bytes, returning the
+/// dotted extension (defaulting to `.jpg` — Feishu images are usually JPEG) so
+/// the staged inbound path is something the agent's `Read` renders.
+fn image_ext(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        ".png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        ".jpg"
+    } else if bytes.starts_with(b"GIF8") {
+        ".gif"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        ".webp"
+    } else {
+        ".jpg"
+    }
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.

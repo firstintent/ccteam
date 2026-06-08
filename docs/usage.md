@@ -193,7 +193,7 @@ Telegram 之外可同时接入飞书/Lark(同一个 `credentials.json`,与 teleg
 - `allowed_user_ids` 是 **open_id**(`ou_...`)白名单,且**留空 = 拒绝所有人**(fail-closed,与 telegram「空=放开」相反,默认更安全);`["*"]` 放开所有人(不建议)。
 - **怎么拿自己的 open_id**:先留个占位(或留空)启动 daemon,给 bot 发一条消息,在 daemon 日志里找这行 —— `Lark WS: ignoring ou_xxxx (not in allowed_users)`,`ou_xxxx` 就是你的 open_id;填回 `allowed_user_ids` 再重启。
 
-改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 当前支持文本 + 富文本(post)收发;图片/文件收发是后续项。
+改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 支持文本 + 富文本(post)+ 图片/文件(image/file/audio/media)收发 —— 收到的图/文件自动落盘供 agent `Read`,`chat_send_file` 也能把图/文件发回(与 Telegram 对等)。
 
 ---
 
@@ -291,7 +291,7 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 **长消息自动分片**:超过 Telegram 4096(UTF-16)上限的回答会被有序切成多条发出(代码块跨片自动闭合/重开),不再截断丢数据。
 
-**发图 / 发文件给 bot**:在 TG 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。>20MB 拒收。
+**发图 / 发文件给 bot**:在 TG 或 飞书/Lark 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。TG >20MB / 飞书 >30MB 拒收。
 
 **bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`;图 ≤10MB / 文件 ≤50MB,超限或不存在返回结构化 error)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
 
