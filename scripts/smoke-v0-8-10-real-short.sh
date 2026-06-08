@@ -34,8 +34,8 @@ Required on the target box:
 Set CCTEAM_ALLOW_NON_NAS_SMOKE=1 only for a rehearsal run. A rehearsal is not
 the v0.8.10 real-machine short smoke and must not be recorded as PASS.
 
-The script also requires HEAD to match origin/dev so the checklist records the
-exact pushed commit under test.
+The script also requires a clean worktree and HEAD to match origin/dev so the
+checklist records the exact pushed commit under test.
 EOF
 }
 
@@ -104,6 +104,15 @@ HEAD:       $head
 origin/dev: $origin_dev
 
 Fetch/pull the pushed dev commit before recording nas-box005 smoke results.
+EOF
+    exit 78
+  fi
+  if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+    cat >&2 <<'EOF'
+smoke-v0-8-10-real-short: worktree is dirty.
+
+Commit, stash, or clean local changes before recording nas-box005 smoke
+results. The release smoke must run against an exact pushed commit.
 EOF
     exit 78
   fi
