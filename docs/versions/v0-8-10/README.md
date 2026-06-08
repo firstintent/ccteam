@@ -3,9 +3,10 @@
 v0.8.10 is the "core flow production-grade: STABILITY + high-quality UX"
 release track.
 
-Status: CI-fake gates complete; nas-box005 short smoke pending. Do not claim
-tag-ready until `nas-box005-short-smoke-checklist.md` is completed on the
-dedicated host.
+Status: CI-fake gates complete; automated nas-box005 short smoke passed at
+`b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`. Do not claim tag-ready until the
+manual host-fault section in `nas-box005-short-smoke-checklist.md` is completed
+on the dedicated host.
 
 ## Source Documents
 
@@ -26,7 +27,8 @@ dedicated host.
 
 - `completion-audit.md` — requirement-by-requirement A1-A5/B1-B6 status.
 - `nas-box005-short-smoke-checklist.md` — required real-machine short smoke
-  record. It is intentionally still marked `SPECIAL MACHINE PENDING`.
+  record. Its automated section has passed; manual host suspend/netdrop checks
+  remain pending.
 
 ## Commit Discipline
 

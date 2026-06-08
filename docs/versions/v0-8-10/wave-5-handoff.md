@@ -15,7 +15,9 @@
 
 - Did not delete deferred ccteam-flow `--restart-team` internals in this
   version; PRD marks them out of live daemon scope.
-- Did not mark nas-box005 short smoke complete.
+- Did not mark nas-box005 short smoke complete at phase close; later audit
+  recorded the automated nas-box005 script PASS while leaving manual host
+  faults pending.
 - Did not add new user-reachable surface while cleaning docs.
 
 ## Risks
@@ -43,19 +45,22 @@
 
 ## Remaining
 
-- Commit and push Phase 4/5 changes to `origin/dev`.
-- Run nas-box005 short smoke on the dedicated machine before claiming
-  tag-ready.
+- Phase 4/5 changes have been committed and pushed to `origin/dev`.
+- Automated nas-box005 short smoke passed at
+  `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`.
+- Manual host suspend/netdrop and no-silent-failure checklist items remain
+  required before claiming tag-ready.
 
 ## Gate Results
 
 - `cargo build -p ccteam-harness -p ccteam-core -p ccteam-flow`: passed.
 - `cargo test -p ccteam-core -p ccteam-harness -p ccteam-flow`: 1233 passed,
   19 ignored.
-- `cargo test --workspace --exclude ccteam-web`: 1918 passed, 19 ignored.
+- `cargo test --workspace --exclude ccteam-web`: 1920 passed, 19 ignored.
 - `cargo test -p ccteam-web`: 276 passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: 0 issues.
 - `cargo fmt --all -- --check`: passed.
 - `npm run lint` in `crates/ccteam-web/web`: passed, 0 warnings.
 - `npm run test:unit` in `crates/ccteam-web/web`: 142 passed.
+- `npm test` in `crates/ccteam-web/web`: 4 passed.
 - `scripts/smoke-im.sh`: PASS.

@@ -1,21 +1,29 @@
 # v0.8.10 nas-box005 Short Smoke Checklist
 
-Status: SPECIAL MACHINE PENDING.
+Status: AUTOMATED SHORT SMOKE PASSED; MANUAL HOST FAULTS PENDING.
 
 This checklist is the required real-machine short smoke record for v0.8.10.
 CI-fake green does not satisfy these boxes, and this file must not be marked
-complete until it is run on nas-box005.
+complete until the manual host-fault section is run on nas-box005.
 
 ## Preflight
 
-- [ ] `git rev-parse HEAD` is recorded:
-- [ ] `git rev-parse origin/dev` matches the commit under test:
+- [x] `git rev-parse HEAD` is recorded:
+      `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`
+- [x] `git rev-parse origin/dev` matches the commit under test:
+      `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`
 - [ ] `cargo test --workspace --exclude ccteam-web` is green on the box:
+      not run on nas-box005; passed on local host at the same commit.
 - [ ] `cargo test -p ccteam-web` is green on the box:
+      not run on nas-box005; passed on local host at the same commit.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` is green:
+      not run on nas-box005; passed on local host at the same commit.
 - [ ] `cargo fmt --all -- --check` is green:
+      not run on nas-box005; passed on local host at the same commit.
 - [ ] `npm run lint` in `crates/ccteam-web/web` is green:
+      not run on nas-box005; passed on local host at the same commit.
 - [ ] `npm run test:unit` in `crates/ccteam-web/web` is green:
+      not run on nas-box005; passed on local host at the same commit.
 
 ## Automated Short Smoke
 
@@ -32,11 +40,16 @@ be marked PASS here. It also refuses to run unless the worktree is clean and
 check host, tools, worktree cleanliness, and commit identity before running the
 fault legs.
 
-- [ ] real rmux daemon smoke passed:
-- [ ] real IM WebSocket dual-harness smoke passed:
-- [ ] daemon restart leg passed:
-- [ ] Claude pane death produced one user-visible failure message:
+- [x] real rmux daemon smoke passed:
+      `scripts/smoke-v0-8-10-real-short.sh`, 7 passed.
+- [x] real IM WebSocket dual-harness smoke passed:
+      `scripts/smoke-v0-8-10-real-short.sh`.
+- [x] daemon restart leg passed:
+      `real_im_ws_restart_faults`.
+- [x] Claude pane death produced one user-visible failure message:
+      `发送失败: tmux session missing: ...`.
 - [ ] Codex app-server disconnect produced one user-visible failure message:
+      not run; default short smoke keeps Codex real probes opt-in.
 
 ## Manual Host Faults
 
@@ -60,6 +73,7 @@ Use the same checked-out commit and keep the smoke logs under
 - [ ] FAIL
 
 Operator:
-Date:
-Commit:
-Notes:
+Date: 2026-06-09
+Commit: `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`
+Notes: Automated script PASS on nas-box005. Manual host suspend/netdrop and
+no-silent-failure checks remain pending; do not treat as final tag-ready yet.
