@@ -15,15 +15,16 @@
 
 - Did not delete deferred ccteam-flow `--restart-team` internals in this
   version; PRD marks them out of live daemon scope.
-- Did not mark nas-box005 short smoke complete at phase close; later audit
-  recorded the automated nas-box005 script PASS while leaving manual host
-  faults pending.
+- Did not treat nas-box005 as the only possible execution target after the
+  latest user direction; the target-host checklist was completed locally on
+  `rob-ws`.
 - Did not add new user-reachable surface while cleaning docs.
 
 ## Risks
 
-- Final tag readiness still requires nas-box005 short smoke to be run and
-  recorded in `nas-box005-short-smoke-checklist.md`.
+- Full ACPI suspend / RTC wake and system-level outbound network blocking are
+  not claimed by the local target-host smoke. The completed local host-fault
+  scope is 600s daemon `SIGSTOP`/`SIGCONT` plus WebSocket reconnect.
 - Market install real-machine verification remains best-effort and
   blocked-on ccteam-hub public availability.
 
@@ -46,10 +47,10 @@
 ## Remaining
 
 - Phase 4/5 changes have been committed and pushed to `origin/dev`.
-- Automated nas-box005 short smoke passed at
-  `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`.
-- Manual host suspend/netdrop and no-silent-failure checklist items remain
-  required before claiming tag-ready.
+- Local target-host short smoke passed on `rob-ws` at
+  `e38ff81425ffafc9b75f2df0820ba92eb481da18`.
+- No required manual host-fault checklist items remain for the user-directed
+  local target-host scope.
 
 ## Gate Results
 
@@ -64,3 +65,6 @@
 - `npm run test:unit` in `crates/ccteam-web/web`: 142 passed.
 - `npm test` in `crates/ccteam-web/web`: 4 passed.
 - `scripts/smoke-im.sh`: PASS.
+- `scripts/smoke-v0-8-10-real-short.sh` on `rob-ws`: PASS.
+- `real_ws_dual_harness_smoke`: 1 passed in 616.66s with restart + 600s
+  `SIGSTOP`/`SIGCONT` + WS reconnect + pane-death fault.

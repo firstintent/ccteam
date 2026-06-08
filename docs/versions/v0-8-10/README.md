@@ -3,10 +3,10 @@
 v0.8.10 is the "core flow production-grade: STABILITY + high-quality UX"
 release track.
 
-Status: CI-fake gates complete; automated nas-box005 short smoke passed at
-`b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`. Do not claim tag-ready until the
-manual host-fault section in `nas-box005-short-smoke-checklist.md` is completed
-on the dedicated host.
+Status: CI-fake gates complete; local target-host short smoke passed on
+`rob-ws` at `e38ff81425ffafc9b75f2df0820ba92eb481da18`. The host-fault record
+uses `SIGSTOP`/`SIGCONT` daemon freeze plus WebSocket disconnect/reconnect; it
+does not claim full ACPI suspend or system-level outbound network blocking.
 
 ## Source Documents
 
@@ -26,14 +26,14 @@ on the dedicated host.
 ## Release Evidence
 
 - `completion-audit.md` — requirement-by-requirement A1-A5/B1-B6 status.
-- `nas-box005-short-smoke-checklist.md` — required real-machine short smoke
-  record. Its automated section has passed; manual host suspend/netdrop checks
-  remain pending.
+- `nas-box005-short-smoke-checklist.md` — target-host real-machine short smoke
+  record. The latest run is local (`rob-ws`) per user direction and is marked
+  PASS with the host-fault scope caveat above.
 
 ## Commit Discipline
 
 Local CI-fake evidence was collected after the v0.8.10 code changes had landed.
-The nas-box005 script enforces a clean worktree and `HEAD == origin/dev` before
-it records any real smoke result, so the dedicated-host record always names the
-exact pushed commit under test. If any non-documentation code changes land after
-the audit, rerun the full local gates before running the real smoke.
+The short-smoke script enforces a clean worktree and `HEAD == origin/dev`
+before it records any real smoke result, so the target-host record names the
+exact pushed commit under test. If any non-documentation code changes land
+after the audit, rerun the full local gates before running the real smoke.

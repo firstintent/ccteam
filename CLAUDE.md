@@ -31,7 +31,7 @@
 | Workspace version | `0.8.10` |
 | 测试 baseline | `1920/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 276 pass;vitest 142 pass(SPA);Playwright 4 pass(SPA smoke)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.10 已落地(核心流程生产级稳定性 + 高质量 UX)**:在 v0.8.9 的 plugin marketplace / 统一 chat-shell web UI / 逐字节保真终端 / 零提示词引擎基础上,补 CI-fake fault guards、sid 精确 progress/reset/session 身份、file-backed stall SoT、边界/通知可靠性、人话失败信号、模型支持 warn-once、上手序列、Status 活动态/cost 边界态、D7 死代码收口;nas-box005 自动短 smoke 已过,**手动 host suspend/netdrop/no-silent-failure checklist 待跑**。PRD/handoff/归档见 `docs/versions/v0-8-10/` |
+| 当前在做 | **v0.8.10 已落地(核心流程生产级稳定性 + 高质量 UX)**:在 v0.8.9 的 plugin marketplace / 统一 chat-shell web UI / 逐字节保真终端 / 零提示词引擎基础上,补 CI-fake fault guards、sid 精确 progress/reset/session 身份、file-backed stall SoT、边界/通知可靠性、人话失败信号、模型支持 warn-once、上手序列、Status 活动态/cost 边界态、D7 死代码收口;本机 target-host 短 smoke 已过(`rob-ws`,600s `SIGSTOP`/`SIGCONT` + WS reconnect + pane-death),不声称 ACPI suspend / 系统级断网。PRD/handoff/归档见 `docs/versions/v0-8-10/` |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准(v0.8.10 在 dev 上);历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 

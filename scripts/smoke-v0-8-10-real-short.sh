@@ -117,7 +117,7 @@ smoke-v0-8-10-real-short: HEAD does not match origin/dev.
 HEAD:       $head
 origin/dev: $origin_dev
 
-Fetch/pull the pushed dev commit before recording nas-box005 smoke results.
+Fetch/pull the pushed dev commit before recording target-host smoke results.
 EOF
     exit 78
   fi
@@ -125,7 +125,7 @@ EOF
     cat >&2 <<'EOF'
 smoke-v0-8-10-real-short: worktree is dirty.
 
-Commit, stash, or clean local changes before recording nas-box005 smoke
+Commit, stash, or clean local changes before recording target-host smoke
 results. The release smoke must run against an exact pushed commit.
 EOF
     exit 78

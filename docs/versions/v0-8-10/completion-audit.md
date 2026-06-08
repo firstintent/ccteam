@@ -2,36 +2,42 @@
 
 Audit date: 2026-06-09
 Local host: `rob-ws`
-Local gate evidence commit: `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`
+Local gate evidence commit: `e38ff81425ffafc9b75f2df0820ba92eb481da18`
 Remote: `origin/dev` matched that commit during this audit.
 
 This file records what is proven by current repo state and command evidence,
-and what remains unproven. It is not a replacement for the nas-box005 checklist.
+and what remains unproven. It is not a replacement for the target-host
+checklist.
 If a later commit changes non-documentation code, rerun the full local gate
 suite before using this audit as release evidence.
 
 ## Overall Status
 
-Not tag-ready until the manual nas-box005 host-fault checklist is completed.
+Tag-ready for the user-directed local target-host gate.
 
-The CI-fake, local deterministic gates, and automated nas-box005 short smoke
-are complete at `b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d`. The remaining
-release evidence is the manual host suspend/netdrop/no-silent-failure section
-in `nas-box005-short-smoke-checklist.md`. The checked-in script refuses to run
-as release evidence unless:
+The CI-fake, local deterministic gates, and local target-host short smoke are
+complete at `e38ff81425ffafc9b75f2df0820ba92eb481da18`. Latest user direction
+moved the checklist execution from `nas-box005` to this local workstation. The
+checked-in script refuses to run as release evidence unless:
 
-- hostname is `nas-box005`;
+- hostname matches `CCTEAM_REAL_SMOKE_HOST` (default `nas-box005`; latest run
+  used `rob-ws`);
 - worktree is clean;
 - `HEAD == origin/dev`;
 - required tools are present;
 - `target/debug/ccteam` exists for the real IM/web leg.
 
+Host-fault caveat: the local target-host smoke proves a 600s `SIGSTOP`/`SIGCONT`
+daemon freeze and WebSocket disconnect/reconnect backlog replay. It does not
+claim full ACPI system suspend, RTC wake, or system-level outbound network
+blocking.
+
 ## Stability Gates
 
 | Gate | Status | Evidence |
 |---|---|---|
-| A1 golden-path soak | Partial | CI-fake slice passed; automated nas-box005 short smoke passed at `b7edeee` (`scripts/smoke-v0-8-10-real-short.sh`: real rmux PASS + real IM WS restart/faults PASS). Manual host suspend/netdrop remains pending. |
-| A2 failure-mode injection | Partial | CI-fake restart/replay/fault slices passed; automated nas-box005 restart + Claude pane death fault passed; host suspend and real netdrop are still checklist-only pending items. |
+| A1 golden-path soak | Passed for local target-host scope | CI-fake slice passed; local target-host short smoke passed at `e38ff81` (`scripts/smoke-v0-8-10-real-short.sh`: real rmux PASS + real IM WS restart + 600s SIGSTOP/SIGCONT + WS disconnect/reconnect + Claude pane-death fault PASS). Full ACPI suspend/system-level net block not claimed. |
+| A2 failure-mode injection | Passed for local target-host scope | CI-fake restart/replay/fault slices passed; local smoke covered daemon restart, 600s SIGSTOP/SIGCONT recovery, WS reconnect exactly-once backlog replay, and Claude pane death user-visible failure. Codex app-server disconnect remains opt-in/best-effort. |
 | A3 named guards for D2/D3/D4 | Passed for CI scope | `backend_literal_guard_test`, sid-bearing reset/progress tests, same-role/roleless routing tests, and file-backed stall classifier tests are included in the 1920-pass workspace gate. |
 | A4 boundary timeout/retry/idempotence | Passed for CI scope | Gateway persistence, outbound replay/idempotence, WS replay, start/submit failure, and turn-timeout smoke slices passed in `scripts/smoke-im.sh`. |
 | A5 baseline/gates | Passed locally | `cargo test --workspace --exclude ccteam-web`: 1920 passed, 19 ignored; `cargo test -p ccteam-web`: 276 passed; clippy/fmt/eslint/vitest/Playwright all passed. |
@@ -40,7 +46,7 @@ as release evidence unless:
 
 | Gate | Status | Evidence |
 |---|---|---|
-| B1 zero silent failure signals | Partial | IM/web deterministic failures and marker-missing signal tests pass; automated nas-box005 Claude pane death produced one user-visible `发送失败: tmux session missing:` message; manual no-silent-failure checklist remains pending. |
+| B1 zero silent failure signals | Passed for local target-host scope | IM/web deterministic failures and marker-missing signal tests pass; local short smoke recovered SIGSTOP/WS reconnect visibly exactly once and Claude pane death produced one user-visible `发送失败: tmux session missing:` message. |
 | B2 dogfooding bug class regression tests | Passed for CI scope | Hook materialization, dynamic project registry, per-sid isolation, ANSI/capture cleanup, roleless tail/reply tests are in the local gates and handoffs. |
 | B3 onboarding path | Passed for CI scope | `run_init_next_block_names_shortest_path_and_role_modes`, `cto_role_template_has_fresh_user_guidance`, `README.md`, and `docs/usage.md` carry the six-step sequence. Real phone-to-reply walk remains manual/best-effort evidence. |
 | B4 model support honesty | Passed for CI scope | `is_claude_family` tests plus gateway warn-once positive/negative tests pass; README/usage supported-model matrix is present. |
@@ -75,39 +81,40 @@ Current evidence:
 - `bash -n scripts/smoke-v0-8-10-real-short.sh`: passed.
 - `scripts/smoke-v0-8-10-real-short.sh --help`: passed.
 - `scripts/smoke-v0-8-10-real-short.sh --skip-rmux --skip-im --preflight-only`
-  on `rob-ws`: correctly refused as non-nas host.
-- `CCTEAM_ALLOW_NON_NAS_SMOKE=1 scripts/smoke-v0-8-10-real-short.sh --skip-rmux --skip-im --preflight-only`
-  on `rob-ws`: rehearsal preflight passed and printed matching `HEAD` /
-  `origin/dev`.
+  on `rob-ws` without `CCTEAM_REAL_SMOKE_HOST=rob-ws`: correctly refused as
+  target-host mismatch.
+- `CCTEAM_REAL_SMOKE_HOST=rob-ws scripts/smoke-v0-8-10-real-short.sh`:
+  PASS; log directory `/tmp/ccteam-v0-8-10-real-short`.
 
-## nas-box005 Automated Smoke
+## Local Target-Host Smoke
 
-Run on `nas-box005` at commit
-`b7edeeeaf64d58ecba3f2f9fa014e3e09651b58d` with clean worktree and
+Run on `rob-ws` at commit
+`e38ff81425ffafc9b75f2df0820ba92eb481da18` with clean worktree and
 `HEAD == origin/dev`:
 
 - `cargo build --workspace`: passed.
 - `scripts/smoke-v0-8-10-real-short.sh`: PASS.
 - `real_rmux`: PASS, 7 passed.
 - `real_im_ws_restart_faults`: PASS.
-- The script log is under `/tmp/ccteam-v0-8-10-real-short/` on nas-box005.
+- `real_ws_dual_harness_smoke`: PASS, 1 passed in 616.66s.
+- `smoke-im`: PASS.
+- The script log is under `/tmp/ccteam-v0-8-10-real-short/` on `rob-ws`.
 
 During this audit, two prior automated attempts exposed a real Claude TUI
 submit race: `claude --agent reviewer --model sonnet ...` was launched
 correctly, but immediate `send-keys Enter` could leave the prompt in the
 composer. The final fix waits for the TUI input settle before Enter; the
-automated nas-box005 smoke passed after that change.
+automated smoke passed after that change.
 
-## Remaining Required Evidence
+## Remaining Best-Effort / Not Claimed
 
-Run and record in `nas-box005-short-smoke-checklist.md`:
+The local checklist is complete for the user-directed target-host scope. The
+following are not claimed by this audit and remain best-effort or out of this
+local run:
 
-1. Manual host suspend/resume.
-2. Manual network drop/restore.
-3. Restart-after-fault after those manual checks.
-4. Manual no-silent-failure check.
-5. Optional/best-effort Codex app-server disconnect, long-run, and marketplace
-   install checks.
-
-Only after that checklist is completed with PASS should this release be treated
-as tag-ready.
+1. Full ACPI suspend / RTC wake.
+2. System-level outbound network block.
+3. Codex app-server disconnect real smoke.
+4. Long-run M>=50 / 24h dogfood.
+5. Marketplace install real-machine verification, blocked on hub public
+   availability.
