@@ -76,6 +76,12 @@ impl ClaudeTuiAdapter {
 /// Tmux/process session-name prefix for chat-mode bots.
 pub const CHAT_SESSION_PREFIX: &str = "ccteam-chat-";
 
+/// Claude's TUI can lag one event-loop tick behind tmux's literal text write
+/// just after startup/reattach. Sending Enter immediately after `send-keys -l`
+/// occasionally leaves the text in the composer without submitting it on real
+/// terminals. Keep this short and local to the Claude TUI path.
+const SUBMIT_ENTER_SETTLE: Duration = Duration::from_millis(120);
+
 /// Compose the canonical tmux session name for a chat-mode bot.
 ///
 /// v0.8.8 F1 — 第二参的【语义】由 role 改为 **sid**(`s<N>`):同一
@@ -846,6 +852,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys -l: {e}")))?;
         let literal_ms = sendkeys_t0.elapsed().as_millis() as u64;
+        tokio::time::sleep(SUBMIT_ENTER_SETTLE).await;
         backend
             .send_enter(&id)
             .await
