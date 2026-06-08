@@ -136,6 +136,7 @@ fn session_end_with_clear_reason_emits_chat_session_reset() {
     let slug = "tcp-reset";
     let (paths, project_dir) = setup_project(&tmp, slug);
     std::env::set_var("CCTEAM_CHAT_ROLE", "dora");
+    std::env::set_var("CCTEAM_CHAT_SID", "s5");
 
     let stdin = json!({
         "hook_event_name": "SessionEnd",
@@ -149,8 +150,39 @@ fn session_end_with_clear_reason_emits_chat_session_reset() {
         &ccteam_core::session_context_from_cwd(&project_dir, &paths).unwrap(),
     );
     let rows = read_jsonl(&progress);
-    assert_eq!(rows.last().unwrap()["event"], "chat_session_reset");
+    let row = rows.last().unwrap();
+    assert_eq!(row["event"], "chat_session_reset");
+    assert_eq!(row["role"], "dora");
+    assert_eq!(row["sid"], "s5");
     std::env::remove_var("CCTEAM_CHAT_ROLE");
+    std::env::remove_var("CCTEAM_CHAT_SID");
+}
+
+#[test]
+#[serial]
+fn roleless_session_end_reset_event_carries_sid() {
+    let tmp = TempDir::new().unwrap();
+    let slug = "tcp-roleless-reset";
+    let (paths, project_dir) = setup_project(&tmp, slug);
+    std::env::remove_var("CCTEAM_CHAT_ROLE");
+
+    let stdin = json!({
+        "hook_event_name": "SessionEnd",
+        "session_id": "sess-roleless",
+        "ccteam_sid": "s6",
+        "cwd": project_dir.to_string_lossy(),
+        "reason": "clear",
+    });
+    handle_chat_progress(&paths, "session-end", &stdin).unwrap();
+
+    let progress = paths.progress_jsonl_for_context(
+        &ccteam_core::session_context_from_cwd(&project_dir, &paths).unwrap(),
+    );
+    let rows = read_jsonl(&progress);
+    let row = rows.last().unwrap();
+    assert_eq!(row["event"], "chat_session_reset");
+    assert_eq!(row["role"], "");
+    assert_eq!(row["sid"], "s6");
 }
 
 #[test]

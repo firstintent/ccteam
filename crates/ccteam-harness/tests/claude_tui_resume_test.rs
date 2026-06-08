@@ -537,6 +537,7 @@ async fn resume_failure_falls_back_to_fresh_name() {
     let ev: serde_json::Value = serde_json::from_str(reset_line).expect("valid JSON");
     assert_eq!(ev["event"], "chat_session_reset");
     assert_eq!(ev["role"], role);
+    assert_eq!(ev["sid"], F172_SID);
     assert_eq!(ev["reason"], "resume_failed_fallback_to_fresh");
 
     kill_session_quiet(&session_name);

@@ -993,9 +993,31 @@ mod tests {
 
     #[test]
     fn build_chat_session_reset_with_recovery_event_carries_count() {
-        let ev = build_chat_session_reset_with_recovery_event("frank", 12);
+        let ev = build_chat_session_reset_with_recovery_event("frank", "s9", 12);
         assert_eq!(ev["event"], CHAT_SESSION_RESET_WITH_RECOVERY);
+        assert_eq!(ev["sid"], "s9");
         assert_eq!(ev["recovered_turns"], 12);
+    }
+
+    #[test]
+    fn build_chat_session_reset_event_carries_sid_for_roleless_session() {
+        let ev = build_chat_session_reset_event("", "s7");
+        assert_eq!(ev["event"], CHAT_SESSION_RESET);
+        assert_eq!(ev["role"], "");
+        assert_eq!(ev["sid"], "s7");
+    }
+
+    #[test]
+    fn build_chat_session_reset_with_reason_event_carries_sid() {
+        let ev = build_chat_session_reset_event_with_reason(
+            "reviewer",
+            "s8",
+            "resume_failed_fallback_to_fresh",
+        );
+        assert_eq!(ev["event"], CHAT_SESSION_RESET);
+        assert_eq!(ev["role"], "reviewer");
+        assert_eq!(ev["sid"], "s8");
+        assert_eq!(ev["reason"], "resume_failed_fallback_to_fresh");
     }
 
     #[test]

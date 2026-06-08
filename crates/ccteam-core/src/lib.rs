@@ -252,8 +252,9 @@ pub use silence_classifier::{
 };
 pub use skill::LEGACY_SKILL_NAMES;
 pub use stall::{
-    classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
-    StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
+    classify as classify_stall, classify_progress_stall, classify_with_thresholds, silent_seconds,
+    ProgressStallStatus, StallLevel, StallThresholds, STALL_ESCALATE_SECONDS,
+    STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
@@ -279,7 +280,7 @@ pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,
     query_pane_dims_from_session, session_name_for_project, session_name_for_slug, tmux_available,
-    TmuxSession,
+    tmux_version, TmuxSession,
 };
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,

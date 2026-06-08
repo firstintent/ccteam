@@ -181,7 +181,7 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
                         }
                     }
                 }
-                build_chat_session_reset_event(&role)
+                build_chat_session_reset_event(&role, &ccteam_sid)
             } else {
                 json!({
                     "event": "chat_session_end",

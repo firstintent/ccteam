@@ -1667,7 +1667,11 @@ impl Gateway {
         turn_id: &str,
     ) -> Result<Vec<String>> {
         if let Some(tx) = self.event_sink.clone() {
-            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id);
+            let progress_path = self
+                .project_paths
+                .as_ref()
+                .map(|paths| paths.progress_jsonl(&session.project));
+            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id, progress_path);
             Ok(Vec::new())
         } else {
             let mut replies = Vec::new();
@@ -2372,6 +2376,7 @@ fn spawn_turn_timeout_watchdog(
     session: &GatewaySession,
     start_visible_events: u64,
     turn_id: &str,
+    progress_path: Option<PathBuf>,
 ) {
     let timeout = gateway_turn_timeout_duration();
     if timeout.is_zero() {
@@ -2379,6 +2384,8 @@ fn spawn_turn_timeout_watchdog(
     }
     let visible_events = Arc::clone(&session.visible_events);
     let session_id = session.id.clone();
+    let project = session.project.clone();
+    let role = session.role.clone();
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
@@ -2391,6 +2398,22 @@ fn spawn_turn_timeout_watchdog(
         tokio::time::sleep(timeout).await;
         if visible_events.load(Ordering::SeqCst) != start_visible_events {
             return; // the turn produced a visible answer → not stuck.
+        }
+        if let Some(progress_path) = progress_path.as_ref() {
+            let ev = ccteam_core::progress::build_chat_turn_timeout_event(
+                &role,
+                &project,
+                &turn_id,
+                timeout.as_secs(),
+            );
+            if let Err(err) = ccteam_core::progress::append_event(progress_path, &ev) {
+                tracing::warn!(
+                    session = %session_id,
+                    path = %progress_path.display(),
+                    error = %err,
+                    "turn-watchdog: failed to append chat_turn_timeout progress event"
+                );
+            }
         }
         // No answer within the timeout = a stalled / infinitely-looping turn
         // (e.g. a roleless model spinning on tool calls). INTERRUPT it via the

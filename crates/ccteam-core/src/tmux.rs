@@ -19,7 +19,7 @@ pub use ccteam_harness::tmux_ops::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, list_sessions, pid_is_alive, query_pane_dims,
     query_pane_dims_from_session, resize_window, session_name_for_slug, tmux_available,
-    TmuxSession, SESSION_PREFIX,
+    tmux_version, TmuxSession, SESSION_PREFIX,
 };
 
 use crate::paths::CcteamPaths;

@@ -104,7 +104,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     std::env::set_var("CCTEAM_TAIL_MARKER_WARN_MS", "100");
 
     // Confirm no marker is on disk — this is the "stuck" condition.
-    let marker = active_session_id_path(&project_dir, "alice");
+    let marker = active_session_id_path(&project_dir, "s1");
     assert!(!marker.exists());
 
     let capture = WarnCapture::default();
@@ -118,6 +118,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
         started_at: Utc::now(),
         raw_extras: json!({
             "role": "alice",
+            "sid": "s1",
             "project_dir": project_dir.display().to_string(),
             "cwd": cwd.display().to_string(),
         }),

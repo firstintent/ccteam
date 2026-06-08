@@ -178,13 +178,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // -- 6. Health check + optional wizard --------------------------
     let bin = current_ccteam_bin().ok();
     let claude = Command::new("claude").arg("--version").output();
-    // V0.8 W1 — `tmux -V` probe routes through the canonical
-    // `ccteam_core::tmux_available()` helper (re-exported from
-    // `ccteam_harness::tmux_ops`) but the wizard wants a version string,
-    // not a bool. Keep the inline `Command` here; the V0.9 retirement
-    // of tmux.rs will swap this once tmux_available exposes the
-    // version string too.
-    let tmux = Command::new("tmux").arg("-V").output();
+    let tmux = ccteam_core::tmux_version();
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -224,10 +218,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             .push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
     }
     match &tmux {
-        Ok(o) if o.status.success() => out.push_str(&format!(
-            "  tmux     : {}\n",
-            String::from_utf8_lossy(&o.stdout).trim()
-        )),
+        Some(version) => out.push_str(&format!("  tmux     : {version}\n")),
         _ => {
             out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n")
         }
@@ -3412,6 +3403,11 @@ fn render_ls_json(
             let cost_summary =
                 cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
                     .unwrap_or_default();
+            let last_event =
+                ccteam_core::progress::last_event(&paths.progress_jsonl(&p.state.slug))
+                    .ok()
+                    .flatten();
+            let stall = stall_level(last_event.as_ref(), p.stall_silent_seconds);
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
@@ -3428,7 +3424,7 @@ fn render_ls_json(
                     .state
                     .last_progress_event_at
                     .map(|t| t.to_rfc3339()),
-                "stall_level": stall_level(p.stall_silent_seconds),
+                "stall_level": stall,
             })
         })
         .collect();
@@ -3592,16 +3588,8 @@ fn phase_state_str(s: &PhaseState) -> &'static str {
     }
 }
 
-pub(crate) fn stall_level(silent_s: u64) -> &'static str {
-    if silent_s >= 30 * 60 {
-        "escalate"
-    } else if silent_s >= 15 * 60 {
-        "suspicious"
-    } else if silent_s >= 5 * 60 {
-        "warn"
-    } else {
-        "ok"
-    }
+pub(crate) fn stall_level(last_event: Option<&Value>, silent_s: u64) -> &'static str {
+    ccteam_core::stall::classify_progress_stall(last_event, silent_s).level
 }
 
 /// Collapse the `stall_level` tiers into the short verdict word the
@@ -3609,12 +3597,8 @@ pub(crate) fn stall_level(silent_s: u64) -> &'static str {
 /// instead of decoding raw silence seconds. `escalate`/`suspicious`
 /// both surface as `STUCK` (silent long enough to warrant a takeover),
 /// `warn` stays `warn`, everything else is `OK`.
-pub(crate) fn stall_verdict(silent_s: u64) -> &'static str {
-    match stall_level(silent_s) {
-        "escalate" | "suspicious" => "STUCK",
-        "warn" => "warn",
-        _ => "OK",
-    }
+pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'static str {
+    ccteam_core::stall::classify_progress_stall(last_event, silent_s).verdict
 }
 
 /// One actionable hint line for a warn-or-higher project: the exact
@@ -5242,6 +5226,66 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn run_peek_default_rmux_does_not_shell_out_to_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let fake_bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let sentinel = tmp.path().join("tmux-called");
+        let fake_tmux = fake_bin.join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nprintf called > \"$CCTEAM_TMUX_SENTINEL\"\nexit 99\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, perms).unwrap();
+
+        let old_path = std::env::var_os("PATH");
+        let old_home = std::env::var_os("CCTEAM_HOME");
+        let joined_path = match old_path.as_ref() {
+            Some(path) => {
+                let mut paths = vec![fake_bin.clone()];
+                paths.extend(std::env::split_paths(path));
+                std::env::join_paths(paths).unwrap()
+            }
+            None => fake_bin.clone().into_os_string(),
+        };
+        std::env::set_var("PATH", joined_path);
+        std::env::set_var("CCTEAM_HOME", tmp.path().join("ccteam-home"));
+        std::env::set_var("CCTEAM_MUX_BACKEND", "rmux");
+        std::env::set_var("CCTEAM_TMUX_SENTINEL", &sentinel);
+
+        let result = run_peek_with_role(&paths, "missing", None);
+
+        std::env::remove_var("CCTEAM_MUX_BACKEND");
+        std::env::remove_var("CCTEAM_TMUX_SENTINEL");
+        match old_home {
+            Some(path) => std::env::set_var("CCTEAM_HOME", path),
+            None => std::env::remove_var("CCTEAM_HOME"),
+        }
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("rmux"),
+            "peek should fail through the rmux backend, got: {msg}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "default rmux peek must not invoke a PATH tmux binary"
+        );
+    }
+
     /// v0.8.8 B1 — `stop_project_chat_sessions` consults the *injected*
     /// [`ProcessBackend`], not shell `tmux` directly. The deterministic
     /// list+kill+absent semantics (which need a single live tokio runtime
@@ -5367,14 +5411,17 @@ mod tests {
 
     #[test]
     fn stall_verdict_classifies_silence_tiers() {
-        // 0s → OK, 5m → warn, 15m+/30m+ both collapse to STUCK so the
-        // status row prints a verdict instead of raw seconds.
-        assert_eq!(stall_verdict(0), "OK");
-        assert_eq!(stall_verdict(5 * 60), "warn");
-        assert_eq!(stall_verdict(15 * 60), "STUCK");
-        // Past the escalate threshold (30m) the project is STUCK and the
-        // takeover hint names the exact peek → attach sequence.
-        assert_eq!(stall_verdict(30 * 60), "STUCK");
+        // D4: pure age can warn, but only a file-backed watchdog timeout
+        // (`chat_turn_timeout` / stuck:true in progress.jsonl) may say STUCK.
+        assert_eq!(stall_verdict(None, 0), "OK");
+        assert_eq!(stall_verdict(None, 5 * 60), "warn");
+        assert_eq!(stall_verdict(None, 15 * 60), "warn");
+        assert_eq!(stall_verdict(None, 30 * 60), "warn");
+        let timeout = serde_json::json!({
+            "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+            "stuck": true,
+        });
+        assert_eq!(stall_verdict(Some(&timeout), 0), "STUCK");
         let hint = stall_takeover_hint("dev-checkout", "31m");
         assert!(hint.contains("dev-checkout"), "hint names the slug: {hint}");
         assert!(hint.contains("silent 31m"), "hint shows silence: {hint}");

@@ -3536,25 +3536,26 @@ fn run_status() -> Result<()> {
             .push(row);
     }
 
-    // tracked ⇒ live when the daemon is up; else degrade (matches `session ls`).
-    let session_status = if daemon_up {
-        "live"
-    } else {
-        "registered (daemon down)"
-    };
-
     if projects.is_empty() {
         println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
     } else {
         println!("  projects ({}):", projects.len());
-        // Classify each project's silence into a short verdict so the
-        // operator reads "STUCK" instead of decoding raw seconds. Reuses
-        // `commands::stall_verdict` so the human + JSON views stay consistent.
+        // Classify each project from the same file-backed progress truth that
+        // the JSON status and web Status rail read.
         let mut needs_attention: Vec<(&str, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
             let silent = humanize_secs(p.stall_silent_seconds);
-            let verdict = commands::stall_verdict(p.stall_silent_seconds);
+            let last_progress_event =
+                ccteam_core::progress::last_event(&paths.progress_jsonl(&p.state.slug))
+                    .ok()
+                    .flatten();
+            let status = ccteam_core::stall::classify_progress_stall(
+                last_progress_event.as_ref(),
+                p.stall_silent_seconds,
+            );
+            let verdict =
+                commands::stall_verdict(last_progress_event.as_ref(), p.stall_silent_seconds);
             if verdict != "OK" {
                 needs_attention.push((p.state.slug.as_str(), silent.clone()));
             }
@@ -3567,6 +3568,11 @@ fn run_status() -> Result<()> {
             // no per-session timestamp, so the session "last-event" reuses the
             // project-level silence (a glance-level proxy); `-` when unknown.
             if let Some(rows) = sessions_by_project.get(&p.state.slug) {
+                let session_status = if daemon_up {
+                    status.activity
+                } else {
+                    "registered (daemon down)"
+                };
                 let last_event = if p.stall_silent_seconds > 0 {
                     silent.clone()
                 } else {

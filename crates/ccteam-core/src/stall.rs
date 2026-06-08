@@ -3,7 +3,9 @@
 //! tracing; M1 hooks telegram per the design's escalate path.
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 
+use crate::progress;
 use crate::state::ProjectState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,55 @@ pub fn classify(silent_seconds: u64) -> StallLevel {
     classify_with_thresholds(silent_seconds, &StallThresholds::default())
 }
 
+/// Read-side status for the core chat loop, sourced from the last
+/// `progress.jsonl` event plus its age. Unlike the legacy phase-level
+/// [`classify`] helper, this never promotes pure age to STUCK: a stuck verdict
+/// requires a file-backed event written by the live watchdog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressStallStatus {
+    pub level: &'static str,
+    pub verdict: &'static str,
+    pub activity: &'static str,
+}
+
+/// Classify chat-loop activity from the file-backed progress truth.
+///
+/// - `chat_turn_timeout` / `stuck:true` is the only STUCK source.
+/// - long silence without that event is only `warn`, because the live daemon
+///   might be down and CLI/web cannot see the watchdog's process memory.
+/// - non-idle last events render as `working`; idle boundaries render `idle`.
+pub fn classify_progress_stall(
+    last_event: Option<&Value>,
+    silent_seconds: u64,
+) -> ProgressStallStatus {
+    let stuck = last_event.is_some_and(|event| {
+        event.get("event").and_then(Value::as_str) == Some(progress::CHAT_TURN_TIMEOUT)
+            || event.get("stuck").and_then(Value::as_bool) == Some(true)
+    });
+    if stuck {
+        return ProgressStallStatus {
+            level: "stuck",
+            verdict: "STUCK",
+            activity: "stuck",
+        };
+    }
+    let level = if silent_seconds >= STALL_WARN_SECONDS {
+        "warn"
+    } else {
+        "ok"
+    };
+    let activity = if progress::is_idle(last_event) {
+        "idle"
+    } else {
+        "working"
+    };
+    ProgressStallStatus {
+        level,
+        verdict: if level == "warn" { "warn" } else { "OK" },
+        activity,
+    }
+}
+
 /// How many seconds have passed since the project's most recent
 /// progress event? Falls back to `now − created_at` when no events
 /// have been observed yet, so the warn-clock starts ticking the moment
@@ -127,6 +178,35 @@ mod tests {
         assert_eq!(classify(STALL_ESCALATE_SECONDS - 1), StallLevel::Suspicious);
         assert_eq!(classify(STALL_ESCALATE_SECONDS), StallLevel::Escalate);
         assert_eq!(classify(60 * 60), StallLevel::Escalate);
+    }
+
+    #[test]
+    fn progress_stall_requires_file_backed_timeout_for_stuck() {
+        let idle = serde_json::json!({"event": progress::CHAT_TURN_COMPLETED});
+        let status = classify_progress_stall(Some(&idle), STALL_SUSPICIOUS_SECONDS);
+        assert_eq!(status.level, "warn");
+        assert_eq!(status.verdict, "warn");
+        assert_eq!(status.activity, "idle");
+    }
+
+    #[test]
+    fn progress_stall_marks_timeout_event_stuck_even_when_recent() {
+        let timeout = serde_json::json!({
+            "event": progress::CHAT_TURN_TIMEOUT,
+            "stuck": true,
+        });
+        let status = classify_progress_stall(Some(&timeout), 1);
+        assert_eq!(status.level, "stuck");
+        assert_eq!(status.verdict, "STUCK");
+        assert_eq!(status.activity, "stuck");
+    }
+
+    #[test]
+    fn progress_stall_marks_non_idle_event_working() {
+        let prompt = serde_json::json!({"event": progress::CHAT_TURN_USER_PROMPT});
+        let status = classify_progress_stall(Some(&prompt), 10);
+        assert_eq!(status.level, "ok");
+        assert_eq!(status.activity, "working");
     }
 
     #[test]

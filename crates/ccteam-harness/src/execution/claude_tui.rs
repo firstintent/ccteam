@@ -684,6 +684,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                         let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
+                            &ctx.sid,
                             "resume_failed_fallback_to_fresh",
                         );
                         if let Err(err) = append_event(&progress_path, &ev) {
@@ -887,7 +888,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .to_string();
         // v0.8.8 F1 — sid 是 turns / cursor / marker 的真实键。tail_loop
         // 用它算 cursor_path / active_session_id_path,使同 (project, role)
-        // 多会话各跟各自的 jsonl,绝不串台。空 sid(旧 handle)回退到 role。
+        // 多会话各跟各自的 jsonl,绝不串台。
         let sid = h
             .raw_extras
             .get("sid")
@@ -910,18 +911,16 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
             // v0.8.9 — roleless sessions (empty role) ALSO need the transcript
             // tail loop: answer-forwarding reads the transcript regardless of
-            // persona, so gate on a usable KEY (the sid), NOT on a non-empty
-            // role. The previous `if !role.is_empty()` guard was a
+            // persona, so gate on the sid, NOT on a non-empty role. The
+            // previous `if !role.is_empty()` guard was a
             // "session = role"-era leftover that v0.8.8-F2's roleless spawn
             // missed — it silently dropped EVERY roleless reply: `events()`
             // spawned no tail loop, so its stream stayed empty and the gateway
             // pump never observed an ANSWER. The tail key is the sid (turns /
-            // cursor / marker 真实键); the `role` fallback covers only an empty
-            // sid (legacy handle / tests).
-            let key = if sid.is_empty() { role.clone() } else { sid };
-            if !key.is_empty() {
+            // cursor / marker 真实键).
+            if !sid.is_empty() {
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                tokio::spawn(tail_loop(pdir, cwd, slug, role, key, tx, dispatch));
+                tokio::spawn(tail_loop(pdir, cwd, slug, role, sid, tx, dispatch));
             }
         }
 
@@ -1097,10 +1096,8 @@ impl ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
         // v0.8.8 F1 — marker 现按 sid 存储,与 events()/tail_loop 同键。
-        // 空 sid(旧 handle)回退到 role,保持向后可读。
         let sid = h.raw_extras.get("sid").and_then(|v| v.as_str());
-        let role = h.raw_extras.get("role").and_then(|v| v.as_str());
-        let marker_key = sid.filter(|s| !s.is_empty()).or(role).unwrap_or("");
+        let marker_key = sid.filter(|s| !s.is_empty()).unwrap_or("");
         let parent_dir = anthropic_project_dir(&cwd)?;
         // Marker sid first (deterministic per-session target, set by the
         // chat-progress hook); only trust it if the file actually exists.
@@ -1477,7 +1474,7 @@ impl MarkerSilenceWatch {
     }
 }
 
-/// Read just the sid from `<project>/.ccteam/chat/<role>/active-session-id`.
+/// Read just the sid from `<project>/.ccteam/chat/<sid>/active-session-id`.
 /// Returns `None` when the marker is absent (hook hasn't fired yet) or
 /// unreadable. Trims whitespace because the hook writes the raw sid
 /// without a trailing newline but a future writer might.

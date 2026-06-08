@@ -1116,6 +1116,27 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
                 s.starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms")
             })
     }));
+
+    let paths = ccteam_core::CcteamPaths {
+        root: ccteam_im::default_ccteam_root_public(),
+        projects_root: home.path().join("projects"),
+    };
+    let progress = paths.progress_jsonl("default");
+    let body = std::fs::read_to_string(&progress).unwrap_or_else(|err| {
+        panic!(
+            "watchdog must append chat_turn_timeout to {}: {err}",
+            progress.display()
+        )
+    });
+    let timeout_event = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["event"] == "chat_turn_timeout")
+        .expect("expected chat_turn_timeout in progress.jsonl");
+    assert_eq!(timeout_event["role"], "helper");
+    assert_eq!(timeout_event["slug"], "default");
+    assert_eq!(timeout_event["turn_id"], "failing-stub-turn");
+    assert_eq!(timeout_event["stuck"], true);
 }
 
 #[allow(clippy::await_holding_lock)]

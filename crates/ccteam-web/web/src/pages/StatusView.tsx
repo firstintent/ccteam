@@ -144,27 +144,26 @@ export function StatusCards({
           <div className="text-xs text-text-dim">没有活动会话。</div>
         ) : (
           <div className="space-y-1">
-            {rail.map((s) => (
-              <div key={s.sid} className="text-xs text-text-secondary flex items-center gap-2">
-                <span className="font-mono text-text-dim">{s.project}</span>
-                <span className="text-text-dim">/</span>
-                <span
-                  className={s.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}
+            {rail.map((s) => {
+              const activity = sessionActivityMeta(s.status);
+              return (
+                <div key={s.sid} className="text-xs text-text-secondary flex items-center gap-2">
+                  <span className="font-mono text-text-dim">{s.project}</span>
+                  <span className="text-text-dim">/</span>
+                  <span
+                    className={s.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}
                 >
                   {[s.vendor, s.role || "(无 role)"].filter(Boolean).join(" · ")}
                 </span>
                 <span className="font-mono text-text-dim">{s.sid}</span>
-                <span
-                  className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${
-                    s.status === "live"
-                      ? "bg-status-running/15 text-status-running"
-                      : "bg-brand-500/15 text-brand-400"
-                  }`}
-                >
-                  {s.status === "live" ? "live" : "idle"}
-                </span>
-              </div>
-            ))}
+                  <span
+                    className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${activity.className}`}
+                  >
+                    {activity.label}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -215,4 +214,34 @@ export function StatusCards({
       </div>
     </>
   );
+}
+
+function sessionActivityMeta(status: string): { label: string; className: string } {
+  switch (status) {
+    case "stuck":
+      return {
+        label: "疑似卡",
+        className: "bg-status-error/15 text-status-error",
+      };
+    case "working":
+      return {
+        label: "working",
+        className: "bg-status-running/15 text-status-running",
+      };
+    case "idle":
+      return {
+        label: "idle",
+        className: "bg-brand-500/15 text-brand-400",
+      };
+    case "live":
+      return {
+        label: "live",
+        className: "bg-status-running/15 text-status-running",
+      };
+    default:
+      return {
+        label: status || "idle",
+        className: "bg-brand-500/15 text-brand-400",
+      };
+  }
 }

@@ -64,7 +64,7 @@ use axum::{
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::{AgentVendor, PermissionMode};
-use ccteam_im::gateway::GatewayEvent;
+use ccteam_im::gateway::{GatewayEvent, SessionView};
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -135,7 +135,7 @@ pub(crate) async fn handle_list_sessions(
         return no_gateway();
     };
     // session_views() is sync after the lock — no `.await` is held under it.
-    let views = {
+    let mut views = {
         let guard = gw.lock().await;
         guard
             .session_views()
@@ -143,7 +143,37 @@ pub(crate) async fn handle_list_sessions(
             .filter(|v| v.project == slug)
             .collect::<Vec<_>>()
     };
+    apply_progress_activity_status(&app.paths, &slug, &mut views);
     Json(views).into_response()
+}
+
+fn apply_progress_activity_status(
+    paths: &ccteam_core::CcteamPaths,
+    slug: &str,
+    views: &mut [SessionView],
+) {
+    if views.is_empty() {
+        return;
+    }
+    let Some(silent_seconds) = ccteam_core::collect_projects(paths)
+        .ok()
+        .and_then(|projects| {
+            projects
+                .into_iter()
+                .find(|project| project.state.slug == slug)
+                .map(|project| project.stall_silent_seconds)
+        })
+    else {
+        return;
+    };
+    let last_event = ccteam_core::progress::last_event(&paths.progress_jsonl(slug))
+        .ok()
+        .flatten();
+    let activity =
+        ccteam_core::stall::classify_progress_stall(last_event.as_ref(), silent_seconds).activity;
+    for view in views {
+        view.status = activity.to_string();
+    }
 }
 
 /// POST body for session creation — `role` (required), `vendor` (optional,
@@ -895,11 +925,59 @@ mod tests {
     }
 
     #[test]
+    fn progress_activity_status_uses_core_file_backed_classifier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_project_state(&paths, "demo");
+        let mut views = vec![SessionView {
+            sid: "s1".into(),
+            project: "demo".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+            current: true,
+            status: "live".into(),
+        }];
+
+        let stale_completed = serde_json::json!({
+            "event": ccteam_core::progress::CHAT_TURN_COMPLETED,
+            "ts": (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
+        });
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &stale_completed)
+            .unwrap();
+        apply_progress_activity_status(&paths, "demo", &mut views);
+        assert_eq!(views[0].status, "idle");
+
+        let timeout = serde_json::json!({
+            "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+            "stuck": true,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        });
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &timeout).unwrap();
+        apply_progress_activity_status(&paths, "demo", &mut views);
+        assert_eq!(views[0].status, "stuck");
+    }
+
+    #[test]
     fn collect_session_turns_missing_file_is_empty() {
         // Absent turns.jsonl is the legitimate first-turn case → empty (200),
         // not an error. read_all_turns returns Ok(empty) for a missing file.
         // v0.8.8 F1 — keyed by sid (the never-spawned `s99` has no mirror yet).
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(collect_session_turns(tmp.path(), "s99").is_empty());
+    }
+
+    fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {
+        ccteam_core::CcteamPaths {
+            root: root.join(".ccteam"),
+            projects_root: root.join("projects"),
+        }
+    }
+
+    fn write_project_state(paths: &ccteam_core::CcteamPaths, slug: &str) {
+        let state_path = paths.project_state(slug);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let state = ccteam_core::ProjectState::initial(slug.to_string());
+        std::fs::write(state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
     }
 }

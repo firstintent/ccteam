@@ -149,6 +149,22 @@ describe("StatusCards (seeded success state)", () => {
     expect(html).toContain("text-brand-400");
   });
 
+  it("renders file-backed stuck session status as a distinct badge", () => {
+    const snap: StatusSnapshot = {
+      daemon_healthy: true,
+      sessions_live: 1,
+      sessions_idle: 0,
+      cost_24h_usd: 0,
+      cost_24h_by_vendor: {},
+      budget_cap_24h: null,
+    };
+    const html = renderToString(
+      <StatusCards status={snap} rail={[{ ...RAIL[0], status: "stuck" }]} />,
+    );
+    expect(html).toContain("疑似卡");
+    expect(html).toContain("text-status-error");
+  });
+
   it("shows no budget warning when no cap is configured", () => {
     const snap: StatusSnapshot = {
       daemon_healthy: true,

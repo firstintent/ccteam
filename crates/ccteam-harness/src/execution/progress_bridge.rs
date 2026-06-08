@@ -165,27 +165,34 @@ pub fn build_chat_turn_completed_event(
     })
 }
 
-pub fn build_chat_session_reset_event(role: &str) -> Value {
+pub fn build_chat_session_reset_event(role: &str, sid: &str) -> Value {
     json!({
         "event": CHAT_SESSION_RESET,
         "role": role,
+        "sid": sid,
         "ts": Utc::now().to_rfc3339(),
     })
 }
 
-pub fn build_chat_session_reset_event_with_reason(role: &str, reason: &str) -> Value {
+pub fn build_chat_session_reset_event_with_reason(role: &str, sid: &str, reason: &str) -> Value {
     json!({
         "event": CHAT_SESSION_RESET,
         "role": role,
+        "sid": sid,
         "reason": reason,
         "ts": Utc::now().to_rfc3339(),
     })
 }
 
-pub fn build_chat_session_reset_with_recovery_event(role: &str, recovered_turns: usize) -> Value {
+pub fn build_chat_session_reset_with_recovery_event(
+    role: &str,
+    sid: &str,
+    recovered_turns: usize,
+) -> Value {
     json!({
         "event": CHAT_SESSION_RESET_WITH_RECOVERY,
         "role": role,
+        "sid": sid,
         "recovered_turns": recovered_turns,
         "ts": Utc::now().to_rfc3339(),
     })
