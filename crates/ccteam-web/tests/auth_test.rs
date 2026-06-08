@@ -50,9 +50,14 @@ async fn spawn(state: AppState) -> SocketAddr {
 
 fn nofollow() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .unwrap()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 #[tokio::test]
@@ -61,7 +66,11 @@ async fn loopback_default_no_token_required_for_root() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::disabled());
     let addr = spawn(state).await;
-    let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    let resp = client()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "auth disabled ⇒ open");
 }
 
@@ -71,7 +80,11 @@ async fn auth_enabled_rejects_missing_authorization() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    let resp = client()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401, "no auth header ⇒ 401");
     let body = resp.text().await.unwrap();
     assert!(body.contains("auth required"), "got: {body}");
@@ -83,7 +96,7 @@ async fn auth_enabled_accepts_valid_bearer_header() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(format!("http://{addr}/"))
         .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
         .send()
@@ -98,7 +111,7 @@ async fn auth_enabled_rejects_wrong_bearer_token() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(format!("http://{addr}/"))
         .header("Authorization", "Bearer ccteam:nope")
         .send()
@@ -158,6 +171,7 @@ async fn cookie_carries_subsequent_request() {
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .cookie_store(true)
         .build()
         .unwrap();
@@ -184,7 +198,11 @@ async fn health_endpoint_is_exempt_from_auth() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
-    let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+    let resp = client()
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "/health must not require auth");
 }
 

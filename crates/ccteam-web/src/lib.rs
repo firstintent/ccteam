@@ -311,7 +311,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         let url = format!("http://{addr}/health");
-        let resp = reqwest::get(&url).await.expect("GET /health");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client.get(&url).send().await.expect("GET /health");
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(json["status"], "ok");

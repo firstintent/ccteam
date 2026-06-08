@@ -31,6 +31,8 @@ fn fixture_project(paths: &CcteamPaths, slug: &str) {
 }
 
 async fn spawn_server(state: AppState) -> SocketAddr {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router_with_state(state);

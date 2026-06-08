@@ -76,6 +76,10 @@ async fn spawn(state: AppState) -> SocketAddr {
     addr
 }
 
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 #[tokio::test]
 async fn workflow_summary_absent_workflow_yaml_returns_empty_default() {
     let tmp = TempDir::new().unwrap();
@@ -83,7 +87,9 @@ async fn workflow_summary_absent_workflow_yaml_returns_empty_default() {
     fixture_project(&paths, "legacy");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/legacy"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/legacy"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -128,7 +134,9 @@ agents:
     );
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/team-a"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/team-a"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -218,7 +226,9 @@ agents:
     );
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/team-b"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/team-b"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -271,7 +281,9 @@ agents:
     );
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/guard"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/guard"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);

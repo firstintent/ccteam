@@ -164,7 +164,9 @@ export default function ChatConsole() {
   }, []);
 
   useEffect(() => {
-    void refreshSessions();
+    queueMicrotask(() => {
+      void refreshSessions();
+    });
   }, [refreshSessions]);
 
   // v0.8.8 bug5 — pick up projects/sessions registered out-of-band (a CLI
@@ -576,7 +578,9 @@ export function NewSessionModal({
   useEffect(() => {
     if (isNew || !project) return;
     let cancelled = false;
-    setRoleState({ kind: "loading" });
+    queueMicrotask(() => {
+      if (!cancelled) setRoleState({ kind: "loading" });
+    });
     listProjectRoles(project)
       .then((roles) => {
         if (!cancelled) setRoleState({ kind: "ready", roles });

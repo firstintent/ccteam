@@ -175,11 +175,14 @@ export function useSessionEvents(
       };
     }
 
-    // Switching sid: drop the previous sid's events so streams never mix.
-    setEvents([]);
-    setGatewayUnavailable(false);
-    const url = sessionEventsUrl(sid);
     let cancelled = false;
+    // Switching sid: drop the previous sid's events so streams never mix.
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setEvents([]);
+      setGatewayUnavailable(false);
+    });
+    const url = sessionEventsUrl(sid);
 
     const connect = () => {
       if (cancelled) return;

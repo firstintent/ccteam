@@ -62,9 +62,14 @@ async fn spawn(state: AppState) -> SocketAddr {
 
 fn nofollow() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .unwrap()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 #[tokio::test]
@@ -74,7 +79,9 @@ async fn get_api_v1_projects_returns_dashboard_row_array() {
     fixture_project(&paths, "demo");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -104,7 +111,9 @@ async fn get_api_v1_project_detail_returns_summary_shape() {
     fixture_project(&paths, "demo");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/demo"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/demo"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -138,7 +147,9 @@ async fn get_api_v1_project_detail_404_for_unknown_slug() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/missing"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/missing"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
@@ -159,11 +170,13 @@ async fn get_api_v1_session_detail_404_for_unknown_workflow_sid() {
     let paths = fake_paths(tmp.path());
     fixture_project(&paths, "demo");
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!(
-        "http://{addr}/api/v1/projects/demo/sessions/missing"
-    ))
-    .await
-    .unwrap();
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/projects/demo/sessions/missing"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -172,7 +185,9 @@ async fn get_api_v1_auth_token_returns_null_when_auth_disabled() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/auth/token"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -189,7 +204,7 @@ async fn get_api_v1_auth_token_returns_wire_token_when_enabled() {
     let addr = spawn(state).await;
 
     // Auth-on: present Bearer header to satisfy auth_layer.
-    let resp = reqwest::Client::new()
+    let resp = client()
         .get(format!("http://{addr}/api/v1/auth/token"))
         .header("Authorization", format!("Bearer ccteam:{token_hex}"))
         .send()
@@ -206,7 +221,9 @@ async fn get_api_v1_projects_rejects_unauthenticated_when_auth_enabled() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled("abc123".into()));
     let addr = spawn(state).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
@@ -220,7 +237,7 @@ async fn post_btw_json_returns_ok_true_and_writes_inbox() {
     let inbox_dir = paths.project_ccteam_dir("demo").join("inbox");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/btw"))
         .json(&serde_json::json!({"text": "hello via JSON"}))
         .send()
@@ -245,7 +262,7 @@ async fn post_btw_json_empty_returns_ok_false() {
     fixture_project(&paths, "demo");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/btw"))
         .json(&serde_json::json!({"text": "   "}))
         .send()
@@ -265,7 +282,7 @@ async fn post_btw_json_overlong_returns_ok_false() {
 
     let addr = spawn(AppState::new(paths)).await;
     let big = "x".repeat(5000);
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/btw"))
         .json(&serde_json::json!({"text": big}))
         .send()
@@ -310,7 +327,7 @@ async fn post_pause_json_returns_ok_true() {
     let state_path = paths.project_state("demo");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/pause"))
         .header("Content-Type", "application/json")
         .body("{}")
@@ -332,7 +349,7 @@ async fn post_inject_decision_json_writes_file_and_returns_ok() {
     let target = paths.project_ccteam_dir("demo").join("decision-json.md");
 
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/inject_decision"))
         .json(&serde_json::json!({
             "path": target.display().to_string(),
@@ -355,7 +372,7 @@ async fn post_inject_decision_json_rejects_outside_ccteam_dir() {
     let paths = fake_paths(tmp.path());
     fixture_project(&paths, "demo");
     let addr = spawn(AppState::new(paths)).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/inject_decision"))
         .json(&serde_json::json!({"path": "/etc/passwd", "body": "evil"}))
         .send()

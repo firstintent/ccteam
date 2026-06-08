@@ -46,9 +46,14 @@ async fn spawn(state: AppState) -> SocketAddr {
 
 fn nofollow() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .unwrap()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 #[tokio::test]
@@ -91,7 +96,7 @@ async fn post_btw_rejects_empty_text() {
     fixture_project(&paths, "demo");
     let state = AppState::new(paths);
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/btw"))
         .form(&[("text", "")])
         .send()
@@ -108,7 +113,7 @@ async fn post_btw_rejects_overlong_text() {
     let state = AppState::new(paths);
     let addr = spawn(state).await;
     let big = "x".repeat(5000);
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/btw"))
         .form(&[("text", big.as_str())])
         .send()
@@ -149,7 +154,7 @@ async fn post_inject_decision_rejects_path_outside_ccteam_dir() {
     fixture_project(&paths, "demo");
     let state = AppState::new(paths);
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/inject_decision"))
         .form(&[("path", "/etc/passwd"), ("body", "evil")])
         .send()
@@ -169,7 +174,7 @@ async fn post_inject_decision_rejects_dotdot_traversal() {
     );
     let state = AppState::new(paths);
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/demo/inject_decision"))
         .form(&[("path", raw.as_str()), ("body", "evil")])
         .send()
@@ -231,7 +236,7 @@ async fn post_btw_for_unknown_slug_returns_4xx() {
     let paths = fake_paths(tmp.path());
     let state = AppState::new(paths);
     let addr = spawn(state).await;
-    let resp = reqwest::Client::new()
+    let resp = client()
         .post(format!("http://{addr}/api/missing/btw"))
         .form(&[("text", "hi")])
         .send()
