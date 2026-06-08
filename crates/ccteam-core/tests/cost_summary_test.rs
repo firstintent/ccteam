@@ -306,6 +306,7 @@ fn write_transcript(path: &std::path::Path, turns: &[(u64, u64, u64, u64)]) {
 }
 
 #[test]
+#[serial_test::serial(cost_summary_cache)]
 fn t06_link_scan_path_present_sums_usage() {
     reset_cache_for_tests();
     let tmp = TempDir::new().unwrap();
@@ -343,6 +344,7 @@ fn t06_link_scan_path_present_sums_usage() {
 }
 
 #[test]
+#[serial_test::serial(cost_summary_cache)]
 fn t07_state_json_field_zero_falls_back_to_transcript() {
     reset_cache_for_tests();
     let tmp = TempDir::new().unwrap();
@@ -370,6 +372,7 @@ fn t07_state_json_field_zero_falls_back_to_transcript() {
 }
 
 #[test]
+#[serial_test::serial(cost_summary_cache)]
 fn t08_link_scan_path_missing_falls_back_to_state_json() {
     reset_cache_for_tests();
     ccteam_core::reset_link_scan_warn_for_tests();
@@ -412,6 +415,7 @@ fn t08_link_scan_path_missing_falls_back_to_state_json() {
 }
 
 #[test]
+#[serial_test::serial(cost_summary_cache)]
 fn t09_memoize_second_call_no_reread() {
     reset_cache_for_tests();
     let tmp = TempDir::new().unwrap();
@@ -535,6 +539,7 @@ fn per_vendor_model_specific_pricing() {
 }
 
 #[test]
+#[serial_test::serial(cost_summary_cache)]
 fn t11_budget_cap_triggers_with_transcript_cost() {
     // Drive `compute_cost_summary` end-to-end: one open agent_spawn
     // whose `probe` returns `Terminal { cost_usd: <transcript-derived> }`

@@ -4769,7 +4769,8 @@ mod tests {
         let state_path = tmp.path().join("gateway-state.json");
         let fake = Arc::new(FakeAdapter::default());
 
-        let original_secret;
+        let original_secret_s1;
+        let original_secret_s2;
         {
             let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
             gateway.register_project("beta", "/tmp/beta");
@@ -4782,9 +4783,16 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap();
             // R-M1 — the minted secret is non-empty and will be persisted.
-            original_secret = gateway.sessions.get("s1").unwrap().secret.clone();
-            assert_eq!(original_secret.len(), 32);
+            original_secret_s1 = gateway.sessions.get("s1").unwrap().secret.clone();
+            original_secret_s2 = gateway.sessions.get("s2").unwrap().secret.clone();
+            assert_eq!(original_secret_s1.len(), 32);
+            assert_eq!(original_secret_s2.len(), 32);
+            assert_ne!(original_secret_s1, original_secret_s2);
         }
 
         let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
@@ -4795,22 +4803,50 @@ mod tests {
         // map still matches the live pane's `CCTEAM_CHAT_SECRET`.
         assert_eq!(
             restored.sessions.get("s1").unwrap().secret,
-            original_secret,
-            "the cto-gate secret must round-trip through persisted state"
+            original_secret_s1,
+            "s1 cto-gate secret must round-trip through persisted state"
+        );
+        assert_eq!(
+            restored.sessions.get("s2").unwrap().secret,
+            original_secret_s2,
+            "s2 cto-gate secret must round-trip through persisted state"
         );
 
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["s1:beta:Claude:reviewer"]);
+        assert_eq!(
+            sessions,
+            vec!["s1:beta:Claude:reviewer\ns2:beta:Claude:reviewer"]
+        );
 
-        let reply = restored
+        assert_eq!(
+            restored
+                .handle_text("mock", "chat-1", "alice", "/use s1")
+                .await
+                .unwrap(),
+            vec!["using session s1"]
+        );
+        let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-reviewer-s1 echo: after restart"]);
-        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(reply_s1, vec!["beta-reviewer-s1 echo: after restart"]);
+
+        assert_eq!(
+            restored
+                .handle_text("mock", "chat-1", "alice", "/use s2")
+                .await
+                .unwrap(),
+            vec!["using session s2"]
+        );
+        let reply_s2 = restored
+            .handle_text("mock", "chat-1", "alice", "after restart two")
+            .await
+            .unwrap();
+        assert_eq!(reply_s2, vec!["beta-reviewer-s2 echo: after restart two"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
     }
 
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
