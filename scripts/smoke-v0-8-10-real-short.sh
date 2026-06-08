@@ -14,7 +14,7 @@ mkdir -p "$LOG_DIR"
 
 usage() {
   cat <<'EOF'
-usage: scripts/smoke-v0-8-10-real-short.sh [--skip-rmux] [--skip-im]
+usage: scripts/smoke-v0-8-10-real-short.sh [--skip-rmux] [--skip-im] [--preflight-only]
 
 Runs the automated part of the v0.8.10 nas-box005 short smoke:
   1. real rmux daemon smoke
@@ -33,11 +33,15 @@ Required on the target box:
 
 Set CCTEAM_ALLOW_NON_NAS_SMOKE=1 only for a rehearsal run. A rehearsal is not
 the v0.8.10 real-machine short smoke and must not be recorded as PASS.
+
+The script also requires HEAD to match origin/dev so the checklist records the
+exact pushed commit under test.
 EOF
 }
 
 run_rmux=1
 run_im=1
+preflight_only=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-rmux)
@@ -46,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-im)
       run_im=0
+      shift
+      ;;
+    --preflight-only)
+      preflight_only=1
       shift
       ;;
     -h|--help)
@@ -85,6 +93,21 @@ EOF
 
   require_cmd git
   require_cmd cargo
+  local head
+  local origin_dev
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  origin_dev="$(git -C "$ROOT" rev-parse origin/dev)"
+  if [[ "$head" != "$origin_dev" ]]; then
+    cat >&2 <<EOF
+smoke-v0-8-10-real-short: HEAD does not match origin/dev.
+HEAD:       $head
+origin/dev: $origin_dev
+
+Fetch/pull the pushed dev commit before recording nas-box005 smoke results.
+EOF
+    exit 78
+  fi
+
   if [[ "$run_rmux" -eq 1 ]]; then
     require_cmd tmux
   fi
@@ -100,8 +123,8 @@ EOF
 
   echo "==> preflight"
   echo "host: $current_host"
-  echo "head: $(git -C "$ROOT" rev-parse HEAD)"
-  echo "origin/dev: $(git -C "$ROOT" rev-parse origin/dev)"
+  echo "head: $head"
+  echo "origin/dev: $origin_dev"
   echo "log dir: $LOG_DIR"
 }
 
@@ -123,6 +146,11 @@ run_logged() {
 }
 
 preflight
+
+if [[ "$preflight_only" -eq 1 ]]; then
+  echo "==> preflight-only: PASS"
+  exit 0
+fi
 
 if [[ "$run_rmux" -eq 1 ]]; then
   run_logged real_rmux scripts/rmux-smoke.sh
