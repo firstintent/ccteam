@@ -138,8 +138,14 @@ pub fn default_ccteam_root_public() -> PathBuf {
 /// sessions here; the read-only `ccteam sessions` CLI view loads them back via
 /// [`gateway::tracked_chat_session_names`]. Both sides resolve the path through
 /// this one helper so they never drift.
+pub fn gateway_state_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("imd").join("gateway-state.json")
+}
+
+/// Resolve the gateway route-table snapshot for the current user
+/// (`~/.ccteam/imd/gateway-state.json`).
 pub fn default_gateway_state_path() -> PathBuf {
-    default_ccteam_root().join("imd").join("gateway-state.json")
+    gateway_state_path_in(&default_ccteam_root())
 }
 
 /// `<ccteam_root>/imd/registry/` — base registry dir given an explicit
