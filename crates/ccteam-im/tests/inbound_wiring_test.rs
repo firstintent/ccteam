@@ -1525,24 +1525,43 @@ async fn real_ws_dual_harness_smoke() {
             "restart must restore original sessions; got {sessions:?}"
         );
 
-        send_ws_text(
-            &mut socket,
-            "real-ws-codex-after-restart",
-            "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
-        )
-        .await;
-        let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-        assert!(
-            !codex_ack.content.starts_with("gateway error"),
-            "Codex after restart should reuse s1, got {:?}",
-            codex_ack.content
-        );
-        recv_ws_until_contains(
-            &mut socket,
-            "CCTEAM-CODEX-WS-RESTART-OK",
-            Duration::from_secs(120),
-        )
-        .await;
+        if nl_mode
+            .as_deref()
+            .is_some_and(|mode| mode == "1" || mode == "codex")
+        {
+            send_ws_text(
+                &mut socket,
+                "real-ws-codex-after-restart",
+                "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
+            )
+            .await;
+            let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+            assert!(
+                !codex_ack.content.starts_with("gateway error"),
+                "Codex after restart should reuse s1, got {:?}",
+                codex_ack.content
+            );
+            recv_ws_until_contains(
+                &mut socket,
+                "CCTEAM-CODEX-WS-RESTART-OK",
+                Duration::from_secs(120),
+            )
+            .await;
+        } else {
+            send_ws_text(
+                &mut socket,
+                "real-ws-codex-after-restart-status",
+                "@api /status",
+            )
+            .await;
+            let codex_status =
+                recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+            assert!(
+                !codex_status.content.starts_with("gateway error"),
+                "Codex status after restart should reuse s1, got {:?}",
+                codex_status.content
+            );
+        }
 
         send_ws_text(
             &mut socket,
