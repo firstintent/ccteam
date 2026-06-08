@@ -2322,10 +2322,8 @@ fn run_chat_send_file(
     live_target: Option<(String, String)>,
 ) -> std::result::Result<String, String> {
     let sink = sink.ok_or_else(|| "chat_send_file: IM gateway not running".to_string())?;
-    let bots =
-        ccteam_im::list_bots().map_err(|e| format!("chat_send_file: registry error: {e}"))?;
     let seq = CHAT_SEND_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let event = build_send_file_event(args, &bots, seq, live_target)?;
+    let event = build_send_file_event(args, seq, live_target)?;
     let dest = format!("{}/{}", event.channel, event.chat_id);
     sink.send(event)
         .map_err(|_| "chat_send_file: gateway sink closed".to_string())?;
@@ -2337,12 +2335,12 @@ const OUTBOUND_PHOTO_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const OUTBOUND_DOCUMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Pure core of `run_chat_send_file`: parse args, validate the file
-/// (exists + within the send ceiling), resolve the home chat from
-/// `bots`, and build the `GatewayEvent`. Only I/O is the file
-/// stat, so it is unit-testable without a live registry or sink.
+/// (exists + within the send ceiling), and build the `GatewayEvent`
+/// addressed to the firing session's `live_target` — the SINGLE source of
+/// truth for session→chat addressing. Only I/O is the file stat, so it is
+/// unit-testable.
 fn build_send_file_event(
     args: &serde_json::Value,
-    bots: &[ccteam_im::BotRegistration],
     seq: u64,
     live_target: Option<(String, String)>,
 ) -> std::result::Result<ccteam_im::gateway::GatewayEvent, String> {
@@ -2379,14 +2377,19 @@ fn build_send_file_event(
             max / (1024 * 1024),
         ));
     }
-    // v0.8.7 (FIX-1) — prefer the live session's reply target (the chat the
-    // user is actively talking to), falling back to the on-disk registry only
-    // when no live (project, role) session is tracked. This lets an
-    // actively-chatting agent push a file back without a prior
-    // `chat_register_bot` (the registry is only written by explicit register).
-    let (channel, chat_id) = live_target
-        .or_else(|| ccteam_im::resolve_home_chat(slug, role, bots))
-        .ok_or_else(|| format!("chat_send_file: no registered chat for {slug}/{role}"))?;
+    // v0.8.8 — single source of truth: the firing session's live reply target
+    // (its `owner` ChatKey, set at spawn, keyed by sid via `reply_target_for`).
+    // NO registry fallback — the two-store addressing is gone; a missing
+    // binding is a spawn/bind-flow defect, surfaced precisely, not papered over.
+    let sid = args
+        .get("_caller_sid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let (channel, chat_id) = live_target.ok_or_else(|| {
+        format!(
+            "chat_send_file: no IM chat bound to firing session sid={sid:?} ({slug}/{role}); owner unset at spawn/bind"
+        )
+    })?;
     Ok(ccteam_im::gateway::GatewayEvent {
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
         channel,
@@ -2496,16 +2499,12 @@ async fn execute_interaction_ask(
     }
 
     // Resolve addressing first — no point registering a pending we can't show.
-    // v0.8.7 (FIX-1) — prefer the live firing session's reply target (resolve
-    // under the gateway lock, drop the guard before the long await — the
-    // lookup is sync), falling back to the on-disk registry. Lets an
-    // actively-chatting agent ask the user a question without a prior
-    // `chat_register_bot`.
-    //
-    // v0.8.8 F1 — keyed by the firing session's ccteam sid (`session_sid`,
-    // forwarded by the `intercept_ask` hook from `CCTEAM_CHAT_SID`):
-    // post-dedup `(slug, role)` is no longer unique. Empty sid → skip the live
-    // lookup and fall straight to the registry.
+    // v0.8.8 — single source of truth: the live firing session's reply target
+    // (its `owner` ChatKey, set at spawn, keyed by sid via `reply_target_for`;
+    // resolve under the gateway lock, drop the guard before the long await —
+    // the lookup is sync). NO registry fallback — the two-store addressing is
+    // gone; a missing binding (empty/unpropagated sid, or no live session for
+    // it) is a spawn/bind-flow defect, surfaced precisely.
     let session_sid = params
         .get("session_sid")
         .and_then(|v| v.as_str())
@@ -2517,19 +2516,9 @@ async fn execute_interaction_ask(
         }
         _ => None,
     };
-    let resolved = match live_target {
-        Some(t) => Some(t),
-        None => {
-            let bots = match ccteam_im::list_bots() {
-                Ok(b) => b,
-                Err(e) => return err_resp(format!("interaction/ask: registry error: {e}")),
-            };
-            ccteam_im::resolve_home_chat(slug, role, &bots)
-        }
-    };
-    let Some((channel, chat_id)) = resolved else {
+    let Some((channel, chat_id)) = live_target else {
         return err_resp(format!(
-            "interaction/ask: no registered chat for {slug}/{role}"
+            "interaction/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
         ));
     };
 
@@ -2693,38 +2682,34 @@ async fn execute_permission_ask(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // Resolve addressing first — no point registering a pending we can't show.
-    let bots = match ccteam_im::list_bots() {
-        Ok(b) => b,
-        Err(e) => return err_resp(format!("permission/ask: registry error: {e}")),
-    };
-    let Some((channel, chat_id)) = ccteam_im::resolve_home_chat(slug, role, &bots) else {
-        return err_resp(format!(
-            "permission/ask: no registered chat for {slug}/{role}"
-        ));
-    };
-
-    // Resolve the firing session's gateway sid (for the prompt label).
-    //
-    // v0.8.8 F1 — the hook reports the firing session's own ccteam sid via
-    // `session_sid` (sourced from `CCTEAM_CHAT_SID` / the `X-Ccteam-Sid`
-    // header). Post-dedup `(slug, role)` is no longer unique, so we trust the
-    // hook-reported sid and only CONFIRM it against the live session map
-    // (`session_sid_for(sid)` → the canonical id when tracked). Read-only
-    // lookup; drop the gateway guard immediately (never held across the long
-    // await — lock discipline §7-1). 红线:这里用的是 ccteam 的 `s<N>` sid,
-    // 不是 Anthropic 的 `session_id` UUID。
+    // v0.8.8 F1 — the firing session's own ccteam sid (`s<N>`), reported by the
+    // hook via `session_sid` (sourced from `CCTEAM_CHAT_SID` / `X-Ccteam-Sid`).
+    // 红线:ccteam 的 `s<N>` sid,不是 Anthropic 的 `session_id` UUID。
     let session_sid = params
         .get("session_sid")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("");
-    let sid_label = match (gateway, session_sid.is_empty()) {
+    // Single source of truth for the approval-prompt destination: the firing
+    // session's live reply target (its `owner` ChatKey, set at spawn, keyed by
+    // sid via `reply_target_for`). Resolve it AND the canonical sid label in one
+    // read-only gateway lock dropped before the long await (lock discipline
+    // §7-1). NO registry fallback — the two-store addressing is gone; a missing
+    // binding is a spawn/bind-flow defect, surfaced precisely.
+    let (dest, sid_label) = match (gateway, session_sid.is_empty()) {
         (Some(gw), false) => {
             let guard = gw.lock().await;
-            guard.session_sid_for(session_sid)
+            (
+                guard.reply_target_for(session_sid),
+                guard.session_sid_for(session_sid),
+            )
         }
-        _ => None,
+        _ => (None, None),
+    };
+    let Some((channel, chat_id)) = dest else {
+        return err_resp(format!(
+            "permission/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
+        ));
     };
     let session_desc = match (&sid_label, role.is_empty()) {
         (Some(sid), false) => format!("session {sid} ({role})"),
@@ -3981,20 +3966,6 @@ mod chat_send_file_tests {
     use super::*;
     use ccteam_im::transport::OutboundFileKind;
 
-    fn bot(slug: &str, role: &str, platform: &str, chat: &str) -> ccteam_im::BotRegistration {
-        ccteam_im::BotRegistration {
-            workflow_slug: slug.into(),
-            role: role.into(),
-            vendor: ccteam_harness::AgentVendor::Claude,
-            persona_id: None,
-            im_platform: platform.into(),
-            im_chat_id: chat.into(),
-            chat_handle: None,
-            project_dir: None,
-            created_at: chrono::Utc::now(),
-        }
-    }
-
     #[test]
     fn parse_outbound_kind_infers_photo_from_extension() {
         assert_eq!(
@@ -4017,18 +3988,18 @@ mod chat_send_file_tests {
     }
 
     #[test]
-    fn build_send_file_event_resolves_home_chat_and_attaches() {
+    fn build_send_file_event_uses_live_target_and_attaches() {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("shot.png");
         std::fs::write(&file, b"png").unwrap();
-        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
         let args = serde_json::json!({
             "path": file.to_string_lossy(),
             "caption": "the chart",
             "slug": "dev-foo",
             "role": "lead",
         });
-        let evt = build_send_file_event(&args, &bots, 7, None).unwrap();
+        let live = Some(("telegram".to_string(), "chat-42".to_string()));
+        let evt = build_send_file_event(&args, 7, live).unwrap();
         assert_eq!(evt.channel, "telegram");
         assert_eq!(evt.chat_id, "chat-42");
         assert_eq!(evt.attachments.len(), 1);
@@ -4037,65 +4008,62 @@ mod chat_send_file_tests {
         assert!(evt.id.ends_with("-7"));
     }
 
-    /// v0.8.7 (FIX-1) — a live session's reply target wins even when the
-    /// on-disk registry is EMPTY (the actively-chatting agent can push a file
-    /// back without a prior `chat_register_bot`).
+    /// v0.8.8 — the firing session's live reply target is the single source of
+    /// truth; no registry is consulted (the actively-chatting agent pushes a
+    /// file back without any prior `chat_register_bot`).
     #[test]
-    fn build_send_file_event_uses_live_target_over_empty_registry() {
+    fn build_send_file_event_uses_live_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("shot.png");
         std::fs::write(&file, b"png").unwrap();
-        // Empty registry — only the live target can address this.
-        let bots: Vec<ccteam_im::BotRegistration> = vec![];
         let args = serde_json::json!({
             "path": file.to_string_lossy(),
             "slug": "dev-foo",
             "role": "cto",
         });
         let live = Some(("telegram".to_string(), "live-chat-7".to_string()));
-        let evt = build_send_file_event(&args, &bots, 1, live).unwrap();
+        let evt = build_send_file_event(&args, 1, live).unwrap();
         assert_eq!(evt.channel, "telegram");
         assert_eq!(evt.chat_id, "live-chat-7");
     }
 
-    /// v0.8.7 (FIX-1) — when both a live target and a registry row exist, the
-    /// live session (whoever the user is actually chatting with) wins.
+    /// v0.8.8 — a web live target routes to the web channel (the single source
+    /// of truth carries whatever channel the firing session is bound to).
     #[test]
-    fn build_send_file_event_live_target_overrides_registry() {
+    fn build_send_file_event_live_target_web_channel() {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("x.txt");
         std::fs::write(&file, b"hi").unwrap();
-        let bots = vec![bot("dev-foo", "lead", "telegram", "stale-chat")];
         let args = serde_json::json!({
             "path": file.to_string_lossy(), "slug": "dev-foo", "role": "lead",
         });
         let live = Some(("web".to_string(), "web-live".to_string()));
-        let evt = build_send_file_event(&args, &bots, 2, live).unwrap();
+        let evt = build_send_file_event(&args, 2, live).unwrap();
         assert_eq!(evt.channel, "web");
         assert_eq!(evt.chat_id, "web-live");
     }
 
     #[test]
     fn build_send_file_event_errors_on_missing_file() {
-        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
         let args = serde_json::json!({
             "path": "/nope/does-not-exist.png", "slug": "dev-foo", "role": "lead",
         });
-        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
+        let err = build_send_file_event(&args, 0, None).unwrap_err();
         assert!(err.contains("file not found"), "got: {err}");
     }
 
+    /// v0.8.8 — no live target (None) → precise error pointing at the
+    /// spawn/bind flow; the registry is NOT consulted (single source of truth).
     #[test]
-    fn build_send_file_event_errors_on_unregistered_chat() {
+    fn build_send_file_event_errors_when_no_live_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("x.txt");
         std::fs::write(&file, b"hi").unwrap();
-        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
         let args = serde_json::json!({
             "path": file.to_string_lossy(), "slug": "dev-foo", "role": "ghost",
         });
-        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
-        assert!(err.contains("no registered chat"), "got: {err}");
+        let err = build_send_file_event(&args, 0, None).unwrap_err();
+        assert!(err.contains("no IM chat bound"), "got: {err}");
     }
 
     #[test]
@@ -4104,11 +4072,10 @@ mod chat_send_file_tests {
         let file = tmp.path().join("huge.png");
         let f = std::fs::File::create(&file).unwrap();
         f.set_len(11 * 1024 * 1024).unwrap(); // 11 MB (sparse) > 10 MB photo limit
-        let bots = vec![bot("dev-foo", "lead", "telegram", "chat-42")];
         let args = serde_json::json!({
             "path": file.to_string_lossy(), "slug": "dev-foo", "role": "lead",
         });
-        let err = build_send_file_event(&args, &bots, 0, None).unwrap_err();
+        let err = build_send_file_event(&args, 0, None).unwrap_err();
         assert!(err.contains("too large"), "got: {err}");
     }
 }

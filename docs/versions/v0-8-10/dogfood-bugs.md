@@ -2,7 +2,10 @@
 
 > Newly-surfaced core-loop bugs found by dogfooding after the v0.8.10 build, recorded for v0.8.10 final-review / a follow-up fix. **file:line as of dev `a18ed68` — re-grep (dev moves).** Author = docs-only (diagnosis + record; a dev session fixes).
 
-## DF-1 · HITL approval never reaches IM (`permission/ask` resolves dest from the registry, not the live session) — HIGH
+## DF-1 · HITL approval never reaches IM (`permission/ask` resolves dest from the registry, not the live session) — HIGH ✅ FIXED
+
+> **✅ FIXED (owner-directed, TG 2440):** implemented the single-source unification (the `★ CORRECTION` below). All 3 outbound paths — `chat_send_file`, `interaction/ask`, `permission/ask` — now resolve the destination **solely** via the firing session's live `reply_target_for(sid)`; the `resolve_home_chat` registry fallback was deleted from all three and the now-dead `resolve_home_chat` fn (+ its unit test) removed. A missing binding → a precise spawn/bind-flow error, never a fallback. `register_bot`/registry retained only for `@handle` named-bot addressing. Gate: `ccteam-im` lib 239/0, `ccteam-cli` tests green, `clippy -D warnings` clean, `cargo fmt --check` clean. The historical diagnosis below is kept for the record.
+
 
 **Symptom** (user TG 2435, live hitl session): a non-allowlist tool (`WebSearch`) in a hitl session was denied with `用户未批准该工具调用（或审批通道不可用）。Tool call not approved by the user.` / `Denied by PermissionRequest hook` — and **no `[同意][拒绝]` prompt appeared in Telegram**.
 
