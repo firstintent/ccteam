@@ -411,9 +411,9 @@ mod tests {
         let p = paths(&tmp);
         let socket = daemon_socket_path(&p);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        {
-            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        }
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        std::thread::sleep(Duration::from_millis(10));
 
         let health = check_health(&p);
         assert!(
