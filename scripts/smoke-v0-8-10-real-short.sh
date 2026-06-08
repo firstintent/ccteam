@@ -3,7 +3,7 @@
 #
 # This script is intentionally a release-validation helper, not a product
 # command. It runs the real probes that can be automated from the repo and
-# leaves host suspend / network-drop checks to the paired checklist:
+# records host-fault evidence in the paired checklist:
 # docs/versions/v0-8-10/nas-box005-short-smoke-checklist.md
 
 set -euo pipefail
@@ -16,23 +16,30 @@ usage() {
   cat <<'EOF'
 usage: scripts/smoke-v0-8-10-real-short.sh [--skip-rmux] [--skip-im] [--preflight-only]
 
-Runs the automated part of the v0.8.10 nas-box005 short smoke:
+Runs the automated part of the v0.8.10 target-host short smoke:
   1. real rmux daemon smoke
-  2. real IM WebSocket dual-harness smoke with restart + fault injection
+  2. real IM WebSocket dual-harness smoke with restart + host-fault +
+     pane-death fault injection
 
-Manual host suspend / netdrop checks remain in:
+The host-fault leg is local and repeatable:
+  - SIGSTOP/SIGCONT freezes the daemon test process.
+  - WebSocket disconnect/reconnect covers the IM/web client network boundary.
+  - Set CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS to override the freeze length.
+
+Checklist record:
   docs/versions/v0-8-10/nas-box005-short-smoke-checklist.md
 
 Required on the target box:
-  - hostname nas-box005
   - tmux
   - claude
   - codex only for opt-in Codex probes
   - cargo
   - a built ccteam binary in target/debug/ccteam
 
-Set CCTEAM_ALLOW_NON_NAS_SMOKE=1 only for a rehearsal run. A rehearsal is not
-the v0.8.10 real-machine short smoke and must not be recorded as PASS.
+Set CCTEAM_REAL_SMOKE_HOST to the hostname that is allowed to record the smoke.
+It defaults to nas-box005 for the original release target; this wave also
+supports recording on the local workstation when the operator explicitly sets
+that variable to the local hostname.
 
 The script also requires a clean worktree and HEAD to match origin/dev so the
 checklist records the exact pushed commit under test.
@@ -92,8 +99,8 @@ preflight() {
 smoke-v0-8-10-real-short: refusing to run on '$current_host'.
 Expected host: '$expected_host'.
 
-Run on nas-box005 for the release gate. For a rehearsal only, set:
-  CCTEAM_ALLOW_NON_NAS_SMOKE=1
+Set CCTEAM_REAL_SMOKE_HOST=$current_host to record this host intentionally, or
+set CCTEAM_ALLOW_NON_NAS_SMOKE=1 for a rehearsal that must not be marked PASS.
 EOF
     exit 78
   fi
@@ -134,7 +141,7 @@ EOF
     fi
     if [[ ! -x "$ROOT/target/debug/ccteam" ]]; then
       echo "smoke-v0-8-10-real-short: target/debug/ccteam is missing or not executable" >&2
-      echo "Build it first on nas-box005: cargo build --workspace" >&2
+      echo "Build it first on the target host: cargo build --workspace" >&2
       exit 69
     fi
   fi
@@ -180,6 +187,8 @@ if [[ "$run_im" -eq 1 ]]; then
   run_logged real_im_ws_restart_faults env \
     CCTEAM_REAL_IM_WS=1 \
     CCTEAM_REAL_IM_WS_RESTART=1 \
+    CCTEAM_REAL_IM_WS_HOST_FAULTS=1 \
+    CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS="${CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS:-600}" \
     CCTEAM_REAL_IM_WS_FAULTS=1 \
     scripts/smoke-im.sh --real
 else
@@ -189,8 +198,10 @@ fi
 cat <<EOF
 ==> automated real short smoke: PASS
 
-Next required manual record on nas-box005:
+Checklist record:
   docs/versions/v0-8-10/nas-box005-short-smoke-checklist.md
 
-This script does not prove host suspend or real netdrop recovery by itself.
+Host-fault scope: SIGSTOP/SIGCONT daemon freeze plus WebSocket client
+disconnect/reconnect. It does not claim full ACPI system suspend or
+system-level outbound network blocking.
 EOF

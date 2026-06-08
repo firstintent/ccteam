@@ -1363,8 +1363,6 @@ async fn real_ws_dual_harness_smoke() {
     let _g = env_lock();
     assert!(command_exists("tmux"), "tmux is required for real Claude");
     assert!(command_exists("claude"), "claude binary is required");
-    assert!(command_exists("codex"), "codex binary is required");
-
     let ccteam_home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let slug = format!("real-ws-{}", std::process::id());
@@ -1379,8 +1377,16 @@ async fn real_ws_dual_harness_smoke() {
         .is_some_and(|mode| mode == "1" || mode == "codex");
     let codex_mode =
         std::env::var("CCTEAM_REAL_IM_WS_CODEX").ok().as_deref() == Some("1") || codex_nl_mode;
+    if codex_mode {
+        assert!(command_exists("codex"), "codex binary is required");
+    }
     let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
     let fault_mode = std::env::var("CCTEAM_REAL_IM_WS_FAULTS").ok().as_deref() == Some("1");
+    let host_fault_mode = std::env::var("CCTEAM_REAL_IM_WS_HOST_FAULTS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let host_fault_stop = real_ws_host_fault_stop_duration();
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
     // F10: stdio is the default transport — unset the socket override so
     // the adapter spawns `codex app-server --listen stdio://` itself.
@@ -1423,16 +1429,19 @@ async fn real_ws_dual_harness_smoke() {
         }
     }
 
-    let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let mut ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
     let ws_addr = ws.local_addr();
     let ws_url = format!("ws://{ws_addr}");
-    let max_runtime = if nl_mode.is_some() || restart_mode || fault_mode {
+    let mut max_runtime = if nl_mode.is_some() || restart_mode || fault_mode || host_fault_mode {
         Duration::from_secs(300)
     } else {
         Duration::from_secs(30)
     };
+    if host_fault_mode {
+        max_runtime += host_fault_stop;
+    }
     let (mut stop_tx, mut daemon) =
-        spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
+        spawn_real_ws_gateway_daemon(project.path().to_path_buf(), Arc::clone(&ws), max_runtime);
 
     let mut socket = connect_ws_with_retry(&ws_url).await;
     let claude_sid = if codex_mode {
@@ -1531,8 +1540,12 @@ async fn real_ws_dual_harness_smoke() {
             "Claude tmux session must survive daemon restart: {claude_tmux_session}"
         );
 
-        let ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
-        let restarted = spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
+        ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+        let restarted = spawn_real_ws_gateway_daemon(
+            project.path().to_path_buf(),
+            Arc::clone(&ws),
+            max_runtime,
+        );
         stop_tx = restarted.0;
         daemon = restarted.1;
         socket = connect_ws_with_retry(&ws_url).await;
@@ -1598,6 +1611,103 @@ async fn real_ws_dual_harness_smoke() {
             Duration::from_secs(180),
         )
         .await;
+    }
+
+    if host_fault_mode {
+        send_ws_text(
+            &mut socket,
+            "real-ws-claude-sigstop",
+            "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-SIGSTOP-OK and no extra text.",
+        )
+        .await;
+        let sigstop_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            !sigstop_ack.content.starts_with("gateway error"),
+            "Claude SIGSTOP prompt should be submitted, got {:?}",
+            sigstop_ack.content
+        );
+        wait_turns_file_contains(
+            project.path(),
+            claude_sid,
+            "CCTEAM-CLAUDE-WS-SIGSTOP-OK",
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        sigstop_self_for(host_fault_stop);
+        recv_ws_until_contains_once(
+            &mut socket,
+            "CCTEAM-CLAUDE-WS-SIGSTOP-OK",
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        send_ws_text(&mut socket, "real-ws-sigstop-sessions", "/sessions").await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "SIGSTOP resume must preserve the original Claude sid; got {sessions:?}"
+        );
+
+        let _ = socket.close(None).await;
+        drop(socket);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        ws.send(&SendMessage::new("CCTEAM-WS-NETDROP-OK", "chat-1"))
+            .await
+            .expect("inject WS netdrop backlog message");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        socket = connect_ws_with_retry(&ws_url).await;
+        send_ws_text(&mut socket, "real-ws-netdrop-resync", "/sessions").await;
+        recv_ws_until_contains_once(
+            &mut socket,
+            "CCTEAM-WS-NETDROP-OK",
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        send_ws_text(&mut socket, "real-ws-netdrop-sessions", "/sessions").await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "WS reconnect must preserve the original Claude sid; got {sessions:?}"
+        );
+
+        drop(socket);
+        let _ = stop_tx.send(());
+        daemon.await.unwrap();
+        assert!(
+            tmux_session_exists(&claude_tmux_session),
+            "Claude tmux session must survive local host-fault daemon restart: {claude_tmux_session}"
+        );
+
+        let ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+        let restarted = spawn_real_ws_gateway_daemon(
+            project.path().to_path_buf(),
+            Arc::clone(&ws),
+            max_runtime,
+        );
+        stop_tx = restarted.0;
+        daemon = restarted.1;
+        socket = connect_ws_with_retry(&ws_url).await;
+        send_ws_text(
+            &mut socket,
+            "real-ws-host-fault-restart-sessions",
+            "/sessions",
+        )
+        .await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "daemon restart after local host faults must restore the original sid; got {sessions:?}"
+        );
     }
 
     if fault_mode {
@@ -1874,6 +1984,128 @@ where
         if seen.contains(needle) {
             return;
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn recv_ws_until_contains_once<S>(
+    socket: &mut WebSocketStream<S>,
+    needle: &str,
+    timeout: Duration,
+    quiet_window: Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut seen = String::new();
+    let mut matches = 0usize;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while matches == 0 {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for exactly one {needle}; seen:\n{seen}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let msg = tokio::time::timeout(remaining, async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .unwrap_or_else(|| panic!("websocket closed while waiting for {needle}"))
+                    .unwrap();
+                if let Message::Text(text) = frame {
+                    return serde_json::from_str::<SendMessage>(&text).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for exactly one {needle}; seen:\n{seen}"));
+        matches += msg.content.matches(needle).count();
+        seen.push_str(&msg.content);
+        seen.push('\n');
+    }
+    assert_eq!(
+        matches, 1,
+        "expected exactly one {needle} before quiet window; seen:\n{seen}"
+    );
+
+    let quiet_deadline = tokio::time::Instant::now() + quiet_window;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline {
+            break;
+        }
+        match tokio::time::timeout(quiet_deadline.saturating_duration_since(now), socket.next())
+            .await
+        {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let msg: SendMessage = serde_json::from_str(&text).unwrap();
+                matches += msg.content.matches(needle).count();
+                seen.push_str(&msg.content);
+                seen.push('\n');
+                assert_eq!(
+                    matches, 1,
+                    "expected exactly one {needle} after quiet window; seen:\n{seen}"
+                );
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(err))) => panic!("websocket error while checking duplicates: {err}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+fn real_ws_host_fault_stop_duration() -> Duration {
+    let secs = std::env::var("CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(12)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+fn sigstop_self_for(duration: Duration) {
+    let pid = std::process::id();
+    let secs = duration.as_secs().max(1);
+    let mut helper = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("sleep {secs}; kill -CONT {pid}"))
+        .spawn()
+        .expect("spawn SIGCONT helper");
+    let status = std::process::Command::new("kill")
+        .arg("-STOP")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGSTOP to self");
+    assert!(status.success(), "kill -STOP self should succeed");
+    let _ = helper.wait();
+}
+
+async fn wait_turns_file_contains(
+    project: &std::path::Path,
+    sid: &str,
+    needle: &str,
+    timeout: Duration,
+) {
+    let path = project
+        .join(".ccteam")
+        .join("chat")
+        .join(sid)
+        .join("turns.jsonl");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if body.contains(needle) {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {needle} in {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

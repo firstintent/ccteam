@@ -24,6 +24,10 @@ Set CCTEAM_REAL_IM_WS_NL=codex|claude|1 with CCTEAM_REAL_IM_WS=1
 to require true natural-language replies from Codex, Claude, or both.
 Set CCTEAM_REAL_IM_WS_RESTART=1 with CCTEAM_REAL_IM_WS=1 to kill and
 restart the daemon mid-smoke, then require both sessions to continue.
+Set CCTEAM_REAL_IM_WS_HOST_FAULTS=1 with CCTEAM_REAL_IM_WS=1 to run
+the local host-fault leg: SIGSTOP/SIGCONT daemon freeze plus WebSocket
+disconnect/reconnect exactly-once recovery. Override the freeze duration with
+CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS.
 Set CCTEAM_REAL_IM_WS_FAULTS=1 with CCTEAM_REAL_IM_WS=1 to inject a
 real Claude tmux-session death plus, when the Codex leg is enabled, a
 Codex app-server disconnect; require user-visible gateway errors.
