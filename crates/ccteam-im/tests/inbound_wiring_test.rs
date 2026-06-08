@@ -67,10 +67,15 @@ fn isolate_home() -> TempDir {
 fn seed_role(project_dir: &std::path::Path, role: &str) {
     let agents_dir = project_dir.join(".claude").join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
+    let model = if role == "reviewer" {
+        "model: sonnet\n"
+    } else {
+        ""
+    };
     std::fs::write(
         agents_dir.join(format!("{role}.md")),
         format!(
-            "---\nname: {role}\n---\n\
+            "---\nname: {role}\n{model}---\n\
              You are a ccteam real-machine smoke-test role.\n\
              When the user asks you to reply with exactly a token, output only that token.\n\
              Do not inspect files or add explanation for smoke-test token prompts.\n"
