@@ -24,10 +24,15 @@ Manual host suspend / netdrop checks remain in:
   docs/versions/v0-8-10/nas-box005-short-smoke-checklist.md
 
 Required on the target box:
+  - hostname nas-box005
   - tmux
   - claude
   - codex
+  - cargo
   - a built ccteam binary in target/debug/ccteam
+
+Set CCTEAM_ALLOW_NON_NAS_SMOKE=1 only for a rehearsal run. A rehearsal is not
+the v0.8.10 real-machine short smoke and must not be recorded as PASS.
 EOF
 }
 
@@ -55,6 +60,51 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "smoke-v0-8-10-real-short: required command not found: $cmd" >&2
+    exit 69
+  }
+}
+
+preflight() {
+  local expected_host="${CCTEAM_REAL_SMOKE_HOST:-nas-box005}"
+  local current_host
+  current_host="$(hostname -s 2>/dev/null || hostname)"
+  if [[ "$current_host" != "$expected_host" && "${CCTEAM_ALLOW_NON_NAS_SMOKE:-}" != "1" ]]; then
+    cat >&2 <<EOF
+smoke-v0-8-10-real-short: refusing to run on '$current_host'.
+Expected host: '$expected_host'.
+
+Run on nas-box005 for the release gate. For a rehearsal only, set:
+  CCTEAM_ALLOW_NON_NAS_SMOKE=1
+EOF
+    exit 78
+  fi
+
+  require_cmd git
+  require_cmd cargo
+  if [[ "$run_rmux" -eq 1 ]]; then
+    require_cmd tmux
+  fi
+  if [[ "$run_im" -eq 1 ]]; then
+    require_cmd claude
+    require_cmd codex
+    if [[ ! -x "$ROOT/target/debug/ccteam" ]]; then
+      echo "smoke-v0-8-10-real-short: target/debug/ccteam is missing or not executable" >&2
+      echo "Build it first on nas-box005: cargo build --workspace" >&2
+      exit 69
+    fi
+  fi
+
+  echo "==> preflight"
+  echo "host: $current_host"
+  echo "head: $(git -C "$ROOT" rev-parse HEAD)"
+  echo "origin/dev: $(git -C "$ROOT" rev-parse origin/dev)"
+  echo "log dir: $LOG_DIR"
+}
+
 run_logged() {
   local name="$1"
   shift
@@ -71,6 +121,8 @@ run_logged() {
   }
   tail -20 "$log"
 }
+
+preflight
 
 if [[ "$run_rmux" -eq 1 ]]; then
   run_logged real_rmux scripts/rmux-smoke.sh

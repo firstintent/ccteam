@@ -25,6 +25,10 @@ Run:
 scripts/smoke-v0-8-10-real-short.sh
 ```
 
+The script refuses to run unless the hostname is `nas-box005`. If
+`CCTEAM_ALLOW_NON_NAS_SMOKE=1` was used, this was only a rehearsal and must not
+be marked PASS here.
+
 - [ ] real rmux daemon smoke passed:
 - [ ] real IM WebSocket dual-harness smoke passed:
 - [ ] daemon restart leg passed:
