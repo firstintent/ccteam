@@ -1448,15 +1448,15 @@ async fn real_ws_dual_harness_smoke() {
         tmux_session_exists(&claude_tmux_session),
         "Claude tmux session should remain live after /new: {claude_tmux_session}"
     );
-    send_ws_text(&mut socket, "real-ws-codex-compact", "@api /compact").await;
-    // V0.8.4 P1 (F1): the "submitted … turn …" ack is folded away — the
-    // first send is now a progress seed / output, so this (real-bot) probe
-    // only asserts the turn did not error out. The NL round-trips below use
-    // `recv_ws_until_contains`, which is robust to the leading seed.
+    send_ws_text(&mut socket, "real-ws-codex-status", "@api /status").await;
+    // Keep this as an immediate Codex-session routing probe. `/compact` starts
+    // a Codex turn and may legitimately produce no short-window event while
+    // the daemon event-sink path has folded away submit acks; the real Codex
+    // turn path is exercised by the restart round-trip below.
     let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
     assert!(
         !codex.content.starts_with("gateway error"),
-        "Codex /compact should reach app-server RPC, got {:?}",
+        "Codex /status should reach the Codex session, got {:?}",
         codex.content
     );
 
