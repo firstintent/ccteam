@@ -19,4 +19,16 @@
 
 **Severity HIGH**: HITL approval silently fails for the common IM-driven case (the entire point of a hitl session). The deny is at least fail-safe (no un-approved tool runs — red line held), but the user has no way to approve, so the turn stalls on denials with no visible prompt = exactly the "零静默失败" / HITL-reliability target of v0.8.10.
 
-**Workaround** (not the fix): explicitly `register_bot` for that `(slug,role)` so `resolve_home_chat` finds it → the prompt appears. Proper fix = the live-target resolution above.
+**Workaround** (not the fix): explicitly `register_bot` for that `(slug,role)` so `resolve_home_chat` finds it → the prompt appears. Proper fix = a SINGLE source of truth, NOT the fallback sketched above — see the correction below.
+
+---
+
+## ★ CORRECTION (owner directive, TG 2437) — single source of truth, NO fallback
+
+Owner rejected the `reply_target_for → resolve_home_chat` **fallback**: a fallback chain perpetuates the two-store split that IS the root cause. There must be **ONE** source of truth for session→chat addressing, populated by the bind/spawn flow; a miss = a registration-flow defect to fix **at the source**, not a silent fallback.
+
+**Grounded finding (current dev):** the single source already exists — the per-session **`owner: ChatKey`** on `GatewaySession` (`gateway.rs:64`), set **at spawn** (~1200/1327), keyed by **sid**, **persisted** in `SavedGatewaySession.owner` (`gateway.rs:409`) and **restored** on restart (~1580/1592), exposed as **`gateway.reply_target_for(sid)`** (`gateway.rs:2149`). The on-disk bot **registry** (`resolve_home_chat`, written ONLY by explicit `register_bot`, never by spawn) is a SECOND store that grep confirms is called by **nothing except the 3 outbound paths** (`main.rs:2388/2527/2701`) — pure dead-weight fallback for session outbound.
+
+**Corrected fix (class-wide, not a 3-line patch):** route ALL session outbound — `chat_send_file` (2388), `interaction/ask` (2527), `permission/ask` (2701) — through `reply_target_for(sid)` as the **SOLE** resolver, and **delete the `resolve_home_chat` fallback from all three**. A `None` (session has no `owner` / sid not propagated) → a **precise error** naming the sid + that its owner wasn't bound (a spawn/bind-flow defect to fix at source), **never** a fallback. `register_bot`/registry stays only for its separate feature (explicit `@handle` named-bot addressing), out of the session-outbound path entirely.
+
+This eliminates the **whole two-store class** (permission/ask = most-broken: registry-only → always misses for IM-driven sessions; file-send + interaction/ask = latent, masked because live-first usually hits). It also aligns with v0.8.10's own **D4 "single file-backed SoT"** discipline — same principle, applied to outbound addressing.
