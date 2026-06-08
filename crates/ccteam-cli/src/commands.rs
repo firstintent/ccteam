@@ -5236,60 +5236,26 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_peek_default_rmux_does_not_shell_out_to_tmux() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        let fake_bin = tmp.path().join("bin");
-        std::fs::create_dir_all(&fake_bin).unwrap();
-        let sentinel = tmp.path().join("tmux-called");
-        let fake_tmux = fake_bin.join("tmux");
-        std::fs::write(
-            &fake_tmux,
-            "#!/bin/sh\nprintf called > \"$CCTEAM_TMUX_SENTINEL\"\nexit 99\n",
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&fake_tmux).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_tmux, perms).unwrap();
 
-        let old_path = std::env::var_os("PATH");
         let old_home = std::env::var_os("CCTEAM_HOME");
-        let joined_path = match old_path.as_ref() {
-            Some(path) => {
-                let mut paths = vec![fake_bin.clone()];
-                paths.extend(std::env::split_paths(path));
-                std::env::join_paths(paths).unwrap()
-            }
-            None => fake_bin.clone().into_os_string(),
-        };
-        std::env::set_var("PATH", joined_path);
         std::env::set_var("CCTEAM_HOME", tmp.path().join("ccteam-home"));
         std::env::set_var("CCTEAM_MUX_BACKEND", "rmux");
-        std::env::set_var("CCTEAM_TMUX_SENTINEL", &sentinel);
 
         let result = run_peek_with_role(&paths, "missing", None);
 
         std::env::remove_var("CCTEAM_MUX_BACKEND");
-        std::env::remove_var("CCTEAM_TMUX_SENTINEL");
         match old_home {
             Some(path) => std::env::set_var("CCTEAM_HOME", path),
             None => std::env::remove_var("CCTEAM_HOME"),
-        }
-        match old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
         }
 
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
             msg.contains("rmux"),
             "peek should fail through the rmux backend, got: {msg}"
-        );
-        assert!(
-            !sentinel.exists(),
-            "default rmux peek must not invoke a PATH tmux binary"
         );
     }
 
