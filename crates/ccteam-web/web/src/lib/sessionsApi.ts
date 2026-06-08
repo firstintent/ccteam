@@ -15,7 +15,7 @@
 // rides along too. Error mapping mirrors `listApi`/`detailApi`:
 //   401 → throw Error("UNAUTHENTICATED")  (global TokenEntryGate kicks in)
 //   404 → throw Error("NOT_FOUND")
-//   other non-2xx → throw Error("HTTP <status>")
+//   other non-2xx → throw server `{error}` / text body, else `HTTP <status>`
 
 /** One live gateway session (the `SessionView` the backend serializes —
  *  `crates/ccteam-im/src/gateway.rs::SessionView`). `sid` is the gateway
@@ -28,6 +28,7 @@ export interface SessionView {
   permission_mode: string;
   current: boolean;
   status: string;
+  last_activity_seconds?: number | null;
 }
 
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn
@@ -92,7 +93,7 @@ async function getJson<T>(url: string): Promise<T> {
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (res.status === 404) throw new Error("NOT_FOUND");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res));
   return (await res.json()) as T;
 }
 
@@ -112,8 +113,25 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (res.status === 404) throw new Error("NOT_FOUND");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res));
   return (await res.json()) as T;
+}
+
+async function errorMessage(res: Response): Promise<string> {
+  const fallback = `HTTP ${res.status}`;
+  const contentType = res.headers.get("content-type") ?? "";
+  try {
+    if (contentType.includes("application/json")) {
+      const body = (await res.json()) as { error?: unknown; message?: unknown };
+      const msg = body.error ?? body.message;
+      if (typeof msg === "string" && msg.trim()) return msg;
+      return fallback;
+    }
+    const text = await res.text();
+    return text.trim() || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 /** `GET /api/v1/projects/{slug}/sessions` — the gateway `s{n}` session list

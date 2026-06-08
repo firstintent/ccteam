@@ -12,12 +12,8 @@
 //!   4. Mode missing → defaults to artifact-driven (V0.4.6 compat)
 //!   5. Agent team mode accepts empty agents map
 //!   6. Artifact-driven mode rejects agent_team block
-//!   7. Settings template for agent-team has 3 new hooks
-//!   8. PROJECT_SETTINGS_AGENT_TEAM_JSON contains all 3 hook entries
-//!   9. F94 hook progress-append accepts the 3 new event_type strings
+//!   7. F94 hook progress-append accepts the 3 new event_type strings
 //!      (delegated to progress_append unit; tested in ccteam-hooks)
-
-use std::path::Path;
 
 use ccteam_flow::workflow::{
     AgentTeamSpec, CleanupOnStop, SuggestedTeammate, SuggestedTeammateKind, WorkflowMode,
@@ -222,92 +218,6 @@ agents: {}
     std::fs::write(&path, yaml).unwrap();
     let err = WorkflowSpec::load(&path).unwrap_err();
     assert!(format!("{err}").contains("adhoc_model"));
-}
-
-#[test]
-fn settings_agent_team_template_has_three_new_hooks() {
-    // The shipped settings.agent-team.json must include all three F94
-    // hook entries (`TeammateIdle`, `TaskCreated`, `TaskCompleted`).
-    let body = ccteam_core::PROJECT_SETTINGS_AGENT_TEAM_JSON;
-    let v: serde_json::Value =
-        serde_json::from_str(body).expect("settings.agent-team.json must parse");
-    let hooks = v
-        .get("hooks")
-        .and_then(|h| h.as_object())
-        .expect("hooks object");
-    for required in [
-        "TeammateIdle",
-        "TaskCreated",
-        "TaskCompleted",
-        // F94 red line: existing 7 hooks still present (no regression
-        // vs settings.json baseline).
-        "SessionStart",
-        "Stop",
-        "Notification",
-        "PreToolUse",
-        "PostToolUse",
-        "SubagentStop",
-        "SessionEnd",
-    ] {
-        assert!(
-            hooks.contains_key(required),
-            "settings.agent-team.json template missing `{required}` hook",
-        );
-    }
-}
-
-#[test]
-fn render_project_settings_agent_team_substitutes_hook_sh_path() {
-    // V0.6.1 F139 — agent-team hook commands route through
-    // `~/.ccteam/hooks/hook.sh` (the daemon-aware wrapper) instead of
-    // cold-spawning `<bin> internal hook ...` every firing.
-    let body = ccteam_core::render_project_settings_agent_team(
-        Path::new("/home/u/.ccteam/hooks/hook.sh"),
-        &ccteam_core::SettingsEnv::default(),
-        &ccteam_core::EnabledPluginsSetting::default(),
-    )
-    .expect("render must succeed");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let teammate_idle = v["hooks"]["TeammateIdle"][0]["hooks"][0]["command"]
-        .as_str()
-        .expect("TeammateIdle command");
-    assert_eq!(
-        teammate_idle,
-        "/home/u/.ccteam/hooks/hook.sh progress-append team_teammate_idle",
-    );
-    let task_created = v["hooks"]["TaskCreated"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        task_created,
-        "/home/u/.ccteam/hooks/hook.sh progress-append team_task_created",
-    );
-    let task_completed = v["hooks"]["TaskCompleted"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        task_completed,
-        "/home/u/.ccteam/hooks/hook.sh progress-append team_task_completed",
-    );
-}
-
-#[test]
-fn write_project_settings_agent_team_lands_on_disk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path();
-    ccteam_core::write_project_settings_agent_team(
-        project,
-        &ccteam_core::EnabledPluginsSetting::default(),
-    )
-    .expect("write must succeed");
-    // v0.8.6 W2b — managed base/hooks land on the local settings layer
-    // (settings.local.json), never the user-committed settings.json.
-    let path = project.join(".claude").join("settings.local.json");
-    assert!(path.exists(), "settings.local.json must be written");
-    let body = std::fs::read_to_string(&path).unwrap();
-    assert!(body.contains("TeammateIdle"));
-    assert!(body.contains("TaskCreated"));
-    assert!(body.contains("TaskCompleted"));
 }
 
 #[test]

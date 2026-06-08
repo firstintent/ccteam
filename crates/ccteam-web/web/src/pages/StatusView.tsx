@@ -156,6 +156,11 @@ export function StatusCards({
                   {[s.vendor, s.role || "(无 role)"].filter(Boolean).join(" · ")}
                 </span>
                 <span className="font-mono text-text-dim">{s.sid}</span>
+                  {typeof s.last_activity_seconds === "number" ? (
+                    <span className="text-[10px] text-text-dim">
+                      最近活动 {formatActivityAge(s.last_activity_seconds)}前
+                    </span>
+                  ) : null}
                   <span
                     className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${activity.className}`}
                   >
@@ -214,6 +219,15 @@ export function StatusCards({
       </div>
     </>
   );
+}
+
+function formatActivityAge(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, Math.floor(seconds))} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} 小时`;
+  return `${Math.floor(hours / 24)} 天`;
 }
 
 function sessionActivityMeta(status: string): { label: string; className: string } {

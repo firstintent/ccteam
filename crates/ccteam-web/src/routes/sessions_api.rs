@@ -166,14 +166,43 @@ fn apply_progress_activity_status(
     else {
         return;
     };
-    let last_event = ccteam_core::progress::last_event(&paths.progress_jsonl(slug))
+    let progress_path = paths.progress_jsonl(slug);
+    let project_last = ccteam_core::progress::last_event(&progress_path)
         .ok()
         .flatten();
-    let activity =
-        ccteam_core::stall::classify_progress_stall(last_event.as_ref(), silent_seconds).activity;
+    let project_fallback = project_last
+        .as_ref()
+        .filter(|event| progress_event_sid(event).is_none());
     for view in views {
+        let sid_last = ccteam_core::progress::last_event_for_sid(&progress_path, &view.sid)
+            .ok()
+            .flatten();
+        let selected = sid_last.as_ref().or(project_fallback);
+        view.last_activity_seconds = selected.and_then(progress_event_age_seconds);
+        let age = view.last_activity_seconds.unwrap_or(silent_seconds);
+        let activity = ccteam_core::stall::classify_progress_stall(selected, age).activity;
         view.status = activity.to_string();
     }
+}
+
+fn progress_event_sid(event: &serde_json::Value) -> Option<&str> {
+    event
+        .get("sid")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| event.get("session_id").and_then(serde_json::Value::as_str))
+}
+
+fn progress_event_age_seconds(event: &serde_json::Value) -> Option<u64> {
+    let ts = event.get("ts").and_then(serde_json::Value::as_str)?;
+    let ts = chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(
+        chrono::Utc::now()
+            .signed_duration_since(ts)
+            .num_seconds()
+            .max(0) as u64,
+    )
 }
 
 /// POST body for session creation — `role` (required), `vendor` (optional,
@@ -258,7 +287,7 @@ pub(crate) async fn handle_create_session(
             tracing::warn!(%slug, %role, %err, "create_session_api failed");
             create_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("create session failed: {err}"),
+                format_create_session_error(&err),
                 mode,
             )
         }
@@ -386,17 +415,20 @@ pub(crate) async fn handle_session_turn(
     }
     let result = {
         let mut guard = gw.lock().await;
+        if !guard
+            .session_views()
+            .iter()
+            .any(|session| session.sid == sid)
+        {
+            return unknown_session(&sid);
+        }
         guard.submit_to_sid(&sid, form.text).await
     };
     match result {
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
-            // submit_to_sid returns Err for an unknown sid → 404. We can't
-            // cleanly distinguish that from a genuine submit error without
-            // probing first; an unknown-sid 404 is the meaningful client
-            // signal, so prefer it (a stale sid is the common failure).
             tracing::warn!(%sid, %err, "submit_to_sid failed");
-            unknown_session(&sid)
+            create_error(StatusCode::BAD_GATEWAY, format_submit_error(&err), mode)
         }
     }
 }
@@ -681,6 +713,27 @@ fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
     }
 }
 
+fn format_create_session_error(err: &anyhow::Error) -> String {
+    let raw = err.to_string();
+    if let Some(project) = raw.strip_prefix("unknown project: ") {
+        return format!(
+            "项目不存在: {project}。下一步: 先在项目目录运行 ccteam init，或从已有项目列表重新选择。"
+        );
+    }
+    if let Some(rest) = raw.strip_prefix("spawn failed: ") {
+        return format!(
+            "会话启动失败: {rest}。下一步: 请检查项目和角色后重试，或重启 ccteam start。"
+        );
+    }
+    format!("会话启动失败: {raw}。下一步: 请检查项目和角色后重试，或重启 ccteam start。")
+}
+
+fn format_submit_error(err: &anyhow::Error) -> String {
+    let raw = err.to_string();
+    let detail = raw.strip_prefix("submit failed: ").unwrap_or(&raw);
+    format!("发送失败: {detail}。下一步: 请重试；如果仍失败，刷新会话列表或重新 /new。")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,6 +990,7 @@ mod tests {
             permission_mode: "skip".into(),
             current: true,
             status: "live".into(),
+            last_activity_seconds: None,
         }];
 
         let stale_completed = serde_json::json!({
@@ -947,6 +1001,7 @@ mod tests {
             .unwrap();
         apply_progress_activity_status(&paths, "demo", &mut views);
         assert_eq!(views[0].status, "idle");
+        assert!(views[0].last_activity_seconds.is_some());
 
         let timeout = serde_json::json!({
             "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
@@ -956,6 +1011,61 @@ mod tests {
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &timeout).unwrap();
         apply_progress_activity_status(&paths, "demo", &mut views);
         assert_eq!(views[0].status, "stuck");
+    }
+
+    #[test]
+    fn progress_activity_status_prefers_sid_specific_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_project_state(&paths, "demo");
+        let mut views = vec![
+            SessionView {
+                sid: "s1".into(),
+                project: "demo".into(),
+                role: "cto".into(),
+                vendor: "claude".into(),
+                permission_mode: "skip".into(),
+                current: true,
+                status: "live".into(),
+                last_activity_seconds: None,
+            },
+            SessionView {
+                sid: "s2".into(),
+                project: "demo".into(),
+                role: "qa".into(),
+                vendor: "claude".into(),
+                permission_mode: "skip".into(),
+                current: false,
+                status: "live".into(),
+                last_activity_seconds: None,
+            },
+        ];
+
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("demo"),
+            &serde_json::json!({
+                "event": ccteam_core::progress::CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "ts": (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
+            }),
+        )
+        .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("demo"),
+            &serde_json::json!({
+                "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+                "sid": "s2",
+                "stuck": true,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        apply_progress_activity_status(&paths, "demo", &mut views);
+        assert_eq!(views[0].status, "idle");
+        assert!(views[0].last_activity_seconds.unwrap() >= 60);
+        assert_eq!(views[1].status, "stuck");
+        assert!(views[1].last_activity_seconds.unwrap() < 60);
     }
 
     #[test]

@@ -31,6 +31,14 @@ You talk to ccteam from three places, all backed by one daemon:
 
 **Harness × provider, best-fit drive.** ccteam abstracts each agentic CLI as a *harness*; the model behind it is the *provider* sub-facet. Today the primary harness is **claude-code**, driven through a long-lived **tmux TUI** session — durable, full TUI, driven with `send-keys` plus transcript tailing and the official Claude Code hooks. ccteam never scrapes terminal output. **Codex** is supported on a best-effort basis, and more harnesses (gemini-cli, grok-cli, …) are designed to plug in as adapters. Whatever is actually installed on your `PATH` is reported live by the API's `GET /capabilities`.
 
+Supported model paths:
+
+| Path | Support level | Notes |
+|---|---|---|
+| Claude harness + Claude-family models (`claude-*`, `sonnet`, `opus`, `haiku`) | First-class | Recommended for Claude sessions and role frontmatter. |
+| Codex harness + Codex/OpenAI models | Best-effort | Available when the Codex adapter and CLI are present. |
+| Claude harness + non-Claude models (for example `deepseek-via-claude`) | Untested | Not blocked, but ccteam labels the limitation; switch back to `sonnet`/`opus`/`haiku` if the session spins. |
+
 **Full slash-command coverage, from chat.** A slash command you type in IM (or the web console) does the right thing for whichever agent owns the session — no command silently degrades into literal text. Claude's open command set (skills, `/compact`, `/clear`, custom commands, …) passes straight through to the TUI. Popup / picker commands — pick a model, choose a review target, and the like — are answered with **inline buttons** in IM (or **chips** in web chat) instead of getting stuck in a hidden TUI modal. And when an agent itself raises a question mid-task (an `AskUserQuestion`), it surfaces as the same kind of inline choice, so you can answer from your phone and the agent keeps going.
 
 **Approve dangerous actions, per session (optional).** By default a session runs hands-off. Spin one up with human-in-the-loop instead (`/new claude <role> hitl`) and any non-allowlisted tool call pauses for your **approve / deny** — surfaced as inline buttons in chat or the web console, via Claude's native permission hook (ccteam never injects a prompt to do this). Deny blocks just that one tool, never the whole turn. Auto-allowed tools never prompt.

@@ -71,6 +71,28 @@ pub fn default_adapter_factory() -> AdapterFactory {
     })
 }
 
+fn format_gateway_user_error(err: &anyhow::Error) -> String {
+    let raw = err.to_string();
+    if let Some(rest) = raw.strip_prefix("spawn failed: ") {
+        return format!(
+            "会话启动失败: {rest}。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。"
+        );
+    }
+    if let Some(rest) = raw.strip_prefix("submit failed: ") {
+        return format!(
+            "发送失败: {rest}。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。"
+        );
+    }
+    if let Some(project) = raw.strip_prefix("unknown project: ") {
+        return format!(
+            "项目不存在: {project}。下一步: 发送 /projects 查看可用项目，或先运行 ccteam init 注册项目。"
+        );
+    }
+    format!(
+        "操作失败: {raw}。下一步: 请重试；如果仍失败，发送 /projects 检查项目，或重启 ccteam start。"
+    )
+}
+
 /// CLI arguments forwarded from `main.rs`.
 ///
 /// Not `Clone` — it owns a one-shot `gateway_event_rx` (V0.8.4 P2b).
@@ -722,7 +744,7 @@ fn spawn_inbound_consumer(
                 }
                 Err(err) => {
                     let out =
-                        SendMessage::new(format!("gateway error: {err}"), msg.reply_target.clone())
+                        SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
                             .in_thread(msg.thread_ts.clone());
                     send_gateway_outbound(&cid, 0, &msg.channel, channel.as_ref(), out).await;
                     tracing::warn!(

@@ -117,7 +117,7 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            build_chat_turn_user_prompt_event(&role, turn_id, prompt)
+            build_chat_turn_user_prompt_event(&role, &ccteam_sid, turn_id, prompt)
         }
         "stop" => {
             let turn_id = stdin
@@ -128,7 +128,7 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
             // reads it from the transcript / state.json. Emit with a
             // default-shaped usage so consumers can join on schema.
             let usage = ccteam_harness::UnifiedTokenUsage::default();
-            build_chat_turn_completed_event(&role, turn_id, &usage)
+            build_chat_turn_completed_event(&role, &ccteam_sid, turn_id, &usage)
         }
         "subagent-stop" => json!({
             "event": "chat_subagent_completed",

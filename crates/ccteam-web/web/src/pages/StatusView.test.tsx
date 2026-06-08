@@ -13,6 +13,10 @@ import type { SessionView } from "../lib/sessionsApi";
 
 const realFetch = globalThis.fetch;
 
+function visibleText(html: string): string {
+  return html.replace(/<!-- -->/g, "");
+}
+
 const RAIL: SessionView[] = [
   {
     sid: "s5",
@@ -22,6 +26,7 @@ const RAIL: SessionView[] = [
     permission_mode: "skip",
     current: true,
     status: "live",
+    last_activity_seconds: 45,
   },
   {
     sid: "s7",
@@ -31,6 +36,7 @@ const RAIL: SessionView[] = [
     permission_mode: "skip",
     current: false,
     status: "live",
+    last_activity_seconds: 3700,
   },
 ];
 
@@ -62,6 +68,7 @@ describe("StatusCards (seeded success state)", () => {
       budget_cap_24h: 20,
     };
     const html = renderToString(<StatusCards status={snap} rail={RAIL} />);
+    const text = visibleText(html);
     expect(html).toContain('data-testid="status-daemon"');
     expect(html).toContain("daemon healthy");
     expect(html).toContain('data-testid="status-sessions"');
@@ -71,6 +78,9 @@ describe("StatusCards (seeded success state)", () => {
     expect(html).toContain("live ·");
     expect(html).toContain("idle");
     expect(html).toContain("architect");
+    expect(html).toContain("最近活动");
+    expect(text).toContain("45 秒前");
+    expect(text).toContain("1 小时前");
     expect(html).toContain('data-testid="status-cost"');
     expect(html).toContain("$2.14 / $20.00");
     expect(html).toContain("claude $1.62 · codex $0.52");

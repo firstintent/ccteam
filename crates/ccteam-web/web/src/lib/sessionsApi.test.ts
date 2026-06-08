@@ -110,6 +110,17 @@ describe("sessionsApi", () => {
     expect(got.accepted).toBe(true);
   });
 
+  it("submitTurn lifts the server human error body", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(502, {
+        error: "发送失败: tmux session missing。下一步: 请重试；如果仍失败，刷新会话列表或重新 /new。",
+      }),
+    );
+    await expect(submitTurn("s2", "review")).rejects.toThrow(
+      "发送失败: tmux session missing",
+    );
+  });
+
   it("stopSession POSTs to /sessions/{sid}/stop", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse(200, { stopped: true }));
@@ -169,6 +180,18 @@ describe("sessionsApi", () => {
     await createSession("dex-ui", { role: "cto" });
     const body = JSON.parse(vi.mocked(globalThis.fetch).mock.calls[0][1]!.body as string);
     expect(body).toEqual({ role: "cto" });
+  });
+
+  it("createSession lifts the server human error body", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(500, {
+        ok: false,
+        error: "会话启动失败: simulated start failure。下一步: 请检查项目和角色后重试。",
+      }),
+    );
+    await expect(createSession("dex-ui", { role: "cto" })).rejects.toThrow(
+      "会话启动失败: simulated start failure",
+    );
   });
 
   it("maps 401 → UNAUTHENTICATED and 404 → NOT_FOUND", async () => {

@@ -977,16 +977,15 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
-    assert_eq!(
-        contents,
-        vec!["gateway error: spawn failed: simulated start failure"]
-    );
+    let expected =
+        "会话启动失败: simulated start failure。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。";
+    assert_eq!(contents, vec![expected.to_string()]);
+    assert!(!contents[0].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     let rows = read_durable_outbound_rows();
-    assert!(rows.iter().any(|row| {
-        row["state"] == "sent"
-            && row["message"]["content"] == "gateway error: spawn failed: simulated start failure"
-    }));
+    assert!(rows
+        .iter()
+        .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1031,20 +1030,19 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
+    let expected =
+        "发送失败: simulated submit failure。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。";
     assert_eq!(
         contents,
-        vec![
-            "created session s1".to_string(),
-            "gateway error: submit failed: simulated submit failure".to_string()
-        ]
+        vec!["created session s1".to_string(), expected.to_string()]
     );
+    assert!(!contents[1].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
     let rows = read_durable_outbound_rows();
-    assert!(rows.iter().any(|row| {
-        row["state"] == "sent"
-            && row["message"]["content"] == "gateway error: submit failed: simulated submit failure"
-    }));
+    assert!(rows
+        .iter()
+        .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1574,9 +1572,7 @@ async fn real_ws_dual_harness_smoke() {
         .await;
         let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
         assert!(
-            fault
-                .content
-                .starts_with("gateway error: submit failed: tmux session missing:"),
+            fault.content.starts_with("发送失败: tmux session missing:"),
             "Claude tmux death should be user-visible, got {:?}",
             fault.content
         );
@@ -1589,7 +1585,7 @@ async fn real_ws_dual_harness_smoke() {
         .await;
         let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
         assert!(
-            fault.content.starts_with("gateway error: submit failed:")
+            fault.content.starts_with("发送失败:")
                 && (fault.content.contains("turn/start")
                     || fault.content.contains("codex app-server fault injection")),
             "Codex app-server death should be user-visible, got {:?}",

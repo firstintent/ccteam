@@ -247,9 +247,16 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
-    out.push_str("  - ccteam config               # register MCP / set IM token / prefs\n");
-    out.push_str("  - ccteam start                # boots gateway + web\n");
+    out.push_str("  1. install: keep `ccteam` on PATH and install the Claude/Codex plugin\n");
+    out.push_str("  2. init: this project is now initialized\n");
+    out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
+    out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
+    out.push_str("  5. pair: send `/pair <code>` in IM, if your channel needs pairing\n");
+    out.push_str(
+        "  6. cd: send `/cd <project>`; the first message starts the default cto session\n",
+    );
+    out.push_str("  role tip: roleless uses project CLAUDE.md, cto is the default guide, work roles live in .claude/agents/<role>.md\n");
+    out.push_str("  guide: docs/usage.md\n");
     Ok(out)
 }
 
@@ -5720,6 +5727,39 @@ mod tests {
         assert_eq!(cfg.projects.len(), 1);
         assert_eq!(cfg.projects[0].slug, "f72-fresh");
         assert_eq!(cfg.projects[0].team, "dev");
+    }
+
+    #[test]
+    fn run_init_next_block_names_shortest_path_and_role_modes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let out = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(tmp.path().join("onboard-demo")),
+                slug: Some("onboard-demo".into()),
+                team: Some("dev".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        for needle in [
+            "1. install:",
+            "2. init:",
+            "3. config:",
+            "4. start:",
+            "5. pair:",
+            "6. cd:",
+            "roleless uses project CLAUDE.md",
+            "cto is the default guide",
+            "work roles live in .claude/agents/<role>.md",
+            "docs/usage.md",
+        ] {
+            assert!(
+                out.contains(needle),
+                "init next block missing {needle:?}:\n{out}"
+            );
+        }
     }
 
     /// V0.5.0 F93b — `ccteam init` without `--mode` defaults to

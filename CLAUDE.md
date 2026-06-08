@@ -5,9 +5,9 @@
 
 ---
 
-## 〇、当前架构红线(v0.8.9)
+## 〇、当前架构红线(v0.8.10)
 
-本仓已落地 **「IM 通用模式 + session 独立一等实体 + 插件市场」**(版本号 `0.8.9`;在 v0.8.8 模型上补 **plugin marketplace(ccteam ↔ ccteam-hub ↔ project)+ 统一 chat-shell web UI + 逐字节保真 rmux 终端 + 零提示词内容引擎**):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表)。**下文若仍见 v8.3 / orchestrator / 多模式(模式 1/2/3)/ flex / session=role / AGENTS.md-替代 / 27-tool 残留 / 内置 role catalog / agent-team init mode,以本节为准 —— 那些已退役:**
+本仓已落地 **「IM 通用模式 + session 独立一等实体 + 插件市场」**(版本号 `0.8.10`;在 v0.8.9 模型上补 **核心流程生产级稳定性 + 高质量 UX**:CI-fake soak/fault guards、sid 精确身份、file-backed stall SoT、边界/通知可靠性、人话失败信号、模型支持诚实 warn、上手序列、Status 活动态、D7 死代码收口):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表)。**下文若仍见 v8.3 / orchestrator / 多模式(模式 1/2/3)/ flex / session=role / AGENTS.md-替代 / 27-tool 残留 / 内置 role catalog / agent-team init mode,以本节为准 —— 那些已退役:**
 
 - **核心模型 `chat ⇄ project ⇄ session`,role 是 session 的属性**:一个 chat = 你的终端(IM chat 或 web)→ 切 project → spawn/resume **session**。**session 是独立一等实体**,有持久 `sid`(`s<N>`,单调、扛 daemon 重启、不复用);**role 降为 session 的一个属性**(spawn 时绑 `--agent <role>` persona)。**同一 role 可并存多个 session**(去掉了 `(project,role)` dedup)。session 启动走 `claude [--agent <role>] --name|--resume <session-name>`(tmux send-keys 路径;hooks 全触发,含 `Stop`→`chat_turn_completed`)。role 库 = 项目级 `.claude/agents/<role>.md`;`ccteam init` 种默认 `cto` role(chat-first 管家:懂 ccteam、**推荐** work-role,本版只推荐,用户自己 `/role` 切)。
 - **pane / turns / marker 全按 sid**:pane = `ccteam-chat-<slug>-<sid>`、turns = `.ccteam/chat/<sid>/turns.jsonl`、transcript cursor / active-session marker 同按 sid;`CCTEAM_CHAT_SID` 注入 pane env(daemon HTTP 路径加 `X-Ccteam-Sid` header)→ hook 与 in-pane forwarder 都拿得到 sid,写/读同键。gateway `spawn_event_pump` 的 ANSWER 分支按 sid `append_turn`(它是 live daemon 唯一 turns writer)。
@@ -28,12 +28,12 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.8.9` |
-| 测试 baseline | `1898/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 229 pass / 4 env-gated `ws_*`(tmux pipe-pane PTY,留 CI/专机)+ vitest 128/128(SPA)|
+| Workspace version | `0.8.10` |
+| 测试 baseline | `1918/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 276 pass;vitest 142 pass(SPA)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.9 已落地(插件市场 + 统一 web UI + 保真终端 + 零提示词引擎)**:**plugin marketplace**(内容住 `ccteam-hub`,ccteam 经 HTTPS+`~/.ccteam/hub-cache/` 读 `index.json`、sha256 校验后装进项目 `.claude/{agents,skills}/`;ingestion verbatim vendor agency-agents 192;`role search/add` 改读 hub)· **统一 chat-shell web UI**(收敛成一个 `ChatConsole`,删全部 operator 视图;底部导航 插件市场/Status/Settings + cost pill + `GET /api/v1/status`)· **逐字节保真终端**(rmux backend 改裸 pane 字节流 + `Oldest` backlog → 默认 rmux 即保真;byte API 自 0.3.1 起就有,rmux pin 升 **0.5**)· **零提示词内容引擎**(删 legacy agent-team/meta-agent 模板 + `squad_roster`/`meta_agent` + 根 `agents/`/`workflows/`;退役 `InitMode::AgentTeam`(init 总 scaffold artifact 型 workflow.yaml、无 `--mode`);删 DEAD `chat_history`/`chat_send_input` → **MCP 17→15**)· PRD/handoff/归档见 `docs/versions/v0-8-9/` |
+| 当前在做 | **v0.8.10 已落地(核心流程生产级稳定性 + 高质量 UX)**:在 v0.8.9 的 plugin marketplace / 统一 chat-shell web UI / 逐字节保真终端 / 零提示词引擎基础上,补 CI-fake fault guards、sid 精确 progress/reset/session 身份、file-backed stall SoT、边界/通知可靠性、人话失败信号、模型支持 warn-once、上手序列、Status 活动态/cost 边界态、D7 死代码收口;真机短 smoke 脚本与 checklist 已就绪,**nas-box005 待跑**。PRD/handoff/归档见 `docs/versions/v0-8-10/` |
 
-> 主分支 HEAD 以 `git rev-parse origin/dev` 为准(v0.8.9 在 dev 上);历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
+> 主分支 HEAD 以 `git rev-parse origin/dev` 为准(v0.8.10 在 dev 上);历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 

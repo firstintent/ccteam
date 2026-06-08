@@ -6,7 +6,6 @@ pub mod codex_app_server;
 pub mod codex_exec;
 pub mod codex_jsonrpc;
 pub mod codex_typed_events;
-pub mod marker_reporter;
 pub mod process_inspect;
 pub mod progress_bridge;
 pub mod session_recovery;

@@ -45,7 +45,6 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::execution::marker_reporter;
 use crate::execution::process_inspect::pane_runs_process;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, hooks_script_from_env,
@@ -59,7 +58,7 @@ use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -877,15 +876,6 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // V0.6.8 F196 — tail_loop needs `slug` so it can consult the
-        // per-bot MarkerReporter registry. Pre-F196 the loop only knew
-        // `role`; the slug is in `raw_extras` (start_thread writes it).
-        let slug = h
-            .raw_extras
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         // v0.8.8 F1 — sid 是 turns / cursor / marker 的真实键。tail_loop
         // 用它算 cursor_path / active_session_id_path,使同 (project, role)
         // 多会话各跟各自的 jsonl,绝不串台。
@@ -920,7 +910,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             // cursor / marker 真实键).
             if !sid.is_empty() {
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                tokio::spawn(tail_loop(pdir, cwd, slug, role, sid, tx, dispatch));
+                tokio::spawn(tail_loop(pdir, cwd, role, sid, tx, dispatch));
             }
         }
 
@@ -1146,11 +1136,10 @@ impl ClaudeTuiAdapter {
 async fn tail_loop(
     project_dir: PathBuf,
     cwd: PathBuf,
-    slug: String,
     role: String,
     // v0.8.8 F1 — cursor / marker 的存储键(`s<N>`),非 Anthropic 原生
-    // UUID。`role` 仍保留给 observe_marker 的 (slug,role) MarkerReporter
-    // 注册表 + 日志上下文;cursor_path / active_session_id_path 一律按 sid。
+    // UUID。`role` 仍保留给日志上下文;cursor_path /
+    // active_session_id_path 一律按 sid。
     sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
@@ -1201,7 +1190,7 @@ async fn tail_loop(
             );
             // Best-effort fallback to the legacy polling path —
             // shouldn't realistically happen on supported platforms.
-            tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
+            tail_loop_polling(project_dir, cwd, role, sid, tx, dispatch).await;
             return;
         }
     };
@@ -1212,7 +1201,7 @@ async fn tail_loop(
             "claude-tui tail: watch() failed; falling back to plain polling"
         );
         drop(watcher);
-        tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
+        tail_loop_polling(project_dir, cwd, role, sid, tx, dispatch).await;
         return;
     }
     tracing::info!(
@@ -1236,10 +1225,10 @@ async fn tail_loop(
         &mut silence,
         initial.is_some(),
         &marker_file,
-        &slug,
         &role,
         &project_dir,
         &dispatch,
+        &tx,
     )
     .await;
     if let Some((sid, path)) = initial {
@@ -1273,10 +1262,10 @@ async fn tail_loop(
                             &mut silence,
                             true,
                             &marker_file,
-                            &slug,
                             &role,
                             &project_dir,
                             &dispatch,
+                            &tx,
                         )
                         .await;
                         sid
@@ -1286,10 +1275,10 @@ async fn tail_loop(
                             &mut silence,
                             false,
                             &marker_file,
-                            &slug,
                             &role,
                             &project_dir,
                             &dispatch,
+                            &tx,
                         )
                         .await;
                         continue;
@@ -1333,10 +1322,10 @@ async fn tail_loop(
                     &mut silence,
                     pair.is_some(),
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 if let Some((sid, path)) = pair {
@@ -1350,45 +1339,31 @@ async fn tail_loop(
     }
 }
 
-/// V0.6.8 F196 — single observation point that fans out to both the
-/// F187 in-process WARN gate ([`MarkerSilenceWatch`]) and the
-/// supervisor-side state machine (via the
-/// [`ccteam_harness::execution::marker_reporter`] registry).
+/// Single observation point for the F187 in-process WARN gate
+/// ([`MarkerSilenceWatch`]).
 ///
 /// Called once per tail-loop tick (initial sweep, every inotify
 /// CREATE/MODIFY event, and every 2-second safety-net tick in
-/// `tail_loop`; every iteration of the poll-only fallback). The
-/// supervisor counts the misses and escalates to a session reset when
-/// the consecutive run crosses its threshold — `tail_loop` stays a
-/// fire-and-forget reporter and doesn't see the heal decision.
-///
-/// Lookup failures (no supervisor registered, supervisor dropped) are
-/// silently swallowed — the corresponding bot's state machine no
-/// longer matters.
+/// `tail_loop`; every iteration of the poll-only fallback).
 async fn observe_marker(
     silence: &mut MarkerSilenceWatch,
     marker_present: bool,
     marker_file: &Path,
-    slug: &str,
     role: &str,
     project_dir: &Path,
     dispatch: &tracing::Dispatch,
+    tx: &mpsc::Sender<ThreadEvent>,
 ) {
-    tracing::dispatcher::with_default(dispatch, || {
+    let user_message = tracing::dispatcher::with_default(dispatch, || {
         silence.observe(marker_present, marker_file, role, project_dir)
     });
-    // Empty slug means raw_extras was malformed at `events()` entry —
-    // the registry uses `(slug, role)` as the key so an empty slug
-    // would never resolve. Skip the lookup to avoid noise.
-    if slug.is_empty() {
-        return;
-    }
-    if let Some(reporter) = marker_reporter::lookup(slug, role) {
-        if marker_present {
-            reporter.report_marker_found().await;
-        } else {
-            reporter.report_marker_missing().await;
-        }
+    if let Some(message) = user_message {
+        let _ = tx
+            .send(ThreadEvent::Error(ThreadErrorEvent {
+                kind: "tail_marker_missing".to_string(),
+                message,
+            }))
+            .await;
     }
 }
 
@@ -1453,24 +1428,30 @@ impl MarkerSilenceWatch {
         marker_file: &Path,
         role: &str,
         project_dir: &Path,
-    ) {
+    ) -> Option<String> {
         if marker_present {
             self.first_missing = None;
             self.warned = false;
-            return;
+            return None;
         }
         let started = *self.first_missing.get_or_insert_with(Instant::now);
         if !self.warned && started.elapsed() >= self.warn_after {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
             tracing::warn!(
                 event = "tail_marker_missing",
                 role = %role,
                 project_dir = %project_dir.display(),
                 marker = %marker_file.display(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 "chat-mode tail waiting for SessionStart hook — likely env-propagation failure if this persists"
             );
             self.warned = true;
+            return Some(
+                "会话暂时没有产出: ccteam 还没看到 Claude 的 SessionStart 标记，可能是 hook 没有启动或环境变量没有传到会话。下一步: 请先重试发送；如果仍无回复，运行 `ccteam doctor` 检查 hook，或重启 `ccteam start`。"
+                    .to_string(),
+            );
         }
+        None
     }
 }
 
@@ -1544,10 +1525,9 @@ async fn drain_path(
 async fn tail_loop_polling(
     project_dir: PathBuf,
     cwd: PathBuf,
-    slug: String,
     role: String,
     // v0.8.8 F1 — 同 tail_loop:cursor / marker 按 sid;role 仅供
-    // observe_marker 注册表 + 日志。
+    // 日志。
     sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
@@ -1587,10 +1567,10 @@ async fn tail_loop_polling(
                     &mut silence,
                     true,
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 pair
@@ -1600,10 +1580,10 @@ async fn tail_loop_polling(
                     &mut silence,
                     false,
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;

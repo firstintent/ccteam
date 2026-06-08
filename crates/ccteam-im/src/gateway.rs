@@ -5,7 +5,7 @@
 //! daemon-agnostic: tests drive it with a fake [`HarnessAdapter`], and
 //! the daemon can wire the same state machine into real transports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
-use ccteam_core::{CcteamPaths, HotConfig};
+use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
     ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
@@ -137,6 +137,10 @@ pub struct Gateway {
     /// registered after daemon start without a restart — config.yaml is the
     /// source of truth, `projects` is just a cache. `None` in unit tests.
     config: Option<HotConfig<CcteamConfig>>,
+    /// v0.8.10 D9 — warn once per Claude-routed non-Claude model family.
+    /// This is an honesty label only: it never blocks spawn and never changes
+    /// adapter/model behavior.
+    model_warned: HashSet<(AgentVendor, String)>,
 }
 
 /// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
@@ -288,6 +292,9 @@ pub struct SessionView {
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
     pub status: String,
+    /// Seconds since this session's latest progress event when known.
+    #[serde(default)]
+    pub last_activity_seconds: Option<u64>,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -511,6 +518,7 @@ impl Gateway {
             )),
             project_paths: None,
             config: None,
+            model_warned: HashSet::new(),
         }
     }
 
@@ -1099,7 +1107,8 @@ impl Gateway {
         // This is the same `read_role` existence check `/role`
         // (switch_current_role) already applies; here it guards creation. See
         // `ensure_role_exists` for the test-dir exemption.
-        ensure_role_exists(&cwd, &role)?;
+        let role_detail = ensure_role_exists(&cwd, &role)?;
+        let model_id = role_model_id(role_detail.as_ref());
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
         // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
@@ -1126,7 +1135,7 @@ impl Gateway {
                     cwd: cwd.clone(),
                     project_dir: cwd,
                     extra_args: vec![],
-                    model_id: None,
+                    model_id: model_id.clone(),
                     permission_mode,
                     secret: secret.clone(),
                 },
@@ -1149,6 +1158,7 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
             },
         );
+        self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
@@ -1214,11 +1224,15 @@ impl Gateway {
         // on a bad name (path-traversal etc.) and `Ok(None)` when the file is
         // absent — both mean "no such role", so we bail with a clear hint and
         // leave the session completely intact.
-        if ccteam_core::read_role(&cwd, &role).ok().flatten().is_none() {
-            return Err(anyhow!(
-                "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
-            ));
-        }
+        let role_detail = match ccteam_core::read_role(&cwd, &role) {
+            Ok(Some(detail)) => detail,
+            Ok(None) | Err(_) => {
+                return Err(anyhow!(
+                    "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
+                ));
+            }
+        };
+        let model_id = role_model_id(Some(&role_detail));
 
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
@@ -1243,7 +1257,7 @@ impl Gateway {
                     cwd: cwd.clone(),
                     project_dir: cwd,
                     extra_args: vec![],
-                    model_id: None,
+                    model_id: model_id.clone(),
                     permission_mode,
                     secret: secret.clone(),
                 },
@@ -1272,7 +1286,52 @@ impl Gateway {
         self.current_session.insert(chat.clone(), sid.clone());
         self.persist_state()?;
         self.spawn_event_pump(&sid);
+        self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
         Ok(sid)
+    }
+
+    fn maybe_emit_model_support_warning(
+        &mut self,
+        chat: &ChatKey,
+        sid: &str,
+        vendor: AgentVendor,
+        model: Option<&str>,
+    ) {
+        if vendor != AgentVendor::Claude {
+            return;
+        }
+        let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+            return;
+        };
+        if ccteam_core::is_claude_family(model) {
+            return;
+        }
+        let key = (vendor, model_warn_key(model));
+        if !self.model_warned.insert(key) {
+            return;
+        }
+        let content = format!(
+            "模型提示: 这个 Claude session 的角色声明了 model `{model}`。ccteam 目前只验证 Claude 家族模型；如果会话长时间空转，请改用 sonnet/opus/haiku，或在角色文件里调整 model 后重新 /new。"
+        );
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-model-warn-{sid}-{}", model_warn_key(model)),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+        });
+    }
+
+    fn emit_user_signal(&self, event: GatewayEvent) {
+        if let Some(tx) = self.event_sink.clone() {
+            let _ = tx.send(event);
+        } else {
+            let _ = self.events_broadcast.send(event);
+        }
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
@@ -2013,6 +2072,7 @@ impl Gateway {
                 permission_mode: s.permission_mode.as_str().to_string(),
                 current: current.contains(&s.id),
                 status: "live".to_string(),
+                last_activity_seconds: None,
             })
             .collect();
         views.sort_by_key(|v| session_index(&v.sid));
@@ -2402,6 +2462,7 @@ fn spawn_turn_timeout_watchdog(
         if let Some(progress_path) = progress_path.as_ref() {
             let ev = ccteam_core::progress::build_chat_turn_timeout_event(
                 &role,
+                &session_id,
                 &project,
                 &turn_id,
                 timeout.as_secs(),
@@ -2521,28 +2582,45 @@ fn wrap_inbound(
 /// integration tests that spawn against bare fake project dirs (e.g.
 /// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
 /// routing, not personas, and shouldn't be forced to scaffold a role tree.
-fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDetail>> {
     // v0.8.8 F2 — 空 role = 显式 roleless(裸 claude 自读项目 CLAUDE.md):跳过
     // 存在性校验。必须在 `read_role` 之前(`read_role("")` 会因 charset 校验
     // bail → `.ok().flatten()` 折成 None → 误报 RoleNotFound)。
     if role.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // No agents dir → uninitialized / test project; skip (see doc comment).
     if !ccteam_core::agents_dir(cwd).exists() {
-        return Ok(());
+        return Ok(None);
     }
     // `read_role` returns Err on a bad name (charset / traversal) and Ok(None)
     // when the file is absent — both mean "no such role" here.
     // v0.8.7 review-fix (R-M6): surface a typed `RoleNotFound` (via anyhow) so
     // the web create handler can map it to a 4xx instead of a blanket 500.
-    if ccteam_core::read_role(cwd, role).ok().flatten().is_none() {
-        return Err(RoleNotFound {
+    match ccteam_core::read_role(cwd, role) {
+        Ok(Some(detail)) => Ok(Some(detail)),
+        Ok(None) | Err(_) => Err(RoleNotFound {
             role: role.to_string(),
         }
-        .into());
+        .into()),
     }
-    Ok(())
+}
+
+fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
+    detail
+        .and_then(|d| d.frontmatter.get("model"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn model_warn_key(model: &str) -> String {
+    model
+        .trim()
+        .split_once('[')
+        .map_or_else(|| model.trim(), |(head, _)| head.trim())
+        .to_ascii_lowercase()
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -2898,11 +2976,16 @@ mod tests {
     /// existence check (`ccteam_core::read_role`) resolves it. Minimal frontmatter
     /// is enough; the gateway only checks the file exists, not its contents.
     fn seed_role(project_dir: &std::path::Path, role: &str) {
+        seed_role_with_model(project_dir, role, None);
+    }
+
+    fn seed_role_with_model(project_dir: &std::path::Path, role: &str, model: Option<&str>) {
         let agents = project_dir.join(".claude").join("agents");
         std::fs::create_dir_all(&agents).unwrap();
+        let model = model.map(|m| format!("model: {m}\n")).unwrap_or_default();
         std::fs::write(
             agents.join(format!("{role}.md")),
-            format!("---\nname: {role}\n---\n{role} role.\n"),
+            format!("---\nname: {role}\n{model}---\n{role} role.\n"),
         )
         .unwrap();
     }
@@ -3007,6 +3090,99 @@ mod tests {
         let sink = gw.event_sink.clone().expect("sink wired");
         assert!(sink.send(fake_event(Some("s7"))));
         assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
+    }
+
+    #[tokio::test]
+    async fn claude_non_family_role_model_warns_once_to_event_stream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        assert_eq!(
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap(),
+            vec!["created session s1"]
+        );
+        let warn = events.recv().await.unwrap();
+        assert_eq!(warn.sid.as_deref(), Some("s1"));
+        assert!(warn.content.contains("模型提示"), "{}", warn.content);
+        assert!(
+            warn.content.contains("deepseek-via-claude"),
+            "{}",
+            warn.content
+        );
+        assert!(
+            warn.content.contains("sonnet/opus/haiku"),
+            "{}",
+            warn.content
+        );
+        assert!(warn.content.contains("/new"), "{}", warn.content);
+
+        assert_eq!(
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap(),
+            vec!["created session s2"]
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "same model family should warn once"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_family_role_models_do_not_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "sonnetrole", Some("sonnet[1m]"));
+        seed_role_with_model(tmp.path(), "future", Some("claude-future-99"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude sonnetrole")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude future")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "Claude-family role models must not warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_route_with_non_claude_role_model_does_not_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "api", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Codex));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex api")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "non-Claude vendor must not emit Claude model warning"
+        );
     }
 
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
@@ -5090,7 +5266,7 @@ mod tests {
     /// (v0.8.5) A project registered in config.yaml AFTER the gateway started
     /// — e.g. `ccteam init` while the daemon was already running — must be
     /// addressable by /cd, not just the startup snapshot. Reproduces the
-    /// "gateway error: unknown project" bug.
+    /// stale startup-only project registry bug.
     #[tokio::test]
     async fn gateway_cd_dynamically_loads_project_from_config() {
         use ccteam_core::config::{upsert_project, ProjectEntry};

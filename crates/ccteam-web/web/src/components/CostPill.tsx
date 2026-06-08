@@ -55,6 +55,16 @@ export default function CostPill() {
     };
   }, []);
 
+  return <CostPillButton snap={snap} onOpenStatus={() => navigate("/status")} />;
+}
+
+export function CostPillButton({
+  snap,
+  onOpenStatus,
+}: {
+  snap: StatusSnapshot | null;
+  onOpenStatus: () => void;
+}) {
   const severity = snap ? budgetSeverity(snap.cost_24h_usd, snap.budget_cap_24h) : "ok";
   const cap = snap?.budget_cap_24h ?? null;
 
@@ -70,7 +80,7 @@ export default function CostPill() {
     <button
       type="button"
       data-testid="cost-pill"
-      onClick={() => navigate("/status")}
+      onClick={onOpenStatus}
       title="今日花费 / 24h 预算（点开看 per-vendor）"
       className={`text-[11px] font-mono px-2.5 py-1 rounded-full bg-surface-800 border ${tone} hover:bg-surface-700 transition-colors cursor-pointer`}
     >
