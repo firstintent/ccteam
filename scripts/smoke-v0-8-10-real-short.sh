@@ -27,7 +27,7 @@ Required on the target box:
   - hostname nas-box005
   - tmux
   - claude
-  - codex
+  - codex only for opt-in Codex probes
   - cargo
   - a built ccteam binary in target/debug/ccteam
 
@@ -76,6 +76,13 @@ require_cmd() {
   }
 }
 
+needs_real_codex() {
+  [[ "${CCTEAM_REAL_CODEX_RPC:-0}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_CODEX:-0}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_NL:-}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_NL:-}" == "codex" ]]
+}
+
 preflight() {
   local expected_host="${CCTEAM_REAL_SMOKE_HOST:-nas-box005}"
   local current_host
@@ -122,7 +129,9 @@ EOF
   fi
   if [[ "$run_im" -eq 1 ]]; then
     require_cmd claude
-    require_cmd codex
+    if needs_real_codex; then
+      require_cmd codex
+    fi
     if [[ ! -x "$ROOT/target/debug/ccteam" ]]; then
       echo "smoke-v0-8-10-real-short: target/debug/ccteam is missing or not executable" >&2
       echo "Build it first on nas-box005: cargo build --workspace" >&2

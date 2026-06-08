@@ -10,22 +10,23 @@ usage() {
   cat <<'EOF'
 usage: scripts/smoke-im.sh [--real]
 
-  --real  Fail loud unless real claude/codex binaries and a Codex
-          app-server transport are present. This mode is the v8.2 guard
-          against accidentally treating fake gateway tests as a real
-          IM smoke.
+  --real  Fail loud unless the real Claude/tmux path is present. Codex
+          binaries and app-server transport are required only for explicit
+          Codex probes. This mode is the v8.2 guard against accidentally
+          treating fake gateway tests as a real IM smoke.
 
 Set CCTEAM_REAL_CODEX_RPC=1 with --real to also probe Codex app-server
-thread/start. The default preflight only proves binaries + transport availability.
+thread/start. The default preflight skips Codex app-server.
 Set CCTEAM_REAL_IM_WS=1 with --real to also run the real WebSocket
-dual-harness smoke (Codex app-server + Claude tmux).
+smoke (Claude tmux by default; set CCTEAM_REAL_IM_WS_CODEX=1 to include
+the Codex app-server leg).
 Set CCTEAM_REAL_IM_WS_NL=codex|claude|1 with CCTEAM_REAL_IM_WS=1
 to require true natural-language replies from Codex, Claude, or both.
 Set CCTEAM_REAL_IM_WS_RESTART=1 with CCTEAM_REAL_IM_WS=1 to kill and
 restart the daemon mid-smoke, then require both sessions to continue.
 Set CCTEAM_REAL_IM_WS_FAULTS=1 with CCTEAM_REAL_IM_WS=1 to inject a
-real Claude tmux-session death plus a Codex app-server disconnect, and
-require user-visible gateway errors.
+real Claude tmux-session death plus, when the Codex leg is enabled, a
+Codex app-server disconnect; require user-visible gateway errors.
 Set CCTEAM_REAL_IM_TELEGRAM=1 with --real plus CCTEAM_TELEGRAM_BOT_TOKEN
 and CCTEAM_TELEGRAM_CHAT_ID to run an opt-in real Telegram send/listen
 round trip. The test sends a unique code and waits for that exact reply.
@@ -142,34 +143,47 @@ ensure_codex_app_server_socket() {
   return 1
 }
 
+needs_real_codex() {
+  [[ "${CCTEAM_REAL_CODEX_RPC:-0}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_CODEX:-0}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_NL:-}" == "1" ]] \
+    || [[ "${CCTEAM_REAL_IM_WS_NL:-}" == "codex" ]]
+}
+
 run_real_preflight() {
   local missing=0
-  local claude_bin codex_bin codex_socket
+  local claude_bin codex_bin
   if ! claude_bin="$(resolve_bin CCTEAM_CLAUDE_BIN claude)"; then
-    missing=1
-  fi
-  if ! codex_bin="$(resolve_bin CCTEAM_CODEX_BIN codex)"; then
     missing=1
   fi
   if ! command -v tmux >/dev/null 2>&1; then
     echo "smoke-im --real: tmux is required for ClaudeTuiAdapter" >&2
     missing=1
   fi
-  if [[ "$missing" -eq 0 ]] && ! ensure_codex_app_server_socket "$codex_bin"; then
-    missing=1
+  if needs_real_codex; then
+    if ! codex_bin="$(resolve_bin CCTEAM_CODEX_BIN codex)"; then
+      missing=1
+    fi
+    if [[ "$missing" -eq 0 ]] && ! ensure_codex_app_server_socket "$codex_bin"; then
+      missing=1
+    fi
   fi
   if [[ "$missing" -ne 0 ]]; then
     exit 2
   fi
 
   run_version_probe claude "$claude_bin"
-  run_version_probe codex "$codex_bin"
-  if [[ -z "${CCTEAM_CODEX_APP_SERVER_SOCKET:-}" ]]; then
-    echo "smoke-im --real: Codex app-server transport stdio (default)"
+  if needs_real_codex; then
+    run_version_probe codex "$codex_bin"
+    if [[ -z "${CCTEAM_CODEX_APP_SERVER_SOCKET:-}" ]]; then
+      echo "smoke-im --real: Codex app-server transport stdio (default)"
+    else
+      echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
+    fi
+    export CCTEAM_REAL_CODEX_APP_SERVER=1
   else
-    echo "smoke-im --real: Codex app-server socket $CCTEAM_CODEX_APP_SERVER_SOCKET"
+    echo "smoke-im --real: skipping Codex binary/app-server preflight (set CCTEAM_REAL_IM_WS_CODEX=1 or CCTEAM_REAL_CODEX_RPC=1)"
   fi
-  export CCTEAM_REAL_CODEX_APP_SERVER=1
   echo "smoke-im --real: real binary preflight PASS"
 }
 

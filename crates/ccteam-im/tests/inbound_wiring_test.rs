@@ -1364,6 +1364,11 @@ async fn real_ws_dual_harness_smoke() {
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
     let old_path = std::env::var_os("PATH");
     let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
+    let codex_nl_mode = nl_mode
+        .as_deref()
+        .is_some_and(|mode| mode == "1" || mode == "codex");
+    let codex_mode =
+        std::env::var("CCTEAM_REAL_IM_WS_CODEX").ok().as_deref() == Some("1") || codex_nl_mode;
     let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
     let fault_mode = std::env::var("CCTEAM_REAL_IM_WS_FAULTS").ok().as_deref() == Some("1");
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
@@ -1420,52 +1425,59 @@ async fn real_ws_dual_harness_smoke() {
         spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
 
     let mut socket = connect_ws_with_retry(&ws_url).await;
-    send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
-    assert_eq!(
-        recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
-            .await
-            .content,
-        "created session s1"
-    );
+    let claude_sid = if codex_mode {
+        send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
+        assert_eq!(
+            recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+                .await
+                .content,
+            "created session s1"
+        );
+        "s2"
+    } else {
+        "s1"
+    };
     send_ws_text(&mut socket, "real-ws-claude-new", "/new claude reviewer").await;
     assert_eq!(
         recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20))
             .await
             .content,
-        "created session s2"
+        format!("created session {claude_sid}")
     );
     send_ws_text(&mut socket, "real-ws-sessions", "/sessions").await;
     let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(5))
         .await
         .content;
+    let has_claude = sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer"));
+    let has_codex = !codex_mode || sessions.contains(&format!("s1:{slug}:Codex:api"));
     assert!(
-        sessions.contains(&format!("s1:{slug}:Codex:api"))
-            && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+        has_claude && has_codex,
         "real WS sessions must use the configured project slug; got {sessions:?}"
     );
-    let claude_tmux_session = format!("ccteam-chat-{slug}-s2");
+    let claude_tmux_session = format!("ccteam-chat-{slug}-{claude_sid}");
     assert!(
         tmux_session_exists(&claude_tmux_session),
         "Claude tmux session should remain live after /new: {claude_tmux_session}"
     );
-    send_ws_text(&mut socket, "real-ws-codex-status", "@api /status").await;
-    // Keep this as an immediate Codex-session routing probe. `/compact` starts
-    // a Codex turn and may legitimately produce no short-window event while
-    // the daemon event-sink path has folded away submit acks; the real Codex
-    // turn path is exercised by the restart round-trip below.
-    let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-    assert!(
-        !codex.content.starts_with("gateway error"),
-        "Codex /status should reach the Codex session, got {:?}",
-        codex.content
-    );
+    if codex_mode {
+        send_ws_text(&mut socket, "real-ws-codex-status", "@api /status").await;
+        // Keep this as an immediate Codex-session routing probe. `/compact` starts
+        // a Codex turn and may legitimately produce no short-window event while
+        // the daemon event-sink path has folded away submit acks.
+        let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            !codex.content.starts_with("gateway error"),
+            "Codex /status should reach the Codex session, got {:?}",
+            codex.content
+        );
+    }
 
     if nl_mode
         .as_deref()
         .is_some_and(|mode| mode == "1" || mode == "codex" || mode == "claude")
     {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if nl_mode.as_deref() != Some("claude") {
+        if codex_nl_mode {
             send_ws_text(
                 &mut socket,
                 "real-ws-codex-nl",
@@ -1519,48 +1531,49 @@ async fn real_ws_dual_harness_smoke() {
         let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
             .await
             .content;
+        let has_claude = sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer"));
+        let has_codex = !codex_mode || sessions.contains(&format!("s1:{slug}:Codex:api"));
         assert!(
-            sessions.contains(&format!("s1:{slug}:Codex:api"))
-                && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+            has_claude && has_codex,
             "restart must restore original sessions; got {sessions:?}"
         );
 
-        if nl_mode
-            .as_deref()
-            .is_some_and(|mode| mode == "1" || mode == "codex")
-        {
-            send_ws_text(
-                &mut socket,
-                "real-ws-codex-after-restart",
-                "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
-            )
-            .await;
-            let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-            assert!(
-                !codex_ack.content.starts_with("gateway error"),
-                "Codex after restart should reuse s1, got {:?}",
-                codex_ack.content
-            );
-            recv_ws_until_contains(
-                &mut socket,
-                "CCTEAM-CODEX-WS-RESTART-OK",
-                Duration::from_secs(120),
-            )
-            .await;
-        } else {
-            send_ws_text(
-                &mut socket,
-                "real-ws-codex-after-restart-status",
-                "@api /status",
-            )
-            .await;
-            let codex_status =
-                recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-            assert!(
-                !codex_status.content.starts_with("gateway error"),
-                "Codex status after restart should reuse s1, got {:?}",
-                codex_status.content
-            );
+        if codex_mode {
+            if codex_nl_mode {
+                send_ws_text(
+                    &mut socket,
+                    "real-ws-codex-after-restart",
+                    "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
+                )
+                .await;
+                let codex_ack =
+                    recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+                assert!(
+                    !codex_ack.content.starts_with("gateway error"),
+                    "Codex after restart should reuse s1, got {:?}",
+                    codex_ack.content
+                );
+                recv_ws_until_contains(
+                    &mut socket,
+                    "CCTEAM-CODEX-WS-RESTART-OK",
+                    Duration::from_secs(120),
+                )
+                .await;
+            } else {
+                send_ws_text(
+                    &mut socket,
+                    "real-ws-codex-after-restart-status",
+                    "@api /status",
+                )
+                .await;
+                let codex_status =
+                    recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+                assert!(
+                    !codex_status.content.starts_with("gateway error"),
+                    "Codex status after restart should reuse s1, got {:?}",
+                    codex_status.content
+                );
+            }
         }
 
         send_ws_text(
@@ -1607,21 +1620,23 @@ async fn real_ws_dual_harness_smoke() {
             "Claude tmux death should be user-visible, got {:?}",
             fault.content
         );
-        std::env::set_var("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN", "1");
-        send_ws_text(
-            &mut socket,
-            "real-ws-codex-after-kill",
-            "@api this should surface a codex app-server disconnect",
-        )
-        .await;
-        let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
-        assert!(
-            fault.content.starts_with("发送失败:")
-                && (fault.content.contains("turn/start")
-                    || fault.content.contains("codex app-server fault injection")),
-            "Codex app-server death should be user-visible, got {:?}",
-            fault.content
-        );
+        if codex_mode {
+            std::env::set_var("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN", "1");
+            send_ws_text(
+                &mut socket,
+                "real-ws-codex-after-kill",
+                "@api this should surface a codex app-server disconnect",
+            )
+            .await;
+            let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
+            assert!(
+                fault.content.starts_with("发送失败:")
+                    && (fault.content.contains("turn/start")
+                        || fault.content.contains("codex app-server fault injection")),
+                "Codex app-server death should be user-visible, got {:?}",
+                fault.content
+            );
+        }
         drop(socket);
         let _ = stop_tx.send(());
         daemon.await.unwrap();
