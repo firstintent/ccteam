@@ -76,11 +76,12 @@ impl ClaudeTuiAdapter {
 /// Tmux/process session-name prefix for chat-mode bots.
 pub const CHAT_SESSION_PREFIX: &str = "ccteam-chat-";
 
-/// Claude's TUI can lag one event-loop tick behind tmux's literal text write
-/// just after startup/reattach. Sending Enter immediately after `send-keys -l`
+/// Claude's TUI can lag behind tmux's literal text write just after
+/// startup/reattach. Sending Enter immediately after `send-keys -l`
 /// occasionally leaves the text in the composer without submitting it on real
-/// terminals. Keep this short and local to the Claude TUI path.
-const SUBMIT_ENTER_SETTLE: Duration = Duration::from_millis(120);
+/// terminals. Keep this local to the Claude TUI path; one second is below
+/// normal human-perceived turn latency and avoids scraping the pane.
+const SUBMIT_ENTER_SETTLE: Duration = Duration::from_millis(1000);
 
 /// Compose the canonical tmux session name for a chat-mode bot.
 ///
