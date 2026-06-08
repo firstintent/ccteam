@@ -313,6 +313,58 @@ pub struct StartOutcome {
     /// The session's permission posture (always the requested mode on a fresh
     /// spawn).
     pub permission_mode: PermissionMode,
+    /// Optional model-support warning emitted when the role declares a
+    /// Claude-routed model outside the verified Claude family.
+    pub model_warning: Option<String>,
+}
+
+/// Result returned by the web/resource session creation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSessionOutcome {
+    /// The freshly minted gateway session id (`s{n}`).
+    pub sid: String,
+    /// Optional human warning for a Claude-routed role model that ccteam has
+    /// not verified as part of the Claude model family.
+    pub model_warning: Option<String>,
+}
+
+impl CreateSessionOutcome {
+    /// Borrow the session id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl std::ops::Deref for CreateSessionOutcome {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sid
+    }
+}
+
+impl AsRef<str> for CreateSessionOutcome {
+    fn as_ref(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl std::fmt::Display for CreateSessionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sid)
+    }
+}
+
+impl PartialEq<&str> for CreateSessionOutcome {
+    fn eq(&self, other: &&str) -> bool {
+        self.sid == *other
+    }
+}
+
+impl PartialEq<CreateSessionOutcome> for &str {
+    fn eq(&self, other: &CreateSessionOutcome) -> bool {
+        *self == other.sid
+    }
 }
 
 /// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
@@ -1158,7 +1210,8 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
             },
         );
-        self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
+        let model_warning =
+            self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
@@ -1166,6 +1219,7 @@ impl Gateway {
             id,
             // Fresh spawn ran with exactly the requested posture.
             permission_mode,
+            model_warning,
         })
     }
 
@@ -1286,7 +1340,7 @@ impl Gateway {
         self.current_session.insert(chat.clone(), sid.clone());
         self.persist_state()?;
         self.spawn_event_pump(&sid);
-        self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
+        let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
         Ok(sid)
     }
 
@@ -1296,19 +1350,17 @@ impl Gateway {
         sid: &str,
         vendor: AgentVendor,
         model: Option<&str>,
-    ) {
+    ) -> Option<String> {
         if vendor != AgentVendor::Claude {
-            return;
+            return None;
         }
-        let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
-            return;
-        };
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
         if ccteam_core::is_claude_family(model) {
-            return;
+            return None;
         }
         let key = (vendor, model_warn_key(model));
         if !self.model_warned.insert(key) {
-            return;
+            return None;
         }
         let content = format!(
             "模型提示: 这个 Claude session 的角色声明了 model `{model}`。ccteam 目前只验证 Claude 家族模型；如果会话长时间空转，请改用 sonnet/opus/haiku，或在角色文件里调整 model 后重新 /new。"
@@ -1318,12 +1370,13 @@ impl Gateway {
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
-            content,
+            content: content.clone(),
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some(sid.to_string()),
         });
+        Some(content)
     }
 
     fn emit_user_signal(&self, event: GatewayEvent) {
@@ -2166,14 +2219,17 @@ impl Gateway {
         role: String,
         vendor: AgentVendor,
         permission_mode: PermissionMode,
-    ) -> Result<String> {
+    ) -> Result<CreateSessionOutcome> {
         let owner = web_api_chat();
         // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
         // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
         self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
-            .map(|o| o.id)
+            .map(|o| CreateSessionOutcome {
+                sid: o.id,
+                model_warning: o.model_warning,
+            })
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -3139,6 +3195,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_api_returns_model_warning_once_in_band() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let first = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.sid, "s1");
+        assert!(
+            first
+                .model_warning
+                .as_deref()
+                .is_some_and(|msg| msg.contains("deepseek-via-claude")),
+            "first API create must return the warning in-band: {first:?}"
+        );
+
+        let second = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.sid, "s2");
+        assert_eq!(second.model_warning, None);
+    }
+
+    #[tokio::test]
     async fn claude_family_role_models_do_not_warn() {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_role_with_model(tmp.path(), "sonnetrole", Some("sonnet[1m]"));
@@ -3512,8 +3606,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let sec1 = gateway.sessions.get(&s1).unwrap().secret.clone();
-        let sec2 = gateway.sessions.get(&s2).unwrap().secret.clone();
+        let sec1 = gateway.sessions.get(s1.as_str()).unwrap().secret.clone();
+        let sec2 = gateway.sessions.get(s2.as_str()).unwrap().secret.clone();
         assert_eq!(sec1.len(), 32, "secret is 128-bit hex");
         assert_ne!(sec1, sec2, "each session gets its own secret");
         // The secret reached the spawn env (FakeAdapter records SpawnCtx).
@@ -3540,7 +3634,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let secret = gateway.sessions.get(&sid).unwrap().secret.clone();
+        let secret = gateway.sessions.get(sid.as_str()).unwrap().secret.clone();
 
         // Correct (role, secret) pair authenticates.
         assert!(gateway.verify_session_caller("cto", &secret));
@@ -3583,8 +3677,8 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(sid1, sid2, "two same-role sessions are distinct sids");
-        let secret1 = gateway.sessions.get(&sid1).unwrap().secret.clone();
-        let secret2 = gateway.sessions.get(&sid2).unwrap().secret.clone();
+        let secret1 = gateway.sessions.get(sid1.as_str()).unwrap().secret.clone();
+        let secret2 = gateway.sessions.get(sid2.as_str()).unwrap().secret.clone();
         assert_ne!(secret1, secret2, "each session mints its own secret");
 
         // Each session's secret authenticates as the (live) cto role.
@@ -4167,7 +4261,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(gateway.session_sid_for(&sid), Some(sid.clone()));
+        assert_eq!(gateway.session_sid_for(&sid), Some(sid.sid.clone()));
         assert_eq!(gateway.session_sid_for("s99"), None);
     }
 
@@ -4292,7 +4386,7 @@ mod tests {
         // resolves it deterministically and never collides on "".
         assert_eq!(
             gateway.session_by_handle(&web_api_chat(), &sid),
-            Some(sid.clone()),
+            Some(sid.sid.clone()),
             "roleless handle must fall back to the sid (addressable, non-empty)"
         );
     }

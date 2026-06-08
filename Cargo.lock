@@ -543,6 +543,7 @@ version = "0.8.10"
 dependencies = [
  "anyhow",
  "askama",
+ "async-trait",
  "axum",
  "axum-extra",
  "ccteam-core",

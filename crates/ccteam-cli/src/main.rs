@@ -3085,20 +3085,23 @@ async fn run_session_spawn(
     .map_err(|e| format!("session_spawn: {e}"))?;
 
     let mut gw = gateway.lock().await;
-    let sid = gw
+    let created = gw
         .create_session_api(project.clone(), role.clone(), vendor, permission_mode)
         .await
         .map_err(|e| format!("session_spawn failed: {e}"))?;
     drop(gw);
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    let mut body = serde_json::json!({
         "ok": true,
-        "sid": sid,
+        "sid": created.sid,
         "project": project,
         "role": role,
         "permission_mode": permission_mode.as_str(),
         "hint": "dispatch a task with session_dispatch{sid, task}, then poll session_collect{sid}.",
-    }))
-    .unwrap_or_else(|_| "{}".to_string()))
+    });
+    if let Some(model_warning) = created.model_warning {
+        body["model_warning"] = serde_json::json!(model_warning);
+    }
+    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// `session_dispatch` — forward a task as a user turn to a session by sid.
@@ -3542,55 +3545,88 @@ fn run_status() -> Result<()> {
         println!("  projects ({}):", projects.len());
         // Classify each project from the same file-backed progress truth that
         // the JSON status and web Status rail read.
-        let mut needs_attention: Vec<(&str, String)> = Vec::new();
+        let mut needs_attention: Vec<(String, Option<String>, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
-            let silent = humanize_secs(p.stall_silent_seconds);
-            let last_progress_event =
-                ccteam_core::progress::last_event(&paths.progress_jsonl(&p.state.slug))
-                    .ok()
-                    .flatten();
-            let status = ccteam_core::stall::classify_progress_stall(
-                last_progress_event.as_ref(),
+            let events =
+                ccteam_core::progress::read_all_events(&paths.progress_jsonl(&p.state.slug))
+                    .unwrap_or_default();
+            let now = chrono::Utc::now();
+            let project_fallback = events
+                .last()
+                .filter(|event| ccteam_core::progress::event_sid(event).is_none());
+            let fallback_activity = ccteam_core::stall::classify_progress_activity(
+                project_fallback,
                 p.stall_silent_seconds,
+                now,
             );
-            let verdict =
-                commands::stall_verdict(last_progress_event.as_ref(), p.stall_silent_seconds);
+            let mut project_status = fallback_activity.status;
+            let mut attention_sid: Option<String> = None;
+            let mut attention_silent_seconds = fallback_activity
+                .event_age_seconds
+                .unwrap_or(p.stall_silent_seconds);
+
+            let mut session_lines: Vec<(String, String, String, String, String)> = Vec::new();
+            if let Some(rows) = sessions_by_project.get(&p.state.slug) {
+                for s in rows {
+                    let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+                        &events,
+                        &s.sid,
+                        p.stall_silent_seconds,
+                        now,
+                    );
+                    if progress_status_rank(activity.status) > progress_status_rank(project_status)
+                    {
+                        project_status = activity.status;
+                        attention_sid = Some(s.sid.clone());
+                        attention_silent_seconds =
+                            activity.event_age_seconds.unwrap_or(p.stall_silent_seconds);
+                    }
+                    let role = if s.role.is_empty() { "-" } else { &s.role };
+                    let session_status = if daemon_up {
+                        activity.status.activity.to_string()
+                    } else {
+                        "registered (daemon down)".to_string()
+                    };
+                    let last_event = activity
+                        .event_age_seconds
+                        .map(humanize_secs)
+                        .unwrap_or_else(|| "-".to_string());
+                    session_lines.push((
+                        role.to_string(),
+                        s.vendor.clone(),
+                        session_status,
+                        s.sid.clone(),
+                        last_event,
+                    ));
+                }
+            }
+
+            let verdict = project_status.verdict;
+            let silent = humanize_secs(attention_silent_seconds);
             if verdict != "OK" {
-                needs_attention.push((p.state.slug.as_str(), silent.clone()));
+                needs_attention.push((p.state.slug.clone(), attention_sid, silent.clone()));
             }
             println!(
                 "    {:<32}  age {:>8}  last-event {:>8}  {}",
                 p.state.slug, age, silent, verdict
             );
 
-            // Nested session rows for this project. The gateway state carries
-            // no per-session timestamp, so the session "last-event" reuses the
-            // project-level silence (a glance-level proxy); `-` when unknown.
-            if let Some(rows) = sessions_by_project.get(&p.state.slug) {
-                let session_status = if daemon_up {
-                    status.activity
-                } else {
-                    "registered (daemon down)"
-                };
-                let last_event = if p.stall_silent_seconds > 0 {
-                    silent.clone()
-                } else {
-                    "-".to_string()
-                };
-                for s in rows {
-                    let role = if s.role.is_empty() { "-" } else { &s.role };
-                    println!(
-                        "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
-                        role, s.vendor, session_status, s.sid, last_event
-                    );
-                }
+            for (role, vendor, session_status, sid, last_event) in session_lines {
+                println!(
+                    "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
+                    role, vendor, session_status, sid, last_event
+                );
             }
         }
         // One actionable hint line per warn-or-higher project so the
         // operator knows the exact peek → attach takeover sequence.
-        for (slug, silent) in &needs_attention {
-            println!("    {}", commands::stall_takeover_hint(slug, silent));
+        for (slug, sid, silent) in &needs_attention {
+            let hint = match sid {
+                Some(sid) => commands::stall_takeover_hint_for_session(slug, sid, silent),
+                None => commands::stall_takeover_hint(slug, silent),
+            };
+            println!("    {hint}");
         }
     }
     println!();
@@ -3622,6 +3658,14 @@ fn run_status() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn progress_status_rank(status: ccteam_core::stall::ProgressStallStatus) -> u8 {
+    match status.level {
+        "stuck" => 3,
+        "warn" => 2,
+        _ => 1,
+    }
 }
 
 /// v0.8.8 F3 — predicate for a LAN-reachable IPv4: a private
@@ -4195,7 +4239,8 @@ mod session_tool_tests {
                 ccteam_harness::PermissionMode::Skip,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .sid;
         let beta_sid = gw
             .create_session_api(
                 "beta".into(),
@@ -4204,7 +4249,8 @@ mod session_tool_tests {
                 ccteam_harness::PermissionMode::Skip,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .sid;
         let cto_secret = stub
             .spawns
             .lock()

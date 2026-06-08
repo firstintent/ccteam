@@ -242,6 +242,11 @@ function sessionActivityMeta(status: string): { label: string; className: string
         label: "working",
         className: "bg-status-running/15 text-status-running",
       };
+    case "stale":
+      return {
+        label: "疑似慢",
+        className: "bg-status-waiting/15 text-status-waiting",
+      };
     case "idle":
       return {
         label: "idle",

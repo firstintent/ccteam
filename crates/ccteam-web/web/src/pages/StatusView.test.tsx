@@ -175,6 +175,22 @@ describe("StatusCards (seeded success state)", () => {
     expect(html).toContain("text-status-error");
   });
 
+  it("renders stale session status with the warning badge", () => {
+    const snap: StatusSnapshot = {
+      daemon_healthy: true,
+      sessions_live: 1,
+      sessions_idle: 0,
+      cost_24h_usd: 0,
+      cost_24h_by_vendor: {},
+      budget_cap_24h: null,
+    };
+    const html = renderToString(
+      <StatusCards status={snap} rail={[{ ...RAIL[0], status: "stale" }]} />,
+    );
+    expect(html).toContain("疑似慢");
+    expect(html).toContain("text-status-waiting");
+  });
+
   it("shows no budget warning when no cap is configured", () => {
     const snap: StatusSnapshot = {
       daemon_healthy: true,

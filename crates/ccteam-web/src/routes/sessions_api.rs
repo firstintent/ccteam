@@ -11,7 +11,7 @@
 //! Routes (all `/api/v1`, behind the shared `auth_layer`):
 //!
 //! - `GET    /api/v1/projects/{slug}/sessions`        → `[SessionView]` for the slug
-//! - `POST   /api/v1/projects/{slug}/sessions`        → create → 201 `{sid}`
+//! - `POST   /api/v1/projects/{slug}/sessions`        → create → 201 `{sid, model_warning?}`
 //! - `GET    /api/v1/sessions/{sid}`                  → `{sid, events}` history
 //! - `POST   /api/v1/sessions/{sid}/turn`             → submit → 202 `{accepted:true}`
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
@@ -166,43 +166,19 @@ fn apply_progress_activity_status(
     else {
         return;
     };
-    let progress_path = paths.progress_jsonl(slug);
-    let project_last = ccteam_core::progress::last_event(&progress_path)
-        .ok()
-        .flatten();
-    let project_fallback = project_last
-        .as_ref()
-        .filter(|event| progress_event_sid(event).is_none());
+    let events =
+        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
+    let now = chrono::Utc::now();
     for view in views {
-        let sid_last = ccteam_core::progress::last_event_for_sid(&progress_path, &view.sid)
-            .ok()
-            .flatten();
-        let selected = sid_last.as_ref().or(project_fallback);
-        view.last_activity_seconds = selected.and_then(progress_event_age_seconds);
-        let age = view.last_activity_seconds.unwrap_or(silent_seconds);
-        let activity = ccteam_core::stall::classify_progress_stall(selected, age).activity;
-        view.status = activity.to_string();
+        let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+            &events,
+            &view.sid,
+            silent_seconds,
+            now,
+        );
+        view.last_activity_seconds = activity.last_activity_seconds;
+        view.status = activity.status.activity.to_string();
     }
-}
-
-fn progress_event_sid(event: &serde_json::Value) -> Option<&str> {
-    event
-        .get("sid")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| event.get("session_id").and_then(serde_json::Value::as_str))
-}
-
-fn progress_event_age_seconds(event: &serde_json::Value) -> Option<u64> {
-    let ts = event.get("ts").and_then(serde_json::Value::as_str)?;
-    let ts = chrono::DateTime::parse_from_rfc3339(ts)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    Some(
-        chrono::Utc::now()
-            .signed_duration_since(ts)
-            .num_seconds()
-            .max(0) as u64,
-    )
 }
 
 /// POST body for session creation — `role` (required), `vendor` (optional,
@@ -224,7 +200,7 @@ pub struct CreateSessionForm {
 /// Creates a new session via the spine. v0.8.8 F1 — ALWAYS mints a fresh sid
 /// (no `(project, role)` dedup), so a project can run multiple same-role
 /// sessions side by side. v0.8.8 F2-web — an empty `role` is a valid roleless
-/// session (bare claude). 201 `{sid}` on success. 400 on a bad vendor token or
+/// session (bare claude). 201 `{sid, model_warning?}` on success. 400 on a bad vendor token or
 /// bad permission_mode. 422 when a NAMED role has no `.claude/agents/<role>.md`
 /// (a caller mistake, R-M6; an empty role is NOT this case). 503 with no
 /// gateway. 500 if the gateway create fails for a genuine internal reason
@@ -236,7 +212,7 @@ pub struct CreateSessionForm {
     params(("slug" = String, Path, description = "Project slug")),
     request_body(content = CreateSessionForm, description = "Session to create (JSON or x-www-form-urlencoded)"),
     responses(
-        (status = 201, description = "Created; `{sid}`", body = serde_json::Value),
+        (status = 201, description = "Created; `{sid, model_warning?}`", body = serde_json::Value),
         (status = 400, description = "Bad vendor / bad permission_mode"),
         (status = 422, description = "Unknown NAMED role (no `.claude/agents/<role>.md`); empty role is allowed (roleless)"),
         (status = 503, description = "No live gateway (standalone web)"),
@@ -267,14 +243,20 @@ pub(crate) async fn handle_create_session(
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
 
-    let sid = {
+    let created = {
         let mut guard = gw.lock().await;
         guard
             .create_session_api(slug.clone(), role.clone(), vendor, permission_mode)
             .await
     };
-    match sid {
-        Ok(sid) => (StatusCode::CREATED, Json(json!({"sid": sid}))).into_response(),
+    match created {
+        Ok(created) => {
+            let mut body = json!({"sid": created.sid});
+            if let Some(model_warning) = created.model_warning {
+                body["model_warning"] = json!(model_warning);
+            }
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
         // role has no `.claude/agents/<role>.md`) from a real internal failure
         // (adapter spawn / fs error). A bad role is a client error → 422
@@ -1066,6 +1048,72 @@ mod tests {
         assert!(views[0].last_activity_seconds.unwrap() >= 60);
         assert_eq!(views[1].status, "stuck");
         assert!(views[1].last_activity_seconds.unwrap() < 60);
+    }
+
+    #[test]
+    fn progress_activity_status_hides_age_while_working() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_project_state(&paths, "demo");
+        let mut views = vec![SessionView {
+            sid: "s1".into(),
+            project: "demo".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+            current: true,
+            status: "live".into(),
+            last_activity_seconds: None,
+        }];
+
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("demo"),
+            &serde_json::json!({
+                "event": ccteam_core::progress::CHAT_TURN_USER_PROMPT,
+                "sid": "s1",
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        apply_progress_activity_status(&paths, "demo", &mut views);
+        assert_eq!(views[0].status, "working");
+        assert_eq!(views[0].last_activity_seconds, None);
+    }
+
+    #[test]
+    fn progress_activity_status_marks_old_non_idle_event_stale() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_project_state(&paths, "demo");
+        let mut views = vec![SessionView {
+            sid: "s1".into(),
+            project: "demo".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+            current: true,
+            status: "live".into(),
+            last_activity_seconds: None,
+        }];
+
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("demo"),
+            &serde_json::json!({
+                "event": ccteam_core::progress::CHAT_TURN_USER_PROMPT,
+                "sid": "s1",
+                "ts": (chrono::Utc::now()
+                    - chrono::Duration::seconds(ccteam_core::stall::STALL_WARN_SECONDS as i64))
+                .to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        apply_progress_activity_status(&paths, "demo", &mut views);
+        assert_eq!(views[0].status, "stale");
+        assert!(
+            views[0].last_activity_seconds.unwrap() >= ccteam_core::stall::STALL_WARN_SECONDS - 1
+        );
     }
 
     #[test]

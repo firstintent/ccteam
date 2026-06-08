@@ -3604,6 +3604,7 @@ pub(crate) fn stall_level(last_event: Option<&Value>, silent_s: u64) -> &'static
 /// instead of decoding raw silence seconds. `escalate`/`suspicious`
 /// both surface as `STUCK` (silent long enough to warrant a takeover),
 /// `warn` stays `warn`, everything else is `OK`.
+#[cfg(test)]
 pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'static str {
     ccteam_core::stall::classify_progress_stall(last_event, silent_s).verdict
 }
@@ -3613,6 +3614,13 @@ pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'stat
 pub(crate) fn stall_takeover_hint(slug: &str, silent: &str) -> String {
     format!(
         "{slug} silent {silent} — `ccteam internal peek {slug}` then \
+         `ccteam internal attach {slug}` to take over"
+    )
+}
+
+pub(crate) fn stall_takeover_hint_for_session(slug: &str, sid: &str, silent: &str) -> String {
+    format!(
+        "{slug} session {sid} silent {silent} — `ccteam internal peek {slug}` then \
          `ccteam internal attach {slug}` to take over"
     )
 }

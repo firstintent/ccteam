@@ -13,10 +13,16 @@
 //! (`/api/v1/sessions/active` from api_v1 vs `/api/v1/sessions/{sid}` here).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ccteam_core::CcteamPaths;
+use ccteam_harness::{
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
+};
 use ccteam_web::{router_with_state, AppState};
+use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
@@ -27,6 +33,80 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
         root: root.join(".ccteam"),
         projects_root: root.join("projects"),
     }
+}
+
+struct FakeAdapter {
+    vendor: AgentVendor,
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for FakeAdapter {
+    fn name(&self) -> &'static str {
+        "web-test"
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        self.vendor
+    }
+
+    async fn start_thread(
+        &self,
+        _spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        Ok(ThreadHandle {
+            vendor: self.vendor,
+            mode: ExecutionMode::Chat,
+            identity: format!("{}-{}", ctx.slug, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::Value::Null,
+        })
+    }
+
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        Ok(TurnId::new("turn-web-test"))
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        Box::pin(stream::empty())
+    }
+
+    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "web-test".into(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Done { receipt: d.name })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
+}
+
+fn seed_role_with_model(project_dir: &std::path::Path, role: &str, model: Option<&str>) {
+    let agents = project_dir.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let model = model.map(|m| format!("model: {m}\n")).unwrap_or_default();
+    std::fs::write(
+        agents.join(format!("{role}.md")),
+        format!("---\nname: {role}\n{model}---\n{role} body\n"),
+    )
+    .unwrap();
 }
 
 async fn spawn_server(state: AppState) -> SocketAddr {
@@ -69,6 +149,55 @@ async fn create_session_no_gateway_is_503() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn create_session_returns_model_warning_in_body() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_role_with_model(&project_dir, "reviewer", Some("deepseek-via-claude"));
+    seed_role_with_model(&project_dir, "sonnet", Some("sonnet[1m]"));
+
+    let factory = Arc::new(|vendor| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+
+    let warned = client
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "reviewer", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(warned.status(), 201);
+    let body: Value = warned.json().await.unwrap();
+    assert_eq!(body["sid"], "s1");
+    assert!(
+        body["model_warning"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("deepseek-via-claude")),
+        "expected model_warning in 201 body, got {body}"
+    );
+
+    let ok = client
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "sonnet", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 201);
+    let body: Value = ok.json().await.unwrap();
+    assert_eq!(body["sid"], "s2");
+    assert!(
+        body.get("model_warning").is_none(),
+        "Claude-family model must not warn: {body}"
+    );
 }
 
 #[tokio::test]

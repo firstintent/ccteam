@@ -56,8 +56,9 @@ work-role = `.claude/agents/<role>.md` 里的专门角色。
 - **work-role session**(`session_spawn` → `dispatch` → `collect`,**独立进程、真异步、跨轮存活**):
   派一个角色**持续**干一摊活,或组**多人并行**的 team。先 `dispatch` 立刻回话,稍后 `collect` 收增量。
   - `session_spawn{role, vendor?, permission_mode?}`:在当前项目拉起 work-role,返回 `s{n}`;
-    同 (项目, role) 幂等。`permission_mode` 默认 `skip`,传 `hitl` 则该 session 的**非白名单**
-    工具调用弹到 IM 让用户批准。
+    每次调用都铸一个新 sid:同一 role 再 spawn 一次 = 另一个独立 session(独立 pane/transcript),
+    可并行多实例;要复用已有 worker 就记住它的 sid,走 dispatch/collect,别再 spawn。
+    `permission_mode` 默认 `skip`,传 `hitl` 则该 session 的**非白名单**工具调用弹到 IM 让用户批准。
   - `session_dispatch{sid, task}`:把任务**原样**作为一个 user turn 交给该 session(**不**注入
     system prompt——它的行为来自它自己的 `.md`)。
   - `session_collect{sid, since?, n?}`:tail 它的回答;传上次见过的 `since` 只取增量,没跑完返回空。

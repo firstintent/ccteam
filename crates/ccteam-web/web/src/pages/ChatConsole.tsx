@@ -204,11 +204,12 @@ export default function ChatConsole() {
           const created = await apiCreateProject(slug, newProjectPath);
           targetSlug = created.slug;
         }
-        const { sid: newSid } = await apiCreateSession(targetSlug, {
+        const { sid: newSid, model_warning: modelWarning } = await apiCreateSession(targetSlug, {
           role,
           vendor,
           permission_mode: permissionMode,
         });
+        if (modelWarning) toastBus.handler?.info(modelWarning);
         await refreshSessions();
         navigate(`/chat/s/${encodeURIComponent(newSid)}`);
         return true;

@@ -193,7 +193,7 @@ pub fn last_event_for_sid(path: &Path, sid: &str) -> Result<Option<Value>> {
         .find(|event| event_sid(event).is_some_and(|value| value == sid)))
 }
 
-fn event_sid(event: &Value) -> Option<&str> {
+pub fn event_sid(event: &Value) -> Option<&str> {
     event
         .get("sid")
         .and_then(Value::as_str)

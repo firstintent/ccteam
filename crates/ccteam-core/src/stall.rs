@@ -117,12 +117,25 @@ pub struct ProgressStallStatus {
     pub activity: &'static str,
 }
 
+/// Read-side activity for one chat session after selecting its relevant
+/// progress event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressActivityStatus {
+    pub status: ProgressStallStatus,
+    /// Raw age of the selected event, when the event carries a timestamp.
+    pub event_age_seconds: Option<u64>,
+    /// Age suitable for user-facing session status surfaces. Active working
+    /// turns hide the ever-growing prompt age; stale/stuck/idle still show it.
+    pub last_activity_seconds: Option<u64>,
+}
+
 /// Classify chat-loop activity from the file-backed progress truth.
 ///
 /// - `chat_turn_timeout` / `stuck:true` is the only STUCK source.
 /// - long silence without that event is only `warn`, because the live daemon
 ///   might be down and CLI/web cannot see the watchdog's process memory.
-/// - non-idle last events render as `working`; idle boundaries render `idle`.
+/// - non-idle recent events render as `working`; non-idle events older than
+///   the warn threshold render as `stale`; idle boundaries render `idle`.
 pub fn classify_progress_stall(
     last_event: Option<&Value>,
     silent_seconds: u64,
@@ -143,8 +156,11 @@ pub fn classify_progress_stall(
     } else {
         "ok"
     };
-    let activity = if progress::is_idle(last_event) {
+    let idle = progress::is_idle(last_event);
+    let activity = if idle {
         "idle"
+    } else if level == "warn" {
+        "stale"
     } else {
         "working"
     };
@@ -153,6 +169,58 @@ pub fn classify_progress_stall(
         verdict: if level == "warn" { "warn" } else { "OK" },
         activity,
     }
+}
+
+/// Select and classify the read-side activity for one gateway session id.
+///
+/// The project-level fallback is only the file's global tail event when that
+/// tail has no `sid`/`session_id`, matching the old `last_event` fallback
+/// without letting one session's tail event bleed into its siblings.
+pub fn classify_progress_activity_for_sid(
+    events: &[Value],
+    sid: &str,
+    fallback_silent_seconds: u64,
+    now: DateTime<Utc>,
+) -> ProgressActivityStatus {
+    let project_fallback = events
+        .last()
+        .filter(|event| progress::event_sid(event).is_none());
+    let sid_last = if sid.is_empty() {
+        None
+    } else {
+        events
+            .iter()
+            .rev()
+            .find(|event| progress::event_sid(event) == Some(sid))
+    };
+    classify_progress_activity(sid_last.or(project_fallback), fallback_silent_seconds, now)
+}
+
+/// Classify an already-selected progress event and compute age visibility.
+pub fn classify_progress_activity(
+    selected: Option<&Value>,
+    fallback_silent_seconds: u64,
+    now: DateTime<Utc>,
+) -> ProgressActivityStatus {
+    let event_age_seconds = selected.and_then(|event| progress_event_age_seconds(event, now));
+    let age_for_classification = event_age_seconds.unwrap_or(fallback_silent_seconds);
+    let status = classify_progress_stall(selected, age_for_classification);
+    let last_activity_seconds = if status.activity == "working" {
+        None
+    } else {
+        event_age_seconds
+    };
+    ProgressActivityStatus {
+        status,
+        event_age_seconds,
+        last_activity_seconds,
+    }
+}
+
+pub fn progress_event_age_seconds(event: &Value, now: DateTime<Utc>) -> Option<u64> {
+    let ts = event.get("ts").and_then(Value::as_str)?;
+    let ts = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some(now.signed_duration_since(ts).num_seconds().max(0) as u64)
 }
 
 /// How many seconds have passed since the project's most recent
@@ -207,6 +275,41 @@ mod tests {
         let status = classify_progress_stall(Some(&prompt), 10);
         assert_eq!(status.level, "ok");
         assert_eq!(status.activity, "working");
+    }
+
+    #[test]
+    fn progress_stall_marks_old_non_idle_event_stale() {
+        let prompt = serde_json::json!({"event": progress::CHAT_TURN_USER_PROMPT});
+        let status = classify_progress_stall(Some(&prompt), STALL_WARN_SECONDS);
+        assert_eq!(status.level, "warn");
+        assert_eq!(status.verdict, "warn");
+        assert_eq!(status.activity, "stale");
+    }
+
+    #[test]
+    fn progress_activity_selects_sid_and_hides_only_working_age() {
+        let now = Utc::now();
+        let events = vec![
+            serde_json::json!({
+                "event": progress::CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "ts": (now - chrono::Duration::minutes(10)).to_rfc3339(),
+            }),
+            serde_json::json!({
+                "event": progress::CHAT_TURN_USER_PROMPT,
+                "sid": "s2",
+                "ts": (now - chrono::Duration::seconds(30)).to_rfc3339(),
+            }),
+        ];
+
+        let idle = classify_progress_activity_for_sid(&events, "s1", 0, now);
+        assert_eq!(idle.status.activity, "idle");
+        assert!(idle.last_activity_seconds.is_some());
+
+        let working = classify_progress_activity_for_sid(&events, "s2", 0, now);
+        assert_eq!(working.status.activity, "working");
+        assert!(working.event_age_seconds.is_some());
+        assert_eq!(working.last_activity_seconds, None);
     }
 
     #[test]

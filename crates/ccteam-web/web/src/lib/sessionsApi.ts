@@ -127,8 +127,8 @@ async function errorMessage(res: Response): Promise<string> {
       if (typeof msg === "string" && msg.trim()) return msg;
       return fallback;
     }
-    const text = await res.text();
-    return text.trim() || fallback;
+    const text = (await res.text()).trim();
+    return text ? `HTTP ${res.status}: ${text.slice(0, 200)}` : fallback;
   } catch {
     return fallback;
   }
@@ -203,14 +203,19 @@ export interface CreateSessionOpts {
   permission_mode?: "skip" | "hitl";
 }
 
-/** `POST /api/v1/projects/{slug}/sessions` — create (or idempotently reuse)
- *  a `(project, role)` session. 201 `{sid}`. */
+export interface CreateSessionResult {
+  sid: string;
+  model_warning?: string;
+}
+
+/** `POST /api/v1/projects/{slug}/sessions` — mint a fresh session sid.
+ *  201 `{sid}` with optional `{model_warning}` for honest model support. */
 export function createSession(
   slug: string,
   opts: CreateSessionOpts,
-): Promise<{ sid: string }> {
+): Promise<CreateSessionResult> {
   const body: Record<string, unknown> = { role: opts.role };
   if (opts.vendor) body.vendor = opts.vendor;
   if (opts.permission_mode) body.permission_mode = opts.permission_mode;
-  return postJson<{ sid: string }>(sessionsUrl(slug), body);
+  return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }

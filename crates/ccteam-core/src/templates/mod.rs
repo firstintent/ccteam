@@ -647,4 +647,16 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn cto_role_template_describes_session_spawn_as_fresh_sid() {
+        assert!(
+            CTO_ROLE_MD.contains("每次调用都铸一个新 sid"),
+            "cto_role.md must say session_spawn mints a fresh sid"
+        );
+        assert!(
+            !CTO_ROLE_MD.contains("同 (项目, role) 幂等"),
+            "cto_role.md must not describe removed (project, role) dedup"
+        );
+    }
 }
