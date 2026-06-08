@@ -1443,7 +1443,7 @@ async fn real_ws_dual_harness_smoke() {
             && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
         "real WS sessions must use the configured project slug; got {sessions:?}"
     );
-    let claude_tmux_session = format!("ccteam-chat-{slug}-reviewer");
+    let claude_tmux_session = format!("ccteam-chat-{slug}-s2");
     assert!(
         tmux_session_exists(&claude_tmux_session),
         "Claude tmux session should remain live after /new: {claude_tmux_session}"
