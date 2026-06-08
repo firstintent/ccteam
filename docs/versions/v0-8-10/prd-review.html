@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v0.8.10 PRD Review — 生产级稳定性 + 高质量 UX</title>
+<style>
+  :root{
+    --bg:#0e0f13; --panel:#16181f; --panel2:#1c1f28; --line:#2a2e3a;
+    --ink:#e7e9ee; --dim:#9aa0ad; --faint:#6b7280;
+    --amber:#d9a14a; --amber2:#e9b766; --claude:#d97757; --codex:#10a37f;
+    --blue:#5b8def; --green:#46c08a; --red:#e5675a; --violet:#9b7be0;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:28px 18px 80px}
+  h1{font-size:25px;margin:0 0 4px;letter-spacing:.3px}
+  h2{font-size:19px;margin:38px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px}
+  h3{font-size:15px;margin:0 0 6px}
+  a{color:var(--amber2)}
+  code{background:#0a0b0e;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfd3dc}
+  .sub{color:var(--dim);font-size:13.5px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--line);vertical-align:middle}
+  .t-stab{color:#bcd0ff;background:rgba(91,141,239,.12);border-color:rgba(91,141,239,.4)}
+  .t-ux{color:#f0cd8e;background:rgba(217,161,74,.12);border-color:rgba(217,161,74,.4)}
+  .t-hard{color:#f0a59c;background:rgba(229,103,90,.12);border-color:rgba(229,103,90,.4)}
+  .t-best{color:#9aa0ad;background:rgba(154,160,173,.1);border-color:var(--line)}
+  .t-in{color:#9ad9b8;background:rgba(70,192,138,.12);border-color:rgba(70,192,138,.4)}
+  .t-out{color:#f0a59c;background:rgba(229,103,90,.12);border-color:rgba(229,103,90,.4)}
+  .t-fix{color:#d9c2f5;background:rgba(155,123,224,.14);border-color:rgba(155,123,224,.45)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px 16px;margin:11px 0}
+  .lead{background:linear-gradient(180deg,#191b22,#15171d);border:1px solid var(--line);border-radius:14px;padding:18px 18px;margin:14px 0}
+  .grid{display:grid;gap:11px}
+  @media(min-width:680px){.grid.d2{grid-template-columns:1fr 1fr}}
+  .d{border-left:3px solid var(--blue)}
+  .d.ux{border-left-color:var(--amber)}
+  .d .dh{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .d .dn{font-weight:700;color:#fff}
+  .d .ac{margin-top:7px;font-size:12.5px;color:var(--dim)}
+  .d .ac b{color:#bcd0ff;font-weight:600}
+  .d.ux .ac b{color:#f0cd8e}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:12.8px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:var(--dim);font-weight:600}
+  td .who{color:var(--faint);font-size:11.5px}
+  .loop{font:12px/1.5 ui-monospace,Menlo,monospace;color:#cfd3dc;background:#0a0b0e;border:1px solid var(--line);border-radius:10px;padding:13px;overflow-x:auto;white-space:pre}
+  ul.inv{list-style:none;padding:0;margin:8px 0}
+  ul.inv li{padding:6px 0 6px 22px;position:relative;border-bottom:1px dashed #21242e}
+  ul.inv li:before{content:"●";color:var(--green);position:absolute;left:2px;top:6px;font-size:11px}
+  ul.inv li:last-child{border-bottom:0}
+  ul.inv b{color:#fff}
+  .chat{background:#0c0d11;border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin:9px 0}
+  .bubble{background:#202431;border-radius:10px;border-top-left-radius:3px;padding:9px 11px;margin:7px 0;max-width:92%;font-size:13px}
+  .bubble.warn{background:rgba(217,161,74,.13);border:1px solid rgba(217,161,74,.4)}
+  .bubble.err{background:rgba(229,103,90,.12);border:1px solid rgba(229,103,90,.4)}
+  .bubble .nx{display:block;margin-top:4px;color:var(--amber2);font-size:12px}
+  .bubble .ico{margin-right:5px}
+  .before{color:var(--faint);font-size:12px;font-family:ui-monospace,Menlo,monospace;background:#0a0b0e;border:1px dashed #2a2e3a;border-radius:7px;padding:7px 9px;margin:6px 0}
+  .before:before{content:"现状(静默/jargon):";color:var(--red);font-family:inherit;font-size:11px;display:block;margin-bottom:3px;font-weight:600}
+  .arrow{color:var(--faint);text-align:center;font-size:14px;margin:2px 0}
+  .pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:6px;background:#0a0b0e;border:1px solid var(--line);color:var(--dim);margin:2px 4px 2px 0}
+  .note{color:var(--dim);font-size:12.5px;margin:6px 0}
+  .mut{color:var(--faint)}
+  .ok{color:#9ad9b8}.no{color:#f0a59c}
+  .hdrline{color:var(--faint);font-size:12.5px;margin-top:6px}
+  .legend{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>v0.8.10 · 改动 review</h1>
+  <div class="sub">核心流程做成生产级 — <b style="color:#bcd0ff">STABILITY</b> + <b style="color:#f0cd8e">高质量 UX</b>(同等两轴)。<span class="tag t-best">DRAFT / 候选</span> doc-first,review + scope 冻结后才动代码。</div>
+  <div class="hdrline">基于 <code>docs/versions/v0-8-10/prd.md</code>(对抗式 workflow 终稿,279 行)· 代码基线 HEAD <code>9480ecc</code> · 本页是给你 review 的可视摘要,完整规格见 prd.md。</div>
+
+  <div class="legend">
+    <span class="tag t-stab">STABILITY</span><span class="tag t-ux">UX(本版新维)</span>
+    <span class="tag t-hard">硬门</span><span class="tag t-best">best-effort</span>
+    <span class="tag t-in">IN</span><span class="tag t-out">OUT</span>
+    <span class="tag t-fix">对抗审查修正</span>
+  </div>
+
+  <div class="lead">
+    <h3>〇、一句话</h3>
+    把核心环路 — <b>inbound(IM/web)→ spawn/resume session → agent 干活(可 HITL)→ turn 完通知 → 人 steer</b> — 打到「<b>无聊地可靠 + 用着顺手</b>」:一条 golden-path <b>soak</b>(按 vendor 分轴)量稳定,一组 <b>UX 门</b>量体验。<span class="mut">不是加功能,是让这条<b>已有</b>的路在真实失败态下零意外、对用户零困惑、失败时看得见。</span>
+  </div>
+
+  <h2>🔒 铁律 — 双轴,只硬化 + 打磨已有面</h2>
+  <div class="card">
+    <p style="margin:0 0 8px">v0.8.10 只在两条<b>同等</b>的轴上把「<b>已存在的</b>核心环路」打到生产级:<span class="tag t-stab">STABILITY</span> 零丢/零串/零静默失败/零 STUCK 误报/resume 精确/扛重启·suspend·断网 &nbsp;&amp;&nbsp; <span class="tag t-ux">UX</span> 同一条环路的用户体验(失败看得见读得懂、随时看到 session 在干嘛/卡没卡/花多少、报错可操作、上手知道「然后呢」、模型支持诚实标注)。</p>
+    <p style="margin:0;background:#0a0b0e;border:1px solid var(--line);border-radius:8px;padding:10px 12px"><b>最锋利的 IN/OUT 测试:</b>「本版后,用户有没有一件<b>以前做不到、现在能做的新事</b>?」<br>有 → <span class="tag t-out">OUT</span>(= feature,出局)&nbsp;&nbsp; 同一件事变可靠/看得见/清楚/报错友好 → <span class="tag t-in">IN</span></p>
+    <p class="note">只承认 2 个 micro-exception(D9-② 模型未验证 warn、D9-③ 每 session 活动态 label),其余新增用户可达能力一律出局。<span class="mut">reframe:UX 大部分不是新工作 — 它是「已有可靠性不变式」的<b>用户可见的脸</b>(「零静默失败」本身就是 UX),折叠进 D4/D5/D6,不另开无底 UX pass。</span></p>
+  </div>
+
+  <h2>一、核心环路 + 不变式(永不破)</h2>
+  <div class="loop">  IM/web 消息 ──▶ spawn 或 resume session ──▶ agent 干活(可 HITL)──▶ turn 完成通知回 chat ──▶ 人给方向 ──┐
+       ▲                                                                                                │
+       └────────────────────────────────────────────────────────────────────────────────────────────┘</div>
+  <ul class="inv">
+    <li><b>零丢数据</b> · 每条 turn 入/出都不丢;通知不丢、不错投。</li>
+    <li><b>零串台</b> · 会话间历史/事件严格隔离;<span class="mut">同一 cwd 多 session + Task 子 agent 时回复只投自己 chat。</span></li>
+    <li><b>零静默失败</b> · 失败必有<b>用户当场可见</b>的<b>人话</b>信号;<span class="mut">且健康但安静的 session 不得误报(反假阳)。</span> <span class="tag t-stab">STAB</span><span class="tag t-ux">UX(D8 的脸)</span></li>
+    <li><b>零误报</b> · STUCK 不撒谎;<span class="mut">单一 file-backed(progress.jsonl)stall 真相,CLI 与 web 读同一分类函数。</span></li>
+    <li><b>resume 精确续</b> · <span style="color:var(--claude)">Claude</span>=byte-exact reattach + 上下文续;<span style="color:var(--codex)">Codex</span>=按 id <code>codex resume</code> 重放、不重复投递。</li>
+    <li><b>扛得住</b> · daemon 重启 / 空闲释放 / host suspend / 断网重连 — 都不丢不串不卡;restart 后所有 live session 按 sid 重挂。</li>
+    <li><b>默认成立</b> · 默认 rmux × {claude, codex} 下成立,不靠 tmux 兜底。<span class="mut">Codex 是架构 best-effort tier。</span></li>
+    <li><b>(UX)零困惑</b> · 用户不必读代码/日志就知道:在哪个 project/session、它在干嘛、卡没卡、花多少、下一步、失败怎么办。 <span class="tag t-ux">UX</span></li>
+  </ul>
+
+  <h2>二、交付物 D1–D9 <span class="sub" style="font-weight:400">· D1–D7 稳定性,D8–D9 UX(同等新维,盖在 D4/D5/D6 上,不另开 track)</span></h2>
+  <div class="grid d2">
+    <div class="card d"><div class="dh"><span class="dn">D1</span> golden-path soak 框架 <span class="tag t-stab">核心交付 + 门</span></div>
+      <div>e2e + fault-injection harness,跑核心环路 + 注故障。<span class="mut">复用已有 8 个 reconnect/resume harness,不另起炉灶。</span></div>
+      <div class="ac">验收:<b>CI-fake 切片硬门</b>(kill daemon/杀 pane/断网,确定性)+ <b>真机 ≤1h 短 smoke 硬门</b>;真机长跑/Codex 长跑 = best-effort。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D2</span> 收口 backend 抽象 <span class="tag t-stab">病根 a</span></div>
+      <div>所有绕过 <code>ProcessBackend</code> 直连 tmux 的路径改走抽象(bug5 peek 同类病根)。</div>
+      <div class="ac">验收:<b>guard 测试</b> — <code>tmux</code> 字面只许白名单文件,PATH 注入假 tmux 让白名单外被调即 panic。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D3</span> 收口 session 身份 <span class="tag t-stab">病根 b</span></div>
+      <div>所有按 role(而非 sid)keyed 的残留改按 gateway session-map;<code>chat_session_reset*</code> 三 builder 收 sid。</div>
+      <div class="ac">验收:同 role 多 session 不串 + roleless 端到端有回复 + 多 session-per-cwd transcript 选对目标(bug6 专测守)。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D4</span> 修 state 失同步 + 单一 stall SoT <span class="tag t-stab">病根 c</span></div>
+      <div>两套 stall 概念收敛成 <b>file-backed progress.jsonl 单一真相</b>;每状态字段必有 writer。</div>
+      <div class="ac">验收:CLI <code>stall_verdict</code> 与 web 读同一真相 + 同一 ccteam-core 分类函数,同 fixture 断相等。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D5</span> 边界可靠性工程 <span class="tag t-stab">timeout/retry/幂等</span></div>
+      <div>每个跨进程/网络边界给定 {超时&lt;播报截止, 重试+退避, 幂等键}(§五.x 表)。</div>
+      <div class="ac">验收:daemon restart 后 ≥2 sid 重挂 / recreate 失败诚实 reset 带 sid / ledger 重放幂等 / 入站断网不丢不重。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D6</span> 通知可靠 + flake 先定位 <span class="tag t-stab">原语 3</span></div>
+      <div>先 stress 定位 flake(产品缺陷 vs 测试 timing 都 in-scope),修 outbound-ledger flake + file-send gap。</div>
+      <div class="ac">验收:每 turn-done 必达对的 chat;多 session-per-cwd 不串台;<b>0-flake = D6 出口门</b>(连跑 ≥10 次绿)。</div></div>
+    <div class="card d"><div class="dh"><span class="dn">D7</span> 核心环路 bug backlog + 死代码 <span class="tag t-stab">收口</span></div>
+      <div>pull dev 重列未修项;死代码逐项 grep 核实 caller 集再删。</div>
+      <div class="ac">验收:每行带真实 caller 集 + 删除验收 <code>cargo build/test</code> ≥ 基线(杜绝「按 PRD 删了反而 red build」)。</div></div>
+    <div class="card d ux"><div class="dh"><span class="dn">D8</span> 零静默失败的<b>用户信号</b> <span class="tag t-ux">UX 同等新维</span></div>
+      <div>「失败必有可见信号」从「log 里能查」升级成「用户当场看见、是<b>人话</b>」。枚举核心环路全部失败态 → 每个映射一条人话消息(见下方失败表 + mockup)。</div>
+      <div class="ac">验收:该失败 → <b>每通道恰好一条</b>非空、含 next-step 的消息;<b>每个 new-emit 行带反假阳测试</b>(健康但安静不误报)。</div></div>
+    <div class="card d ux"><div class="dh"><span class="dn">D9</span> 上手 + 模型诚实 + 可观测性 + 文案 <span class="tag t-ux">UX 同等新维</span></div>
+      <div>① 上手引导(init 后「然后呢」)② 模型支持诚实(非 Claude 模型 warn)③ 可观测性(每 session 活动态)④ 错误文案打磨。<span class="mut">全是打磨已有面。</span></div>
+      <div class="ac">验收:上手零未文档化步骤;模型 warn 谓词正确;CLI/web 读同一 stall 真相;错误文案过正则白/黑名单。</div></div>
+  </div>
+
+  <h2>三、D8 — 失败分级表 <span class="sub" style="font-weight:400">· 每个失败态 → 人话信号(本版要 review 的重点)</span></h2>
+  <table>
+    <tr><th>失败态</th><th>级别</th><th>new-emit?</th><th>目标信号(人话 + 怎么办)</th></tr>
+    <tr><td>roleless session 无回复<div class="who">events 不起 tail,已修</div></td><td><span class="no">user-facing 必现</span></td><td>复用(升 F187 WARN)</td><td>「会话未在产出回复,正在重试 / 请 <code>/new</code>」</td></tr>
+    <tr><td>模型 burning-loop<div class="who">裸 claude + 非 Claude 模型</div></td><td><span class="no">user-facing 必现</span></td><td>复用(watchdog)</td><td>watchdog Esc(已有)+「疑似空转,已打断」+ 叠 D9-② 模型 warn</td></tr>
+    <tr><td>hook.sh-not-found</td><td><span class="no">user-facing 必现</span></td><td>复用</td><td>人话 + 具体路径 +「已自动修复 / 请重 <code>ccteam init</code>」</td></tr>
+    <tr><td><code>unknown project</code></td><td><span class="no">user-facing 必现</span></td><td>复用</td><td>「该目录没 init?跑 <code>ccteam init</code> 再 <code>/projects</code> 确认」</td></tr>
+    <tr><td>pane 死 / app-server socket 断</td><td><span class="no">user-facing 必现</span></td><td>复用</td><td>「会话连接断开,正在重连;失败请 <code>ccteam stop &amp;&amp; start</code>」</td></tr>
+    <tr><td><b>marker 滞后/丢失</b><div class="who">头号脆点 · 健康 pane 静默</div></td><td><span class="ok">self-heal 优先,持续不会合才报</span></td><td><b>new-emit ⇒ 必带反假阳测试</b></td><td>先 self-heal(下一 prompt 重写 marker);<b>仅超预算仍不会合</b>才报「未在产出回复」,<b>绝不在刚起/还没出 output 时误报</b></td></tr>
+    <tr><td>subagent-read 失败</td><td><span class="mut">fail-safe 静默续(保持)</span></td><td>否</td><td>读失败不前进 cursor,不打扰用户</td></tr>
+    <tr><td>turn 超时</td><td><span class="ok">已达标范本</span></td><td>复用</td><td>watchdog 已通知(全仓唯一达标)→ 纳入清单做回归</td></tr>
+  </table>
+
+  <h2>四、D8/D9 — UX 改动 mockup <span class="sub" style="font-weight:400">· 静默/jargon → 人话(实际文案方向,请 review)</span></h2>
+
+  <h3 style="margin-top:14px">① 失败信号:从静默/jargon 变人话</h3>
+  <div class="grid d2">
+    <div class="chat">
+      <div class="who" style="margin-bottom:4px">roleless 无回复</div>
+      <div class="before">（整段静默,web 什么都不显示）</div>
+      <div class="arrow">↓</div>
+      <div class="bubble warn"><span class="ico">⏳</span>会话还没产出回复,正在重试…<span class="nx">→ 仍无响应可发 <code>/new</code> 重开,或 <code>/role cto</code> 绑个角色</span></div>
+    </div>
+    <div class="chat">
+      <div class="who" style="margin-bottom:4px">unknown project</div>
+      <div class="before">gateway error: unknown project: demo</div>
+      <div class="arrow">↓</div>
+      <div class="bubble err"><span class="ico">⚠️</span>找不到项目 <b>demo</b> — 这个目录还没初始化?<span class="nx">→ 在该目录跑 <code>ccteam init</code>,再 <code>/projects</code> 确认</span></div>
+    </div>
+    <div class="chat">
+      <div class="who" style="margin-bottom:4px">turn 僵死(watchdog)</div>
+      <div class="bubble"><span class="ico">⏱️</span>这一轮 120s 没产出回复 — 看门狗已打断它(会话还在,直接再发一条重试)。<span class="nx">→ 反复出现?绑个 role(如 cto)或给更清晰的任务</span></div>
+    </div>
+    <div class="chat">
+      <div class="who" style="margin-bottom:4px">hook.sh 缺失</div>
+      <div class="before">/bin/sh: hook.sh: not found</div>
+      <div class="arrow">↓</div>
+      <div class="bubble err"><span class="ico">🔧</span>会话钩子 <code>~/.ccteam/hooks/hook.sh</code> 缺失,已自动补上。<span class="nx">→ 若仍异常,跑 <code>ccteam doctor --install-hooks</code></span></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:18px">② D9-① 上手引导 — 「init 之后,然后呢?」</h3>
+  <div class="chat" style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#cfd3dc">
+    <div style="color:var(--green)">✓ initialized project <b>demo</b> at ~/demo</div>
+    <div style="color:var(--faint);margin:8px 0 4px">— 然后呢 —</div>
+    <div>1. <span style="color:var(--amber2)">ccteam start</span> &nbsp;启动 daemon</div>
+    <div>2. <span style="color:var(--amber2)">/pair</span> 在 IM 里配对(并 approve)</div>
+    <div>3. <span style="color:var(--amber2)">/cd demo</span> 切到项目,直接聊就会 spawn 会话</div>
+    <div style="color:var(--dim);margin-top:7px">默认 <b>cto</b>(懂 ccteam 的管家);<b>roleless</b>=裸 claude 读项目 CLAUDE.md;装别的角色看 <code>docs/usage.md §6</code></div>
+  </div>
+
+  <div class="grid d2" style="margin-top:14px">
+    <div>
+      <h3>③ D9-② 模型支持诚实 <span class="tag t-in">承认例外 #1</span></h3>
+      <div class="chat">
+        <div class="who" style="margin-bottom:4px">新建 session,模型 = <code>deepseek-v4-pro</code></div>
+        <div class="bubble warn"><span class="ico">⚠️</span>该模型经 claude CLI 驱动,属<b>未验证路径</b>,可能不稳/无限 thinking。<span class="nx">→ 异常请绑一个 role,或换 supported 模型</span></div>
+        <div class="note" style="margin-top:7px">谓词 = <code>is_claude_family</code> 前缀匹配;<b>未来 Claude 模型(如 <code>claude-future-99</code>)零提示</b>,不误报。usage/README 加支持矩阵。</div>
+      </div>
+    </div>
+    <div>
+      <h3>④ D9-③ 可观测性 <span class="tag t-in">承认例外 #2</span></h3>
+      <div class="chat">
+        <div class="who" style="margin-bottom:5px">StatusView — 今天只有 live/idle,补「活动态 + 最近活动」</div>
+        <div style="font-size:12.5px"><span class="pill" style="color:#9ad9b8;border-color:rgba(70,192,138,.4)">● working</span> s12 · 最近活动 3s 前</div>
+        <div style="font-size:12.5px;margin-top:5px"><span class="pill" style="color:var(--faint)">○ idle</span> s9 · 12m 前</div>
+        <div style="font-size:12.5px;margin-top:5px"><span class="pill" style="color:#f0a59c;border-color:rgba(229,103,90,.4)">⚠ 疑似卡</span> s7 · 18m 无产出</div>
+        <div class="note" style="margin-top:7px">「疑似卡」与 CLI <code>ccteam status</code> 读<b>同一 file-backed 真相</b>(不出现 CLI 说 STUCK、web 说 live)。只读 label,零新端点/页面。</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>五、§六.0 — UX 逐项 IN/OUT 裁决 <span class="sub" style="font-weight:400">· 每条跑「是不是新功能」的 sharp test</span></h2>
+  <table>
+    <tr><th>UX 条目</th><th>有没有「以前做不到、现在能的新事」?</th><th>裁决</th></tr>
+    <tr><td>D8 失败信号</td><td>否 — 已有失败路径从静默/jargon 变人话</td><td><span class="tag t-in">IN</span></td></tr>
+    <tr><td>D9-① 上手引导</td><td>否 — 改 init println + cto 文案 + 文档</td><td><span class="tag t-in">IN</span></td></tr>
+    <tr><td>D9-② 模型适配 warn</td><td>是(小)— 多一个「模型未验证」提示</td><td><span class="tag t-in">IN · 例外 #1</span></td></tr>
+    <tr><td>D9-③ 每 session 活动态 label</td><td>是(小)— StatusView 多个只读活动态</td><td><span class="tag t-in">IN · 例外 #2</span></td></tr>
+    <tr><td>D9-④ 错误文案 + 末端打磨</td><td>否 — 改文案 + 既有面可读性</td><td><span class="tag t-in">IN</span></td></tr>
+    <tr><td class="mut">交互 wizard / 实时面板 / 真让 deepseek work / 新页/新命令</td><td class="mut">是 — 新 surface/能力</td><td><span class="tag t-out">OUT</span></td></tr>
+  </table>
+
+  <h2>六、对抗审查抓到的 <span class="sub" style="font-weight:400">· 4 路 critic,全部对照 HEAD <code>9480ecc</code> 代码核实</span></h2>
+  <div class="card">
+    <div style="margin-bottom:9px"><span class="tag t-fix">P0</span> <b>3 处死代码错判会 red-build</b> — 原稿叫删的符号其实有 live caller:<code>agent_team_spawn_test.rs</code> 是 <code>write_project_settings_agent_team</code> 的 live test caller;<code>CHAT_BOT_MARKER_STUCK</code> 在 <code>progress.rs:376</code> 有 live match arm;<code>marker_reporter</code> 是 wired-but-unregistered(<code>observe_marker</code> 6 个 live call-site + 内含 live F187 WARN)。→ §九死代码表逐行补真实 caller 集 + <code>cargo build/test</code> 删除验收。</div>
+    <div style="margin-bottom:9px"><span class="tag t-fix">轴</span> <b>Codex ≠ Claude</b>(无常驻 pane,是 <code>codex exec</code>+<code>resume</code>)→ soak 按 vendor 分轴,Codex 真机长跑降 best-effort。</div>
+    <div style="margin-bottom:9px"><span class="tag t-fix">门</span> <b>「24h 硬门」不可重复</b> → 改 M≥50 加速循环 + 真机 ≤1h 短 smoke 才是硬门。</div>
+    <div style="margin-bottom:9px"><span class="tag t-fix">机制</span> <b>D4「读进程内存 visible_events」不可行</b>(CLI 跨进程读不到)→ 改 file-backed <code>progress.jsonl</code> 单一 stall 真相,不造新 RPC。</div>
+    <div style="margin-bottom:9px"><span class="tag t-fix">谓词</span> <b>模型 warn 谓词错</b>(<code>pricing.rs</code> 的「未知模型」会对未来 Claude 模型误报)→ 新建 <code>is_claude_family</code>,emit 在 spawn 路径非 pricing。</div>
+    <div><span class="tag t-fix">红线</span> <b>空项目 scaffold</b> 与「ccteam 不生成 CLAUDE.md/AGENTS.md」红线冲突 → §四.z 裁定为 owner 批准的受限例外(empty-only/never-overwrite/idempotent),本版刻进 CLAUDE.md §三 防 D7 误删。</div>
+  </div>
+
+  <h2>七、验收门 <span class="sub" style="font-weight:400">· A 全绿 ∧ B 全过 = 完成(真机长跑/Codex 长跑 = best-effort 非 tag blocker)</span></h2>
+  <div class="grid d2">
+    <div class="card">
+      <h3 style="color:#bcd0ff">A · STABILITY</h3>
+      <ul class="inv" style="font-size:13px">
+        <li><b>A1</b> soak:CI-fake 切片 + 真机 ≤1h 短 smoke <span class="tag t-hard">硬门</span>;长跑/Codex <span class="tag t-best">best-effort</span></li>
+        <li><b>A2</b> 全失败模式注入(kill daemon/断网/suspend/杀 pane/socket/空闲唤醒)各一用例 + 恢复断言</li>
+        <li><b>A3</b> 病根 3 类各有 named guard 测试</li>
+        <li><b>A4</b> 每边界 timeout+retry 幂等 + D5 矩阵四项</li>
+        <li><b>A5</b> 基线 = 实测 <b>1907/0</b>(CLAUDE.md 1898 过期,对齐);0-flake = D6 出口门</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:#f0cd8e">B · UX</h3>
+      <ul class="inv" style="font-size:13px">
+        <li><b>B1</b> 零静默失败可断言:每通道恰好一条信号 + 每 new-emit 反假阳</li>
+        <li><b>B2</b> 每个 dogfooding bug 类(bug1/2/3/5/6)有回归测试</li>
+        <li><b>B3</b> 上手可量:6 步单一来源 + 真判据「零未文档化步骤 + 每步有反馈」</li>
+        <li><b>B4</b> 模型 warn 正确:deepseek→warn,未来 Claude→零提示</li>
+        <li><b>B5</b> 可观测性:CLI/web 读同一 file-backed 真相,同 fixture 断相等</li>
+        <li><b>B6</b> 错误文案 lint(核心环路):正则白名单 next-step ∧ 黑名单 jargon/stack-trace</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="lead" style="margin-top:26px">
+    <h3>给你 review 的几个点</h3>
+    <ul style="margin:6px 0 0;padding-left:20px;color:var(--dim);font-size:13.5px">
+      <li>UX 维度的取舍对不对:只打磨已有面 + 2 个 micro-exception,够不够 / 过不过?</li>
+      <li>失败信号的<b>实际文案</b>(§四 mockup)是不是你要的语气 + next-step?</li>
+      <li>验收门(A1–A5 / B1–B6)的硬门 vs best-effort 划分合不合理?</li>
+      <li>scope 是否冻结 — 冻结后我接着出分 phase 的 <b>dev-plan</b>。</li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>
