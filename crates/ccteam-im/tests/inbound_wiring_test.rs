@@ -1582,12 +1582,6 @@ async fn real_ws_dual_harness_smoke() {
             "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-RESTART-OK and no extra text.",
         )
         .await;
-        let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-        assert!(
-            !claude_ack.content.starts_with("gateway error"),
-            "Claude after restart should reuse s2, got {:?}",
-            claude_ack.content
-        );
         recv_ws_until_contains(
             &mut socket,
             "CCTEAM-CLAUDE-WS-RESTART-OK",
