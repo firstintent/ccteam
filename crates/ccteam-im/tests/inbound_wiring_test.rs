@@ -860,6 +860,95 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_replays_queued_durable_outbound_idempotently_once() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    write_durable_outbound_row(
+        "replay-idem-1",
+        "telegram",
+        "queued",
+        "queued exactly once across restarts",
+    );
+
+    let first_mock = Arc::new(MockChannel::new());
+    let mut first_channels: ChannelMap = std::collections::HashMap::new();
+    first_channels.insert(
+        "telegram".to_string(),
+        first_mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    run_daemon_with_shutdown(
+        DaemonArgs {
+            credentials: None,
+            registry: Some(projects_root.clone()),
+            max_runtime: Some(Duration::from_millis(100)),
+            adapter_factory: Some(adapter_factory),
+            channels_override: Some(first_channels),
+            extra_channels: None,
+            ..Default::default()
+        },
+        async {
+            futures::future::pending::<()>().await;
+        },
+    )
+    .await
+    .unwrap();
+
+    let first_outbox = first_mock.outbox().await;
+    assert_eq!(first_outbox.len(), 1);
+    assert_eq!(
+        first_outbox[0].content,
+        "queued exactly once across restarts"
+    );
+
+    let second_mock = Arc::new(MockChannel::new());
+    let mut second_channels: ChannelMap = std::collections::HashMap::new();
+    second_channels.insert(
+        "telegram".to_string(),
+        second_mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let second_adapter = Arc::new(GatewayAdapter::default());
+    let second_factory: AdapterFactory = {
+        let cloned = second_adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    run_daemon_with_shutdown(
+        DaemonArgs {
+            credentials: None,
+            registry: Some(projects_root),
+            max_runtime: Some(Duration::from_millis(100)),
+            adapter_factory: Some(second_factory),
+            channels_override: Some(second_channels),
+            extra_channels: None,
+            ..Default::default()
+        },
+        async {
+            futures::future::pending::<()>().await;
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        second_mock.outbox().await.is_empty(),
+        "a durable row whose latest state is sent must not replay again"
+    );
+    let rows = read_durable_outbound_rows();
+    let sent_count = rows
+        .iter()
+        .filter(|row| row["id"] == "replay-idem-1" && row["state"] == "sent")
+        .count();
+    assert_eq!(sent_count, 1, "replay must append exactly one sent row");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_surfaces_start_failure_to_im_and_ledger() {
     let _g = env_lock();
     let home = isolate_home();

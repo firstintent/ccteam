@@ -3460,6 +3460,92 @@ mod tests {
         assert_eq!(turns2[0].assistant, "from-sid2");
     }
 
+    /// v0.8.10 D6 — same-role sessions must route user turns by sid, not by
+    /// role/current-session fallback. This is the lowest-level guard for the
+    /// "two reviewers in one cwd do not cross-talk" notification invariant:
+    /// each submit hits its own harness thread and each user mirror lands under
+    /// the addressed sid.
+    #[tokio::test]
+    async fn same_role_submit_to_sid_routes_to_each_thread() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+
+        let sid1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sid2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!((sid1.as_str(), sid2.as_str()), ("s1", "s2"));
+
+        gateway
+            .submit_to_sid(&sid1, "first reviewer prompt".into())
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid2, "second reviewer prompt".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[
+                (
+                    "alpha-reviewer-s1".to_string(),
+                    "first reviewer prompt".to_string()
+                ),
+                (
+                    "alpha-reviewer-s2".to_string(),
+                    "second reviewer prompt".to_string()
+                )
+            ],
+            "same-role submits must address each sid's own thread"
+        );
+
+        let turns1 = read_all_turns(&project_dir, &sid1).unwrap();
+        let turns2 = read_all_turns(&project_dir, &sid2).unwrap();
+        assert!(
+            turns1
+                .iter()
+                .any(|turn| turn.user == "first reviewer prompt"),
+            "sid1 mirror must contain only its prompt: {turns1:?}"
+        );
+        assert!(
+            !turns1
+                .iter()
+                .any(|turn| turn.user == "second reviewer prompt"),
+            "sid1 mirror must not receive sid2 prompt: {turns1:?}"
+        );
+        assert!(
+            turns2
+                .iter()
+                .any(|turn| turn.user == "second reviewer prompt"),
+            "sid2 mirror must contain only its prompt: {turns2:?}"
+        );
+        assert!(
+            !turns2
+                .iter()
+                .any(|turn| turn.user == "first reviewer prompt"),
+            "sid2 mirror must not receive sid1 prompt: {turns2:?}"
+        );
+    }
+
     /// v0.8.8 bug-fix (bug3) — `submit_to_sid` MIRRORS THE USER'S PROMPT to
     /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump records only the
     /// assistant side, so without this user-side mirror a session reopened from
