@@ -62,19 +62,7 @@ codex --version           # 可选,用 Codex 会话才需要
 | Codex harness + Codex/OpenAI 模型 | best-effort | Codex adapter 可用时工作,真机长跑属于 best-effort。 |
 | Claude harness + 非 Claude 模型(如 `deepseek-via-claude`) | 未验证 | ccteam 不阻断,但会在 session 启动时提示“模型未验证”;若空转,改回 `sonnet`/`opus`/`haiku` 后重新 `/new`。 |
 
-在 Claude Code 会话里装插件(`/plugin` 是 Claude Code 内建命令,给 agent 提供 `mcp__ccteam__*` 工具):
-
-```text
-/plugin marketplace add https://github.com/firstintent/ccteam
-/plugin install ccteam
-```
-
-```bash
-# Codex 用户装 Codex 插件
-codex plugin marketplace add firstintent/ccteam
-```
-
-> 注册 MCP 服务用 `ccteam config`(见 §3),不再用 `doctor --install-mcp`。
+agent 侧的 `mcp__ccteam__*` 工具由 `ccteam config`(见 §3)注册 —— 它**同时**给 Claude(`~/.claude.json`)和 Codex(`~/.codex/config.toml`)写入 ccteam MCP server,无需 `/plugin`、也不再用 `doctor --install-mcp`。ccteam 本身是纯 CLI、不是 vendor 插件。
 
 > **从旧版本升级(须知)**:本版的独立 session 模型与旧的 per-role 会话状态**不兼容**。升级前请**清掉旧状态**再重新初始化 —— `ccteam stop` → 删 `~/.ccteam` 以及各项目里的 `.ccteam/` → 各项目重跑 `ccteam init` → `ccteam config` → `ccteam start`。旧的 per-role 历史会丢(pre-v1.0 阶段可接受,无兼容迁移)。**不碰你的业务代码 / `CLAUDE.md` / `.env` / `.git`**。
 >

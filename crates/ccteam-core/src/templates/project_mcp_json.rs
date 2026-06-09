@@ -32,11 +32,12 @@ pub const CCTEAM_MCP_SERVER_KEY: &str = "ccteam";
 /// `ccteam internal mcp-serve`. The bare top-level `mcp-serve` is a
 /// DEPRECATED alias — it still runs but prints a stderr deprecation WARN
 /// on every startup — so every generated `mcpServers.ccteam` entry must
-/// use this form: both `ccteam doctor --install-mcp` (`~/.claude.json`,
-/// `mcp_serve::install_mcp_into`) and this project `.mcp.json` template
-/// (`ccteam-creator`), matching the shipped root `.mcp.json`. Sharing one
-/// const keeps the two writers from drifting from the manifest again.
-/// (v0.8.5 review fix)
+/// use this form. ccteam is a pure CLI (not a vendor plugin), so every
+/// MCP install path shares this const: `ccteam config` registers both
+/// Claude (`~/.claude.json`, `mcp_serve::install_mcp_into`) and Codex
+/// (`~/.codex/config.toml`, `mcp_serve::install_codex_mcp_into`), plus
+/// this project `.mcp.json` template. Sharing one const keeps the writers
+/// from drifting apart. (v0.8.5 review fix)
 pub const CCTEAM_MCP_SERVE_ARGS: [&str; 2] = ["internal", "mcp-serve"];
 
 /// Render a fresh `.mcp.json` body that registers the ccteam server

@@ -25,7 +25,7 @@ You talk to ccteam from three places, all backed by one daemon:
 
 **A role library, your way — plus a plugin marketplace.** Because a role is just a Markdown file in `.claude/agents/`, you build your team by dropping in `.md` files — write your own, or install ready-made roles, skills, and workflows from the **ccteam plugin marketplace**: a curated catalog (which vendors in open-source libraries like [agency-agents](https://github.com/wshobson/agents), MIT) that you browse and one-click-install into a project from the web console, or from the CLI with `ccteam role search` / `ccteam role add`. Every install is content-integrity checked. The default `cto` is a manager that suggests which role fits the task; you make the call with `/role`.
 
-**One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM/web⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, the web server and its resource API, and a local MCP Unix socket (so the Claude/Codex plugins can call ccteam tools). All tasks share one clean-shutdown signal.
+**One gateway daemon, no tick loop.** `ccteam start` runs a single resident process that is purely an IM/web⇄session routing gateway — there is no orchestrator polling loop. In one runtime it co-hosts the IM gateway, the web server and its resource API, and a local MCP Unix socket (so the `mcp__ccteam__*` tools, registered for Claude and Codex by `ccteam config`, can reach the daemon). All tasks share one clean-shutdown signal.
 
 **No prompt injection — the vendor reads its own role.** A session is launched as `claude --agent <role>`, so Claude itself loads and obeys `.claude/agents/<role>.md`; ccteam never injects a system prompt into the pane. Project knowledge stays vendor-native too — Claude reads your `CLAUDE.md`, Codex reads your `AGENTS.md`, and ccteam neither generates nor rewrites those files.
 
@@ -71,7 +71,8 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 # 2. Turn any directory into a ccteam project:
 ccteam init
 
-# 3. One-time setup (install MCP, set your IM token, preferences):
+# 3. One-time setup — installs the ccteam MCP server for BOTH Claude and Codex
+#    (~/.claude.json + ~/.codex/config.toml), sets your IM token, and preferences:
 ccteam config
 #    Interactive menu, or non-interactively:  ccteam config <key> <value>
 
@@ -81,17 +82,7 @@ ccteam start
 ```
 
 ```text
-# 5. Register the plugin so the slash commands and MCP tools light up.
-#    In a Claude session:
-/plugin marketplace add https://github.com/firstintent/ccteam
-/plugin install ccteam
-
-#    Or in a Codex session (the ccteam binary must be on $PATH from step 1):
-codex plugin marketplace add firstintent/ccteam
-```
-
-```text
-# 6. Drive it from IM (Telegram):
+# 5. Drive it from IM (Telegram):
 /pair <code>            # link your chat to the daemon (code from `ccteam config`)
 /cd myproject           # switch to a project (or `/cd` to list)
                         # → a `cto` session spins up; just start chatting

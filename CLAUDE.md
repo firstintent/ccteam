@@ -41,7 +41,7 @@
 - **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session(按持久 sid):Claude 走 `claude [--agent <role>]` tmux 长 session(send-keys + transcript + hook;空 role = roleless 裸 claude),Codex best-effort;两 vendor 归一成中立 `CanonicalEvent`。
 - **状态 SoT**:`progress.jsonl` 业务事件(`harness/progress_bridge` 单一权威);chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(按 sid;不依赖 Anthropic 内部 `~/.claude/projects/`)。
 - **接口**:15 个 MCP 工具 `mcp__ccteam__{admin_,chat_,advise_,session_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ 标准资源 API `/api/v1`(含 `marketplace` + `status` + `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/pair /cd /use /new /role @handle @ccteam`)+ 统一 chat-shell web(per-session `/chat/s/:sid` Chat|终端 + 底部导航 插件市场/Status/Settings)。
-- **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ Claude `/plugin install ccteam` OR Codex `codex plugin marketplace add firstintent/ccteam`;`cargo install --git …` 是 fallback。
+- **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ `ccteam config` 注册 MCP server(给 Claude `~/.claude.json` + Codex `~/.codex/config.toml` 都写)。**ccteam 是纯 CLI、不是 vendor 插件**,无 `/plugin` 步;`cargo install --git …` 是 fallback。
 
 详 `docs/tech-design.md`。
 
@@ -104,7 +104,7 @@
 | **Skills** | **0 个 ccteam repo 自带**(repo 根 `skills/` 已删;原 skill 功能落 MCP 工具 + cto role + work-role + `config` CLI)。可从 **ccteam-hub 插件市场**装 skill 到项目 `.claude/skills/`(同 role 路径);项目自有 skill 仍可直接放各项目 `.claude/skills/`(vendor 原生,ccteam 不管)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流(work-role 可自带)|
 | **Hooks** | `ccteam internal hook progress-append / load-context` 等(隐藏);写 `.claude/settings.local.json` 的 ccteam hook 段 |
-| **Plugins** | **ccteam 自身分发**:repo 同时是 Claude + Codex plugin marketplace ── `.claude-plugin/{plugin,marketplace}.json` + `.codex-plugin/plugin.json` + 根 `.mcp.json`(`command: "ccteam"` 走 PATH binary,canonical `internal mcp-serve`);user 装路径 = install.sh(binary)+ `/plugin install ccteam` OR `codex plugin marketplace add firstintent/ccteam` |
+| **Plugins** | **ccteam 是纯 CLI、不是 vendor 插件**:MCP server 由 `ccteam config` 注册 —— 同时写 Claude `~/.claude.json` + Codex `~/.codex/config.toml`(`mcp_serve::install_mcp` / `install_codex_mcp`,canonical `internal mcp-serve`),外加 `ccteam init` 写的 per-project `.mcp.json`;repo **不**带 `.claude-plugin`/`.codex-plugin`/`marketplace.json`/根 `.mcp.json`。提示词类插件(skill/role/workflow)住 ccteam-hub |
 
 **CLI 分组**(W4 锁定):顶层扁平 `init / start / stop / status / config / doctor` + `project`(ls/show/new/rm/stop)+ `session`(ls/attach/pause/resume/register/unregister/persona/add-tool/bots/role)+ 隐藏 `internal`(mcp-serve/hook/peek/progress/send/spawn/probe-project/web/mux)。`config` = setup hub(交互菜单 + `config <key> <value>`/`get`/`show`:装 MCP + IM token + prefs)。删除 = `project rm <slug> [--purge --dry-run --force]`;`project stop <slug>` 停项目全部 session。6 个废弃顶层别名(hook/peek/progress/send/spawn/mcp-serve)已删。
 

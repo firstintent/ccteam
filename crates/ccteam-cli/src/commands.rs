@@ -247,7 +247,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  1. install: keep `ccteam` on PATH and install the Claude/Codex plugin\n");
+    out.push_str("  1. install: keep `ccteam` on PATH; `ccteam config` registers the MCP server for Claude + Codex\n");
     out.push_str("  2. init: this project is now initialized\n");
     out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
     out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
@@ -2166,27 +2166,35 @@ fn render_install_memory_bridge_report(
 }
 
 fn render_install_mcp_report() -> Result<String> {
-    let path = crate::mcp_serve::install_mcp()?;
-    Ok(render_install_mcp_body(&path))
+    // ccteam is a pure CLI (not a vendor plugin), so `ccteam config` is the
+    // MCP installer for BOTH vendors: Claude (`~/.claude.json`) and Codex
+    // (`~/.codex/config.toml`).
+    let claude_path = crate::mcp_serve::install_mcp()?;
+    let codex_path = crate::mcp_serve::install_codex_mcp()?;
+    Ok(render_install_mcp_body(&claude_path, &codex_path))
 }
 
 /// Pure renderer for the `config mcp` report body, split out from the
-/// `~/.claude.json` write so it stays unit-testable without touching the
-/// real config. The `tools surface` line interpolates the live tool count
-/// from the same `tool_definitions()` source `run_verify_mcp` introspects
-/// — never hard-code it, or the number drifts (it was stuck at "9" while
-/// the surface grew to 27).
-fn render_install_mcp_body(path: &std::path::Path) -> String {
-    let mut out = String::from("ccteam config: register MCP server\n\n");
+/// `~/.claude.json` + `~/.codex/config.toml` writes so it stays
+/// unit-testable without touching the real config. The `tools surface`
+/// line interpolates the live tool count from the same `tool_definitions()`
+/// source `run_verify_mcp` introspects — never hard-code it, or the number
+/// drifts (it was stuck at "9" while the surface grew to 27).
+fn render_install_mcp_body(claude_path: &std::path::Path, codex_path: &std::path::Path) -> String {
+    let mut out = String::from("ccteam config: register MCP server (Claude + Codex)\n\n");
     out.push_str(&format!(
-        "  registered ccteam MCP server in {}\n",
-        path.display()
+        "  registered ccteam MCP server for Claude in {}\n",
+        claude_path.display()
+    ));
+    out.push_str(&format!(
+        "  registered ccteam MCP server for Codex  in {}\n",
+        codex_path.display()
     ));
     let total_tools = run_verify_mcp().total_tools;
     out.push_str(&format!("  tools surface : {total_tools}\n"));
     out.push('\n');
     out.push_str(
-        "open a new claude session to pick up the change; existing sessions need /reload-mcp.\n",
+        "open a new claude / codex session to pick up the change; existing claude sessions need /reload-mcp.\n",
     );
     out
 }
@@ -6676,7 +6684,10 @@ mod tests {
         // the pure body renderer with a synthetic path so it never
         // touches the real ~/.claude.json.
         let total = run_verify_mcp().total_tools;
-        let report = render_install_mcp_body(std::path::Path::new("/tmp/fake-claude.json"));
+        let report = render_install_mcp_body(
+            std::path::Path::new("/tmp/fake-claude.json"),
+            std::path::Path::new("/tmp/fake-codex/config.toml"),
+        );
         assert!(
             report.contains(&format!("tools surface : {total}")),
             "report must interpolate live tool count {total}: {report}",
@@ -6685,6 +6696,15 @@ mod tests {
         assert!(
             !report.contains("interfaces §12.2"),
             "stale section tag must be dropped: {report}",
+        );
+        // Both vendor targets must be named in the report body.
+        assert!(
+            report.contains("/tmp/fake-claude.json"),
+            "report must name the Claude target path: {report}",
+        );
+        assert!(
+            report.contains("/tmp/fake-codex/config.toml"),
+            "report must name the Codex target path: {report}",
         );
     }
 

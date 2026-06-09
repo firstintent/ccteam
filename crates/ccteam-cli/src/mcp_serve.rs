@@ -766,6 +766,108 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
     Ok(claude_json)
 }
 
+/// Codex equivalent of [`install_mcp_into`]: register the ccteam MCP
+/// server in Codex's `config.toml` so any Codex session can call ccteam
+/// tools. ccteam is a pure CLI (not a vendor plugin), so `ccteam config`
+/// is the installer for BOTH vendors.
+///
+/// Schema (verified against `references/codex/codex-rs/config/` and
+/// `docs/research/ccteam-codex-integration.md`): a stdio MCP server is a
+/// `[mcp_servers.<name>]` table carrying flat `command = "<path>"` and
+/// `args = [...]` keys. We write `[mcp_servers.ccteam]` with the running
+/// binary path and the SHARED [`ccteam_core::CCTEAM_MCP_SERVE_ARGS`] const
+/// (the same `internal mcp-serve` argv `install_mcp_into` and the project
+/// `.mcp.json` template use) so the writers can't drift apart.
+///
+/// MERGE, never clobber: an existing `config.toml` is parsed and every
+/// other top-level key and every other `[mcp_servers.*]` entry is
+/// preserved; only `mcp_servers.ccteam` is set/replaced. The parent dir
+/// and file are created if absent. Idempotent.
+pub fn install_codex_mcp_into(
+    config_toml: &std::path::Path,
+    ccteam_bin: &std::path::Path,
+) -> Result<()> {
+    let bin = ccteam_bin
+        .to_str()
+        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8"))?;
+
+    // Parse the existing config (or start empty). A non-table / unparseable
+    // root is treated as "start fresh" rather than failing the install,
+    // mirroring `install_mcp_into`'s tolerance for a junk `~/.claude.json`.
+    let mut root: toml::Table = if config_toml.exists() {
+        let body = std::fs::read_to_string(config_toml)
+            .with_context(|| format!("read {}", config_toml.display()))?;
+        if body.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            toml::from_str::<toml::Table>(&body)
+                .with_context(|| format!("parse existing {}", config_toml.display()))?
+        }
+    } else {
+        toml::Table::new()
+    };
+
+    // Ensure `[mcp_servers]` is a table, preserving any sibling servers.
+    let servers_entry = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !servers_entry.is_table() {
+        anyhow::bail!(
+            "{}: `mcp_servers` exists but is not a TOML table",
+            config_toml.display()
+        );
+    }
+    let servers = servers_entry.as_table_mut().expect("checked above");
+
+    // Build the ccteam server entry: command + shared args const.
+    let mut entry = toml::Table::new();
+    entry.insert("command".to_string(), toml::Value::String(bin.to_string()));
+    entry.insert(
+        "args".to_string(),
+        toml::Value::Array(
+            ccteam_core::CCTEAM_MCP_SERVE_ARGS
+                .iter()
+                .map(|s| toml::Value::String((*s).to_string()))
+                .collect(),
+        ),
+    );
+    servers.insert(
+        ccteam_core::CCTEAM_MCP_SERVER_KEY.to_string(),
+        toml::Value::Table(entry),
+    );
+
+    let body = toml::to_string_pretty(&root).context("serialize codex config.toml")?;
+    if let Some(parent) = config_toml.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut tmp_os = config_toml.as_os_str().to_owned();
+    tmp_os.push(".ccteam-mcp.tmp");
+    let tmp = std::path::PathBuf::from(tmp_os);
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(body.as_bytes())?;
+    }
+    std::fs::rename(&tmp, config_toml)
+        .with_context(|| format!("rename {} → {}", tmp.display(), config_toml.display()))?;
+    Ok(())
+}
+
+/// Production path: resolve `$CODEX_HOME/config.toml` (CODEX_HOME falling
+/// back to `~/.codex`, mirroring
+/// `ccteam_harness::execution::codex_app_server`'s resolution) and the
+/// running binary, then call [`install_codex_mcp_into`].
+pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
+        .ok_or_else(|| anyhow!("cannot resolve CODEX_HOME or ~/.codex (no home dir)"))?;
+    let config_toml = codex_home.join("config.toml");
+    let bin = ccteam_core::current_ccteam_bin()?;
+    install_codex_mcp_into(&config_toml, &bin)?;
+    Ok(config_toml)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +930,16 @@ mod tests {
             v["mcpServers"]["ccteam"]["args"],
             serde_json::json!(["internal", "mcp-serve"])
         );
+        // Invariant (previously also guarded by the now-removed
+        // plugin_manifest_version_test): every MCP install path emits the
+        // SHARED `ccteam_core::CCTEAM_MCP_SERVE_ARGS` const, so the Claude
+        // writer can't drift from the project `.mcp.json` / Codex writers.
+        let shared: Vec<&str> = ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec();
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["args"],
+            serde_json::json!(shared),
+            "Claude install args must equal ccteam_core::CCTEAM_MCP_SERVE_ARGS"
+        );
     }
 
     #[test]
@@ -845,6 +957,130 @@ mod tests {
         assert_eq!(v["userID"], "rob");
         assert_eq!(v["mcpServers"]["playwright"]["command"], "npx");
         assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
+    }
+
+    #[test]
+    fn install_codex_mcp_into_writes_command_and_shared_args() {
+        // Fresh config.toml → `[mcp_servers.ccteam]` with command + the
+        // shared `CCTEAM_MCP_SERVE_ARGS` const (NOT a hardcoded argv).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
+        install_codex_mcp_into(&config_toml, &ccteam_bin).unwrap();
+        let body = std::fs::read_to_string(&config_toml).unwrap();
+        let v: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(
+            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
+            "/usr/local/bin/ccteam"
+        );
+        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        // Must equal the shared const, not a literal copy.
+        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
+    }
+
+    #[test]
+    fn install_codex_mcp_into_merges_preserving_other_keys_and_servers() {
+        // Pre-existing config with an unrelated top-level key AND another
+        // `[mcp_servers.foo]`. MERGE must preserve both and only set
+        // `mcp_servers.ccteam`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_toml,
+            "model = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"foo-server\"\nargs = [\"--flag\"]\n",
+        )
+        .unwrap();
+        install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        let v: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
+        // Unrelated top-level key preserved.
+        assert_eq!(v["model"].as_str().unwrap(), "gpt-5");
+        // Pre-existing sibling server preserved untouched.
+        assert_eq!(
+            v["mcp_servers"]["foo"]["command"].as_str().unwrap(),
+            "foo-server"
+        );
+        assert_eq!(
+            v["mcp_servers"]["foo"]["args"][0].as_str().unwrap(),
+            "--flag"
+        );
+        // Our entry set.
+        assert_eq!(
+            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
+            "/x/ccteam"
+        );
+        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
+    }
+
+    #[test]
+    fn install_codex_mcp_into_is_idempotent_and_replaces_only_ccteam() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        // Stale ccteam entry pointing at an old binary + a sibling server.
+        std::fs::write(
+            &config_toml,
+            "[mcp_servers.ccteam]\ncommand = \"/old/bin/ccteam\"\nargs = [\"mcp-serve\"]\n\n[mcp_servers.playwright]\ncommand = \"npx\"\n",
+        )
+        .unwrap();
+        install_codex_mcp_into(
+            &config_toml,
+            &std::path::PathBuf::from("/usr/local/bin/ccteam"),
+        )
+        .unwrap();
+        let first = std::fs::read_to_string(&config_toml).unwrap();
+        let v: toml::Value = toml::from_str(&first).unwrap();
+        // ccteam entry replaced with the new binary + canonical args.
+        assert_eq!(
+            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
+            "/usr/local/bin/ccteam"
+        );
+        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
+        // Sibling untouched.
+        assert_eq!(
+            v["mcp_servers"]["playwright"]["command"].as_str().unwrap(),
+            "npx"
+        );
+        // Rerunning with the same binary is byte-identical.
+        install_codex_mcp_into(
+            &config_toml,
+            &std::path::PathBuf::from("/usr/local/bin/ccteam"),
+        )
+        .unwrap();
+        let second = std::fs::read_to_string(&config_toml).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn install_codex_mcp_into_creates_missing_file_and_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Nested, not-yet-created CODEX_HOME dir.
+        let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
+        assert!(!config_toml.exists());
+        install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        assert!(config_toml.exists());
+        let v: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
+        assert_eq!(
+            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
+            "/x/ccteam"
+        );
     }
 
     // V0.3 M5.0: `next_inbox_seq` body lives in
