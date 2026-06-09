@@ -27,6 +27,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The rmux smoke only needs the ccteam binary as an rmux daemon host for a
+# PTY roundtrip — it never serves the web SPA. Skip the ccteam-web SPA bundle
+# so the `cargo build` below does not invoke npm/vite: vite bundles via
+# rolldown, whose native node binding is platform-specific, and the lockfile
+# is resolved on linux-x64, so npm on the macOS CI leg never installs
+# rolldown's darwin binding ("Cannot find module @rolldown/binding-darwin-*").
+# That build step is unrelated to the rmux path under test. build.rs honors
+# this env by emitting a placeholder dist/ (see crates/ccteam-web/build.rs);
+# the publish path is handled separately by release.yml's platform-split npm
+# pre-install.
+export CCTEAM_SKIP_WEB_BUILD=1
+
 echo "==> rmux smoke: building ccteam binary (debug, --locked)"
 cargo build -p ccteam-cli --locked
 
