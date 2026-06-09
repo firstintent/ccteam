@@ -64,6 +64,26 @@ fn isolate_home() -> TempDir {
     tmp
 }
 
+fn seed_role(project_dir: &std::path::Path, role: &str) {
+    let agents_dir = project_dir.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    let model = if role == "reviewer" {
+        "model: sonnet\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        agents_dir.join(format!("{role}.md")),
+        format!(
+            "---\nname: {role}\n{model}---\n\
+             You are a ccteam real-machine smoke-test role.\n\
+             When the user asks you to reply with exactly a token, output only that token.\n\
+             Do not inspect files or add explanation for smoke-test token prompts.\n"
+        ),
+    )
+    .unwrap();
+}
+
 // ----- stub adapter — records submit_turn -----------------------------
 
 #[derive(Debug, Default)]
@@ -860,6 +880,95 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_replays_queued_durable_outbound_idempotently_once() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    write_durable_outbound_row(
+        "replay-idem-1",
+        "telegram",
+        "queued",
+        "queued exactly once across restarts",
+    );
+
+    let first_mock = Arc::new(MockChannel::new());
+    let mut first_channels: ChannelMap = std::collections::HashMap::new();
+    first_channels.insert(
+        "telegram".to_string(),
+        first_mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let adapter = Arc::new(GatewayAdapter::default());
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    run_daemon_with_shutdown(
+        DaemonArgs {
+            credentials: None,
+            registry: Some(projects_root.clone()),
+            max_runtime: Some(Duration::from_millis(100)),
+            adapter_factory: Some(adapter_factory),
+            channels_override: Some(first_channels),
+            extra_channels: None,
+            ..Default::default()
+        },
+        async {
+            futures::future::pending::<()>().await;
+        },
+    )
+    .await
+    .unwrap();
+
+    let first_outbox = first_mock.outbox().await;
+    assert_eq!(first_outbox.len(), 1);
+    assert_eq!(
+        first_outbox[0].content,
+        "queued exactly once across restarts"
+    );
+
+    let second_mock = Arc::new(MockChannel::new());
+    let mut second_channels: ChannelMap = std::collections::HashMap::new();
+    second_channels.insert(
+        "telegram".to_string(),
+        second_mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let second_adapter = Arc::new(GatewayAdapter::default());
+    let second_factory: AdapterFactory = {
+        let cloned = second_adapter.clone();
+        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    run_daemon_with_shutdown(
+        DaemonArgs {
+            credentials: None,
+            registry: Some(projects_root),
+            max_runtime: Some(Duration::from_millis(100)),
+            adapter_factory: Some(second_factory),
+            channels_override: Some(second_channels),
+            extra_channels: None,
+            ..Default::default()
+        },
+        async {
+            futures::future::pending::<()>().await;
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        second_mock.outbox().await.is_empty(),
+        "a durable row whose latest state is sent must not replay again"
+    );
+    let rows = read_durable_outbound_rows();
+    let sent_count = rows
+        .iter()
+        .filter(|row| row["id"] == "replay-idem-1" && row["state"] == "sent")
+        .count();
+    assert_eq!(sent_count, 1, "replay must append exactly one sent row");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_surfaces_start_failure_to_im_and_ledger() {
     let _g = env_lock();
     let home = isolate_home();
@@ -888,16 +997,15 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
-    assert_eq!(
-        contents,
-        vec!["gateway error: spawn failed: simulated start failure"]
-    );
+    let expected =
+        "会话启动失败: simulated start failure。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。";
+    assert_eq!(contents, vec![expected.to_string()]);
+    assert!(!contents[0].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     let rows = read_durable_outbound_rows();
-    assert!(rows.iter().any(|row| {
-        row["state"] == "sent"
-            && row["message"]["content"] == "gateway error: spawn failed: simulated start failure"
-    }));
+    assert!(rows
+        .iter()
+        .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -942,20 +1050,19 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
+    let expected =
+        "发送失败: simulated submit failure。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。";
     assert_eq!(
         contents,
-        vec![
-            "created session s1".to_string(),
-            "gateway error: submit failed: simulated submit failure".to_string()
-        ]
+        vec!["created session s1".to_string(), expected.to_string()]
     );
+    assert!(!contents[1].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
     let rows = read_durable_outbound_rows();
-    assert!(rows.iter().any(|row| {
-        row["state"] == "sent"
-            && row["message"]["content"] == "gateway error: submit failed: simulated submit failure"
-    }));
+    assert!(rows
+        .iter()
+        .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1027,6 +1134,27 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
                 s.starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms")
             })
     }));
+
+    let paths = ccteam_core::CcteamPaths {
+        root: ccteam_im::default_ccteam_root_public(),
+        projects_root: home.path().join("projects"),
+    };
+    let progress = paths.progress_jsonl("default");
+    let body = std::fs::read_to_string(&progress).unwrap_or_else(|err| {
+        panic!(
+            "watchdog must append chat_turn_timeout to {}: {err}",
+            progress.display()
+        )
+    });
+    let timeout_event = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["event"] == "chat_turn_timeout")
+        .expect("expected chat_turn_timeout in progress.jsonl");
+    assert_eq!(timeout_event["role"], "helper");
+    assert_eq!(timeout_event["slug"], "default");
+    assert_eq!(timeout_event["turn_id"], "failing-stub-turn");
+    assert_eq!(timeout_event["stuck"], true);
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1235,8 +1363,6 @@ async fn real_ws_dual_harness_smoke() {
     let _g = env_lock();
     assert!(command_exists("tmux"), "tmux is required for real Claude");
     assert!(command_exists("claude"), "claude binary is required");
-    assert!(command_exists("codex"), "codex binary is required");
-
     let ccteam_home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let slug = format!("real-ws-{}", std::process::id());
@@ -1246,8 +1372,21 @@ async fn real_ws_dual_harness_smoke() {
     let old_mux_backend = std::env::var_os("CCTEAM_MUX_BACKEND");
     let old_path = std::env::var_os("PATH");
     let nl_mode = std::env::var("CCTEAM_REAL_IM_WS_NL").ok();
+    let codex_nl_mode = nl_mode
+        .as_deref()
+        .is_some_and(|mode| mode == "1" || mode == "codex");
+    let codex_mode =
+        std::env::var("CCTEAM_REAL_IM_WS_CODEX").ok().as_deref() == Some("1") || codex_nl_mode;
+    if codex_mode {
+        assert!(command_exists("codex"), "codex binary is required");
+    }
     let restart_mode = std::env::var("CCTEAM_REAL_IM_WS_RESTART").ok().as_deref() == Some("1");
     let fault_mode = std::env::var("CCTEAM_REAL_IM_WS_FAULTS").ok().as_deref() == Some("1");
+    let host_fault_mode = std::env::var("CCTEAM_REAL_IM_WS_HOST_FAULTS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let host_fault_stop = real_ws_host_fault_stop_duration();
     std::env::set_var("CCTEAM_HOME", ccteam_home.path());
     // F10: stdio is the default transport — unset the socket override so
     // the adapter spawns `codex app-server --listen stdio://` itself.
@@ -1272,6 +1411,8 @@ async fn real_ws_dual_harness_smoke() {
     let paths = ccteam_core::CcteamPaths::from_env().unwrap();
     ccteam_core::bootstrap_project_at_dir(&paths, project.path(), &slug, "", "real-ws").unwrap();
     ccteam_core::install_hooks(&paths).unwrap();
+    seed_role(project.path(), "api");
+    seed_role(project.path(), "reviewer");
     if let Some(bin) = workspace_ccteam_bin() {
         let hook = paths.hooks_script();
         std::fs::write(
@@ -1288,64 +1429,74 @@ async fn real_ws_dual_harness_smoke() {
         }
     }
 
-    let ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
+    let mut ws = Arc::new(WsChannel::bind_localhost().await.unwrap());
     let ws_addr = ws.local_addr();
     let ws_url = format!("ws://{ws_addr}");
-    let max_runtime = if nl_mode.is_some() || restart_mode || fault_mode {
+    let mut max_runtime = if nl_mode.is_some() || restart_mode || fault_mode || host_fault_mode {
         Duration::from_secs(300)
     } else {
         Duration::from_secs(30)
     };
+    if host_fault_mode {
+        max_runtime += host_fault_stop;
+    }
     let (mut stop_tx, mut daemon) =
-        spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
+        spawn_real_ws_gateway_daemon(project.path().to_path_buf(), Arc::clone(&ws), max_runtime);
 
     let mut socket = connect_ws_with_retry(&ws_url).await;
-    send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
-    assert_eq!(
-        recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
-            .await
-            .content,
-        "created session s1"
-    );
+    let claude_sid = if codex_mode {
+        send_ws_text(&mut socket, "real-ws-codex-new", "/new codex api").await;
+        assert_eq!(
+            recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+                .await
+                .content,
+            "created session s1"
+        );
+        "s2"
+    } else {
+        "s1"
+    };
     send_ws_text(&mut socket, "real-ws-claude-new", "/new claude reviewer").await;
     assert_eq!(
         recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20))
             .await
             .content,
-        "created session s2"
+        format!("created session {claude_sid}")
     );
     send_ws_text(&mut socket, "real-ws-sessions", "/sessions").await;
     let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(5))
         .await
         .content;
+    let has_claude = sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer"));
+    let has_codex = !codex_mode || sessions.contains(&format!("s1:{slug}:Codex:api"));
     assert!(
-        sessions.contains(&format!("s1:{slug}:Codex:api"))
-            && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+        has_claude && has_codex,
         "real WS sessions must use the configured project slug; got {sessions:?}"
     );
-    let claude_tmux_session = format!("ccteam-chat-{slug}-reviewer");
+    let claude_tmux_session = format!("ccteam-chat-{slug}-{claude_sid}");
     assert!(
         tmux_session_exists(&claude_tmux_session),
         "Claude tmux session should remain live after /new: {claude_tmux_session}"
     );
-    send_ws_text(&mut socket, "real-ws-codex-compact", "@api /compact").await;
-    // V0.8.4 P1 (F1): the "submitted … turn …" ack is folded away — the
-    // first send is now a progress seed / output, so this (real-bot) probe
-    // only asserts the turn did not error out. The NL round-trips below use
-    // `recv_ws_until_contains`, which is robust to the leading seed.
-    let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-    assert!(
-        !codex.content.starts_with("gateway error"),
-        "Codex /compact should reach app-server RPC, got {:?}",
-        codex.content
-    );
+    if codex_mode {
+        send_ws_text(&mut socket, "real-ws-codex-status", "@api /status").await;
+        // Keep this as an immediate Codex-session routing probe. `/compact` starts
+        // a Codex turn and may legitimately produce no short-window event while
+        // the daemon event-sink path has folded away submit acks.
+        let codex = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            !codex.content.starts_with("gateway error"),
+            "Codex /status should reach the Codex session, got {:?}",
+            codex.content
+        );
+    }
 
     if nl_mode
         .as_deref()
         .is_some_and(|mode| mode == "1" || mode == "codex" || mode == "claude")
     {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if nl_mode.as_deref() != Some("claude") {
+        if codex_nl_mode {
             send_ws_text(
                 &mut socket,
                 "real-ws-codex-nl",
@@ -1389,8 +1540,12 @@ async fn real_ws_dual_harness_smoke() {
             "Claude tmux session must survive daemon restart: {claude_tmux_session}"
         );
 
-        let ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
-        let restarted = spawn_real_ws_gateway_daemon(project.path().to_path_buf(), ws, max_runtime);
+        ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+        let restarted = spawn_real_ws_gateway_daemon(
+            project.path().to_path_buf(),
+            Arc::clone(&ws),
+            max_runtime,
+        );
         stop_tx = restarted.0;
         daemon = restarted.1;
         socket = connect_ws_with_retry(&ws_url).await;
@@ -1399,30 +1554,50 @@ async fn real_ws_dual_harness_smoke() {
         let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
             .await
             .content;
+        let has_claude = sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer"));
+        let has_codex = !codex_mode || sessions.contains(&format!("s1:{slug}:Codex:api"));
         assert!(
-            sessions.contains(&format!("s1:{slug}:Codex:api"))
-                && sessions.contains(&format!("s2:{slug}:Claude:reviewer")),
+            has_claude && has_codex,
             "restart must restore original sessions; got {sessions:?}"
         );
 
-        send_ws_text(
-            &mut socket,
-            "real-ws-codex-after-restart",
-            "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
-        )
-        .await;
-        let codex_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-        assert!(
-            !codex_ack.content.starts_with("gateway error"),
-            "Codex after restart should reuse s1, got {:?}",
-            codex_ack.content
-        );
-        recv_ws_until_contains(
-            &mut socket,
-            "CCTEAM-CODEX-WS-RESTART-OK",
-            Duration::from_secs(120),
-        )
-        .await;
+        if codex_mode {
+            if codex_nl_mode {
+                send_ws_text(
+                    &mut socket,
+                    "real-ws-codex-after-restart",
+                    "@api Reply with exactly CCTEAM-CODEX-WS-RESTART-OK and no extra text.",
+                )
+                .await;
+                let codex_ack =
+                    recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+                assert!(
+                    !codex_ack.content.starts_with("gateway error"),
+                    "Codex after restart should reuse s1, got {:?}",
+                    codex_ack.content
+                );
+                recv_ws_until_contains(
+                    &mut socket,
+                    "CCTEAM-CODEX-WS-RESTART-OK",
+                    Duration::from_secs(120),
+                )
+                .await;
+            } else {
+                send_ws_text(
+                    &mut socket,
+                    "real-ws-codex-after-restart-status",
+                    "@api /status",
+                )
+                .await;
+                let codex_status =
+                    recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+                assert!(
+                    !codex_status.content.starts_with("gateway error"),
+                    "Codex status after restart should reuse s1, got {:?}",
+                    codex_status.content
+                );
+            }
+        }
 
         send_ws_text(
             &mut socket,
@@ -1430,18 +1605,109 @@ async fn real_ws_dual_harness_smoke() {
             "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-RESTART-OK and no extra text.",
         )
         .await;
-        let claude_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
-        assert!(
-            !claude_ack.content.starts_with("gateway error"),
-            "Claude after restart should reuse s2, got {:?}",
-            claude_ack.content
-        );
         recv_ws_until_contains(
             &mut socket,
             "CCTEAM-CLAUDE-WS-RESTART-OK",
             Duration::from_secs(180),
         )
         .await;
+    }
+
+    if host_fault_mode {
+        send_ws_text(
+            &mut socket,
+            "real-ws-claude-sigstop",
+            "@reviewer Reply with exactly CCTEAM-CLAUDE-WS-SIGSTOP-OK and no extra text.",
+        )
+        .await;
+        let sigstop_ack = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
+        assert!(
+            !sigstop_ack.content.starts_with("gateway error"),
+            "Claude SIGSTOP prompt should be submitted, got {:?}",
+            sigstop_ack.content
+        );
+        wait_turns_file_contains(
+            project.path(),
+            claude_sid,
+            "CCTEAM-CLAUDE-WS-SIGSTOP-OK",
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        sigstop_self_for(host_fault_stop);
+        recv_ws_until_contains_once(
+            &mut socket,
+            "CCTEAM-CLAUDE-WS-SIGSTOP-OK",
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        send_ws_text(&mut socket, "real-ws-sigstop-sessions", "/sessions").await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "SIGSTOP resume must preserve the original Claude sid; got {sessions:?}"
+        );
+
+        let _ = socket.close(None).await;
+        drop(socket);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        ws.send(&SendMessage::new("CCTEAM-WS-NETDROP-OK", "chat-1"))
+            .await
+            .expect("inject WS netdrop backlog message");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        socket = connect_ws_with_retry(&ws_url).await;
+        send_ws_text(&mut socket, "real-ws-netdrop-resync", "/sessions").await;
+        recv_ws_until_contains_once(
+            &mut socket,
+            "CCTEAM-WS-NETDROP-OK",
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )
+        .await;
+
+        send_ws_text(&mut socket, "real-ws-netdrop-sessions", "/sessions").await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "WS reconnect must preserve the original Claude sid; got {sessions:?}"
+        );
+
+        drop(socket);
+        let _ = stop_tx.send(());
+        daemon.await.unwrap();
+        assert!(
+            tmux_session_exists(&claude_tmux_session),
+            "Claude tmux session must survive local host-fault daemon restart: {claude_tmux_session}"
+        );
+
+        let ws = Arc::new(WsChannel::bind_on_listen(ws_addr));
+        let restarted = spawn_real_ws_gateway_daemon(
+            project.path().to_path_buf(),
+            Arc::clone(&ws),
+            max_runtime,
+        );
+        stop_tx = restarted.0;
+        daemon = restarted.1;
+        socket = connect_ws_with_retry(&ws_url).await;
+        send_ws_text(
+            &mut socket,
+            "real-ws-host-fault-restart-sessions",
+            "/sessions",
+        )
+        .await;
+        let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
+            .await
+            .content;
+        assert!(
+            sessions.contains(&format!("{claude_sid}:{slug}:Claude:reviewer")),
+            "daemon restart after local host faults must restore the original sid; got {sessions:?}"
+        );
     }
 
     if fault_mode {
@@ -1464,27 +1730,27 @@ async fn real_ws_dual_harness_smoke() {
         .await;
         let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10)).await;
         assert!(
-            fault
-                .content
-                .starts_with("gateway error: submit failed: tmux session missing:"),
+            fault.content.starts_with("发送失败: tmux session missing:"),
             "Claude tmux death should be user-visible, got {:?}",
             fault.content
         );
-        std::env::set_var("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN", "1");
-        send_ws_text(
-            &mut socket,
-            "real-ws-codex-after-kill",
-            "@api this should surface a codex app-server disconnect",
-        )
-        .await;
-        let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
-        assert!(
-            fault.content.starts_with("gateway error: submit failed:")
-                && (fault.content.contains("turn/start")
-                    || fault.content.contains("codex app-server fault injection")),
-            "Codex app-server death should be user-visible, got {:?}",
-            fault.content
-        );
+        if codex_mode {
+            std::env::set_var("CCTEAM_CODEX_APP_SERVER_FAULT_KILL_BEFORE_TURN", "1");
+            send_ws_text(
+                &mut socket,
+                "real-ws-codex-after-kill",
+                "@api this should surface a codex app-server disconnect",
+            )
+            .await;
+            let fault = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20)).await;
+            assert!(
+                fault.content.starts_with("发送失败:")
+                    && (fault.content.contains("turn/start")
+                        || fault.content.contains("codex app-server fault injection")),
+                "Codex app-server death should be user-visible, got {:?}",
+                fault.content
+            );
+        }
         drop(socket);
         let _ = stop_tx.send(());
         daemon.await.unwrap();
@@ -1718,6 +1984,128 @@ where
         if seen.contains(needle) {
             return;
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn recv_ws_until_contains_once<S>(
+    socket: &mut WebSocketStream<S>,
+    needle: &str,
+    timeout: Duration,
+    quiet_window: Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut seen = String::new();
+    let mut matches = 0usize;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while matches == 0 {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for exactly one {needle}; seen:\n{seen}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let msg = tokio::time::timeout(remaining, async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .unwrap_or_else(|| panic!("websocket closed while waiting for {needle}"))
+                    .unwrap();
+                if let Message::Text(text) = frame {
+                    return serde_json::from_str::<SendMessage>(&text).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for exactly one {needle}; seen:\n{seen}"));
+        matches += msg.content.matches(needle).count();
+        seen.push_str(&msg.content);
+        seen.push('\n');
+    }
+    assert_eq!(
+        matches, 1,
+        "expected exactly one {needle} before quiet window; seen:\n{seen}"
+    );
+
+    let quiet_deadline = tokio::time::Instant::now() + quiet_window;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline {
+            break;
+        }
+        match tokio::time::timeout(quiet_deadline.saturating_duration_since(now), socket.next())
+            .await
+        {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let msg: SendMessage = serde_json::from_str(&text).unwrap();
+                matches += msg.content.matches(needle).count();
+                seen.push_str(&msg.content);
+                seen.push('\n');
+                assert_eq!(
+                    matches, 1,
+                    "expected exactly one {needle} after quiet window; seen:\n{seen}"
+                );
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(err))) => panic!("websocket error while checking duplicates: {err}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+fn real_ws_host_fault_stop_duration() -> Duration {
+    let secs = std::env::var("CCTEAM_REAL_IM_WS_HOST_FAULT_STOP_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(12)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+fn sigstop_self_for(duration: Duration) {
+    let pid = std::process::id();
+    let secs = duration.as_secs().max(1);
+    let mut helper = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("sleep {secs}; kill -CONT {pid}"))
+        .spawn()
+        .expect("spawn SIGCONT helper");
+    let status = std::process::Command::new("kill")
+        .arg("-STOP")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGSTOP to self");
+    assert!(status.success(), "kill -STOP self should succeed");
+    let _ = helper.wait();
+}
+
+async fn wait_turns_file_contains(
+    project: &std::path::Path,
+    sid: &str,
+    needle: &str,
+    timeout: Duration,
+) {
+    let path = project
+        .join(".ccteam")
+        .join("chat")
+        .join(sid)
+        .join("turns.jsonl");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if body.contains(needle) {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {needle} in {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

@@ -7,10 +7,10 @@
 //! jsonl bot-A just wrote → fan-out (every `@<bot>` in the group chat
 //! triggered three identical replies).
 //!
-//! With F177 each bot's tail loop is targeted at the sid recorded in
-//! `<project>/.ccteam/chat/<role>/active-session-id` (written by the
-//! F176 chat-progress hook on SessionStart). When bot-A appends a turn
-//! to its own jsonl, only bot-A's event stream should observe it.
+//! With F177 each session's tail loop is targeted at the transcript id
+//! recorded in `<project>/.ccteam/chat/<sid>/active-session-id` (written
+//! by the F176 chat-progress hook on SessionStart). When session A appends
+//! a turn to its own jsonl, only session A's event stream should observe it.
 //!
 //! This test exercises the tail loop end-to-end via
 //! `ClaudeTuiAdapter::events`, plants the markers + transcripts that
@@ -35,15 +35,16 @@ use tempfile::TempDir;
 
 /// Assemble a `ThreadHandle` that drives `ClaudeTuiAdapter::events`
 /// straight into a tail loop pointed at our hermetic temp tree.
-fn make_handle(project_dir: &Path, cwd: &Path, role: &str) -> ThreadHandle {
+fn make_handle(project_dir: &Path, cwd: &Path, role: &str, sid: &str) -> ThreadHandle {
     ThreadHandle {
         vendor: AgentVendor::Claude,
         mode: ExecutionMode::Chat,
-        identity: format!("ccteam-chat-fanout-{role}"),
+        identity: format!("ccteam-chat-fanout-{sid}"),
         started_at: chrono::Utc::now(),
         raw_extras: json!({
-            "tmux_session": format!("ccteam-chat-fanout-{role}"),
+            "tmux_session": format!("ccteam-chat-fanout-{sid}"),
             "role": role,
+            "sid": sid,
             "project_dir": project_dir.to_string_lossy(),
             "cwd": cwd.to_string_lossy(),
             "slug": "fanout",
@@ -52,10 +53,10 @@ fn make_handle(project_dir: &Path, cwd: &Path, role: &str) -> ThreadHandle {
 }
 
 /// Plant the active-session-id marker the way the F176 hook would.
-fn plant_marker(project_dir: &Path, role: &str, sid: &str) {
-    let marker = active_session_id_path(project_dir, role);
+fn plant_marker(project_dir: &Path, ccteam_sid: &str, transcript_sid: &str) {
+    let marker = active_session_id_path(project_dir, ccteam_sid);
     std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    std::fs::write(&marker, sid).unwrap();
+    std::fs::write(&marker, transcript_sid).unwrap();
 }
 
 /// Path to a bot's Anthropic transcript jsonl under the hermetic HOME
@@ -140,26 +141,27 @@ async fn three_bots_one_project_only_target_bot_observes_turn() {
         .join(encode_project_cwd(&cwd));
     std::fs::create_dir_all(&anth_dir).unwrap();
 
-    // Plant one marker per bot, pointing at a distinct sid.
-    let bots: [(&str, &str); 3] = [
-        ("alice", "sid-aaaa"),
-        ("bob", "sid-bbbb"),
-        ("carol", "sid-cccc"),
+    // Plant one marker per session. All three sessions intentionally share
+    // the same role and cwd; the ccteam sid is the only valid routing key.
+    let sessions: [(&str, &str, &str); 3] = [
+        ("reviewer", "s1", "anth-aaaa"),
+        ("reviewer", "s2", "anth-bbbb"),
+        ("reviewer", "s3", "anth-cccc"),
     ];
-    for (role, sid) in bots {
-        plant_marker(&project_dir, role, sid);
+    for (_role, ccteam_sid, transcript_sid) in sessions {
+        plant_marker(&project_dir, ccteam_sid, transcript_sid);
         // Pre-create each bot's jsonl as empty so `read_marker_target`
         // sees it. Pre-creating also matters because the tail loop's
         // initial sweep would otherwise return None until first MODIFY.
-        let path = transcript_path(&home, &cwd, sid);
+        let path = transcript_path(&home, &cwd, transcript_sid);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "").unwrap();
     }
 
     let adapter = ClaudeTuiAdapter::new();
-    let h_a = make_handle(&project_dir, &cwd, bots[0].0);
-    let h_b = make_handle(&project_dir, &cwd, bots[1].0);
-    let h_c = make_handle(&project_dir, &cwd, bots[2].0);
+    let h_a = make_handle(&project_dir, &cwd, sessions[0].0, sessions[0].1);
+    let h_b = make_handle(&project_dir, &cwd, sessions[1].0, sessions[1].1);
+    let h_c = make_handle(&project_dir, &cwd, sessions[2].0, sessions[2].1);
     let s_a = adapter.events(&h_a);
     let s_b = adapter.events(&h_b);
     let s_c = adapter.events(&h_c);
@@ -167,9 +169,9 @@ async fn three_bots_one_project_only_target_bot_observes_turn() {
     // Let the watchers arm before we trigger the event.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Bot-A receives a new turn. B and C jsonls remain unchanged.
-    let path_a = transcript_path(&home, &cwd, bots[0].1);
-    append_assistant_turn(&path_a, "uuid-a-1", "hello from alice");
+    // Session A receives a new turn. B and C jsonls remain unchanged.
+    let path_a = transcript_path(&home, &cwd, sessions[0].2);
+    append_assistant_turn(&path_a, "uuid-a-1", "hello from s1");
 
     // Concurrent collection — each stream gets the same wall-clock
     // window to surface any cross-fire. The fanout bug would have all
@@ -181,7 +183,7 @@ async fn three_bots_one_project_only_target_bot_observes_turn() {
     );
 
     assert!(
-        msgs_a.iter().any(|t| t == "hello from alice"),
+        msgs_a.iter().any(|t| t == "hello from s1"),
         "bot A must observe its own turn; got: {msgs_a:?}"
     );
     assert!(

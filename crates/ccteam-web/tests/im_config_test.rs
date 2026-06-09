@@ -58,6 +58,10 @@ fn state_with_creds(tmp: &TempDir, auth: AuthState) -> (AppState, std::path::Pat
     (state, creds_path)
 }
 
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 // --------------------------------------------------------------------------
 // Telegram mock (getMe + getUpdates)
 // --------------------------------------------------------------------------
@@ -156,7 +160,9 @@ async fn get_im_config_masks_secrets() {
     credentials::save(&creds_path, &creds).unwrap();
 
     let addr = spawn_app(state).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/config/im"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/config/im"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -196,7 +202,9 @@ async fn get_im_config_empty_when_no_creds() {
     let tmp = TempDir::new().unwrap();
     let (state, _) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/config/im"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/config/im"))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -219,7 +227,7 @@ async fn put_telegram_valid_token_persists() {
     let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
 
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/telegram"))
         .json(&serde_json::json!({"bot_token": "111:GOODTOKEN"}))
@@ -264,7 +272,7 @@ async fn put_telegram_preserves_existing_chat_ids() {
     .unwrap();
     let addr = spawn_app(state).await;
 
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/telegram"))
         .json(&serde_json::json!({"bot_token": "new:TOKEN"}))
@@ -291,7 +299,7 @@ async fn put_telegram_bad_token_is_400_no_persist() {
     let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
 
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/telegram"))
         .json(&serde_json::json!({"bot_token": "111:BADTOKEN"}))
@@ -320,7 +328,7 @@ async fn put_telegram_empty_token_is_400() {
     let tmp = TempDir::new().unwrap();
     let (state, _) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/telegram"))
         .json(&serde_json::json!({"bot_token": "   "}))
@@ -344,7 +352,7 @@ async fn put_lark_valid_creds_persists() {
     let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
 
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/lark"))
         .json(&serde_json::json!({
@@ -381,7 +389,7 @@ async fn put_lark_bad_creds_is_400_no_persist() {
     let (state, creds_path) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
 
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .put(format!("http://{addr}/api/v1/config/im/lark"))
         .json(&serde_json::json!({
@@ -432,7 +440,7 @@ async fn chat_id_capture_writes_into_allowlist() {
 
     // Poll the GET endpoint until it reports `captured` (the background task
     // resolves quickly against the mock).
-    let client = reqwest::Client::new();
+    let client = client();
     let mut captured = None;
     for _ in 0..50 {
         let v: Value = client
@@ -464,7 +472,9 @@ async fn chat_id_poll_idle_when_not_started() {
     let tmp = TempDir::new().unwrap();
     let (state, _) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
-    let v: Value = reqwest::get(format!("http://{addr}/api/v1/config/im/telegram/chat-id"))
+    let v: Value = client()
+        .get(format!("http://{addr}/api/v1/config/im/telegram/chat-id"))
+        .send()
         .await
         .unwrap()
         .json()
@@ -478,7 +488,7 @@ async fn chat_id_start_without_token_is_400() {
     let tmp = TempDir::new().unwrap();
     let (state, _) = state_with_creds(&tmp, AuthState::disabled());
     let addr = spawn_app(state).await;
-    let client = reqwest::Client::new();
+    let client = client();
     let resp = client
         .post(format!(
             "http://{addr}/api/v1/config/im/telegram/chat-id/start"
@@ -500,7 +510,9 @@ async fn config_im_requires_web_token() {
     let addr = spawn_app(state).await;
 
     // No Authorization header → 401 on the GET.
-    let resp = reqwest::get(format!("http://{addr}/api/v1/config/im"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/config/im"))
+        .send()
         .await
         .unwrap();
     assert_eq!(
@@ -510,7 +522,7 @@ async fn config_im_requires_web_token() {
     );
 
     // With the bearer token → 200.
-    let client = reqwest::Client::new();
+    let client = client();
     let ok = client
         .get(format!("http://{addr}/api/v1/config/im"))
         .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))

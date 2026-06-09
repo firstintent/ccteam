@@ -31,16 +31,15 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub use ccteam_harness::execution::progress_bridge::{
-    append_event, build_chat_bot_marker_stuck_event, build_chat_bot_permanent_failure_event,
-    build_chat_compact_done_event, build_chat_hop_escalate_event,
-    build_chat_marker_self_heal_attempt_event, build_chat_permission_prompt_outstanding_event,
-    build_chat_session_reset_event, build_chat_session_reset_event_with_reason,
-    build_chat_session_reset_with_recovery_event, build_chat_session_started_event,
-    build_chat_tool_call_started_event, build_chat_turn_completed_event,
-    build_chat_turn_running_long_event, build_chat_turn_timeout_event,
-    build_chat_turn_user_prompt_event, build_codex_plan_updated_event,
-    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
-    build_merger_lossy_partial_event, build_typed_event_event, CHAT_BOT_MARKER_STUCK,
+    append_event, build_chat_bot_permanent_failure_event, build_chat_compact_done_event,
+    build_chat_hop_escalate_event, build_chat_marker_self_heal_attempt_event,
+    build_chat_permission_prompt_outstanding_event, build_chat_session_reset_event,
+    build_chat_session_reset_event_with_reason, build_chat_session_reset_with_recovery_event,
+    build_chat_session_started_event, build_chat_tool_call_started_event,
+    build_chat_turn_completed_event, build_chat_turn_running_long_event,
+    build_chat_turn_timeout_event, build_chat_turn_user_prompt_event,
+    build_codex_plan_updated_event, build_codex_rate_limit_event, build_codex_thread_status_event,
+    build_codex_token_usage_event, build_merger_lossy_partial_event, build_typed_event_event,
     CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
     CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET,
     CHAT_SESSION_RESET_WITH_RECOVERY, CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED,
@@ -178,6 +177,27 @@ pub fn read_all_events(path: &Path) -> Result<Vec<Value>> {
         }
     }
     Ok(out)
+}
+
+/// Return the latest event that belongs to a gateway session id. New chat
+/// events carry `sid`; older workflow-era events used `session_id`, so the
+/// read-side accepts both names.
+pub fn last_event_for_sid(path: &Path, sid: &str) -> Result<Option<Value>> {
+    if sid.is_empty() {
+        return Ok(None);
+    }
+    let events = read_all_events(path)?;
+    Ok(events
+        .into_iter()
+        .rev()
+        .find(|event| event_sid(event).is_some_and(|value| value == sid)))
+}
+
+pub fn event_sid(event: &Value) -> Option<&str> {
+    event
+        .get("sid")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("session_id").and_then(Value::as_str))
 }
 
 /// Idle detection per tech-design §6.9.
@@ -373,7 +393,6 @@ pub fn is_chat_event(kind: &str) -> bool {
             | CHAT_HOP_ESCALATE
             | CHAT_BOT_PERMANENT_FAILURE
             | CHAT_MARKER_SELF_HEAL_ATTEMPT
-            | CHAT_BOT_MARKER_STUCK
             | CHAT_TURN_RUNNING_LONG
             | CHAT_TURN_TIMEOUT
     )
@@ -890,9 +909,10 @@ mod tests {
 
     #[test]
     fn build_chat_turn_timeout_event_carries_stuck_flag() {
-        let ev = build_chat_turn_timeout_event("alice", "dev-foo", "turn-42", 200);
+        let ev = build_chat_turn_timeout_event("alice", "s3", "dev-foo", "turn-42", 200);
         assert_eq!(ev["event"], CHAT_TURN_TIMEOUT);
         assert_eq!(ev["role"], "alice");
+        assert_eq!(ev["sid"], "s3");
         assert_eq!(ev["slug"], "dev-foo");
         assert_eq!(ev["turn_id"], "turn-42");
         assert_eq!(ev["elapsed_sec"], 200);
@@ -947,8 +967,9 @@ mod tests {
     #[test]
     fn build_chat_turn_user_prompt_event_truncates_long_excerpt() {
         let long = "x".repeat(1000);
-        let ev = build_chat_turn_user_prompt_event("bob", "turn-42", &long);
+        let ev = build_chat_turn_user_prompt_event("bob", "s4", "turn-42", &long);
         assert_eq!(ev["event"], CHAT_TURN_USER_PROMPT);
+        assert_eq!(ev["sid"], "s4");
         let excerpt = ev["prompt_excerpt"].as_str().unwrap();
         assert_eq!(excerpt.chars().count(), 256);
     }
@@ -956,8 +977,9 @@ mod tests {
     #[test]
     fn build_chat_turn_completed_event_carries_usage() {
         let usage = ccteam_cost::UnifiedTokenUsage::default();
-        let ev = build_chat_turn_completed_event("carol", "turn-7", &usage);
+        let ev = build_chat_turn_completed_event("carol", "s5", "turn-7", &usage);
         assert_eq!(ev["event"], CHAT_TURN_COMPLETED);
+        assert_eq!(ev["sid"], "s5");
         assert_eq!(ev["turn_id"], "turn-7");
         assert!(ev["usage"].is_object());
     }
@@ -993,9 +1015,31 @@ mod tests {
 
     #[test]
     fn build_chat_session_reset_with_recovery_event_carries_count() {
-        let ev = build_chat_session_reset_with_recovery_event("frank", 12);
+        let ev = build_chat_session_reset_with_recovery_event("frank", "s9", 12);
         assert_eq!(ev["event"], CHAT_SESSION_RESET_WITH_RECOVERY);
+        assert_eq!(ev["sid"], "s9");
         assert_eq!(ev["recovered_turns"], 12);
+    }
+
+    #[test]
+    fn build_chat_session_reset_event_carries_sid_for_roleless_session() {
+        let ev = build_chat_session_reset_event("", "s7");
+        assert_eq!(ev["event"], CHAT_SESSION_RESET);
+        assert_eq!(ev["role"], "");
+        assert_eq!(ev["sid"], "s7");
+    }
+
+    #[test]
+    fn build_chat_session_reset_with_reason_event_carries_sid() {
+        let ev = build_chat_session_reset_event_with_reason(
+            "reviewer",
+            "s8",
+            "resume_failed_fallback_to_fresh",
+        );
+        assert_eq!(ev["event"], CHAT_SESSION_RESET);
+        assert_eq!(ev["role"], "reviewer");
+        assert_eq!(ev["sid"], "s8");
+        assert_eq!(ev["reason"], "resume_failed_fallback_to_fresh");
     }
 
     #[test]
@@ -1007,22 +1051,6 @@ mod tests {
         assert_eq!(ev["event"], CHAT_MARKER_SELF_HEAL_ATTEMPT);
         assert_eq!(ev["role"], "grace");
         assert_eq!(ev["attempt_n"], 2);
-        assert!(ev["ts"].is_string());
-    }
-
-    #[test]
-    fn build_chat_bot_marker_stuck_event_shape() {
-        // V0.6.8 F196 — same envelope as F192c
-        // chat_bot_permanent_failure: role + attempts + ts. No
-        // freeform reason field because the failure mode is
-        // structural (SessionStart hook prerequisite missing) and
-        // the operator-facing surface for diagnostics is the F187
-        // tail_marker_missing WARN line + the supervisor's heal
-        // attempt history.
-        let ev = build_chat_bot_marker_stuck_event("hank", 3);
-        assert_eq!(ev["event"], CHAT_BOT_MARKER_STUCK);
-        assert_eq!(ev["role"], "hank");
-        assert_eq!(ev["attempts"], 3);
         assert!(ev["ts"].is_string());
     }
 
@@ -1139,5 +1167,25 @@ mod tests {
             append_event(&path, &json!({"event": "e", "seq": i})).unwrap();
         }
         assert_eq!(last_event(&path).unwrap().unwrap()["seq"], 49);
+    }
+
+    #[test]
+    fn last_event_for_sid_reads_latest_sid_event_and_legacy_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        append_event(&path, &json!({"event": "old", "sid": "s1"})).unwrap();
+        append_event(&path, &json!({"event": "other", "sid": "s2"})).unwrap();
+        append_event(&path, &json!({"event": "new", "sid": "s1"})).unwrap();
+        append_event(&path, &json!({"event": "legacy", "session_id": "legacy-1"})).unwrap();
+
+        assert_eq!(
+            last_event_for_sid(&path, "s1").unwrap().unwrap()["event"],
+            "new"
+        );
+        assert_eq!(
+            last_event_for_sid(&path, "legacy-1").unwrap().unwrap()["event"],
+            "legacy"
+        );
+        assert!(last_event_for_sid(&path, "missing").unwrap().is_none());
     }
 }

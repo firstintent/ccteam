@@ -178,13 +178,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // -- 6. Health check + optional wizard --------------------------
     let bin = current_ccteam_bin().ok();
     let claude = Command::new("claude").arg("--version").output();
-    // V0.8 W1 — `tmux -V` probe routes through the canonical
-    // `ccteam_core::tmux_available()` helper (re-exported from
-    // `ccteam_harness::tmux_ops`) but the wizard wants a version string,
-    // not a bool. Keep the inline `Command` here; the V0.9 retirement
-    // of tmux.rs will swap this once tmux_available exposes the
-    // version string too.
-    let tmux = Command::new("tmux").arg("-V").output();
+    let tmux = ccteam_core::tmux_version();
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -224,10 +218,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             .push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
     }
     match &tmux {
-        Ok(o) if o.status.success() => out.push_str(&format!(
-            "  tmux     : {}\n",
-            String::from_utf8_lossy(&o.stdout).trim()
-        )),
+        Some(version) => out.push_str(&format!("  tmux     : {version}\n")),
         _ => {
             out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n")
         }
@@ -256,9 +247,16 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     }
 
     out.push_str("\nnext:\n");
-    out.push_str("  - edit .ccteam/workflow.yaml + .claude/agents/<role>.md to your taste\n");
-    out.push_str("  - ccteam config               # register MCP / set IM token / prefs\n");
-    out.push_str("  - ccteam start                # boots gateway + web\n");
+    out.push_str("  1. install: keep `ccteam` on PATH and install the Claude/Codex plugin\n");
+    out.push_str("  2. init: this project is now initialized\n");
+    out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
+    out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
+    out.push_str("  5. pair: send `/pair <code>` in IM, if your channel needs pairing\n");
+    out.push_str(
+        "  6. cd: send `/cd <project>`; the first message starts the default cto session\n",
+    );
+    out.push_str("  role tip: roleless uses project CLAUDE.md, cto is the default guide, work roles live in .claude/agents/<role>.md\n");
+    out.push_str("  guide: docs/usage.md\n");
     Ok(out)
 }
 
@@ -3412,6 +3410,11 @@ fn render_ls_json(
             let cost_summary =
                 cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
                     .unwrap_or_default();
+            let last_event =
+                ccteam_core::progress::last_event(&paths.progress_jsonl(&p.state.slug))
+                    .ok()
+                    .flatten();
+            let stall = stall_level(last_event.as_ref(), p.stall_silent_seconds);
             json!({
                 "slug": p.state.slug,
                 "current_phase": p.state.current_phase,
@@ -3428,7 +3431,7 @@ fn render_ls_json(
                     .state
                     .last_progress_event_at
                     .map(|t| t.to_rfc3339()),
-                "stall_level": stall_level(p.stall_silent_seconds),
+                "stall_level": stall,
             })
         })
         .collect();
@@ -3592,16 +3595,8 @@ fn phase_state_str(s: &PhaseState) -> &'static str {
     }
 }
 
-pub(crate) fn stall_level(silent_s: u64) -> &'static str {
-    if silent_s >= 30 * 60 {
-        "escalate"
-    } else if silent_s >= 15 * 60 {
-        "suspicious"
-    } else if silent_s >= 5 * 60 {
-        "warn"
-    } else {
-        "ok"
-    }
+pub(crate) fn stall_level(last_event: Option<&Value>, silent_s: u64) -> &'static str {
+    ccteam_core::stall::classify_progress_stall(last_event, silent_s).level
 }
 
 /// Collapse the `stall_level` tiers into the short verdict word the
@@ -3609,12 +3604,9 @@ pub(crate) fn stall_level(silent_s: u64) -> &'static str {
 /// instead of decoding raw silence seconds. `escalate`/`suspicious`
 /// both surface as `STUCK` (silent long enough to warrant a takeover),
 /// `warn` stays `warn`, everything else is `OK`.
-pub(crate) fn stall_verdict(silent_s: u64) -> &'static str {
-    match stall_level(silent_s) {
-        "escalate" | "suspicious" => "STUCK",
-        "warn" => "warn",
-        _ => "OK",
-    }
+#[cfg(test)]
+pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'static str {
+    ccteam_core::stall::classify_progress_stall(last_event, silent_s).verdict
 }
 
 /// One actionable hint line for a warn-or-higher project: the exact
@@ -3622,6 +3614,13 @@ pub(crate) fn stall_verdict(silent_s: u64) -> &'static str {
 pub(crate) fn stall_takeover_hint(slug: &str, silent: &str) -> String {
     format!(
         "{slug} silent {silent} — `ccteam internal peek {slug}` then \
+         `ccteam internal attach {slug}` to take over"
+    )
+}
+
+pub(crate) fn stall_takeover_hint_for_session(slug: &str, sid: &str, silent: &str) -> String {
+    format!(
+        "{slug} session {sid} silent {silent} — `ccteam internal peek {slug}` then \
          `ccteam internal attach {slug}` to take over"
     )
 }
@@ -5242,6 +5241,32 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn run_peek_default_rmux_does_not_shell_out_to_tmux() {
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+
+        let old_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("CCTEAM_HOME", tmp.path().join("ccteam-home"));
+        std::env::set_var("CCTEAM_MUX_BACKEND", "rmux");
+
+        let result = run_peek_with_role(&paths, "missing", None);
+
+        std::env::remove_var("CCTEAM_MUX_BACKEND");
+        match old_home {
+            Some(path) => std::env::set_var("CCTEAM_HOME", path),
+            None => std::env::remove_var("CCTEAM_HOME"),
+        }
+
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("rmux"),
+            "peek should fail through the rmux backend, got: {msg}"
+        );
+    }
+
     /// v0.8.8 B1 — `stop_project_chat_sessions` consults the *injected*
     /// [`ProcessBackend`], not shell `tmux` directly. The deterministic
     /// list+kill+absent semantics (which need a single live tokio runtime
@@ -5367,14 +5392,17 @@ mod tests {
 
     #[test]
     fn stall_verdict_classifies_silence_tiers() {
-        // 0s → OK, 5m → warn, 15m+/30m+ both collapse to STUCK so the
-        // status row prints a verdict instead of raw seconds.
-        assert_eq!(stall_verdict(0), "OK");
-        assert_eq!(stall_verdict(5 * 60), "warn");
-        assert_eq!(stall_verdict(15 * 60), "STUCK");
-        // Past the escalate threshold (30m) the project is STUCK and the
-        // takeover hint names the exact peek → attach sequence.
-        assert_eq!(stall_verdict(30 * 60), "STUCK");
+        // D4: pure age can warn, but only a file-backed watchdog timeout
+        // (`chat_turn_timeout` / stuck:true in progress.jsonl) may say STUCK.
+        assert_eq!(stall_verdict(None, 0), "OK");
+        assert_eq!(stall_verdict(None, 5 * 60), "warn");
+        assert_eq!(stall_verdict(None, 15 * 60), "warn");
+        assert_eq!(stall_verdict(None, 30 * 60), "warn");
+        let timeout = serde_json::json!({
+            "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+            "stuck": true,
+        });
+        assert_eq!(stall_verdict(Some(&timeout), 0), "STUCK");
         let hint = stall_takeover_hint("dev-checkout", "31m");
         assert!(hint.contains("dev-checkout"), "hint names the slug: {hint}");
         assert!(hint.contains("silent 31m"), "hint shows silence: {hint}");
@@ -5673,6 +5701,39 @@ mod tests {
         assert_eq!(cfg.projects.len(), 1);
         assert_eq!(cfg.projects[0].slug, "f72-fresh");
         assert_eq!(cfg.projects[0].team, "dev");
+    }
+
+    #[test]
+    fn run_init_next_block_names_shortest_path_and_role_modes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let out = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(tmp.path().join("onboard-demo")),
+                slug: Some("onboard-demo".into()),
+                team: Some("dev".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        for needle in [
+            "1. install:",
+            "2. init:",
+            "3. config:",
+            "4. start:",
+            "5. pair:",
+            "6. cd:",
+            "roleless uses project CLAUDE.md",
+            "cto is the default guide",
+            "work roles live in .claude/agents/<role>.md",
+            "docs/usage.md",
+        ] {
+            assert!(
+                out.contains(needle),
+                "init next block missing {needle:?}:\n{out}"
+            );
+        }
     }
 
     /// V0.5.0 F93b — `ccteam init` without `--mode` defaults to
@@ -6701,13 +6762,46 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                // Drain the request headers (reqwest sends a small POST);
-                // we don't need to parse them for the canned reply.
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                // Drain the complete reqwest POST before replying. Returning
+                // while the client is still writing can make hyper observe a
+                // closed socket and decode an empty response body.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let end = pos + 4;
+                                    header_end = Some(end);
+                                    let headers = String::from_utf8_lossy(&req[..end]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if req.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );

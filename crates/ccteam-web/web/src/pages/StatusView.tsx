@@ -144,27 +144,31 @@ export function StatusCards({
           <div className="text-xs text-text-dim">没有活动会话。</div>
         ) : (
           <div className="space-y-1">
-            {rail.map((s) => (
-              <div key={s.sid} className="text-xs text-text-secondary flex items-center gap-2">
-                <span className="font-mono text-text-dim">{s.project}</span>
-                <span className="text-text-dim">/</span>
-                <span
-                  className={s.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}
+            {rail.map((s) => {
+              const activity = sessionActivityMeta(s.status);
+              return (
+                <div key={s.sid} className="text-xs text-text-secondary flex items-center gap-2">
+                  <span className="font-mono text-text-dim">{s.project}</span>
+                  <span className="text-text-dim">/</span>
+                  <span
+                    className={s.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}
                 >
                   {[s.vendor, s.role || "(无 role)"].filter(Boolean).join(" · ")}
                 </span>
                 <span className="font-mono text-text-dim">{s.sid}</span>
-                <span
-                  className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${
-                    s.status === "live"
-                      ? "bg-status-running/15 text-status-running"
-                      : "bg-brand-500/15 text-brand-400"
-                  }`}
-                >
-                  {s.status === "live" ? "live" : "idle"}
-                </span>
-              </div>
-            ))}
+                  {typeof s.last_activity_seconds === "number" ? (
+                    <span className="text-[10px] text-text-dim">
+                      最近活动 {formatActivityAge(s.last_activity_seconds)}前
+                    </span>
+                  ) : null}
+                  <span
+                    className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${activity.className}`}
+                  >
+                    {activity.label}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -215,4 +219,48 @@ export function StatusCards({
       </div>
     </>
   );
+}
+
+function formatActivityAge(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, Math.floor(seconds))} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} 小时`;
+  return `${Math.floor(hours / 24)} 天`;
+}
+
+function sessionActivityMeta(status: string): { label: string; className: string } {
+  switch (status) {
+    case "stuck":
+      return {
+        label: "疑似卡",
+        className: "bg-status-error/15 text-status-error",
+      };
+    case "working":
+      return {
+        label: "working",
+        className: "bg-status-running/15 text-status-running",
+      };
+    case "stale":
+      return {
+        label: "疑似慢",
+        className: "bg-status-waiting/15 text-status-waiting",
+      };
+    case "idle":
+      return {
+        label: "idle",
+        className: "bg-brand-500/15 text-brand-400",
+      };
+    case "live":
+      return {
+        label: "live",
+        className: "bg-status-running/15 text-status-running",
+      };
+    default:
+      return {
+        label: status || "idle",
+        className: "bg-brand-500/15 text-brand-400",
+      };
+  }
 }

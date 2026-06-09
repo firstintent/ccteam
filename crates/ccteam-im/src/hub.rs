@@ -227,15 +227,33 @@ pub enum HubError {
 /// (open-redirect / typo-squat) becomes a non-success status the caller
 /// rejects as [`HubError::BadStatus`] rather than silently fetching attacker
 /// content.
-fn hardened_client(what: &str) -> Result<reqwest::Client, HubError> {
-    reqwest::Client::builder()
+fn hardened_client(what: &str, url: &str) -> Result<reqwest::Client, HubError> {
+    let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|source| HubError::Http {
-            what: what.to_string(),
-            source,
-        })
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if url_is_loopback(url) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder.build().map_err(|source| HubError::Http {
+        what: what.to_string(),
+        source,
+    })
+}
+
+fn url_is_loopback(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// GET `url` with the hardened client and return the body bytes, enforcing
@@ -289,7 +307,7 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str, what: &str) -> Result<
 /// cache.
 pub async fn fetch_index(base: &str) -> Result<HubIndex, HubError> {
     let url = ccteam_core::catalog_raw_url(base, "index.json");
-    let client = hardened_client("index.json")?;
+    let client = hardened_client("index.json", &url)?;
     let bytes = fetch_bytes(&client, &url, "index.json").await?;
     parse_index(&bytes)
 }
@@ -325,7 +343,7 @@ pub async fn load_catalog(
     }
     // Refresh path: fetch + parse, then persist atomically.
     let url = ccteam_core::catalog_raw_url(base, "index.json");
-    let client = hardened_client("index.json")?;
+    let client = hardened_client("index.json", &url)?;
     let bytes = fetch_bytes(&client, &url, "index.json").await?;
     let index = parse_index(&bytes)?;
     write_cache_atomic(&cache_path, &bytes)?;
@@ -360,7 +378,7 @@ fn write_cache_atomic(cache_path: &Path, bytes: &[u8]) -> Result<(), HubError> {
 /// also be non-empty UTF-8 within the size cap.
 pub async fn fetch_plugin_body(base: &str, plugin: &HubPlugin) -> Result<String, HubError> {
     let url = ccteam_core::catalog_raw_url(base, &plugin.path);
-    let client = hardened_client(&plugin.id)?;
+    let client = hardened_client(&plugin.id, &url)?;
     let buf = fetch_bytes(&client, &url, &plugin.id).await?;
 
     // Integrity check is over the raw bytes (sha256 of the file content).

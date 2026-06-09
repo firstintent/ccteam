@@ -138,8 +138,14 @@ pub fn default_ccteam_root_public() -> PathBuf {
 /// sessions here; the read-only `ccteam sessions` CLI view loads them back via
 /// [`gateway::tracked_chat_session_names`]. Both sides resolve the path through
 /// this one helper so they never drift.
+pub fn gateway_state_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("imd").join("gateway-state.json")
+}
+
+/// Resolve the gateway route-table snapshot for the current user
+/// (`~/.ccteam/imd/gateway-state.json`).
 pub fn default_gateway_state_path() -> PathBuf {
-    default_ccteam_root().join("imd").join("gateway-state.json")
+    gateway_state_path_in(&default_ccteam_root())
 }
 
 /// `<ccteam_root>/imd/registry/` — base registry dir given an explicit
@@ -568,21 +574,6 @@ pub fn list_bots() -> Result<Vec<BotRegistration>> {
     list_bots_in(&default_ccteam_root(), None)
 }
 
-/// V0.8.4 P2b — resolve a bot's "home chat" `(im_platform, im_chat_id)`
-/// from the registry, for zero-addressing outbound (`chat_send_file`).
-/// The agent knows only its slug/role (ambient `CCTEAM_CHAT_{SLUG,ROLE}`
-/// env); the daemon owns chat addressing. Covers the one-bot-one-chat
-/// majority; in-turn precision (reply_to) is deferred.
-pub fn resolve_home_chat(
-    slug: &str,
-    role: &str,
-    bots: &[BotRegistration],
-) -> Option<(String, String)> {
-    bots.iter()
-        .find(|b| b.workflow_slug == slug && b.role == role)
-        .map(|b| (b.im_platform.clone(), b.im_chat_id.clone()))
-}
-
 /// Re-export the daemon entry points. `run_daemon_with_shutdown` is the
 /// V0.6.1 F130 form `ccteam start` consumes (caller-supplied shutdown
 /// future); `run_daemon` is the SIGINT-only convenience wrapper kept
@@ -597,39 +588,5 @@ mod tests {
     fn registration_path_layout() {
         let p = registration_path("dev-foo", "lead");
         assert!(p.ends_with(".ccteam/imd/registry/dev-foo/lead.json"));
-    }
-
-    fn reg(slug: &str, role: &str, platform: &str, chat: &str) -> BotRegistration {
-        BotRegistration {
-            workflow_slug: slug.into(),
-            role: role.into(),
-            vendor: ccteam_harness::AgentVendor::Claude,
-            persona_id: None,
-            im_platform: platform.into(),
-            im_chat_id: chat.into(),
-            chat_handle: None,
-            project_dir: None,
-            created_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn resolve_home_chat_matches_slug_and_role() {
-        let bots = vec![
-            reg("dev-foo", "lead", "telegram", "chat-1"),
-            reg("dev-foo", "reviewer", "telegram", "chat-2"),
-            reg("dev-bar", "lead", "web", "web-9"),
-        ];
-        assert_eq!(
-            resolve_home_chat("dev-foo", "reviewer", &bots),
-            Some(("telegram".to_string(), "chat-2".to_string()))
-        );
-        assert_eq!(
-            resolve_home_chat("dev-bar", "lead", &bots),
-            Some(("web".to_string(), "web-9".to_string()))
-        );
-        // Unregistered slug/role → None (caller surfaces a failure).
-        assert_eq!(resolve_home_chat("dev-foo", "ghost", &bots), None);
-        assert_eq!(resolve_home_chat("nope", "lead", &bots), None);
     }
 }

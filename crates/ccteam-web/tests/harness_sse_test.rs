@@ -54,7 +54,14 @@ async fn spawn_server(state: AppState) -> SocketAddr {
 
 async fn open_sse(addr: SocketAddr, path: &str) -> tokio::io::Lines<impl AsyncBufReadExt + Unpin> {
     let url = format!("http://{addr}{path}");
-    let resp = reqwest::get(&url).await.expect("sse get");
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .expect("sse get");
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers()

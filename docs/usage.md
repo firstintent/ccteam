@@ -17,12 +17,14 @@
 
 > **命令菜单**:daemon 启动时会把**网关自有命令**注册进你的 IM 客户端(Telegram 走 `setMyCommands`)—— 在聊天框敲 `/` 就能看到候选(其余透传给 agent 的 slash 不进菜单,因为它跟当前 vendor 相关、列进去会误导)。随时发 `/help` 看网关命令清单 + 「其余 `/` 命令透传给当前 agent」的说明。
 
-整体上手四步(终端一次性)+ IM 日常:
+整体上手六步(终端一次性 + IM 日常):
 
 ```text
-curl install.sh | sh   →   ccteam init   →   ccteam config   →   ccteam start
-                                                                      ↓
-IM:  /pair <code>  →  /cd <项目>  →  (自动 spawn cto)  →  /role <role>  →  /new · /use · @handle  →  @ccteam status/pause/remove
+install → init → config → start → /pair(+approve) → /cd(自动 spawn cto)
+
+curl install.sh | sh  →  ccteam init  →  ccteam config  →  ccteam start
+                                                              ↓
+IM: /pair <code>  →  /cd <项目>  →  直接发任务 / /role <role> / /new · /use · @handle
 ```
 
 ---
@@ -51,6 +53,14 @@ ccteam 不打包 Claude / Codex,调用你机器上的真实 CLI。本版主驱�
 claude --version          # 必需;需要时按提示登录
 codex --version           # 可选,用 Codex 会话才需要
 ```
+
+模型支持矩阵:
+
+| 路径 | 支持级别 | 说明 |
+|---|---|---|
+| Claude harness + Claude 家族模型(`claude-*` / `sonnet` / `opus` / `haiku`) | first-class | 默认路径;角色 frontmatter 的 `model:` 用这些值最稳。 |
+| Codex harness + Codex/OpenAI 模型 | best-effort | Codex adapter 可用时工作,真机长跑属于 best-effort。 |
+| Claude harness + 非 Claude 模型(如 `deepseek-via-claude`) | 未验证 | ccteam 不阻断,但会在 session 启动时提示“模型未验证”;若空转,改回 `sonnet`/`opus`/`haiku` 后重新 `/new`。 |
 
 在 Claude Code 会话里装插件(`/plugin` 是 Claude Code 内建命令,给 agent 提供 `mcp__ccteam__*` 工具):
 
@@ -183,7 +193,7 @@ Telegram 之外可同时接入飞书/Lark(同一个 `credentials.json`,与 teleg
 - `allowed_user_ids` 是 **open_id**(`ou_...`)白名单,且**留空 = 拒绝所有人**(fail-closed,与 telegram「空=放开」相反,默认更安全);`["*"]` 放开所有人(不建议)。
 - **怎么拿自己的 open_id**:先留个占位(或留空)启动 daemon,给 bot 发一条消息,在 daemon 日志里找这行 —— `Lark WS: ignoring ou_xxxx (not in allowed_users)`,`ou_xxxx` 就是你的 open_id;填回 `allowed_user_ids` 再重启。
 
-改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 当前支持文本 + 富文本(post)收发;图片/文件收发是后续项。
+改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 支持文本 + 富文本(post)+ 图片/文件(image/file/audio/media)收发 —— 收到的图/文件自动落盘供 agent `Read`,`chat_send_file` 也能把图/文件发回(与 Telegram 对等)。
 
 ---
 
@@ -281,7 +291,7 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 **长消息自动分片**:超过 Telegram 4096(UTF-16)上限的回答会被有序切成多条发出(代码块跨片自动闭合/重开),不再截断丢数据。
 
-**发图 / 发文件给 bot**:在 TG 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。>20MB 拒收。
+**发图 / 发文件给 bot**:在 TG 或 飞书/Lark 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。TG >20MB / 飞书 >30MB 拒收。
 
 **bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`;图 ≤10MB / 文件 ≤50MB,超限或不存在返回结构化 error)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
 
@@ -523,8 +533,8 @@ tail -120 /tmp/ccteam.log
 
 1. **`ccteam: command not found`** — `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"`。
 2. **Telegram 不回 / `drop msg from non-allowed chat`** — chat id 不在 allowlist,或改了凭证没重启:编辑 `~/.ccteam/im/credentials.json` 的 `allowed_chat_ids`(或重跑 `ccteam config`)→ `ccteam stop && ccteam start`。
-3. **IM 收到 `gateway error: ...`(pane 死 / socket 断)** — `ccteam stop && ccteam start`,再发同一 `@handle`;仍失败用 `/new claude reviewer2` 开新 session。
-4. **`gateway error: turn timed out ...`** — 等一会重试;长上下文先 `@bot /compact`;反复超时就新建 session。
-5. **`/cd` / `/new` 报 `unknown project`** — 项目没 init 或 daemon 没加载:`cd <repo> && ccteam init` → `ccteam stop && ccteam start` → IM 里 `/projects` 确认 → `/cd <s>`。
+3. **IM 收到 `发送失败: ... 下一步: ...`(pane 死 / socket 断)** — `ccteam stop && ccteam start`,再发同一 `@handle`;仍失败用 `/new claude reviewer2` 开新 session。
+4. **收到 `会话暂时没有产出: ... 下一步: ...` 或超时提示** — 等一会重试;长上下文先 `@bot /compact`;反复超时就新建 session。
+5. **`/cd` / `/new` 报 `项目不存在: ... 下一步: ...`** — 项目没 init 或 daemon 没加载:`cd <repo> && ccteam init` → `ccteam stop && ccteam start` → IM 里 `/projects` 确认 → `/cd <s>`。
 
 > IM 路径里的 Claude session 默认 `skip`(`--dangerously-skip-permissions`,YOLO 模式、无批准门)——只把 bot 暴露给可信 chat,bot token 不进 git。要逐工具人工批准,用 `/new <vendor> <role> hitl` 起一个 HITL session(见 §6「人工批准模式」)。

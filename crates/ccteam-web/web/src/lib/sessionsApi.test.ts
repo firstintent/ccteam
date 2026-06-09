@@ -30,6 +30,13 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+function textResponse(status: number, body: string): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "text/html" },
+  });
+}
+
 describe("sessionsApi url builders", () => {
   it("targets the gateway s{n} namespace under /api/v1", () => {
     expect(sessionsUrl("dex-ui")).toBe("/api/v1/projects/dex-ui/sessions");
@@ -110,6 +117,17 @@ describe("sessionsApi", () => {
     expect(got.accepted).toBe(true);
   });
 
+  it("submitTurn lifts the server human error body", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(502, {
+        error: "发送失败: tmux session missing。下一步: 请重试；如果仍失败，刷新会话列表或重新 /new。",
+      }),
+    );
+    await expect(submitTurn("s2", "review")).rejects.toThrow(
+      "发送失败: tmux session missing",
+    );
+  });
+
   it("stopSession POSTs to /sessions/{sid}/stop", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse(200, { stopped: true }));
@@ -148,7 +166,9 @@ describe("sessionsApi", () => {
 
   it("createSession POSTs role+vendor+permission_mode to the project list", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(jsonResponse(201, { sid: "s4" }));
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(201, { sid: "s4", model_warning: "模型提示: deepseek" }),
+    );
     const got = await createSession("dex-ui", {
       role: "cto",
       vendor: "claude",
@@ -161,6 +181,7 @@ describe("sessionsApi", () => {
       body: JSON.stringify({ role: "cto", vendor: "claude", permission_mode: "hitl" }),
     });
     expect(got.sid).toBe("s4");
+    expect(got.model_warning).toContain("deepseek");
   });
 
   it("createSession omits optional fields when not given", async () => {
@@ -169,6 +190,37 @@ describe("sessionsApi", () => {
     await createSession("dex-ui", { role: "cto" });
     const body = JSON.parse(vi.mocked(globalThis.fetch).mock.calls[0][1]!.body as string);
     expect(body).toEqual({ role: "cto" });
+  });
+
+  it("createSession lifts the server human error body", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(500, {
+        ok: false,
+        error: "会话启动失败: simulated start failure。下一步: 请检查项目和角色后重试。",
+      }),
+    );
+    await expect(createSession("dex-ui", { role: "cto" })).rejects.toThrow(
+      "会话启动失败: simulated start failure",
+    );
+  });
+
+  it("caps non-JSON error bodies and prefixes the HTTP status", async () => {
+    const html = `<html>${"x".repeat(1000)}</html>`;
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(textResponse(500, html));
+    try {
+      await listSessions("dex-ui");
+      throw new Error("expected listSessions to fail");
+    } catch (e) {
+      expect(e).toBeInstanceOf(Error);
+      const message = (e as Error).message;
+      expect(message).toMatch(/^HTTP 500: <html>x+/);
+      expect(message.length).toBeLessThanOrEqual(210);
+    }
+  });
+
+  it("keeps structured JSON error text verbatim", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(500, { error: "x" }));
+    await expect(listSessions("dex-ui")).rejects.toThrow("x");
   });
 
   it("maps 401 → UNAUTHENTICATED and 404 → NOT_FOUND", async () => {

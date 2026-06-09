@@ -277,3 +277,56 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared inbound-attachment staging helpers (V0.8.4 P2a). Every provider
+// that downloads inbound files (telegram, lark, …) routes through these so
+// the staging layout and the name-sanitization rule stay identical across
+// channels — a fix in one place protects every channel's `image_path="…"`
+// turn-text attribute.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Staging dir for downloaded inbound attachments (channel-scoped — the
+/// routing to a project/role happens later in the gateway).
+pub(crate) fn inbound_staging_dir() -> std::path::PathBuf {
+    crate::default_ccteam_root_public()
+        .join("imd")
+        .join("attachments")
+        .join("inbound")
+}
+
+/// Pure: strip path separators / control chars and cap length so a
+/// platform-supplied name can't traverse out of the staging dir. Also
+/// drops `" < >` so the name can't break (or inject into) the
+/// `<channel image_path="…">` turn-text attribute the gateway builds.
+pub(crate) fn sanitize_attachment_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"' | '<' | '>'))
+        .take(128)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_attachment_name_blocks_traversal_and_control() {
+        assert_eq!(sanitize_attachment_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_attachment_name("a/b/c.png"), "c.png");
+        assert_eq!(sanitize_attachment_name("ok\u{0000}name.txt"), "okname.txt");
+        assert_eq!(sanitize_attachment_name(""), "file");
+        assert_eq!(sanitize_attachment_name("   "), "file");
+        // Quotes/angle brackets would break the `image_path="…"` attr.
+        assert_eq!(sanitize_attachment_name("foo\"bar.pdf"), "foobar.pdf");
+        assert_eq!(sanitize_attachment_name("a<b>c.png"), "abc.png");
+    }
+}

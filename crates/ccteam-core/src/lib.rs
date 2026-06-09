@@ -59,6 +59,7 @@ pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
 // used during project creation (mode inference for new workflows).
 pub mod mode_inferrer;
+pub mod model_support;
 pub mod paths;
 pub mod pending_inject;
 // V0.6.1 F98 — plan-approval ↔ outbox engine. Pure state machine over
@@ -217,6 +218,7 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
+pub use model_support::is_claude_family;
 pub use paths::{
     agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,
     teams_progress_path,
@@ -252,8 +254,9 @@ pub use silence_classifier::{
 };
 pub use skill::LEGACY_SKILL_NAMES;
 pub use stall::{
-    classify as classify_stall, classify_with_thresholds, silent_seconds, StallLevel,
-    StallThresholds, STALL_ESCALATE_SECONDS, STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
+    classify as classify_stall, classify_progress_stall, classify_with_thresholds, silent_seconds,
+    ProgressStallStatus, StallLevel, StallThresholds, STALL_ESCALATE_SECONDS,
+    STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
 pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
 pub use team::{
@@ -268,18 +271,17 @@ pub use team_resolver::{
 pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
     merge_project_mcp_json, probe_project, render_project_mcp_json, render_project_settings,
-    render_project_settings_agent_team, render_workflow_agents_block, render_workflow_template,
-    write_global_helper_templates, write_project_settings, write_project_settings_agent_team,
-    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
-    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
-    CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_AGENT_TEAM_JSON,
-    PROJECT_SETTINGS_JSON,
+    render_workflow_agents_block, render_workflow_template, write_global_helper_templates,
+    write_project_settings, EnabledPluginsSetting, Language, ProjectKind, ProjectProbe,
+    SettingsEnv, WorkflowAgentEntry, WorkflowPreset, WorkflowTemplateCtx,
+    WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD,
+    HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,
     capture_pane_with_ansi_from_session, pid_is_alive, query_pane_dims,
     query_pane_dims_from_session, session_name_for_project, session_name_for_slug, tmux_available,
-    TmuxSession,
+    tmux_version, TmuxSession,
 };
 pub use tool_surface::{
     disable_tool_surface_bootstrap_for_tests, ensure_skills_placeholders,

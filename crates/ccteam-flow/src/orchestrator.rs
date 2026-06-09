@@ -323,12 +323,10 @@ fn snapshot_to_team_spec(snapshot: &serde_json::Value) -> Option<AgentTeamSpec> 
 /// from filesystem watching of `~/.claude/teams/<team>/`. The sixth
 /// (`TeamTeammateIdle`, F94 Wave 2) is hook-only — Anthropic's idle
 /// state is an in-memory signal not surfaced through the
-/// `config.json` / `inboxes/` / `tasks/` files the watcher reads, so
-/// the `TeammateIdle` hook is the only way to capture it. F93b
-/// advanced-path projects install the F94 hook via
-/// `settings.agent-team.json`; F93a primary-path sessions
-/// don't install hooks and have to degrade their idle inference to
-/// 30s-no-message heuristics.
+/// `config.json` / `inboxes/` / `tasks/` files the watcher reads. The
+/// legacy agent-team hook template that emitted this event was retired with
+/// agent-team init; the enum remains only so deferred flow code can still read
+/// old progress rows.
 ///
 /// **Why a typed enum on top of `serde_json::Value`**: the watcher
 /// writes events as untyped JSON (the legacy approach used by every
@@ -401,11 +399,8 @@ pub enum TeamEvent {
         completed_at: String,
         ts: String,
     },
-    /// V0.5.0 F94 — emitted by the F93b advanced-path `TeammateIdle`
-    /// hook (`settings.agent-team.json`). The lead uses this to detect
-    /// "all teammates idle but tasks pending" stall conditions.
-    /// Hook-only: there is no fallback path because Anthropic's idle
-    /// signal is not persisted to disk.
+    /// V0.5.0 F94 — legacy `TeammateIdle` hook row. The hook template is
+    /// retired, but deferred flow code keeps the variant for old progress rows.
     #[serde(rename = "team_teammate_idle")]
     TeamTeammateIdle {
         team_name: String,

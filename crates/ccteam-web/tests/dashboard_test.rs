@@ -32,9 +32,14 @@ async fn spawn_server(state: AppState) -> SocketAddr {
 
 fn nofollow() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .unwrap()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 async fn assert_root_redirects_to_spa(paths: CcteamPaths) {
@@ -93,7 +98,9 @@ async fn dashboard_root_redirect_is_independent_of_team_kind() {
 async fn dashboard_followed_redirect_reaches_spa_index() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
-    let resp = reqwest::get(format!("http://{addr}/"))
+    let resp = client()
+        .get(format!("http://{addr}/"))
+        .send()
         .await
         .expect("GET / with default redirect policy");
     assert_eq!(resp.status(), 200);

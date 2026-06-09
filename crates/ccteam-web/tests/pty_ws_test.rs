@@ -18,6 +18,7 @@
 //! the registry's mutex can churn on tmux-server-wide state if we
 //! don't serialize.
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,28 @@ const SUBPROTOCOL: &str = "ccteam-pty.v1";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+struct EnvGuard {
+    key: &'static str,
+    old: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.old {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 fn unique_slug(test_name: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -52,6 +75,13 @@ fn fake_paths(root: &Path) -> CcteamPaths {
         root: root.join(".ccteam"),
         projects_root: root.join("projects"),
     }
+}
+
+fn tmux_backend_for_test(paths: &CcteamPaths) -> (EnvGuard, EnvGuard) {
+    (
+        EnvGuard::set("CCTEAM_MUX_BACKEND", "tmux"),
+        EnvGuard::set("CCTEAM_HOME", paths.root.as_os_str()),
+    )
 }
 
 /// Drop guard: kills the tmux session on test exit.
@@ -228,6 +258,7 @@ async fn ws_with_bearer_header_accepts_upgrade() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("bearer-upgrade");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -272,6 +303,7 @@ async fn ws_no_auth_loopback_accepts_upgrade() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("loopback-upgrade");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -306,6 +338,7 @@ async fn ws_receives_pane_bytes_from_pipe_pane() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("pane-bytes");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -385,6 +418,7 @@ async fn ws_two_clients_share_one_pipe_pane() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("share-pipe");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -443,6 +477,7 @@ async fn ws_resize_control_frame_invokes_tmux_resize() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("resize");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -492,6 +527,7 @@ async fn ws_last_client_disconnect_stops_pipe_pane() {
     }
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let _env = tmux_backend_for_test(&paths);
     let slug = unique_slug("teardown");
     let tmux_name = format!("ccteam-{slug}");
     fixture_workflow_project(&paths, &slug, &tmux_name);
@@ -503,7 +539,9 @@ async fn ws_last_client_disconnect_stops_pipe_pane() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let fifo_path = paths.pty_dir().join(format!("{slug}.fifo"));
+    let fifo_path = paths
+        .pty_dir()
+        .join(format!("{}.fifo", tmux_name.replace('/', "-")));
 
     let state = AppState::with_auth(paths.clone(), AuthState::disabled());
     let addr = spawn(state).await;

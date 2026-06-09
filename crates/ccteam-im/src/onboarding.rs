@@ -20,6 +20,33 @@ use thiserror::Error;
 
 use crate::credentials::{LarkCreds, TelegramCreds};
 
+fn client_for_api_base(
+    api_base: &str,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let builder = reqwest::Client::builder().timeout(timeout);
+    let builder = if api_base_is_loopback(api_base) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder.build()
+}
+
+fn api_base_is_loopback(api_base: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Wrapper around [`TelegramCreds`] that carries the `bot_username`
 /// returned by `getMe` for the skill UX ("在 TG 找 @xxx"). Kept off
 /// the on-disk [`TelegramCreds`] struct so credentials.json stays
@@ -116,9 +143,7 @@ pub async fn telegram_validate_token_with_base(
 ) -> Result<String, OnboardingError> {
     // getMe is a single short request; a 30s budget is plenty and avoids
     // the long-poll timeout the combined flow uses.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = client_for_api_base(api_base, std::time::Duration::from_secs(30))?;
     let me: GetMeResponse = client
         .get(format!("{api_base}/bot{token}/getMe"))
         .send()
@@ -146,9 +171,7 @@ pub async fn telegram_poll_chat_id_with_base(
     api_base: &str,
     poll_seconds: u64,
 ) -> Result<i64, OnboardingError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(poll_seconds + 10))
-        .build()?;
+    let client = client_for_api_base(api_base, std::time::Duration::from_secs(poll_seconds + 10))?;
     poll_first_chat_id(&client, token, api_base, poll_seconds).await
 }
 
@@ -283,9 +306,7 @@ pub async fn lark_setup_with_base(
     use_feishu: bool,
     api_base: &str,
 ) -> Result<LarkSetupResult, OnboardingError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = client_for_api_base(api_base, std::time::Duration::from_secs(30))?;
 
     // tenant_access_token/internal — same body the live channel posts.
     let url = format!("{api_base}/auth/v3/tenant_access_token/internal");

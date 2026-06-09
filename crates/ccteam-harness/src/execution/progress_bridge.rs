@@ -25,7 +25,6 @@ pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
 pub const CHAT_TOOL_CALL_STARTED: &str = "chat_tool_call_started";
 pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
 pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
-pub const CHAT_BOT_MARKER_STUCK: &str = "chat_bot_marker_stuck";
 pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
 pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
 /// v0.8.7 review-fix (R-L1) — a HITL session is PARKED awaiting a human
@@ -140,11 +139,17 @@ pub fn build_chat_session_started_event(role: &str, project_dir: &str) -> Value 
     })
 }
 
-pub fn build_chat_turn_user_prompt_event(role: &str, turn_id: &str, prompt_excerpt: &str) -> Value {
+pub fn build_chat_turn_user_prompt_event(
+    role: &str,
+    sid: &str,
+    turn_id: &str,
+    prompt_excerpt: &str,
+) -> Value {
     let trimmed: String = prompt_excerpt.chars().take(256).collect();
     json!({
         "event": CHAT_TURN_USER_PROMPT,
         "role": role,
+        "sid": sid,
         "turn_id": turn_id,
         "prompt_excerpt": trimmed,
         "ts": Utc::now().to_rfc3339(),
@@ -153,39 +158,48 @@ pub fn build_chat_turn_user_prompt_event(role: &str, turn_id: &str, prompt_excer
 
 pub fn build_chat_turn_completed_event(
     role: &str,
+    sid: &str,
     turn_id: &str,
     usage: &ccteam_cost::UnifiedTokenUsage,
 ) -> Value {
     json!({
         "event": CHAT_TURN_COMPLETED,
         "role": role,
+        "sid": sid,
         "turn_id": turn_id,
         "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
         "ts": Utc::now().to_rfc3339(),
     })
 }
 
-pub fn build_chat_session_reset_event(role: &str) -> Value {
+pub fn build_chat_session_reset_event(role: &str, sid: &str) -> Value {
     json!({
         "event": CHAT_SESSION_RESET,
         "role": role,
+        "sid": sid,
         "ts": Utc::now().to_rfc3339(),
     })
 }
 
-pub fn build_chat_session_reset_event_with_reason(role: &str, reason: &str) -> Value {
+pub fn build_chat_session_reset_event_with_reason(role: &str, sid: &str, reason: &str) -> Value {
     json!({
         "event": CHAT_SESSION_RESET,
         "role": role,
+        "sid": sid,
         "reason": reason,
         "ts": Utc::now().to_rfc3339(),
     })
 }
 
-pub fn build_chat_session_reset_with_recovery_event(role: &str, recovered_turns: usize) -> Value {
+pub fn build_chat_session_reset_with_recovery_event(
+    role: &str,
+    sid: &str,
+    recovered_turns: usize,
+) -> Value {
     json!({
         "event": CHAT_SESSION_RESET_WITH_RECOVERY,
         "role": role,
+        "sid": sid,
         "recovered_turns": recovered_turns,
         "ts": Utc::now().to_rfc3339(),
     })
@@ -229,15 +243,6 @@ pub fn build_chat_marker_self_heal_attempt_event(role: &str, attempt_n: u32) -> 
     })
 }
 
-pub fn build_chat_bot_marker_stuck_event(role: &str, attempts: u32) -> Value {
-    json!({
-        "event": CHAT_BOT_MARKER_STUCK,
-        "role": role,
-        "attempts": attempts,
-        "ts": Utc::now().to_rfc3339(),
-    })
-}
-
 pub fn build_chat_turn_running_long_event(
     role: &str,
     slug: &str,
@@ -256,6 +261,7 @@ pub fn build_chat_turn_running_long_event(
 
 pub fn build_chat_turn_timeout_event(
     role: &str,
+    sid: &str,
     slug: &str,
     turn_id: &str,
     elapsed_sec: u64,
@@ -263,6 +269,7 @@ pub fn build_chat_turn_timeout_event(
     json!({
         "event": CHAT_TURN_TIMEOUT,
         "role": role,
+        "sid": sid,
         "slug": slug,
         "turn_id": turn_id,
         "elapsed_sec": elapsed_sec,

@@ -59,7 +59,7 @@ async fn spawn(state: AppState) -> SocketAddr {
 /// e2e canary self-contained.
 async fn open_sse(addr: SocketAddr, path: &str) -> tokio::io::Lines<impl AsyncBufReadExt + Unpin> {
     let url = format!("http://{addr}{path}");
-    let resp = reqwest::get(&url).await.expect("sse get");
+    let resp = client().get(&url).send().await.expect("sse get");
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers()
@@ -74,6 +74,10 @@ async fn open_sse(addr: SocketAddr, path: &str) -> tokio::io::Lines<impl AsyncBu
     let reader = tokio_util::io::StreamReader::new(mapped);
     let buf = tokio::io::BufReader::new(reader);
     buf.lines()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 async fn read_one_event(
@@ -149,6 +153,7 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
     let app_state = AppState::new(paths.clone());
     let addr = spawn(app_state).await;
     let nofollow = reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .build()
         .unwrap();
@@ -168,7 +173,9 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
         "/app/",
     );
 
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects"))
+        .send()
         .await
         .expect("GET /api/v1/projects");
     assert_eq!(resp.status(), 200, "projects API must return 200");
@@ -196,7 +203,9 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
         format!("/app/p/{slug}"),
     );
 
-    let resp = reqwest::get(format!("http://{addr}/api/v1/projects/{slug}"))
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/projects/{slug}"))
+        .send()
         .await
         .expect("GET /api/v1/projects/<slug>");
     assert_eq!(resp.status(), 200, "project JSON must return 200");

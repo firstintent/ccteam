@@ -38,6 +38,8 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 }
 
 async fn spawn_server() -> SocketAddr {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
     let tmp = TempDir::new().unwrap();
     let state = AppState::new(fake_paths(tmp.path()));
     // SPA asset routes don't touch the filesystem; let the TempDir go.

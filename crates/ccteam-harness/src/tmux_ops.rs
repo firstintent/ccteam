@@ -486,11 +486,17 @@ pub fn pid_is_alive(pid: i32) -> bool {
 /// Probe whether tmux is installed and runnable. Used to skip
 /// integration tests gracefully on machines without tmux.
 pub fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tmux_version().is_some()
+}
+
+/// Return the installed tmux version string (`tmux -V`) when tmux is runnable.
+pub fn tmux_version() -> Option<String> {
+    let output = Command::new("tmux").arg("-V").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!version.is_empty()).then_some(version)
 }
 
 /// List every live tmux session on the current server, returning bare

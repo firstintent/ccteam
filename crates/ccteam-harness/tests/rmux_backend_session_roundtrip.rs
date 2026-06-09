@@ -209,9 +209,11 @@ async fn subscribe_and_capture_are_byte_faithful() {
         vec![
             "sh".into(),
             "-c".into(),
-            // \033[31m = red, \033[0m = reset. Loop so capture's backlog
-            // and the live subscribe both have raw ESC bytes to observe.
-            "printf '\\033[31mRED\\033[0m\\n'; sleep 30".into(),
+            // \033[31m = red, \033[0m = reset. `cat` keeps the pty
+            // open and echoes the later raw ESC bytes we send below, so
+            // capture's backlog and the live subscribe path both observe
+            // byte-faithful ANSI output.
+            "printf '\\033[31mRED\\033[0m\\n'; exec cat".into(),
         ],
         PathBuf::from("/tmp"),
     );
@@ -234,9 +236,10 @@ async fn subscribe_and_capture_are_byte_faithful() {
     // subscribe → drive the pane to emit fresh bytes, assert a raw
     // OutputChunk carries the ESC byte verbatim.
     let mut stream = backend.subscribe(&id).await.expect("subscribe ok");
-    // Emit a fresh colored line on the live tail.
+    // Emit a fresh colored line on the live tail. Send actual ESC bytes
+    // through cat; a shell command string would only prove prompt/input echo.
     backend
-        .send_text(&id, "printf '\\033[32mGREEN\\033[0m\\n'")
+        .send_text(&id, "\x1b[32mGREEN\x1b[0m")
         .await
         .unwrap();
     backend.send_enter(&id).await.unwrap();

@@ -45,7 +45,6 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::execution::marker_reporter;
 use crate::execution::process_inspect::pane_runs_process;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, hooks_script_from_env,
@@ -59,7 +58,7 @@ use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -76,6 +75,13 @@ impl ClaudeTuiAdapter {
 
 /// Tmux/process session-name prefix for chat-mode bots.
 pub const CHAT_SESSION_PREFIX: &str = "ccteam-chat-";
+
+/// Claude's TUI can lag behind tmux's literal text write just after
+/// startup/reattach. Sending Enter immediately after `send-keys -l`
+/// occasionally leaves the text in the composer without submitting it on real
+/// terminals. Keep this local to the Claude TUI path; one second is below
+/// normal human-perceived turn latency and avoids scraping the pane.
+const SUBMIT_ENTER_SETTLE: Duration = Duration::from_millis(1000);
 
 /// Compose the canonical tmux session name for a chat-mode bot.
 ///
@@ -353,29 +359,87 @@ fn permission_args(mode: PermissionMode) -> Vec<String> {
     }
 }
 
-fn spec_for_resume(
-    role: &str,
-    slug: &str,
-    sid: &str,
-    cwd: &Path,
-    session_id_name: &str,
+#[derive(Clone, Copy)]
+struct ClaudeTuiSpecInput<'a> {
+    role: &'a str,
+    slug: &'a str,
+    sid: &'a str,
+    cwd: &'a Path,
+    session_id_name: &'a str,
+    model_id: Option<&'a str>,
     permission_mode: PermissionMode,
-    secret: &str,
-) -> MuxSessionSpec {
+    secret: &'a str,
+}
+
+impl<'a> ClaudeTuiSpecInput<'a> {
+    fn new(
+        role: &'a str,
+        slug: &'a str,
+        sid: &'a str,
+        cwd: &'a Path,
+        session_id_name: &'a str,
+    ) -> Self {
+        Self {
+            role,
+            slug,
+            sid,
+            cwd,
+            session_id_name,
+            model_id: None,
+            permission_mode: PermissionMode::Skip,
+            secret: "",
+        }
+    }
+
+    fn with_model_id(mut self, model_id: Option<&'a str>) -> Self {
+        self.model_id = model_id;
+        self
+    }
+
+    fn with_permission_mode(mut self, permission_mode: PermissionMode) -> Self {
+        self.permission_mode = permission_mode;
+        self
+    }
+
+    fn with_secret(mut self, secret: &'a str) -> Self {
+        self.secret = secret;
+        self
+    }
+}
+
+fn claude_spawn_argv_base(input: ClaudeTuiSpecInput<'_>) -> Vec<String> {
     // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
     // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。
     let mut argv = vec![claude_bin()];
-    if !role.is_empty() {
+    if !input.role.is_empty() {
         argv.push("--agent".to_string());
-        argv.push(role.to_string());
+        argv.push(input.role.to_string());
     }
-    argv.extend(permission_args(permission_mode));
+    if let Some(model) = input.model_id.map(str::trim).filter(|m| !m.is_empty()) {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    argv.extend(permission_args(input.permission_mode));
+    argv
+}
+
+fn spec_for_resume(input: ClaudeTuiSpecInput<'_>) -> MuxSessionSpec {
+    let mut argv = claude_spawn_argv_base(input);
     argv.push("--resume".to_string());
-    argv.push(session_id_name.to_string());
+    argv.push(input.session_id_name.to_string());
     // v0.8.8 F1 — pane 名按 sid(`--agent` 仍按 role 绑 persona)。
-    MuxSessionSpec::new(chat_session_name(slug, sid), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug, secret, sid))
-        .with_kind(MuxSessionKind::LongLived)
+    MuxSessionSpec::new(
+        chat_session_name(input.slug, input.sid),
+        argv,
+        input.cwd.to_path_buf(),
+    )
+    .with_env(chat_spawn_env_owned(
+        input.role,
+        input.slug,
+        input.secret,
+        input.sid,
+    ))
+    .with_kind(MuxSessionKind::LongLived)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the `--resume` failure fallback: fresh
@@ -384,24 +448,8 @@ fn spec_for_resume(
 /// [`spec_for_new`], so it inherits the same `--agent <role>` persona binding
 /// (v0.8.6 W1 session-is-the-role keystone) — or, when `role` is empty
 /// (v0.8.8 F2 roleless), the same `--agent`-omitted bare-claude shape.
-fn spec_for_fresh(
-    role: &str,
-    slug: &str,
-    sid: &str,
-    cwd: &Path,
-    session_id_name: &str,
-    permission_mode: PermissionMode,
-    secret: &str,
-) -> MuxSessionSpec {
-    spec_for_new(
-        role,
-        slug,
-        sid,
-        cwd,
-        session_id_name,
-        permission_mode,
-        secret,
-    )
+fn spec_for_fresh(input: ClaudeTuiSpecInput<'_>) -> MuxSessionSpec {
+    spec_for_new(input)
 }
 
 /// V0.8 W2c — `MuxSessionSpec` for the brand-new (session-absent) path:
@@ -411,30 +459,23 @@ fn spec_for_fresh(
 /// the session-is-the-role keystone (v0.8.6 W1). v0.8.8 F2 — an empty `role`
 /// (roleless) OMITS `--agent` so bare claude reads the project's own
 /// `CLAUDE.md`; the `--name`/sid segment is unconditional.
-fn spec_for_new(
-    role: &str,
-    slug: &str,
-    sid: &str,
-    cwd: &Path,
-    session_id_name: &str,
-    permission_mode: PermissionMode,
-    secret: &str,
-) -> MuxSessionSpec {
-    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
-    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。`--name`/
-    // sid 段恒在,roleless 仍要确定性 session jsonl 名供后续 `--resume`。
-    let mut argv = vec![claude_bin()];
-    if !role.is_empty() {
-        argv.push("--agent".to_string());
-        argv.push(role.to_string());
-    }
-    argv.extend(permission_args(permission_mode));
+fn spec_for_new(input: ClaudeTuiSpecInput<'_>) -> MuxSessionSpec {
+    let mut argv = claude_spawn_argv_base(input);
     argv.push("--name".to_string());
-    argv.push(session_id_name.to_string());
+    argv.push(input.session_id_name.to_string());
     // v0.8.8 F1 — pane 名按 sid(`--agent` 仍按 role 绑 persona)。
-    MuxSessionSpec::new(chat_session_name(slug, sid), argv, cwd.to_path_buf())
-        .with_env(chat_spawn_env_owned(role, slug, secret, sid))
-        .with_kind(MuxSessionKind::LongLived)
+    MuxSessionSpec::new(
+        chat_session_name(input.slug, input.sid),
+        argv,
+        input.cwd.to_path_buf(),
+    )
+    .with_env(chat_spawn_env_owned(
+        input.role,
+        input.slug,
+        input.secret,
+        input.sid,
+    ))
+    .with_kind(MuxSessionKind::LongLived)
 }
 
 fn ccteam_bin_for_hooks() -> String {
@@ -593,6 +634,11 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         // to reload the prior session jsonl (lossless context restore
         // via Anthropic's own CLI surface; R10 守).
         let session_id_name = chat_session_id_name(&ctx.slug, &ctx.sid);
+        let tui_spec_input =
+            ClaudeTuiSpecInput::new(&spec.role, &ctx.slug, &ctx.sid, &ctx.cwd, &session_id_name)
+                .with_model_id(ctx.model_id.as_deref())
+                .with_permission_mode(ctx.permission_mode)
+                .with_secret(&ctx.secret);
         if backend
             .exists(&id)
             .await
@@ -634,15 +680,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     .await
                     .map_err(|e| HarnessError::SpawnFailed(format!("mux kill stale: {e}")))?;
                 backend
-                    .spawn(spec_for_resume(
-                        &spec.role,
-                        &ctx.slug,
-                        &ctx.sid,
-                        &ctx.cwd,
-                        &session_id_name,
-                        ctx.permission_mode,
-                        &ctx.secret,
-                    ))
+                    .spawn(spec_for_resume(tui_spec_input))
                     .await
                     .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn resume: {e}")))?;
 
@@ -666,15 +704,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     // re-spawn fresh.
                     let _ = backend.kill(&id).await;
                     backend
-                        .spawn(spec_for_fresh(
-                            &spec.role,
-                            &ctx.slug,
-                            &ctx.sid,
-                            &ctx.cwd,
-                            &session_id_name,
-                            ctx.permission_mode,
-                            &ctx.secret,
-                        ))
+                        .spawn(spec_for_fresh(tui_spec_input))
                         .await
                         .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn fresh: {e}")))?;
                     // Best-effort emit `chat_session_reset` with
@@ -684,6 +714,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                     if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                         let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
+                            &ctx.sid,
                             "resume_failed_fallback_to_fresh",
                         );
                         if let Err(err) = append_event(&progress_path, &ev) {
@@ -703,15 +734,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             // path is unchanged (operates on turns.jsonl, not Anthropic
             // session jsonl).
             backend
-                .spawn(spec_for_new(
-                    &spec.role,
-                    &ctx.slug,
-                    &ctx.sid,
-                    &ctx.cwd,
-                    &session_id_name,
-                    ctx.permission_mode,
-                    &ctx.secret,
-                ))
+                .spawn(spec_for_new(tui_spec_input))
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("mux spawn new: {e}")))?;
 
@@ -830,6 +853,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("send_keys -l: {e}")))?;
         let literal_ms = sendkeys_t0.elapsed().as_millis() as u64;
+        tokio::time::sleep(SUBMIT_ENTER_SETTLE).await;
         backend
             .send_enter(&id)
             .await
@@ -876,18 +900,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // V0.6.8 F196 — tail_loop needs `slug` so it can consult the
-        // per-bot MarkerReporter registry. Pre-F196 the loop only knew
-        // `role`; the slug is in `raw_extras` (start_thread writes it).
-        let slug = h
-            .raw_extras
-            .get("slug")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         // v0.8.8 F1 — sid 是 turns / cursor / marker 的真实键。tail_loop
         // 用它算 cursor_path / active_session_id_path,使同 (project, role)
-        // 多会话各跟各自的 jsonl,绝不串台。空 sid(旧 handle)回退到 role。
+        // 多会话各跟各自的 jsonl,绝不串台。
         let sid = h
             .raw_extras
             .get("sid")
@@ -910,18 +925,16 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         if let (Some(pdir), Some(cwd)) = (project_dir, cwd) {
             // v0.8.9 — roleless sessions (empty role) ALSO need the transcript
             // tail loop: answer-forwarding reads the transcript regardless of
-            // persona, so gate on a usable KEY (the sid), NOT on a non-empty
-            // role. The previous `if !role.is_empty()` guard was a
+            // persona, so gate on the sid, NOT on a non-empty role. The
+            // previous `if !role.is_empty()` guard was a
             // "session = role"-era leftover that v0.8.8-F2's roleless spawn
             // missed — it silently dropped EVERY roleless reply: `events()`
             // spawned no tail loop, so its stream stayed empty and the gateway
             // pump never observed an ANSWER. The tail key is the sid (turns /
-            // cursor / marker 真实键); the `role` fallback covers only an empty
-            // sid (legacy handle / tests).
-            let key = if sid.is_empty() { role.clone() } else { sid };
-            if !key.is_empty() {
+            // cursor / marker 真实键).
+            if !sid.is_empty() {
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                tokio::spawn(tail_loop(pdir, cwd, slug, role, key, tx, dispatch));
+                tokio::spawn(tail_loop(pdir, cwd, role, sid, tx, dispatch));
             }
         }
 
@@ -1097,10 +1110,8 @@ impl ClaudeTuiAdapter {
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
         // v0.8.8 F1 — marker 现按 sid 存储,与 events()/tail_loop 同键。
-        // 空 sid(旧 handle)回退到 role,保持向后可读。
         let sid = h.raw_extras.get("sid").and_then(|v| v.as_str());
-        let role = h.raw_extras.get("role").and_then(|v| v.as_str());
-        let marker_key = sid.filter(|s| !s.is_empty()).or(role).unwrap_or("");
+        let marker_key = sid.filter(|s| !s.is_empty()).unwrap_or("");
         let parent_dir = anthropic_project_dir(&cwd)?;
         // Marker sid first (deterministic per-session target, set by the
         // chat-progress hook); only trust it if the file actually exists.
@@ -1149,11 +1160,10 @@ impl ClaudeTuiAdapter {
 async fn tail_loop(
     project_dir: PathBuf,
     cwd: PathBuf,
-    slug: String,
     role: String,
     // v0.8.8 F1 — cursor / marker 的存储键(`s<N>`),非 Anthropic 原生
-    // UUID。`role` 仍保留给 observe_marker 的 (slug,role) MarkerReporter
-    // 注册表 + 日志上下文;cursor_path / active_session_id_path 一律按 sid。
+    // UUID。`role` 仍保留给日志上下文;cursor_path /
+    // active_session_id_path 一律按 sid。
     sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
@@ -1204,7 +1214,7 @@ async fn tail_loop(
             );
             // Best-effort fallback to the legacy polling path —
             // shouldn't realistically happen on supported platforms.
-            tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
+            tail_loop_polling(project_dir, cwd, role, sid, tx, dispatch).await;
             return;
         }
     };
@@ -1215,7 +1225,7 @@ async fn tail_loop(
             "claude-tui tail: watch() failed; falling back to plain polling"
         );
         drop(watcher);
-        tail_loop_polling(project_dir, cwd, slug, role, sid, tx, dispatch).await;
+        tail_loop_polling(project_dir, cwd, role, sid, tx, dispatch).await;
         return;
     }
     tracing::info!(
@@ -1239,10 +1249,10 @@ async fn tail_loop(
         &mut silence,
         initial.is_some(),
         &marker_file,
-        &slug,
         &role,
         &project_dir,
         &dispatch,
+        &tx,
     )
     .await;
     if let Some((sid, path)) = initial {
@@ -1276,10 +1286,10 @@ async fn tail_loop(
                             &mut silence,
                             true,
                             &marker_file,
-                            &slug,
                             &role,
                             &project_dir,
                             &dispatch,
+                            &tx,
                         )
                         .await;
                         sid
@@ -1289,10 +1299,10 @@ async fn tail_loop(
                             &mut silence,
                             false,
                             &marker_file,
-                            &slug,
                             &role,
                             &project_dir,
                             &dispatch,
+                            &tx,
                         )
                         .await;
                         continue;
@@ -1336,10 +1346,10 @@ async fn tail_loop(
                     &mut silence,
                     pair.is_some(),
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 if let Some((sid, path)) = pair {
@@ -1353,45 +1363,31 @@ async fn tail_loop(
     }
 }
 
-/// V0.6.8 F196 — single observation point that fans out to both the
-/// F187 in-process WARN gate ([`MarkerSilenceWatch`]) and the
-/// supervisor-side state machine (via the
-/// [`ccteam_harness::execution::marker_reporter`] registry).
+/// Single observation point for the F187 in-process WARN gate
+/// ([`MarkerSilenceWatch`]).
 ///
 /// Called once per tail-loop tick (initial sweep, every inotify
 /// CREATE/MODIFY event, and every 2-second safety-net tick in
-/// `tail_loop`; every iteration of the poll-only fallback). The
-/// supervisor counts the misses and escalates to a session reset when
-/// the consecutive run crosses its threshold — `tail_loop` stays a
-/// fire-and-forget reporter and doesn't see the heal decision.
-///
-/// Lookup failures (no supervisor registered, supervisor dropped) are
-/// silently swallowed — the corresponding bot's state machine no
-/// longer matters.
+/// `tail_loop`; every iteration of the poll-only fallback).
 async fn observe_marker(
     silence: &mut MarkerSilenceWatch,
     marker_present: bool,
     marker_file: &Path,
-    slug: &str,
     role: &str,
     project_dir: &Path,
     dispatch: &tracing::Dispatch,
+    tx: &mpsc::Sender<ThreadEvent>,
 ) {
-    tracing::dispatcher::with_default(dispatch, || {
+    let user_message = tracing::dispatcher::with_default(dispatch, || {
         silence.observe(marker_present, marker_file, role, project_dir)
     });
-    // Empty slug means raw_extras was malformed at `events()` entry —
-    // the registry uses `(slug, role)` as the key so an empty slug
-    // would never resolve. Skip the lookup to avoid noise.
-    if slug.is_empty() {
-        return;
-    }
-    if let Some(reporter) = marker_reporter::lookup(slug, role) {
-        if marker_present {
-            reporter.report_marker_found().await;
-        } else {
-            reporter.report_marker_missing().await;
-        }
+    if let Some(message) = user_message {
+        let _ = tx
+            .send(ThreadEvent::Error(ThreadErrorEvent {
+                kind: "tail_marker_missing".to_string(),
+                message,
+            }))
+            .await;
     }
 }
 
@@ -1456,28 +1452,34 @@ impl MarkerSilenceWatch {
         marker_file: &Path,
         role: &str,
         project_dir: &Path,
-    ) {
+    ) -> Option<String> {
         if marker_present {
             self.first_missing = None;
             self.warned = false;
-            return;
+            return None;
         }
         let started = *self.first_missing.get_or_insert_with(Instant::now);
         if !self.warned && started.elapsed() >= self.warn_after {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
             tracing::warn!(
                 event = "tail_marker_missing",
                 role = %role,
                 project_dir = %project_dir.display(),
                 marker = %marker_file.display(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 "chat-mode tail waiting for SessionStart hook — likely env-propagation failure if this persists"
             );
             self.warned = true;
+            return Some(
+                "会话暂时没有产出: ccteam 还没看到 Claude 的 SessionStart 标记，可能是 hook 没有启动或环境变量没有传到会话。下一步: 请先重试发送；如果仍无回复，运行 `ccteam doctor` 检查 hook，或重启 `ccteam start`。"
+                    .to_string(),
+            );
         }
+        None
     }
 }
 
-/// Read just the sid from `<project>/.ccteam/chat/<role>/active-session-id`.
+/// Read just the sid from `<project>/.ccteam/chat/<sid>/active-session-id`.
 /// Returns `None` when the marker is absent (hook hasn't fired yet) or
 /// unreadable. Trims whitespace because the hook writes the raw sid
 /// without a trailing newline but a future writer might.
@@ -1547,10 +1549,9 @@ async fn drain_path(
 async fn tail_loop_polling(
     project_dir: PathBuf,
     cwd: PathBuf,
-    slug: String,
     role: String,
     // v0.8.8 F1 — 同 tail_loop:cursor / marker 按 sid;role 仅供
-    // observe_marker 注册表 + 日志。
+    // 日志。
     sid: String,
     tx: mpsc::Sender<ThreadEvent>,
     dispatch: tracing::Dispatch,
@@ -1590,10 +1591,10 @@ async fn tail_loop_polling(
                     &mut silence,
                     true,
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 pair
@@ -1603,10 +1604,10 @@ async fn tail_loop_polling(
                     &mut silence,
                     false,
                     &marker_file,
-                    &slug,
                     &role,
                     &project_dir,
                     &dispatch,
+                    &tx,
                 )
                 .await;
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
@@ -1655,6 +1656,16 @@ pub use crate::execution::transcript_tail::anthropic_project_dir as resolve_anth
 mod tests {
     use super::*;
 
+    fn test_spec_input<'a>(
+        role: &'a str,
+        slug: &'a str,
+        sid: &'a str,
+        cwd: &'a Path,
+        session_id_name: &'a str,
+    ) -> ClaudeTuiSpecInput<'a> {
+        ClaudeTuiSpecInput::new(role, slug, sid, cwd, session_id_name)
+    }
+
     #[test]
     fn permission_args_skip_is_the_skip_flag() {
         // Default (skip) → exactly the single skip flag, unchanged behavior.
@@ -1680,7 +1691,7 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
         // Skip: carries the skip flag, not --permission-mode.
         // v0.8.8 F1 — 第三参为 sid。
-        let skip = spec_for_new("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        let skip = spec_for_new(test_spec_input("dev", "slug", "s1", cwd, "sid-1"));
         assert!(skip
             .argv
             .iter()
@@ -1697,7 +1708,10 @@ mod tests {
         );
         assert!(skip.argv.iter().any(|a| a == "--name"));
         // Hitl: drops the skip flag, carries --permission-mode default.
-        let hitl = spec_for_new("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Hitl, "");
+        let hitl = spec_for_new(
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1")
+                .with_permission_mode(PermissionMode::Hitl),
+        );
         assert!(!hitl
             .argv
             .iter()
@@ -1711,7 +1725,10 @@ mod tests {
     fn spec_for_resume_argv_reflects_permission_mode() {
         let cwd = std::path::Path::new("/tmp/cc-permmode");
         // v0.8.8 F1 — 第三参为 sid。
-        let hitl = spec_for_resume("dev", "slug", "s1", cwd, "sid-1", PermissionMode::Hitl, "");
+        let hitl = spec_for_resume(
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1")
+                .with_permission_mode(PermissionMode::Hitl),
+        );
         assert!(!hitl
             .argv
             .iter()
@@ -1727,7 +1744,7 @@ mod tests {
     #[test]
     fn spec_for_new_roleless_omits_agent() {
         let cwd = std::path::Path::new("/tmp/cc-roleless");
-        let spec = spec_for_new("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        let spec = spec_for_new(test_spec_input("", "slug", "s1", cwd, "sid-1"));
         assert!(
             !spec.argv.iter().any(|a| a == "--agent"),
             "roleless spawn must omit --agent, got: {:?}",
@@ -1747,7 +1764,7 @@ mod tests {
     #[test]
     fn spec_for_resume_roleless_omits_agent() {
         let cwd = std::path::Path::new("/tmp/cc-roleless");
-        let spec = spec_for_resume("", "slug", "s1", cwd, "sid-1", PermissionMode::Skip, "");
+        let spec = spec_for_resume(test_spec_input("", "slug", "s1", cwd, "sid-1"));
         assert!(
             !spec.argv.iter().any(|a| a == "--agent"),
             "roleless resume must omit --agent, got: {:?}",
@@ -1766,13 +1783,7 @@ mod tests {
     fn spec_env_carries_secret_only_when_present() {
         let cwd = std::path::Path::new("/tmp/cc-secret");
         let with = spec_for_new(
-            "dev",
-            "slug",
-            "s1",
-            cwd,
-            "sid-1",
-            PermissionMode::Skip,
-            "deadbeef",
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1").with_secret("deadbeef"),
         );
         let pairs: std::collections::HashMap<&str, &str> = with
             .env
@@ -1785,7 +1796,7 @@ mod tests {
         assert_eq!(pairs.get("CCTEAM_CHAT_SID"), Some(&"s1"));
 
         // 空 secret 略过 CCTEAM_CHAT_SECRET;空 sid 略过 CCTEAM_CHAT_SID。
-        let without = spec_for_new("dev", "slug", "", cwd, "sid-1", PermissionMode::Skip, "");
+        let without = spec_for_new(test_spec_input("dev", "slug", "", cwd, "sid-1"));
         assert!(
             !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SECRET"),
             "empty secret must omit CCTEAM_CHAT_SECRET, got: {:?}",
@@ -1795,6 +1806,48 @@ mod tests {
             !without.env.iter().any(|(k, _)| k == "CCTEAM_CHAT_SID"),
             "empty sid must omit CCTEAM_CHAT_SID, got: {:?}",
             without.env
+        );
+    }
+
+    #[test]
+    fn spec_argv_carries_role_model_when_present() {
+        let cwd = std::path::Path::new("/tmp/cc-model");
+        let spec = spec_for_new(
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1")
+                .with_model_id(Some("deepseek-via-claude")),
+        );
+        let model_at = spec
+            .argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("role model must be passed through to claude argv");
+        assert_eq!(
+            spec.argv.get(model_at + 1).map(String::as_str),
+            Some("deepseek-via-claude")
+        );
+
+        let resume = spec_for_resume(
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1")
+                .with_model_id(Some("sonnet"))
+                .with_permission_mode(PermissionMode::Hitl),
+        );
+        let resume_model_at = resume
+            .argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("resume must preserve role model");
+        assert_eq!(
+            resume.argv.get(resume_model_at + 1).map(String::as_str),
+            Some("sonnet")
+        );
+
+        let no_model = spec_for_new(
+            test_spec_input("dev", "slug", "s1", cwd, "sid-1").with_model_id(Some("  ")),
+        );
+        assert!(
+            !no_model.argv.iter().any(|a| a == "--model"),
+            "blank model must not add a claude --model argv pair: {:?}",
+            no_model.argv
         );
     }
 

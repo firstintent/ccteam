@@ -30,7 +30,7 @@
 | **vendor 原生项目知识** | 痛点 10 + 痛点 13 | 项目知识层归 vendor:Claude session 自动读项目 `CLAUDE.md`,Codex 自动读 `AGENTS.md`。ccteam **不生成、不修改、不抑制**这些文件(R8);ccteam 的自定义只在 **role** 层(roleless session 则纯靠项目知识层当 brain)|
 | **resume-by-session-id 会话** | 痛点 8/9 | session 按需 spawn(首条消息触发)+ 按持久 sid resume + 空闲释放;不常驻吊着(state 落盘,重启后 reconnect),避免影子 SoT(R4) |
 | **零交互沙盒** | 痛点 8:每一步都点允许 | IM 路径的 Claude session 走 `--dangerously-skip-permissions`;只把 bot 暴露给可信 chat(`allowed_chat_ids` allowlist) |
-| **失败必须可见** | 痛点 7 + 痛点 11 | gateway 的原则是失败不能静默挂住:submit/turn 超时、Claude tmux pane 死、Codex app-server 断,都翻成 `gateway error: ...` 回到 IM / web |
+| **失败必须可见** | 痛点 7 + 痛点 11 | gateway 的原则是失败不能静默挂住:submit/turn 超时、Claude tmux pane 死、Codex app-server 断,都翻成中文人话 + 下一步建议回到 IM / web |
 | **预算硬上限** | 痛点 5 + 自激励 loop 防失控 | 成本 per-vendor 记账(`ccteam-cost`);`budgets.{claude,codex}.max_cost_usd_per_24h` per-vendor cap;CLAUDE.md $200 全 ccteam 物理上限兜底 |
 | **headless 状态引擎** | 通知层不能改状态 | ccteam 核心是 headless 引擎,IM / web / 标准 API 都是可插拔前端,共用同一 gateway dispatch;任何前端**不得**引入新 LLM 层 —— LLM 推理只发生在 agent session(Claude/Codex)内部 |
 
@@ -310,11 +310,11 @@ gateway 的原则:失败必须可见,不能静默挂住。
 
 | 故障 | 用户看到 | 恢复方式 |
 |---|---|---|
-| agent 启动失败 | `gateway error: ...` | 看 daemon log,确认 `claude` / `codex` 在 `PATH` 且已登录 |
+| agent 启动失败 | `会话启动失败: ... 下一步: ...` | 看 daemon log,确认 `claude` / `codex` 在 `PATH` 且已登录 |
 | 缺 `cto.md` 的旧项目 | `--agent cto` 启动失败 | pre-v1.0「清旧数据 + 重 `ccteam init`」策略;init 必种 cto.md |
-| Claude tmux pane 死 | `gateway error: ...` | `ccteam stop && ccteam start` 再发同一 `@handle`(deterministic 名 reattach;dead pane recreate + `--resume` lossless,失败回退 fresh spawn + emit `chat_session_reset{reason}`) |
-| Codex app-server socket 断 | `gateway error: ...` | 确认 `codex app-server` 可用;重启 daemon(app-server resume 接回 thread) |
-| turn 超时 | `gateway error: turn timed out ...` | 稍后重试;反复出现则 `/compact` 或 `/new` |
+| Claude tmux pane 死 | `发送失败: ... 下一步: ...` | `ccteam stop && ccteam start` 再发同一 `@handle`(deterministic 名 reattach;dead pane recreate + `--resume` lossless,失败回退 fresh spawn + emit `chat_session_reset{reason}`) |
+| Codex app-server socket 断 | `发送失败: ... 下一步: ...` | 确认 `codex app-server` 可用;重启 daemon(app-server resume 接回 thread) |
+| turn 超时 | `发送失败: turn timed out ... 下一步: ...` | 稍后重试;反复出现则 `/compact` 或 `/new` |
 | daemon 被 kill | 短暂离线 | 重新 `ccteam start`;session 和 outbound ledger 恢复 |
 | 某 session context 不可用 | —— | `/new` 建新 session;旧 session 不影响同 chat 其他 session |
 
@@ -441,7 +441,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 
 `crates/ccteam-web/` 是 Vite + React SPA(`build.rs` 在 `cargo build` 时跑 `npm run build` → rust-embed,`CCTEAM_SKIP_WEB_BUILD=1` 跳过);backend axum + SSE,服务 SPA bundle + 标准资源 API(§2.6)+ SSE + WS。
 
-**统一 chat-shell 布局(v0.8.9)**:两套分叉的 SPA 布局(旧 operator UI 的 Dashboard/ProjectDetail/SessionDetail/SessionsList/Teams*/WorkflowView + 各 panel + operator 侧栏/顶栏)**已删**,收敛成**一个** chat 风格外壳(`App.tsx` shell + `ChatConsole.tsx`):顶栏 = crumb + 连接态 + **cost pill**(`CostPill.tsx`,读 `GET /api/v1/status`)+ per-session **Chat | 终端** tab;底部全局导航三视图 = **插件市场**(`MarketplaceView.tsx`,§6.8)/ **Status**(`StatusView.tsx`,轻量 daemon 健康 + sessions live/idle + 今日 cost/budget,读 `GET /api/v1/status`)/ **Settings**(`SettingsPage.tsx`,IM config)。旧 Roles 只读页被插件市场浏览器取代。统一 dark+amber 设计 token。
+**统一 chat-shell 布局(v0.8.9+,v0.8.10 补 UX 状态)**:两套分叉的 SPA 布局(旧 operator UI 的 Dashboard/ProjectDetail/SessionDetail/SessionsList/Teams*/WorkflowView + 各 panel + operator 侧栏/顶栏)**已删**,收敛成**一个** chat 风格外壳(`App.tsx` shell + `ChatConsole.tsx`):顶栏 = crumb + 连接态 + **cost pill**(`CostPill.tsx`,读 `GET /api/v1/status`)+ per-session **Chat | 终端** tab;底部全局导航三视图 = **插件市场**(`MarketplaceView.tsx`,§6.8)/ **Status**(`StatusView.tsx`,轻量 daemon 健康 + sessions live/idle/疑似卡 + 最近活动 + 今日 cost/budget,读既有 `GET /api/v1/status` + `/sessions` 数据)/ **Settings**(`SettingsPage.tsx`,IM config)。旧 Roles 只读页被插件市场浏览器取代。统一 dark+amber 设计 token。
 
 **Authentication**:loopback 免 token;非 loopback 自动生成 `~/.ccteam/web-token`(mode 0600)+ LAN-RCE 倒计时;URL shim `?token=ccteam:<hex>` → HttpOnly cookie + 303 干净 URL。标准 API `/api/v1/*` 全走同一 web-token auth。
 
@@ -502,7 +502,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 | 风险 | 影响 | 应对 |
 |---|---|---|
 | **`--agent <role> --name/--resume` 在 tmux send-keys 路径** | role-as-attribute 模型不成立 | smoke gate 已实证(交互 + resume + hooks 全触发;roleless 省略 `--agent` 同样跑通);见 §4.1 |
-| **agent session 卡死 / turn 超时** | 用户等不到回复 | submit/turn 超时阈值 → `gateway error` 回 IM;stall 软告警;per-vendor cap 兜底 |
+| **agent session 卡死 / turn 超时** | 用户等不到回复 | submit/turn 超时阈值 → 中文人话 + 下一步建议回 IM;stall 软告警;per-vendor cap 兜底 |
 | **daemon 死了消息沉默** | 命令写到磁盘但永不消费 | action 工具在 daemon 不健康时直接返回 error,绝不假装成功;`ccteam status` 看 liveness |
 | **成本失控** | 一夜烧光 | per-vendor `max_cost_usd_per_24h` + 全 ccteam $200 物理上限;不限 max_turns;`doctor --check-cost-orphan` 对账 |
 | **`--dangerously-skip-permissions` 被滥用** | rm -rf 用户文件 | `allowed_chat_ids` allowlist + hook 拦危险 Bash + 项目隔离;只暴露给可信 chat |
@@ -567,7 +567,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 | IM transport / 凭证 | `crates/ccteam-im/src/transport/`(`Channel` trait + providers)+ `im/credentials.json` 解析 | — |
 | IM 出站分片 | `Channel::max_message_len` + `sanitize::split_for_channel`(UTF-16 预算 / fence 平衡)+ `daemon::send_gateway_outbound` | `cargo test -p ccteam-im split` |
 | IM 进度 status | `progress::ProgressFold` + `Channel::edit_message` + `gateway::spawn_event_pump` + `GatewayEventKind::Progress` | `cargo test -p ccteam-im --test im_progress_test` |
-| IM 附件 I/O | 入站:`transport::{ChannelAttachment,AttachmentKind}` + telegram `getFile`;出站:`transport::{OutboundFile,OutboundFileKind}` + `chat_send_file` 走 `mcp.sock` | `cargo test -p ccteam-im` |
+| IM 附件 I/O | 入站:`transport::{ChannelAttachment,AttachmentKind}` + telegram `getFile` / lark `im/v1/messages/{id}/resources/{key}`(staging+sanitize helper 共享在 `transport/mod.rs`);出站:`transport::{OutboundFile,OutboundFileKind}` + `chat_send_file` 走 `mcp.sock`,telegram `sendPhoto/sendDocument` / lark `im/v1/{images,files}` 上传后发 image/file 消息 | `cargo test -p ccteam-im` |
 | HarnessAdapter / ProcessBackend / AgentVendor | `crates/ccteam-harness/src/adapter.rs`(trait + `AgentVendor` enum + `ExecutionMode`)+ `lib.rs` | `cargo test -p ccteam-harness adapter` |
 | Claude spawn argv(role-as-attribute + roleless)+ pane/turns 按 sid | `crates/ccteam-harness/src/execution/claude_tui.rs`(`spec_for_new` / `spec_for_resume` / `spec_for_fresh` —— **非空 role 才 push `--agent`**,空=roleless;`chat_session_name(slug, sid)` → pane / `--name`;`chat_spawn_env_owned(role,slug,secret,sid)` 注入 `CCTEAM_CHAT_SID`/`CCTEAM_CHAT_SECRET`;`parse_chat_session_name → Option<(slug, sid)>`;`/role` death-probe) | `cargo test -p ccteam-harness --test claude_tui_resume_test`;`cargo test -p ccteam-harness --test claude_tui_env_test`(env-gated) |
 | 命令面中立词汇 | `Directive` / `DirectiveOutcome`(5 值)/ `ChoicePrompt` / `ChoiceOption` / `ChoiceSelection` / `ContextUsage` / `ThreadStatus` + `handle_directive` / `thread_status`(无 default impl)= `crates/ccteam-harness/src/adapter.rs` | `cargo test -p ccteam-harness adapter` |

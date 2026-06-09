@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ccteam_harness::execution::transcript_tail::{active_session_id_path, encode_project_cwd};
+use futures::StreamExt;
 use serial_test::serial;
 use tempfile::TempDir;
 use tracing::field::{Field, Visit};
@@ -104,7 +105,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
     std::env::set_var("CCTEAM_TAIL_MARKER_WARN_MS", "100");
 
     // Confirm no marker is on disk — this is the "stuck" condition.
-    let marker = active_session_id_path(&project_dir, "alice");
+    let marker = active_session_id_path(&project_dir, "s1");
     assert!(!marker.exists());
 
     let capture = WarnCapture::default();
@@ -118,13 +119,14 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
         started_at: Utc::now(),
         raw_extras: json!({
             "role": "alice",
+            "sid": "s1",
             "project_dir": project_dir.display().to_string(),
             "cwd": cwd.display().to_string(),
         }),
     };
 
     let adapter = ClaudeTuiAdapter::new();
-    let _stream = tracing::dispatcher::with_default(&dispatch, || adapter.events(&handle));
+    let mut stream = tracing::dispatcher::with_default(&dispatch, || adapter.events(&handle));
 
     // The 2s safety-net tick gates the WARN — sleep long enough for at
     // least one tick past the 100ms threshold to land. 3s is safe.
@@ -154,5 +156,81 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
         tail_warns.len(),
         1,
         "tail_marker_missing WARN must fire exactly once per stuck period, got: {warns:?}",
+    );
+    let ev = tokio::time::timeout(Duration::from_millis(100), stream.next())
+        .await
+        .expect("tail_marker_missing should emit a user-facing event")
+        .expect("event stream should still be open");
+    match ev {
+        ccteam_harness::ThreadEvent::Error(err) => {
+            assert_eq!(err.kind, "tail_marker_missing");
+            assert!(err.message.contains("会话暂时没有产出"), "{}", err.message);
+            assert!(err.message.contains("下一步"), "{}", err.message);
+            assert!(err.message.contains("ccteam doctor"), "{}", err.message);
+        }
+        other => panic!("expected marker-missing Error event, got {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "tail_marker_missing user-facing event must not spam"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn healthy_quiet_marker_does_not_emit_marker_missing_signal() {
+    use ccteam_harness::execution::claude_tui::ClaudeTuiAdapter;
+    use ccteam_harness::{AgentVendor, ExecutionMode, HarnessAdapter, ThreadHandle};
+    use chrono::Utc;
+    use serde_json::json;
+
+    let tmp = TempDir::new().unwrap();
+    let fake_home = tmp.path().join("home");
+    let project_dir = tmp.path().join("project");
+    let cwd = project_dir.clone();
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let encoded = encode_project_cwd(&cwd);
+    let anthropic_dir = fake_home.join(".claude").join("projects").join(&encoded);
+    std::fs::create_dir_all(&anthropic_dir).unwrap();
+    std::fs::write(anthropic_dir.join("anthropic-sid.jsonl"), "").unwrap();
+    let marker = active_session_id_path(&project_dir, "s1");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "anthropic-sid").unwrap();
+
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", &fake_home);
+    std::env::set_var("CCTEAM_TAIL_MARKER_WARN_MS", "50");
+
+    let handle = ThreadHandle {
+        vendor: AgentVendor::Claude,
+        mode: ExecutionMode::Chat,
+        identity: "ccteam-chat-test-alice".into(),
+        started_at: Utc::now(),
+        raw_extras: json!({
+            "role": "alice",
+            "sid": "s1",
+            "project_dir": project_dir.display().to_string(),
+            "cwd": cwd.display().to_string(),
+        }),
+    };
+
+    let adapter = ClaudeTuiAdapter::new();
+    let mut stream = adapter.events(&handle);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    if let Some(h) = prev_home {
+        std::env::set_var("HOME", h);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    std::env::remove_var("CCTEAM_TAIL_MARKER_WARN_MS");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "healthy quiet marker should not emit a marker-missing signal"
     );
 }

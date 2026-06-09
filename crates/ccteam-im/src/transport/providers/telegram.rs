@@ -20,8 +20,8 @@ use anyhow::Context as _;
 
 use crate::latency::now_unix_ms;
 use crate::transport::{
-    AttachmentKind, Channel, ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec,
-    OutboundFile, OutboundFileKind, SendMessage,
+    inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
+    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -391,25 +391,6 @@ fn pick_attachment(m: &TgMessage) -> Option<PendingDownload> {
     })
 }
 
-/// Pure: strip path separators / control chars and cap length so a
-/// platform-supplied name can't traverse out of the staging dir.
-/// Also drops `" < >` (V0.8.4 P2a / F4) so the name can't break the
-/// `<channel image_path="…">` turn-text attribute (or inject into it).
-fn sanitize_attachment_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let cleaned: String = base
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"' | '<' | '>'))
-        .take(128)
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Telegram caption ceiling, in UTF-16 code units (separate from the
 /// 4096 message ceiling). Attachment messages skip the outbound
 /// splitter, so an over-long caption is truncated here (V0.8.4 P2b / F7).
@@ -429,15 +410,6 @@ fn truncate_caption(s: &str) -> String {
         out.push(ch);
     }
     out
-}
-
-/// Staging dir for downloaded inbound attachments (channel-scoped — the
-/// routing to a project/role happens later in the gateway).
-fn inbound_staging_dir() -> std::path::PathBuf {
-    crate::default_ccteam_root_public()
-        .join("imd")
-        .join("attachments")
-        .join("inbound")
 }
 
 #[async_trait]
@@ -825,18 +797,6 @@ mod tests {
         }))
         .unwrap();
         assert!(pick_attachment(&m).is_none());
-    }
-
-    #[test]
-    fn sanitize_attachment_name_blocks_traversal_and_control() {
-        assert_eq!(sanitize_attachment_name("../../etc/passwd"), "passwd");
-        assert_eq!(sanitize_attachment_name("a/b/c.png"), "c.png");
-        assert_eq!(sanitize_attachment_name("ok\u{0000}name.txt"), "okname.txt");
-        assert_eq!(sanitize_attachment_name(""), "file");
-        assert_eq!(sanitize_attachment_name("   "), "file");
-        // F4 — quotes/angle brackets would break the `image_path="…"` attr.
-        assert_eq!(sanitize_attachment_name("foo\"bar.pdf"), "foobar.pdf");
-        assert_eq!(sanitize_attachment_name("a<b>c.png"), "abc.png");
     }
 
     #[test]

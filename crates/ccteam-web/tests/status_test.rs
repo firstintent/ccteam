@@ -54,6 +54,43 @@ fn append_event(paths: &CcteamPaths, slug: &str, event: Value) {
     f.write_all(line.as_bytes()).unwrap();
 }
 
+fn write_one_tracked_session(root: &std::path::Path) {
+    let path = ccteam_im::gateway_state_path_in(root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "default_project": "outside",
+            "current_project": [],
+            "current_session": [],
+            "sessions": [{
+                "id": "s1",
+                "owner": {
+                    "channel": "web",
+                    "chat_id": "outside-chat",
+                    "user_id": "outside-user"
+                },
+                "project": "outside",
+                "role": "cto",
+                "vendor": "claude",
+                "permission_mode": "skip",
+                "secret": "outside-secret",
+                "handle": "outside-handle",
+                "thread": {
+                    "vendor": "claude",
+                    "mode": "chat",
+                    "identity": "ccteam-chat-outside-s1",
+                    "started_at": "2026-06-08T00:00:00Z",
+                    "raw_extras": {}
+                }
+            }],
+            "next_session": 2
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 async fn spawn(state: AppState) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -78,6 +115,10 @@ fn client() -> reqwest::Client {
 async fn t01_status_empty_install_is_zeroed_snapshot() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let global = tmp.path().join("global-home");
+    write_one_tracked_session(&global);
+    let old_home = std::env::var_os("CCTEAM_HOME");
+    std::env::set_var("CCTEAM_HOME", &global);
 
     let addr = spawn(AppState::new(paths)).await;
     let resp = client()
@@ -85,6 +126,10 @@ async fn t01_status_empty_install_is_zeroed_snapshot() {
         .send()
         .await
         .unwrap();
+    match old_home {
+        Some(path) => std::env::set_var("CCTEAM_HOME", path),
+        None => std::env::remove_var("CCTEAM_HOME"),
+    }
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
 

@@ -164,7 +164,9 @@ export default function ChatConsole() {
   }, []);
 
   useEffect(() => {
-    void refreshSessions();
+    queueMicrotask(() => {
+      void refreshSessions();
+    });
   }, [refreshSessions]);
 
   // v0.8.8 bug5 — pick up projects/sessions registered out-of-band (a CLI
@@ -202,11 +204,12 @@ export default function ChatConsole() {
           const created = await apiCreateProject(slug, newProjectPath);
           targetSlug = created.slug;
         }
-        const { sid: newSid } = await apiCreateSession(targetSlug, {
+        const { sid: newSid, model_warning: modelWarning } = await apiCreateSession(targetSlug, {
           role,
           vendor,
           permission_mode: permissionMode,
         });
+        if (modelWarning) toastBus.handler?.info(modelWarning);
         await refreshSessions();
         navigate(`/chat/s/${encodeURIComponent(newSid)}`);
         return true;
@@ -576,7 +579,9 @@ export function NewSessionModal({
   useEffect(() => {
     if (isNew || !project) return;
     let cancelled = false;
-    setRoleState({ kind: "loading" });
+    queueMicrotask(() => {
+      if (!cancelled) setRoleState({ kind: "loading" });
+    });
     listProjectRoles(project)
       .then((roles) => {
         if (!cancelled) setRoleState({ kind: "ready", roles });

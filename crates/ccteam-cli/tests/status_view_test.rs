@@ -145,6 +145,21 @@ fn run_status(ccteam_home: &Path, projects_root: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+#[cfg(unix)]
+fn fake_healthy_daemon(ccteam_home: &Path) -> std::thread::JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    let socket = ccteam_home.join("run").join("mcp.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..8 {
+            let _ = listener.accept();
+        }
+    })
+}
+
 /// The status view nests both sessions (claude + codex) under the
 /// project with their vendor + sid, and shows the web token (bare hex)
 /// + web url (port 7331, `ccteam:`-prefixed token).
@@ -169,6 +184,66 @@ fn status_nests_sessions_with_vendor_sid_and_web_lines() {
         "claude role missing:\n{stdout}"
     );
     assert!(stdout.contains("builder"), "codex role missing:\n{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_classifies_nested_sessions_by_sid() {
+    let (_tmp, root, projects_root, slug) = ephemeral_home("statusproj-sid");
+    let _daemon = fake_healthy_daemon(&root);
+    let paths = ccteam_core::CcteamPaths {
+        root: root.clone(),
+        projects_root: projects_root.clone(),
+    };
+    ccteam_core::progress::append_event(
+        &paths.progress_jsonl(&slug),
+        &json!({
+            "event": ccteam_core::progress::CHAT_TURN_USER_PROMPT,
+            "sid": "s1",
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .unwrap();
+    ccteam_core::progress::append_event(
+        &paths.progress_jsonl(&slug),
+        &json!({
+            "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+            "sid": "s2",
+            "stuck": true,
+            "ts": (chrono::Utc::now() - chrono::Duration::minutes(12)).to_rfc3339(),
+        }),
+    )
+    .unwrap();
+
+    let stdout = run_status(&root, &projects_root);
+    let reviewer_line = stdout
+        .lines()
+        .find(|line| line.contains("reviewer") && line.contains("s1"))
+        .expect("reviewer s1 line");
+    let builder_line = stdout
+        .lines()
+        .find(|line| line.contains("builder") && line.contains("s2"))
+        .expect("builder s2 line");
+    let project_line = stdout
+        .lines()
+        .find(|line| line.contains(&slug) && !line.contains("session"))
+        .expect("project line");
+    assert!(
+        reviewer_line.contains("working") && !reviewer_line.contains("stuck"),
+        "healthy sibling must not inherit s2 timeout:\n{stdout}"
+    );
+    assert!(
+        builder_line.contains("stuck"),
+        "timed-out sid must be the stuck row:\n{stdout}"
+    );
+    assert!(
+        project_line.contains("STUCK"),
+        "project verdict must still escalate:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{slug} session s2 silent")),
+        "takeover hint must identify the stuck sid:\n{stdout}"
+    );
 }
 
 /// The legacy "recent events" section is gone.

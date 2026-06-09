@@ -87,14 +87,6 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 /// ccteam-created project. Single source for both seed paths.
 pub const CTO_ROLE_MD: &str = include_str!("cto_role.md");
 
-/// V0.5.0 F93b + F94 — per-project settings template for
-/// `mode: agent-team` workflows (rendered output lands in the
-/// `.claude/settings.local.json` local layer, v0.8.6 W2b). Same shape
-/// as [`PROJECT_SETTINGS_JSON`] plus three new hook entries:
-/// `TeammateIdle`, `TaskCreated`, `TaskCompleted`. Used only by
-/// `ccteam init --mode agent-team` (per PRD F94 红线: advanced path only).
-pub const PROJECT_SETTINGS_AGENT_TEAM_JSON: &str = include_str!("settings.agent-team.json");
-
 /// M2.4: helper templates that user-authored agent / workflow markdown
 /// can `@`-reference. Shipped inside the binary so a fresh install (or
 /// `ccteam doctor`) can stamp them into `~/.ccteam/templates/` without
@@ -161,26 +153,7 @@ pub fn render_project_settings(
     render_settings_template(PROJECT_SETTINGS_JSON, hook_sh, extra_env, enabled)
 }
 
-/// V0.5.0 F93b + F94 — same as [`render_project_settings`] but
-/// renders the agent-team template (with `TeammateIdle` /
-/// `TaskCreated` / `TaskCompleted` hooks). Used by
-/// `ccteam init --mode agent-team`.
-pub fn render_project_settings_agent_team(
-    hook_sh: &Path,
-    extra_env: &SettingsEnv,
-    enabled: &EnabledPluginsSetting,
-) -> Result<String> {
-    render_settings_template(
-        PROJECT_SETTINGS_AGENT_TEAM_JSON,
-        hook_sh,
-        extra_env,
-        enabled,
-    )
-}
-
-/// Shared implementation for [`render_project_settings`] +
-/// [`render_project_settings_agent_team`]. Takes the raw template
-/// `&str` so callers pick which placeholder text to substitute into.
+/// Shared implementation for [`render_project_settings`].
 fn render_settings_template(
     template: &str,
     hook_sh: &Path,
@@ -241,23 +214,10 @@ pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSettin
     write_settings_template(project_dir, enabled, ProjectSettingsKind::ArtifactDriven)
 }
 
-/// V0.5.0 F93b + F94 — same as [`write_project_settings`] but writes
-/// the agent-team variant of the settings template (with
-/// `TeammateIdle` / `TaskCreated` / `TaskCompleted` hooks per F94).
-/// Used by `ccteam init --mode agent-team`. Idempotent.
-pub fn write_project_settings_agent_team(
-    project_dir: &Path,
-    enabled: &EnabledPluginsSetting,
-) -> Result<()> {
-    write_settings_template(project_dir, enabled, ProjectSettingsKind::AgentTeam)
-}
-
-/// V0.5.0 F93b — discriminator for [`write_project_settings`] +
-/// [`write_project_settings_agent_team`].
+/// Discriminator for settings template writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectSettingsKind {
     ArtifactDriven,
-    AgentTeam,
 }
 
 fn write_settings_template(
@@ -278,9 +238,6 @@ fn write_settings_template(
     };
     let body = match kind {
         ProjectSettingsKind::ArtifactDriven => render_project_settings(&hook_sh, &extra, enabled)?,
-        ProjectSettingsKind::AgentTeam => {
-            render_project_settings_agent_team(&hook_sh, &extra, enabled)?
-        }
     };
     // v0.8.6 review-fix — merge the rendered ccteam base config into the
     // existing settings.local.json (read + merge + write), mirroring
@@ -670,5 +627,36 @@ mod tests {
                 "cto `tools:` must grant `{handle}`, got: {tools_line}"
             );
         }
+    }
+
+    #[test]
+    fn cto_role_template_has_fresh_user_guidance() {
+        for needle in [
+            "新用户问",
+            "ccteam config",
+            "ccteam start",
+            "/pair <code>",
+            "/cd <项目>",
+            "roleless = 裸 Claude",
+            "cto` = 默认管家",
+            "work-role = `.claude/agents/<role>.md`",
+        ] {
+            assert!(
+                CTO_ROLE_MD.contains(needle),
+                "cto_role.md missing fresh-user guidance {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cto_role_template_describes_session_spawn_as_fresh_sid() {
+        assert!(
+            CTO_ROLE_MD.contains("每次调用都铸一个新 sid"),
+            "cto_role.md must say session_spawn mints a fresh sid"
+        );
+        assert!(
+            !CTO_ROLE_MD.contains("同 (项目, role) 幂等"),
+            "cto_role.md must not describe removed (project, role) dedup"
+        );
     }
 }

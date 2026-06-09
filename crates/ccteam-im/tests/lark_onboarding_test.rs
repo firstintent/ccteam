@@ -21,11 +21,43 @@ fn spawn_oneshot_http(body: &'static str) -> String {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf);
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&buf[..n]);
+                        if header_end.is_none() {
+                            if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let end = pos + 4;
+                                header_end = Some(end);
+                                let headers = String::from_utf8_lossy(&req[..end]);
+                                content_length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                            }
+                        }
+                        if let Some(end) = header_end {
+                            if req.len().saturating_sub(end) >= content_length {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );

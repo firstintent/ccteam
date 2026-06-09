@@ -5,7 +5,7 @@
 //! daemon-agnostic: tests drive it with a fake [`HarnessAdapter`], and
 //! the daemon can wire the same state machine into real transports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
-use ccteam_core::{CcteamPaths, HotConfig};
+use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
     ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
@@ -137,6 +137,10 @@ pub struct Gateway {
     /// registered after daemon start without a restart — config.yaml is the
     /// source of truth, `projects` is just a cache. `None` in unit tests.
     config: Option<HotConfig<CcteamConfig>>,
+    /// v0.8.10 D9 — warn once per Claude-routed non-Claude model family.
+    /// This is an honesty label only: it never blocks spawn and never changes
+    /// adapter/model behavior.
+    model_warned: HashSet<(AgentVendor, String)>,
 }
 
 /// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
@@ -288,6 +292,9 @@ pub struct SessionView {
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
     pub status: String,
+    /// Seconds since this session's latest progress event when known.
+    #[serde(default)]
+    pub last_activity_seconds: Option<u64>,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -306,6 +313,58 @@ pub struct StartOutcome {
     /// The session's permission posture (always the requested mode on a fresh
     /// spawn).
     pub permission_mode: PermissionMode,
+    /// Optional model-support warning emitted when the role declares a
+    /// Claude-routed model outside the verified Claude family.
+    pub model_warning: Option<String>,
+}
+
+/// Result returned by the web/resource session creation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSessionOutcome {
+    /// The freshly minted gateway session id (`s{n}`).
+    pub sid: String,
+    /// Optional human warning for a Claude-routed role model that ccteam has
+    /// not verified as part of the Claude model family.
+    pub model_warning: Option<String>,
+}
+
+impl CreateSessionOutcome {
+    /// Borrow the session id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl std::ops::Deref for CreateSessionOutcome {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sid
+    }
+}
+
+impl AsRef<str> for CreateSessionOutcome {
+    fn as_ref(&self) -> &str {
+        &self.sid
+    }
+}
+
+impl std::fmt::Display for CreateSessionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sid)
+    }
+}
+
+impl PartialEq<&str> for CreateSessionOutcome {
+    fn eq(&self, other: &&str) -> bool {
+        self.sid == *other
+    }
+}
+
+impl PartialEq<CreateSessionOutcome> for &str {
+    fn eq(&self, other: &CreateSessionOutcome) -> bool {
+        *self == other.sid
+    }
 }
 
 /// v0.8.7 W1 — what [`Gateway::session_resolve`] hands a collector so it can
@@ -511,6 +570,7 @@ impl Gateway {
             )),
             project_paths: None,
             config: None,
+            model_warned: HashSet::new(),
         }
     }
 
@@ -1099,7 +1159,8 @@ impl Gateway {
         // This is the same `read_role` existence check `/role`
         // (switch_current_role) already applies; here it guards creation. See
         // `ensure_role_exists` for the test-dir exemption.
-        ensure_role_exists(&cwd, &role)?;
+        let role_detail = ensure_role_exists(&cwd, &role)?;
+        let model_id = role_model_id(role_detail.as_ref());
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
         // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
@@ -1126,7 +1187,7 @@ impl Gateway {
                     cwd: cwd.clone(),
                     project_dir: cwd,
                     extra_args: vec![],
-                    model_id: None,
+                    model_id: model_id.clone(),
                     permission_mode,
                     secret: secret.clone(),
                 },
@@ -1149,6 +1210,8 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
             },
         );
+        let model_warning =
+            self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
         self.current_session.insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
@@ -1156,6 +1219,7 @@ impl Gateway {
             id,
             // Fresh spawn ran with exactly the requested posture.
             permission_mode,
+            model_warning,
         })
     }
 
@@ -1214,11 +1278,15 @@ impl Gateway {
         // on a bad name (path-traversal etc.) and `Ok(None)` when the file is
         // absent — both mean "no such role", so we bail with a clear hint and
         // leave the session completely intact.
-        if ccteam_core::read_role(&cwd, &role).ok().flatten().is_none() {
-            return Err(anyhow!(
-                "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
-            ));
-        }
+        let role_detail = match ccteam_core::read_role(&cwd, &role) {
+            Ok(Some(detail)) => detail,
+            Ok(None) | Err(_) => {
+                return Err(anyhow!(
+                    "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
+                ));
+            }
+        };
+        let model_id = role_model_id(Some(&role_detail));
 
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
@@ -1243,7 +1311,7 @@ impl Gateway {
                     cwd: cwd.clone(),
                     project_dir: cwd,
                     extra_args: vec![],
-                    model_id: None,
+                    model_id: model_id.clone(),
                     permission_mode,
                     secret: secret.clone(),
                 },
@@ -1272,7 +1340,51 @@ impl Gateway {
         self.current_session.insert(chat.clone(), sid.clone());
         self.persist_state()?;
         self.spawn_event_pump(&sid);
+        let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
         Ok(sid)
+    }
+
+    fn maybe_emit_model_support_warning(
+        &mut self,
+        chat: &ChatKey,
+        sid: &str,
+        vendor: AgentVendor,
+        model: Option<&str>,
+    ) -> Option<String> {
+        if vendor != AgentVendor::Claude {
+            return None;
+        }
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        if ccteam_core::is_claude_family(model) {
+            return None;
+        }
+        let key = (vendor, model_warn_key(model));
+        if !self.model_warned.insert(key) {
+            return None;
+        }
+        let content = format!(
+            "模型提示: 这个 Claude session 的角色声明了 model `{model}`。ccteam 目前只验证 Claude 家族模型；如果会话长时间空转，请改用 sonnet/opus/haiku，或在角色文件里调整 model 后重新 /new。"
+        );
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-model-warn-{sid}-{}", model_warn_key(model)),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content: content.clone(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+        });
+        Some(content)
+    }
+
+    fn emit_user_signal(&self, event: GatewayEvent) {
+        if let Some(tx) = self.event_sink.clone() {
+            let _ = tx.send(event);
+        } else {
+            let _ = self.events_broadcast.send(event);
+        }
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
@@ -1667,7 +1779,11 @@ impl Gateway {
         turn_id: &str,
     ) -> Result<Vec<String>> {
         if let Some(tx) = self.event_sink.clone() {
-            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id);
+            let progress_path = self
+                .project_paths
+                .as_ref()
+                .map(|paths| paths.progress_jsonl(&session.project));
+            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id, progress_path);
             Ok(Vec::new())
         } else {
             let mut replies = Vec::new();
@@ -2009,6 +2125,7 @@ impl Gateway {
                 permission_mode: s.permission_mode.as_str().to_string(),
                 current: current.contains(&s.id),
                 status: "live".to_string(),
+                last_activity_seconds: None,
             })
             .collect();
         views.sort_by_key(|v| session_index(&v.sid));
@@ -2102,14 +2219,17 @@ impl Gateway {
         role: String,
         vendor: AgentVendor,
         permission_mode: PermissionMode,
-    ) -> Result<String> {
+    ) -> Result<CreateSessionOutcome> {
         let owner = web_api_chat();
         // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
         // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
         self.start_session(owner, project, vendor, role, handle, permission_mode)
             .await
-            .map(|o| o.id)
+            .map(|o| CreateSessionOutcome {
+                sid: o.id,
+                model_warning: o.model_warning,
+            })
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -2372,6 +2492,7 @@ fn spawn_turn_timeout_watchdog(
     session: &GatewaySession,
     start_visible_events: u64,
     turn_id: &str,
+    progress_path: Option<PathBuf>,
 ) {
     let timeout = gateway_turn_timeout_duration();
     if timeout.is_zero() {
@@ -2379,6 +2500,8 @@ fn spawn_turn_timeout_watchdog(
     }
     let visible_events = Arc::clone(&session.visible_events);
     let session_id = session.id.clone();
+    let project = session.project.clone();
+    let role = session.role.clone();
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
@@ -2391,6 +2514,23 @@ fn spawn_turn_timeout_watchdog(
         tokio::time::sleep(timeout).await;
         if visible_events.load(Ordering::SeqCst) != start_visible_events {
             return; // the turn produced a visible answer → not stuck.
+        }
+        if let Some(progress_path) = progress_path.as_ref() {
+            let ev = ccteam_core::progress::build_chat_turn_timeout_event(
+                &role,
+                &session_id,
+                &project,
+                &turn_id,
+                timeout.as_secs(),
+            );
+            if let Err(err) = ccteam_core::progress::append_event(progress_path, &ev) {
+                tracing::warn!(
+                    session = %session_id,
+                    path = %progress_path.display(),
+                    error = %err,
+                    "turn-watchdog: failed to append chat_turn_timeout progress event"
+                );
+            }
         }
         // No answer within the timeout = a stalled / infinitely-looping turn
         // (e.g. a roleless model spinning on tool calls). INTERRUPT it via the
@@ -2498,28 +2638,45 @@ fn wrap_inbound(
 /// integration tests that spawn against bare fake project dirs (e.g.
 /// `/tmp/alpha`) with a `FakeAdapter` and no seeded agents — those exercise
 /// routing, not personas, and shouldn't be forced to scaffold a role tree.
-fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<()> {
+fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDetail>> {
     // v0.8.8 F2 — 空 role = 显式 roleless(裸 claude 自读项目 CLAUDE.md):跳过
     // 存在性校验。必须在 `read_role` 之前(`read_role("")` 会因 charset 校验
     // bail → `.ok().flatten()` 折成 None → 误报 RoleNotFound)。
     if role.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // No agents dir → uninitialized / test project; skip (see doc comment).
     if !ccteam_core::agents_dir(cwd).exists() {
-        return Ok(());
+        return Ok(None);
     }
     // `read_role` returns Err on a bad name (charset / traversal) and Ok(None)
     // when the file is absent — both mean "no such role" here.
     // v0.8.7 review-fix (R-M6): surface a typed `RoleNotFound` (via anyhow) so
     // the web create handler can map it to a 4xx instead of a blanket 500.
-    if ccteam_core::read_role(cwd, role).ok().flatten().is_none() {
-        return Err(RoleNotFound {
+    match ccteam_core::read_role(cwd, role) {
+        Ok(Some(detail)) => Ok(Some(detail)),
+        Ok(None) | Err(_) => Err(RoleNotFound {
             role: role.to_string(),
         }
-        .into());
+        .into()),
     }
-    Ok(())
+}
+
+fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
+    detail
+        .and_then(|d| d.frontmatter.get("model"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn model_warn_key(model: &str) -> String {
+    model
+        .trim()
+        .split_once('[')
+        .map_or_else(|| model.trim(), |(head, _)| head.trim())
+        .to_ascii_lowercase()
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -2875,11 +3032,16 @@ mod tests {
     /// existence check (`ccteam_core::read_role`) resolves it. Minimal frontmatter
     /// is enough; the gateway only checks the file exists, not its contents.
     fn seed_role(project_dir: &std::path::Path, role: &str) {
+        seed_role_with_model(project_dir, role, None);
+    }
+
+    fn seed_role_with_model(project_dir: &std::path::Path, role: &str, model: Option<&str>) {
         let agents = project_dir.join(".claude").join("agents");
         std::fs::create_dir_all(&agents).unwrap();
+        let model = model.map(|m| format!("model: {m}\n")).unwrap_or_default();
         std::fs::write(
             agents.join(format!("{role}.md")),
-            format!("---\nname: {role}\n---\n{role} role.\n"),
+            format!("---\nname: {role}\n{model}---\n{role} role.\n"),
         )
         .unwrap();
     }
@@ -2984,6 +3146,137 @@ mod tests {
         let sink = gw.event_sink.clone().expect("sink wired");
         assert!(sink.send(fake_event(Some("s7"))));
         assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
+    }
+
+    #[tokio::test]
+    async fn claude_non_family_role_model_warns_once_to_event_stream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        assert_eq!(
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap(),
+            vec!["created session s1"]
+        );
+        let warn = events.recv().await.unwrap();
+        assert_eq!(warn.sid.as_deref(), Some("s1"));
+        assert!(warn.content.contains("模型提示"), "{}", warn.content);
+        assert!(
+            warn.content.contains("deepseek-via-claude"),
+            "{}",
+            warn.content
+        );
+        assert!(
+            warn.content.contains("sonnet/opus/haiku"),
+            "{}",
+            warn.content
+        );
+        assert!(warn.content.contains("/new"), "{}", warn.content);
+
+        assert_eq!(
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap(),
+            vec!["created session s2"]
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "same model family should warn once"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_api_returns_model_warning_once_in_band() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let first = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.sid, "s1");
+        assert!(
+            first
+                .model_warning
+                .as_deref()
+                .is_some_and(|msg| msg.contains("deepseek-via-claude")),
+            "first API create must return the warning in-band: {first:?}"
+        );
+
+        let second = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.sid, "s2");
+        assert_eq!(second.model_warning, None);
+    }
+
+    #[tokio::test]
+    async fn claude_family_role_models_do_not_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "sonnetrole", Some("sonnet[1m]"));
+        seed_role_with_model(tmp.path(), "future", Some("claude-future-99"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude sonnetrole")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude future")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "Claude-family role models must not warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_route_with_non_claude_role_model_does_not_warn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "api", Some("deepseek-via-claude"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Codex));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex api")
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "non-Claude vendor must not emit Claude model warning"
+        );
     }
 
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
@@ -3313,8 +3606,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let sec1 = gateway.sessions.get(&s1).unwrap().secret.clone();
-        let sec2 = gateway.sessions.get(&s2).unwrap().secret.clone();
+        let sec1 = gateway.sessions.get(s1.as_str()).unwrap().secret.clone();
+        let sec2 = gateway.sessions.get(s2.as_str()).unwrap().secret.clone();
         assert_eq!(sec1.len(), 32, "secret is 128-bit hex");
         assert_ne!(sec1, sec2, "each session gets its own secret");
         // The secret reached the spawn env (FakeAdapter records SpawnCtx).
@@ -3341,7 +3634,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let secret = gateway.sessions.get(&sid).unwrap().secret.clone();
+        let secret = gateway.sessions.get(sid.as_str()).unwrap().secret.clone();
 
         // Correct (role, secret) pair authenticates.
         assert!(gateway.verify_session_caller("cto", &secret));
@@ -3384,8 +3677,8 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(sid1, sid2, "two same-role sessions are distinct sids");
-        let secret1 = gateway.sessions.get(&sid1).unwrap().secret.clone();
-        let secret2 = gateway.sessions.get(&sid2).unwrap().secret.clone();
+        let secret1 = gateway.sessions.get(sid1.as_str()).unwrap().secret.clone();
+        let secret2 = gateway.sessions.get(sid2.as_str()).unwrap().secret.clone();
         assert_ne!(secret1, secret2, "each session mints its own secret");
 
         // Each session's secret authenticates as the (live) cto role.
@@ -3458,6 +3751,92 @@ mod tests {
         assert_eq!(turns1[0].assistant, "from-sid1");
         assert_eq!(turns2.len(), 1);
         assert_eq!(turns2[0].assistant, "from-sid2");
+    }
+
+    /// v0.8.10 D6 — same-role sessions must route user turns by sid, not by
+    /// role/current-session fallback. This is the lowest-level guard for the
+    /// "two reviewers in one cwd do not cross-talk" notification invariant:
+    /// each submit hits its own harness thread and each user mirror lands under
+    /// the addressed sid.
+    #[tokio::test]
+    async fn same_role_submit_to_sid_routes_to_each_thread() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+
+        let sid1 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sid2 = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!((sid1.as_str(), sid2.as_str()), ("s1", "s2"));
+
+        gateway
+            .submit_to_sid(&sid1, "first reviewer prompt".into())
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid2, "second reviewer prompt".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[
+                (
+                    "alpha-reviewer-s1".to_string(),
+                    "first reviewer prompt".to_string()
+                ),
+                (
+                    "alpha-reviewer-s2".to_string(),
+                    "second reviewer prompt".to_string()
+                )
+            ],
+            "same-role submits must address each sid's own thread"
+        );
+
+        let turns1 = read_all_turns(&project_dir, &sid1).unwrap();
+        let turns2 = read_all_turns(&project_dir, &sid2).unwrap();
+        assert!(
+            turns1
+                .iter()
+                .any(|turn| turn.user == "first reviewer prompt"),
+            "sid1 mirror must contain only its prompt: {turns1:?}"
+        );
+        assert!(
+            !turns1
+                .iter()
+                .any(|turn| turn.user == "second reviewer prompt"),
+            "sid1 mirror must not receive sid2 prompt: {turns1:?}"
+        );
+        assert!(
+            turns2
+                .iter()
+                .any(|turn| turn.user == "second reviewer prompt"),
+            "sid2 mirror must contain only its prompt: {turns2:?}"
+        );
+        assert!(
+            !turns2
+                .iter()
+                .any(|turn| turn.user == "first reviewer prompt"),
+            "sid2 mirror must not receive sid1 prompt: {turns2:?}"
+        );
     }
 
     /// v0.8.8 bug-fix (bug3) — `submit_to_sid` MIRRORS THE USER'S PROMPT to
@@ -3882,7 +4261,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(gateway.session_sid_for(&sid), Some(sid.clone()));
+        assert_eq!(gateway.session_sid_for(&sid), Some(sid.sid.clone()));
         assert_eq!(gateway.session_sid_for("s99"), None);
     }
 
@@ -4007,7 +4386,7 @@ mod tests {
         // resolves it deterministically and never collides on "".
         assert_eq!(
             gateway.session_by_handle(&web_api_chat(), &sid),
-            Some(sid.clone()),
+            Some(sid.sid.clone()),
             "roleless handle must fall back to the sid (addressable, non-empty)"
         );
     }
@@ -4660,7 +5039,8 @@ mod tests {
         let state_path = tmp.path().join("gateway-state.json");
         let fake = Arc::new(FakeAdapter::default());
 
-        let original_secret;
+        let original_secret_s1;
+        let original_secret_s2;
         {
             let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
             gateway.register_project("beta", "/tmp/beta");
@@ -4673,9 +5053,16 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap();
             // R-M1 — the minted secret is non-empty and will be persisted.
-            original_secret = gateway.sessions.get("s1").unwrap().secret.clone();
-            assert_eq!(original_secret.len(), 32);
+            original_secret_s1 = gateway.sessions.get("s1").unwrap().secret.clone();
+            original_secret_s2 = gateway.sessions.get("s2").unwrap().secret.clone();
+            assert_eq!(original_secret_s1.len(), 32);
+            assert_eq!(original_secret_s2.len(), 32);
+            assert_ne!(original_secret_s1, original_secret_s2);
         }
 
         let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
@@ -4686,22 +5073,50 @@ mod tests {
         // map still matches the live pane's `CCTEAM_CHAT_SECRET`.
         assert_eq!(
             restored.sessions.get("s1").unwrap().secret,
-            original_secret,
-            "the cto-gate secret must round-trip through persisted state"
+            original_secret_s1,
+            "s1 cto-gate secret must round-trip through persisted state"
+        );
+        assert_eq!(
+            restored.sessions.get("s2").unwrap().secret,
+            original_secret_s2,
+            "s2 cto-gate secret must round-trip through persisted state"
         );
 
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["s1:beta:Claude:reviewer"]);
+        assert_eq!(
+            sessions,
+            vec!["s1:beta:Claude:reviewer\ns2:beta:Claude:reviewer"]
+        );
 
-        let reply = restored
+        assert_eq!(
+            restored
+                .handle_text("mock", "chat-1", "alice", "/use s1")
+                .await
+                .unwrap(),
+            vec!["using session s1"]
+        );
+        let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-reviewer-s1 echo: after restart"]);
-        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(reply_s1, vec!["beta-reviewer-s1 echo: after restart"]);
+
+        assert_eq!(
+            restored
+                .handle_text("mock", "chat-1", "alice", "/use s2")
+                .await
+                .unwrap(),
+            vec!["using session s2"]
+        );
+        let reply_s2 = restored
+            .handle_text("mock", "chat-1", "alice", "after restart two")
+            .await
+            .unwrap();
+        assert_eq!(reply_s2, vec!["beta-reviewer-s2 echo: after restart two"]);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
     }
 
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
@@ -4945,7 +5360,7 @@ mod tests {
     /// (v0.8.5) A project registered in config.yaml AFTER the gateway started
     /// — e.g. `ccteam init` while the daemon was already running — must be
     /// addressable by /cd, not just the startup snapshot. Reproduces the
-    /// "gateway error: unknown project" bug.
+    /// stale startup-only project registry bug.
     #[tokio::test]
     async fn gateway_cd_dynamically_loads_project_from_config() {
         use ccteam_core::config::{upsert_project, ProjectEntry};
