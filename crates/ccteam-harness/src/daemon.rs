@@ -75,6 +75,15 @@ const HIDDEN_DAEMON_WORKER_THREADS: usize = 4;
 pub fn run_internal_daemon(socket: OsString) -> io::Result<()> {
     let socket_path = PathBuf::from(socket);
 
+    // An *ephemeral* daemon — socket under the system temp dir, e.g. a test's
+    // `TempDir` — must not outlive the process that spawned it. rmux detaches
+    // the daemon with `setsid` (no double-fork), so once the spawner exits we
+    // reparent to init (PPID=1) and would otherwise linger forever, piling up
+    // across `cargo test` runs. The canonical resident daemon (`~/.ccteam/run`)
+    // is exempt: it is *designed* to outlive its transient launcher (24/7
+    // chat), so it is never reaped. Decide before `socket_path` is moved.
+    let reap_when_orphaned = is_ephemeral_socket(&socket_path);
+
     // Disable rmux's exit-empty self-termination (W-verify G-D). Without
     // this the daemon dies when its last session is killed, stranding the
     // 24/7 mode-3 chat use case. Best-effort: a write failure degrades to
@@ -91,9 +100,53 @@ pub fn run_internal_daemon(socket: OsString) -> io::Result<()> {
 
     runtime.block_on(async move {
         let server = ServerDaemon::new(config).bind().await?;
+        if reap_when_orphaned {
+            spawn_orphan_reaper();
+        }
         server.wait().await
     })
 }
+
+/// Whether `socket_path` lives under the system temp dir — the signature of
+/// an *ephemeral* daemon whose lifetime is bounded by the process that
+/// spawned it (a test's `TempDir`). The canonical resident socket lives under
+/// `~/.ccteam/run`, so this is `false` in production. Best-effort: any path we
+/// can't classify as temp is treated as resident, so we never reap a daemon
+/// we're unsure about.
+fn is_ephemeral_socket(socket_path: &Path) -> bool {
+    socket_path.starts_with(std::env::temp_dir())
+}
+
+/// Spawn a background poll that exits an *ephemeral* daemon once it is
+/// orphaned (reparented away from the process that spawned it). Keyed off the
+/// spawner's death via `getppid()` rather than `PR_SET_PDEATHSIG`: rmux
+/// detaches us with `setsid` and the production daemon is *meant* to outlive
+/// its launcher, so the kernel parent-death signal is the wrong tool here.
+/// Only ever called for ephemeral daemons (see [`is_ephemeral_socket`]).
+/// Mirrors the proven orphan-poll in ccteam-cli's mcp-serve. No-op on
+/// non-Unix (no `getppid`).
+#[cfg(unix)]
+fn spawn_orphan_reaper() {
+    // SAFETY: getppid() is a thin, always-safe syscall wrapper taking no args.
+    let original_ppid = unsafe { libc::getppid() };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.tick().await; // consume the immediate first tick
+        loop {
+            tick.tick().await;
+            // SAFETY: see above.
+            let now = unsafe { libc::getppid() };
+            // Reparented (spawner died) or already orphaned to init: the
+            // process that owned this ephemeral daemon is gone — don't linger.
+            if now != original_ppid || now == 1 {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_orphan_reaper() {}
 
 #[cfg(test)]
 mod tests {
@@ -119,5 +172,17 @@ mod tests {
         // "/" has no parent component → None, so run_internal_daemon
         // degrades to stock defaults rather than aborting startup.
         assert!(write_ccteam_rmux_conf(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn ephemeral_socket_classification() {
+        // A daemon socket under the system temp dir (a test's TempDir) is
+        // ephemeral → eligible for orphan-reaping.
+        let ephemeral = std::env::temp_dir().join(".tmpABC123/.ccteam/run/mux.sock");
+        assert!(is_ephemeral_socket(&ephemeral));
+        // The canonical resident socket is NOT under temp → never reaped.
+        assert!(!is_ephemeral_socket(Path::new(
+            "/nonexistent-resident-root/.ccteam/run/mux.sock"
+        )));
     }
 }
