@@ -108,12 +108,12 @@ ccteam project ls                       # 列已知项目
 ccteam config                  # 交互式编号菜单(需要 TTY)
 ```
 
-菜单三项:① 注册 / 刷新 ccteam MCP 服务(写 `~/.claude.json`,让日常 claude 会话看到 ccteam 工具)② 设置 IM(Telegram)bot token ③ 查看偏好。
+菜单三项:① 注册 / 刷新 ccteam MCP 服务(**给 Claude `~/.claude.json` + Codex `~/.codex/config.toml` 都写**,让 claude / codex 会话都能用 ccteam 工具;ccteam 是纯 CLI、不是 vendor 插件,这是唯一的 MCP 安装路径)② 设置 IM(Telegram)bot token ③ 查看偏好。
 
 非交互形(headless / CI):
 
 ```bash
-ccteam config mcp                          # 注册 / 刷新 ccteam MCP 服务(等价菜单①)
+ccteam config mcp                          # 注册 / 刷新 ccteam MCP 服务(Claude + Codex 都写;等价菜单①)
 ccteam config show                         # 打印当前偏好
 ccteam config get fallback.on_claude_quota # 读一项偏好
 ccteam config fallback.on_claude_quota codex   # 设一项偏好(off|codex)
@@ -366,7 +366,7 @@ ccteam role add data-scientist --project demo-app   # 装到指定项目(默认�
 ccteam role list                    # 列当前项目已装的 role(= /role 可切的)
 ```
 
-- `role search` / `add` 读 **ccteam-hub 插件市场** 的 `index.json`(经 HTTPS 拉取 + 本地缓存 `~/.ccteam/hub-cache/`;首次访问联网,之后走缓存)。`search` 无匹配会给提示、exit 0。
+- `role search` / `add` 读 **ccteam-hub 插件市场** 的 `index.json`(经 HTTPS 拉取 + 本地缓存 `~/.ccteam/hub-cache/`;首次访问联网,之后走缓存)。**官方 ccteam 插件(`source: ccteam`)在结果里置顶,其余来源依次排后。** `search` 无匹配会给提示、exit 0。
 - `role add` 会取该 role 的 markdown 原文、**sha256 校验内容完整性**后写入 `.claude/agents/<role>.md`(零改写;agency 的 .md 本就 Claude 原生)。已存在同名 → 拒绝覆盖,加 `--force` 才覆盖。装完打印 `/role <role>` 提示,IM 里直接 `/role <role>` 切过去用。
 - 插件内容住独立的 `firstintent/ccteam-hub`(curated marketplace),开源插件 verbatim vendor 进 hub(pinned sha)；ccteam repo 本身不带任何 role/skill 内容(唯一例外默认 `cto`)。web 控制台的「插件市场」页是同一来源的图形入口(见 §8)。
 
@@ -400,7 +400,7 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 
 - **新建项目**:新建会话弹窗里选「＋ 新建项目…」,填 slug(名)+ 路径即可在任意目录 scaffold 一个项目(走 `POST /api/v1/projects`),建好直接在里头起会话。
 - **新建会话弹窗**:role 是从该项目 `.claude/agents/` 拉的**真实 role 下拉**(显示 role + 说明),外加一个「(无角色 / 裸 claude)」选项起 roleless 会话;不选则默认 cto。
-- **插件市场页**:浏览 ccteam-hub 的 role/skill/workflow 插件(含 agency-agents 等开源),**点开看正文预览**(install 前 review),**一键装进当前项目**(sha256 校验,带「已装」状态标)。取代了旧的只读 Roles 页 —— 装完 IM 里 `/role <role>` 即用。
+- **插件市场页**:浏览 ccteam-hub 的 role/skill/workflow 插件(**官方 ccteam 插件置顶**,其余如 agency-agents 等开源依次),**点开看正文预览**(install 前 review),**一键装进当前项目**(sha256 校验,带「已装」状态标)。取代了旧的只读 Roles 页 —— 装完 IM 里 `/role <role>` 即用。
 - **Status 页**:轻量状态总览 —— daemon 健康 + 会话 live/idle 数 + 今日成本/预算(同 `GET /api/v1/status`,也是 cost pill 的来源)。
 - **Settings 页**:在浏览器里配 IM 凭证 —— Telegram(bot token + 异步抓 chat_id:存好 token 后给 bot 发条消息,页面轮询自动捕获)与 Lark/飞书(App ID / Secret / region / allowlist)。**秘密只显示掩码**(`…last4`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅 daemon 启动时加载一次,无热重载)—— 页面会提示 `restart required`,照 §5 `ccteam stop && ccteam start`。
 - **web 终端**(per-session):按会话解析到对应 pane,稳定连(不再秒断重连)。**本版默认 mux backend(rmux)即逐字节保真**(裸 ANSI / 光标 / 换行/对齐都对,连上回放当前屏幕),不再需要 `CCTEAM_MUX_BACKEND=tmux`。终端 UI 当前只对 claude 会话开放。
