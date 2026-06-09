@@ -24,18 +24,23 @@
 //!   secret. We overwrite any caller-supplied value (same plumbing as
 //!   `chat_send_file`).
 //!
-//! Permission layering (defense-in-depth, NOT a hard boundary — see honest
-//! scope below):
-//!   1. `cto_role.md` frontmatter `tools:` grants the `mcp__ccteam__session_*`
-//!      handles; work-role templates do NOT, so Claude's per-agent allow-list
-//!      discourages a non-cto role from calling the tool. (Vendor caveat: MCP
-//!      tools may bypass that allow-list depending on the CLI version, so this
-//!      layer is best-effort, not load-bearing.)
+//! Permission model — the daemon `(role, secret)` gate is the SOLE real
+//! boundary (there is no meaningful per-agent frontmatter allow-list layer):
+//!   1. MCP tools are AMBIENT: every spawned session sees the full
+//!      `mcp__ccteam__ccteam__*` set via `.mcp.json`, and the `cto` role
+//!      template deliberately omits a frontmatter `tools:` line so it inherits
+//!      them. The per-agent allow-list is NOT used to gate these — and never
+//!      could have been: the real exposed names are double-`ccteam`
+//!      (`mcp__ccteam__ccteam__session_*` = server `ccteam` + the tool's own
+//!      `ccteam__` prefix), so the old single-`ccteam` grant matched nothing.
+//!      The cto's dependency on the scheduling tool SET is guarded instead by
+//!      the `cto_scheduling_tools_present_in_canonical_set` test below.
 //!   2. The daemon handler authenticates the forwarded `(role, secret)` pair
 //!      against its `sid -> {role, secret}` session map and returns an MCP
 //!      `isError` result on a non-cto role OR a missing/wrong secret. A cheap
 //!      role pre-filter runs first so an obvious non-cto is denied even with
-//!      the gateway down; the secret match is the security-relevant check.
+//!      the gateway down; the secret match is the security-relevant check —
+//!      this is the ONLY load-bearing gate.
 //!
 //! HONEST SCOPE (do not over-claim): under the current single-OS-uid
 //! full-trust model there is NO hard boundary between agents. A same-uid
@@ -238,6 +243,33 @@ mod tests {
         assert!(names.contains(&"ccteam__session_collect"));
         assert!(names.contains(&"ccteam__session_list"));
         assert!(names.contains(&"ccteam__session_stop"));
+    }
+
+    /// Tripwire for the cto scheduling surface (replaces the old `cto_role.md`
+    /// frontmatter `tools:` grant). The cto role template deliberately does NOT
+    /// enumerate these MCP tools — they are ambient to every session via
+    /// `.mcp.json`, and the cto's privilege is the daemon `(role, secret)` gate,
+    /// not a per-agent allow-list. So THIS is the single-source-of-truth guard
+    /// for the cto's dependency: if a `session_*` tool is removed or renamed it
+    /// fails loudly and names the cto, so the dependency can't be silently
+    /// dropped when the MCP tool set is trimmed.
+    #[test]
+    fn cto_scheduling_tools_present_in_canonical_set() {
+        for needed in [
+            "ccteam__session_spawn",
+            "ccteam__session_dispatch",
+            "ccteam__session_collect",
+            "ccteam__session_list",
+            "ccteam__session_stop",
+        ] {
+            assert!(
+                SESSION_TOOL_NAMES.contains(&needed),
+                "the cto role depends on the `{needed}` scheduling tool (exposed \
+                 to agents as `mcp__ccteam__{needed}`); if you removed or renamed \
+                 it, update the daemon session handler + cto role — do not \
+                 silently drop it"
+            );
+        }
     }
 
     #[test]

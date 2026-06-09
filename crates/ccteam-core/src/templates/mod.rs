@@ -598,35 +598,35 @@ mod tests {
         assert_eq!(map["feature-dev@claude-plugins-official"], true);
     }
 
-    /// v0.8.7 W1 DA.3 layer 1 — the seeded `cto` role MUST grant the
-    /// `mcp__ccteam__session_*` handles in its frontmatter `tools:` line
-    /// (Claude Code's per-agent allow-list). Work-role templates do NOT, so
-    /// only the cto can drive the scheduling tools (the daemon hard-gate is
-    /// the second layer). If this drifts, the cto loses its scheduling tools.
+    /// The seeded `cto` role MUST NOT restrict its tools via a frontmatter
+    /// `tools:` line. Omitting it makes the spawned session inherit ALL tools
+    /// (Claude Code treats a missing `tools:` as the wildcard), so every
+    /// `mcp__ccteam__ccteam__*` tool is available ambiently via `.mcp.json` —
+    /// the cto needs no per-agent enumeration. (The earlier template DID carry
+    /// such a line, but listed the handles as single-`ccteam`
+    /// `mcp__ccteam__session_*`, which never matched the real double-`ccteam`
+    /// names and so granted nothing.) The cto's scheduling PRIVILEGE is
+    /// enforced by the daemon `(role, secret)` gate, and the scheduling tool
+    /// SET is guarded by `cto_scheduling_tools_present_in_canonical_set` in
+    /// `mcp_session_tools` — neither lives in this fragile frontmatter.
     #[test]
-    fn cto_role_template_grants_session_scheduling_tools() {
+    fn cto_role_template_does_not_restrict_tools() {
         // Frontmatter is the block between the first two `---` fences.
         let after = CTO_ROLE_MD
             .strip_prefix("---")
             .expect("cto_role.md starts with frontmatter fence");
         let end = after.find("---").expect("frontmatter closing fence");
         let frontmatter = &after[..end];
-        let tools_line = frontmatter
-            .lines()
-            .find(|l| l.trim_start().starts_with("tools:"))
-            .expect("cto_role.md frontmatter must carry a `tools:` line");
-        for handle in [
-            "mcp__ccteam__session_spawn",
-            "mcp__ccteam__session_dispatch",
-            "mcp__ccteam__session_collect",
-            "mcp__ccteam__session_list",
-            "mcp__ccteam__session_stop",
-        ] {
-            assert!(
-                tools_line.contains(handle),
-                "cto `tools:` must grant `{handle}`, got: {tools_line}"
-            );
-        }
+        assert!(
+            !frontmatter
+                .lines()
+                .any(|l| l.trim_start().starts_with("tools:")),
+            "cto_role.md frontmatter must NOT carry a restrictive `tools:` line \
+             (omit it so the session inherits all tools, incl. ambient \
+             mcp__ccteam__ccteam__* via .mcp.json); the cto's scheduling \
+             privilege is enforced by the daemon (role, secret) gate, not by a \
+             per-agent allow-list"
+        );
     }
 
     #[test]
