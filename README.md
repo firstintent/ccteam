@@ -1,8 +1,8 @@
 # ccteam
 
-> **Your AI dev team, cloud-resident on your own machine — driven from IM and a web console.** Built on top of Claude Code (and OpenAI Codex). No YAML to write, no flags to memorize.
+> **Remote Claude Code & Codex, done right — runs autonomously, stays online 24/7, answers the moment you ping.** Your AI dev team resident on your own machine, driven from IM and a web console. No YAML to write, no flags to memorize.
 
-ccteam is a meta-tool that runs on top of [Claude Code](https://code.claude.com/) (and OpenAI Codex). It puts a single resident gateway daemon on your own computer, sitting in front of the real `claude` / `codex` agents, so you can drive them from instant messaging (Telegram, Slack, …) and a local web console — as if your phone were a terminal into your machine.
+ccteam makes [Claude Code](https://code.claude.com/) (and OpenAI Codex) **remote-first, self-running, and always-on** — you drive the real agents from anywhere, they keep working unattended on your own machine, and they answer the moment you message. It does this with a single resident gateway daemon on your own computer, sitting in front of the real `claude` / `codex` agents, so you can drive them from instant messaging (Telegram, Slack, …) and a local web console — as if your phone were a terminal into your machine.
 
 The AI runs on **your computer**: it reads your files, runs your commands, touches your code. IM is just the entry point — close the laptop lid and the work keeps running. Sessions are durable and survive restarts.
 
