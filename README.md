@@ -2,9 +2,15 @@
 
 > **Remote Claude Code & Codex, done right — runs autonomously, stays online 24/7, answers the moment you ping.** Your AI dev team resident on your own machine, driven from IM and a web console. No YAML to write, no flags to memorize.
 
-ccteam makes [Claude Code](https://code.claude.com/) (and OpenAI Codex) **remote-first, self-running, and always-on** — you drive the real agents from anywhere, they keep working unattended on your own machine, and they answer the moment you message. It does this with a single resident gateway daemon on your own computer, sitting in front of the real `claude` / `codex` agents, so you can drive them from instant messaging (Telegram, Slack, …) and a local web console — as if your phone were a terminal into your machine.
+ccteam is a **self-hosted control plane for coding agents** — [Claude Code](https://code.claude.com/) and OpenAI Codex stay the data plane. One resident daemon on your own computer sits in front of the stock `claude` / `codex` agents and owns everything *around* the work — **routing** (IM and web chats to the right session), **identity** (durable session handles), **lifecycle** (spawn on demand, resume by id, release when idle), and **budget** (per-vendor 24h cost caps) — and never touches the work itself: no injected prompts, no scraped terminals, no forked runtime. What you drive is the real Claude Code / Codex, every native capability intact.
 
-The AI runs on **your computer**: it reads your files, runs your commands, touches your code. IM is just the entry point — close the laptop lid and the work keeps running. Sessions are durable and survive restarts.
+Owning everything around the work — and nothing inside it — is what buys you:
+
+- **Remote-first.** Your phone is a terminal into your machine: drive the agents from IM (Telegram, Slack, …) or a local web console, and when an agent asks a question mid-task, you answer it right in chat.
+- **Always-on.** The AI runs on **your computer** — it reads your files, runs your commands, touches your code — and keeps working after you close the laptop lid.
+- **A team, not a single chat.** Many addressable sessions run side by side across projects, each with its own role and context.
+- **Durable.** Sessions survive daemon restarts and machine reboots; state lives on disk, so a restart resumes instead of forgetting.
+- **Vendor-native, zero lock-in.** A new Claude Code / Codex capability works the day the vendor ships it; the vendor is a per-session attribute, not a platform commitment.
 
 ## What it is
 
