@@ -81,6 +81,15 @@ impl HubIndex {
     pub fn find(&self, id: &str) -> Option<&HubPlugin> {
         self.plugins.iter().find(|p| p.id == id)
     }
+
+    /// Browse ordering: official ccteam first-party plugins (`source ==
+    /// "ccteam"`) sort to the top — the featured / recommended slot — while
+    /// every other source keeps its existing (id-sorted) order. Stable, so the
+    /// non-ccteam tail is untouched. Applied at parse time so every consumer
+    /// (web marketplace browse, CLI `role search`) inherits one ordering.
+    pub fn sort_ccteam_first(&mut self) {
+        self.plugins.sort_by_key(|p| p.source != "ccteam");
+    }
 }
 
 /// One installable plugin entry in the hub index.
@@ -315,7 +324,11 @@ pub async fn fetch_index(base: &str) -> Result<HubIndex, HubError> {
 /// Parse index bytes into a [`HubIndex`], mapping a parse failure to
 /// [`HubError::BadIndex`].
 fn parse_index(bytes: &[u8]) -> Result<HubIndex, HubError> {
-    serde_json::from_slice(bytes).map_err(|e| HubError::BadIndex(format!("{e}")))
+    let mut index: HubIndex =
+        serde_json::from_slice(bytes).map_err(|e| HubError::BadIndex(format!("{e}")))?;
+    // Feature official ccteam plugins at the top of every browse/list.
+    index.sort_ccteam_first();
+    Ok(index)
 }
 
 /// Load the hub catalog with a local cache under `~/.ccteam/hub-cache/`.
@@ -569,5 +582,40 @@ mod tests {
         };
         assert!(idx.find("foo").is_some());
         assert!(idx.find("bar").is_none());
+    }
+
+    #[test]
+    fn sort_ccteam_first_features_ccteam_source() {
+        fn p(id: &str, source: &str) -> HubPlugin {
+            HubPlugin {
+                id: id.into(),
+                type_: "skill".into(),
+                name: id.into(),
+                description: String::new(),
+                path: format!("skills/{id}.md"),
+                content_sha: "0".into(),
+                source: source.into(),
+                upstream: String::new(),
+                license: String::new(),
+                tags: vec![],
+            }
+        }
+        let mut idx = HubIndex {
+            version: 1,
+            name: "h".into(),
+            description: String::new(),
+            generated_at: String::new(),
+            plugins: vec![
+                p("a-agency", "agency-agents"),
+                p("x-ccteam", "ccteam"),
+                p("b-agency", "agency-agents"),
+                p("y-ccteam", "ccteam"),
+            ],
+        };
+        idx.sort_ccteam_first();
+        let order: Vec<&str> = idx.plugins.iter().map(|p| p.id.as_str()).collect();
+        // `source == "ccteam"` first (original relative order preserved), then
+        // every other source (also order-preserving) — a stable sort.
+        assert_eq!(order, vec!["x-ccteam", "y-ccteam", "a-agency", "b-agency"]);
     }
 }

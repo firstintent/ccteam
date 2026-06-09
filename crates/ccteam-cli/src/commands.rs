@@ -4182,7 +4182,8 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
 /// curated ccteam-hub marketplace `index.json` (loaded via the
 /// `~/.ccteam/hub-cache/` cache; first run fetches it). Matches the
 /// (case-insensitive) query against each plugin's id / name / description /
-/// tags. An empty query lists everything, sorted by id. Text output prints
+/// tags. An empty query lists everything; official ccteam plugins
+/// (`source == "ccteam"`) are featured first, then sorted by id. Text output prints
 /// `id` + type + description so the user can copy an `id` into
 /// `ccteam role add`. The async load is driven on a throwaway current-thread
 /// runtime ([`block_on_async`]) since `main()` is sync.
@@ -4206,7 +4207,13 @@ pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -
                 || p.tags.iter().any(|t| t.to_lowercase().contains(&q))
         })
         .collect();
-    hits.sort_by(|a, b| a.id.cmp(&b.id));
+    // Feature official ccteam plugins (`source == "ccteam"`) first, then by id —
+    // mirrors the web marketplace browse order (see `HubIndex::sort_ccteam_first`).
+    hits.sort_by(|a, b| {
+        (a.source != "ccteam")
+            .cmp(&(b.source != "ccteam"))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(match format {
         OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
         OutputFormat::Text => {
