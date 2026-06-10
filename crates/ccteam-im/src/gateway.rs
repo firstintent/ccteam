@@ -465,8 +465,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/rm",
-        arg_hint: Some("[id]"),
-        help: "destroy a session (bare = current)",
+        arg_hint: Some("<id>"),
+        help: "destroy a session by id",
         in_menu: false,
     },
     GatewayCommandSpec {
@@ -973,33 +973,36 @@ impl Gateway {
                     .filter(|s| s.owner == *chat || chat.channel == "web")
                     .ok_or_else(|| anyhow!("unknown session for this chat: {id}"))?;
                 let sid = session.id.clone();
+                // v0.8.10 — capture the target session's project so the switch can
+                // also move the chat's project context (below).
+                let project = session.project.clone();
                 if let Ok(mut target) = session.reply_to.lock() {
                     *target = chat.clone();
                 }
+                // Switching INTO a session moves the chat's "current project" to
+                // that session's project, so a following /new (and /cd's default)
+                // lands in the same project you just switched into — not the stale
+                // prior one.
+                self.current_project.insert(chat.clone(), project);
                 self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
                 self.persist_state()?;
                 Ok(Some(format!("using session {sid}")))
             }
             "/rm" => {
-                // v0.8.10 — destroy a session. `/rm <sid>` targets a specific
-                // session; bare `/rm` destroys the current one. Completes the
-                // session lifecycle: /new (create) · /clear (recycle) · /use
-                // (switch) · /rm (destroy). `stop_session` aborts the pump, closes
-                // the vendor thread, drops the record, and clears any
-                // `current_session` route pointing at it (so after removing the
-                // current session the next message spawns a fresh default).
-                let sid = match parts.next() {
-                    Some(id) => id.to_string(),
-                    None => self
-                        .current_session
-                        .read()
-                        .unwrap()
-                        .get(chat)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow!("/rm 需要一个 session id:/rm <sid>(或先有个当前会话)")
-                        })?,
-                };
+                // v0.8.10 — destroy a session BY ID. Completes the session
+                // lifecycle: /new (create) · /clear (recycle) · /use (switch) ·
+                // /rm (destroy). A session id is REQUIRED — bare `/rm` is rejected
+                // because silently destroying the current session is too easy to
+                // fat-finger. `stop_session` aborts the pump, closes the vendor
+                // thread, drops the record, and clears any `current_session` route
+                // pointing at it (so removing the current session leaves the next
+                // message to spawn a fresh default).
+                let sid = parts
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow!("/rm 必须带 session id:/rm <sid>(安全起见不支持裸 /rm)")
+                    })?
+                    .to_string();
                 // Scope to sessions this chat owns (web console may target any),
                 // mirroring /use — never let one chat destroy another's session.
                 let owned = self
