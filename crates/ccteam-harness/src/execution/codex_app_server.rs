@@ -60,7 +60,8 @@ use crate::execution::progress_bridge::{
     CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 use crate::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
+    SpawnCtx,
     ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
     UnifiedTokenUsage,
 };
@@ -1347,6 +1348,24 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 "thread/start response missing thread.thread_id: {result}"
             ))
         })?;
+        // v0.8.10 — make codex sessions writable by default. Codex's server
+        // default thread posture is restrictive (read-only / approval
+        // on-request); combined with ccteam's auto-deny approval callback (no
+        // codex→IM HITL wired yet, see codex_jsonrpc.rs) the agent cannot write
+        // files. Mirror the Claude `Skip` default (`--dangerously-skip-permissions`
+        // — full access incl. network, no prompts): seed every turn with
+        // sandbox=dangerFullAccess + approval=never, consistent with ccteam's
+        // single-uid full-trust model and overridable per session via
+        // `/permissions`. `Hitl` sessions stay on codex's restricted default —
+        // codex approval routing to the IM HITL is not wired, so they remain
+        // locked down rather than silently bypassing approval.
+        if matches!(ctx.permission_mode, PermissionMode::Skip) {
+            self.set_override(&thread_id, |o| {
+                o.approval_policy = Some("never".to_string());
+                o.sandbox_policy = Some(json!({ "type": "dangerFullAccess" }));
+            })
+            .await;
+        }
         // v0.8.5 D2.4 — seed the tracker's model for this thread from the
         // spawn ctx so `/status` + `thread_status` can report it before the
         // first tokenUsage notification arrives.
