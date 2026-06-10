@@ -106,7 +106,12 @@ pub struct Gateway {
     state_path: Option<PathBuf>,
     projects: BTreeMap<String, PathBuf>,
     current_project: BTreeMap<ChatKey, String>,
-    current_session: BTreeMap<ChatKey, String>,
+    /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
+    /// detached event pumps can read it to label *out-of-band* answers/errors
+    /// — i.e. async events from a session that is no longer the chat's focus,
+    /// which otherwise masquerade as the current session in the single IM
+    /// stream (v0.8.10 routing-isolation fix).
+    current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
     sessions: BTreeMap<String, GatewaySession>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
@@ -558,7 +563,7 @@ impl Gateway {
             state_path: None,
             projects,
             current_project: BTreeMap::new(),
-            current_session: BTreeMap::new(),
+            current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
@@ -800,6 +805,8 @@ impl Gateway {
     /// True when this chat/user already has a current gateway session.
     pub fn has_current_session(&self, channel: &str, chat_id: &str, user_id: &str) -> bool {
         self.current_session
+            .read()
+            .unwrap()
             .contains_key(&ChatKey::new(channel, chat_id, user_id))
     }
 
@@ -858,7 +865,7 @@ impl Gateway {
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
-                self.current_session.insert(chat.clone(), session_id);
+                self.current_session.write().unwrap().insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -868,7 +875,7 @@ impl Gateway {
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
-                self.current_session.insert(chat.clone(), session_id);
+                self.current_session.write().unwrap().insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -944,7 +951,7 @@ impl Gateway {
                 if let Ok(mut target) = session.reply_to.lock() {
                     *target = chat.clone();
                 }
-                self.current_session.insert(chat.clone(), sid.clone());
+                self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
                 self.persist_state()?;
                 Ok(Some(format!("using session {sid}")))
             }
@@ -1039,7 +1046,7 @@ impl Gateway {
     }
 
     async fn ensure_current_session(&mut self, chat: &ChatKey) -> Result<()> {
-        if self.current_session.contains_key(chat) {
+        if self.current_session.read().unwrap().contains_key(chat) {
             return Ok(());
         }
         let templates = self.templates_for_chat(chat);
@@ -1212,7 +1219,7 @@ impl Gateway {
         );
         let model_warning =
             self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
-        self.current_session.insert(owner, id.clone());
+        self.current_session.write().unwrap().insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
         Ok(StartOutcome {
@@ -1238,6 +1245,8 @@ impl Gateway {
     async fn switch_current_role(&mut self, chat: &ChatKey, role: String) -> Result<String> {
         let sid = self
             .current_session
+            .read()
+            .unwrap()
             .get(chat)
             .cloned()
             .ok_or_else(|| anyhow!("/role 需要一个活动会话:先 /new 或发条消息再切换。"))?;
@@ -1337,7 +1346,7 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
             },
         );
-        self.current_session.insert(chat.clone(), sid.clone());
+        self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
         self.persist_state()?;
         self.spawn_event_pump(&sid);
         let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
@@ -1404,6 +1413,10 @@ impl Gateway {
         let project_dir = self.projects.get(&session.project).cloned();
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
+        // v0.8.10 routing-isolation — read handle to the chat→focus map so the
+        // detached pump can label out-of-band answers/errors (events from a
+        // session that is no longer the chat's current focus).
+        let current_session = Arc::clone(&self.current_session);
         let handle = tokio::spawn(async move {
             use std::time::Instant;
             // V0.8.4 P1: split the event stream into ANSWER (new message)
@@ -1488,7 +1501,40 @@ impl Gateway {
                                     );
                                 }
                             }
-                            let (channel, chat_id) = pump_target(&session);
+                            // Resolve the live reply target ONCE (reply_to → owner
+                            // fallback, same as pump_target) and reuse it for the
+                            // focus check below.
+                            let chat_key = session
+                                .reply_to
+                                .lock()
+                                .map(|k| k.clone())
+                                .unwrap_or_else(|_| session.owner.clone());
+                            let channel = chat_key.channel.clone();
+                            let chat_id = chat_key.chat_id.clone();
+                            // v0.8.10 routing-isolation — when this session is NOT the
+                            // chat's current focus (the user has since /use'd or
+                            // messaged a different sid), its async answer/error still
+                            // lands in the same single IM stream. Prefix the sid +
+                            // context so an old session can't masquerade as the current
+                            // one; the focused session's own replies stay unlabeled.
+                            // turns.jsonl already captured the RAW `text` above — only
+                            // the IM `content` is prefixed.
+                            let is_focused = current_session
+                                .read()
+                                .map(|m| m.get(&chat_key).map(|s| s == &session_id).unwrap_or(false))
+                                .unwrap_or(true);
+                            let content = if is_focused {
+                                text
+                            } else {
+                                format!(
+                                    "[{} {} {} {}] {}",
+                                    session_id,
+                                    session.project,
+                                    vendor_str(session.vendor),
+                                    session.role,
+                                    text
+                                )
+                            };
                             // `GatewayEventSink::send` returns false only when the
                             // mpsc consumer is gone (daemon exited) → stop the pump.
                             if !tx.send(GatewayEvent {
@@ -1496,7 +1542,7 @@ impl Gateway {
                                 channel,
                                 chat_id,
                                 thread_ts: None,
-                                content: text,
+                                content,
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
                                 options: Vec::new(),
@@ -1560,7 +1606,7 @@ impl Gateway {
             .into_iter()
             .map(|route| (route.chat, route.value))
             .collect();
-        self.current_session = saved
+        *self.current_session.write().unwrap() = saved
             .current_session
             .into_iter()
             .map(|route| (route.chat, route.value))
@@ -1598,7 +1644,10 @@ impl Gateway {
         // truncated out-of-band). With sid-keying nothing is collapsed here, but
         // a dangling route would otherwise address a non-existent session.
         let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
-        self.current_session.retain(|_, sid| live.contains(sid));
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, sid| live.contains(sid));
         Ok(())
     }
 
@@ -1621,6 +1670,8 @@ impl Gateway {
                 .collect(),
             current_session: self
                 .current_session
+                .read()
+                .unwrap()
                 .iter()
                 .map(|(chat, value)| SavedGatewayRoute {
                     chat: chat.clone(),
@@ -1691,6 +1742,8 @@ impl Gateway {
     async fn submit_to_current(&self, chat: &ChatKey, payload: String) -> Result<Vec<String>> {
         let session_id = self
             .current_session
+            .read()
+            .unwrap()
             .get(chat)
             .ok_or_else(|| anyhow!("no current session for chat"))?
             .clone();
@@ -1886,7 +1939,7 @@ impl Gateway {
     /// Resolve a numeric short-reply (1-based) against the current session's
     /// pending choice (v0.8.5 D3).
     async fn resolve_numeric(&self, chat: &ChatKey, n: usize) -> Result<Vec<String>> {
-        let Some(session_id) = self.current_session.get(chat).cloned() else {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
             return Ok(vec!["no choice to answer".to_string()]);
         };
         let key = pending_key(chat, &session_id);
@@ -1942,10 +1995,10 @@ impl Gateway {
 
     /// True when the current session has an outstanding pending choice.
     async fn has_pending_for_current(&self, chat: &ChatKey) -> bool {
-        let Some(session_id) = self.current_session.get(chat) else {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
             return false;
         };
-        let key = pending_key(chat, session_id);
+        let key = pending_key(chat, &session_id);
         let mut pend = self.pending.lock().await;
         // (v0.8.5 S2) A lapsed prompt no longer counts as pending, so a bare
         // number after the TTL falls through to ordinary agent text.
@@ -1973,10 +2026,10 @@ impl Gateway {
             .map(|s| s.id.clone());
         match &adopted {
             Some(id) => {
-                self.current_session.insert(chat.clone(), id.clone());
+                self.current_session.write().unwrap().insert(chat.clone(), id.clone());
             }
             None => {
-                self.current_session.remove(chat);
+                self.current_session.write().unwrap().remove(chat);
             }
         }
         adopted
@@ -2113,7 +2166,8 @@ impl Gateway {
     /// session is `current` when it is the active session for at least one
     /// routed chat. Ordered by `s{n}` index for stable rendering.
     pub fn session_views(&self) -> Vec<SessionView> {
-        let current: std::collections::HashSet<&String> = self.current_session.values().collect();
+        let current: std::collections::HashSet<String> =
+            self.current_session.read().unwrap().values().cloned().collect();
         let mut views: Vec<SessionView> = self
             .sessions
             .values()
@@ -2342,7 +2396,7 @@ impl Gateway {
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
         // chat doesn't keep addressing a dead session.
-        self.current_session.retain(|_, v| v != sid);
+        self.current_session.write().unwrap().retain(|_, v| v != sid);
         self.persist_state()?;
         Ok(())
     }
