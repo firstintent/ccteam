@@ -99,3 +99,22 @@
 3. **订阅 ToS 边界**:多客户/多人共用一份 Max 订阅的产品口径:#3 已限 API-key 主线规避大头,「复用既有订阅」卖点的诚实范围仍需一句官方表述(与 #3 范围限定/#14 表里)。
 4. **商业形态**:OSS+managed hosting(RunMyClaw 先例)还是 OSS+低价订阅?决定 #1 做到「自托管文档级」还是「一键托管镜像级」,也决定③漏斗→②的转化路径。
 5. **#5 兑现节奏确认**:确认 §6 两段式处置(v0.9 立项+设计冻结、v0.10 物理 uid 主线);若 v0.10 排不下,是否接受软围栏长期作唯一边界及其文档诚实成本。
+
+## 8. Owner 裁定(2026-06-10,TG 1106)—— 拓扑纠正与重排
+
+> 本节为 owner 对 §1–§7 的事后裁定,优先级高于上文;上文保留原样作论证存档。
+
+**拓扑纠正**:ccteam 跑在**单租户独享的 agent sandbox** 里 —— 一个客户/一个交付 = 一个独享 sandbox,**不在单 daemon 内按 project 做多租户**。客户隔离由 sandbox 边界(infra 层)白送,不靠 daemon 内围栏。
+
+**失前提即砍/降**:
+- **#4 客户项目-软围栏、#5 项目即租户-OS 隔离:P0 → CUT**(作为客户互防的前提消失;#5 残值 = sandbox 内部纵深防御,可后置不立项)。
+- **#6 身份网关、#13 审批路由:降档收窄** —— 不再是"同机多客户互窥防线",收敛为集群入口的「谁能驱动哪个 sandbox + 操作署名」。
+- §7-2(多人触发线)、§7-5(#5 节奏)随之失效大半;§7-1 主线竞争格局改写(见下)。
+
+**升格**:**#9 多机-舰队寻址 从 P1 升为候选主线** = 「**sandbox 集群化 agent 编排**」:一个控制面 / 一个 IM 入口,对 N 个单租户 sandbox 做 spawn / 寻址(sid 全局)/ 恢复 / 记账;#10 沙箱-spawn-backend 与之同向(sandbox 供给侧)。归因模型反而更干净:**一个 sandbox = 一个客户 = 一条账**,per-sandbox 成本/回放天然按客户分。
+
+**不受影响、继续有效**:#1 零入站姿态+签名(每个 sandbox 都要)、#2 同驾回合仲裁(per-sid 语义不变)、#3 凭证注入(per-sandbox 反而简化)、#7 账本+预算闸(归因单位从 project-inside-host 改为 sandbox,简化)、#8 回放账本、#12 /handoff(集群层)、#15/#16/#18。
+
+**具名基底**(owner 同步给出,TG 1107):[kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)(v0.4.6,SIG Apps)—— `Sandbox` CRD:单例有状态工作负载、稳定网络身份、扛重启持久存储、pause/resume 生命周期、gVisor/Kata 隔离;扩展 CRD `SandboxTemplate`/`SandboxClaim`/`SandboxWarmPool`;Python client。**与 ccteam 红线的结构同构**:Sandbox 的 pause/resume + 稳定身份 + 持久存储 ≅ ccteam 的 resume-by-sid + 空闲释放 + 双 SoT —— k8s 把「可恢复的常驻会话」做成了集群原语,ccteam 把它做成了单机原语;集群编排方向 = 两者对接(sid ↔ Sandbox CR),#9+#10 合并为同一条主线的两面(寻址面 + 供给面)。
+
+**待下轮 PRD 决断的关键分叉**:① ccteam-per-sandbox(每租户一个完整 ccteam,上面另起薄控制面)vs ② ccteam-as-control-plane(网关居集群入口,session spawn 进 k8s Sandbox,`backend: k8s-agent-sandbox` 作第三 spawn backend)。②保留壳的全部结构位置(网关唯一汇合点 / sid 寻址 / IM 单入口),①把控制面问题推给未知新层 —— 倾向②,owner 拍板。**§6 版本线待下轮 PRD 按本裁定重排**(信任底座的"多客户在一台机"段落让位于集群编排方向)。
