@@ -22,7 +22,7 @@
 ## 二、交付物 E1–E5
 
 - **E1 · ClaudeStreamJsonAdapter(Claude vendor 第二 spawn 路径)**
-  - argv:`claude --input-format stream-json --output-format stream-json --include-partial-messages --verbose --replay-user-messages --debug --debug-to-stderr [--agent <role>] [--permission-prompt-tool stdio | --dangerously-skip-permissions] [--session-id <uuid> | --resume <uuid>]`(flags 已对 2.1.170 `--help` + 活体实验验证;`-p` 带不带见 §四 Q1)。长驻 child、stdin 常开;停 = 关 stdin 优雅退出。
+  - argv:`claude --input-format stream-json --output-format stream-json --include-partial-messages --verbose --replay-user-messages --debug --debug-to-stderr [--agent <role>] [--permission-prompt-tool stdio | --dangerously-skip-permissions] [--session-id <uuid> | --resume <uuid>]`(flags 已对 2.1.170 `--help` + 活体实验验证;**不带 `-p`**,§四 Q1 决策)。长驻 child、stdin 常开;停 = 关 stdin 优雅退出。
   - **身份**:spawn 即 `--session-id` mint vendor-UUID ↔ ccteam sid 双射,登记 gateway session map —— 在新通道根除 tmux 路径的 transcript-discovery rendezvous 脆点(v0.8.10 §四.b 头号脆点)。
   - **outbound**:daemon 单点消费 stdout → `CanonicalEvent` → `progress.jsonl`/`turns.jsonl` 直写(此类 session **无** hook / settings.local.json hook 段 / pane-env / X-Ccteam-Sid forwarder 链);schema 权威仍 `harness/progress_bridge`,事件 taxonomy 复用不新增权威。
   - **HITL**:hitl session 走 `--permission-prompt-tool stdio`,`can_use_tool` control RPC → IM `[同意][拒绝]`(复用既有 permission/ask 面);deny 只挡该次工具不 kill turn(红线不变);skip session 走 `--dangerously-skip-permissions`(现状对齐)。
@@ -52,13 +52,13 @@
 | track-upstream 市场 | 已独立成 `docs/versions/v0-8-12/prd.md`(正交) |
 | 编排层(ccteam-flow)上线、新 IM 平台 | 既有 deferred 不变 |
 
-## 四、Open questions(review 时定)
+## 四、Open questions → 决策(user 拍板 2026-06-10,TG 1093;Q4 留 dev-plan)
 
-1. **`-p` 带不带**:VS Code 不带(交互流模式),alleycat 带(`-p` + stream-json 输入也支持多轮,EOF 退出);影响 exit/错误语义 —— wave 0 实验定,倾向跟 VS Code。
-2. **IM `/new` 默认是否与 web 同步切 stream-json**:建议同步(单一默认常量),terminal 经显式参数选。
-3. **cto session(init 种的管家)默认通道**:建议 stream-json(纯 chat 角色,无终端需求)。
-4. **E4 量化阈值**:输入往返 p95、reconnect 重绘一致性判据,dev-plan 时定数。
-5. **headless 子进程的插件隔离**:spawn 的 claude 加载用户全局插件,独占外部资源类插件(telegram 同 token 单 getUpdates 消费者)会与用户自跑实例互踢(研究文档 §6 实测事故);旋钮三档已确认(`enabledPlugins` 项目层 override / `--setting-sources` 收窄 / `CLAUDE_CONFIG_HOME`)。倾向:**不默认替用户关插件**(用户环境归用户),doctor 加检测 + warn + 给一行 fix。
+1. **`-p`:不带**(决策)—— IM 场景是长命会话、非短命 one-shot;跟 VS Code 交互流模式(长驻、stdin 常开)。
+2. **IM `/new` 默认:与 web 同步切 stream-json**(决策)—— 单一默认常量,terminal 经显式参数选。
+3. **cto session 默认通道:stream-json**(决策)—— 纯 chat 角色,无终端需求。
+4. **E4 量化阈值**(开放):输入往返 p95、reconnect 重绘一致性判据,dev-plan 时定数。
+5. **插件隔离:定点隔离官方 telegram 插件**(决策)—— ccteam spawn 的 session 经项目 `.claude/settings.local.json`(ccteam 托管层,红线允许)写 `enabledPlugins: {"telegram@claude-plugins-official": false}` 定点关闭:它独占 bot-token getUpdates,与 ccteam 自身 IM 网关结构性冲突(研究文档 §6 实测互踢事故)。**其余用户插件不动**(用户环境归用户);doctor 对同类独占外部资源插件保留检测 + warn + 一行 fix。
 
 ## 五、参考
 
@@ -78,3 +78,4 @@
 ## 七、变更记录
 
 - **2026-06-10 初版**:由 stream-json 协议研究催生(TG 1079–1087);user 定 scope:加入版本需求(TG 1088→更正 1091 为 v0.8.11)+ 参考 alleycat(TG 1089)+ web 创建默认 stream-json、rmux 高级选项(TG 1090)+ 主线=继续 v0.8.10 方向加码稳定性/终端体验(TG 1091)。原占位 v0.8.11 的 track-upstream 市场 PRD 顺移 v0.8.12。候选,待 review。
+- **2026-06-10 决策回填(TG 1093)**:Q1 不带 `-p`(IM 非短命 session)/ Q2 IM `/new` 同步默认 stream-json / Q3 cto 走 stream-json / Q5 定点隔离官方 telegram 插件(settings.local.json `enabledPlugins` 定点 false,不碰其余用户插件);Q4 留 dev-plan。同日启动「云端托管 code-agent 控制中心」主战场需求探索(参考 `references/litellm-agent-platform`,workflow 产出落 `docs/research/`)。
