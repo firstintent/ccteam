@@ -498,11 +498,15 @@ fn hook_via_daemon_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// v0.8.5 D5 — local-jsx popup commands that apply directly when given an
-/// arg (no picker) but pop a picker when bare (model: SetModelAndClose;
-/// effort: ApplyEffortAndClose). bare → NeedsChoice; arg/choice → arg-form
-/// passthrough. Synced from references/claude-code/src/commands.
-const CLAUDE_ARG_POPUPS: &[&str] = &["model", "effort"];
+/// v0.8.5 D5 — local-jsx popup commands that apply directly when given an arg
+/// but pop a ccteam picker when bare (effort: ApplyEffortAndClose). bare →
+/// NeedsChoice; arg/choice → arg-form passthrough.
+///
+/// v0.8.10 — `model` was REMOVED: claude's real `/model` picker + "Switch
+/// model?" confirmation drift from any hardcoded list, so `/model` now passes
+/// straight through to claude's native TUI (see the dedicated `/model` arm in
+/// `handle_directive`); the user drives it via `/screen` + number replies.
+const CLAUDE_ARG_POPUPS: &[&str] = &["effort"];
 
 /// v0.8.5 D5 — local-jsx commands that open a TUI panel/picker with no
 /// chat-drivable arg form; sent bare they stick the modal + swallow input,
@@ -528,18 +532,6 @@ const CLAUDE_PANEL_POPUPS: &[&str] = &[
     "rate-limit-options",
 ];
 
-/// Model aliases offered for a bare `/model` choice (MODEL_ALIASES,
-/// references/claude-code/src/utils/model/aliases.ts).
-const CLAUDE_MODEL_ALIASES: &[&str] = &[
-    "opus",
-    "sonnet",
-    "haiku",
-    "best",
-    "opus[1m]",
-    "sonnet[1m]",
-    "opusplan",
-];
-
 /// Reasoning-effort levels offered for a bare `/effort` choice.
 const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
 
@@ -549,7 +541,6 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
 /// when two sessions raise the same command's picker at once.
 fn claude_popup_prompt(name: &str) -> ChoicePrompt {
     let (title, opts): (&str, &[&str]) = match name {
-        "model" => ("Pick a model", CLAUDE_MODEL_ALIASES),
         "effort" => ("Pick a reasoning effort", CLAUDE_EFFORT_LEVELS),
         _ => ("Pick an option", &[]),
     };
@@ -1021,9 +1012,27 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             });
         }
 
-        // Channel 3a — arg-applicable popup (model / effort). A resolved
-        // choice (from a prior NeedsChoice) or inline args both apply
-        // directly with no picker (confirmed by the §5.1 smoke).
+        // v0.8.10 — `/model` ALWAYS passes through to claude's NATIVE picker /
+        // confirmation, never a ccteam hardcoded list (which drifts from
+        // claude's real, evolving model set). claude's `/model` is an
+        // interactive TUI (a picker when bare; a "Switch model?" confirmation
+        // for a cache-invalidating switch) with no hook event, so ccteam can't
+        // forward or auto-drive it — the user drives it from chat: `/screen` to
+        // see the pane, then reply the number / Enter / `s` / `/esc`.
+        if name == "model" {
+            let line = if d.args.trim().is_empty() {
+                "/model".to_string()
+            } else {
+                format!("/model {}", d.args.trim())
+            };
+            self.submit_turn(h, TurnInput::UserText(line)).await?;
+            return Ok(DirectiveOutcome::Done {
+                receipt: "已发送 /model —— claude 在 pane 里弹了它自己的选单/确认框。用 /screen 看，回数字选（回车=设为默认 · 输 s=仅本会话 · /esc=取消）。".to_string(),
+            });
+        }
+
+        // Channel 3a — arg-applicable popup (effort). A resolved choice (from a
+        // prior NeedsChoice) or inline args both apply directly with no picker.
         if CLAUDE_ARG_POPUPS.contains(&name.as_str()) {
             let applied = d
                 .choice
