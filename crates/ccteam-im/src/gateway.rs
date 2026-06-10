@@ -464,6 +464,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: false,
     },
     GatewayCommandSpec {
+        name: "/rm",
+        arg_hint: Some("[id]"),
+        help: "destroy a session (bare = current)",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
         name: "/role",
         arg_hint: Some("<role>"),
         help: "switch the current session to a fresh agent role",
@@ -973,6 +979,39 @@ impl Gateway {
                 self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
                 self.persist_state()?;
                 Ok(Some(format!("using session {sid}")))
+            }
+            "/rm" => {
+                // v0.8.10 — destroy a session. `/rm <sid>` targets a specific
+                // session; bare `/rm` destroys the current one. Completes the
+                // session lifecycle: /new (create) · /clear (recycle) · /use
+                // (switch) · /rm (destroy). `stop_session` aborts the pump, closes
+                // the vendor thread, drops the record, and clears any
+                // `current_session` route pointing at it (so after removing the
+                // current session the next message spawns a fresh default).
+                let sid = match parts.next() {
+                    Some(id) => id.to_string(),
+                    None => self
+                        .current_session
+                        .read()
+                        .unwrap()
+                        .get(chat)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow!("/rm 需要一个 session id:/rm <sid>(或先有个当前会话)")
+                        })?,
+                };
+                // Scope to sessions this chat owns (web console may target any),
+                // mirroring /use — never let one chat destroy another's session.
+                let owned = self
+                    .sessions
+                    .get(&sid)
+                    .map(|s| s.owner == *chat || chat.channel == "web")
+                    .unwrap_or(false);
+                if !owned {
+                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                }
+                self.stop_session(&sid).await?;
+                Ok(Some(format!("removed session {sid}")))
             }
             "/cd" => {
                 let project = parts
