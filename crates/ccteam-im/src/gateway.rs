@@ -464,9 +464,9 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: false,
     },
     GatewayCommandSpec {
-        name: "/rm",
+        name: "/stop",
         arg_hint: Some("<id>"),
-        help: "destroy a session by id",
+        help: "stop (destroy) a session by id",
         in_menu: false,
     },
     GatewayCommandSpec {
@@ -997,23 +997,25 @@ impl Gateway {
                 self.persist_state()?;
                 Ok(Some(format!("using session {sid}")))
             }
-            "/rm" => {
-                // v0.8.10 — destroy a session BY ID. Completes the session
+            "/stop" => {
+                // v0.8.10 — stop (destroy) a session BY ID. Completes the session
                 // lifecycle: /new (create) · /clear (recycle) · /use (switch) ·
-                // /rm (destroy). A session id is REQUIRED — bare `/rm` is rejected
+                // /stop (destroy). Uses the SAME `stop_session` the web API's
+                // `POST /sessions/{sid}/stop` calls, so the verb is unified across
+                // IM and web. A session id is REQUIRED — a bare `/stop` is rejected
                 // because silently destroying the current session is too easy to
                 // fat-finger. `stop_session` aborts the pump, closes the vendor
                 // thread, drops the record, and clears any `current_session` route
-                // pointing at it (so removing the current session leaves the next
+                // pointing at it (so stopping the current session leaves the next
                 // message to spawn a fresh default).
                 let sid = parts
                     .next()
                     .ok_or_else(|| {
-                        anyhow!("/rm 必须带 session id:/rm <sid>(安全起见不支持裸 /rm)")
+                        anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
                     })?
                     .to_string();
                 // Scope to sessions this chat owns (web console may target any),
-                // mirroring /use — never let one chat destroy another's session.
+                // mirroring /use — never let one chat stop another's session.
                 let owned = self
                     .sessions
                     .get(&sid)
@@ -1023,7 +1025,7 @@ impl Gateway {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
                 self.stop_session(&sid).await?;
-                Ok(Some(format!("removed session {sid}")))
+                Ok(Some(format!("stopped session {sid}")))
             }
             "/cd" => {
                 let project = parts
