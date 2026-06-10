@@ -892,6 +892,25 @@ impl Gateway {
             return Ok(vec![crate::inbound::format_ambiguous_dm_reply(&handles)]);
         }
         self.ensure_current_session(&chat).await?;
+        // v0.8.10 — codex `/clear` = recycle + recreate at the gateway, so its
+        // user-facing EFFECT matches Claude Code's in-thread `/clear` (a brand-new
+        // empty conversation). Codex cannot clear a thread in place (its native
+        // `/clear` is itself a new thread), so we model it as stop-old + start-new.
+        // Claude keeps its native in-thread `/clear` (the passthrough below) — only
+        // a codex current session + an exact `/clear` is intercepted here.
+        if text.trim() == "/clear" {
+            let current = self.current_session.read().unwrap().get(&chat).cloned();
+            if let Some(sid) = current {
+                let is_codex = self
+                    .sessions
+                    .get(&sid)
+                    .map(|s| s.vendor == AgentVendor::Codex)
+                    .unwrap_or(false);
+                if is_codex {
+                    return self.recycle_codex_session(chat.clone(), &sid).await;
+                }
+            }
+        }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
         self.submit_to_current(&chat, turn).await
     }
@@ -1101,6 +1120,58 @@ impl Gateway {
             ""
         };
         format!("created session {id}{suffix}")
+    }
+
+    /// v0.8.10 — codex `/clear`: recycle the current codex session and start a
+    /// fresh one in its place, so the user-facing effect matches Claude's
+    /// in-thread `/clear` (a brand-new empty conversation). Codex has no in-place
+    /// thread-wipe (its native `/clear` is a new thread), so this is modeled at
+    /// the gateway. The replacement is spawned FIRST (same project / role / vendor
+    /// / permission posture); only on success is the old session stopped — so a
+    /// spawn failure leaves the user's existing session intact rather than
+    /// session-less. `start_session` repoints `current_session` at the new sid, so
+    /// the subsequent `stop_session` of the old sid leaves the chat on the fresh
+    /// session.
+    async fn recycle_codex_session(
+        &mut self,
+        chat: ChatKey,
+        old_sid: &str,
+    ) -> Result<Vec<String>> {
+        let (project, vendor, role, handle, permission_mode) = {
+            let s = self
+                .sessions
+                .get(old_sid)
+                .ok_or_else(|| anyhow!("session vanished: {old_sid}"))?;
+            (
+                s.project.clone(),
+                s.vendor,
+                s.role.clone(),
+                s.handle.clone(),
+                s.permission_mode,
+            )
+        };
+        // Spawn the replacement first; propagate the error WITHOUT touching the
+        // old session if it fails.
+        let outcome = self
+            .start_session(chat, project, vendor, role, handle, permission_mode)
+            .await?;
+        let new_sid = outcome.id.clone();
+        // Replacement is live + current; retire the old session. A stop failure
+        // is non-fatal — the fresh session already serves the chat.
+        if let Err(err) = self.stop_session(old_sid).await {
+            tracing::warn!(
+                old_sid,
+                new_sid = %new_sid,
+                error = %err,
+                "codex /clear: fresh session started but stopping the old one failed"
+            );
+            return Ok(vec![format!(
+                "/clear: started fresh codex session {new_sid} (old {old_sid} could not be stopped: {err})"
+            )]);
+        }
+        Ok(vec![format!(
+            "/clear: recycled codex session {old_sid}; started fresh {new_sid}"
+        )])
     }
 
     async fn start_template_session(
