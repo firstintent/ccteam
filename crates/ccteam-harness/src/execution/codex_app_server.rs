@@ -61,9 +61,8 @@ use crate::execution::progress_bridge::{
 };
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx,
-    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput,
-    UnifiedTokenUsage,
+    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
+    TurnInput, UnifiedTokenUsage,
 };
 use crate::{
     ChoiceOption, ChoicePrompt, ChoiceSelection, ContextUsage, Directive, DirectiveOutcome,

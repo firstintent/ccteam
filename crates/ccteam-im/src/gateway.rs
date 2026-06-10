@@ -871,7 +871,10 @@ impl Gateway {
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
-                self.current_session.write().unwrap().insert(chat.clone(), session_id);
+                self.current_session
+                    .write()
+                    .unwrap()
+                    .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -881,7 +884,10 @@ impl Gateway {
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
-                self.current_session.write().unwrap().insert(chat.clone(), session_id);
+                self.current_session
+                    .write()
+                    .unwrap()
+                    .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -984,7 +990,10 @@ impl Gateway {
                 // lands in the same project you just switched into — not the stale
                 // prior one.
                 self.current_project.insert(chat.clone(), project);
-                self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
+                self.current_session
+                    .write()
+                    .unwrap()
+                    .insert(chat.clone(), sid.clone());
                 self.persist_state()?;
                 Ok(Some(format!("using session {sid}")))
             }
@@ -1174,11 +1183,7 @@ impl Gateway {
     /// session-less. `start_session` repoints `current_session` at the new sid, so
     /// the subsequent `stop_session` of the old sid leaves the chat on the fresh
     /// session.
-    async fn recycle_codex_session(
-        &mut self,
-        chat: ChatKey,
-        old_sid: &str,
-    ) -> Result<Vec<String>> {
+    async fn recycle_codex_session(&mut self, chat: ChatKey, old_sid: &str) -> Result<Vec<String>> {
         let (project, vendor, role, handle, permission_mode) = {
             let s = self
                 .sessions
@@ -1332,7 +1337,10 @@ impl Gateway {
         );
         let model_warning =
             self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
-        self.current_session.write().unwrap().insert(owner, id.clone());
+        self.current_session
+            .write()
+            .unwrap()
+            .insert(owner, id.clone());
         self.persist_state()?;
         self.spawn_event_pump(&id);
         Ok(StartOutcome {
@@ -1459,7 +1467,10 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
             },
         );
-        self.current_session.write().unwrap().insert(chat.clone(), sid.clone());
+        self.current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid.clone());
         self.persist_state()?;
         self.spawn_event_pump(&sid);
         let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
@@ -2139,7 +2150,10 @@ impl Gateway {
             .map(|s| s.id.clone());
         match &adopted {
             Some(id) => {
-                self.current_session.write().unwrap().insert(chat.clone(), id.clone());
+                self.current_session
+                    .write()
+                    .unwrap()
+                    .insert(chat.clone(), id.clone());
             }
             None => {
                 self.current_session.write().unwrap().remove(chat);
@@ -2279,8 +2293,13 @@ impl Gateway {
     /// session is `current` when it is the active session for at least one
     /// routed chat. Ordered by `s{n}` index for stable rendering.
     pub fn session_views(&self) -> Vec<SessionView> {
-        let current: std::collections::HashSet<String> =
-            self.current_session.read().unwrap().values().cloned().collect();
+        let current: std::collections::HashSet<String> = self
+            .current_session
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         let mut views: Vec<SessionView> = self
             .sessions
             .values()
@@ -2509,7 +2528,10 @@ impl Gateway {
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
         // chat doesn't keep addressing a dead session.
-        self.current_session.write().unwrap().retain(|_, v| v != sid);
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, v| v != sid);
         self.persist_state()?;
         Ok(())
     }
