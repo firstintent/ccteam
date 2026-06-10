@@ -592,6 +592,40 @@ pub fn build_gateway_for_daemon(registry: Option<PathBuf>) -> Result<Gateway> {
     ))
 }
 
+/// Best-effort: (re)publish the gateway command menu to Telegram's
+/// `setMyCommands`, reading the configured bot token from
+/// `credentials.json` (or `credentials_path` when overridden).
+///
+/// `ccteam start` calls this on **every** invocation, *before* the
+/// single-instance pidfile guard — so the menu refreshes even when a
+/// daemon is already running (the second `ccteam start` otherwise aborts
+/// at `write_pidfile` before the daemon-startup registration in
+/// [`run_daemon_with_shutdown`] could fire) and even when Telegram was
+/// configured *after* the daemon first started. `setMyCommands` is
+/// idempotent (it replaces the whole menu), so refreshing every start is
+/// safe and runs no risk to live sessions/daemon — it is one HTTPS POST
+/// to the Bot API, touching nothing in the running process.
+///
+/// Reuses the SAME path the daemon uses: [`menu_command_specs`] +
+/// [`TelegramChannel::register_commands`] (→ `setMyCommands`), so there is
+/// no second copy of the request body/POST. `Ok(())` when no Telegram
+/// credential is configured (nothing to refresh) or the menu published
+/// successfully; `Err` only when the Bot API call itself failed — the CLI
+/// logs that warn and never aborts `ccteam start`.
+///
+/// [`menu_command_specs`]: crate::gateway::menu_command_specs
+pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> Result<()> {
+    let creds = credentials::load(credentials_path)?;
+    let Some(tg) = creds.telegram.as_ref() else {
+        return Ok(()); // no Telegram configured → nothing to refresh
+    };
+    let specs = crate::gateway::menu_command_specs();
+    // The allowlist is irrelevant to setMyCommands (it gates inbound reads,
+    // not this outbound publish), so an empty list keeps the channel minimal.
+    let channel = TelegramChannel::new(tg.bot_token.clone(), Vec::new());
+    channel.register_commands(&specs).await
+}
+
 /// Surface `ccteam-chat-*` processes that outlived a prior daemon but are not
 /// in the restored route table (orphans). Read-only control-plane enumeration:
 /// it only LOGS — reclaim stays explicit and opt-in (the "never auto-kill a
@@ -1248,6 +1282,36 @@ mod tests {
             Some(String::new()),
             "captionless attachment must clear the security gate"
         );
+    }
+
+    /// `refresh_telegram_command_menu` is a no-op (returns `Ok`) when no
+    /// Telegram credential is configured: `ccteam start` calls it
+    /// unconditionally (gated only on `--no-imd`), so the common
+    /// "no Telegram set up" path must not error / must not touch the network.
+    /// A missing credentials file loads as empty creds → `telegram = None`.
+    #[tokio::test]
+    async fn refresh_menu_is_noop_without_telegram_creds() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-credentials.json");
+        // No file → empty credentials → no telegram block → Ok, no HTTP call.
+        refresh_telegram_command_menu(Some(&missing))
+            .await
+            .expect("missing creds → Ok no-op");
+
+        // A credentials file present but WITHOUT a telegram block is also a
+        // no-op (only the telegram arm publishes setMyCommands).
+        let only_lark = tmp.path().join("lark-only.json");
+        std::fs::write(&only_lark, r#"{"lark":{"app_id":"a","app_secret":"s"}}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&only_lark).unwrap().permissions();
+            perm.set_mode(0o600);
+            std::fs::set_permissions(&only_lark, perm).unwrap();
+        }
+        refresh_telegram_command_menu(Some(&only_lark))
+            .await
+            .expect("non-telegram creds → Ok no-op");
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

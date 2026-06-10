@@ -1719,6 +1719,38 @@ fn run_start(
         let _ = std::fs::remove_file(&trigger);
     }
 
+    // Re-publish the Telegram command menu (`setMyCommands`) on EVERY
+    // `ccteam start`, BEFORE the single-instance pidfile guard below.
+    // The daemon also registers the menu at its own startup
+    // (`run_daemon_with_shutdown`), but that only fires when a *fresh*
+    // daemon boots: if one is already running, the `write_pidfile` guard
+    // aborts this `ccteam start` before any registration happens, and a
+    // token configured *after* first start never re-registers. Doing it
+    // here makes the menu refresh reliably on every start regardless —
+    // idempotent (`setMyCommands` replaces the whole menu) and inert to a
+    // live daemon/sessions (it is one HTTPS POST to the Bot API). Skipped
+    // when IM is off (`--no-imd`); warn-only so a Bot-API hiccup never
+    // blocks startup. A short throwaway runtime keeps this self-contained
+    // ahead of the main runtime built below.
+    if !imd.disabled {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                if let Err(err) = rt.block_on(ccteam_im::refresh_telegram_command_menu(None)) {
+                    tracing::warn!(
+                        error = %err,
+                        "ccteam start: Telegram command-menu refresh (setMyCommands) failed; menu may be stale"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "ccteam start: could not build runtime for Telegram menu refresh; skipping");
+            }
+        }
+    }
+
     // v8.1: no-slug `ccteam start` is the resident gateway daemon, not
     // the flow/orchestrator loop. The legacy tick/claude-argv flags are
     // accepted by clap for compatibility but are intentionally ignored
