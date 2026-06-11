@@ -1700,6 +1700,14 @@ impl Gateway {
         // 入 SPA/collect 历史永远为空)。spawn-on-demand 时项目已 register,缺失
         // 才退化(pump 仍跑、只是不落盘),所以 None 不阻断 ANSWER 投递。
         let project_dir = self.projects.get(&session.project).cloned();
+        // v0.8.11 E4 — stream-json sessions have NO chat-progress hooks, so the
+        // pump is their only progress.jsonl writer (the E1 "直写 progress" intent).
+        // Capture the path so the pump can mirror turn boundaries for them; tmux
+        // sessions get these from their Stop hook (gated on protocol below).
+        let progress_path = self
+            .project_paths
+            .as_ref()
+            .map(|paths| paths.progress_jsonl(&session.project));
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
@@ -1736,6 +1744,34 @@ impl Gateway {
                     biased;
                     maybe = events.next() => {
                         let Some(evt) = maybe else { break; };
+                        // v0.8.11 E4 — for a stream-json session (no hooks), the
+                        // pump mirrors each completed turn to progress.jsonl with
+                        // the sid, so the session-list activity classifier (which
+                        // keys off the latest sid-tagged event) sees it as active
+                        // and `last_activity_seconds` tracks. Tmux sessions get
+                        // this from their Stop hook → gate on protocol to avoid a
+                        // double-write.
+                        if session.protocol.is_stream_json() {
+                            if let (ThreadEvent::TurnCompleted { turn_id, usage }, Some(ppath)) =
+                                (&evt, progress_path.as_ref())
+                            {
+                                let ev = ccteam_core::progress::build_chat_turn_completed_event(
+                                    &session.role,
+                                    &session_id,
+                                    turn_id,
+                                    usage,
+                                );
+                                if let Err(err) =
+                                    ccteam_core::progress::append_event(ppath, &ev)
+                                {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        error = %err,
+                                        "stream-json pump: failed to mirror chat_turn_completed"
+                                    );
+                                }
+                            }
+                        }
                         if let Some(text) = async_event_text(&evt) {
                             // ----- ANSWER (or error) -----
                             // Finalize this turn's status epoch first.
@@ -3757,6 +3793,11 @@ mod tests {
         /// start_thread so a test can assert the minted per-session secret was
         /// threaded into the spawn env.
         spawn_secrets: Arc<Mutex<Vec<String>>>,
+        /// v0.8.11 E4 — when set, `submit_turn` ALSO enqueues a `TurnCompleted`
+        /// after the `AgentMessage` (mirrors a real adapter's turn boundary).
+        /// Off by default so the sync-drain tests (which only take the first
+        /// text-bearing event) don't leave a stale `TurnCompleted` queued.
+        emit_turn_boundary: bool,
     }
 
     impl Default for FakeAdapter {
@@ -3778,7 +3819,15 @@ mod tests {
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
+                emit_turn_boundary: false,
             }
+        }
+
+        /// Opt into emitting a `TurnCompleted` boundary after the answer
+        /// (v0.8.11 E4 — drives the stream-json pump's progress.jsonl mirror).
+        fn with_turn_boundary(mut self) -> Self {
+            self.emit_turn_boundary = true;
+            self
         }
 
         /// Set the status this fake reports from `thread_status` (P3).
@@ -3846,6 +3895,19 @@ mod tests {
                     },
                 },
             ));
+            // A real adapter also emits a turn boundary (carrying usage); the
+            // stream-json pump mirrors it to progress.jsonl for paneless
+            // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
+            // sync-drain tests don't leave a stale TurnCompleted queued.
+            if self.emit_turn_boundary {
+                self.events.lock().await.push_back((
+                    h.identity.clone(),
+                    ThreadEvent::TurnCompleted {
+                        turn_id: format!("turn-{}", h.identity),
+                        usage: ccteam_harness::UnifiedTokenUsage::default(),
+                    },
+                ));
+            }
             Ok(TurnId::new(format!("turn-{}", h.identity)))
         }
 
@@ -4337,6 +4399,62 @@ mod tests {
         assert_eq!(
             assistant.role, "reviewer",
             "content-label role on the record"
+        );
+    }
+
+    /// v0.8.11 E4 — a stream-json session has no chat-progress hooks, so the
+    /// pump must be its progress.jsonl writer: a completed turn lands a
+    /// `chat_turn_completed` event carrying the sid, so the session-list
+    /// activity classifier sees it as active. (Tmux sessions get this from
+    /// their Stop hook; the pump gates on protocol to avoid a double-write.)
+    #[tokio::test]
+    async fn stream_json_pump_mirrors_turn_to_progress_jsonl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // create_session_api defaults to the stream-json protocol.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        // The detached pump appends chat_turn_completed (carrying the sid) once
+        // the FakeAdapter's TurnCompleted flows through. Poll the progress file.
+        let progress = paths.progress_jsonl("alpha");
+        let mut found = false;
+        for _ in 0..100 {
+            if let Ok(body) = std::fs::read_to_string(&progress) {
+                if body.contains(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                    && body.contains(&format!("\"{sid}\""))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
+            progress.display()
         );
     }
 
