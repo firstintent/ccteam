@@ -195,6 +195,7 @@ export default function ChatConsole() {
       role: string,
       vendor: string,
       permissionMode: "skip" | "hitl",
+      protocol: "stream-json" | "terminal",
       newProjectPath?: string,
     ): Promise<boolean> => {
       try {
@@ -208,6 +209,7 @@ export default function ChatConsole() {
           role,
           vendor,
           permission_mode: permissionMode,
+          protocol,
         });
         if (modelWarning) toastBus.handler?.info(modelWarning);
         await refreshSessions();
@@ -555,6 +557,7 @@ export function NewSessionModal({
     role: string,
     vendor: string,
     permissionMode: "skip" | "hitl",
+    protocol: "stream-json" | "terminal",
     newProjectPath?: string,
   ) => Promise<boolean>;
 }) {
@@ -564,6 +567,9 @@ export function NewSessionModal({
   const [vendor, setVendor] = useState<"claude" | "codex">("claude");
   const [role, setRole] = useState("");
   const [hitl, setHitl] = useState(false);
+  // v0.8.11 — wire protocol. stream-json is the薄/default (no pane); terminal
+  // is the advanced, pane-backed option (terminal mirror / attach / screenshot).
+  const [protocol, setProtocol] = useState<"stream-json" | "terminal">("stream-json");
   const [pending, setPending] = useState(false);
   const [roleState, setRoleState] = useState<RoleFetchState>({ kind: "idle" });
 
@@ -665,6 +671,7 @@ export function NewSessionModal({
       effectiveRole,
       vendor,
       hitl ? "hitl" : "skip",
+      protocol,
       isNew ? newPath.trim() : undefined,
     )
       .then((ok) => {
@@ -769,6 +776,30 @@ export function NewSessionModal({
             ))}
           </div>
 
+          {/* v0.8.11 — wire protocol. stream-json is the薄/default (no pane);
+              terminal is the advanced, pane-backed option. */}
+          <label className="block text-xs text-text-dim">协议</label>
+          <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
+            {(["stream-json", "terminal"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                disabled={pending}
+                onClick={() => setProtocol(value)}
+                className={`flex-1 h-8 rounded text-xs disabled:opacity-40 ${
+                  protocol === value ? "bg-surface-700 text-text-primary" : "text-text-dim"
+                }`}
+              >
+                {value === "stream-json" ? "stream-json（默认）" : "terminal（高级）"}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-text-dim leading-4">
+            {protocol === "stream-json"
+              ? "默认薄路径：直接 stream-json 管道，无终端。"
+              : "高级选项：需要终端镜像 / attach / 截图时选它（占用一个 tmux/rmux pane）。"}
+          </p>
+
           <div className="flex items-center justify-between">
             <label className="block text-xs text-text-dim">Role</label>
             {roleLoading ? (
@@ -817,7 +848,9 @@ export function NewSessionModal({
             </span>{" "}
             vendor=
             <span className="text-text-secondary">{vendor}</span> mode=
-            <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>
+            <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>{" "}
+            protocol=
+            <span className="text-text-secondary">{protocol}</span>
           </div>
         </div>
         <div className="px-4 py-3 flex justify-end gap-2 border-t border-surface-700/50">

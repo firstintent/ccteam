@@ -18,7 +18,7 @@ use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
     ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,13 @@ struct GatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.11 E2 — the session's protocol axis (`stream-json` default /
+    /// `terminal`). Selects the adapter via the factory; remembered so a
+    /// `/role` re-spawn and a daemon-restart resume re-bind the same adapter.
+    protocol: SessionProtocol,
+    /// v0.8.11 §七 ② — the host axis, reserved for v0.9 (`local` only today;
+    /// not exposed via UI/CLI). Carried so the schema is forward-shaped.
+    host: String,
     /// v0.8.7 W2 (DB.1) — per-session permission posture (`skip` default /
     /// `hitl`). Remembered so a `/role` re-spawn and a daemon-restart resume
     /// re-apply the same mode (and the same hook install).
@@ -100,8 +107,9 @@ struct GatewayRouteTemplate {
 
 /// In-memory v8.1 route table for one daemon process.
 pub struct Gateway {
-    adapter_factory:
-        Arc<dyn Fn(AgentVendor) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync>,
+    adapter_factory: Arc<
+        dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync,
+    >,
     default_project: String,
     state_path: Option<PathBuf>,
     projects: BTreeMap<String, PathBuf>,
@@ -293,6 +301,14 @@ pub struct SessionView {
     /// non-allowlist tools. `#[serde(default)]` keeps older clients tolerant.
     #[serde(default)]
     pub permission_mode: String,
+    /// v0.8.11 E2 — protocol axis, stringified (`"stream-json"` /
+    /// `"terminal"`). The SPA hides the terminal tab for `stream-json`
+    /// (paneless) sessions. `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub protocol: String,
+    /// v0.8.11 §七 ② — host axis (reserved; `"local"` today).
+    #[serde(default)]
+    pub host: String,
     /// Whether this session is the active one for at least one chat.
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
@@ -415,6 +431,17 @@ struct SavedGatewaySession {
     project: String,
     role: String,
     vendor: AgentVendor,
+    /// v0.8.11 E2 — persisted protocol axis so a daemon restart re-binds the
+    /// same adapter. `#[serde(default)]` ⇒ pre-existing state files (no field)
+    /// restore as `StreamJson` (the new default). NOTE: such an old session's
+    /// live handle is a tmux handle; resume re-spawns it under the default
+    /// protocol — acceptable for pre-v0.8.11 state (dev-stage, no migration).
+    #[serde(default)]
+    protocol: SessionProtocol,
+    /// v0.8.11 §七 ② — persisted host axis (reserved). `#[serde(default)]` ⇒
+    /// empty restores; normalized to `local` on load.
+    #[serde(default)]
+    host: String,
     /// v0.8.7 W2 (DB.1) — persisted permission posture so a daemon restart
     /// re-spawns a hitl session as hitl. `#[serde(default)]` ⇒ already-saved
     /// state files (no field) restore as `Skip`, matching prior behavior.
@@ -547,17 +574,19 @@ impl Gateway {
         Self::new_with_factory(
             {
                 let adapter = Arc::clone(&adapter);
-                Arc::new(move |_vendor| Arc::clone(&adapter))
+                Arc::new(move |_vendor, _protocol| Arc::clone(&adapter))
             },
             default_project,
             default_dir,
         )
     }
 
-    /// Create a gateway with per-vendor adapter selection.
+    /// Create a gateway with per-(vendor, protocol) adapter selection.
     pub fn new_with_factory(
         adapter_factory: Arc<
-            dyn Fn(AgentVendor) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync,
+            dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
         >,
         default_project: impl Into<String>,
         default_dir: impl Into<PathBuf>,
@@ -678,7 +707,7 @@ impl Gateway {
                 );
                 continue;
             };
-            let adapter = (self.adapter_factory)(snapshot.vendor);
+            let adapter = (self.adapter_factory)(snapshot.vendor, snapshot.protocol);
             let resumed = match snapshot.vendor {
                 AgentVendor::Claude => {
                     match adapter.resume_thread(&snapshot.thread.identity).await {
@@ -953,14 +982,41 @@ impl Gateway {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 let role = parts.next().unwrap_or("cto").to_string();
                 // v0.8.7 W2 (DB.1) — optional trailing `hitl` token enables
-                // human-in-the-loop approval for this session, e.g.
-                // `/new claude cto hitl`. Absent / `skip` ⇒ default skip.
-                let permission_mode =
-                    PermissionMode::parse_opt(parts.next()).map_err(|e| anyhow!(e))?;
+                // human-in-the-loop approval. v0.8.11 E2 — optional `terminal`
+                // token selects the tmux/terminal protocol. Both are order-
+                // independent (`/new claude cto hitl terminal` ≡
+                // `/new claude cto terminal hitl`); defaults = skip + stream-json.
+                let mut permission_mode = PermissionMode::Skip;
+                let mut protocol = SessionProtocol::StreamJson;
+                for tok in parts {
+                    match tok {
+                        "hitl" | "skip" => {
+                            permission_mode =
+                                PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+                        }
+                        "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json" => {
+                            protocol =
+                                SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "/new: unknown option `{other}` (expected hitl / terminal)"
+                            ));
+                        }
+                    }
+                }
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
                 let outcome = self
-                    .start_session(chat.clone(), project, vendor, role, handle, permission_mode)
+                    .start_session(
+                        chat.clone(),
+                        project,
+                        vendor,
+                        role,
+                        handle,
+                        permission_mode,
+                        protocol,
+                    )
                     .await?;
                 Ok(Some(Self::new_session_receipt(&outcome)))
             }
@@ -1059,6 +1115,18 @@ impl Gateway {
                     .filter(|s| s.owner == *chat || chat.channel == "web")
                     .map(|s| s.project.clone())
                     .ok_or_else(|| anyhow!("unknown session for this chat: {sid}"))?;
+                // v0.8.11 E2 — a stream-json session has no pane to capture;
+                // refuse with a human message instead of a generic degrade.
+                if self
+                    .sessions
+                    .get(&sid)
+                    .map(|s| s.protocol.is_stream_json())
+                    .unwrap_or(false)
+                {
+                    return Ok(Some(format!(
+                        "会话 {sid} 是 stream-json 通道(无终端 pane),没法截图 —— 它的回复直接走聊天。要终端镜像/截图,用 `/new … terminal` 起一个终端通道会话。"
+                    )));
+                }
                 let paths = self
                     .project_paths
                     .clone()
@@ -1223,6 +1291,9 @@ impl Gateway {
             // Implicit default-cto spawn (first message, no `/new`) stays
             // skip — HITL is opt-in via `/new … hitl` / API / cto tool.
             PermissionMode::Skip,
+            // v0.8.11 E2 — cto defaults to the stream-json protocol (a pure
+            // chat role with no terminal needs).
+            SessionProtocol::StreamJson,
         )
         .await?;
         Ok(())
@@ -1252,7 +1323,7 @@ impl Gateway {
     /// the subsequent `stop_session` of the old sid leaves the chat on the fresh
     /// session.
     async fn recycle_codex_session(&mut self, chat: ChatKey, old_sid: &str) -> Result<Vec<String>> {
-        let (project, vendor, role, handle, permission_mode) = {
+        let (project, vendor, role, handle, permission_mode, protocol) = {
             let s = self
                 .sessions
                 .get(old_sid)
@@ -1263,12 +1334,21 @@ impl Gateway {
                 s.role.clone(),
                 s.handle.clone(),
                 s.permission_mode,
+                s.protocol,
             )
         };
         // Spawn the replacement first; propagate the error WITHOUT touching the
         // old session if it fails.
         let outcome = self
-            .start_session(chat, project, vendor, role, handle, permission_mode)
+            .start_session(
+                chat,
+                project,
+                vendor,
+                role,
+                handle,
+                permission_mode,
+                protocol,
+            )
             .await?;
         let new_sid = outcome.id.clone();
         // Replacement is live + current; retire the old session. A stop failure
@@ -1305,11 +1385,18 @@ impl Gateway {
             // Template-spawned sessions are skip (the route template has no
             // mode field; HITL is opt-in per session, not per route).
             PermissionMode::Skip,
+            // Template sessions default to the stream-json protocol.
+            SessionProtocol::StreamJson,
         )
         .await
         .map(|o| o.id)
     }
 
+    // v0.8.11 E2 — the spawn axes (vendor / role / permission_mode /
+    // protocol) are all independent session attributes; a param-bag struct
+    // would just move the same 7 fields behind one name. Keep the flat
+    // signature (the 4 callers pass them positionally).
+    #[allow(clippy::too_many_arguments)]
     async fn start_session(
         &mut self,
         owner: ChatKey,
@@ -1318,6 +1405,7 @@ impl Gateway {
         role: String,
         handle: String,
         permission_mode: PermissionMode,
+        protocol: SessionProtocol,
     ) -> Result<StartOutcome> {
         // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
         // pane/--name/turns/marker all key on `s<N>`, so one (project, role) can
@@ -1370,7 +1458,7 @@ impl Gateway {
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
         let secret = ccteam_core::session_secret::mint();
-        let adapter = (self.adapter_factory)(vendor);
+        let adapter = (self.adapter_factory)(vendor, protocol);
         let thread = adapter
             .start_thread(
                 &AgentSpecBrief { role: role.clone() },
@@ -1394,6 +1482,8 @@ impl Gateway {
                 project,
                 role,
                 vendor,
+                protocol,
+                host: "local".to_string(),
                 permission_mode,
                 secret,
                 handle,
@@ -1455,6 +1545,11 @@ impl Gateway {
         // flag + hook install). Without capturing it here the fresh SpawnCtx
         // would default the session back to skip.
         let permission_mode = old.permission_mode;
+        // v0.8.11 E2 — preserve the protocol axis across a `/role` re-spawn so
+        // the same adapter is re-selected (a terminal session stays terminal,
+        // a stream-json session stays stream-json).
+        let protocol = old.protocol;
+        let host = old.host.clone();
         let owner = old.owner.clone();
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
@@ -1494,7 +1589,7 @@ impl Gateway {
         }
         let _ = old_adapter.close_thread(&old_thread).await;
 
-        let adapter = (self.adapter_factory)(vendor);
+        let adapter = (self.adapter_factory)(vendor, protocol);
         // v0.8.7 review-fix (R-M1) — a `/role` switch closes the old pane and
         // spawns a brand-new one, so mint a FRESH secret: the new pane's env
         // gets it, and the in-place record below stores the same value, keeping
@@ -1526,6 +1621,8 @@ impl Gateway {
                 project,
                 role: role.clone(),
                 vendor,
+                protocol,
+                host,
                 permission_mode,
                 secret,
                 handle: role,
@@ -1810,7 +1907,12 @@ impl Gateway {
         // records are now legitimately independent sessions, NOT duplicates to
         // collapse. The prior seen-panes collapse is gone with the dedup.
         for saved_session in saved.sessions {
-            let adapter = (self.adapter_factory)(saved_session.vendor);
+            let adapter = (self.adapter_factory)(saved_session.vendor, saved_session.protocol);
+            let host = if saved_session.host.is_empty() {
+                "local".to_string()
+            } else {
+                saved_session.host
+            };
             self.sessions.insert(
                 saved_session.id.clone(),
                 GatewaySession {
@@ -1819,6 +1921,8 @@ impl Gateway {
                     project: saved_session.project,
                     role: saved_session.role,
                     vendor: saved_session.vendor,
+                    protocol: saved_session.protocol,
+                    host,
                     permission_mode: saved_session.permission_mode,
                     // R-M1 — restore the persisted secret so the gate-map matches
                     // the live pane's `CCTEAM_CHAT_SECRET` after a daemon restart.
@@ -1879,6 +1983,8 @@ impl Gateway {
                     project: session.project.clone(),
                     role: session.role.clone(),
                     vendor: session.vendor,
+                    protocol: session.protocol,
+                    host: session.host.clone(),
                     permission_mode: session.permission_mode,
                     secret: session.secret.clone(),
                     handle: session.handle.clone(),
@@ -2377,6 +2483,12 @@ impl Gateway {
                 role: s.role.clone(),
                 vendor: vendor_str(s.vendor).to_string(),
                 permission_mode: s.permission_mode.as_str().to_string(),
+                protocol: s.protocol.as_str().to_string(),
+                host: if s.host.is_empty() {
+                    "local".to_string()
+                } else {
+                    s.host.clone()
+                },
                 current: current.contains(&s.id),
                 status: "live".to_string(),
                 last_activity_seconds: None,
@@ -2474,16 +2586,47 @@ impl Gateway {
         vendor: AgentVendor,
         permission_mode: PermissionMode,
     ) -> Result<CreateSessionOutcome> {
+        // Default protocol = stream-json (the薄/default channel); the REST
+        // route uses `create_session_api_proto` to honor an explicit choice.
+        self.create_session_api_proto(
+            project,
+            role,
+            vendor,
+            permission_mode,
+            SessionProtocol::default(),
+        )
+        .await
+    }
+
+    /// v0.8.11 E2 — like [`Self::create_session_api`] but with an explicit
+    /// `protocol` (the REST `POST …/sessions` path threads the request's
+    /// `protocol` field here; omitted → caller passes the default).
+    pub async fn create_session_api_proto(
+        &mut self,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+    ) -> Result<CreateSessionOutcome> {
         let owner = web_api_chat();
         // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
         // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
-        self.start_session(owner, project, vendor, role, handle, permission_mode)
-            .await
-            .map(|o| CreateSessionOutcome {
-                sid: o.id,
-                model_warning: o.model_warning,
-            })
+        self.start_session(
+            owner,
+            project,
+            vendor,
+            role,
+            handle,
+            permission_mode,
+            protocol,
+        )
+        .await
+        .map(|o| CreateSessionOutcome {
+            sid: o.id,
+            model_warning: o.model_warning,
+        })
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -3072,22 +3215,19 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// True when a restored Claude `ThreadHandle` carries enough context
+/// (`cwd` + `project_dir`) to rebuild from the persisted `SpawnCtx` via
+/// `start_thread` after a `resume_thread` failure. Covers BOTH Claude spawn
+/// paths: the tmux/terminal handle (keyed by `tmux_session`) and the
+/// v0.8.11 stream-json handle (`adapter = "claude-stream-json"`, resumed via
+/// the deterministic per-sid uuid + `--resume`). A handle missing the cwd
+/// pair can't be rebuilt, so the resume keeps the stale handle instead.
 fn is_real_claude_tui_handle(thread: &ThreadHandle) -> bool {
-    thread
-        .raw_extras
-        .get("tmux_session")
-        .and_then(|v| v.as_str())
-        .is_some()
-        && thread
-            .raw_extras
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .is_some()
-        && thread
-            .raw_extras
-            .get("project_dir")
-            .and_then(|v| v.as_str())
-            .is_some()
+    let has = |k: &str| thread.raw_extras.get(k).and_then(|v| v.as_str()).is_some();
+    let is_tmux = has("tmux_session");
+    let is_stream_json =
+        thread.raw_extras.get("adapter").and_then(|v| v.as_str()) == Some("claude-stream-json");
+    (is_tmux || is_stream_json) && has("cwd") && has("project_dir")
 }
 
 fn merge_thread_extras(
@@ -4931,12 +5071,14 @@ mod tests {
         let factory = {
             let claude = Arc::clone(&claude);
             let codex = Arc::clone(&codex);
-            Arc::new(move |vendor| -> Arc<dyn HarnessAdapter + Send + Sync> {
-                match vendor {
-                    AgentVendor::Claude => claude.clone(),
-                    AgentVendor::Codex => codex.clone(),
-                }
-            })
+            Arc::new(
+                move |vendor, _protocol| -> Arc<dyn HarnessAdapter + Send + Sync> {
+                    match vendor {
+                        AgentVendor::Claude => claude.clone(),
+                        AgentVendor::Codex => codex.clone(),
+                    }
+                },
+            )
         };
         let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
         gateway.register_project("beta", "/tmp/beta");
@@ -5009,12 +5151,14 @@ mod tests {
         let factory = {
             let claude = Arc::clone(&claude);
             let codex = Arc::clone(&codex);
-            Arc::new(move |vendor| -> Arc<dyn HarnessAdapter + Send + Sync> {
-                match vendor {
-                    AgentVendor::Claude => claude.clone(),
-                    AgentVendor::Codex => codex.clone(),
-                }
-            })
+            Arc::new(
+                move |vendor, _protocol| -> Arc<dyn HarnessAdapter + Send + Sync> {
+                    match vendor {
+                        AgentVendor::Claude => claude.clone(),
+                        AgentVendor::Codex => codex.clone(),
+                    }
+                },
+            )
         };
         let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
 

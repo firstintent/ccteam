@@ -252,6 +252,10 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
+        // bot-token getUpdates poll structurally collides with ccteam's IM
+        // gateway). Same managed layer the tmux path uses; only this one plugin.
+        crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
         let bin = spawn_spec::claude_bin();
         // §七 ⑤ — stable per-(slug,sid) uuid: the stateless resume key.
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);

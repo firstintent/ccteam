@@ -396,7 +396,7 @@ async fn daemon_wires_mock_channel_to_supervisor_inbox() {
     let adapter = Arc::new(StubAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
 
     let args = DaemonArgs {
@@ -498,7 +498,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
 
     let args = DaemonArgs {
@@ -641,7 +641,7 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,
@@ -794,7 +794,7 @@ async fn daemon_split_failure_surfaces_notice() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,
@@ -849,7 +849,7 @@ async fn daemon_replays_queued_durable_outbound_to_mock_channel() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,
@@ -901,7 +901,7 @@ async fn daemon_replays_queued_durable_outbound_idempotently_once() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     run_daemon_with_shutdown(
         DaemonArgs {
@@ -936,7 +936,7 @@ async fn daemon_replays_queued_durable_outbound_idempotently_once() {
     let second_adapter = Arc::new(GatewayAdapter::default());
     let second_factory: AdapterFactory = {
         let cloned = second_adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     run_daemon_with_shutdown(
         DaemonArgs {
@@ -1176,7 +1176,7 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
 
     let args = DaemonArgs {
@@ -1804,7 +1804,7 @@ fn spawn_ws_gateway_daemon(
 
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
 
     let args = DaemonArgs {
@@ -1872,7 +1872,7 @@ async fn run_mock_gateway_daemon<T>(
     );
     let adapter_factory: AdapterFactory = {
         let cloned = Arc::clone(&adapter);
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,
@@ -2196,7 +2196,7 @@ async fn daemon_routes_inbound_image_attachment_into_turn_text() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,
@@ -2269,7 +2269,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
     let adapter = Arc::new(GatewayAdapter::default());
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,

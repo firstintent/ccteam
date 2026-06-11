@@ -63,7 +63,7 @@ use axum::{
     Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_harness::{AgentVendor, PermissionMode};
+use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -193,6 +193,10 @@ pub struct CreateSessionForm {
     /// skip flag at spawn so non-allowlist tool calls prompt the IM user.
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// v0.8.11 E2 — `"stream-json"` (default) or `"terminal"`. Selects the
+    /// session channel; omitted → the daemon default (stream-json).
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -242,11 +246,22 @@ pub(crate) async fn handle_create_session(
         Ok(m) => m,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
+    // v0.8.11 E2 — optional `protocol` body field; default stream-json.
+    let protocol = match SessionProtocol::parse_opt(form.protocol.as_deref()) {
+        Ok(p) => p,
+        Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
+    };
 
     let created = {
         let mut guard = gw.lock().await;
         guard
-            .create_session_api(slug.clone(), role.clone(), vendor, permission_mode)
+            .create_session_api_proto(
+                slug.clone(),
+                role.clone(),
+                vendor,
+                permission_mode,
+                protocol,
+            )
             .await
     };
     match created {
@@ -970,6 +985,8 @@ mod tests {
             role: "cto".into(),
             vendor: "claude".into(),
             permission_mode: "skip".into(),
+            protocol: "stream-json".into(),
+            host: "local".into(),
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
@@ -1007,6 +1024,8 @@ mod tests {
                 role: "cto".into(),
                 vendor: "claude".into(),
                 permission_mode: "skip".into(),
+                protocol: "stream-json".into(),
+                host: "local".into(),
                 current: true,
                 status: "live".into(),
                 last_activity_seconds: None,
@@ -1017,6 +1036,8 @@ mod tests {
                 role: "qa".into(),
                 vendor: "claude".into(),
                 permission_mode: "skip".into(),
+                protocol: "stream-json".into(),
+                host: "local".into(),
                 current: false,
                 status: "live".into(),
                 last_activity_seconds: None,
@@ -1061,6 +1082,8 @@ mod tests {
             role: "cto".into(),
             vendor: "claude".into(),
             permission_mode: "skip".into(),
+            protocol: "stream-json".into(),
+            host: "local".into(),
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
@@ -1092,6 +1115,8 @@ mod tests {
             role: "cto".into(),
             vendor: "claude".into(),
             permission_mode: "skip".into(),
+            protocol: "stream-json".into(),
+            host: "local".into(),
             current: true,
             status: "live".into(),
             last_activity_seconds: None,

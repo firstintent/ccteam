@@ -160,7 +160,7 @@ async fn create_session_returns_model_warning_in_body() {
     seed_role_with_model(&project_dir, "reviewer", Some("deepseek-via-claude"));
     seed_role_with_model(&project_dir, "sonnet", Some("sonnet[1m]"));
 
-    let factory = Arc::new(|vendor| {
+    let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);

@@ -411,7 +411,7 @@ mod tests {
     impl<T> Pipe for T {}
 
     fn adapter_factory(state: Arc<RecordingState>) -> ccteam_im::daemon::AdapterFactory {
-        Arc::new(move |vendor| {
+        Arc::new(move |vendor, _protocol| {
             Arc::new(RecordingAdapter {
                 vendor,
                 state: Arc::clone(&state),

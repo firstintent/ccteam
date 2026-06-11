@@ -29,6 +29,12 @@ export interface SessionView {
   current: boolean;
   status: string;
   last_activity_seconds?: number | null;
+  /** Wire protocol: `"stream-json"` (the薄/default, no pane) | `"terminal"`
+   *  (advanced, owns a tmux/rmux pane). Optional for backward-compat — a
+   *  session that predates the field is treated as terminal-capable. */
+  protocol?: string;
+  /** Where the session runs: `"local"` (reserved; ignored in the UI). */
+  host?: string;
 }
 
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn
@@ -201,6 +207,10 @@ export interface CreateSessionOpts {
   role: string;
   vendor?: string;
   permission_mode?: "skip" | "hitl";
+  /** Wire protocol for the new session. Omitted → server defaults to
+   *  `"stream-json"` (the薄/default path); pass `"terminal"` for the advanced
+   *  pane-backed session (terminal mirror / attach / screenshot). */
+  protocol?: "stream-json" | "terminal";
 }
 
 export interface CreateSessionResult {
@@ -217,5 +227,6 @@ export function createSession(
   const body: Record<string, unknown> = { role: opts.role };
   if (opts.vendor) body.vendor = opts.vendor;
   if (opts.permission_mode) body.permission_mode = opts.permission_mode;
+  if (opts.protocol) body.protocol = opts.protocol;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }

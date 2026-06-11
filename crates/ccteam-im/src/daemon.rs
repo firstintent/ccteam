@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use ccteam_harness::execution::{ClaudeTuiAdapter, CodexAppServerAdapter};
-use ccteam_harness::{AgentVendor, HarnessAdapter};
+use ccteam_harness::execution::{ClaudeStreamJsonAdapter, ClaudeTuiAdapter, CodexAppServerAdapter};
+use ccteam_harness::{AgentVendor, HarnessAdapter, SessionProtocol};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -46,29 +46,41 @@ pub type ChannelMap = HashMap<String, Arc<dyn Channel + Send + Sync>>;
 /// Hidden behind a function pointer so integration tests can swap
 /// the real `ClaudeTuiAdapter` for a stub. The default returned by
 /// [`default_adapter_factory`] is what `main.rs` wires.
-pub type AdapterFactory =
-    Arc<dyn Fn(AgentVendor) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync>;
+pub type AdapterFactory = Arc<
+    dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync,
+>;
 
-/// Pick the canonical production adapter for `vendor`.
+/// Pick the canonical production adapter for `(vendor, protocol)`.
 ///
-/// - `Claude` → [`ClaudeTuiAdapter`] (the mode 3 chat adapter).
-/// - `Codex` → [`CodexAppServerAdapter`] — mode-3 chat sessions use the
-///   app-server JSON-RPC control plane so `/compact` and `/review` map to
-///   Codex-native RPCs instead of `codex exec` subprocess turns.
+/// - `Claude` + `StreamJson` (the default) → [`ClaudeStreamJsonAdapter`] —
+///   the lightweight NDJSON chat path (no PTY / pane / hook chain).
+/// - `Claude` + `Terminal` → [`ClaudeTuiAdapter`] — the advanced tmux-PTY
+///   path (byte-faithful terminal mirror / attach / screenshot).
+/// - `Codex` → [`CodexAppServerAdapter`] regardless of protocol (codex
+///   always drives via its app-server JSON-RPC control plane).
 ///
-/// F10: **per-vendor singleton.** Exactly ONE `ClaudeTuiAdapter` and ONE
-/// `CodexAppServerAdapter` are constructed here; every factory call
-/// `.clone()`s the matching `Arc`. Because `CodexAppServerAdapter`
-/// memoises a single `codex app-server` child (stdio transport), one
-/// shared adapter ⇒ one memoised client ⇒ one codex app-server child for
-/// the whole daemon, instead of a fresh child per chat session.
+/// F10: **per-(vendor,protocol) singleton.** Exactly ONE of each adapter is
+/// constructed here; every factory call `.clone()`s the matching `Arc` so a
+/// vendor's memoised child (codex app-server) / live-session registry
+/// (stream-json) is shared across all that vendor's chat sessions.
+///
+/// NOTE (v0.8.11): the stream-json adapter is constructed WITHOUT a HITL
+/// `CanUseToolResolver`, so a `hitl` stream-json session default-denies tool
+/// approvals (the safe direction). The default posture is `skip`, so the
+/// common path is unaffected; wiring the production resolver
+/// (→ `permission/ask` → IM) is a follow-up.
 pub fn default_adapter_factory() -> AdapterFactory {
-    let claude: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
+    let claude_tui: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
+    let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> =
+        Arc::new(ClaudeStreamJsonAdapter::new());
     let codex: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(CodexAppServerAdapter::new());
-    Arc::new(move |vendor: AgentVendor| match vendor {
-        AgentVendor::Claude => Arc::clone(&claude),
-        AgentVendor::Codex => Arc::clone(&codex),
-    })
+    Arc::new(
+        move |vendor: AgentVendor, protocol: SessionProtocol| match (vendor, protocol) {
+            (AgentVendor::Claude, SessionProtocol::StreamJson) => Arc::clone(&claude_stream),
+            (AgentVendor::Claude, SessionProtocol::Terminal) => Arc::clone(&claude_tui),
+            (AgentVendor::Codex, _) => Arc::clone(&codex),
+        },
+    )
 }
 
 fn format_gateway_user_error(err: &anyhow::Error) -> String {
@@ -1359,13 +1371,13 @@ mod tests {
     #[test]
     fn default_adapter_factory_codex_arm_returns_app_server_adapter() {
         let factory = default_adapter_factory();
-        let claude = factory(AgentVendor::Claude);
+        let claude = factory(AgentVendor::Claude, SessionProtocol::default());
         assert_eq!(
             claude.vendor(),
             AgentVendor::Claude,
             "claude arm must return a Claude adapter"
         );
-        let codex = factory(AgentVendor::Codex);
+        let codex = factory(AgentVendor::Codex, SessionProtocol::default());
         assert_eq!(
             codex.vendor(),
             AgentVendor::Codex,
@@ -1380,17 +1392,36 @@ mod tests {
     #[test]
     fn default_adapter_factory_is_per_vendor_singleton() {
         let factory = default_adapter_factory();
-        let codex_a = factory(AgentVendor::Codex);
-        let codex_b = factory(AgentVendor::Codex);
+        let codex_a = factory(AgentVendor::Codex, SessionProtocol::default());
+        let codex_b = factory(AgentVendor::Codex, SessionProtocol::default());
         assert!(
             Arc::ptr_eq(&codex_a, &codex_b),
             "F10: codex arm must memoise ONE adapter (one app-server child), got distinct Arcs"
         );
-        let claude_a = factory(AgentVendor::Claude);
-        let claude_b = factory(AgentVendor::Claude);
+        let claude_a = factory(AgentVendor::Claude, SessionProtocol::default());
+        let claude_b = factory(AgentVendor::Claude, SessionProtocol::default());
         assert!(
             Arc::ptr_eq(&claude_a, &claude_b),
             "F10: claude arm must also be a singleton"
         );
+    }
+
+    /// v0.8.11 E2 — the factory routes Claude by protocol: StreamJson →
+    /// `claude-stream-json`, Terminal → `claude-tui`. Codex ignores protocol.
+    #[test]
+    fn default_adapter_factory_routes_claude_by_protocol() {
+        let factory = default_adapter_factory();
+        let stream = factory(AgentVendor::Claude, SessionProtocol::StreamJson);
+        assert_eq!(stream.name(), "claude-stream-json");
+        assert_eq!(stream.vendor(), AgentVendor::Claude);
+        let terminal = factory(AgentVendor::Claude, SessionProtocol::Terminal);
+        assert_eq!(terminal.name(), "claude-tui");
+        // The two protocols select DIFFERENT adapter instances.
+        assert!(!Arc::ptr_eq(&stream, &terminal));
+        // Codex ignores protocol — same app-server adapter either way.
+        let codex_s = factory(AgentVendor::Codex, SessionProtocol::StreamJson);
+        let codex_t = factory(AgentVendor::Codex, SessionProtocol::Terminal);
+        assert_eq!(codex_s.name(), "codex-app-server");
+        assert!(Arc::ptr_eq(&codex_s, &codex_t));
     }
 }

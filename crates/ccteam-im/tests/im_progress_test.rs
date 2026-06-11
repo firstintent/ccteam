@@ -225,7 +225,7 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
     let adapter = Arc::new(ScriptedAdapter::new(script));
     let adapter_factory: AdapterFactory = {
         let cloned = adapter.clone();
-        Arc::new(move |_| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
     };
     let args = DaemonArgs {
         credentials: None,

@@ -4219,11 +4219,12 @@ mod session_tool_tests {
         let factory: std::sync::Arc<
             dyn Fn(
                     ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
                 )
                     -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
                 + Send
                 + Sync,
-        > = std::sync::Arc::new(move |_| {
+        > = std::sync::Arc::new(move |_, _| {
             std::sync::Arc::new(stub_for_factory.clone())
                 as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
         });

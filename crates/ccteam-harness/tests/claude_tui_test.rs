@@ -9,7 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ccteam_harness::execution::claude_tui::{
-    chat_session_name, ensure_chat_hooks_installed, ClaudeTuiAdapter,
+    chat_session_name, ensure_chat_hooks_installed, ensure_telegram_plugin_disabled,
+    ClaudeTuiAdapter, TELEGRAM_PLUGIN_ID,
 };
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
@@ -529,4 +530,65 @@ async fn claude_directive_panel_command_rejected() {
             "/{name} (panel popup) must Rejected, got {outcome:?}"
         );
     }
+}
+
+// ── v0.8.11 E2 — Telegram plugin pin-point isolation ────────────────────
+
+#[test]
+fn telegram_plugin_disabled_merges_without_clobbering() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path();
+    let settings = project.join(".claude/settings.local.json");
+
+    // Pre-seed settings with an unrelated key + another enabled plugin.
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "someUserKey": {"keep": "me"},
+            "enabledPlugins": {"other@vendor": true},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    ensure_telegram_plugin_disabled(project).unwrap();
+
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    // The telegram plugin is pinned false…
+    assert_eq!(
+        v["enabledPlugins"][TELEGRAM_PLUGIN_ID],
+        serde_json::json!(false)
+    );
+    // …every other plugin + unrelated key is preserved verbatim.
+    assert_eq!(v["enabledPlugins"]["other@vendor"], serde_json::json!(true));
+    assert_eq!(v["someUserKey"]["keep"], serde_json::json!("me"));
+
+    // Idempotent: a second call is a no-op on the rest.
+    ensure_telegram_plugin_disabled(project).unwrap();
+    let v2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v2["enabledPlugins"]["other@vendor"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        v2["enabledPlugins"][TELEGRAM_PLUGIN_ID],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn telegram_plugin_disabled_creates_file_when_absent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ensure_telegram_plugin_disabled(tmp.path()).unwrap();
+    let settings = tmp.path().join(".claude/settings.local.json");
+    assert!(settings.exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["enabledPlugins"][TELEGRAM_PLUGIN_ID],
+        serde_json::json!(false)
+    );
 }

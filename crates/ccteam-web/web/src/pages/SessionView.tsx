@@ -193,7 +193,14 @@ export default function SessionView({
   // BOTH vendors, but the codex terminal is unverified on a real codex pane
   // (the daemon wires the codex app-server adapter, which owns no tmux/rmux
   // pane), so we don't promise a codex terminal in the UI yet.
-  const canTerminal = session?.vendor === "claude";
+  //
+  // A stream-json session owns NO pane (the薄/default protocol drives claude
+  // over a bidirectional stream-json pipe, not a tmux/rmux PTY), so the
+  // terminal can't mirror it — hide the tab for it. Backward-compat: only an
+  // EXPLICIT `"stream-json"` hides the terminal; a missing/undefined protocol
+  // (a session that predates the field) is treated as terminal-capable.
+  const isStreamJson = session?.protocol === "stream-json";
+  const canTerminal = session?.vendor === "claude" && !isStreamJson;
   const showTerminal = view === "terminal" && canTerminal;
 
   // Auto-scroll to the newest message only when already near the bottom.
@@ -266,17 +273,22 @@ export default function SessionView({
           >
             <MessageSquare className="h-3.5 w-3.5" /> Chat
           </button>
-          <button
-            type="button"
-            disabled={!canTerminal}
-            onClick={() => canTerminal && setView("terminal")}
-            title={canTerminal ? "终端(tmux pane)" : "仅 Claude/tmux session 有终端"}
-            className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
-              showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
-            } ${canTerminal ? "" : "opacity-40 cursor-not-allowed"}`}
-          >
-            <Terminal className="h-3.5 w-3.5" /> 终端
-          </button>
+          {/* A stream-json session has no pane → HIDE the terminal tab outright
+              (not merely disable it). A codex session keeps the existing
+              disabled/greyed affordance (pane exists but terminal unverified). */}
+          {isStreamJson ? null : (
+            <button
+              type="button"
+              disabled={!canTerminal}
+              onClick={() => canTerminal && setView("terminal")}
+              title={canTerminal ? "终端(tmux pane)" : "仅 Claude/tmux session 有终端"}
+              className={`h-7 px-2 rounded text-xs flex items-center gap-1 ${
+                showTerminal ? "bg-surface-700 text-text-primary" : "text-text-dim"
+              } ${canTerminal ? "" : "opacity-40 cursor-not-allowed"}`}
+            >
+              <Terminal className="h-3.5 w-3.5" /> 终端
+            </button>
+          )}
         </div>
       </div>
 
@@ -284,6 +296,12 @@ export default function SessionView({
         <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
       ) : (
         <>
+          {isStreamJson ? (
+            <div className="shrink-0 px-4 py-1.5 text-[11px] text-text-dim border-b border-surface-700/30">
+              stream-json session 无终端（薄/默认路径）；需要终端镜像 / attach /
+              截图请新建 terminal session。
+            </div>
+          ) : null}
           <div
             ref={scrollRef}
             onScroll={onTranscriptScroll}

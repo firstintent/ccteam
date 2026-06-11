@@ -279,6 +279,52 @@ pub fn ensure_chat_hooks_installed(
     Ok(())
 }
 
+/// The official Telegram plugin id. It claims the bot-token `getUpdates`
+/// long-poll, which is structurally exclusive (Telegram allows ONE consumer
+/// per token) and collides with ccteam's own IM gateway — see
+/// `docs/research/cc-stream-json-protocol.md` §6 (a real mid-session kick).
+pub const TELEGRAM_PLUGIN_ID: &str = "telegram@claude-plugins-official";
+
+/// v0.8.11 E2 (PRD §四 Q5) — pin-point isolate the official Telegram plugin
+/// for a ccteam-spawned Claude session by writing
+/// `enabledPlugins.{TELEGRAM_PLUGIN_ID} = false` into the project's
+/// ccteam-managed `.claude/settings.local.json` (the layer ccteam already
+/// owns; local > project > user, so this wins). ONLY this one plugin is
+/// touched — every other user plugin is left exactly as the user set it
+/// (vendor-native red line). Idempotent: existing `enabledPlugins` entries
+/// and all other settings keys are preserved.
+pub fn ensure_telegram_plugin_disabled(project_dir: &Path) -> Result<(), HarnessError> {
+    let settings_dir = project_dir.join(".claude");
+    std::fs::create_dir_all(&settings_dir)
+        .map_err(|e| HarnessError::Io(format!("create {}: {e}", settings_dir.display())))?;
+    let settings_path = settings_dir.join("settings.local.json");
+    let mut root: Value = if settings_path.exists() {
+        let body = std::fs::read_to_string(&settings_path)
+            .map_err(|e| HarnessError::Io(format!("read {}: {e}", settings_path.display())))?;
+        serde_json::from_str(&body).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    let enabled = root
+        .as_object_mut()
+        .expect("root forced to object")
+        .entry("enabledPlugins")
+        .or_insert_with(|| json!({}));
+    let enabled_obj = enabled.as_object_mut().ok_or_else(|| {
+        HarnessError::Io("settings.local.json `enabledPlugins` is not an object".into())
+    })?;
+    // Idempotent + non-clobbering: if the user explicitly RE-enabled it we
+    // still pin it false (the structural conflict makes co-running unsafe),
+    // but we touch no other plugin key.
+    enabled_obj.insert(TELEGRAM_PLUGIN_ID.to_string(), Value::Bool(false));
+
+    let serialized = serde_json::to_string_pretty(&root)
+        .map_err(|e| HarnessError::Io(format!("serialize settings.local.json: {e}")))?;
+    std::fs::write(&settings_path, serialized)
+        .map_err(|e| HarnessError::Io(format!("write {}: {e}", settings_path.display())))?;
+    Ok(())
+}
+
 fn claude_bin() -> String {
     std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
 }
@@ -588,6 +634,10 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             &ccteam_bin_for_hooks(),
             ctx.permission_mode,
         )?;
+        // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
+        // bot-token getUpdates poll structurally collides with ccteam's IM
+        // gateway). Only this one plugin; every other stays as the user set it.
+        ensure_telegram_plugin_disabled(&ctx.project_dir)?;
         // 2. Make sure the session's chat dir exists (turns.jsonl + cursor).
         //    v0.8.8 F1 — 按 sid 建目录(同 turns / marker / cursor 维度),
         //    所以同 (project, role) 多会话各自独立、不互相覆盖。

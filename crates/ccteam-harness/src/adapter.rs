@@ -189,6 +189,62 @@ impl PermissionMode {
     }
 }
 
+/// v0.8.11 E2 — the **protocol axis** of a session (PRD §〇): how a Claude
+/// session is driven.
+///
+/// - `StreamJson` (default) — the lightweight chat path: a long-running
+///   `claude` child over a bidirectional NDJSON pipe
+///   ([`crate::ClaudeStreamJsonAdapter`]). No PTY / pane / hook chain.
+/// - `Terminal` — the advanced path: a tmux PTY + `claude` TUI
+///   ([`crate::execution::claude_tui::ClaudeTuiAdapter`]); needed only when
+///   the user wants the byte-faithful terminal mirror / attach / screenshot.
+///
+/// Named `protocol` (NOT `backend`) per PRD §七 ②: `backend` is reserved for
+/// the v0.9 **host** axis. Codex sessions carry a protocol value too but it
+/// is informational — codex always drives via its app-server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionProtocol {
+    /// `stream-json` — the薄/default chat channel.
+    #[default]
+    StreamJson,
+    /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / screenshot).
+    Terminal,
+}
+
+impl SessionProtocol {
+    /// Parse an optional wire token (`"stream-json"` / `"terminal"`).
+    /// `None` / empty ⇒ [`SessionProtocol::StreamJson`] (the default).
+    /// An unrecognized non-empty token is an `Err` so a typo surfaces.
+    pub fn parse_opt(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).unwrap_or("") {
+            "" | "stream-json" | "streamjson" | "stream_json" => Ok(SessionProtocol::StreamJson),
+            "terminal" | "tmux" => Ok(SessionProtocol::Terminal),
+            other => Err(format!(
+                "invalid protocol `{other}`: expected `stream-json` or `terminal`"
+            )),
+        }
+    }
+
+    /// Lowercase wire string (`"stream-json"` / `"terminal"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionProtocol::StreamJson => "stream-json",
+            SessionProtocol::Terminal => "terminal",
+        }
+    }
+
+    /// True for the default stream-json (paneless) channel.
+    pub fn is_stream_json(self) -> bool {
+        matches!(self, SessionProtocol::StreamJson)
+    }
+
+    /// True for the tmux/terminal (pane-backed) channel.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, SessionProtocol::Terminal)
+    }
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -1072,6 +1128,39 @@ mod tests {
         assert_eq!(PermissionMode::Hitl.as_str(), "hitl");
         let back: PermissionMode = serde_json::from_str("\"hitl\"").unwrap();
         assert_eq!(back, PermissionMode::Hitl);
+    }
+
+    #[test]
+    fn session_protocol_default_parse_and_serde() {
+        assert_eq!(SessionProtocol::default(), SessionProtocol::StreamJson);
+        assert!(SessionProtocol::default().is_stream_json());
+        // None / empty / "stream-json" → StreamJson.
+        assert_eq!(
+            SessionProtocol::parse_opt(None),
+            Ok(SessionProtocol::StreamJson)
+        );
+        assert_eq!(
+            SessionProtocol::parse_opt(Some("")),
+            Ok(SessionProtocol::StreamJson)
+        );
+        assert_eq!(
+            SessionProtocol::parse_opt(Some("stream-json")),
+            Ok(SessionProtocol::StreamJson)
+        );
+        assert_eq!(
+            SessionProtocol::parse_opt(Some(" terminal ")),
+            Ok(SessionProtocol::Terminal)
+        );
+        assert!(SessionProtocol::parse_opt(Some("bogus")).is_err());
+        // Wire string is kebab-case.
+        assert_eq!(SessionProtocol::StreamJson.as_str(), "stream-json");
+        assert_eq!(SessionProtocol::Terminal.as_str(), "terminal");
+        assert_eq!(
+            serde_json::to_string(&SessionProtocol::StreamJson).unwrap(),
+            "\"stream-json\""
+        );
+        let back: SessionProtocol = serde_json::from_str("\"terminal\"").unwrap();
+        assert_eq!(back, SessionProtocol::Terminal);
     }
 
     #[test]
