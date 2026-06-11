@@ -241,9 +241,10 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 **多 session + 切换 + 查看**:
 
 ```text
-/new                        铸一个新会话(默认 vendor=claude / role=cto),回新句柄 s<N>
+/new                        铸一个新会话(默认 vendor=claude / role=cto / 通道=stream-json),回新句柄 s<N>
 /new claude reviewer        建新会话(vendor = claude|codex;role 可选,默认 cto)
 /new claude reviewer hitl   建一个开了「人工批准」的会话(尾 token hitl;默认是 skip)
+/new claude reviewer terminal  起一个**终端通道**(tmux)会话,要逐字节终端镜像 / attach / screenshot 时用(尾 token terminal;默认是 stream-json;顺序无关,可配 hitl)
 /use s1                     切到会话 s1(同一项目里多会话间切换)
 /role reviewer              把**当前**会话改成 reviewer 角色(原地重启、同句柄 s<N>)
 /sessions                   列当前 chat 的会话(每行带 vendor + role + model + 上下文用量)
@@ -251,6 +252,8 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 ```
 
 `/new` 每次都**铸一个全新会话**(新 `s<N>`,绝不复用旧的),回一个句柄给你;`/use s<N>` 在已有会话间切。同一项目可并存任意多会话,各自独立——开两个 `reviewer` 也是两条互不串台的对话。**roleless**:IM 的 `/new` 至少给 cto;要起一个**裸 claude(无角色)**会话,用 web 控制台新建会话弹窗里的「(无角色 / 裸 claude)」选项,或资源 API `POST …/sessions` 传空 role(brain 走项目 `CLAUDE.md`)。
+
+**协议通道(stream-json 默认 | terminal)**:Claude session 默认走 **stream-json** 通道 —— 长驻 `claude` 子进程 + NDJSON 管道,更轻、活动部件更少,适合纯聊天。要**逐字节终端镜像 / attach / `/screen` 截图**,起会话时显式选 **terminal**(`/new claude <role> terminal`,或 web 新建弹窗里的 protocol 选「terminal(高级)」)。stream-json session **无终端 pane**:web 隐藏它的「终端」tab,`/screen` 会人话告诉你该 session 没法截图(回复直接走聊天)。`/role` 切换 + daemon 重启都保留 session 的通道。寻址(`/use` / `@handle`)对两种通道完全一致。
 
 **人工批准模式(HITL,可选,默认关)**:`/new <vendor> <role> hitl` 建的 session 跑**非自动放行**的工具时,会先把「session sX(role) 要跑:`<tool> <摘要>`」+ `[✅ 同意] [⛔ 拒绝]` 两个按钮弹到你 chat,点同意才执行、拒绝则只挡这一次工具(不杀整个 turn)。allowlist 内 / 自动放行的工具永不弹。不带 `hitl`(默认 `skip`)的 session 维持 YOLO(直接执行,不弹)。`/role` 切换 + daemon 重启都保留 session 的批准模式。(Codex session 忽略此模式 —— 自带 sandbox。)
 
