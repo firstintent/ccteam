@@ -47,6 +47,13 @@ log = os.environ.get("FAKE_SJ_ARGV_LOG")
 if log:
     with open(log, "w") as f:
         f.write(mode + " " + sid + "\n")
+# Contract guard: real `claude` only speaks stream-json (and thus only
+# emits system:init) under --no-chrome (or --print). The fake mirrors that
+# — fail loud if build_argv ever drops the flag again, so this fake can't
+# mask the "timed out waiting for system:init" regression the way it did.
+if "--no-chrome" not in argv:
+    sys.stderr.write("fake-claude-sj: missing --no-chrome (no system:init)\n")
+    sys.exit(3)
 # Resume-failure fault: die immediately when spawned with --resume (before
 # init), so start_thread's resume attempt fails and falls back to fresh.
 if mode == "resume" and os.environ.get("FAKE_SJ_DIE_ON_RESUME") == "1":

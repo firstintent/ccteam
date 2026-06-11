@@ -38,13 +38,19 @@ pub struct StreamJsonSpawnInput<'a> {
 
 /// Build the `claude` argv for a long-running stream-json session.
 ///
-/// Flags verified against `claude --help` 2.1.170 + the live VS Code
+/// Flags verified against `claude --help` 2.1.173 + the live VS Code
 /// extension process capture (see `docs/research/cc-stream-json-protocol.md`
-/// §1). **No `-p`** (PRD §四 Q1): this is a long-lived interactive process
-/// with stdin held open across the whole multi-turn session, not a
-/// one-shot. `--debug --debug-to-stderr` guarantees any diagnostic claude
-/// emits lands on stderr (which the transport drains) and never pollutes
-/// the stdout NDJSON stream.
+/// §1) and an on-machine A/B repro. **`--no-chrome` is the headless
+/// trigger**: `--input-format`/`--output-format stream-json` only take
+/// effect under `--print` OR `--no-chrome`; with neither, claude boots the
+/// interactive TUI and never emits `system:init` (the "timed out waiting
+/// for claude system:init" failure — every stream-json spawn dies at
+/// init). We use `--no-chrome`, **not** `-p`/`--print`: this is a
+/// long-lived resident process holding stdin open across the whole
+/// multi-turn session, whereas `-p` is one-shot — `--no-chrome` is exactly
+/// the shape the VS Code extension (a persistent client) launches.
+/// `--debug --debug-to-stderr` keeps any diagnostic on stderr (drained by
+/// the transport) so it never pollutes the stdout NDJSON stream.
 pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     let mut argv = vec![
         bin.to_string(),
@@ -52,6 +58,9 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         "stream-json".into(),
         "--output-format".into(),
         "stream-json".into(),
+        // Headless trigger — WITHOUT this, stream-json I/O is ignored and
+        // no `system:init` is ever emitted (see the doc comment above).
+        "--no-chrome".into(),
         "--include-partial-messages".into(),
         "--verbose".into(),
         "--replay-user-messages".into(),
@@ -252,6 +261,8 @@ mod tests {
             "--input-format",
             "stream-json",
             "--output-format",
+            // The headless trigger — its absence is the init-timeout bug.
+            "--no-chrome",
             "--include-partial-messages",
             "--replay-user-messages",
         ] {
