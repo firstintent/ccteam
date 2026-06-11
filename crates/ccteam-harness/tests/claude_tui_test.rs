@@ -425,12 +425,44 @@ fn dummy_chat_handle() -> ThreadHandle {
     }
 }
 
-#[tokio::test]
-async fn claude_directive_bare_model_offers_choice() {
-    // D5: a bare arg-applicable popup must NeedsChoice (never blind-send).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn claude_directive_bare_model_passes_through_to_native_picker() {
+    // v0.8.10 (commit b18aade) — `/model` no longer offers a ccteam-hardcoded
+    // choice list (which drifts from claude's evolving model set); it ALWAYS
+    // passes straight through to claude's native picker / "Switch model?"
+    // confirmation and returns `Done` with a receipt pointing the user at
+    // `/screen`. This needs a live pane because the arm submits a turn.
+    std::env::set_var("CCTEAM_MUX_BACKEND", "tmux");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = fake_claude_script(&tmp);
+    let slug = format!("tui-model-{}", std::process::id());
+    let sid = "s1".to_string();
+    let session_name = chat_session_name(&slug, &sid);
+    kill_session_quiet(&session_name);
+    std::env::set_var(CLAUDE_BIN_ENV, bin.to_str().unwrap());
+
+    let brief = AgentSpecBrief {
+        role: "alice".to_string(),
+    };
+    let ctx = SpawnCtx {
+        slug: slug.clone(),
+        sid: sid.clone(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        permission_mode: PermissionMode::Skip,
+        secret: String::new(),
+    };
+    let handle = ClaudeTuiAdapter::new()
+        .start_thread(&brief, &ctx)
+        .await
+        .expect("start");
+
     let outcome = ClaudeTuiAdapter::new()
         .handle_directive(
-            &dummy_chat_handle(),
+            &handle,
             Directive {
                 name: "model".into(),
                 args: String::new(),
@@ -440,21 +472,18 @@ async fn claude_directive_bare_model_offers_choice() {
         .await
         .expect("handle_directive");
     match outcome {
-        DirectiveOutcome::NeedsChoice(p) => {
+        DirectiveOutcome::Done { receipt } => {
             assert!(
-                p.token.starts_with("cj") && !p.token.contains(':') && p.token.len() <= 16,
-                "token must be a unique, colon-free, ≤16B id: {:?}",
-                p.token
-            );
-            assert!(!p.multi);
-            let ids: Vec<&str> = p.options.iter().map(|o| o.id.as_str()).collect();
-            assert!(
-                ids.contains(&"opus") && ids.contains(&"sonnet"),
-                "model aliases expected, got {ids:?}"
+                receipt.contains("/screen"),
+                "the /model receipt must point the user at /screen, got {receipt:?}"
             );
         }
-        other => panic!("bare /model must NeedsChoice, got {other:?}"),
+        other => panic!("bare /model must pass through (Done), got {other:?}"),
     }
+
+    let _ = ClaudeTuiAdapter::new().close_thread(&handle).await;
+    kill_session_quiet(&session_name);
+    std::env::remove_var(CLAUDE_BIN_ENV);
 }
 
 #[tokio::test]
