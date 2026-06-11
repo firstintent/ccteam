@@ -95,4 +95,24 @@ describe("NewSessionModal project dropdown", () => {
     // The "no existing projects" placeholder must NOT show when we have one.
     expect(html).not.toContain("（暂无已有项目）");
   });
+
+  it("renders runtime choices instead of contradictory vendor/protocol labels", () => {
+    const html = renderToString(
+      <NewSessionModal
+        projects={["demo"]}
+        fallbackRoles={["cto"]}
+        defaultProject="demo"
+        onCancel={() => {}}
+        onCreate={async () => true}
+      />,
+    );
+
+    expect(html).toContain("运行时");
+    expect(html).toContain("Claude · stream-json");
+    expect(html).toContain("Claude · terminal");
+    expect(html).toContain("Codex · app-server");
+    expect(html).toContain("permission=");
+    expect(html).not.toContain("Claude Code · tmux");
+    expect(html).not.toContain(" mode=");
+  });
 });

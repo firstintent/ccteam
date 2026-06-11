@@ -17,8 +17,9 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
-    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, PermissionMode, ProcessBackend,
-    SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, HarnessError, PermissionMode,
+    ProcessBackend, SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
+    TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -459,6 +460,19 @@ struct SavedGatewaySession {
     thread: ThreadHandle,
 }
 
+#[derive(Clone)]
+struct RestoredSessionSnapshot {
+    id: String,
+    project: String,
+    role: String,
+    vendor: AgentVendor,
+    permission_mode: PermissionMode,
+    secret: String,
+    thread: ThreadHandle,
+    cwd: PathBuf,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+}
+
 /// A gateway-owned command (v0.8.5 P1): the single source of truth for the
 /// command names the gateway handles itself + their menu/help metadata.
 /// `is_gateway_command`, `/help`, and the channel menu registration all
@@ -696,69 +710,13 @@ impl Gateway {
     pub async fn resume_restored_sessions(&mut self) {
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let Some(snapshot) = self.sessions.get(&id).cloned() else {
+            let Some(snapshot) = self.restored_session_snapshot(&id) else {
                 continue;
             };
-            let Some(cwd) = self.projects.get(&snapshot.project).cloned() else {
-                tracing::warn!(
-                    session = %id,
-                    project = %snapshot.project,
-                    "ccteam-im: restored gateway session skipped; project root missing"
-                );
-                continue;
-            };
-            let adapter = (self.adapter_factory)(snapshot.vendor, snapshot.protocol);
-            let resumed = match snapshot.vendor {
-                AgentVendor::Claude => {
-                    match adapter.resume_thread(&snapshot.thread.identity).await {
-                        Ok(mut thread) => {
-                            thread.raw_extras = merge_thread_extras(
-                                snapshot.thread.raw_extras.clone(),
-                                thread.raw_extras,
-                            );
-                            Ok(thread)
-                        }
-                        Err(err) if is_real_claude_tui_handle(&snapshot.thread) => {
-                            tracing::warn!(
-                                session = %id,
-                                error = %err,
-                                "ccteam-im: Claude restored-session resume failed; trying start_thread reattach/recreate"
-                            );
-                            adapter
-                                .start_thread(
-                                    &AgentSpecBrief {
-                                        role: snapshot.role.clone(),
-                                    },
-                                    &SpawnCtx {
-                                        slug: snapshot.project.clone(),
-                                        sid: snapshot.id.clone(),
-                                        cwd: cwd.clone(),
-                                        project_dir: cwd,
-                                        extra_args: vec![],
-                                        model_id: None,
-                                        // Restart resume re-applies the
-                                        // persisted posture (DB.1).
-                                        permission_mode: snapshot.permission_mode,
-                                        // R-M1 — recreate-fallback re-injects the
-                                        // SAME persisted secret so the new pane's
-                                        // env still matches the gate-map.
-                                        secret: snapshot.secret.clone(),
-                                    },
-                                )
-                                .await
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-                AgentVendor::Codex => adapter.resume_thread(&snapshot.thread.identity).await,
-            };
+            let resumed = Self::resume_restored_snapshot(&snapshot).await;
             match resumed {
                 Ok(thread) => {
-                    if let Some(session) = self.sessions.get_mut(&id) {
-                        session.thread = thread;
-                        session.adapter = adapter;
-                        session.visible_events = Arc::new(AtomicU64::new(0));
-                    }
+                    self.apply_resumed_restored_session(&id, snapshot.adapter, thread);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -776,6 +734,136 @@ impl Gateway {
                 "ccteam-im: failed to persist resumed gateway sessions"
             );
         }
+    }
+
+    /// Resume restored sessions without holding the shared web/IM gateway lock
+    /// across adapter startup. Stream-json may wait for `system:init` and time
+    /// out; keeping that await outside the mutex prevents stale restored
+    /// sessions from blocking fresh web `POST /sessions` requests.
+    pub async fn resume_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let ids = {
+            let g = gateway.lock().await;
+            g.sessions.keys().cloned().collect::<Vec<_>>()
+        };
+        for id in ids {
+            let Some(snapshot) = ({
+                let g = gateway.lock().await;
+                g.restored_session_snapshot(&id)
+            }) else {
+                continue;
+            };
+            let resumed = Self::resume_restored_snapshot(&snapshot).await;
+            let mut g = gateway.lock().await;
+            match resumed {
+                Ok(thread) => {
+                    g.apply_resumed_restored_session(&id, snapshot.adapter, thread);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        session = %id,
+                        vendor = ?snapshot.vendor,
+                        error = %err,
+                        "ccteam-im: restored gateway session resume failed; keeping persisted handle"
+                    );
+                }
+            }
+            if let Err(err) = g.persist_state() {
+                tracing::warn!(
+                    error = %err,
+                    "ccteam-im: failed to persist resumed gateway session"
+                );
+            }
+        }
+    }
+
+    fn restored_session_snapshot(&self, id: &str) -> Option<RestoredSessionSnapshot> {
+        let snapshot = self.sessions.get(id)?;
+        let Some(cwd) = self.projects.get(&snapshot.project).cloned() else {
+            tracing::warn!(
+                session = %id,
+                project = %snapshot.project,
+                "ccteam-im: restored gateway session skipped; project root missing"
+            );
+            return None;
+        };
+        Some(RestoredSessionSnapshot {
+            id: snapshot.id.clone(),
+            project: snapshot.project.clone(),
+            role: snapshot.role.clone(),
+            vendor: snapshot.vendor,
+            permission_mode: snapshot.permission_mode,
+            secret: snapshot.secret.clone(),
+            thread: snapshot.thread.clone(),
+            cwd,
+            adapter: (self.adapter_factory)(snapshot.vendor, snapshot.protocol),
+        })
+    }
+
+    async fn resume_restored_snapshot(
+        snapshot: &RestoredSessionSnapshot,
+    ) -> Result<ThreadHandle, HarnessError> {
+        match snapshot.vendor {
+            AgentVendor::Claude => match snapshot
+                .adapter
+                .resume_thread(&snapshot.thread.identity)
+                .await
+            {
+                Ok(mut thread) => {
+                    thread.raw_extras =
+                        merge_thread_extras(snapshot.thread.raw_extras.clone(), thread.raw_extras);
+                    Ok(thread)
+                }
+                Err(err) if is_real_claude_tui_handle(&snapshot.thread) => {
+                    tracing::warn!(
+                        session = %snapshot.id,
+                        error = %err,
+                        "ccteam-im: Claude restored-session resume failed; trying start_thread reattach/recreate"
+                    );
+                    snapshot
+                        .adapter
+                        .start_thread(
+                            &AgentSpecBrief {
+                                role: snapshot.role.clone(),
+                            },
+                            &SpawnCtx {
+                                slug: snapshot.project.clone(),
+                                sid: snapshot.id.clone(),
+                                cwd: snapshot.cwd.clone(),
+                                project_dir: snapshot.cwd.clone(),
+                                extra_args: vec![],
+                                model_id: None,
+                                permission_mode: snapshot.permission_mode,
+                                secret: snapshot.secret.clone(),
+                            },
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            },
+            AgentVendor::Codex => {
+                snapshot
+                    .adapter
+                    .resume_thread(&snapshot.thread.identity)
+                    .await
+            }
+        }
+    }
+
+    fn apply_resumed_restored_session(
+        &mut self,
+        id: &str,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        thread: ThreadHandle,
+    ) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.thread = thread;
+            session.adapter = adapter;
+            session.visible_events = Arc::new(AtomicU64::new(0));
+        }
+        if let Some(pump) = self.event_pumps.remove(id) {
+            pump.abort();
+        }
+        self.spawn_event_pump(id);
     }
 
     /// Register or update a project root addressable by `/cd <slug>`.
@@ -3777,6 +3865,8 @@ mod tests {
         submissions: Arc<Mutex<Vec<(String, String)>>>,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
         event_delay: std::time::Duration,
+        resume_delay: std::time::Duration,
+        resume_started: Arc<AtomicUsize>,
         /// Recorded `handle_directive` calls (thread id + directive) for
         /// routing + choice-reentry assertions (v0.8.5 D1).
         directives: Arc<Mutex<Vec<(String, Directive)>>>,
@@ -3814,6 +3904,8 @@ mod tests {
                 submissions: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 event_delay: std::time::Duration::ZERO,
+                resume_delay: std::time::Duration::ZERO,
+                resume_started: Arc::new(AtomicUsize::new(0)),
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
@@ -3840,6 +3932,11 @@ mod tests {
                 event_delay,
                 ..Self::new(vendor)
             }
+        }
+
+        fn with_resume_delay(mut self, resume_delay: std::time::Duration) -> Self {
+            self.resume_delay = resume_delay;
+            self
         }
     }
 
@@ -3932,6 +4029,10 @@ mod tests {
         }
 
         async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+            self.resume_started.fetch_add(1, Ordering::SeqCst);
+            if !self.resume_delay.is_zero() {
+                tokio::time::sleep(self.resume_delay).await;
+            }
             Err(HarnessError::NotImplemented {
                 reason: "fake".to_string(),
             })
@@ -4456,6 +4557,60 @@ mod tests {
             "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
             progress.display()
         );
+    }
+
+    /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
+    /// The web API shares the same Gateway mutex, so restore work must not hold
+    /// that lock while awaiting the adapter; otherwise `POST /sessions` blocks
+    /// behind every stale restored session.
+    #[tokio::test]
+    async fn restored_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_path = tmp.path().join("gateway.json");
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let seed = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(seed, "alpha", project_dir.clone());
+        gateway.enable_persistence(&state_path).unwrap();
+        let sid = gateway
+            .create_session_api_proto(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+
+        let slow = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_resume_delay(std::time::Duration::from_millis(250)),
+        );
+        let mut restored = Gateway::new(slow.clone(), "alpha", project_dir);
+        restored.enable_persistence(&state_path).unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(restored));
+
+        let resume_task = tokio::spawn(Gateway::resume_restored_sessions_shared(Arc::clone(
+            &gateway,
+        )));
+        for _ in 0..50 {
+            if slow.resume_started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(slow.resume_started.load(Ordering::SeqCst), 1);
+
+        let guard = tokio::time::timeout(std::time::Duration::from_millis(50), gateway.lock())
+            .await
+            .expect("gateway lock must stay available while restored resume awaits adapter");
+        assert_eq!(guard.session_views().len(), 1);
+        drop(guard);
+
+        resume_task.await.unwrap();
     }
 
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value

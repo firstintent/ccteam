@@ -289,9 +289,10 @@ where
             _ => tokio::sync::mpsc::unbounded_channel::<GatewayEvent>(),
         };
     {
-        // Hold the gateway lock only for the synchronous + short-async setup.
-        // (At daemon boot nothing else has the handle yet, so this never
-        // contends; doing it under one guard keeps the sequence atomic.)
+        // Hold the gateway lock only for synchronous setup. Restored-session
+        // resume can wait on vendor startup (stream-json `system:init`), and
+        // web session creation shares this same mutex, so resume is kicked off
+        // below without holding the lock.
         let mut g = gateway.lock().await;
         // v0.8.5 D6 — inject the shared pending-interaction registry when one
         // was supplied (`ccteam start` hands the same `Arc` to the mcp.sock
@@ -301,10 +302,13 @@ where
         if let Some(pending) = args.pending.clone() {
             g.set_pending(pending);
         }
-        g.resume_restored_sessions().await;
         log_orphan_chat_sessions(&g).await;
         g.set_event_sink(gateway_event_tx);
     }
+    let restore_gateway = Arc::clone(&gateway);
+    tokio::spawn(async move {
+        Gateway::resume_restored_sessions_shared(restore_gateway).await;
+    });
 
     // V0.6.1 F132 — spawn one `Channel::listen` task per active
     // channel. Each listener pushes ChannelMessages into a shared mpsc

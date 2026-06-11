@@ -539,6 +539,45 @@ type RoleFetchState =
   | { kind: "ready"; roles: RoleSummary[] }
   | { kind: "error" };
 
+const RUNTIME_OPTIONS = [
+  {
+    id: "claude-stream-json",
+    label: "Claude · stream-json",
+    hint: "轻量聊天",
+    vendor: "claude",
+    protocol: "stream-json",
+  },
+  {
+    id: "claude-terminal",
+    label: "Claude · terminal",
+    hint: "终端镜像 / 截图",
+    vendor: "claude",
+    protocol: "terminal",
+  },
+  {
+    id: "codex-app-server",
+    label: "Codex · app-server",
+    hint: "Codex JSON-RPC",
+    vendor: "codex",
+    protocol: "stream-json",
+  },
+  {
+    id: "codex-terminal",
+    label: "Codex · terminal",
+    hint: "终端模式",
+    vendor: "codex",
+    protocol: "terminal",
+  },
+] as const satisfies readonly {
+  id: string;
+  label: string;
+  hint: string;
+  vendor: "claude" | "codex";
+  protocol: "stream-json" | "terminal";
+}[];
+
+type RuntimeId = (typeof RUNTIME_OPTIONS)[number]["id"];
+
 export function NewSessionModal({
   projects,
   fallbackRoles,
@@ -564,14 +603,14 @@ export function NewSessionModal({
   const [project, setProject] = useState(defaultProject);
   const [newSlug, setNewSlug] = useState("");
   const [newPath, setNewPath] = useState("");
-  const [vendor, setVendor] = useState<"claude" | "codex">("claude");
+  const [runtimeId, setRuntimeId] = useState<RuntimeId>("claude-stream-json");
   const [role, setRole] = useState("");
   const [hitl, setHitl] = useState(false);
-  // v0.8.11 — wire protocol. stream-json is the薄/default (no pane); terminal
-  // is the advanced, pane-backed option (terminal mirror / attach / screenshot).
-  const [protocol, setProtocol] = useState<"stream-json" | "terminal">("stream-json");
   const [pending, setPending] = useState(false);
   const [roleState, setRoleState] = useState<RoleFetchState>({ kind: "idle" });
+  const runtime = RUNTIME_OPTIONS.find((item) => item.id === runtimeId) ?? RUNTIME_OPTIONS[0];
+  const vendor = runtime.vendor;
+  const protocol = runtime.protocol;
 
   const isNew = project === NEW_PROJECT;
 
@@ -759,45 +798,25 @@ export function NewSessionModal({
             </div>
           ) : null}
 
-          <label className="block text-xs text-text-dim">Code agent</label>
-          <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
-            {(["claude", "codex"] as const).map((value) => (
+          <label className="block text-xs text-text-dim">运行时</label>
+          <div className="grid grid-cols-2 gap-1 rounded-md bg-surface-800 p-0.5">
+            {RUNTIME_OPTIONS.map((option) => (
               <button
-                key={value}
+                key={option.id}
                 type="button"
                 disabled={pending}
-                onClick={() => setVendor(value)}
-                className={`flex-1 h-8 rounded text-xs disabled:opacity-40 ${
-                  vendor === value ? "bg-surface-700 text-text-primary" : "text-text-dim"
+                onClick={() => setRuntimeId(option.id)}
+                className={`min-h-10 rounded px-2 py-1 text-left disabled:opacity-40 ${
+                  runtimeId === option.id ? "bg-surface-700 text-text-primary" : "text-text-dim"
                 }`}
               >
-                {value === "claude" ? "Claude Code · tmux" : "Codex · app-server"}
-              </button>
-            ))}
-          </div>
-
-          {/* v0.8.11 — wire protocol. stream-json is the薄/default (no pane);
-              terminal is the advanced, pane-backed option. */}
-          <label className="block text-xs text-text-dim">协议</label>
-          <div className="flex gap-1 rounded-md bg-surface-800 p-0.5">
-            {(["stream-json", "terminal"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                disabled={pending}
-                onClick={() => setProtocol(value)}
-                className={`flex-1 h-8 rounded text-xs disabled:opacity-40 ${
-                  protocol === value ? "bg-surface-700 text-text-primary" : "text-text-dim"
-                }`}
-              >
-                {value === "stream-json" ? "stream-json（默认）" : "terminal（高级）"}
+                <span className="block text-xs font-medium leading-4">{option.label}</span>
+                <span className="block text-[10px] leading-3 text-text-dim">{option.hint}</span>
               </button>
             ))}
           </div>
           <p className="text-[10px] text-text-dim leading-4">
-            {protocol === "stream-json"
-              ? "默认薄路径：直接 stream-json 管道，无终端。"
-              : "高级选项：需要终端镜像 / attach / 截图时选它（占用一个 tmux/rmux pane）。"}
+            {runtime.label} → vendor={vendor} · protocol={protocol}
           </p>
 
           <div className="flex items-center justify-between">
@@ -847,7 +866,7 @@ export function NewSessionModal({
               {effectiveRole || "(无角色 / 裸 claude)"}
             </span>{" "}
             vendor=
-            <span className="text-text-secondary">{vendor}</span> mode=
+            <span className="text-text-secondary">{vendor}</span> permission=
             <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>{" "}
             protocol=
             <span className="text-text-secondary">{protocol}</span>
