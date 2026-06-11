@@ -75,7 +75,18 @@
   - E3 故障×通道矩阵 CI-fake 全绿 + 真机短 smoke(web 新建 stream-json session → IM 聊一轮 → /compact → /context → HITL → idle → 唤醒 resume → daemon 重启 resume);
   - 基线不退:`cargo test --workspace` ≥ 起跑实测 + clippy 0 + `cargo fmt --all` 干净 + vitest/Playwright 不退。
 
-## 七、变更记录
+## 七、v0.9 准备度(前瞻约束;2026-06-11 对照 v0.9.0 PRD v2 review 产出)
+
+> v0.9 = 宿主轴(SessionHost 契约:local | satellite | k8s-agent-sandbox,见 `docs/versions/v0-9-0/prd.md`)。本版(协议轴)是它的直接前置;下列约束**不扩 scope、只约束实现形状**,目的 = v0.9 H1(契约收编)接手时零返工:
+
+1. **E1 内部按 SessionHost 预折叠四条缝**:① spawn-spec(argv/env/cwd builder,纯函数)② transport(读写抽象 + 本地 pipe 实现;**NDJSON 消费端不得直接持 `Child` 句柄**,为 WS 透明替换留位)③ NDJSON→CanonicalEvent 消费 ④ SoT writer(event pump)。四件各自成模块,不与 gateway 内部纠缠。
+2. **E2 命名修正**:创建参数落码用 **`protocol`**(`stream-json` 默认 | `terminal`)而非 `backend`(backend 一词留给宿主轴);session schema **预留 `host` 字段**(默认 `local`,本版不暴露 UI/CLI)。
+3. **E3 故障注入 harness 轴参数化**:矩阵实现为 `通道 × 故障` 的参数化夹具,新增宿主维(×{local,satellite,k8s})时只加参数不重写;fake transport 缝与 ①② 同源。
+4. **SoT writer 模块化为「随宿主走」组件**:本版 local 形态 = daemon 进程内调用;模块边界按「未来被 runner(`ccteam satellite`)原样复用」设计(它在 v0.9 是会话宿主侧唯一 turns/progress writer)。
+5. **sid↔vendor-uuid 映射表 host-facet 友好**:`--session-id` mint 的映射存储预留扩列(v0.9 同表挂 sid↔Sandbox CR / host),不做一次性双键结构。
+
+## 八、变更记录
 
 - **2026-06-10 初版**:由 stream-json 协议研究催生(TG 1079–1087);user 定 scope:加入版本需求(TG 1088→更正 1091 为 v0.8.11)+ 参考 alleycat(TG 1089)+ web 创建默认 stream-json、rmux 高级选项(TG 1090)+ 主线=继续 v0.8.10 方向加码稳定性/终端体验(TG 1091)。原占位 v0.8.11 的 track-upstream 市场 PRD 顺移 v0.8.12。候选,待 review。
 - **2026-06-10 决策回填(TG 1093)**:Q1 不带 `-p`(IM 非短命 session)/ Q2 IM `/new` 同步默认 stream-json / Q3 cto 走 stream-json / Q5 定点隔离官方 telegram 插件(settings.local.json `enabledPlugins` 定点 false,不碰其余用户插件);Q4 留 dev-plan。同日启动「云端托管 code-agent 控制中心」主战场需求探索(参考 `references/litellm-agent-platform`,workflow 产出落 `docs/research/`)。
+- **2026-06-11 +§七 v0.9 准备度(TG 1120 review)**:对照 v0.9.0 PRD v2(宿主轴)逐条 review,新增 5 条实现形状约束(SessionHost 预折叠四缝 / `protocol` 命名修正 + 预留 `host` 字段 / 故障矩阵轴参数化 / SoT writer 随宿主组件化 / sid 映射表扩列友好);scope 不变。结论:E1-E5 与 v0.9 方向无冲突,本版即 v0.9 的协议轴前置。
