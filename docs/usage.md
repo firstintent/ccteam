@@ -370,8 +370,8 @@ ccteam role list                    # 列当前项目已装的 role(= /role 可�
 ```
 
 - `role search` / `add` 读 **ccteam-hub 插件市场** 的 `index.json`(经 HTTPS 拉取 + 本地缓存 `~/.ccteam/hub-cache/`;首次访问联网,之后走缓存)。**官方 ccteam 插件(`source: ccteam`)在结果里置顶,其余来源依次排后。** `search` 无匹配会给提示、exit 0。
-- `role add` 会取该 role 的 markdown 原文、**sha256 校验内容完整性**后写入 `.claude/agents/<role>.md`(零改写;agency 的 .md 本就 Claude 原生)。已存在同名 → 拒绝覆盖,加 `--force` 才覆盖。装完打印 `/role <role>` 提示,IM 里直接 `/role <role>` 切过去用。
-- 插件内容住独立的 `firstintent/ccteam-hub`(curated marketplace),开源插件 verbatim vendor 进 hub(pinned sha)；ccteam repo 本身不带任何 role/skill 内容(唯一例外默认 `cto`)。web 控制台的「插件市场」页是同一来源的图形入口(见 §8)。
+- `role add` 从该条目的 `upstream` URL(已登记仓库 @pinned-sha)取原文、**sha256 校验内容完整性**后写入 `.claude/agents/<role>.md`(零改写)。**skill 同理**:单文件落 `.claude/skills/<id>/SKILL.md`,**多文件 skill**(带 `manifest`,如 mattpocock 的部分 skill)整目录落 `.claude/skills/<id>/<…>`。已存在同名 → 拒绝覆盖,加 `--force` 才覆盖。装完打印 `/role <role>` 提示,IM 里直接 `/role <role>` 切过去用。
+- 插件**目录**住独立的 `firstintent/ccteam-hub`(curated marketplace)。市场是 **track-upstream** 模型:`index.json` 只存元数据 + 每条 `upstream`(指向上游仓库 @pinned-sha 的 raw URL)+ `content_sha`,**不存内容副本**;`sources.json` 声明跟踪的上游仓库(agency-agents + mattpocock/skills,均 MIT),装时才从 upstream 拉(只信白名单 host `raw.githubusercontent.com`)。ccteam repo 本身不带任何 role/skill 内容(唯一例外默认 `cto`)。web 控制台的「插件市场」页是同一来源的图形入口(见 §8)。
 
 ---
 
