@@ -41,3 +41,4 @@ graphify-out/
 # is never the real config home (runtime config = ~/.ccteam/config.yaml).
 /config.yaml
 ccteam-hub/
+cleat/
