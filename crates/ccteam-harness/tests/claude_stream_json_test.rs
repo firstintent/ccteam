@@ -13,12 +13,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use ccteam_harness::execution::claude_stream_json::bridge::{ApprovalDecision, FnResolver};
 use ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid;
 use ccteam_harness::execution::claude_stream_json::ClaudeStreamJsonAdapter;
 use ccteam_harness::execution::transcript_tail::anthropic_project_dir;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadEvent, ThreadItemDetails, TurnInput,
+    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
+    HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -52,8 +55,36 @@ emit({"type":"system","subtype":"init","session_id":sid,"model":"fake-model",
 if os.environ.get("FAKE_SJ_DIE_AFTER_INIT") == "1":
     sys.exit(0)
 reply = os.environ.get("FAKE_SJ_REPLY", "ok")
-for line in sys.stdin:
+ask_tool = os.environ.get("FAKE_SJ_ASK_TOOL")
+# Use readline (not `for line in sys.stdin`) so we can interleave a
+# control_response read after emitting a can_use_tool request.
+n = 0
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
     if not line.strip():
+        continue
+    n += 1
+    if ask_tool:
+        rid = "req-%d" % n
+        emit({"type":"control_request","request_id":rid,
+              "request":{"subtype":"can_use_tool","tool_name":ask_tool,
+                         "input":{"command":"ls -la"},"tool_use_id":"tu-%d" % n}})
+        resp = sys.stdin.readline()
+        behavior = "deny"
+        try:
+            behavior = json.loads(resp)["response"]["response"]["behavior"]
+        except Exception:
+            pass
+        verdict = ("ran:" + ask_tool) if behavior == "allow" else ("blocked:" + ask_tool)
+        # The turn still COMPLETES even when the tool was denied (deny only
+        # blocks the tool call, never the turn).
+        emit({"type":"assistant","session_id":sid,
+              "message":{"role":"assistant","content":[{"type":"text","text":verdict}]}})
+        emit({"type":"result","subtype":"success","result":verdict,"is_error":False,
+              "total_cost_usd":0.001,"usage":{"input_tokens":7,"output_tokens":4},
+              "session_id":sid})
         continue
     emit({"type":"assistant","session_id":sid,
           "message":{"role":"assistant","content":[{"type":"text","text":reply}]}})
@@ -284,4 +315,156 @@ async fn child_death_then_restart_recovers() {
         "recovered session must answer"
     );
     adapter.close_thread(&revived).await.unwrap();
+}
+
+// ── Wave 2: slash bridge + HITL ─────────────────────────────────────────
+
+fn ctx_hitl(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
+    SpawnCtx {
+        permission_mode: PermissionMode::Hitl,
+        ..ctx(tmp, slug, sid)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn slash_bridge_passes_through_safe_rejects_dialog() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start");
+
+    // /compact is a red-line passthrough (and in the init table) → Turn.
+    let compact = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "compact".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(compact, DirectiveOutcome::Turn(_)),
+        "/compact must pass through as a turn, got {compact:?}"
+    );
+
+    // /model is a dialog/panel command → human-readable Rejected.
+    let model = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match model {
+        DirectiveOutcome::Rejected { reason } => {
+            assert!(
+                reason.contains("/model"),
+                "reason should name the command: {reason}"
+            );
+        }
+        other => panic!("/model must Reject, got {other:?}"),
+    }
+
+    // An unknown command becomes text (never "Unknown skill") → Turn.
+    let unknown = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "frobnicate".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(unknown, DirectiveOutcome::Turn(_)));
+
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn hitl_deny_blocks_tool_but_turn_completes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_ASK_TOOL", "Bash");
+    // Resolver allows everything EXCEPT Bash.
+    let adapter = ClaudeStreamJsonAdapter::new().with_resolver(Arc::new(FnResolver(
+        |_sid: &str, req: &ccteam_harness::execution::claude_stream_json::bridge::CanUseToolReq| {
+            if req.tool_name == "Bash" {
+                ApprovalDecision::deny("denied by policy")
+            } else {
+                ApprovalDecision::allow()
+            }
+        },
+    )));
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx_hitl(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start hitl");
+
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("run a command".into()));
+    let ((answer, completed), _) = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+    // Deny round-tripped: the fake saw behavior=deny → "blocked:Bash".
+    assert_eq!(answer.as_deref(), Some("blocked:Bash"));
+    // The turn still COMPLETED — deny blocks only the tool, never the turn.
+    assert!(completed, "turn must complete despite the tool denial");
+
+    std::env::remove_var("FAKE_SJ_ASK_TOOL");
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn hitl_allow_lets_tool_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_ASK_TOOL", "Read");
+    let adapter = ClaudeStreamJsonAdapter::new().with_resolver(Arc::new(FnResolver(
+        |_sid: &str,
+         _req: &ccteam_harness::execution::claude_stream_json::bridge::CanUseToolReq| {
+            ApprovalDecision::allow()
+        },
+    )));
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx_hitl(tmp.path(), "demo", "s2"),
+        )
+        .await
+        .expect("start hitl");
+
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("read a file".into()));
+    let (answer, _) = tokio::join!(collect_answer(&adapter, &stream_handle), submit).0;
+    assert_eq!(answer.as_deref(), Some("ran:Read"));
+
+    std::env::remove_var("FAKE_SJ_ASK_TOOL");
+    adapter.close_thread(&handle).await.unwrap();
 }

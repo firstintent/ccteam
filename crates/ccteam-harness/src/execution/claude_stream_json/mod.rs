@@ -27,6 +27,7 @@
 //!   what makes `--resume` stateless across daemon restart.
 //! - **No terminal scraping**: there is no terminal — naturally satisfied.
 
+pub mod bridge;
 pub mod protocol;
 pub mod spawn_spec;
 pub mod translate;
@@ -52,6 +53,7 @@ use crate::{
     HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 
+use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
 use protocol::Outbound;
 use spawn_spec::StreamJsonSpawnInput;
 use translate::StreamTranslator;
@@ -90,6 +92,11 @@ struct LiveSession {
 #[derive(Clone, Default)]
 pub struct ClaudeStreamJsonAdapter {
     live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
+    /// HITL resolver for `can_use_tool` reverse RPCs. `None` = no HITL
+    /// wiring (a hitl session then default-denies, the safe direction).
+    /// The gateway wires the production resolver (→ `permission/ask` → IM)
+    /// in Wave 3; tests inject a deterministic stub.
+    resolver: Option<Arc<dyn CanUseToolResolver>>,
 }
 
 impl std::fmt::Debug for ClaudeStreamJsonAdapter {
@@ -101,6 +108,48 @@ impl std::fmt::Debug for ClaudeStreamJsonAdapter {
 
 /// Adapter `name()` — the stable id used in handles, logs, and tests.
 pub const STREAM_JSON_ADAPTER_NAME: &str = "claude-stream-json";
+
+/// Spawn the per-session HITL dispatcher: watch the transport for
+/// `can_use_tool` reverse RPCs, resolve each via the wired resolver, and
+/// reply with a `control_response`. A missing resolver default-denies (the
+/// safe direction). `deny` blocks ONLY the tool call — the turn continues.
+fn spawn_hitl_dispatcher(
+    transport: Arc<StreamJsonTransport>,
+    sid: String,
+    resolver: Option<Arc<dyn CanUseToolResolver>>,
+) {
+    let mut sub = transport.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = transport.wait_closed() => return,
+                msg = sub.recv() => match msg {
+                    Ok(Outbound::ControlRequest(creq)) => {
+                        let Some(req) = bridge::parse_can_use_tool(&creq) else { continue };
+                        let decision = match &resolver {
+                            Some(r) => r.resolve(&sid, &req).await,
+                            None => ApprovalDecision::deny(
+                                "HITL approval is unavailable (no resolver wired) — denied",
+                            ),
+                        };
+                        let line = protocol::can_use_tool_response_line(
+                            &req.request_id,
+                            decision.allow,
+                            &req.input,
+                            &decision.message,
+                        );
+                        if transport.send_line(line).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    });
+}
 
 /// Translate one outbound message and forward its events to the stream's
 /// channel. `Err(())` means the consumer dropped the stream (stop).
@@ -131,6 +180,12 @@ fn init_timeout() -> Duration {
 impl ClaudeStreamJsonAdapter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the HITL `can_use_tool` resolver (gateway wiring, Wave 3).
+    pub fn with_resolver(mut self, resolver: Arc<dyn CanUseToolResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     fn lookup(&self, identity: &str) -> Option<Arc<LiveSession>> {
@@ -252,6 +307,18 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             host: "local".to_string(),
         };
         let model = init.model.clone();
+        // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
+        // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
+        // resolves each via the wired resolver (→ IM approve/deny) and
+        // replies with a control_response. A skip session never gets one,
+        // so no dispatcher is needed.
+        if ctx.permission_mode.is_hitl() {
+            spawn_hitl_dispatcher(
+                Arc::clone(&transport),
+                ctx.sid.clone(),
+                self.resolver.clone(),
+            );
+        }
         let live = LiveSession {
             identity: identity.clone(),
             transport,
@@ -432,18 +499,30 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         h: &ThreadHandle,
         d: Directive,
     ) -> Result<DirectiveOutcome, HarnessError> {
-        // Wave 1 — minimal passthrough: forward `/name args` as user text
-        // (the open-set prompt/local slash contract). The full bridge gate
-        // (known-dialog human-refuse / unknown-as-text / IM-command
-        // precedence) + HITL land in Wave 2.
-        let name = d.name.trim().trim_start_matches('/');
-        let line = if d.args.trim().is_empty() {
-            format!("/{name}")
-        } else {
-            format!("/{name} {}", d.args.trim())
-        };
-        let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
-        Ok(DirectiveOutcome::Turn(turn))
+        // Bridge gate (PRD E1): classify against the live init command
+        // table. ccteam's own IM commands never reach here — the gateway
+        // intercepts them before `handle_directive`.
+        let commands = self
+            .lookup(&h.identity)
+            .map(|live| live.commands.clone())
+            .unwrap_or_default();
+        let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
+        match bridge::classify_slash(&name, &commands) {
+            SlashClass::Reject => Ok(DirectiveOutcome::Rejected {
+                reason: bridge::reject_reason(&name),
+            }),
+            SlashClass::Passthrough => {
+                // Known prompt/local (incl. /compact /clear /context) OR
+                // unknown → forward verbatim as user text.
+                let line = if d.args.trim().is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {}", d.args.trim())
+                };
+                let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
+                Ok(DirectiveOutcome::Turn(turn))
+            }
+        }
     }
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
