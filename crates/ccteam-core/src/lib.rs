@@ -116,7 +116,8 @@ pub use actions::{
 // adds the skill sibling `write_skill` (`.claude/skills/<id>/SKILL.md`) used
 // by the hub installer.
 pub use admin_actions::{
-    agent_md_path, change_persona, skill_md_path, write_role, write_skill, AddToolResult,
+    agent_md_path, change_persona, skill_dir_path, skill_md_path, write_role, write_skill,
+    write_skill_file, AddToolResult,
 };
 // V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
 // (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).

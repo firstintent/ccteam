@@ -53,8 +53,9 @@ fn fixture_project(paths: &CcteamPaths, slug: &str) {
 }
 
 /// Build an `index.json` with a single agent plugin whose `content_sha` is the
-/// real sha256 of `AGENT_BODY` (so the integrity check passes on install).
-fn good_index_json(id: &str) -> String {
+/// real sha256 of `AGENT_BODY` and whose `upstream` points back at the fake hub
+/// `base` (so the engine's upstream-fetch hits the loopback fake, not github).
+fn good_index_json(id: &str, base: &str) -> String {
     let sha = sha256_hex(AGENT_BODY.as_bytes());
     format!(
         r#"{{
@@ -68,10 +69,9 @@ fn good_index_json(id: &str) -> String {
               "type": "agent",
               "name": "Helper",
               "description": "A curated helper",
-              "path": "agents/{id}.md",
+              "upstream": "{base}/agents/{id}.md",
               "content_sha": "{sha}",
               "source": "agency-agents",
-              "upstream": "https://github.com/example/x",
               "license": "MIT",
               "tags": ["util"]
             }}
@@ -80,14 +80,20 @@ fn good_index_json(id: &str) -> String {
     )
 }
 
-/// A looping multi-route fake hub: serves `/index.json` and a per-path body
-/// map for EVERY connection until the listener is dropped at test end (the
-/// real router makes a varying number of fetches across the round-trip — index
-/// refresh + cached reads + a body fetch on install). Routes on the request
-/// path; unknown paths get a 404. Returns the `base` URL.
-fn spawn_looping_hub(index_json: String, bodies: Vec<(String, String)>) -> String {
+/// Bind + serve a looping fake hub for a single agent `id`. Returns the base
+/// URL; the index it serves points `upstream` back at this base so the engine's
+/// upstream-fetch (loopback — on the host allowlist) resolves `/agents/<id>.md`.
+/// `serve_body == false` omits the body route (for the early-return 404 tests).
+fn spawn_helper_hub(id: &str, serve_body: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let index_json = good_index_json(id, &base);
+    let bodies: Vec<(String, String)> = if serve_body {
+        vec![(format!("agents/{id}.md"), AGENT_BODY.to_string())]
+    } else {
+        vec![]
+    };
     std::thread::spawn(move || loop {
         let Ok((mut stream, _)) = listener.accept() else {
             break;
@@ -123,7 +129,7 @@ fn spawn_looping_hub(index_json: String, bodies: Vec<(String, String)>) -> Strin
         let _ = stream.write_all(resp.as_bytes());
         let _ = stream.flush();
     });
-    format!("http://{addr}")
+    base
 }
 
 async fn spawn_router(state: AppState) -> SocketAddr {
@@ -150,10 +156,7 @@ async fn marketplace_round_trip_catalog_decorate_install() {
     let project_dir = paths.project_dir("demo");
 
     let id = "helper";
-    let hub_base = spawn_looping_hub(
-        good_index_json(id),
-        vec![(format!("agents/{id}.md"), AGENT_BODY.to_string())],
-    );
+    let hub_base = spawn_helper_hub(id, true);
     std::env::set_var(HUB_BASE_ENV, &hub_base);
 
     let addr = spawn_router(AppState::new(paths)).await;
@@ -241,10 +244,7 @@ async fn marketplace_body_preview_and_unknown_id() {
     let paths = fake_paths(tmp.path());
 
     let id = "helper";
-    let hub_base = spawn_looping_hub(
-        good_index_json(id),
-        vec![(format!("agents/{id}.md"), AGENT_BODY.to_string())],
-    );
+    let hub_base = spawn_helper_hub(id, true);
     std::env::set_var(HUB_BASE_ENV, &hub_base);
 
     let addr = spawn_router(AppState::new(paths)).await;
@@ -291,7 +291,7 @@ async fn marketplace_unknown_project_404() {
     let paths = fake_paths(tmp.path());
 
     // A fake hub exists but should never be consulted for an unknown project.
-    let hub_base = spawn_looping_hub(good_index_json("helper"), vec![]);
+    let hub_base = spawn_helper_hub("helper", false);
     std::env::set_var(HUB_BASE_ENV, &hub_base);
 
     let addr = spawn_router(AppState::new(paths)).await;
@@ -327,7 +327,7 @@ async fn marketplace_install_unknown_plugin_404() {
     fixture_project(&paths, "demo");
     let project_dir = paths.project_dir("demo");
 
-    let hub_base = spawn_looping_hub(good_index_json("helper"), vec![]);
+    let hub_base = spawn_helper_hub("helper", false);
     std::env::set_var(HUB_BASE_ENV, &hub_base);
 
     let addr = spawn_router(AppState::new(paths)).await;

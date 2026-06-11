@@ -143,6 +143,62 @@ pub fn write_skill(project_dir: &Path, skill: &str, content: &str) -> Result<Pat
     Ok(path)
 }
 
+/// `<project_dir>/.claude/skills/<skill>/` — the directory a multi-file skill
+/// installs into (the parent of its `SKILL.md`).
+pub fn skill_dir_path(project_dir: &Path, skill: &str) -> PathBuf {
+    project_dir.join(".claude").join("skills").join(skill)
+}
+
+/// Validate a skill-relative file path: a plain relative path of only
+/// `Normal` components (rejects absolute paths, `..`, `.`, and Windows
+/// prefixes) so a hostile manifest `relpath` can never escape the skill dir.
+fn validate_skill_relpath(relpath: &str) -> Result<PathBuf> {
+    if relpath.trim().is_empty() {
+        bail!("skill file relpath must be non-empty");
+    }
+    let p = Path::new(relpath);
+    if p.is_absolute() {
+        bail!("skill file relpath must be relative: `{relpath}`");
+    }
+    for comp in p.components() {
+        if !matches!(comp, std::path::Component::Normal(_)) {
+            bail!("skill file relpath `{relpath}` must contain only normal segments (no `..`)");
+        }
+    }
+    Ok(p.to_path_buf())
+}
+
+/// v0.8.12 — write one file of a multi-file skill to
+/// `<project_dir>/.claude/skills/<skill>/<relpath>`, creating the parent
+/// chain, with the same atomic tmp + rename as [`write_skill`]. `relpath` is
+/// validated to stay inside the skill dir (no path traversal). The
+/// marketplace installer uses this to land a skill that carries sibling
+/// resources (`scripts/…`) beyond its `SKILL.md`. Returns the absolute path.
+pub fn write_skill_file(
+    project_dir: &Path,
+    skill: &str,
+    relpath: &str,
+    content: &str,
+) -> Result<PathBuf> {
+    validate_bot_name(skill)?;
+    let rel = validate_skill_relpath(relpath)?;
+    let path = skill_dir_path(project_dir, skill).join(&rel);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("skill file path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("skill file path has no file name: {}", path.display()))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(path)
+}
+
 /// Return value from [`add_tool`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddToolResult {

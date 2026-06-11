@@ -79,6 +79,7 @@ fn hub_error_status(err: &HubError) -> StatusCode {
         HubError::ShaMismatch { .. }
         | HubError::Http { .. }
         | HubError::BadStatus { .. }
+        | HubError::HostNotAllowed { .. }
         | HubError::BadIndex(_)
         | HubError::EmptyBody(_)
         | HubError::TooLarge { .. } => StatusCode::BAD_GATEWAY,
@@ -182,7 +183,7 @@ pub(crate) async fn handle_marketplace_body(
         )
             .into_response();
     };
-    match hub::fetch_plugin_body(&hub::hub_base(), plugin).await {
+    match hub::fetch_plugin_body(plugin).await {
         Ok(body) => Json(serde_json::json!({"id": id, "body": body})).into_response(),
         Err(err) => {
             tracing::warn!(%id, %err, "marketplace body fetch failed");
@@ -315,7 +316,7 @@ pub(crate) async fn handle_project_marketplace_install(
     };
     let project_dir = app.paths.project_dir(&slug);
     let force = form.force.unwrap_or(false);
-    match hub::install_plugin(&project_dir, plugin, None, force, &hub::hub_base()).await {
+    match hub::install_plugin(&project_dir, plugin, None, force).await {
         Ok(result) => {
             let body = serde_json::json!({
                 "id": result.id,

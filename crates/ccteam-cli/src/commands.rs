@@ -4271,7 +4271,6 @@ pub fn run_role_add(
         plugin,
         as_role,
         force,
-        &base,
     ))?
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     // The installed file stem (the `/role` name) is the sanitized override or

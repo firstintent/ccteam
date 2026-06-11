@@ -2,11 +2,14 @@
 //! marketplace).
 //!
 //! `ccteam-hub` (`github.com/firstintent/ccteam-hub`) is a curated catalog of
-//! installable **plugins** — agents today, skills / workflows later. ccteam
+//! installable **plugins** — agents + skills (workflows deferred). ccteam
 //! reads its `index.json` over HTTPS (github-raw) plus a local cache under
-//! `~/.ccteam/hub-cache/`, and installs a plugin's content into a user
-//! project (`.claude/agents/<id>.md` for an agent, `.claude/skills/<id>/SKILL.md`
-//! for a skill). `ccteam-web` + the CLI call this module.
+//! `~/.ccteam/hub-cache/` (track-upstream: the index stores per-plugin
+//! `upstream` URLs, not vendored bodies), and installs a plugin's content into
+//! a user project (`.claude/agents/<id>.md` for an agent;
+//! `.claude/skills/<id>/…` for a skill — a single `SKILL.md`, or a whole dir
+//! for a multi-file skill via its `manifest`). `ccteam-web` + the CLI call
+//! this module.
 //!
 //! ## Why here (not `ccteam-core`)
 //!
@@ -22,10 +25,12 @@
 //!
 //! ## Test seam
 //!
-//! Every public fn takes a `base` parameter and the live wrappers pass
-//! [`ccteam_core::HUB_RAW_BASE`] (overridable via the [`HUB_BASE_ENV`] env
-//! var). Tests point `base` at an in-process fake hub (`spawn_oneshot_http`)
-//! so `cargo test` never touches github.
+//! [`fetch_index`] / [`load_catalog`] take a `base` parameter (the hub
+//! `index.json` host; live wrappers pass [`ccteam_core::HUB_RAW_BASE`],
+//! overridable via [`HUB_BASE_ENV`]). Plugin bodies are fetched from each
+//! entry's own `upstream` URL (track-upstream model), gated by a host
+//! allowlist (github raw + loopback). Tests point both at an in-process
+//! loopback fake hub so `cargo test` never touches github.
 
 use std::path::{Path, PathBuf};
 
@@ -92,13 +97,27 @@ impl HubIndex {
     }
 }
 
-/// One installable plugin entry in the hub index.
+/// One file of a multi-file skill (PRD §二): a path relative to the skill
+/// dir + the sha256 of its body. The engine derives the file's fetch URL from
+/// the plugin's `upstream` dir + `relpath`, verifies the sha, and writes it
+/// under `.claude/skills/<id>/<relpath>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// Path relative to the skill dir (e.g. `SKILL.md`, `scripts/run.sh`).
+    pub relpath: String,
+    /// sha256 hex of this file's body (per-file integrity gate).
+    pub content_sha: String,
+}
+
+/// One installable plugin entry in the hub index (track-upstream schema).
 ///
-/// Matches the live schema:
-/// `{ id, type, name, description, path, content_sha, source, upstream,
-///   license, tags[] }`. `type` is `"agent" | "skill" | "workflow"`;
-/// `content_sha` is the sha256 hex of the body at `path` (relative to the hub
-/// raw base, e.g. `agents/<id>.md`).
+/// `{ id, type, name, description, upstream, content_sha, source, license,
+///   tags[], manifest? }`. `type` is `"agent" | "skill" | "workflow"`;
+/// `upstream` is the raw-fetchable URL of the body
+/// (`raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` for an external
+/// source, or the hub's own raw tree for first-party content). `content_sha`
+/// is the sha256 of that body. A multi-file skill additionally carries a
+/// `manifest` of every file (relpath + sha, incl. `SKILL.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HubPlugin {
     /// Globally-unique plugin id (the install key, and default install stem).
@@ -112,23 +131,28 @@ pub struct HubPlugin {
     /// One-line description (for the catalog browse view).
     #[serde(default)]
     pub description: String,
-    /// Repo-relative path of the plugin body (`agents/<id>.md`).
-    pub path: String,
-    /// sha256 hex of the body at `path`. The installer verifies the fetched
-    /// body against this before writing (integrity / anti-tamper).
-    pub content_sha: String,
-    /// Provenance: where ccteam-hub sourced this plugin (free-form).
-    #[serde(default)]
-    pub source: String,
-    /// Upstream repo / URL the plugin was curated from (free-form).
+    /// Raw-fetchable URL of the body @sha (the install fetch target). For a
+    /// multi-file skill this points at `SKILL.md`; the other files are derived
+    /// from its dir + each `manifest` `relpath`.
     #[serde(default)]
     pub upstream: String,
+    /// sha256 hex of the body at `upstream`. The installer verifies the
+    /// fetched body against this before writing (integrity / anti-tamper).
+    pub content_sha: String,
+    /// Provenance: which source ccteam-hub tracked this plugin from
+    /// (`"ccteam"` first-party, `"agency-agents"`, …).
+    #[serde(default)]
+    pub source: String,
     /// SPDX-ish license string (free-form).
     #[serde(default)]
     pub license: String,
     /// Browse / filter tags.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Multi-file skill manifest (every file incl. `SKILL.md`). Absent for a
+    /// single-file agent / SKILL.md-only skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Vec<ManifestEntry>>,
 }
 
 /// Outcome of a successful [`install_plugin`].
@@ -190,6 +214,18 @@ pub enum HubError {
         /// The HTTP status code.
         status: u16,
         /// The URL that was fetched.
+        url: String,
+    },
+    /// The fetch URL's host is not a registered source host (only github raw
+    /// and loopback are permitted). Refused before any network I/O — the
+    /// host-allowlist gate.
+    #[error("fetch for `{what}` refused: host `{host}` is not an allowed source host ({url})")]
+    HostNotAllowed {
+        /// What was being fetched.
+        what: String,
+        /// The disallowed host.
+        host: String,
+        /// The URL that was refused.
         url: String,
     },
     /// The fetched / cached index failed to parse as the expected schema.
@@ -265,9 +301,45 @@ fn url_is_loopback(url: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Hosts ccteam will fetch plugin/index content from — the curation gate. A
+/// body is only pulled from a registered source's host (today every source,
+/// incl. the hub's own first-party tree, is github raw) at an immutable
+/// pinned-sha path. Loopback is additionally allowed for the in-process test
+/// hub. A future GitLab / self-hosted source extends this list.
+const ALLOWED_FETCH_HOSTS: &[&str] = &["raw.githubusercontent.com"];
+
+/// True when `url`'s host is on the fetch allowlist (or loopback, for tests).
+fn host_is_allowed(url: &str) -> bool {
+    if url_is_loopback(url) {
+        return true;
+    }
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .map(|host| {
+            ALLOWED_FETCH_HOSTS
+                .iter()
+                .any(|h| host.eq_ignore_ascii_case(h))
+        })
+        .unwrap_or(false)
+}
+
 /// GET `url` with the hardened client and return the body bytes, enforcing
 /// the status / size guards. `what` labels the fetch for error messages.
 async fn fetch_bytes(client: &reqwest::Client, url: &str, what: &str) -> Result<Vec<u8>, HubError> {
+    // Host-allowlist gate (PRD §四): refuse any host that isn't a registered
+    // source host before a single byte leaves the process.
+    if !host_is_allowed(url) {
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        return Err(HubError::HostNotAllowed {
+            what: what.to_string(),
+            host,
+            url: url.to_string(),
+        });
+    }
     let mut resp = client
         .get(url)
         .send()
@@ -385,83 +457,135 @@ fn write_cache_atomic(cache_path: &Path, bytes: &[u8]) -> Result<(), HubError> {
     Ok(())
 }
 
-/// Fetch a plugin body from `{base}/{plugin.path}` with the hardened client,
-/// then **verify `sha256(body) == plugin.content_sha`** before returning it.
-/// A mismatch is [`HubError::ShaMismatch`] (the integrity gate). The body must
-/// also be non-empty UTF-8 within the size cap.
-pub async fn fetch_plugin_body(base: &str, plugin: &HubPlugin) -> Result<String, HubError> {
-    let url = ccteam_core::catalog_raw_url(base, &plugin.path);
-    let client = hardened_client(&plugin.id, &url)?;
-    let buf = fetch_bytes(&client, &url, &plugin.id).await?;
-
-    // Integrity check is over the raw bytes (sha256 of the file content).
+/// Fetch the bytes at `url` with the hardened client, **verify
+/// `sha256 == expected_sha`** (the integrity gate), and return the body as
+/// non-empty UTF-8. `what` labels the fetch (plugin id or a manifest relpath)
+/// for error messages. Shared by [`fetch_plugin_body`] and the multi-file
+/// manifest install so every fetched byte passes the same host-allowlist +
+/// size + sha + UTF-8 gauntlet.
+async fn fetch_text_verified(
+    url: &str,
+    expected_sha: &str,
+    what: &str,
+) -> Result<String, HubError> {
+    let client = hardened_client(what, url)?;
+    let buf = fetch_bytes(&client, url, what).await?;
     let actual = sha256_hex(&buf);
-    if !sha_eq(&actual, &plugin.content_sha) {
+    if !sha_eq(&actual, expected_sha) {
         return Err(HubError::ShaMismatch {
-            id: plugin.id.clone(),
-            expected: plugin.content_sha.clone(),
+            id: what.to_string(),
+            expected: expected_sha.to_string(),
             actual,
         });
     }
-
-    // A plugin body must be valid UTF-8 (Claude-native markdown).
-    let body = String::from_utf8(buf).map_err(|_| {
-        HubError::Write(format!("fetched plugin `{}` is not valid UTF-8", plugin.id))
-    })?;
+    let body = String::from_utf8(buf)
+        .map_err(|_| HubError::Write(format!("fetched `{what}` is not valid UTF-8")))?;
     if body.trim().is_empty() {
-        return Err(HubError::EmptyBody(plugin.id.clone()));
+        return Err(HubError::EmptyBody(what.to_string()));
     }
     Ok(body)
 }
 
+/// The directory portion of an `upstream` URL (everything before the last
+/// `/`). A multi-file skill's per-file URLs are `dir + "/" + relpath`.
+fn upstream_dir(upstream: &str) -> Result<&str, HubError> {
+    upstream
+        .rfind('/')
+        .map(|i| &upstream[..i])
+        .ok_or_else(|| HubError::Write(format!("malformed upstream URL: {upstream}")))
+}
+
+/// Fetch a plugin's body from its `upstream` URL and **verify
+/// `sha256(body) == plugin.content_sha`** before returning it (the integrity
+/// gate). The body must be non-empty UTF-8 within the size cap, fetched from
+/// an allowlisted host. For a multi-file skill this returns the `SKILL.md`
+/// body; the sibling files are fetched by [`install_plugin`] via the manifest.
+pub async fn fetch_plugin_body(plugin: &HubPlugin) -> Result<String, HubError> {
+    if plugin.upstream.trim().is_empty() {
+        return Err(HubError::Write(format!(
+            "plugin `{}` has no upstream URL to fetch",
+            plugin.id
+        )));
+    }
+    fetch_text_verified(&plugin.upstream, &plugin.content_sha, &plugin.id).await
+}
+
 /// Install a hub plugin's content into `project_dir`.
 ///
-/// 5-step:
-/// 1. derive + sanitize the install stem — `target_stem` override, else
-///    `plugin.id` — to `[a-z0-9_-]`,
-/// 2. refuse to clobber an existing file at the target unless `force`,
-/// 3. fetch the body + **verify its sha256** ([`fetch_plugin_body`]),
-/// 4. write by type: `"agent"` → [`ccteam_core::write_role`]
-///    (`.claude/agents/<stem>.md`); `"skill"` → [`ccteam_core::write_skill`]
-///    (`.claude/skills/<stem>/SKILL.md`); `"workflow"` →
-///    [`HubError::UnsupportedType`] (deferred); any other → `UnsupportedType`,
-/// 5. return the [`InstallResult`].
+/// - **agent / single-file skill**: derive + sanitize the install stem
+///   (`target_stem` override, else `plugin.id`); refuse to clobber an existing
+///   target unless `force`; fetch the body from `plugin.upstream` + verify its
+///   sha; write `.claude/agents/<stem>.md` (agent) or
+///   `.claude/skills/<stem>/SKILL.md` (skill).
+/// - **multi-file skill** (`manifest` present): the install target is the
+///   skill DIR (`.claude/skills/<stem>/`); refuse to clobber it unless `force`;
+///   fetch + verify EVERY manifest file (URL = the `upstream` dir + each
+///   `relpath`) BEFORE writing any — so a mid-list integrity failure leaves
+///   nothing partial — then write each under `.claude/skills/<stem>/<relpath>`.
+/// - **workflow / unknown type**: [`HubError::UnsupportedType`] (deferred).
 ///
-/// `base` is the hub raw-content base (the test seam). Note step 2's
-/// existence check is keyed on the **post-sanitize** stem + the resolved type
-/// path, so an agent and a skill with the same stem don't collide.
+/// `InstallResult.path` is the primary file (`SKILL.md` / the agent `.md`).
 pub async fn install_plugin(
     project_dir: &Path,
     plugin: &HubPlugin,
     target_stem: Option<&str>,
     force: bool,
-    base: &str,
 ) -> Result<InstallResult, HubError> {
-    // 1. Derive + sanitize the install stem (filename normalization only — the
-    //    body is Claude-native and written verbatim).
     let raw_stem = target_stem.unwrap_or(&plugin.id);
     let stem = ccteam_core::sanitize_role_stem(raw_stem)
         .map_err(|e| HubError::BadStem(format!("{e:#}")))?;
 
-    // Resolve the target path by type up front so the clobber check and the
-    // write agree, and an unsupported type fails before any network I/O.
+    // Multi-file skill (manifest present): a directory install.
+    if let Some(manifest) = plugin.manifest.as_ref().filter(|m| !m.is_empty()) {
+        if plugin.type_ != "skill" {
+            // A manifest only makes sense for a skill directory.
+            return Err(HubError::UnsupportedType(plugin.type_.clone()));
+        }
+        let skill_dir = ccteam_core::skill_dir_path(project_dir, &stem);
+        let exists = skill_dir.exists();
+        if exists && !force {
+            return Err(HubError::Exists(stem));
+        }
+        let base_url = upstream_dir(&plugin.upstream)?;
+        // Pass 1: fetch + verify EVERY file (no writes → atomic on failure).
+        let mut files: Vec<(String, String)> = Vec::with_capacity(manifest.len());
+        for entry in manifest {
+            let url = format!("{base_url}/{}", entry.relpath);
+            let body = fetch_text_verified(&url, &entry.content_sha, &entry.relpath).await?;
+            files.push((entry.relpath.clone(), body));
+        }
+        // Pass 2: write each under .claude/skills/<stem>/<relpath>.
+        let mut primary: Option<PathBuf> = None;
+        for (relpath, body) in &files {
+            let written = ccteam_core::write_skill_file(project_dir, &stem, relpath, body)
+                .map_err(|e| HubError::Write(format!("{e:#}")))?;
+            if relpath == "SKILL.md" {
+                primary = Some(written);
+            }
+        }
+        let path = primary.unwrap_or_else(|| ccteam_core::skill_md_path(project_dir, &stem));
+        return Ok(InstallResult {
+            id: plugin.id.clone(),
+            type_: plugin.type_.clone(),
+            path,
+            overwrote: exists,
+        });
+    }
+
+    // Single-file agent / SKILL.md-only skill. Resolve the target path by type
+    // up front so the clobber check and the write agree, and an unsupported
+    // type fails before any network I/O.
     let dest = match plugin.type_.as_str() {
         "agent" => ccteam_core::agent_md_path(project_dir, &stem),
         "skill" => ccteam_core::skill_md_path(project_dir, &stem),
         "workflow" => return Err(HubError::UnsupportedType(plugin.type_.clone())),
         other => return Err(HubError::UnsupportedType(other.to_string())),
     };
-
-    // 2. Refuse to clobber unless forced.
     let exists = dest.exists();
     if exists && !force {
         return Err(HubError::Exists(stem));
     }
-
-    // 3. Fetch + verify the body (sha256 gate inside).
-    let body = fetch_plugin_body(base, plugin).await?;
-
-    // 4. Write verbatim by type.
+    let body = fetch_plugin_body(plugin).await?;
     let path = match plugin.type_.as_str() {
         "agent" => ccteam_core::write_role(project_dir, &stem, &body),
         "skill" => ccteam_core::write_skill(project_dir, &stem, &body),
@@ -479,13 +603,15 @@ pub async fn install_plugin(
 }
 
 /// Compute the on-the-fly installed status of `plugin` in `project_dir` — no
-/// sidecar file. Reads the bytes at the plugin's **default** target path
-/// (keyed on `plugin.id`, the same stem `install_plugin` uses when no override
-/// is given) and compares their sha256 to `plugin.content_sha`:
+/// sidecar file. Keyed on `plugin.id` (the no-override install stem):
 ///
 /// - target absent → [`InstalledStatus::NotInstalled`],
 /// - present + sha matches → [`InstalledStatus::Installed`],
 /// - present + sha differs → [`InstalledStatus::UpdateAvailable`].
+///
+/// For a **multi-file skill** (`manifest` present) the comparison is over the
+/// whole dir: every manifest file present + sha-matching → `Installed`; none
+/// present → `NotInstalled`; any file missing or stale → `UpdateAvailable`.
 ///
 /// An unreadable file (race / permissions) or an unsupported / unsanitizable
 /// type is treated as `NotInstalled` (best-effort decoration of the catalog;
@@ -495,6 +621,30 @@ pub fn installed_status(project_dir: &Path, plugin: &HubPlugin) -> InstalledStat
     let Ok(stem) = ccteam_core::sanitize_role_stem(&plugin.id) else {
         return InstalledStatus::NotInstalled;
     };
+
+    // Multi-file skill: compare every manifest file under the skill dir.
+    if let Some(manifest) = plugin.manifest.as_ref().filter(|m| !m.is_empty()) {
+        let dir = ccteam_core::skill_dir_path(project_dir, &stem);
+        let mut present = 0usize;
+        let mut matched = 0usize;
+        for entry in manifest {
+            if let Ok(bytes) = std::fs::read(dir.join(&entry.relpath)) {
+                present += 1;
+                if sha_eq(&sha256_hex(&bytes), &entry.content_sha) {
+                    matched += 1;
+                }
+            }
+        }
+        return if present == 0 {
+            InstalledStatus::NotInstalled
+        } else if matched == manifest.len() {
+            InstalledStatus::Installed
+        } else {
+            InstalledStatus::UpdateAvailable
+        };
+    }
+
+    // Single-file agent / SKILL.md-only skill.
     let path = match plugin.type_.as_str() {
         "agent" => ccteam_core::agent_md_path(project_dir, &stem),
         "skill" => ccteam_core::skill_md_path(project_dir, &stem),
@@ -572,12 +722,12 @@ mod tests {
                 type_: "agent".into(),
                 name: "Foo".into(),
                 description: String::new(),
-                path: "agents/foo.md".into(),
+                upstream: String::new(),
                 content_sha: "0".into(),
                 source: String::new(),
-                upstream: String::new(),
                 license: String::new(),
                 tags: vec![],
+                manifest: None,
             }],
         };
         assert!(idx.find("foo").is_some());
@@ -592,12 +742,12 @@ mod tests {
                 type_: "skill".into(),
                 name: id.into(),
                 description: String::new(),
-                path: format!("skills/{id}.md"),
+                upstream: format!("https://raw.githubusercontent.com/x/y/sha/skills/{id}.md"),
                 content_sha: "0".into(),
                 source: source.into(),
-                upstream: String::new(),
                 license: String::new(),
                 tags: vec![],
+                manifest: None,
             }
         }
         let mut idx = HubIndex {
