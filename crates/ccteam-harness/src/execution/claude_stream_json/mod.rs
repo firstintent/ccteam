@@ -431,18 +431,28 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(n, "claude-stream-json: events subscriber lagged");
                         }
-                        Err(broadcast::error::RecvError::Closed) => return,
+                        // The transport was dropped — emit the in-flight signal.
+                        Err(broadcast::error::RecvError::Closed) => {
+                            if let Some(ev) = translator.on_close() {
+                                let _ = tx.send(ev).await;
+                            }
+                            return;
+                        }
                     },
                     // The broadcast sender lives on the transport, so a dead
                     // child never yields `Closed` here — the explicit close
                     // signal does. Drain any buffered messages first (so a
-                    // final answer emitted just before EOF isn't lost), then
-                    // end the stream.
+                    // final answer emitted just before EOF isn't lost), then —
+                    // if a turn was still in flight — emit the honest
+                    // in-flight-loss signal before ending the stream (E3).
                     _ = transport.wait_closed() => {
                         while let Ok(out) = sub.try_recv() {
                             if forward(&mut translator, &tx, out).await.is_err() {
                                 return;
                             }
+                        }
+                        if let Some(ev) = translator.on_close() {
+                            let _ = tx.send(ev).await;
                         }
                         return;
                     }

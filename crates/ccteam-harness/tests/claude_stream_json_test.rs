@@ -47,6 +47,10 @@ log = os.environ.get("FAKE_SJ_ARGV_LOG")
 if log:
     with open(log, "w") as f:
         f.write(mode + " " + sid + "\n")
+# Resume-failure fault: die immediately when spawned with --resume (before
+# init), so start_thread's resume attempt fails and falls back to fresh.
+if mode == "resume" and os.environ.get("FAKE_SJ_DIE_ON_RESUME") == "1":
+    sys.exit(1)
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
 cmds = os.environ.get("FAKE_SJ_INIT_COMMANDS", "compact,context,clear").split(",")
@@ -66,6 +70,19 @@ while True:
     if not line.strip():
         continue
     n += 1
+    if os.environ.get("FAKE_SJ_DIE_MID_TURN") == "1":
+        # Emit an assistant block (turn now in flight) then die WITHOUT a
+        # result — the in-flight-loss fault.
+        emit({"type":"assistant","session_id":sid,
+              "message":{"role":"assistant","content":[{"type":"text","text":"thinking..."}]}})
+        sys.exit(0)
+    if os.environ.get("FAKE_SJ_ERROR_RESULT") == "1":
+        # claude API failure proxy ("断网"): an error-subtype result.
+        emit({"type":"assistant","session_id":sid,
+              "message":{"role":"assistant","content":[{"type":"text","text":"trying"}]}})
+        emit({"type":"result","subtype":"error_during_execution","is_error":True,
+              "session_id":sid})
+        continue
     if ask_tool:
         rid = "req-%d" % n
         emit({"type":"control_request","request_id":rid,
@@ -467,4 +484,208 @@ async fn hitl_allow_lets_tool_run() {
 
     std::env::remove_var("FAKE_SJ_ASK_TOOL");
     adapter.close_thread(&handle).await.unwrap();
+}
+
+// ── Wave 4 (E3): fault × channel matrix ─────────────────────────────────
+//
+// Axis-parameterized fault fixture (PRD §七 ③). The matrix is
+// {channel} × {fault}; a future host axis (×{local, satellite, k8s}) is an
+// added parameter, not a rewrite. The `terminal` (tmux) channel's faults
+// are covered by the `claude_tui` soak tests; this fixture exercises the
+// NEW `stream-json` channel. Invariants: outbound no-loss-no-dup (exactly
+// one answer per turn), failures carry a human signal, in-flight loss is
+// never silent, resume continues the session.
+
+#[derive(Clone, Copy, Debug)]
+enum Channel {
+    StreamJson,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    IdleClose,
+    ChildDeathMidTurn,
+    ErrorResult,
+    DaemonRestartResume,
+}
+
+/// Drain to a terminal event: (answer_count, last_answer, completed, failure).
+async fn collect_outcome(
+    adapter: &ClaudeStreamJsonAdapter,
+    handle: &ccteam_harness::ThreadHandle,
+) -> (usize, Option<String>, bool, Option<String>) {
+    let mut stream = adapter.events(handle);
+    let (mut answers, mut last, mut completed, mut failure) = (0usize, None, false, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        match ev {
+            ThreadEvent::ItemCompleted { item } => {
+                if let ThreadItemDetails::AgentMessage(t) = item.details {
+                    answers += 1;
+                    last = Some(t);
+                }
+            }
+            ThreadEvent::TurnCompleted { .. } => {
+                completed = true;
+                break;
+            }
+            ThreadEvent::TurnFailed { err, .. } => {
+                failure = Some(err.message);
+                break;
+            }
+            _ => {}
+        }
+    }
+    (answers, last, completed, failure)
+}
+
+async fn run_fault_case(tmp: &Path, channel: Channel, fault: Fault) {
+    let Channel::StreamJson = channel;
+    let adapter = ClaudeStreamJsonAdapter::new();
+    match fault {
+        Fault::IdleClose => {
+            let h = adapter
+                .start_thread(
+                    &AgentSpecBrief { role: "a".into() },
+                    &ctx(tmp, "demo", "s1"),
+                )
+                .await
+                .expect("start");
+            let sh = h.clone();
+            let submit = adapter.submit_turn(&h, TurnInput::UserText("hi".into()));
+            let (answers, last, completed, failure) =
+                tokio::join!(collect_outcome(&adapter, &sh), submit).0;
+            assert_eq!(answers, 1, "exactly one answer per turn (no-dup)");
+            assert_eq!(last.as_deref(), Some("ok"));
+            assert!(completed && failure.is_none());
+            adapter.close_thread(&h).await.unwrap();
+            let (_, _, _, post) = collect_outcome(&adapter, &h).await;
+            assert!(post.is_none(), "idle close must NOT signal a failure");
+        }
+        Fault::ChildDeathMidTurn => {
+            std::env::set_var("FAKE_SJ_DIE_MID_TURN", "1");
+            let h = adapter
+                .start_thread(
+                    &AgentSpecBrief { role: "a".into() },
+                    &ctx(tmp, "demo", "s1"),
+                )
+                .await
+                .expect("start");
+            let sh = h.clone();
+            let submit = adapter.submit_turn(&h, TurnInput::UserText("go".into()));
+            let (_, _, completed, failure) = tokio::join!(collect_outcome(&adapter, &sh), submit).0;
+            std::env::remove_var("FAKE_SJ_DIE_MID_TURN");
+            assert!(!completed, "in-flight death must not complete the turn");
+            let msg = failure.expect("in-flight loss MUST emit a human signal");
+            assert!(msg.contains("stream-json"), "human signal: {msg}");
+            adapter.close_thread(&h).await.unwrap();
+        }
+        Fault::ErrorResult => {
+            std::env::set_var("FAKE_SJ_ERROR_RESULT", "1");
+            let h = adapter
+                .start_thread(
+                    &AgentSpecBrief { role: "a".into() },
+                    &ctx(tmp, "demo", "s1"),
+                )
+                .await
+                .expect("start");
+            let sh = h.clone();
+            let submit = adapter.submit_turn(&h, TurnInput::UserText("go".into()));
+            let (_, _, _, failure) = tokio::join!(collect_outcome(&adapter, &sh), submit).0;
+            std::env::remove_var("FAKE_SJ_ERROR_RESULT");
+            let msg = failure.expect("an error result MUST surface a failure signal");
+            assert!(msg.contains("error_during_execution"), "error kind: {msg}");
+            adapter.close_thread(&h).await.unwrap();
+        }
+        Fault::DaemonRestartResume => {
+            let h1 = adapter
+                .start_thread(
+                    &AgentSpecBrief { role: "a".into() },
+                    &ctx(tmp, "demo", "s1"),
+                )
+                .await
+                .expect("start");
+            adapter.close_thread(&h1).await.unwrap();
+            // A FRESH adapter = the restarted daemon (empty live map). The
+            // transcript exists → start_thread re-spawns via --resume.
+            let uuid = deterministic_session_uuid("demo", "s1");
+            let dir = anthropic_project_dir(tmp).expect("anthropic dir");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+            let restarted = ClaudeStreamJsonAdapter::new();
+            let h2 = restarted
+                .start_thread(
+                    &AgentSpecBrief { role: "a".into() },
+                    &ctx(tmp, "demo", "s1"),
+                )
+                .await
+                .expect("restart");
+            assert_eq!(argv_mode(tmp), format!("resume {uuid}"), "must --resume");
+            let sh = h2.clone();
+            let submit = restarted.submit_turn(&h2, TurnInput::UserText("again".into()));
+            let (answers, last, completed, _) =
+                tokio::join!(collect_outcome(&restarted, &sh), submit).0;
+            assert_eq!(answers, 1, "resumed session answers exactly once");
+            assert_eq!(last.as_deref(), Some("ok"));
+            assert!(completed);
+            restarted.close_thread(&h2).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn fault_matrix_stream_json() {
+    for fault in [
+        Fault::IdleClose,
+        Fault::ChildDeathMidTurn,
+        Fault::ErrorResult,
+        Fault::DaemonRestartResume,
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup(tmp.path());
+        run_fault_case(tmp.path(), Channel::StreamJson, fault).await;
+    }
+}
+
+/// E3 — the resume→fresh fallback emits a `chat_session_reset` event
+/// carrying the sid + a reason (the honest "context was lost" signal),
+/// never silently. We force the resume spawn to die (FAKE_SJ_DIE_ON_RESUME)
+/// so start_thread falls back to a fresh `--session-id` spawn + the reset.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn resume_failure_emits_reset_event_with_sid_and_reason() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    // Pre-create the transcript so start_thread chooses --resume first.
+    let uuid = deterministic_session_uuid("demo", "s1");
+    let dir = anthropic_project_dir(tmp.path()).expect("anthropic dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+    // Resume spawn dies; fresh spawn lives.
+    std::env::set_var("FAKE_SJ_DIE_ON_RESUME", "1");
+    std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "1200");
+
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief { role: "a".into() },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread should fall back to fresh after resume death");
+    // The fresh fallback ran (the recorded mode is session-id, not resume).
+    assert_eq!(argv_mode(tmp.path()), format!("session-id {uuid}"));
+
+    // The reset event landed in the progress jsonl with sid + reason.
+    let progress = tmp.path().join(".ccteam/progress/demo.jsonl");
+    let body = std::fs::read_to_string(&progress).unwrap_or_default();
+    assert!(
+        body.contains("\"s1\"") && body.contains("resume_failed_fallback_to_fresh"),
+        "reset event must carry sid + reason; got: {body}"
+    );
+
+    std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
+    std::env::remove_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS");
+    adapter.close_thread(&h).await.unwrap();
 }

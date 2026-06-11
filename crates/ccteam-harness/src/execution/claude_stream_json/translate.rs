@@ -82,6 +82,30 @@ impl StreamTranslator {
         )
     }
 
+    /// Called when the transport closes (child death / EOF). If a turn was
+    /// in flight (started but no `result` arrived), synthesize a
+    /// [`ThreadEvent::TurnFailed`] so the in-flight loss surfaces as a
+    /// **human signal** (the pump forwards `err.message` to IM) instead of
+    /// silence — the honest cost of the stream-json channel (PRD E3:
+    /// stream-json doesn't survive a process interrupt; recovery is only to
+    /// `--resume` granularity). Returns `None` when no turn was active (a
+    /// clean idle close), so a graceful stop emits no spurious failure.
+    pub fn on_close(&mut self) -> Option<ThreadEvent> {
+        self.acc_text.clear();
+        self.active_turn
+            .take()
+            .map(|turn_id| ThreadEvent::TurnFailed {
+                turn_id,
+                err: ThreadErrorEvent {
+                    kind: "stream_closed_in_flight".to_string(),
+                    message: "stream-json 会话在回合进行中断开,这一回合丢失了 \
+                          (stream-json 通道不扛进程中断,只恢复到 --resume 粒度)。\
+                          再发一条消息会自动 resume 续上下文。"
+                        .to_string(),
+                },
+            })
+    }
+
     fn on_assistant(&mut self, env: MessageEnvelope) -> Vec<ThreadEvent> {
         let mut out = Vec::new();
         self.ensure_turn_started(&mut out);
@@ -375,6 +399,32 @@ mod tests {
             session_id: "u-1".into(),
         }));
         assert_eq!(answer_text(&evs).as_deref(), Some("just a string"));
+    }
+
+    #[test]
+    fn on_close_with_in_flight_turn_emits_human_failure() {
+        let mut t = StreamTranslator::new();
+        // An assistant block starts the turn; no result arrives → in flight.
+        t.ingest(assistant(json!([{"type": "text", "text": "partial"}])));
+        match t.on_close() {
+            Some(ThreadEvent::TurnFailed { err, .. }) => {
+                assert!(err.message.contains("stream-json"));
+                assert_eq!(err.kind, "stream_closed_in_flight");
+            }
+            other => panic!("expected TurnFailed on in-flight close, got {other:?}"),
+        }
+        // Idempotent: no active turn left → silent.
+        assert!(t.on_close().is_none());
+    }
+
+    #[test]
+    fn on_close_after_completed_turn_is_silent() {
+        let mut t = StreamTranslator::new();
+        assert!(t.on_close().is_none(), "no turn yet → silent");
+        t.ingest(assistant(json!([{"type": "text", "text": "x"}])));
+        let _ = t.ingest(result_ok("x"));
+        // The turn completed (result arrived) → a clean idle close is silent.
+        assert!(t.on_close().is_none());
     }
 
     #[test]
