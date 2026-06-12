@@ -66,6 +66,17 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         "--replay-user-messages".into(),
         "--debug".into(),
         "--debug-to-stderr".into(),
+        // Do NOT inherit the user's ambient MCP servers. stream-json gates
+        // `system:init` on every MCP server connecting; the daemon's own
+        // `ccteam` MCP (`internal mcp-serve`) connects BACK to the daemon over
+        // `mcp.sock`, but the daemon is synchronously blocked in
+        // `wait_for_init` (holding the gateway lock the mcp.sock handler also
+        // needs) → that self-referential server can never initialize → init
+        // never arrives → timeout. The chat-only adapter reads stdout directly
+        // and needs no in-pane MCP, so strip them all (also drops unrelated
+        // ambient servers like a VS Code extension that would only add init
+        // latency). Per-session curated MCP is a future enhancement.
+        "--strict-mcp-config".into(),
     ];
 
     // Role persona — vendor-native self-read, never injected. Empty =
@@ -263,6 +274,9 @@ mod tests {
             "--output-format",
             // The headless trigger — its absence is the init-timeout bug.
             "--no-chrome",
+            // Don't inherit ambient MCP (the self-referential `ccteam` MCP
+            // deadlocks init — see build_argv).
+            "--strict-mcp-config",
             "--include-partial-messages",
             "--replay-user-messages",
         ] {
