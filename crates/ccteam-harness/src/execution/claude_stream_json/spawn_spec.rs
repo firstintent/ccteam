@@ -77,6 +77,19 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // ambient servers like a VS Code extension that would only add init
         // latency). Per-session curated MCP is a future enhancement.
         "--strict-mcp-config".into(),
+        // Same deadlock via the OTHER self-referential init dependency: the
+        // project's `settings.local.json` carries ccteam's chat-progress
+        // hooks (written for the tmux path), and claude BLOCKS `system:init`
+        // on `SessionStart` hook completion. That hook (`hook.sh`) HTTP-POSTs
+        // back to the daemon — which is wedged in `wait_for_init` — so it
+        // hangs → init never arrives → timeout. The stream-json adapter is
+        // hookless by design (the gateway event pump writes progress/turns
+        // from stdout, NOT hooks), so drop the LOCAL settings source where
+        // those hooks live. `user,project` keeps the user's global + the
+        // project's own settings; only ccteam's managed `settings.local.json`
+        // is excluded (its telegram-disable is already covered by
+        // `--strict-mcp-config`; permissions by the explicit flags below).
+        "--setting-sources=user,project".into(),
     ];
 
     // Role persona — vendor-native self-read, never injected. Empty =
@@ -274,9 +287,10 @@ mod tests {
             "--output-format",
             // The headless trigger — its absence is the init-timeout bug.
             "--no-chrome",
-            // Don't inherit ambient MCP (the self-referential `ccteam` MCP
-            // deadlocks init — see build_argv).
+            // Don't inherit ambient MCP / ccteam's local-settings hooks (both
+            // self-referential init deadlocks — see build_argv).
             "--strict-mcp-config",
+            "--setting-sources=user,project",
             "--include-partial-messages",
             "--replay-user-messages",
         ] {

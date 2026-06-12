@@ -215,8 +215,17 @@ impl ClaudeStreamJsonAdapter {
             .unwrap_or(false)
     }
 
-    /// Spawn the child + await `system:init`, shutting the transport down
-    /// on any failure so a dead child never lingers.
+    /// Spawn the child + perform the `initialize` handshake, shutting the
+    /// transport down on any failure so a dead child never lingers.
+    ///
+    /// claude (stream-json) does **not** emit a `system:init` line until the
+    /// first user turn, so waiting for `system:init` at spawn would hang
+    /// forever (the daemon waits for init while claude waits for input). The
+    /// capability handshake is the `initialize` control_request →
+    /// `control_response` (what the VS Code extension / SDK do); we parse the
+    /// slash-command table + model out of its response. `system:init` is still
+    /// captured opportunistically by the reader when it arrives with the first
+    /// turn (the bridge gate's command table is seeded from the handshake).
     async fn spawn_and_init(
         argv: &[String],
         env: &[(String, String)],
@@ -225,12 +234,25 @@ impl ClaudeStreamJsonAdapter {
         let transport = StreamJsonTransport::connect_stdio(argv, env, cwd)
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("stream-json connect: {e:#}")))?;
-        match transport.wait_for_init(init_timeout()).await {
-            Ok(init) => Ok((Arc::new(transport), init)),
+        match transport
+            .request_control("initialize", json!({}), init_timeout())
+            .await
+        {
+            Ok(body) if body.subtype == "success" => Ok((
+                Arc::new(transport),
+                protocol::SystemMsg::from_initialize(&body),
+            )),
+            Ok(body) => {
+                transport.shutdown().await;
+                Err(HarnessError::SpawnFailed(format!(
+                    "stream-json initialize rejected: {}",
+                    body.error.unwrap_or_else(|| body.subtype.clone())
+                )))
+            }
             Err(e) => {
                 transport.shutdown().await;
                 Err(HarnessError::SpawnFailed(format!(
-                    "stream-json init: {e:#}"
+                    "stream-json init handshake: {e:#}"
                 )))
             }
         }

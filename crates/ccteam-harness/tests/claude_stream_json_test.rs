@@ -61,8 +61,17 @@ if mode == "resume" and os.environ.get("FAKE_SJ_DIE_ON_RESUME") == "1":
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
 cmds = os.environ.get("FAKE_SJ_INIT_COMMANDS", "compact,context,clear").split(",")
-emit({"type":"system","subtype":"init","session_id":sid,"model":"fake-model",
-      "slash_commands":cmds,"tools":["Bash"]})
+# The adapter's spawn handshake sends an `initialize` control_request FIRST
+# (real claude does not emit system:init until the first user turn). Read it
+# and reply with a control_response carrying the slash-command table + model.
+init_line = sys.stdin.readline()
+init_rid = "init"
+try:
+    init_rid = json.loads(init_line).get("request_id", "init")
+except Exception:
+    pass
+emit({"type":"control_response","response":{"subtype":"success","request_id":init_rid,
+      "response":{"commands":[{"name":c} for c in cmds],"models":[{"model":"fake-model"}]}}})
 if os.environ.get("FAKE_SJ_DIE_AFTER_INIT") == "1":
     sys.exit(0)
 reply = os.environ.get("FAKE_SJ_REPLY", "ok")

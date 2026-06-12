@@ -66,6 +66,44 @@ impl SystemMsg {
     pub fn is_init(&self) -> bool {
         self.subtype == "init"
     }
+
+    /// Build the session's capability view from an `initialize`
+    /// `control_response` body. claude (stream-json) does NOT emit a
+    /// `system:init` line until the first user turn, so the spawn-time
+    /// handshake uses the `initialize` control_request and parses its
+    /// response here: `response.commands[].name` → the slash-command table,
+    /// `response.models[0]` → the model id. Missing fields degrade to empty
+    /// (the bridge gate then treats every slash as passthrough text).
+    pub fn from_initialize(body: &ControlResponseBody) -> Self {
+        let resp = body.response.as_ref();
+        let slash_commands = resp
+            .and_then(|v| v.get("commands"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.get("name").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let model = resp
+            .and_then(|v| v.get("models"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|m| {
+                m.get("model")
+                    .or_else(|| m.get("id"))
+                    .or_else(|| m.get("name"))
+            })
+            .and_then(Value::as_str)
+            .map(String::from);
+        SystemMsg {
+            subtype: "init".to_string(),
+            session_id: String::new(),
+            model,
+            slash_commands,
+            tools: Vec::new(),
+        }
+    }
 }
 
 /// `assistant` / `user` envelope. `message` is the raw Anthropic `Message`
