@@ -198,18 +198,29 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(r)) => {
-                        if let Some(usage) = &r.usage {
-                            let snapshot = if let Ok(mut s) = status.lock() {
+                        // Prefer claude's OWN context accounting
+                        // (`get_context_usage` → real totalTokens + maxTokens, no
+                        // hardcoded [1m]/200k window). Fall back to the
+                        // result.usage token-sum + model heuristic only if the
+                        // vendor build doesn't answer.
+                        let real = get_context_usage(&transport).await;
+                        let snapshot = if let Ok(mut s) = status.lock() {
+                            if let Some((used, window)) = real {
+                                s.context = Some(crate::ContextUsage {
+                                    used_tokens: used,
+                                    window_tokens: window,
+                                });
+                            } else if let Some(usage) = &r.usage {
                                 let model = s.model.clone();
                                 s.context =
                                     Some(context_usage_from_usage(usage, model.as_deref()));
-                                Some(s.clone())
-                            } else {
-                                None
-                            };
-                            if let Some(snap) = snapshot {
-                                write_status_file(&project_dir, &sid, &snap);
                             }
+                            Some(s.clone())
+                        } else {
+                            None
+                        };
+                        if let Some(snap) = snapshot {
+                            write_status_file(&project_dir, &sid, &snap);
                         }
                     }
                     Ok(_) => {}
@@ -219,6 +230,31 @@ fn spawn_status_tap(
             }
         }
     });
+}
+
+/// Query claude's REAL context accounting via the `get_context_usage`
+/// control_request → `(totalTokens, maxTokens)`. This is the vendor's actual
+/// window for the session (e.g. a default Opus 4.8 session reports
+/// `maxTokens: 200000` even though the model advertises a 1M capability), so
+/// it replaces the brittle `[1m]`-suffix → 1M/200k heuristic for the live
+/// context bar. `None` on timeout / error / an older CLI without the subtype
+/// (the caller then falls back to the usage-sum + heuristic). Short timeout —
+/// it must never stall the status tap.
+async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)> {
+    let body = transport
+        .request_control("get_context_usage", json!({}), Duration::from_secs(3))
+        .await
+        .ok()?;
+    if body.subtype != "success" {
+        return None;
+    }
+    let resp = body.response.as_ref()?;
+    let used = resp.get("totalTokens").and_then(|v| v.as_u64())?;
+    let window = resp
+        .get("maxTokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| resp.get("rawMaxTokens").and_then(|v| v.as_u64()))?;
+    Some((used, window))
 }
 
 /// Persisted per-session status snapshot path, next to the turns mirror:

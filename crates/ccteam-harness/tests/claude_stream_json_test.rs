@@ -93,7 +93,15 @@ while True:
         ctl = None
     if isinstance(ctl, dict) and ctl.get("type") == "control_request":
         rid = ctl.get("request_id", "ctl")
-        if os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
+        sub = (ctl.get("request") or {}).get("subtype", "")
+        if sub == "get_context_usage":
+            # Real claude returns the vendor's actual window here. maxTokens
+            # 500000 is neither the [1m]=1M nor the 200k baseline, so a test
+            # asserting it PROVES the bar uses get_context_usage, not the
+            # hardcoded heuristic.
+            emit({"type":"control_response","response":{"subtype":"success",
+                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":500000,"percentage":2}}})
+        elif os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
             emit({"type":"control_response","response":{"subtype":"error",
                   "request_id":rid,"error":"unsupported model"}})
         else:
@@ -478,8 +486,8 @@ async fn thread_status_reports_model_and_context_after_turn() {
     let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
     let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
 
-    // The status tap folds result.usage into the live status asynchronously
-    // (transport broadcast) — poll briefly until context lands.
+    // The status tap queries get_context_usage on each turn and folds it into
+    // the live status asynchronously (transport broadcast) — poll until it lands.
     let mut got = None;
     for _ in 0..40 {
         let st = adapter.thread_status(&handle).await.unwrap();
@@ -491,10 +499,13 @@ async fn thread_status_reports_model_and_context_after_turn() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let c = got.expect("context populated after a turn");
-    assert_eq!(c.used_tokens, 7, "input+cache from result.usage");
+    // Numbers come from the vendor's `get_context_usage` (totalTokens 12345,
+    // maxTokens 500000) — NOT the result.usage sum (7) nor the [1m]/200k
+    // heuristic. The 500k window can only come from get_context_usage.
+    assert_eq!(c.used_tokens, 12_345, "totalTokens from get_context_usage");
     assert_eq!(
-        c.window_tokens, 200_000,
-        "fake-model has no [1m] suffix → 200k baseline"
+        c.window_tokens, 500_000,
+        "maxTokens from get_context_usage (real window, not the heuristic)"
     );
 
     adapter.close_thread(&handle).await.unwrap();
@@ -545,8 +556,8 @@ async fn stream_json_status_survives_release_via_persisted_file() {
     let c = after
         .context
         .expect("persisted context survives session release");
-    assert_eq!(c.used_tokens, 7);
-    assert_eq!(c.window_tokens, 200_000);
+    assert_eq!(c.used_tokens, 12_345);
+    assert_eq!(c.window_tokens, 500_000);
 }
 
 /// Task 2 — `/model <id>` is driveable in stream-json: it issues a

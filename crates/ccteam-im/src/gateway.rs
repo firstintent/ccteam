@@ -2538,6 +2538,24 @@ impl Gateway {
     }
 
     fn render_projects(&self) -> String {
+        // Read the SAME source web / `ccteam status` use —
+        // `collect_projects` (config.yaml filtered to projects that have an
+        // on-disk `state.json`) — so IM `/projects` never diverges from the
+        // other surfaces: a half-registered project (in config, no state.json)
+        // shows in NEITHER, and a removed project disappears from BOTH at once.
+        // The gateway's in-memory `self.projects` is an additive ROUTING cache
+        // (it never prunes on a config change), so reading it here is exactly
+        // what let IM drift ahead of web. Fall back to it only when
+        // `project_paths` isn't wired (unit tests without `enable_project_creation`).
+        if let Some(paths) = &self.project_paths {
+            if let Ok(summaries) = ccteam_core::collect_projects(paths) {
+                return summaries
+                    .iter()
+                    .map(|s| s.state.slug.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+        }
         self.projects.keys().cloned().collect::<Vec<_>>().join("\n")
     }
 
