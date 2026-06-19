@@ -500,6 +500,55 @@ async fn thread_status_reports_model_and_context_after_turn() {
     adapter.close_thread(&handle).await.unwrap();
 }
 
+/// Task 1 (durability) — stream-json status is in-memory only, so without
+/// persistence it would vanish on idle-release / daemon restart (the TUI gets
+/// durability free from its on-disk transcript). The tap mirrors each turn's
+/// status to `<project>/.ccteam/chat/<sid>/status.json`; after the live session
+/// is released, `thread_status` falls back to that file — so the statusline
+/// survives, matching the rmux/terminal path.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn stream_json_status_survives_release_via_persisted_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // Drive a turn so the tap persists status to disk.
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+
+    // Poll the persisted file directly (the tap writes it just after folding
+    // the turn's usage) so the test never races the in-memory update.
+    let status_file = tmp.path().join(".ccteam/chat/s1/status.json");
+    for _ in 0..40 {
+        if status_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(status_file.exists(), "tap persisted status.json");
+
+    // Release the live session (idle-release / restart proxy) — in-memory
+    // status + tap are gone, but thread_status now reads the persisted file.
+    adapter.close_thread(&handle).await.unwrap();
+    let after = adapter.thread_status(&handle).await.unwrap();
+    let c = after
+        .context
+        .expect("persisted context survives session release");
+    assert_eq!(c.used_tokens, 7);
+    assert_eq!(c.window_tokens, 200_000);
+}
+
 /// Task 2 — `/model <id>` is driveable in stream-json: it issues a
 /// `set_model` control_request and, on success, completes (`Done`) + updates
 /// the live status model. A bare `/model` (no id) is a usage-hint `Rejected`

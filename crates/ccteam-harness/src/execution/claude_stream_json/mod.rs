@@ -166,7 +166,12 @@ fn spawn_hitl_dispatcher(
 /// compute point
 /// [`context_usage_from_usage`](crate::execution::transcript_tail::context_usage_from_usage)
 /// so the number matches the TUI transcript path byte-for-byte.
-fn spawn_status_tap(transport: Arc<StreamJsonTransport>, status: Arc<StdMutex<ThreadStatus>>) {
+fn spawn_status_tap(
+    transport: Arc<StreamJsonTransport>,
+    status: Arc<StdMutex<ThreadStatus>>,
+    project_dir: PathBuf,
+    sid: String,
+) {
     use crate::execution::transcript_tail::context_usage_from_usage;
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
@@ -178,20 +183,32 @@ fn spawn_status_tap(transport: Arc<StreamJsonTransport>, status: Arc<StdMutex<Th
                         if let Some(usage) = env.message.get("usage") {
                             let model = env.message.get("model").and_then(|v| v.as_str());
                             let ctx = context_usage_from_usage(usage, model);
-                            if let Ok(mut s) = status.lock() {
+                            let snapshot = if let Ok(mut s) = status.lock() {
                                 if let Some(m) = model.filter(|m| !m.is_empty()) {
                                     s.model = Some(m.to_string());
                                 }
                                 s.context = Some(ctx);
+                                Some(s.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(snap) = snapshot {
+                                write_status_file(&project_dir, &sid, &snap);
                             }
                         }
                     }
                     Ok(Outbound::TurnResult(r)) => {
                         if let Some(usage) = &r.usage {
-                            if let Ok(mut s) = status.lock() {
+                            let snapshot = if let Ok(mut s) = status.lock() {
                                 let model = s.model.clone();
                                 s.context =
                                     Some(context_usage_from_usage(usage, model.as_deref()));
+                                Some(s.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(snap) = snapshot {
+                                write_status_file(&project_dir, &sid, &snap);
                             }
                         }
                     }
@@ -202,6 +219,47 @@ fn spawn_status_tap(transport: Arc<StreamJsonTransport>, status: Arc<StdMutex<Th
             }
         }
     });
+}
+
+/// Persisted per-session status snapshot path, next to the turns mirror:
+/// `<project_dir>/.ccteam/chat/<sid>/status.json`. ccteam-owned (no
+/// Anthropic-internal dependency). Unlike the TUI adapter — which re-derives
+/// status from the on-disk transcript every call — a stream-json session's
+/// status lives only in the in-memory `LiveSession`, so it would vanish on
+/// idle-release / daemon restart (spawn-on-demand resume). Persisting it here
+/// lets [`HarnessAdapter::thread_status`] answer for a released/resumed
+/// session, giving the statusline the same durability the TUI gets for free.
+fn status_json_path(project_dir: &Path, sid: &str) -> PathBuf {
+    project_dir
+        .join(".ccteam")
+        .join("chat")
+        .join(sid)
+        .join("status.json")
+}
+
+/// Persist the latest status atomically (tmp + rename). Best-effort: a write
+/// failure only means a released session can't show its statusline until its
+/// next turn — never worth failing anything over.
+fn write_status_file(project_dir: &Path, sid: &str, status: &ThreadStatus) {
+    let path = status_json_path(project_dir, sid);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(body) = serde_json::to_string(status) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Read the persisted status snapshot, or `None` if absent / unreadable.
+fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
+    let body = std::fs::read_to_string(status_json_path(project_dir, sid)).ok()?;
+    serde_json::from_str(&body).ok()
 }
 
 /// Translate one outbound message and forward its events to the stream's
@@ -396,7 +454,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
         // show model + context% as the session burns context.
-        spawn_status_tap(Arc::clone(&transport), Arc::clone(&status));
+        spawn_status_tap(
+            Arc::clone(&transport),
+            Arc::clone(&status),
+            ctx.project_dir.clone(),
+            ctx.sid.clone(),
+        );
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
         // resolves each via the wired resolver (→ IM approve/deny) and
@@ -669,11 +732,35 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         // Live model + context-window usage, kept current by the per-session
-        // status tap ([`spawn_status_tap`]) folding each turn's `usage`.
-        // Default (statusless) is a valid answer for an unknown handle.
-        Ok(self
+        // status tap ([`spawn_status_tap`]) folding each turn's `usage`. A live
+        // session WITH context is authoritative; otherwise fall back to the
+        // persisted snapshot ([`status_json_path`]) so a released / resumed
+        // session (idle-release, daemon restart — spawn-on-demand) still shows
+        // its statusline, the same durability the TUI gets from the transcript.
+        let live = self
             .lookup(&h.identity)
-            .map(|live| live.status.lock().unwrap().clone())
-            .unwrap_or_default())
+            .map(|l| l.status.lock().unwrap().clone());
+        if let Some(s) = &live {
+            if s.context.is_some() {
+                return Ok(s.clone());
+            }
+        }
+        let persisted = h
+            .raw_extras
+            .get("project_dir")
+            .and_then(|v| v.as_str())
+            .zip(h.raw_extras.get("sid").and_then(|v| v.as_str()))
+            .and_then(|(pd, sid)| read_status_file(Path::new(pd), sid));
+        Ok(match (live, persisted) {
+            // Live (model from init, no turn yet) + persisted context → show
+            // the live model with the last-known context.
+            (Some(l), Some(p)) => ThreadStatus {
+                model: l.model.or(p.model),
+                context: p.context,
+            },
+            (Some(l), None) => l,
+            (None, Some(p)) => p,
+            (None, None) => ThreadStatus::default(),
+        })
     }
 }
