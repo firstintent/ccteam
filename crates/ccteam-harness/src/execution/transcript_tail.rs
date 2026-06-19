@@ -623,6 +623,7 @@ pub async fn read_status_tail(
 
     let mut model: Option<String> = None;
     let mut context: Option<crate::ContextUsage> = None;
+    let mut one_m: Option<bool> = None;
     for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -631,6 +632,14 @@ pub async fn read_status_tail(
         let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        // A `/model …[1m]` switch the user typed in the TUI is recorded as a
+        // `system`/`local_command` row. claude resolves the per-message
+        // `message.model` to the bare API id (no `[1m]`), so this command row
+        // is the ONLY transcript signal that the active window is 1M. Keep the
+        // LATEST switch.
+        if let Some(flag) = model_command_1m(&row) {
+            one_m = Some(flag);
+        }
         if let Some((m, ctx)) = parse_status_row(&row) {
             // Keep the LAST occurrence (most recent turn).
             if let Some(m) = m {
@@ -641,7 +650,56 @@ pub async fn read_status_tail(
             }
         }
     }
+    // An explicit `/model` switch wins over the message.model suffix heuristic:
+    // `[1m]` → 1M window + a `[1m]`-tagged model id (so it reads
+    // `claude-sonnet-4-6[1m]`, matching the selection); a plain switch → the
+    // baseline window.
+    match one_m {
+        Some(true) => {
+            if let Some(ctx) = context.as_mut() {
+                ctx.window_tokens = CLAUDE_CONTEXT_WINDOW_1M;
+            }
+            if let Some(m) = model.as_mut() {
+                if !m.to_ascii_lowercase().ends_with("[1m]") {
+                    m.push_str("[1m]");
+                }
+            }
+        }
+        Some(false) => {
+            if let Some(ctx) = context.as_mut() {
+                ctx.window_tokens = CLAUDE_CONTEXT_WINDOW_BASELINE;
+            }
+        }
+        None => {}
+    }
     Ok((model, context))
+}
+
+/// Detect a `/model …` slash entered in the TUI — recorded as a `system` /
+/// `local_command` transcript row like
+/// `{"type":"system","subtype":"local_command","content":"/model sonnet[1m]"}`.
+/// Returns `Some(true)` when the selected model carries the `[1m]` 1M-context
+/// suffix, `Some(false)` for a plain `/model` switch (back to baseline), and
+/// `None` for any other row (incl. a bare `/model` picker-open with no arg, and
+/// look-alikes like `/models`).
+fn model_command_1m(row: &Value) -> Option<bool> {
+    if row.get("type").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    if row.get("subtype").and_then(Value::as_str) != Some("local_command") {
+        return None;
+    }
+    let content = row.get("content").and_then(Value::as_str)?.trim();
+    // `/model` must be followed by whitespace (or end) — reject `/models` etc.
+    let rest = content.strip_prefix("/model")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let arg = rest.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    Some(arg.to_ascii_lowercase().contains("[1m]"))
 }
 
 /// Compute [`crate::ContextUsage`] from a Claude `usage` object + the
@@ -1114,6 +1172,67 @@ mod tests {
         assert_eq!(model.as_deref(), Some("claude-sonnet-4-5"));
         // 188k / 200k → 94%.
         assert_eq!(rendered.as_deref(), Some("188k / 200k (94%)"));
+    }
+
+    #[tokio::test]
+    async fn status_tail_detects_1m_from_model_command() {
+        // The user typed `/model sonnet[1m]` in the TUI: per-message
+        // `message.model` resolves to the bare `claude-sonnet-4-6` (no
+        // suffix), but the `/model …[1m]` local_command row signals 1M. The
+        // reader must reconstruct `claude-sonnet-4-6[1m]` + a 1M window —
+        // matching the user's native statusline, with no transcript scraping.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"system","subtype":"local_command","content":"/model sonnet[1m]"})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"assistant","uuid":"u1","message":{
+                "model":"claude-sonnet-4-6",
+                "content":[{"type":"text","text":"done"}],
+                "usage":{"input_tokens":100_000,"cache_creation_input_tokens":8_000,
+                         "cache_read_input_tokens":80_000}}})
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let (model, ctx) = read_status_tail(&path).await.unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-sonnet-4-6[1m]"),
+            "[1m] reconstructed from the /model command row"
+        );
+        assert_eq!(
+            ctx.unwrap().render(),
+            "188k / 1M (19%)",
+            "1M window from /model [1m], not the 200k message.model heuristic"
+        );
+    }
+
+    #[test]
+    fn model_command_1m_parses_only_real_model_switches() {
+        let cmd = |c: &str| {
+            model_command_1m(&json!({"type":"system","subtype":"local_command","content":c}))
+        };
+        assert_eq!(cmd("/model sonnet[1m]"), Some(true));
+        assert_eq!(cmd("/model opus[1m] "), Some(true));
+        assert_eq!(cmd("/model opus"), Some(false));
+        assert_eq!(cmd("/model"), None, "bare picker-open has no arg");
+        assert_eq!(cmd("/models foo"), None, "look-alike command");
+        // Non-local_command / non-system rows are ignored.
+        assert_eq!(
+            model_command_1m(&json!({"type":"assistant","message":{"model":"x[1m]"}})),
+            None
+        );
+        assert_eq!(
+            model_command_1m(&json!({"type":"system","subtype":"info","content":"/model x[1m]"})),
+            None
+        );
     }
 
     #[tokio::test]
