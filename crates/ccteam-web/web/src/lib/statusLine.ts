@@ -1,0 +1,51 @@
+// Per-session statusline formatter — a pure (dependency-free, node-testable)
+// helper that turns a `SessionStatus` into the single display string the
+// SessionView bar renders. No React / DOM here so it can be unit-tested
+// directly (mirrors `marketplaceFormat.ts`).
+//
+// The server already renders the line (`SessionStatus.status_line`, =
+// `ThreadStatus::status_suffix()` on the backend, e.g.
+// `"claude-opus-4-8[1m] · ctx 188k / 1M (19%)"`) — prefer it verbatim. The
+// structured `model` / `context` fields are a fallback when an older daemon
+// (or a partial payload) gives us numbers but no pre-rendered line.
+
+import type { SessionContext, SessionStatus } from "./sessionsApi";
+
+/** Humanize a token count the way the backend does: `1_000_000 → "1M"`,
+ *  `200_000 → "200k"`, `188_000 → "188k"`. Whole millions render as `<n>M`;
+ *  everything ≥1000 renders as `<n>k` (rounded to a whole k); below 1000 the
+ *  raw count. Negative / non-finite clamp to `"0"`. */
+export function humanizeTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000 && n % 1_000_000 === 0) return `${n / 1_000_000}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return `${Math.round(n)}`;
+}
+
+/** Build the `ctx <used> / <window> (<pct>%)` fragment from structured
+ *  context numbers, mirroring the backend's `status_suffix()` rendering. */
+export function formatContext(context: SessionContext): string {
+  const pct = Number.isFinite(context.pct) ? Math.round(context.pct) : 0;
+  return `ctx ${humanizeTokens(context.used_tokens)} / ${humanizeTokens(
+    context.window_tokens,
+  )} (${pct}%)`;
+}
+
+/** The display line for a session's statusline bar, or `null` to render
+ *  nothing. Prefers the server-rendered `status_line` verbatim when it is a
+ *  non-empty string; else falls back to `<model> · ctx …` built from the
+ *  structured `model` / `context` fields (joining with " · " only the parts we
+ *  have); else (a brand-new session: all null) returns `null`. */
+export function formatStatusLine(status: SessionStatus): string | null {
+  if (typeof status.status_line === "string" && status.status_line.trim()) {
+    return status.status_line;
+  }
+  const parts: string[] = [];
+  if (typeof status.model === "string" && status.model.trim()) {
+    parts.push(status.model);
+  }
+  if (status.context) {
+    parts.push(formatContext(status.context));
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}

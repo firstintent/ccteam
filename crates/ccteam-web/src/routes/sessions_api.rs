@@ -63,7 +63,7 @@ use axum::{
     Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
+use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol, ThreadStatus};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
@@ -367,6 +367,69 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
         "user": turn.user,
         "assistant": turn.assistant,
     })
+}
+
+/// `GET /api/v1/sessions/{sid}/status`
+///
+/// The session's live statusline — model + context-window usage — for the
+/// SPA's per-session top bar (the web peer of the IM `/sessions` model·ctx
+/// suffix). Resolves the sid → `(adapter, thread)` under the gateway lock
+/// (also the 404 gate), **drops the lock**, then awaits
+/// [`HarnessAdapter::thread_status`](ccteam_harness::HarnessAdapter::thread_status)
+/// — fs/transport I/O that must never run under the gateway mutex (same
+/// lock-drop discipline as the history endpoint). 200 `{sid, model, context,
+/// status_line}`; any field is `null` until there is something to report (a
+/// fresh session before its first turn). 404 unknown sid. 503 no gateway. A
+/// `thread_status` error degrades to the empty (all-null) status, never a 5xx.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}/status",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "Live statusline `{sid, model, context:{used_tokens, window_tokens, pct}, status_line}` (fields null until the first turn)", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_status(
+    State(app): State<AppState>,
+    Path(sid): Path<String>,
+) -> Response {
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    // Resolve (adapter, thread) under the lock, then DROP the guard before the
+    // async thread_status I/O.
+    let resolved = {
+        let guard = gw.lock().await;
+        guard.session_status_handle(&sid)
+    };
+    let Some((adapter, thread)) = resolved else {
+        return unknown_session(&sid);
+    };
+    let status = match adapter.thread_status(&thread).await {
+        Ok(s) => s,
+        Err(err) => {
+            // A statusless answer is valid — degrade to empty, never a 5xx.
+            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
+            ThreadStatus::default()
+        }
+    };
+    let context = status.context.map(|c| {
+        json!({
+            "used_tokens": c.used_tokens,
+            "window_tokens": c.window_tokens,
+            "pct": c.pct(),
+        })
+    });
+    Json(json!({
+        "sid": sid,
+        "model": status.model,
+        "context": context,
+        "status_line": status.status_suffix(),
+    }))
+    .into_response()
 }
 
 /// POST body for a turn submission — `text` (required). Form or JSON.

@@ -5,7 +5,7 @@
 
 ---
 
-## 〇、当前架构红线(v0.8.12)
+## 〇、当前架构红线(v0.8.13)
 
 本仓已落地 **「IM 通用模式 + session 独立一等实体 + 插件市场 + 协议轴」**(版本号 `0.8.11`;在 v0.8.10 上新增 **Claude 协议轴**:`ClaudeStreamJsonAdapter`(第二 spawn 路径,长驻子进程 + 双向 NDJSON,无 PTY/pane/hook 链)与既有 `ClaudeTuiAdapter`(tmux)并存,session 第三 facet `protocol`=`stream-json`(默认)| `terminal`;+ slash bridge / HITL / 创建面 protocol / 故障矩阵 / 活动态):架构 SoT 是 `docs/tech-design.md` 与本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议 → 代码位置」指针表)。**下文若仍见 v8.3 / orchestrator / 多模式(模式 1/2/3)/ flex / session=role / AGENTS.md-替代 / 27-tool 残留 / 内置 role catalog / agent-team init mode,以本节为准 —— 那些已退役:**
 
@@ -28,10 +28,10 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.8.12` |
-| 测试 baseline | `1999/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 279 pass;vitest 145 pass(SPA);Playwright 4 pass(SPA smoke)|
+| Workspace version | `0.8.13` |
+| 测试 baseline | `2004/0`(`cargo test --workspace --exclude ccteam-web`);`ccteam-web` = 279 pass;vitest 160 pass(SPA);Playwright 4 pass(SPA smoke)|
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.12 已落地(插件市场转 track-upstream)**:hub 从「vendor 拷贝每个文件」改成**跟踪 upstream 仓库** —— `index.json` 只存元数据 + `upstream`(raw URL @pinned-sha)、零 vendored body(`sync.py` 重写:整仓 @sha clone → glob → pointer 条目 + content_sha-from-upstream;skill id 从目录名取,修 `*/SKILL.md` stem='SKILL' dup 崩;**多文件 skill** 加 `manifest`;全局 id 去重)。引擎 `hub.rs`:`fetch_plugin_body`/`install_plugin` 去 `base` 改从 `upstream` 拉 + **host 白名单**(`HubError::HostNotAllowed`)+ **多文件 skill 装 `.claude/skills/<id>/<relpath>`**(整批 fetch+verify 再落盘)+ `installed_status` 按 manifest 比对;`ccteam_core` 加 `skill_dir_path`/`write_skill_file`(防穿越)。新源 `mattpocock/skills`(29 skill,9 多文件)登记。真机验证过(真引擎打线上 hub 装 `diagnose` 多文件 skill)。stream-json `--no-chrome` 热修(headless 触发器,非 `-p`)随本版上。PRD/dev-plan 见 `docs/versions/v0-8-12/`。**HITL 生产 resolver 接线 = follow-up**(默认 posture=skip)|
+| 当前在做 | **v0.8.13 已落地(statusline 复活 + stream-json `/model` 切换 + 跨前端 session 共享)**:① **statusline 数据源归一到 `thread_status`** —— stream-json adapter 新增 per-session **status tap**(`spawn_status_tap`,订阅 transport,从每个 `assistant`/`result` 的 `usage` 折算 model + context-window,seed 自 init model),`thread_status` 读它 → 修好 IM `/sessions` 在 stream-json(默认)下丢 ctx;TUI/stream-json 共用单一 compute 点 `transcript_tail::context_usage_from_usage`。web 侧新增 `GET /api/v1/sessions/{sid}/status`(gateway `session_status_handle` 锁内取 (adapter,thread)→ 锁外 await `thread_status`,同 history 端纪律)+ SPA `SessionView` 顶部 statusline 条(model · ctx)。② **`/model <id>`** 在 stream-json 里改成走 `set_model` control_request(`handle_directive` 在 bridge gate 前拦截;空参 = 用法提示,vendor 拒 = 诚实 Rejected;`DIALOG_COMMANDS` 不动,早拦优先)。③ **跨前端共享**:`chat_can_access`(own ∨ web operator ∨ 同 current project)放宽 `/use`/`/stop`/`/screen`/`/sessions` 四处 owner 过滤 —— IM 能看/用 web 建的同项目 session;**回复路由不变**(已有 `reply_to` 按本轮提交者重定向,web→web、tg→tg)。**real-vendor `set_model` smoke = follow-up**(协议建模 + fake 验过,未对真 claude)。无 release/tag。|
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准(v0.8.10 在 dev 上);历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 

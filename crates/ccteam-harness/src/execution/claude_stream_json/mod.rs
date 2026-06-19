@@ -81,7 +81,12 @@ struct LiveSession {
     cwd: PathBuf,
     /// Slash-command table from `system:init` (bridge gate, Wave 2).
     commands: Vec<String>,
-    model: Option<String>,
+    /// Live session status (model + context-window usage) for
+    /// [`HarnessAdapter::thread_status`] → IM `/sessions` + the web statusline
+    /// bar. Seeded with the `initialize` model; the per-session **status tap**
+    /// ([`spawn_status_tap`]) overwrites it from each `assistant`/`result`
+    /// message's `usage` as turns run (interior-mutable, shared with the tap).
+    status: Arc<StdMutex<ThreadStatus>>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -140,6 +145,54 @@ fn spawn_hitl_dispatcher(
                         );
                         if transport.send_line(line).await.is_err() {
                             return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the per-session status tap: fold each `assistant`/`result`
+/// message's token `usage` (and the assistant's live `message.model`) into
+/// the shared [`ThreadStatus`], so [`HarnessAdapter::thread_status`] reports
+/// the current model + context-window usage without parsing a transcript.
+/// Runs for the session's whole life (ends when the transport closes). An
+/// `assistant` message carries BOTH `model` and `usage`; the per-turn
+/// `result` updates context against the last-known model. Reuses the single
+/// compute point
+/// [`context_usage_from_usage`](crate::execution::transcript_tail::context_usage_from_usage)
+/// so the number matches the TUI transcript path byte-for-byte.
+fn spawn_status_tap(transport: Arc<StreamJsonTransport>, status: Arc<StdMutex<ThreadStatus>>) {
+    use crate::execution::transcript_tail::context_usage_from_usage;
+    let mut sub = transport.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = transport.wait_closed() => return,
+                msg = sub.recv() => match msg {
+                    Ok(Outbound::Assistant(env)) => {
+                        if let Some(usage) = env.message.get("usage") {
+                            let model = env.message.get("model").and_then(|v| v.as_str());
+                            let ctx = context_usage_from_usage(usage, model);
+                            if let Ok(mut s) = status.lock() {
+                                if let Some(m) = model.filter(|m| !m.is_empty()) {
+                                    s.model = Some(m.to_string());
+                                }
+                                s.context = Some(ctx);
+                            }
+                        }
+                    }
+                    Ok(Outbound::TurnResult(r)) => {
+                        if let Some(usage) = &r.usage {
+                            if let Ok(mut s) = status.lock() {
+                                let model = s.model.clone();
+                                s.context =
+                                    Some(context_usage_from_usage(usage, model.as_deref()));
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -332,7 +385,18 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             vendor_uuid: uuid.clone(),
             host: "local".to_string(),
         };
-        let model = init.model.clone();
+        // Seed the live status with the `initialize` model (context unknown
+        // until the first turn's `usage` lands). The status tap below keeps it
+        // current; thread_status reads it.
+        let status = Arc::new(StdMutex::new(ThreadStatus {
+            model: init.model.clone(),
+            context: None,
+        }));
+        // Status tap (every session, not just hitl): watch the transport for
+        // `assistant`/`result` messages and fold each one's `usage` (+ live
+        // `message.model`) into `status`, so /sessions + the web statusline
+        // show model + context% as the session burns context.
+        spawn_status_tap(Arc::clone(&transport), Arc::clone(&status));
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
         // resolves each via the wired resolver (→ IM approve/deny) and
@@ -353,7 +417,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             project_dir: ctx.project_dir.clone(),
             cwd: ctx.cwd.clone(),
             commands: init.slash_commands.clone(),
-            model,
+            status,
         };
         self.live
             .lock()
@@ -543,6 +607,48 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .map(|live| live.commands.clone())
             .unwrap_or_default();
         let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
+        // `/model <id>` IS driveable in stream-json — the TUI picker has no
+        // headless form, but the SDK control channel does (`set_model`). Handle
+        // it BEFORE the bridge gate so it never falls into a DIALOG reject or a
+        // verbatim passthrough. Empty arg → a usage hint (no pane to open a
+        // picker on). Real-vendor `set_model` support is confirmed at smoke; an
+        // unsupported build returns an error subtype → an honest refusal here.
+        if name == "model" {
+            let arg = d.args.trim();
+            let Some(live) = self.lookup(&h.identity) else {
+                return Err(HarnessError::SubmitFailed(
+                    "set_model: no live stream-json session for this handle".into(),
+                ));
+            };
+            if arg.is_empty() {
+                return Ok(DirectiveOutcome::Rejected {
+                    reason:
+                        "用法: /model <model-id>（stream-json 通道无交互选择器，直接给 model id）"
+                            .into(),
+                });
+            }
+            let body = live
+                .transport
+                .request_control("set_model", json!({ "model": arg }), init_timeout())
+                .await
+                .map_err(|e| HarnessError::SubmitFailed(format!("set_model 失败: {e}")))?;
+            if body.subtype != "success" {
+                let why = body
+                    .error
+                    .unwrap_or_else(|| "vendor rejected set_model".into());
+                return Ok(DirectiveOutcome::Rejected {
+                    reason: format!("/model 切换失败: {why}"),
+                });
+            }
+            // Reflect the switch in the live status immediately (model only;
+            // context refreshes on the next turn's usage).
+            if let Ok(mut s) = live.status.lock() {
+                s.model = Some(arg.to_string());
+            }
+            return Ok(DirectiveOutcome::Done {
+                receipt: format!("已切换 model → {arg}"),
+            });
+        }
         match bridge::classify_slash(&name, &commands) {
             SlashClass::Reject => Ok(DirectiveOutcome::Rejected {
                 reason: bridge::reject_reason(&name),
@@ -562,15 +668,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
     }
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        // Wave 1 — model from init; context-window accounting (from the
-        // `result.usage` stream) is a Wave 2 enhancement. Default
-        // (statusless) is a valid answer for an unknown handle.
+        // Live model + context-window usage, kept current by the per-session
+        // status tap ([`spawn_status_tap`]) folding each turn's `usage`.
+        // Default (statusless) is a valid answer for an unknown handle.
         Ok(self
             .lookup(&h.identity)
-            .map(|live| ThreadStatus {
-                model: live.model.clone(),
-                context: None,
-            })
+            .map(|live| live.status.lock().unwrap().clone())
             .unwrap_or_default())
     }
 }

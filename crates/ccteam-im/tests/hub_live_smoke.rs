@@ -47,7 +47,11 @@ async fn live_install_multi_file_skill() {
         let p = skill_dir.join(&entry.relpath);
         assert!(p.is_file(), "manifest file did not land: {}", p.display());
     }
-    println!("OK: {} files landed under {}", manifest.len(), skill_dir.display());
+    println!(
+        "OK: {} files landed under {}",
+        manifest.len(),
+        skill_dir.display()
+    );
 
     // installed_status must now read back as Installed.
     assert_eq!(

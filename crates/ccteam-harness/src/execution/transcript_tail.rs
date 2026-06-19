@@ -644,16 +644,16 @@ pub async fn read_status_tail(
     Ok((model, context))
 }
 
-/// Pull `(model, ContextUsage)` from one transcript row, if it carries a
-/// `message.usage`. Returns `None` for rows without usage (so the tail
-/// walker only updates on real usage lines). `model` inside the tuple may
-/// still be `None` if the row has usage but no `message.model`.
-fn parse_status_row(row: &Value) -> Option<(Option<String>, Option<crate::ContextUsage>)> {
-    let usage = row.pointer("/message/usage")?;
-    let model = row
-        .pointer("/message/model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+/// Compute [`crate::ContextUsage`] from a Claude `usage` object + the
+/// turn's model id. `used` = `input + cache_creation + cache_read` input
+/// tokens (the live context fed to the model that call); `window` = 1M iff
+/// `model` carries the `[1m]` suffix, else the 200k baseline. This is the
+/// **single compute point** shared by the TUI transcript-tail status reader
+/// ([`parse_status_row`]) and the stream-json status tap
+/// (`claude_stream_json`), so both surfaces agree byte-for-byte once fed
+/// through [`crate::ContextUsage::render`]. A `None` model degrades to the
+/// 200k baseline.
+pub fn context_usage_from_usage(usage: &Value, model: Option<&str>) -> crate::ContextUsage {
     let input = usage
         .get("input_tokens")
         .and_then(|v| v.as_u64())
@@ -668,16 +668,26 @@ fn parse_status_row(row: &Value) -> Option<(Option<String>, Option<crate::Contex
         .unwrap_or(0);
     let used = input + cache_create + cache_read;
     let window = model
-        .as_deref()
         .map(context_window_for_model)
         .unwrap_or(CLAUDE_CONTEXT_WINDOW_BASELINE);
-    Some((
-        model,
-        Some(crate::ContextUsage {
-            used_tokens: used,
-            window_tokens: window,
-        }),
-    ))
+    crate::ContextUsage {
+        used_tokens: used,
+        window_tokens: window,
+    }
+}
+
+/// Pull `(model, ContextUsage)` from one transcript row, if it carries a
+/// `message.usage`. Returns `None` for rows without usage (so the tail
+/// walker only updates on real usage lines). `model` inside the tuple may
+/// still be `None` if the row has usage but no `message.model`.
+fn parse_status_row(row: &Value) -> Option<(Option<String>, Option<crate::ContextUsage>)> {
+    let usage = row.pointer("/message/usage")?;
+    let model = row
+        .pointer("/message/model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let ctx = context_usage_from_usage(usage, model.as_deref());
+    Some((model, Some(ctx)))
 }
 
 /// Context window for a Claude model id: `1M` iff the id ends in the
@@ -1227,6 +1237,27 @@ mod tests {
             context_window_for_model("Some-Model[1M]"),
             CLAUDE_CONTEXT_WINDOW_1M
         );
+    }
+
+    #[test]
+    fn context_usage_from_usage_sums_input_and_cache_and_picks_window() {
+        // used = input + cache_creation + cache_read; window from the `[1m]`
+        // suffix. This is the single compute point shared by the TUI tail
+        // reader and the stream-json status tap.
+        let usage = serde_json::json!({
+            "input_tokens": 1000,
+            "cache_creation_input_tokens": 2000,
+            "cache_read_input_tokens": 185_000,
+            "output_tokens": 42,
+        });
+        let one_m = context_usage_from_usage(&usage, Some("claude-opus-4-8[1m]"));
+        assert_eq!(one_m.used_tokens, 188_000);
+        assert_eq!(one_m.window_tokens, CLAUDE_CONTEXT_WINDOW_1M);
+
+        // No model → 200k baseline; missing usage fields default to 0.
+        let baseline = context_usage_from_usage(&serde_json::json!({ "input_tokens": 50 }), None);
+        assert_eq!(baseline.used_tokens, 50);
+        assert_eq!(baseline.window_tokens, CLAUDE_CONTEXT_WINDOW_BASELINE);
     }
 
     #[tokio::test]

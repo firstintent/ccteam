@@ -9,6 +9,7 @@ import {
   createSession,
   getHistory,
   getRoleDetail,
+  getSessionStatus,
   listProjectRoles,
   listSessions,
   resolveApproval,
@@ -18,6 +19,7 @@ import {
   submitTurn,
   type RoleDetail,
   type RoleSummary,
+  type SessionStatus,
   type SessionView,
 } from "./sessionsApi";
 
@@ -102,6 +104,45 @@ describe("sessionsApi", () => {
       credentials: "same-origin",
     });
     expect(got.events[0].assistant).toBe("yo");
+  });
+
+  it("getSessionStatus GETs /sessions/{sid}/status and returns the payload", async () => {
+    const payload: SessionStatus = {
+      sid: "s8",
+      model: "claude-opus-4-8[1m]",
+      context: { used_tokens: 188000, window_tokens: 1000000, pct: 18.8 },
+      status_line: "claude-opus-4-8[1m] · ctx 188k / 1M (19%)",
+    };
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, payload));
+    const got = await getSessionStatus("s8");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions/s8/status", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual(payload);
+  });
+
+  it("getSessionStatus returns all-null for a brand-new session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(200, { sid: "s9", model: null, context: null, status_line: null }),
+    );
+    const got = await getSessionStatus("s9");
+    expect(got.model).toBeNull();
+    expect(got.context).toBeNull();
+    expect(got.status_line).toBeNull();
+  });
+
+  it("getSessionStatus surfaces 404 (unknown sid) and 503 (no live gateway)", async () => {
+    // The SessionView caller catches either and hides the bar.
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(404, { error: "unknown session: sZ" }),
+    );
+    await expect(getSessionStatus("sZ")).rejects.toThrow("NOT_FOUND");
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(503, { error: "no live gateway: standalone web" }),
+    );
+    await expect(getSessionStatus("s8")).rejects.toThrow("no live gateway");
   });
 
   it("submitTurn POSTs {text} to /sessions/{sid}/turn", async () => {

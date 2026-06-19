@@ -31,11 +31,13 @@ import { TerminalView } from "../components/TerminalView";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import {
   getHistory,
+  getSessionStatus,
   resolveApproval as apiResolveApproval,
   stopSession as apiStopSession,
   submitTurn,
   type SessionView as SessionSummary,
 } from "../lib/sessionsApi";
+import { formatStatusLine } from "../lib/statusLine";
 import {
   appendRow,
   eventToRow,
@@ -120,6 +122,32 @@ export default function SessionView({
   useEffect(() => {
     saveRows(sid, rows);
   }, [sid, rows]);
+
+  // ---- per-session statusline (model + context-window usage) -------------
+  // The display string for the top bar, or null to render NOTHING (a brand-
+  // new session that has not completed a turn reports all-null; a fetch error
+  // — e.g. 404 unknown sid, 503 no live gateway on standalone web — is caught
+  // and likewise hides the bar). Fetched on mount, then RE-FETCHED whenever a
+  // turn finishes (context% grows per turn). The turn-complete signal is the
+  // SSE `done` frame: the gateway flags the finalizing event with `done:true`,
+  // so the number of `done` events is a monotonic per-turn counter — we key a
+  // light effect on it (no timer/polling).
+  const [statusLine, setStatusLine] = useState<string | null>(null);
+  const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
+  useEffect(() => {
+    let cancelled = false;
+    getSessionStatus(sid)
+      .then((s) => {
+        if (!cancelled) setStatusLine(formatStatusLine(s));
+      })
+      .catch(() => {
+        // best-effort — no statusline yet (or no live gateway): hide the bar.
+        if (!cancelled) setStatusLine(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sid, doneCount]);
 
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
@@ -291,6 +319,16 @@ export default function SessionView({
           )}
         </div>
       </div>
+
+      {/* per-session statusline: model + context-window usage (Claude Code
+          statusline-style). Rendered only once there's something to show — a
+          brand-new session (or a fetch error / no gateway) yields null →
+          nothing renders (no empty bar). */}
+      {statusLine ? (
+        <div className="shrink-0 px-4 py-1 text-[11px] text-text-dim font-mono truncate border-b border-surface-700/30">
+          {statusLine}
+        </div>
+      ) : null}
 
       {showTerminal && session?.project ? (
         <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />

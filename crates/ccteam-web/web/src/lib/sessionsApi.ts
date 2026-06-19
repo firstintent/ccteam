@@ -53,6 +53,28 @@ export interface SessionHistory {
   events: SessionHistoryEvent[];
 }
 
+/** Context-window usage for a session (`SessionStatus.context`). `pct` is a
+ *  float 0–100. `null` on the parent when a brand-new session hasn't completed
+ *  a turn yet (no context numbers to report). */
+export interface SessionContext {
+  used_tokens: number;
+  window_tokens: number;
+  pct: number;
+}
+
+/** Per-session statusline payload from `GET /api/v1/sessions/{sid}/status`
+ *  (`crates/ccteam-im` `ThreadStatus` → `ThreadStatus::status_suffix()`).
+ *  `status_line` is the server-rendered, ready-to-display line (prefer it
+ *  verbatim when present); `model` / `context` are the structured fields for
+ *  styling / fallback. ALL three are `null` for a brand-new session that has
+ *  not completed a turn yet. */
+export interface SessionStatus {
+  sid: string;
+  model: string | null;
+  context: SessionContext | null;
+  status_line: string | null;
+}
+
 /** One role summary from `GET /api/v1/projects/{slug}/roles`
  *  (`crates/ccteam-core` `RoleSummary` → `crates/ccteam-web/src/routes/roles.rs`).
  *  `description`/`model` default to `""` server-side when absent. Drives the
@@ -150,6 +172,15 @@ export function listSessions(slug: string): Promise<SessionView[]> {
 /** `GET /api/v1/sessions/{sid}` — mirrored history to seed a reopened page. */
 export function getHistory(sid: string): Promise<SessionHistory> {
   return getJson<SessionHistory>(sessionUrl(sid));
+}
+
+/** `GET /api/v1/sessions/{sid}/status` — the per-session statusline (model +
+ *  context-window usage). A brand-new session reports `model`/`context`/
+ *  `status_line` all `null`. 404 (unknown sid) maps to NOT_FOUND, 503 (no live
+ *  gateway, standalone web) lifts the server `{error}` body; the SessionView
+ *  caller catches any failure and simply hides the bar. */
+export function getSessionStatus(sid: string): Promise<SessionStatus> {
+  return getJson<SessionStatus>(`${sessionUrl(sid)}/status`);
 }
 
 /** `GET /api/v1/projects/{slug}/roles` — the project's real roles

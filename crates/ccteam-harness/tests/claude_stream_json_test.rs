@@ -85,6 +85,21 @@ while True:
         break
     if not line.strip():
         continue
+    # Client→CLI control requests (e.g. /model → set_model) get a
+    # control_response, NOT a turn. Mirrors real claude's control channel.
+    try:
+        ctl = json.loads(line)
+    except Exception:
+        ctl = None
+    if isinstance(ctl, dict) and ctl.get("type") == "control_request":
+        rid = ctl.get("request_id", "ctl")
+        if os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
+            emit({"type":"control_response","response":{"subtype":"error",
+                  "request_id":rid,"error":"unsupported model"}})
+        else:
+            emit({"type":"control_response","response":{"subtype":"success",
+                  "request_id":rid,"response":{}}})
+        continue
     n += 1
     if os.environ.get("FAKE_SJ_DIE_MID_TURN") == "1":
         # Emit an assistant block (turn now in flight) then die WITHOUT a
@@ -392,7 +407,9 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
         "/compact must pass through as a turn, got {compact:?}"
     );
 
-    // /model is a dialog/panel command → human-readable Rejected.
+    // /model with NO arg → Rejected with a usage hint (stream-json has no
+    // interactive picker). `/model <id>` instead drives `set_model` → Done —
+    // see `model_directive_drives_set_model` below.
     let model = adapter
         .handle_directive(
             &handle,
@@ -411,7 +428,7 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
                 "reason should name the command: {reason}"
             );
         }
-        other => panic!("/model must Reject, got {other:?}"),
+        other => panic!("bare /model must Reject, got {other:?}"),
     }
 
     // An unknown command becomes text (never "Unknown skill") → Turn.
@@ -427,6 +444,144 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
         .await
         .unwrap();
     assert!(matches!(unknown, DirectiveOutcome::Turn(_)));
+
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// Task 1 — `thread_status` reports the live model + context-window usage
+/// (the IM `/sessions` suffix + web statusline source). Model is seeded from
+/// the `initialize` handshake; context lands once the first turn's
+/// `result.usage` is folded in by the per-session status tap.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn thread_status_reports_model_and_context_after_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // Before any turn: model seeded from init ("fake-model"), context unknown.
+    let pre = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(pre.model.as_deref(), Some("fake-model"));
+    assert!(pre.context.is_none(), "no context before the first turn");
+
+    // Drive one turn (the fake's result carries usage{input_tokens:7}).
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+
+    // The status tap folds result.usage into the live status asynchronously
+    // (transport broadcast) — poll briefly until context lands.
+    let mut got = None;
+    for _ in 0..40 {
+        let st = adapter.thread_status(&handle).await.unwrap();
+        if let Some(c) = st.context {
+            assert_eq!(st.model.as_deref(), Some("fake-model"));
+            got = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let c = got.expect("context populated after a turn");
+    assert_eq!(c.used_tokens, 7, "input+cache from result.usage");
+    assert_eq!(
+        c.window_tokens, 200_000,
+        "fake-model has no [1m] suffix → 200k baseline"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// Task 2 — `/model <id>` is driveable in stream-json: it issues a
+/// `set_model` control_request and, on success, completes (`Done`) + updates
+/// the live status model. A bare `/model` (no id) is a usage-hint `Rejected`
+/// (no interactive picker in this channel).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_directive_drives_set_model() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let out = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "model".into(),
+                args: "claude-opus-4-8[1m]".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert!(
+            receipt.contains("claude-opus-4-8[1m]"),
+            "receipt names the model: {receipt}"
+        ),
+        other => panic!("/model <id> must complete (Done), got {other:?}"),
+    }
+    // The switch is reflected in thread_status immediately (model only).
+    let st = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(st.model.as_deref(), Some("claude-opus-4-8[1m]"));
+
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// Task 2 — when the vendor refuses `set_model` (error subtype), `/model`
+/// degrades to an honest `Rejected` (never a silent success, never a kill).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_directive_rejects_on_vendor_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_SET_MODEL_FAIL", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let out = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "model".into(),
+                args: "bogus-model".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("FAKE_SJ_SET_MODEL_FAIL");
+    match out {
+        DirectiveOutcome::Rejected { reason } => {
+            assert!(reason.contains("切换失败"), "honest refusal: {reason}")
+        }
+        other => panic!("a vendor set_model error must Reject, got {other:?}"),
+    }
 
     adapter.close_thread(&handle).await.unwrap();
 }

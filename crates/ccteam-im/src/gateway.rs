@@ -1121,12 +1121,16 @@ impl Gateway {
                 let id = parts
                     .next()
                     .ok_or_else(|| anyhow!("/use requires a session id"))?;
-                // The web console drives any session (cross-entry sharing);
-                // IM channels stay scoped to sessions they own.
+                // Cross-frontend sharing: a chat may drive a session it owns,
+                // the web operator console drives any, and ANY chat may drive a
+                // session in its current project (so IM can take over a
+                // web-created session in the same project). Replies still follow
+                // the per-turn submitter (`reply_to` retarget below).
+                let cur_project = self.current_project_for(chat);
                 let session = self
                     .sessions
                     .get(id)
-                    .filter(|s| s.owner == *chat || chat.channel == "web")
+                    .filter(|s| Self::chat_can_access(chat, s, &cur_project))
                     .ok_or_else(|| anyhow!("unknown session for this chat: {id}"))?;
                 let sid = session.id.clone();
                 // v0.8.10 — capture the target session's project so the switch can
@@ -1164,14 +1168,15 @@ impl Gateway {
                         anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
                     })?
                     .to_string();
-                // Scope to sessions this chat owns (web console may target any),
-                // mirroring /use — never let one chat stop another's session.
-                let owned = self
+                // Same access scope as /use — own session, web operator, or any
+                // session in the chat's current project (cross-frontend sharing).
+                let cur_project = self.current_project_for(chat);
+                let accessible = self
                     .sessions
                     .get(&sid)
-                    .map(|s| s.owner == *chat || chat.channel == "web")
+                    .map(|s| Self::chat_can_access(chat, s, &cur_project))
                     .unwrap_or(false);
-                if !owned {
+                if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
                 self.stop_session(&sid).await?;
@@ -1197,10 +1202,11 @@ impl Gateway {
                         .cloned()
                         .ok_or_else(|| anyhow!("/screen 需要一个活动会话(或 /screen <sid>)"))?,
                 };
+                let cur_project = self.current_project_for(chat);
                 let slug = self
                     .sessions
                     .get(&sid)
-                    .filter(|s| s.owner == *chat || chat.channel == "web")
+                    .filter(|s| Self::chat_can_access(chat, s, &cur_project))
                     .map(|s| s.project.clone())
                     .ok_or_else(|| anyhow!("unknown session for this chat: {sid}"))?;
                 // v0.8.11 E2 — a stream-json session has no pane to capture;
@@ -2435,6 +2441,21 @@ impl Gateway {
             .unwrap_or_else(|| self.default_project.clone())
     }
 
+    /// Session access scope — visibility (`/sessions`) AND addressing
+    /// (`/use` / `/stop` / `/screen`). A chat may reach a session it OWNS,
+    /// any session when it is the web operator console (`channel == "web"`),
+    /// or **any session in the chat's current project** (cross-frontend
+    /// sharing: IM can see + drive sessions a web chat created in the same
+    /// project, and vice versa). Reply routing is unaffected — it follows the
+    /// per-turn submitter via `reply_to`, so a session driven from Telegram
+    /// answers Telegram and one driven from web answers web, regardless of who
+    /// created it. `cur_project` is the caller's [`current_project_for`] (passed
+    /// in so this stays a borrow-free predicate usable inside `sessions`
+    /// iteration).
+    fn chat_can_access(chat: &ChatKey, session: &GatewaySession, cur_project: &str) -> bool {
+        session.owner == *chat || chat.channel == "web" || session.project == cur_project
+    }
+
     /// Point the chat's active session at an existing session owned by this
     /// chat in `project` (deterministic: smallest session index), returning its
     /// id. When none exists, clear the active session so the next message spawns
@@ -2484,12 +2505,14 @@ impl Gateway {
 
     async fn render_sessions(&self, chat: &ChatKey) -> String {
         // The web console is a global operator view and lists every chat
-        // session (cross-entry sharing); IM channels stay scoped to their own.
+        // session; an IM channel sees sessions in its CURRENT project
+        // (cross-frontend sharing — incl. web-created ones), plus any it owns.
         let global = chat.channel == "web";
+        let cur_project = self.current_project_for(chat);
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| global || s.owner == *chat)
+            .filter(|s| global || Self::chat_can_access(chat, s, &cur_project))
             .collect();
         if visible.is_empty() {
             return "no sessions".to_string();
@@ -2638,6 +2661,22 @@ impl Gateway {
             project: session.project.clone(),
             project_dir,
         })
+    }
+
+    /// Resolve a sid to its `(adapter, thread)` so the caller can query
+    /// [`HarnessAdapter::thread_status`] (model + context-window usage for the
+    /// web statusline bar) **after dropping the gateway lock**. Returns clones
+    /// (the adapter is an `Arc`, the handle is cheap) for the same lock-drop
+    /// discipline the history endpoint uses — `thread_status` does fs/transport
+    /// I/O and must never run under the gateway mutex. `None` for an unknown
+    /// sid (the handler's 404 gate). Sync, holds no `.await`.
+    pub fn session_status_handle(
+        &self,
+        sid: &str,
+    ) -> Option<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle)> {
+        self.sessions
+            .get(sid)
+            .map(|s| (Arc::clone(&s.adapter), s.thread.clone()))
     }
 
     /// v0.8.7 review-fix (R-M1) — authenticate a forwarded `session_*` caller
@@ -5247,6 +5286,52 @@ mod tests {
         );
     }
 
+    /// Task 3 — cross-frontend sharing by project: a session created by one
+    /// chat (here `chat-1`; the web console / another frontend is the same
+    /// owner≠querier case) is visible AND addressable from a DIFFERENT chat
+    /// whose current project matches — not just its owner. So IM can see + `/use`
+    /// a web-created session in the same project. (Reply routing is unchanged —
+    /// it follows the per-turn submitter via `reply_to`.)
+    #[tokio::test]
+    async fn gateway_sessions_shared_across_frontends_by_project() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // chat-1 creates a session in the default project "alpha".
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // chat-2 (a different frontend/user) owns no session, but its current
+        // project defaults to "alpha" — so it now SEES the shared session
+        // (pre-fix: owner mismatch → "no sessions").
+        let seen = gateway
+            .handle_text("mock", "chat-2", "bob", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(seen, vec!["s1:alpha:Claude:reviewer"]);
+
+        // …and can ADDRESS it: /use succeeds (addressing scope broadened too).
+        let used = gateway
+            .handle_text("mock", "chat-2", "bob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1"]);
+
+        // A chat in a DIFFERENT project does NOT see it (scope is the project,
+        // not "everything"): chat-3 switches to beta, then /sessions is empty.
+        gateway.register_project("beta", "/tmp/beta");
+        gateway
+            .handle_text("mock", "chat-3", "carol", "/cd beta")
+            .await
+            .unwrap();
+        let other = gateway
+            .handle_text("mock", "chat-3", "carol", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(other, vec!["no sessions"]);
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn gateway_reply_wait_can_capture_realistic_delayed_event() {
@@ -6360,12 +6445,16 @@ mod tests {
             "web drive reply: {reply:?}"
         );
 
-        // IM stays scoped: a different Telegram chat does NOT see tg-1's session.
+        // Cross-frontend sharing by project (task 3): a different Telegram chat
+        // whose current project matches now SEES tg-1's session — sharing is by
+        // project, not by creator. (Cross-PROJECT isolation still holds; see
+        // gateway_sessions_shared_across_frontends_by_project. Reply routing is
+        // unchanged — it follows the per-turn submitter via `reply_to`.)
         let other = gateway
             .handle_text("telegram", "tg-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(other, vec!["no sessions"]);
+        assert_eq!(other, vec!["s1:alpha:Claude:assistant"]);
     }
 
     #[tokio::test]
