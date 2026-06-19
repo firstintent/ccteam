@@ -215,6 +215,19 @@ fn spawn_status_tap(
                                 s.context =
                                     Some(context_usage_from_usage(usage, model.as_deref()));
                             }
+                            // Show the FULL model id (…[1m]) when the real window
+                            // is 1M — both statusline surfaces tag the 1M id the
+                            // same way (rmux derives the window FROM the [1m];
+                            // stream-json derives the [1m] FROM the real window).
+                            let is_1m =
+                                matches!(&s.context, Some(c) if c.window_tokens >= 1_000_000);
+                            if is_1m {
+                                if let Some(m) = s.model.as_mut() {
+                                    if !m.to_ascii_lowercase().ends_with("[1m]") {
+                                        m.push_str("[1m]");
+                                    }
+                                }
+                            }
                             Some(s.clone())
                         } else {
                             None

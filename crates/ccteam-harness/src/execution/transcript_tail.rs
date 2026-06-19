@@ -632,12 +632,10 @@ pub async fn read_status_tail(
         let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        // A `/model …[1m]` switch the user typed in the TUI is recorded as a
-        // `system`/`local_command` row. claude resolves the per-message
-        // `message.model` to the bare API id (no `[1m]`), so this command row
-        // is the ONLY transcript signal that the active window is 1M. Keep the
-        // LATEST switch.
-        if let Some(flag) = model_command_1m(&row) {
+        // claude's `/model` confirmation (`Set model to … (1M context)`) is the
+        // only transcript signal that the 1M window is active — the per-message
+        // `message.model` is the bare API id with no `[1m]`. Keep the LATEST.
+        if let Some(flag) = model_set_1m(&row) {
             one_m = Some(flag);
         }
         if let Some((m, ctx)) = parse_status_row(&row) {
@@ -650,56 +648,50 @@ pub async fn read_status_tail(
             }
         }
     }
-    // An explicit `/model` switch wins over the message.model suffix heuristic:
-    // `[1m]` → 1M window + a `[1m]`-tagged model id (so it reads
-    // `claude-sonnet-4-6[1m]`, matching the selection); a plain switch → the
-    // baseline window.
-    match one_m {
-        Some(true) => {
-            if let Some(ctx) = context.as_mut() {
-                ctx.window_tokens = CLAUDE_CONTEXT_WINDOW_1M;
-            }
-            if let Some(m) = model.as_mut() {
-                if !m.to_ascii_lowercase().ends_with("[1m]") {
-                    m.push_str("[1m]");
-                }
+    // A confirmed 1M selection tags the model id `…[1m]`, so the statusline
+    // shows the FULL id (e.g. `claude-opus-4-8[1m]`). The window is then
+    // DERIVED from that id via [`context_window_for_model`] — the rmux path's
+    // "pick 1M or 200k by the `[1m]` in the full model id". A plain switch
+    // (or none) leaves the bare id → 200k.
+    if one_m == Some(true) {
+        if let Some(m) = model.as_mut() {
+            if !m.to_ascii_lowercase().ends_with("[1m]") {
+                m.push_str("[1m]");
             }
         }
-        Some(false) => {
-            if let Some(ctx) = context.as_mut() {
-                ctx.window_tokens = CLAUDE_CONTEXT_WINDOW_BASELINE;
-            }
-        }
-        None => {}
+    }
+    if let (Some(m), Some(ctx)) = (model.as_deref(), context.as_mut()) {
+        ctx.window_tokens = context_window_for_model(m);
     }
     Ok((model, context))
 }
 
-/// Detect a `/model …` slash entered in the TUI — recorded as a `system` /
-/// `local_command` transcript row like
-/// `{"type":"system","subtype":"local_command","content":"/model sonnet[1m]"}`.
-/// Returns `Some(true)` when the selected model carries the `[1m]` 1M-context
-/// suffix, `Some(false)` for a plain `/model` switch (back to baseline), and
-/// `None` for any other row (incl. a bare `/model` picker-open with no arg, and
-/// look-alikes like `/models`).
-fn model_command_1m(row: &Value) -> Option<bool> {
-    if row.get("type").and_then(Value::as_str) != Some("system") {
-        return None;
+/// Detect claude's `/model` confirmation in the transcript and whether it
+/// selected the 1M-context window. claude resolves the per-message
+/// `message.model` to the bare API id (`claude-opus-4-8`, no `[1m]`) and
+/// records no structured window, so the ONLY transcript signal that the 1M
+/// window is active is the model-set confirmation line —
+/// `<local-command-stdout>Set model to Opus 4.8 (1M context) (default)…` — whose
+/// **display name** carries "1M context" exactly when the 1M beta is on (a
+/// plain switch reads "Set model to Opus 4.8"). Returns `Some(true)` for a 1M
+/// confirmation, `Some(false)` for a plain model-set confirmation, `None` for
+/// any other row. (A bare/failed `/model …[1m]` command is deliberately NOT a
+/// signal — only the success confirmation is authoritative.)
+fn model_set_1m(row: &Value) -> Option<bool> {
+    let content = row
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .or_else(|| row.get("content").and_then(Value::as_str))?;
+    let lower = content.to_ascii_lowercase();
+    if lower.contains("set model to") {
+        // The display name (e.g. "Opus 4.8 (1M context)") names "1M context"
+        // iff the 1M window is active. ANSI bold (`\x1b[1m`) never matches the
+        // full "1m context" substring, so it can't false-positive.
+        Some(lower.contains("1m context"))
+    } else {
+        None
     }
-    if row.get("subtype").and_then(Value::as_str) != Some("local_command") {
-        return None;
-    }
-    let content = row.get("content").and_then(Value::as_str)?.trim();
-    // `/model` must be followed by whitespace (or end) — reject `/models` etc.
-    let rest = content.strip_prefix("/model")?;
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let arg = rest.trim();
-    if arg.is_empty() {
-        return None;
-    }
-    Some(arg.to_ascii_lowercase().contains("[1m]"))
 }
 
 /// Compute [`crate::ContextUsage`] from a Claude `usage` object + the
@@ -1175,19 +1167,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_tail_detects_1m_from_model_command() {
-        // The user typed `/model sonnet[1m]` in the TUI: per-message
-        // `message.model` resolves to the bare `claude-sonnet-4-6` (no
-        // suffix), but the `/model …[1m]` local_command row signals 1M. The
-        // reader must reconstruct `claude-sonnet-4-6[1m]` + a 1M window —
-        // matching the user's native statusline, with no transcript scraping.
+    async fn status_tail_detects_1m_from_model_set_confirmation() {
+        // After a `/model` selection, claude writes a `Set model to … (1M
+        // context)` confirmation. The per-message `message.model` resolves to
+        // the bare `claude-sonnet-4-6` (no suffix), but that confirmation is the
+        // 1M signal. The reader must tag the id `claude-sonnet-4-6[1m]` and
+        // derive a 1M window from it — matching the native statusline, no pane
+        // scraping (the confirmation is a transcript row).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("t.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
             "{}",
-            json!({"type":"system","subtype":"local_command","content":"/model sonnet[1m]"})
+            json!({"type":"user","message":{"role":"user","content":
+                "<local-command-stdout>Set model to \u{1b}[1mSonnet 4.6 (1M context) (default)\u{1b}[22m</local-command-stdout>"}})
         )
         .unwrap();
         writeln!(
@@ -1205,34 +1199,34 @@ mod tests {
         assert_eq!(
             model.as_deref(),
             Some("claude-sonnet-4-6[1m]"),
-            "[1m] reconstructed from the /model command row"
+            "[1m] tagged from the Set-model-to (1M context) confirmation"
         );
         assert_eq!(
             ctx.unwrap().render(),
             "188k / 1M (19%)",
-            "1M window from /model [1m], not the 200k message.model heuristic"
+            "window derived from the [1m] id, not the bare-model 200k heuristic"
         );
     }
 
     #[test]
-    fn model_command_1m_parses_only_real_model_switches() {
-        let cmd = |c: &str| {
-            model_command_1m(&json!({"type":"system","subtype":"local_command","content":c}))
-        };
-        assert_eq!(cmd("/model sonnet[1m]"), Some(true));
-        assert_eq!(cmd("/model opus[1m] "), Some(true));
-        assert_eq!(cmd("/model opus"), Some(false));
-        assert_eq!(cmd("/model"), None, "bare picker-open has no arg");
-        assert_eq!(cmd("/models foo"), None, "look-alike command");
-        // Non-local_command / non-system rows are ignored.
+    fn model_set_1m_reads_only_the_confirmation_line() {
+        let stdout =
+            |c: &str| model_set_1m(&json!({"type":"user","message":{"role":"user","content":c}}));
+        // The 1M confirmation → Some(true); ANSI bold doesn't false-positive.
         assert_eq!(
-            model_command_1m(&json!({"type":"assistant","message":{"model":"x[1m]"}})),
-            None
+            stdout("<local-command-stdout>Set model to \u{1b}[1mOpus 4.8 (1M context) (default)\u{1b}[22m</local-command-stdout>"),
+            Some(true)
         );
+        // A plain model-set confirmation → Some(false).
         assert_eq!(
-            model_command_1m(&json!({"type":"system","subtype":"info","content":"/model x[1m]"})),
-            None
+            stdout("Set model to Opus 4.8 and saved as default"),
+            Some(false)
         );
+        // A failed/typed `/model sonnet[1m]` is NOT a confirmation → None
+        // (only the authoritative success line counts).
+        assert_eq!(stdout("/model sonnet[1m]"), None);
+        // Casual mention of "1M context" without a set → None.
+        assert_eq!(stdout("what is the 1M context window?"), None);
     }
 
     #[tokio::test]

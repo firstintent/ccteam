@@ -95,12 +95,12 @@ while True:
         rid = ctl.get("request_id", "ctl")
         sub = (ctl.get("request") or {}).get("subtype", "")
         if sub == "get_context_usage":
-            # Real claude returns the vendor's actual window here. maxTokens
-            # 500000 is neither the [1m]=1M nor the 200k baseline, so a test
-            # asserting it PROVES the bar uses get_context_usage, not the
-            # hardcoded heuristic.
+            # Real claude returns the vendor's actual window here. The bare
+            # "fake-model" has no [1m] suffix, so the heuristic would give 200k;
+            # maxTokens 1000000 can ONLY come from get_context_usage → it both
+            # proves the source AND drives the [1m] model-id tag.
             emit({"type":"control_response","response":{"subtype":"success",
-                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":500000,"percentage":2}}})
+                  "request_id":rid,"response":{"totalTokens":12345,"maxTokens":1000000,"percentage":1}}})
         elif os.environ.get("FAKE_SJ_SET_MODEL_FAIL") == "1":
             emit({"type":"control_response","response":{"subtype":"error",
                   "request_id":rid,"error":"unsupported model"}})
@@ -492,7 +492,9 @@ async fn thread_status_reports_model_and_context_after_turn() {
     for _ in 0..40 {
         let st = adapter.thread_status(&handle).await.unwrap();
         if let Some(c) = st.context {
-            assert_eq!(st.model.as_deref(), Some("fake-model"));
+            // The 1M window (from get_context_usage) tags the model id `[1m]`
+            // even though message.model / init had no suffix.
+            assert_eq!(st.model.as_deref(), Some("fake-model[1m]"));
             got = Some(c);
             break;
         }
@@ -500,11 +502,11 @@ async fn thread_status_reports_model_and_context_after_turn() {
     }
     let c = got.expect("context populated after a turn");
     // Numbers come from the vendor's `get_context_usage` (totalTokens 12345,
-    // maxTokens 500000) — NOT the result.usage sum (7) nor the [1m]/200k
-    // heuristic. The 500k window can only come from get_context_usage.
+    // maxTokens 1000000) — NOT the result.usage sum (7); the bare "fake-model"
+    // heuristic would give 200k, so a 1M window can only come from get_context_usage.
     assert_eq!(c.used_tokens, 12_345, "totalTokens from get_context_usage");
     assert_eq!(
-        c.window_tokens, 500_000,
+        c.window_tokens, 1_000_000,
         "maxTokens from get_context_usage (real window, not the heuristic)"
     );
 
@@ -557,7 +559,7 @@ async fn stream_json_status_survives_release_via_persisted_file() {
         .context
         .expect("persisted context survives session release");
     assert_eq!(c.used_tokens, 12_345);
-    assert_eq!(c.window_tokens, 500_000);
+    assert_eq!(c.window_tokens, 1_000_000);
 }
 
 /// Task 2 — `/model <id>` is driveable in stream-json: it issues a
