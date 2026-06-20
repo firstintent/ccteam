@@ -663,13 +663,28 @@ impl Channel for TelegramChannel {
     /// documented behaviour for an empty `commands` array). Best-effort:
     /// the daemon logs a warn on failure rather than aborting startup.
     async fn register_commands(&self, cmds: &[CommandSpec]) -> anyhow::Result<()> {
+        // Publish to BOTH the default scope (groups / fallback) AND the
+        // `all_private_chats` scope. ccteam is driven from DMs, and Telegram
+        // resolves a private chat's menu from the MOST SPECIFIC scope. A stale
+        // `all_private_chats` menu (e.g. left by a prior bot-setup flow's
+        // `start`/`help`/`status`) therefore shadows a default-scope menu in
+        // every DM, forever — which is why a default-only write was invisible
+        // and "fixed several times" never stuck. Writing `all_private_chats`
+        // explicitly is the only way the DM menu shows ccteam's commands; the
+        // daemon re-asserts it on every start, so any later clobber self-heals.
+        let scopes = [
+            None,
+            Some(serde_json::json!({ "type": "all_private_chats" })),
+        ];
         let url = self.api_url("setMyCommands");
-        let body = set_my_commands_body(cmds);
-        let resp = self.http.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("telegram setMyCommands → {status}: {text}");
+        for scope in scopes {
+            let body = set_my_commands_body(cmds, scope.as_ref());
+            let resp = self.http.post(&url).json(&body).send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("telegram setMyCommands → {status}: {text}");
+            }
         }
         Ok(())
     }
@@ -677,8 +692,13 @@ impl Channel for TelegramChannel {
 
 /// Build the `setMyCommands` request body (v0.8.5 P1). Pure + isolated so
 /// the bare-name stripping + JSON shape are unit-testable without a live
-/// Bot API. Telegram requires bare command names (`new`, not `/new`).
-fn set_my_commands_body(cmds: &[CommandSpec]) -> serde_json::Value {
+/// Bot API. Telegram requires bare command names (`new`, not `/new`). An
+/// optional `scope` (e.g. `{"type":"all_private_chats"}`) targets a single
+/// command scope; `None` writes the default scope.
+fn set_my_commands_body(
+    cmds: &[CommandSpec],
+    scope: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let commands: Vec<serde_json::Value> = cmds
         .iter()
         .map(|c| {
@@ -688,7 +708,11 @@ fn set_my_commands_body(cmds: &[CommandSpec]) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "commands": commands })
+    let mut body = serde_json::json!({ "commands": commands });
+    if let Some(scope) = scope {
+        body["scope"] = scope.clone();
+    }
+    body
 }
 
 #[cfg(test)]
@@ -715,7 +739,7 @@ mod tests {
                 description: "list sessions + status".into(),
             },
         ];
-        let body = set_my_commands_body(&specs);
+        let body = set_my_commands_body(&specs, None);
         let commands = body["commands"].as_array().expect("commands array");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0]["command"], "new");
@@ -728,12 +752,29 @@ mod tests {
                 "telegram command names must be bare"
             );
         }
+        // No scope key on the default-scope write.
+        assert!(body.get("scope").is_none());
     }
 
     #[test]
     fn set_my_commands_body_empty_clears_menu() {
-        let body = set_my_commands_body(&[]);
+        let body = set_my_commands_body(&[], None);
         assert!(body["commands"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_my_commands_body_carries_all_private_chats_scope() {
+        // The DM-scope write is what un-shadows ccteam's menu: a stale
+        // all_private_chats menu otherwise wins over the default scope in
+        // every private chat. The body must carry that scope verbatim.
+        let specs = vec![CommandSpec {
+            name: "/new".into(),
+            description: "start a new session".into(),
+        }];
+        let scope = serde_json::json!({ "type": "all_private_chats" });
+        let body = set_my_commands_body(&specs, Some(&scope));
+        assert_eq!(body["scope"]["type"], "all_private_chats");
+        assert_eq!(body["commands"][0]["command"], "new");
     }
 
     #[test]
