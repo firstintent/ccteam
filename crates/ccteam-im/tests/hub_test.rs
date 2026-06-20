@@ -159,6 +159,8 @@ fn plugin(base: &str, id: &str, sha: &str) -> HubPlugin {
     HubPlugin {
         id: id.to_string(),
         type_: "agent".to_string(),
+        marketplace: None,
+        plugin_id: None,
         name: "Helper".to_string(),
         description: "A curated helper".to_string(),
         upstream: format!("{base}/agents/{id}.md"),
@@ -410,6 +412,8 @@ async fn install_multi_file_skill_lands_every_file() {
     let p = HubPlugin {
         id: "tdd".to_string(),
         type_: "skill".to_string(),
+        marketplace: None,
+        plugin_id: None,
         name: "tdd".to_string(),
         description: "test-driven".to_string(),
         upstream: format!("{base}/skills/eng/tdd/SKILL.md"),
@@ -468,6 +472,8 @@ async fn multi_file_skill_sha_mismatch_writes_nothing() {
     let p = HubPlugin {
         id: "tdd".to_string(),
         type_: "skill".to_string(),
+        marketplace: None,
+        plugin_id: None,
         name: "tdd".to_string(),
         description: String::new(),
         upstream: format!("{base}/skills/eng/tdd/SKILL.md"),
@@ -583,6 +589,8 @@ fn installed_status_multi_file_skill_compares_whole_dir() {
     let p = HubPlugin {
         id: "tdd".to_string(),
         type_: "skill".to_string(),
+        marketplace: None,
+        plugin_id: None,
         name: "tdd".to_string(),
         description: String::new(),
         upstream: "https://raw.githubusercontent.com/x/y/sha/skills/eng/tdd/SKILL.md".to_string(),

@@ -109,20 +109,40 @@ pub struct ManifestEntry {
     pub content_sha: String,
 }
 
+/// A vendor-native plugin marketplace pointer carried by a `type:"plugin"`
+/// hub entry. ccteam never copies the plugin body; it hands these two facts
+/// to Claude Code's own installer via `.claude/settings.local.json` (see
+/// [`ccteam_core::enable_marketplace_plugin`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketplaceRef {
+    /// The marketplace's DECLARED name (its `.claude-plugin/marketplace.json`
+    /// `name`). Becomes the `extraKnownMarketplaces` key + the `@<marketplace>`
+    /// half of the `enabledPlugins` key.
+    pub name: String,
+    /// The vendor `MarketplaceSource` object, stored verbatim and passed
+    /// through unmodified (e.g. `{"source":"github","repo":"owner/repo"}`).
+    /// Kept as raw JSON so the full vendor union (github/url/git/npm/…) is
+    /// honoured without re-modeling it here.
+    pub source: serde_json::Value,
+}
+
 /// One installable plugin entry in the hub index (track-upstream schema).
 ///
 /// `{ id, type, name, description, upstream, content_sha, source, license,
-///   tags[], manifest? }`. `type` is `"agent" | "skill" | "workflow"`;
-/// `upstream` is the raw-fetchable URL of the body
+///   tags[], manifest? }`. `type` is `"agent" | "skill" | "workflow" |
+///   "plugin"`; `upstream` is the raw-fetchable URL of the body
 /// (`raw.githubusercontent.com/<owner>/<repo>/<sha>/<path>` for an external
 /// source, or the hub's own raw tree for first-party content). `content_sha`
 /// is the sha256 of that body. A multi-file skill additionally carries a
-/// `manifest` of every file (relpath + sha, incl. `SKILL.md`).
+/// `manifest` of every file (relpath + sha, incl. `SKILL.md`). A `plugin`
+/// entry carries `marketplace` + `plugin_id` instead of a body (delegated
+/// vendor install — no `upstream` / `content_sha` / `manifest`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HubPlugin {
     /// Globally-unique plugin id (the install key, and default install stem).
     pub id: String,
-    /// `"agent"`, `"skill"`, or `"workflow"`. Serde wire name `type`.
+    /// `"agent"`, `"skill"`, `"workflow"`, or `"plugin"`. Serde wire name
+    /// `type`.
     #[serde(rename = "type")]
     pub type_: String,
     /// Human-friendly name.
@@ -138,6 +158,8 @@ pub struct HubPlugin {
     pub upstream: String,
     /// sha256 hex of the body at `upstream`. The installer verifies the
     /// fetched body against this before writing (integrity / anti-tamper).
+    /// Absent for a `plugin` entry (nothing is fetched / copied).
+    #[serde(default)]
     pub content_sha: String,
     /// Provenance: which source ccteam-hub tracked this plugin from
     /// (`"ccteam"` first-party, `"agency-agents"`, …).
@@ -153,6 +175,14 @@ pub struct HubPlugin {
     /// single-file agent / SKILL.md-only skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Vec<ManifestEntry>>,
+    /// `type:"plugin"` only — the vendor marketplace pointer ccteam delegates
+    /// the install to. Absent for content (agent/skill/workflow) entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<MarketplaceRef>,
+    /// `type:"plugin"` only — the plugin's name within its marketplace (the
+    /// `<plugin>` half of `enabledPlugins["<plugin>@<marketplace>"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
 }
 
 /// Outcome of a successful [`install_plugin`].
@@ -265,6 +295,11 @@ pub enum HubError {
     /// underlying message.
     #[error("{0}")]
     Write(String),
+    /// A `type:"plugin"` entry is missing its `marketplace` / `plugin_id`
+    /// pointer (a malformed catalog row), so it can't be delegated to the
+    /// vendor installer.
+    #[error("plugin `{0}` is missing its marketplace pointer (marketplace + plugin_id)")]
+    InvalidPlugin(String),
 }
 
 /// Build the hardened reqwest client used for every hub fetch: 30s timeout
@@ -501,6 +536,26 @@ fn upstream_dir(upstream: &str) -> Result<&str, HubError> {
 /// an allowlisted host. For a multi-file skill this returns the `SKILL.md`
 /// body; the sibling files are fetched by [`install_plugin`] via the manifest.
 pub async fn fetch_plugin_body(plugin: &HubPlugin) -> Result<String, HubError> {
+    // Vendor-native plugin: there is no body to copy. The "preview" honestly
+    // describes the delegated install (which marketplace/source + plugin), so
+    // the reviewer sees exactly what enabling will hand to Claude Code.
+    if plugin.type_ == "plugin" {
+        let market = plugin
+            .marketplace
+            .as_ref()
+            .ok_or_else(|| HubError::InvalidPlugin(plugin.id.clone()))?;
+        let plugin_name = plugin.plugin_id.as_deref().unwrap_or(&plugin.id);
+        let source = serde_json::to_string_pretty(&market.source)
+            .unwrap_or_else(|_| market.source.to_string());
+        return Ok(format!(
+            "Vendor-native Claude Code plugin (delegated install — ccteam copies/executes \
+             nothing).\n\nEnabling this writes two keys into the project's \
+             .claude/settings.local.json:\n  extraKnownMarketplaces[\"{name}\"].source = \
+             {source}\n  enabledPlugins[\"{plugin_name}@{name}\"] = true\n\nClaude Code fetches \
+             and installs the plugin itself on its next launch in this project.",
+            name = market.name,
+        ));
+    }
     if plugin.upstream.trim().is_empty() {
         return Err(HubError::Write(format!(
             "plugin `{}` has no upstream URL to fetch",
@@ -531,6 +586,13 @@ pub async fn install_plugin(
     target_stem: Option<&str>,
     force: bool,
 ) -> Result<InstallResult, HubError> {
+    // Vendor-native plugin: delegated install (no body fetch / copy / exec) —
+    // ccteam writes the marketplace pointer + enable flag into
+    // settings.local.json and Claude Code does the rest on next launch.
+    if plugin.type_ == "plugin" {
+        return install_marketplace_plugin(project_dir, plugin);
+    }
+
     let raw_stem = target_stem.unwrap_or(&plugin.id);
     let stem = ccteam_core::sanitize_role_stem(raw_stem)
         .map_err(|e| HubError::BadStem(format!("{e:#}")))?;
@@ -602,6 +664,42 @@ pub async fn install_plugin(
     })
 }
 
+/// Delegated install of a `type:"plugin"` entry — writes the marketplace
+/// pointer + enable flag into `<project>/.claude/settings.local.json` and
+/// returns; Claude Code does the actual fetch / native-dep / install on its
+/// next launch in the project. ccteam fetches nothing and executes nothing,
+/// so there is no body, no sha gate, and no clobber check (re-enabling is an
+/// idempotent settings rewrite — `force` is irrelevant and ignored).
+///
+/// `InstallResult.path` is the `settings.local.json` that was written;
+/// `overwrote` is always `false` (config merge, never a content overwrite).
+fn install_marketplace_plugin(
+    project_dir: &Path,
+    plugin: &HubPlugin,
+) -> Result<InstallResult, HubError> {
+    let market = plugin
+        .marketplace
+        .as_ref()
+        .ok_or_else(|| HubError::InvalidPlugin(plugin.id.clone()))?;
+    let plugin_name = plugin
+        .plugin_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HubError::InvalidPlugin(plugin.id.clone()))?;
+
+    ccteam_core::enable_marketplace_plugin(project_dir, &market.name, &market.source, plugin_name)
+        .map_err(|e| HubError::Write(format!("{e:#}")))?;
+    let path = project_dir.join(".claude").join("settings.local.json");
+
+    Ok(InstallResult {
+        id: plugin.id.clone(),
+        type_: plugin.type_.clone(),
+        path,
+        overwrote: false,
+    })
+}
+
 /// Compute the on-the-fly installed status of `plugin` in `project_dir` — no
 /// sidecar file. Keyed on `plugin.id` (the no-override install stem):
 ///
@@ -617,6 +715,22 @@ pub async fn install_plugin(
 /// type is treated as `NotInstalled` (best-effort decoration of the catalog;
 /// never errors). The web layer uses this to badge each catalog row.
 pub fn installed_status(project_dir: &Path, plugin: &HubPlugin) -> InstalledStatus {
+    // Vendor-native plugin: "installed" == enabled in settings.local.json.
+    // There is no `UpdateAvailable` (Claude tracks the marketplace's live ref,
+    // not a hub-pinned sha) — the status is binary.
+    if plugin.type_ == "plugin" {
+        let enabled = matches!(
+            (plugin.marketplace.as_ref(), plugin.plugin_id.as_deref()),
+            (Some(m), Some(p))
+                if ccteam_core::marketplace_plugin_enabled(project_dir, p, &m.name)
+        );
+        return if enabled {
+            InstalledStatus::Installed
+        } else {
+            InstalledStatus::NotInstalled
+        };
+    }
+
     // Default stem == sanitized plugin id (the no-override install path).
     let Ok(stem) = ccteam_core::sanitize_role_stem(&plugin.id) else {
         return InstalledStatus::NotInstalled;
@@ -720,6 +834,8 @@ mod tests {
             plugins: vec![HubPlugin {
                 id: "foo".into(),
                 type_: "agent".into(),
+                marketplace: None,
+                plugin_id: None,
                 name: "Foo".into(),
                 description: String::new(),
                 upstream: String::new(),
@@ -734,12 +850,106 @@ mod tests {
         assert!(idx.find("bar").is_none());
     }
 
+    fn plugin_entry() -> HubPlugin {
+        HubPlugin {
+            id: "understand-anything".into(),
+            type_: "plugin".into(),
+            name: "Understand Anything".into(),
+            description: "Codebase knowledge graphs".into(),
+            upstream: String::new(),
+            content_sha: String::new(),
+            source: "external".into(),
+            license: "see upstream".into(),
+            tags: vec!["understand".into()],
+            manifest: None,
+            marketplace: Some(MarketplaceRef {
+                name: "understand-anything".into(),
+                source: serde_json::json!({"source":"github","repo":"Egonex-AI/Understand-Anything"}),
+            }),
+            plugin_id: Some("understand-anything".into()),
+        }
+    }
+
+    #[test]
+    fn plugin_index_entry_deserializes_without_body_fields() {
+        // The exact wire shape sync.py emits: NO upstream / content_sha /
+        // manifest; marketplace + plugin_id present.
+        let wire = serde_json::json!({
+            "id": "understand-anything",
+            "type": "plugin",
+            "name": "Understand Anything",
+            "description": "...",
+            "source": "external",
+            "license": "see upstream repo",
+            "tags": ["understand"],
+            "marketplace": {
+                "name": "understand-anything",
+                "source": { "source": "github", "repo": "Egonex-AI/Understand-Anything" }
+            },
+            "plugin_id": "understand-anything"
+        });
+        let p: HubPlugin = serde_json::from_value(wire).unwrap();
+        assert_eq!(p.type_, "plugin");
+        assert_eq!(p.content_sha, ""); // defaulted — absent on the wire
+        assert!(p.upstream.is_empty());
+        assert!(p.manifest.is_none());
+        assert_eq!(p.marketplace.unwrap().name, "understand-anything");
+        assert_eq!(p.plugin_id.as_deref(), Some("understand-anything"));
+    }
+
+    #[tokio::test]
+    async fn plugin_install_writes_settings_and_status_flips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let p = plugin_entry();
+
+        assert_eq!(installed_status(dir, &p), InstalledStatus::NotInstalled);
+
+        let res = install_plugin(dir, &p, None, false).await.unwrap();
+        assert_eq!(res.type_, "plugin");
+        assert!(!res.overwrote);
+        assert!(res.path.ends_with(".claude/settings.local.json"));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["enabledPlugins"]["understand-anything@understand-anything"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            v["extraKnownMarketplaces"]["understand-anything"]["source"]["repo"],
+            "Egonex-AI/Understand-Anything"
+        );
+
+        // Binary status — never UpdateAvailable for a plugin.
+        assert_eq!(installed_status(dir, &p), InstalledStatus::Installed);
+    }
+
+    #[tokio::test]
+    async fn plugin_body_preview_describes_delegation_and_missing_pointer_errors() {
+        let preview = fetch_plugin_body(&plugin_entry()).await.unwrap();
+        assert!(preview.contains("extraKnownMarketplaces"));
+        assert!(preview.contains("enabledPlugins[\"understand-anything@understand-anything\"]"));
+
+        let mut bad = plugin_entry();
+        bad.marketplace = None;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            install_plugin(tmp.path(), &bad, None, false).await,
+            Err(HubError::InvalidPlugin(_))
+        ));
+    }
+
     #[test]
     fn sort_ccteam_first_features_ccteam_source() {
         fn p(id: &str, source: &str) -> HubPlugin {
             HubPlugin {
                 id: id.into(),
                 type_: "skill".into(),
+                marketplace: None,
+                plugin_id: None,
                 name: id.into(),
                 description: String::new(),
                 upstream: format!("https://raw.githubusercontent.com/x/y/sha/skills/{id}.md"),

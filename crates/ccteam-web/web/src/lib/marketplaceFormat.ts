@@ -11,6 +11,7 @@ export const CATEGORIES: { type: HubPlugin["type"]; label: string }[] = [
   { type: "agent", label: "Agents / Roles" },
   { type: "skill", label: "Skills" },
   { type: "workflow", label: "Workflows" },
+  { type: "plugin", label: "Plugins" },
 ];
 
 /** Human label for a plugin's install button / pill, per `installed_status`.

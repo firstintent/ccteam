@@ -132,6 +132,71 @@ fn spawn_helper_hub(id: &str, serve_body: bool) -> String {
     base
 }
 
+/// An `index.json` with a single vendor-native `plugin` entry: a marketplace
+/// pointer, NO body fields (no `upstream` / `content_sha` / `manifest`). The
+/// engine installs it by config-write — it never fetches the fake hub for a
+/// body, so this hub only ever serves `/index.json`.
+fn plugin_index_json() -> String {
+    r#"{
+      "version": 1,
+      "name": "ccteam-hub",
+      "description": "curated",
+      "generated_at": "2026-01-01T00:00:00Z",
+      "plugins": [
+        {
+          "id": "understand-anything",
+          "type": "plugin",
+          "name": "Understand Anything",
+          "description": "knowledge graphs",
+          "source": "external",
+          "license": "see upstream repo",
+          "tags": ["understand"],
+          "marketplace": {
+            "name": "understand-anything",
+            "source": { "source": "github", "repo": "Egonex-AI/Understand-Anything" }
+          },
+          "plugin_id": "understand-anything"
+        }
+      ]
+    }"#
+    .to_string()
+}
+
+/// Bind + serve a looping fake hub that returns `index_json` for
+/// `/index.json` and 404 for everything else (no bodies).
+fn spawn_index_only_hub(index_json: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let resp = if path == "/index.json" {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                index_json.len(),
+                index_json
+            )
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+    });
+    base
+}
+
 async fn spawn_router(state: AppState) -> SocketAddr {
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
     std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
@@ -346,6 +411,89 @@ async fn marketplace_install_unknown_plugin_404() {
         !project_dir.join(".claude/agents/nope.md").exists(),
         "nothing should be written for an unknown plugin"
     );
+
+    std::env::remove_var(HUB_BASE_ENV);
+}
+
+/// A `type:"plugin"` entry installs by DELEGATION — the route writes the
+/// marketplace pointer + enable flag into the project's settings.local.json
+/// (ccteam fetches/copies nothing) and the decorated status flips to
+/// `installed`. No `.claude/agents|skills/` file is produced.
+#[tokio::test]
+#[serial]
+async fn marketplace_plugin_install_delegates_via_settings_local() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let project_dir = paths.project_dir("demo");
+
+    let hub_base = spawn_index_only_hub(plugin_index_json());
+    std::env::set_var(HUB_BASE_ENV, &hub_base);
+
+    let addr = spawn_router(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+
+    // Pre-install: catalog lists the plugin as not_installed.
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/v1/projects/demo/marketplace?refresh=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "decorated catalog (pre-install)");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["type"], "plugin");
+    assert_eq!(v["plugins"][0]["installed_status"], "not_installed");
+
+    // Install → 201, type=plugin, path = settings.local.json.
+    let resp = client
+        .post(format!(
+            "http://{addr}/api/v1/projects/demo/marketplace/install"
+        ))
+        .json(&serde_json::json!({ "id": "understand-anything" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "plugin install");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["type"], "plugin");
+    assert_eq!(v["overwrote"], false);
+    assert!(v["path"]
+        .as_str()
+        .unwrap()
+        .ends_with(".claude/settings.local.json"));
+
+    // The two vendor keys landed; NO agent/skill file was written.
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["enabledPlugins"]["understand-anything@understand-anything"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        settings["extraKnownMarketplaces"]["understand-anything"]["source"]["repo"],
+        "Egonex-AI/Understand-Anything"
+    );
+    // No agent/skill FILE for this plugin — the install is config-only.
+    assert!(!project_dir
+        .join(".claude/agents/understand-anything.md")
+        .exists());
+    assert!(!project_dir
+        .join(".claude/skills/understand-anything")
+        .exists());
+
+    // Post-install: status flips to installed (binary — no update_available).
+    let resp = client
+        .get(format!("http://{addr}/api/v1/projects/demo/marketplace"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "decorated catalog (post-install)");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["installed_status"], "installed");
 
     std::env::remove_var(HUB_BASE_ENV);
 }

@@ -10,6 +10,7 @@ import {
   BUDGET_WARN_FRACTION,
   budgetSeverity,
   cardInstallNeedsPreview,
+  CATEGORIES,
   distinctSources,
   filterPlugins,
   formatCostBudget,
@@ -35,6 +36,22 @@ function plugin(over: Partial<HubPlugin> = {}): HubPlugin {
     ...over,
   };
 }
+
+describe("CATEGORIES (browse tabs)", () => {
+  it("includes a Plugins tab for vendor-native plugin entries", () => {
+    const plugin = CATEGORIES.find((c) => c.type === "plugin");
+    expect(plugin?.label).toBe("Plugins");
+  });
+
+  it("filters a plugin-type entry under the plugin category", () => {
+    const entries = [
+      plugin({ id: "code-reviewer", type: "agent" }),
+      plugin({ id: "understand-anything", type: "plugin", source: "external" }),
+    ];
+    const got = filterPlugins(entries, { type: "plugin", source: null, query: "" });
+    expect(got.map((p) => p.id)).toEqual(["understand-anything"]);
+  });
+});
 
 describe("installedStatusLabel + installable", () => {
   it("labels each installed_status", () => {

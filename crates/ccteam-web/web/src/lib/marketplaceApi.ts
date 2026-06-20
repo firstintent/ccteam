@@ -22,10 +22,12 @@
 export type InstalledStatus = "not_installed" | "installed" | "update_available";
 
 /** One installable plugin entry in the hub index
- *  (`ccteam_im::hub::HubPlugin`). `type` is `agent | skill | workflow`. */
+ *  (`ccteam_im::hub::HubPlugin`). `type` is `agent | skill | workflow | plugin`.
+ *  A `plugin` is a vendor-native Claude Code plugin: ccteam copies nothing —
+ *  installing it delegates to Claude Code via the `marketplace` pointer. */
 export interface HubPlugin {
   id: string;
-  type: "agent" | "skill" | "workflow";
+  type: "agent" | "skill" | "workflow" | "plugin";
   name: string;
   description: string;
   path: string;
@@ -34,6 +36,12 @@ export interface HubPlugin {
   upstream: string;
   license: string;
   tags: string[];
+  /** `type:"plugin"` only — the vendor marketplace pointer. Enabling writes
+   *  `extraKnownMarketplaces` + `enabledPlugins` into the project's
+   *  settings.local.json; Claude Code does the actual install. */
+  marketplace?: { name: string; source: Record<string, unknown> };
+  /** `type:"plugin"` only — the plugin's name within its marketplace. */
+  plugin_id?: string;
 }
 
 /** A plugin decorated with its per-project installed status — the shape of

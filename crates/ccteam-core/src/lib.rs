@@ -45,6 +45,8 @@ pub mod handoff;
 // `ccteam-im::hub` so this primitives leaf stays free of an async HTTP + sha2
 // dependency.
 pub mod hub;
+// Delegated vendor-plugin install (marketplace pointer → settings.local.json).
+pub mod marketplace_plugin;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;
@@ -178,6 +180,9 @@ pub use handoff::{
 // `raw_url` (joins base + repo-relative path; re-exported as `catalog_raw_url`)
 // and `sanitize_role_stem` (normalizes an install stem to `[a-z0-9_-]`).
 pub use hub::{raw_url as catalog_raw_url, sanitize_role_stem, HUB_RAW_BASE};
+pub use marketplace_plugin::{
+    enable_marketplace_plugin, enabled_plugin_key, marketplace_plugin_enabled,
+};
 // v0.8.6 — generic config hot-reload wrapper (used by the IM gateway for
 // config.yaml; reusable for any future config file).
 pub use hot_config::HotConfig;

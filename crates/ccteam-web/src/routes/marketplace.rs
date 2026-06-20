@@ -81,6 +81,9 @@ fn hub_error_status(err: &HubError) -> StatusCode {
         | HubError::BadStatus { .. }
         | HubError::HostNotAllowed { .. }
         | HubError::BadIndex(_)
+        // A malformed `type:"plugin"` row (missing marketplace pointer) is bad
+        // upstream catalog data, like BadIndex.
+        | HubError::InvalidPlugin(_)
         | HubError::EmptyBody(_)
         | HubError::TooLarge { .. } => StatusCode::BAD_GATEWAY,
         HubError::Write(_) => StatusCode::INTERNAL_SERVER_ERROR,
