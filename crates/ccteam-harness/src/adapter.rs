@@ -553,6 +553,12 @@ pub fn format_tokens(n: u64) -> String {
 pub struct ThreadStatus {
     pub model: Option<String>,
     pub context: Option<ContextUsage>,
+    /// Reasoning-effort level the model will actually run at (Claude Opus
+    /// 4.6+ / Codex), e.g. `low` / `medium` / `high` / `xhigh` / `max`.
+    /// `None` for builds/models without an effort axis. Default-skipped so
+    /// an older persisted `status.json` (no `effort`) still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl ThreadStatus {
@@ -567,6 +573,9 @@ impl ThreadStatus {
         let mut parts: Vec<String> = Vec::new();
         if let Some(m) = self.model.as_deref().filter(|s| !s.is_empty()) {
             parts.push(m.to_string());
+        }
+        if let Some(e) = self.effort.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(e.to_string());
         }
         if let Some(ctx) = &self.context {
             parts.push(format!("ctx {}", ctx.render()));
@@ -1212,15 +1221,26 @@ mod tests {
                 used_tokens: 188_000,
                 window_tokens: 1_000_000,
             }),
+            effort: None,
         };
         assert_eq!(
             full.status_suffix().as_deref(),
             Some("claude-opus-4-8[1m] · ctx 188k / 1M (19%)")
         );
+        // With effort: it sits between the model and the context segment.
+        let with_effort = ThreadStatus {
+            effort: Some("xhigh".into()),
+            ..full.clone()
+        };
+        assert_eq!(
+            with_effort.status_suffix().as_deref(),
+            Some("claude-opus-4-8[1m] · xhigh · ctx 188k / 1M (19%)")
+        );
         // Model only.
         let model_only = ThreadStatus {
             model: Some("gpt-5".into()),
             context: None,
+            effort: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
         // Default (statusless) → nothing to append.

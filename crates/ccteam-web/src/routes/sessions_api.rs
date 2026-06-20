@@ -387,7 +387,7 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
     tag = "sessions",
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     responses(
-        (status = 200, description = "Live statusline `{sid, model, context:{used_tokens, window_tokens, pct}, status_line}` (fields null until the first turn)", body = serde_json::Value),
+        (status = 200, description = "Live statusline `{sid, model, effort, context:{used_tokens, window_tokens, pct}, status_line}` (fields null until the first turn; `effort` null on models/builds with no effort axis)", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
@@ -426,6 +426,7 @@ pub(crate) async fn handle_session_status(
     Json(json!({
         "sid": sid,
         "model": status.model,
+        "effort": status.effort,
         "context": context,
         "status_line": status.status_suffix(),
     }))

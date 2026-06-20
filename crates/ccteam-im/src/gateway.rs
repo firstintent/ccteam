@@ -5432,6 +5432,7 @@ mod tests {
                 used_tokens: 188_000,
                 window_tokens: 1_000_000,
             }),
+            effort: None,
         })
         .await;
         let with_status = gateway
@@ -5450,6 +5451,7 @@ mod tests {
                 used_tokens: 188_000,
                 window_tokens: 200_000,
             }),
+            effort: None,
         })
         .await;
         let baseline = gateway

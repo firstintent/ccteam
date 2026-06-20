@@ -204,7 +204,14 @@ fn spawn_status_tap(
                         // result.usage token-sum + model heuristic only if the
                         // vendor build doesn't answer.
                         let real = get_context_usage(&transport).await;
+                        // The vendor's runtime-resolved reasoning effort (Opus
+                        // 4.6+ / Codex), e.g. `xhigh`. None on an older CLI
+                        // without `get_settings` or a model with no effort axis.
+                        let effort = get_applied_effort(&transport).await;
                         let snapshot = if let Ok(mut s) = status.lock() {
+                            if let Some(e) = effort {
+                                s.effort = Some(e);
+                            }
                             if let Some((used, window)) = real {
                                 s.context = Some(crate::ContextUsage {
                                     used_tokens: used,
@@ -268,6 +275,83 @@ async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)
         .and_then(|v| v.as_u64())
         .or_else(|| resp.get("rawMaxTokens").and_then(|v| v.as_u64()))?;
     Some((used, window))
+}
+
+/// The reasoning-effort levels claude accepts (Opus 4.6+), low→high. Mirrors
+/// the vendor `EFFORT_LEVELS` (`/effort`); used to validate a `/model <id>
+/// <effort>` / `/effort <level>` argument before it touches settings.
+pub(crate) const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Normalize a user-typed effort token to a canonical level, or `None` if it
+/// isn't one (so `/model opus xhigh` splits cleanly but `/model opus-4-8`
+/// never mis-reads a model fragment as effort).
+pub(crate) fn normalize_effort(arg: &str) -> Option<String> {
+    let a = arg.trim().to_ascii_lowercase();
+    EFFORT_LEVELS
+        .iter()
+        .find(|l| **l == a)
+        .map(|l| (*l).to_string())
+}
+
+/// Split a `/model` argument into `(model, effort?)`: the effort is the
+/// trailing whitespace-separated token IFF it's a valid level, so
+/// `opus[1m] xhigh` → `("opus[1m]", Some("xhigh"))` while a bare model id
+/// (`opus-4-8`, `claude-3-5-haiku`) is never mis-split.
+pub(crate) fn split_model_effort(arg: &str) -> (String, Option<String>) {
+    let arg = arg.trim();
+    if let Some((head, tail)) = arg.rsplit_once(char::is_whitespace) {
+        if let Some(eff) = normalize_effort(tail) {
+            return (head.trim().to_string(), Some(eff));
+        }
+    }
+    (arg.to_string(), None)
+}
+
+/// Read the vendor's REAL runtime-resolved reasoning effort via the
+/// `get_settings` control_request → `response.applied.effort` (the level that
+/// "will actually be sent to the API", after env / session / model defaults).
+/// `None` on timeout / error / an older CLI without the subtype, or a model
+/// with no effort axis. Short timeout — must never stall the status tap.
+async fn get_applied_effort(transport: &StreamJsonTransport) -> Option<String> {
+    let body = transport
+        .request_control("get_settings", json!({}), Duration::from_secs(3))
+        .await
+        .ok()?;
+    if body.subtype != "success" {
+        return None;
+    }
+    body.response
+        .as_ref()?
+        .get("applied")?
+        .get("effort")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Persist a reasoning-effort level into the project's ccteam-managed
+/// `.claude/settings.local.json` as `effortLevel` (the vendor key claude reads
+/// at startup; there is NO live `set_effort` control — `set_model` is
+/// model-only). Idempotent + non-clobbering: every sibling key is preserved.
+/// Like the plugin-enable path, it lands in the gitignored `local` layer and
+/// NEVER touches the user's `settings.json`; it takes effect on the session's
+/// next start (`/new`). `cwd` is the session's project root.
+fn set_effort_level(cwd: &Path, level: &str) -> std::io::Result<()> {
+    let path = cwd.join(".claude").join("settings.local.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    root.as_object_mut()
+        .expect("filtered to object")
+        .insert("effortLevel".to_string(), json!(level));
+    let body = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// Persisted per-session status snapshot path, next to the turns mirror:
@@ -498,6 +582,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let status = Arc::new(StdMutex::new(ThreadStatus {
             model: init.model.clone(),
             context: None,
+            // Effort is unknown until the first turn — the status tap reads the
+            // vendor's runtime-resolved level via `get_settings`.
+            effort: None,
         }));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
@@ -725,6 +812,40 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // verbatim passthrough. Empty arg → a usage hint (no pane to open a
         // picker on). Real-vendor `set_model` support is confirmed at smoke; an
         // unsupported build returns an error subtype → an honest refusal here.
+        // `/effort <level>` — set the reasoning effort. There is NO live
+        // `set_effort` control (the bridge exposes set_model /
+        // set_max_thinking_tokens / set_permission_mode only), so it lands in
+        // the project's `settings.local.json` `effortLevel` — the vendor key
+        // claude reads at startup — and applies on the session's next start
+        // (`/new`). The live status reflects it now so the statusline updates.
+        if name == "effort" {
+            let Some(live) = self.lookup(&h.identity) else {
+                return Err(HarnessError::SubmitFailed(
+                    "effort: no live stream-json session for this handle".into(),
+                ));
+            };
+            let Some(level) = normalize_effort(&d.args) else {
+                return Ok(DirectiveOutcome::Rejected {
+                    reason: format!(
+                        "用法: /effort <{}>（reasoning effort；写入 settings，下次 /new 生效）",
+                        EFFORT_LEVELS.join("|")
+                    ),
+                });
+            };
+            if let Err(e) = set_effort_level(&live.cwd, &level) {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "写入 effortLevel 失败: {e}"
+                )));
+            }
+            if let Ok(mut s) = live.status.lock() {
+                s.effort = Some(level.clone());
+            }
+            return Ok(DirectiveOutcome::Done {
+                receipt: format!(
+                    "已设 effort → {level}（写入 settings.local.json，下次 /new 生效）"
+                ),
+            });
+        }
         if name == "model" {
             let arg = d.args.trim();
             let Some(live) = self.lookup(&h.identity) else {
@@ -735,13 +856,16 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             if arg.is_empty() {
                 return Ok(DirectiveOutcome::Rejected {
                     reason:
-                        "用法: /model <model-id>（stream-json 通道无交互选择器，直接给 model id）"
+                        "用法: /model <model-id> [effort]（无交互选择器，直接给 model id；可选 effort=low|medium|high|xhigh|max）"
                             .into(),
                 });
             }
+            // "<model> [effort]" — effort is the trailing token iff a valid level
+            // (so `/model opus[1m] xhigh` splits but `/model opus-4-8` doesn't).
+            let (model, effort) = split_model_effort(arg);
             let body = live
                 .transport
-                .request_control("set_model", json!({ "model": arg }), init_timeout())
+                .request_control("set_model", json!({ "model": model }), init_timeout())
                 .await
                 .map_err(|e| HarnessError::SubmitFailed(format!("set_model 失败: {e}")))?;
             if body.subtype != "success" {
@@ -752,14 +876,28 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     reason: format!("/model 切换失败: {why}"),
                 });
             }
-            // Reflect the switch in the live status immediately (model only;
-            // context refreshes on the next turn's usage).
+            // Reflect the switch in the live status immediately (context
+            // refreshes on the next turn's usage).
             if let Ok(mut s) = live.status.lock() {
-                s.model = Some(arg.to_string());
+                s.model = Some(model.clone());
             }
-            return Ok(DirectiveOutcome::Done {
-                receipt: format!("已切换 model → {arg}"),
-            });
+            // Optional effort rides along — but it's a startup setting, not a
+            // live control, so it applies on `/new` (model is live now).
+            let mut receipt = format!("已切换 model → {model}（live）");
+            if let Some(level) = effort {
+                match set_effort_level(&live.cwd, &level) {
+                    Ok(()) => {
+                        if let Ok(mut s) = live.status.lock() {
+                            s.effort = Some(level.clone());
+                        }
+                        receipt.push_str(&format!(
+                            "；effort → {level}（写入 settings，下次 /new 生效）"
+                        ));
+                    }
+                    Err(e) => receipt.push_str(&format!("；effort 设置失败: {e}")),
+                }
+            }
+            return Ok(DirectiveOutcome::Done { receipt });
         }
         match bridge::classify_slash(&name, &commands) {
             SlashClass::Reject => Ok(DirectiveOutcome::Rejected {
@@ -806,10 +944,81 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             (Some(l), Some(p)) => ThreadStatus {
                 model: l.model.or(p.model),
                 context: p.context,
+                effort: l.effort.or(p.effort),
             },
             (Some(l), None) => l,
             (None, Some(p)) => p,
             (None, None) => ThreadStatus::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::{normalize_effort, set_effort_level, split_model_effort, EFFORT_LEVELS};
+
+    #[test]
+    fn normalize_effort_accepts_levels_case_insensitively_and_rejects_others() {
+        for lvl in EFFORT_LEVELS {
+            assert_eq!(normalize_effort(lvl).as_deref(), Some(*lvl));
+        }
+        assert_eq!(normalize_effort("XHigh").as_deref(), Some("xhigh"));
+        assert_eq!(normalize_effort(" max ").as_deref(), Some("max"));
+        assert_eq!(normalize_effort("turbo"), None);
+        assert_eq!(normalize_effort("opus-4-8"), None);
+        assert_eq!(normalize_effort(""), None);
+    }
+
+    #[test]
+    fn split_model_effort_only_peels_a_valid_trailing_level() {
+        assert_eq!(
+            split_model_effort("opus[1m] xhigh"),
+            ("opus[1m]".to_string(), Some("xhigh".to_string()))
+        );
+        assert_eq!(
+            split_model_effort("claude-opus-4-8 max"),
+            ("claude-opus-4-8".to_string(), Some("max".to_string()))
+        );
+        // No trailing level → the whole arg is the model (never mis-split).
+        assert_eq!(
+            split_model_effort("claude-opus-4-8"),
+            ("claude-opus-4-8".to_string(), None)
+        );
+        assert_eq!(
+            split_model_effort("opus[1m]"),
+            ("opus[1m]".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn set_effort_level_writes_effortlevel_preserving_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        // Pre-existing sibling key must survive the effortLevel write.
+        std::fs::write(&settings, r#"{"enabledPlugins":{"x@y":true}}"#).unwrap();
+
+        set_effort_level(dir.path(), "xhigh").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["effortLevel"], "xhigh");
+        assert_eq!(v["enabledPlugins"]["x@y"], true, "sibling preserved");
+
+        // Idempotent overwrite of the same key.
+        set_effort_level(dir.path(), "high").unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v2["effortLevel"], "high");
+        assert_eq!(v2["enabledPlugins"]["x@y"], true);
+    }
+
+    #[test]
+    fn set_effort_level_creates_settings_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        set_effort_level(dir.path(), "medium").unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".claude").join("settings.local.json"))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["effortLevel"], "medium");
     }
 }

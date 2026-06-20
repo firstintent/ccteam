@@ -1733,6 +1733,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
         Ok(ThreadStatus {
             model: live.model,
             context: live.usage,
+            // Codex carries a `/model <id> [effort]` axis, but the tracker
+            // doesn't surface it yet — statusline effort is stream-json (Claude)
+            // only for now; None keeps the Codex suffix unchanged.
+            effort: None,
         })
     }
 }

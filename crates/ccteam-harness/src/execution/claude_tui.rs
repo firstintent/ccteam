@@ -1146,7 +1146,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         let (model, context) = transcript_tail::read_status_tail(&transcript)
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("read transcript status: {e}")))?;
-        Ok(ThreadStatus { model, context })
+        // TUI sessions don't surface a reasoning-effort axis (no stream-json
+        // get_settings tap); leave it None so the statusline omits it.
+        Ok(ThreadStatus {
+            model,
+            context,
+            effort: None,
+        })
     }
 }
 
