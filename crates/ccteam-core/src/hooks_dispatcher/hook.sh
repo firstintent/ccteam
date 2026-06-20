@@ -29,6 +29,18 @@ if [ -z "$KIND" ]; then
     exit 2
 fi
 
+# Hookless sessions (the stream-json protocol) read every event directly
+# from the child's stdout and explicitly do NOT want ccteam's hook chain to
+# fire. Firing it would (a) deadlock the spawn — the SessionStart hook POSTs
+# back to the daemon while the daemon is synchronously spawning this very
+# child — and (b) double-emit progress/turns the stdout pump already writes.
+# The spawn injects CCTEAM_HOOKLESS=1 into such a child's env; no-op fast so
+# `initialize` is never blocked. (A no-op decision hook = "no opinion" → the
+# tool proceeds; stream-json HITL runs over the `can_use_tool` RPC, not here.)
+if [ -n "${CCTEAM_HOOKLESS:-}" ]; then
+    exit 0
+fi
+
 CCTEAM_HOME="${CCTEAM_HOME:-$HOME/.ccteam}"
 TOKEN_FILE="$CCTEAM_HOME/web-token"
 PORT="${CCTEAM_WEB_PORT:-7331}"

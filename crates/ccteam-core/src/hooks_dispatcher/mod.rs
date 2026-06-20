@@ -141,6 +141,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_short_circuits_for_hookless_sessions() {
+        // The stream-json protocol marks its child CCTEAM_HOOKLESS=1; the
+        // dispatcher must no-op (exit 0) BEFORE any daemon POST / CLI exec so
+        // it neither deadlocks init nor double-emits.
+        assert!(
+            HOOK_DISPATCHER_SH.contains("CCTEAM_HOOKLESS"),
+            "dispatcher must honour the CCTEAM_HOOKLESS no-op marker"
+        );
+        let guard = HOOK_DISPATCHER_SH
+            .find("CCTEAM_HOOKLESS")
+            .expect("guard present");
+        let curl = HOOK_DISPATCHER_SH
+            .find("curl")
+            .expect("curl fast path present");
+        assert!(
+            guard < curl,
+            "the hookless guard must short-circuit before the daemon POST"
+        );
+    }
+
+    #[test]
     fn install_creates_then_unchanged() {
         let tmp = TempDir::new().unwrap();
         let paths = fake_paths(&tmp);

@@ -77,19 +77,20 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // ambient servers like a VS Code extension that would only add init
         // latency). Per-session curated MCP is a future enhancement.
         "--strict-mcp-config".into(),
-        // Same deadlock via the OTHER self-referential init dependency: the
-        // project's `settings.local.json` carries ccteam's chat-progress
-        // hooks (written for the tmux path), and claude BLOCKS `system:init`
-        // on `SessionStart` hook completion. That hook (`hook.sh`) HTTP-POSTs
-        // back to the daemon — which is wedged in `wait_for_init` — so it
-        // hangs → init never arrives → timeout. The stream-json adapter is
-        // hookless by design (the gateway event pump writes progress/turns
-        // from stdout, NOT hooks), so drop the LOCAL settings source where
-        // those hooks live. `user,project` keeps the user's global + the
-        // project's own settings; only ccteam's managed `settings.local.json`
-        // is excluded (its telegram-disable is already covered by
-        // `--strict-mcp-config`; permissions by the explicit flags below).
-        "--setting-sources=user,project".into(),
+        // Include ALL three settings layers — crucially `local`
+        // (`settings.local.json`), where a marketplace-enabled vendor plugin
+        // writes its `extraKnownMarketplaces` + `enabledPlugins` (so the
+        // plugin actually loads in this default protocol). `local` also
+        // carries ccteam's tmux-path chat hooks, and historically the
+        // `SessionStart` hook deadlocked init (it HTTP-POSTs back to the
+        // daemon while the daemon is synchronously spawning this child) — that
+        // is now defused at the source: the spawn marks the child
+        // `CCTEAM_HOOKLESS=1` (see `build_env`) and `hook.sh` / `internal
+        // hook` no-op for it, so no hook ever fires for a stream-json session
+        // (it stays hookless — events come from stdout). MCP self-reference is
+        // still handled by `--strict-mcp-config`; permissions by the flags
+        // below.
+        "--setting-sources=user,project,local".into(),
     ];
 
     // Role persona — vendor-native self-read, never injected. Empty =
@@ -144,6 +145,13 @@ pub fn build_env(role: &str, slug: &str, secret: &str, sid: &str) -> Vec<(String
     let mut env = vec![
         ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
         ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
+        // This protocol is hookless: events come from the child's stdout, not
+        // the hook chain. We DO include `local` in `--setting-sources` (so a
+        // marketplace-enabled plugin in settings.local.json loads), but that
+        // also pulls in ccteam's tmux-path hooks — so mark the child hookless
+        // and `hook.sh` / `internal hook` no-op for it (no SessionStart-POST
+        // init deadlock, no double-emit). See spawn argv `--setting-sources`.
+        ("CCTEAM_HOOKLESS".to_string(), "1".to_string()),
     ];
     if !secret.is_empty() {
         env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
@@ -287,10 +295,11 @@ mod tests {
             "--output-format",
             // The headless trigger — its absence is the init-timeout bug.
             "--no-chrome",
-            // Don't inherit ambient MCP / ccteam's local-settings hooks (both
-            // self-referential init deadlocks — see build_argv).
+            // Don't inherit ambient MCP (self-referential init deadlock).
             "--strict-mcp-config",
-            "--setting-sources=user,project",
+            // All three layers incl. `local` (plugin enablement lives there);
+            // local hooks are defused via CCTEAM_HOOKLESS — see build_argv.
+            "--setting-sources=user,project,local",
             "--include-partial-messages",
             "--replay-user-messages",
         ] {
@@ -359,6 +368,10 @@ mod tests {
         assert!(keys.contains(&"CCTEAM_CHAT_SLUG"));
         assert!(!keys.contains(&"CCTEAM_CHAT_SECRET"));
         assert!(!keys.contains(&"CCTEAM_CHAT_SID"));
+        // Hookless marker is ALWAYS present (stream-json is hookless even
+        // though it now reads the `local` settings layer for plugins).
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("CCTEAM_HOOKLESS").map(String::as_str), Some("1"));
 
         let env2 = build_env("alice", "demo", "sek", "s3");
         let map: std::collections::HashMap<_, _> = env2.into_iter().collect();

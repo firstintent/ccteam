@@ -1399,6 +1399,11 @@ fn run_mux_hook_emit(
     session: Option<String>,
     json: Option<String>,
 ) -> Result<()> {
+    // Hookless session (stream-json): no-op, same as `run_hook`. This is the
+    // W6 daemon-bus form that bypasses hook.sh's guard.
+    if std::env::var_os("CCTEAM_HOOKLESS").is_some() {
+        return Ok(());
+    }
     // Derive the session id from env when not given explicitly. The hook
     // subprocess inherits CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE from the
     // chat tmux session (claude_tui::chat_spawn_env_owned). Either may
@@ -1591,6 +1596,16 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
 }
 
 fn run_hook(cmd: HookCommand) -> Result<()> {
+    // Hookless session (stream-json protocol): the spawn injects
+    // CCTEAM_HOOKLESS=1 so the hook chain never fires (no SessionStart-POST
+    // init deadlock, no double-emit — events come from the child's stdout).
+    // `hook.sh` already short-circuits before reaching here, but the W6
+    // `mux hook-emit` form and any direct CLI invocation bypass hook.sh, so
+    // guard here too. A no-op (Ok / empty stdout) = "no opinion" for any
+    // decision hook → the tool proceeds.
+    if std::env::var_os("CCTEAM_HOOKLESS").is_some() {
+        return Ok(());
+    }
     let paths = CcteamPaths::from_env()?;
     // V0.6.1 F139: dispatch through the shared `ccteam_hooks::dispatch`
     // entry so the CLI fallback and the daemon HTTP route share one
