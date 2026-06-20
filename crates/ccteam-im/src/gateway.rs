@@ -2195,18 +2195,43 @@ impl Gateway {
             .get(chat)
             .ok_or_else(|| anyhow!("no current session for chat"))?
             .clone();
-        // (v0.8.5 D1) A single-line `/command` is a session directive — the
-        // owning adapter (the only thing that knows its vendor's command
-        // surface) interprets it. Multi-line text starting with `/` is
-        // ordinary content (a pasted path / code block), never a directive.
+        // Both user-entry legs (this IM path and the web `submit_to_sid`) drive
+        // a session through the SAME `submit_resolved` core, so directive
+        // handling can never drift between them — the bug this unification
+        // closed: the web leg used to skip the directive parse and ship
+        // `/model …` to the agent as literal text. The IM handler returns the
+        // synchronous receipts up the inbound stack to send over the channel;
+        // an async turn's answer streams over the event sink (empty Vec here).
+        match self.submit_resolved(chat, &session_id, payload).await? {
+            SubmitResult::Directive(replies) => Ok(replies),
+            SubmitResult::Turn { drained, .. } => Ok(drained),
+        }
+    }
+
+    /// Shared submit core (sid already resolved). A single-line `/command` is a
+    /// session directive interpreted by the owning adapter — the only thing
+    /// that knows its vendor's command surface (`/model` → `set_model`, etc.);
+    /// anything else (incl. multi-line text starting with `/`, e.g. a pasted
+    /// path / code block) is ordinary user text submitted as a turn. `chat` is
+    /// the reply target written to the session's `reply_to`. Returns either the
+    /// directive's synchronous receipts or the new turn's id + any sink-less
+    /// drained answer; each caller takes the leg it needs (IM returns the
+    /// replies; the web/MCP leg returns the turn id and SSE-emits the receipts).
+    async fn submit_resolved(
+        &self,
+        chat: &ChatKey,
+        session_id: &str,
+        payload: String,
+    ) -> Result<SubmitResult> {
         if let Some(directive) = parse_session_directive(&payload) {
-            return self.dispatch_directive(chat, &session_id, directive).await;
+            let replies = self.dispatch_directive(chat, session_id, directive).await?;
+            return Ok(SubmitResult::Directive(replies));
         }
         let session = self
             .sessions
-            .get(&session_id)
+            .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        // Option ① — replies for this turn go back to whoever sent it.
+        // Replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
         }
@@ -2226,8 +2251,13 @@ impl Gateway {
         .await
         .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
         self.mirror_user_turn(session, &user_text, &turn_id.0);
-        self.after_turn_submitted(session, start_visible_events, &turn_id.0)
-            .await
+        let drained = self
+            .after_turn_submitted(session, start_visible_events, &turn_id.0)
+            .await?;
+        Ok(SubmitResult::Turn {
+            id: turn_id.0,
+            drained,
+        })
     }
 
     /// Interpret a session directive through the owning adapter, then render
@@ -2838,36 +2868,48 @@ impl Gateway {
     /// send-keys / RPC; the long turn streams asynchronously through the
     /// event pump. Returns the submitted [`TurnId`]'s inner string.
     pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
-        let session = self
-            .sessions
-            .get(sid)
-            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
-        // Route this turn's async replies to the web console (mirrors the
-        // per-turn `reply_to` retarget the inbound submit path does).
-        if let Ok(mut target) = session.reply_to.lock() {
-            *target = web_api_chat();
+        // Same core as the IM `submit_to_current` path (parity by construction):
+        // a single-line `/command` is a session directive, everything else a
+        // turn. The synthetic web `reply_to` routes async answers / progress
+        // back to the per-`sid` SSE subscriber.
+        match self.submit_resolved(&web_api_chat(), sid, text).await? {
+            // A turn's answer streams over the pump → SSE; hand back the turn id
+            // so a `session_dispatch` caller can `session_collect{since: id}`.
+            SubmitResult::Turn { id, .. } => Ok(id),
+            // A directive's synchronous receipt (e.g. "已切换 model → opus") has
+            // no turn id, and the POST already returned 202 — so deliver it over
+            // the session's SSE stream as an Answer keyed on `sid`, the web peer
+            // of the IM handler sending submit_to_current's returned Vec back.
+            SubmitResult::Directive(replies) => {
+                for (i, reply) in replies.into_iter().enumerate() {
+                    self.emit_sid_answer(sid, i, reply);
+                }
+                Ok(format!("directive:{sid}"))
+            }
         }
-        let start_visible_events = session.visible_events.load(Ordering::SeqCst);
-        // v0.8.8 bug-fix — mirror the user's prompt to turns.jsonl (the pump
-        // records only the assistant side); without it a web session reopened
-        // from history shows the agent's replies but not the user's messages.
-        let user_text = text.clone();
-        let submit_wait = gateway_submit_timeout_duration();
-        let turn_id = tokio::time::timeout(
-            submit_wait,
-            session
-                .adapter
-                .submit_turn(&session.thread, TurnInput::UserText(text)),
-        )
-        .await
-        .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {sid}"))??;
-        self.mirror_user_turn(session, &user_text, &turn_id.0);
-        // Arm the same async-turn machinery the inbound path uses (turn
-        // watchdog when a sink is wired; otherwise this is a no-op drain).
-        let _ = self
-            .after_turn_submitted(session, start_visible_events, &turn_id.0)
-            .await?;
-        Ok(turn_id.0)
+    }
+
+    /// Deliver one synchronous directive receipt to a web session's SSE stream
+    /// as an `Answer` event keyed on `sid` (the per-`sid` SSE filter). The web
+    /// peer of the IM handler sending a `submit_to_current` reply back over the
+    /// channel; `nanos`+`i` keep the outbound id unique.
+    fn emit_sid_answer(&self, sid: &str, i: usize, content: String) {
+        let chat = web_api_chat();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-directive-{sid}-{nanos}-{i}"),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+        });
     }
 
     /// v0.8.7 review-fix (R-H1) — resolve a token-keyed pending choice from the
@@ -3471,6 +3513,21 @@ fn merge_thread_extras(
         }
     }
     serde_json::Value::Object(merged)
+}
+
+/// Outcome of [`Gateway::submit_resolved`] — the one core both user-entry
+/// legs (IM `submit_to_current`, web `submit_to_sid`) funnel through. A
+/// `/command` runs synchronously (carry its receipt lines); plain text becomes
+/// a turn whose answer streams async (carry the turn id + any sink-less drain).
+enum SubmitResult {
+    /// A `/command` directive ran. Its synchronous reply lines
+    /// (`Done`/`Rejected`/`Redirect` receipts; empty when the directive became
+    /// a streaming turn or a sink-delivered choice).
+    Directive(Vec<String>),
+    /// Plain user text submitted as a new turn. `id` is the `TurnId` string
+    /// (handed to `session_dispatch` for `session_collect{since}`); `drained`
+    /// is the sink-less drained answer (empty in production — answers stream).
+    Turn { id: String, drained: Vec<String> },
 }
 
 /// Parse a single-line `/command [args]` into a neutral [`Directive`].
@@ -4244,6 +4301,58 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    /// Web-path parity: a `/command` submitted via `submit_to_sid` (the network
+    /// API leg) is interpreted as a session DIRECTIVE — exactly like the IM
+    /// `submit_to_current` path — not shipped to the agent as literal text. Its
+    /// synchronous receipt is delivered over the session's SSE stream as an
+    /// Answer keyed on `sid`. Regression: `/model …` from the web console used
+    /// to reach claude verbatim → "/model isn't available in this environment".
+    #[tokio::test]
+    async fn submit_to_sid_routes_slash_command_as_directive() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-directive");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+
+        // Subscribe before submitting so the broadcast tee catches the receipt.
+        let mut rx = gateway.subscribe_events();
+
+        let receipt_id = gateway
+            .submit_to_sid(&sid, "/model opus-x".into())
+            .await
+            .unwrap();
+        // A directive has no turn id — a synthetic marker, never "turn-…".
+        assert_eq!(receipt_id, format!("directive:{sid}"));
+
+        // Interpreted as a DIRECTIVE (recorded), NOT a literal turn submission.
+        let directives = fake.directives.lock().await;
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].1.name, "model");
+        assert_eq!(directives[0].1.args, "opus-x");
+        drop(directives);
+        assert!(
+            fake.submissions.lock().await.is_empty(),
+            "a /command must not be submitted to the agent as user text"
+        );
+
+        // The receipt streams back over the session's SSE (sid-keyed Answer).
+        let ev = rx.try_recv().expect("directive receipt emitted to SSE");
+        assert_eq!(ev.sid.as_deref(), Some(sid.as_str()));
+        assert!(matches!(ev.kind, GatewayEventKind::Answer));
+        assert!(
+            ev.content.contains("directive: model"),
+            "got: {}",
+            ev.content
+        );
     }
 
     /// v0.8.7 review-fix (R-M1) — `create_session_api` mints a per-session
