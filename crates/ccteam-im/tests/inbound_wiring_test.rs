@@ -1065,6 +1065,149 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
+/// Emits a steady stream of NON-visible activity (`ItemUpdated`) for well past
+/// the idle window, then a final answer — a "long but actively working" turn.
+/// The idle watchdog must NOT interrupt it (each event resets the idle clock).
+struct StreamingGatewayAdapter {
+    esc_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl HarnessAdapter for StreamingGatewayAdapter {
+    fn name(&self) -> &'static str {
+        "streaming-stub"
+    }
+    fn vendor(&self) -> AgentVendor {
+        AgentVendor::Claude
+    }
+    async fn start_thread(
+        &self,
+        spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Chat,
+            identity: format!("streaming-{}-{}-{}", ctx.slug, spec.role, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({}),
+        })
+    }
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        Ok(TurnId::new("streaming-turn"))
+    }
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        // 15 reasoning ticks @ 20ms = 300ms of activity (past the 200ms idle
+        // window — an old "no answer in window" watchdog would have killed it),
+        // then the answer at ~320ms (well inside the 600ms test daemon window).
+        // Activity resets idle every 20ms, so a correct watchdog never fires.
+        Box::pin(futures::stream::unfold(0u32, |i| async move {
+            if i < 15 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let evt = ThreadEvent::ItemUpdated {
+                    item: ThreadItem {
+                        id: format!("upd-{i}"),
+                        details: ThreadItemDetails::Reasoning("working".into()),
+                    },
+                };
+                Some((evt, i + 1))
+            } else if i == 15 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let evt = ThreadEvent::ItemCompleted {
+                    item: ThreadItem {
+                        id: "ans".into(),
+                        details: ThreadItemDetails::AgentMessage("done working".into()),
+                    },
+                };
+                Some((evt, i + 1))
+            } else {
+                None
+            }
+        }))
+    }
+    async fn resume_thread(&self, _id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "stub".into(),
+        })
+    }
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        if d.name == "esc" {
+            self.esc_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(DirectiveOutcome::Rejected {
+            reason: "test double".into(),
+        })
+    }
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
+}
+
+/// v0.8.15: a long-but-active turn (streaming activity past the idle window)
+/// must NOT be interrupted — the watchdog is idle-based, not "no answer yet".
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_does_not_interrupt_a_streaming_turn() {
+    let _g = env_lock();
+    let old_timeout = std::env::var_os("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS");
+    // 200ms idle window vs 20ms event spacing → activity keeps resetting idle.
+    std::env::set_var("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS", "200");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, ts) in [
+        ("stream-1", "/new claude helper", 0),
+        ("stream-2", "do a long task", 1),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp: ts,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+    let adapter = Arc::new(StreamingGatewayAdapter {
+        esc_calls: AtomicUsize::new(0),
+    });
+    run_mock_gateway_daemon(projects_root, Arc::clone(&mock), Arc::clone(&adapter)).await;
+    restore_env("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS", old_timeout);
+
+    // The watchdog never esc-interrupted the active turn.
+    assert_eq!(
+        adapter.esc_calls.load(Ordering::SeqCst),
+        0,
+        "watchdog must NOT interrupt a turn that is streaming activity"
+    );
+    let contents: Vec<String> = mock.outbox().await.into_iter().map(|m| m.content).collect();
+    assert!(
+        !contents.iter().any(|c| c.contains("went silent")),
+        "no stall message for an active turn: {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|c| c.contains("done working")),
+        "the answer must be delivered: {contents:?}"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
@@ -1113,10 +1256,11 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     // V0.8.4 P1 (F1): no folded "submitted … turn …" ack → created + timeout.
     assert_eq!(contents.len(), 2, "created + timeout (ack folded away)");
     assert_eq!(contents[0], "created session s1");
-    // v0.8.9: the watchdog now INTERRUPTS the stalled turn (handle_directive
-    // `esc` → Ok here) and notifies with the "interrupted it" message.
+    // v0.8.9: the watchdog INTERRUPTS the stalled turn (handle_directive `esc`
+    // → Ok here) and notifies. v0.8.15: idle-based — this stub emits NO events
+    // (stream::empty), so it idles out and the message reads "went silent".
     assert!(
-        contents[1].starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms"),
+        contents[1].starts_with("⏱️ turn failing-stub-turn went silent for 50ms"),
         "unexpected timeout content: {:?}",
         contents[1]
     );
@@ -1130,9 +1274,9 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     let rows = read_durable_outbound_rows();
     assert!(rows.iter().any(|row| {
         row["state"] == "sent"
-            && row["message"]["content"].as_str().is_some_and(|s| {
-                s.starts_with("⏱️ turn failing-stub-turn produced no reply for 50ms")
-            })
+            && row["message"]["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("⏱️ turn failing-stub-turn went silent for 50ms"))
     }));
 
     let paths = ccteam_core::CcteamPaths {

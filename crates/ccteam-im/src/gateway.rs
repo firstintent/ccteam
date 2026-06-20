@@ -88,7 +88,17 @@ struct GatewaySession {
     handle: String,
     thread: ThreadHandle,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// Count of VISIBLE answers (final assistant text / error) produced. The
+    /// turn-timeout watchdog reads it to know the turn ANSWERED (→ stop
+    /// watching, never interrupt).
     visible_events: Arc<AtomicU64>,
+    /// Count of ANY pump event (assistant delta, tool-use, progress, …) — a
+    /// liveness signal. The watchdog resets its idle clock whenever this
+    /// ticks, so a turn that is actively streaming work is never mistaken for
+    /// a stall. Only TRUE silence (no event at all for the idle window) trips
+    /// the interrupt. Distinct from `visible_events`, which counts only final
+    /// answers.
+    activity_events: Arc<AtomicU64>,
     /// Where this session's replies go (option ①: whoever last drove it).
     /// Starts at `owner`; updated on `/use` and on every submit so a turn
     /// sent from web replies to web, one from Telegram replies to Telegram.
@@ -859,6 +869,7 @@ impl Gateway {
             session.thread = thread;
             session.adapter = adapter;
             session.visible_events = Arc::new(AtomicU64::new(0));
+            session.activity_events = Arc::new(AtomicU64::new(0));
         }
         if let Some(pump) = self.event_pumps.remove(id) {
             pump.abort();
@@ -1584,6 +1595,7 @@ impl Gateway {
                 thread,
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
+                activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
             },
         );
@@ -1723,6 +1735,7 @@ impl Gateway {
                 thread,
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
+                activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
             },
         );
@@ -1838,6 +1851,12 @@ impl Gateway {
                     biased;
                     maybe = events.next() => {
                         let Some(evt) = maybe else { break; };
+                        // Liveness tick: ANY event (assistant delta, tool-use,
+                        // progress, turn-completed) means the turn is doing work,
+                        // so the turn-timeout watchdog resets its idle clock. Only
+                        // TRUE silence (no event for the whole idle window) is a
+                        // stall. Counts every event, before any branch/filter.
+                        session.activity_events.fetch_add(1, Ordering::SeqCst);
                         // v0.8.11 E4 — for a stream-json session (no hooks), the
                         // pump mirrors each completed turn to progress.jsonl with
                         // the sid, so the session-list activity classifier (which
@@ -2061,6 +2080,7 @@ impl Gateway {
                     thread: saved_session.thread,
                     adapter,
                     visible_events: Arc::new(AtomicU64::new(0)),
+                    activity_events: Arc::new(AtomicU64::new(0)),
                     reply_to: Arc::new(std::sync::Mutex::new(saved_session.owner)),
                 },
             );
@@ -3080,21 +3100,44 @@ fn spawn_turn_timeout_watchdog(
         return;
     }
     let visible_events = Arc::clone(&session.visible_events);
+    let activity_events = Arc::clone(&session.activity_events);
     let session_id = session.id.clone();
     let project = session.project.clone();
     let role = session.role.clone();
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
-    // v0.8.9 (owner request) — the watchdog now TERMINATES a runaway turn, not
-    // just notifies. Clone the session's adapter + thread so the spawned task
-    // can send the `esc` directive (Esc to a Claude pane) when the turn stalls.
+    // v0.8.9 (owner request) — the watchdog TERMINATES a stalled turn, not just
+    // notifies. v0.8.15 (owner request) — "stalled" is now IDLE-based: reset on
+    // any activity so a long-but-working turn (tool calls / streaming for
+    // minutes) is never killed; only TRUE silence for the whole window trips
+    // it. Clone the adapter + thread so the task can send `esc` on a real stall.
     let adapter = Arc::clone(&session.adapter);
     let thread = session.thread.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        if visible_events.load(Ordering::SeqCst) != start_visible_events {
-            return; // the turn produced a visible answer → not stuck.
+        // Poll at a fraction of the idle window (cap so turn-completion is still
+        // noticed promptly on a long window). Reset `idle` whenever the activity
+        // counter ticks; interrupt only after a full `timeout` of NO events.
+        let poll = timeout.min(std::time::Duration::from_secs(10));
+        let mut last_activity = activity_events.load(Ordering::SeqCst);
+        let mut idle = std::time::Duration::ZERO;
+        loop {
+            tokio::time::sleep(poll).await;
+            // The turn produced a visible answer → finished, never interrupt.
+            if visible_events.load(Ordering::SeqCst) != start_visible_events {
+                return;
+            }
+            let cur = activity_events.load(Ordering::SeqCst);
+            if cur != last_activity {
+                last_activity = cur;
+                idle = std::time::Duration::ZERO; // still working → not a stall
+                continue;
+            }
+            idle += poll;
+            if idle < timeout {
+                continue;
+            }
+            break; // a full idle window of total silence → genuine stall
         }
         if let Some(progress_path) = progress_path.as_ref() {
             let ev = ccteam_core::progress::build_chat_turn_timeout_event(
@@ -3141,14 +3184,15 @@ fn spawn_turn_timeout_watchdog(
         };
         let content = if interrupted {
             format!(
-                "⏱️ turn {turn_id} produced no reply for {timeout:?} — the watchdog \
-                 interrupted it (the session is still alive; just send again to retry). \
-                 If this recurs the model may be looping: bind a role (e.g. cto) or give a \
-                 clearer task. Tune the limit via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS."
+                "⏱️ turn {turn_id} went silent for {timeout:?} (no tokens, tool calls or \
+                 progress) — the watchdog treated it as stalled and interrupted it (the \
+                 session is still alive; just send again). A long-but-active turn is NOT \
+                 killed; if this fired on real work, raise the idle window via \
+                 CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS."
             )
         } else {
             format!(
-                "⏱️ turn {turn_id} timed out after {timeout:?} for {session_id}; the watchdog \
+                "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}; the watchdog \
                  could not interrupt it — you may need to /stop the session."
             )
         };
@@ -3388,7 +3432,12 @@ fn gateway_submit_timeout_duration() -> std::time::Duration {
 }
 
 fn gateway_turn_timeout_duration() -> std::time::Duration {
-    const DEFAULT_MS: u64 = 120_000;
+    // Idle window (v0.8.15): how long a turn may emit NO events at all before
+    // the watchdog treats it as stalled. Generous by default — real work runs
+    // long single tool calls (builds / test suites) that are silent to the
+    // gateway while they execute. A streaming turn resets this on every event,
+    // so this only bites genuine hangs. `0` disables the watchdog.
+    const DEFAULT_MS: u64 = 300_000;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
