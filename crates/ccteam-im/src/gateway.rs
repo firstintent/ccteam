@@ -1167,17 +1167,19 @@ impl Gateway {
                 let id = parts
                     .next()
                     .ok_or_else(|| anyhow!("/use requires a session id"))?;
-                // Cross-frontend sharing: a chat may drive a session it owns,
-                // the web operator console drives any, and ANY chat may drive a
-                // session in its current project (so IM can take over a
-                // web-created session in the same project). Replies still follow
-                // the per-turn submitter (`reply_to` retarget below).
-                let cur_project = self.current_project_for(chat);
+                // `/use <sid>` is the explicit "switch to this session" verb, so
+                // it works for ANY live session regardless of the chat's current
+                // project or who created it — it MOVES the chat's current project
+                // to the target's below, which is the whole point. (This is why a
+                // session you drove from the web console, or one in another
+                // project, is reachable from IM by id without a prior `/cd`.) The
+                // pairing ACL upstream already gates who reaches the daemon;
+                // plain-message routing still respects the current focus, and
+                // replies follow the per-turn submitter (`reply_to` retarget).
                 let session = self
                     .sessions
                     .get(id)
-                    .filter(|s| Self::chat_can_access(chat, s, &cur_project))
-                    .ok_or_else(|| anyhow!("unknown session for this chat: {id}"))?;
+                    .ok_or_else(|| anyhow!("unknown session: {id}"))?;
                 let sid = session.id.clone();
                 // v0.8.10 — capture the target session's project so the switch can
                 // also move the chat's project context (below).
