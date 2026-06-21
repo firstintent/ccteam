@@ -44,6 +44,28 @@ telegram bot 是 **daemon 级**的:一个 bot、多个 chat。多人私信同一
 
 ---
 
+## 3.5 跨端身份:注册 / 登录 / CLI 联动(owner 1226)
+
+身份不能只改 web —— **一张租户表当唯一源**,IM / web / CLI 各端围它改。复用现有拼图,**不新搞账号密码**:
+
+**一个身份 = 已配对的 IM 用户**(`chat_id` / lark `open_id`)—— 本就是 `crates/ccteam-im/src/acl.rs` 的 allowlist 键。多用户 = allowlist 升成租户表(`id → handle`,如 `@alice`)。
+
+**注册**(成为租户):走现有配对 —— 用户 DM bot → **管理员批准**进 allowlist(Lark 本就闭名单;Telegram 把空名单收紧成按 id 记租户)。**注册天生管理员门控**,与「绝不因频道消息批准配对」红线一致。
+
+**登录**(各端,全读同一张表):
+
+| 端 | 登录方式 | 现有件 |
+|---|---|---|
+| IM | `chat_id` 本就在名单里认证过 | `acl.rs` |
+| web | 开个人链接 `?token=ccteam:<你的hex>` → cookie | `TokenEntryPage` 现成 URL-shim;token 改 per-user(查表解析身份,非 `==expected`) |
+| CLI | shell 访问 = **admin**(同账号无法按人分,有 shell 即全权) | — |
+
+**联动改的四处**(一张表当源):① `acl.rs` allowlist → 租户表(`id→handle`);② web `auth.rs` `token==expected` → `token→身份`;③ gateway ACL 按身份 scope(= 档 0);④ **CLI 新增 `ccteam user add/ls/rm`**:铸 per-user web 链接、管租户(+ 可选 `--as <handle>` 看某人视图);现有 `config`/`register` 仍 admin。
+
+**诚实**:能真按人分的只有 **web + IM**(远程、靠 token/chat_id 认证);**CLI 在同账号下是 admin**(单 uid 全权)。要 CLI 也隔离 = 一人一 OS 账号/实例(见 §6 另一条路)。
+
+---
+
 ## 4. 不做 / 不碰
 
 - ❌ 不拆进程、不开沙箱、不动 OS。
