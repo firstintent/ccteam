@@ -869,7 +869,14 @@ impl Gateway {
                                 cwd: snapshot.cwd.clone(),
                                 project_dir: snapshot.cwd.clone(),
                                 extra_args: vec![],
-                                model_id: None,
+                                // Preserve the user's `/model` across a daemon
+                                // restart: re-spawn at the persisted (last-known)
+                                // model, not claude's default. `None` for a
+                                // never-run session (then claude picks default).
+                                model_id: ccteam_harness::persisted_session_model(
+                                    &snapshot.cwd,
+                                    &snapshot.id,
+                                ),
                                 permission_mode: snapshot.permission_mode,
                                 secret: snapshot.secret.clone(),
                             },

@@ -461,6 +461,18 @@ fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
     serde_json::from_str(&body).ok()
 }
 
+/// The last-known model for a session, from its persisted `status.json` (the
+/// status tap records every `/model` switch + the API model). The gateway uses
+/// this so a daemon-restart resume re-spawns at the model the user actually set
+/// (`/model opus[1m]`), not the role default — `--resume` otherwise reverts to
+/// claude's default model (the snapshot carries no live `set_model` state).
+/// `None` for a never-run session (a fresh `/new` keeps using the role model).
+pub fn persisted_session_model(project_dir: &Path, sid: &str) -> Option<String> {
+    read_status_file(project_dir, sid)
+        .and_then(|s| s.model)
+        .filter(|m| !m.trim().is_empty())
+}
+
 /// Read at most the trailing `max_bytes` of a file as a UTF-8 string (lossy).
 /// Bounds a `goal_status` scan so a huge transcript can't stall the statusline;
 /// a partial first line (when we seek mid-file) just fails to parse and is
