@@ -10,29 +10,32 @@
 
 loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的「看 + 管 + 谁的」底座** —— 两根柱子,loop 本身不在内,但每根现在就有用:
 
-- **柱 1 · 驾驶舱(看 + 管)** = 环境体检 + 舰队/成本视图 → 就是 loop 运维台的骨架,本版先显示 **session**,下一版 loop 直接 slot 进来。
+- **柱 1 · 控制台 + 接入(看 + 管)** = ① **Status 长成控制台**(每条 session 状态+成本;**不是新页,是旧 Status 长大**,「舰队」并入它)→ loop 运维台的骨架,下一版同一批行加「预言机/门」两列 ② **接入页**(原「环境体检」改名;agents 装机/连接 + **hostname**,per-host)。
 - **柱 2 · 身份(多用户档 0)** = ACL own-only + 个人 scope → 既治当前「会话串」,又是无人值守多用户 loop 的硬前置。
+
+> **去重(owner 反馈 1222)**:原稿把一个东西切成「环境 / 舰队 / Status」三页且重复。收敛成 **一个会长大的控制台(Status→fleet→loop 运维台,同一面)+ 一个接入页(setup,与 runtime 区分)**。原型 `v0818-real-shell.html` 的「预览 loop 版」按钮演示同一批行就地长出 loop 列。
 
 > 为什么是地基:loop 给 ccteam 的价值 = **看 + 管 + 卡门**。这两根柱子正是「看/管/身份」的底座。它们 ship 了,下一版 loop = 往现成驾驶舱里塞 loop + 加 on-ramp + oracle-diff 门,风险大降。
 
 ---
 
-## 柱 1 · 驾驶舱(看 + 管)
+## 柱 1 · 控制台 + 接入(看 + 管)
 
-### 1A. 环境体检 —— `GET /api/v1/environment`
+### 1A. Status 长成控制台(fleet)—— 不是新页,是旧 Status 长大
 
-把现在只探 `--version` 二态、写死 claude/codex 的 `capabilities.rs` 升级成真正的环境报告:每 vendor 一卡(装了吗 path+**version** / 登录了吗 / **ccteam MCP 注册了吗** / hook+settings / daemon home-drift)+ 红黄绿 + 缺啥给**可复制命令**。
+今天 `StatusView` 给的是一眼概览(daemon 健康 + 会话数 + **今日总成本**),看不到单条。本版把它**就地长成 fleet**:`会话` 卡列出每条 session 的状态 + **per-session 成本**(原稿叫「舰队」的内容,**并入 Status,不另开页** —— owner 1222 指出二者重复)。后端 = 扩 `GET /api/v1/status`(已有 sessions live/idle + 今日 cost/budget,补 per-session cost);前端 = 在现有 `StatusView` 的会话卡上加成本列。
 
+- **为 loop 准备(关键)**:这就是 loop 运维台的骨架。本版每行是 **session**;下一版 loop 在**同一批行**就地加两列「预言机 🟢🔴⏸ + 等哪道门」→ session 行变 loop 行。**同一个面,先建壳后填 loop**(原型「预览 loop 版」按钮演示)。
+- 现在就有用:一处看全 N 条 session 在跑啥 + 各花多少 + 卡预算(loop 来之前就值)。
+
+### 1B. 接入页(原「环境体检」改名)—— `GET /api/v1/environment`
+
+**setup 面,与 Status 的 runtime 面区分**(装没装/连没连 vs 在跑啥/花多少;前者很少变,后者一直变 —— 故二者不重复,但要讲清)。把现在只探 `--version` 二态、写死 claude/codex 的 `capabilities.rs` 升级成真正的环境报告,**per-host**:
+
+- 顶部 **hostname** 条(host 名 + 规格 + ccteam 版本/端口);每 agent 一卡(装了吗 path+**version** / 登录了吗 / **ccteam MCP 注册了吗** / hook+settings)+ 就绪/需配置/未安装 + 缺啥给**可复制命令**。卡内标注 agent 在**哪台 host**(`@hostname`)——将来多 host(host 轴)每台一页。
 - **唯一可从 web 写的** = ccteam 自己的足迹(一键注册 MCP,重跑 `ccteam config` 那段,幂等);**绝不**从 web 写 vendor 登录/key、**绝不**从 web 装 CLI(执行面红线)。
-- vendor-可扩展(`AgentVendor` + 每 vendor `ProbeSpec` 数据)+ 手动 re-probe(破 daemon-终身 cache)。
-- **为 loop 准备**:下一版「云端起跑一个 loop on vendor X」前,得先知道 X 装好/登录/可用。
-
-### 1B. 舰队 + 成本视图
-
-web 里一个真正的 fleet 视图:列**所有 session** 的状态(live/idle/活动)+ per-session/项目 **成本** + 今日 spend/budget。后端 = 扩 `GET /api/v1/status`(已有 sessions live/idle + 今日 cost/budget);前端 = 一个 fleet 卡片视图。
-
-- **为 loop 准备**:这就是 `loop-ops-console.html` 的骨架 —— 本版卡片显示 **session**(预言机/门那几栏先空着或 N/A),下一版 loop 把「预言机 🟢🔴⏸ + 等哪道门」填进同一批卡片。**先建壳,后填 loop。**
-- 现在就有用:你终于能一眼看全 N 个 session + 卡预算(loop 来之前就值)。
+- vendor-可扩展(`AgentVendor` + 每 vendor `ProbeSpec`)+ 手动 re-probe。
+- **为 loop 准备**:下一版「云端起跑一个 loop on vendor X@host Y」前,得先知道 X 在 Y 上装好/登录/可用。
 
 ---
 
@@ -51,8 +54,9 @@ web 里一个真正的 fleet 视图:列**所有 session** 的状态(live/idle/�
 
 | 做(本版) | 不做(留给 loop 版 / 不碰) |
 |---|---|
-| 环境体检(只读 + 仅写 ccteam 自身足迹) | ❌ 从 web 写 vendor 登录/装 CLI |
-| 舰队/成本视图(显示 session) | ❌ loop 运维台的 loop 专属栏(预言机/门)—— 下一版填 |
+| Status 长成控制台(per-session 成本,显示 session) | ❌ loop 运维台的 loop 专属栏(预言机/门)—— 下一版同行加 |
+| 接入页(per-host + hostname;只读 + 仅写 ccteam 自身足迹) | ❌ 从 web 写 vendor 登录/装 CLI |
+| — | ❌ 另开「舰队」页(并入 Status)· 另开「环境」页(改名接入) |
 | 多用户档 0(ACL own-only)+ 档 1 选配 | ❌ on-ramp(loop-skill 库 + 云端起跑)· oracle-diff 门 · loop 版本管理 —— 得有 loop 才有意义 |
 | — | ❌ 跨 vendor 路由 · 拆进程/沙箱 · 改 session 存储 |
 

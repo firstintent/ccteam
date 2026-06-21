@@ -3,16 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ccteam v0.8.18 · 真实 shell 原型</title>
-<!-- 基于真实 SPA:crates/ccteam-web/web/src(ChatConsole 壳 + StatusView 卡片样式)。
-     配色/字体/状态色全部照搬 index.css 的 @theme tokens —— 增量,不是重画。 -->
+<title>ccteam v0.8.18 · 会长大的控制台(真实 shell)</title>
+<!-- 基于真实 SPA crates/ccteam-web/web/src(ChatConsole 壳 + StatusView 卡片 + index.css @theme)。
+     一个会长大的控制台(Status→fleet→loop 运维台)+ 一个接入页。增量,不重画。 -->
 <style>
   :root{
-    /* —— 照搬 index.css @theme —— */
-    --surface-700:#3f3f46; --surface-800:#2c2c30; --surface-850:#262629;
-    --surface-900:#1c1c1f; --surface-950:#141416;
-    --brand-400:#fbbf24; --brand-500:#f59e0b; --brand-600:#d97706;
-    --accent-500:#14b8a6;
+    --surface-700:#3f3f46; --surface-800:#2c2c30; --surface-850:#262629; --surface-900:#1c1c1f; --surface-950:#141416;
+    --brand-400:#fbbf24; --brand-500:#f59e0b; --brand-600:#d97706; --accent-500:#14b8a6;
     --vendor-claude:#d97757; --vendor-codex:#10a37f;
     --text-primary:#e4e4e7; --text-secondary:#a1a1aa; --text-muted:#71717a; --text-dim:#52525b; --text-bright:#fafafa;
     --st-running:#22c55e; --st-waiting:#fbbf24; --st-idle:#71717a; --st-error:#ef4444;
@@ -20,119 +17,112 @@
     --font-mono:'Geist Mono',ui-monospace,'SFMono-Regular',monospace;
   }
   *{box-sizing:border-box}
-  body{margin:0;height:100vh;overflow:hidden;font-family:var(--font-sans);
-    background:var(--surface-900);color:var(--text-primary);
-    -webkit-font-smoothing:antialiased;display:flex;justify-content:center;align-items:center}
-  .app{width:1040px;height:680px;display:flex;border:1px solid var(--surface-700);border-radius:12px;
-    overflow:hidden;box-shadow:0 24px 70px -30px #000;background:var(--surface-900)}
+  body{margin:0;height:100vh;overflow:hidden;font-family:var(--font-sans);background:var(--surface-900);
+    color:var(--text-primary);-webkit-font-smoothing:antialiased;display:flex;justify-content:center;align-items:center}
+  .app{width:1060px;height:700px;display:flex;border:1px solid var(--surface-700);border-radius:12px;overflow:hidden;
+    box-shadow:0 24px 70px -30px #000;background:var(--surface-900)}
 
-  /* ===== sidebar (real: project→session tree + bottom global-nav) ===== */
-  .side{width:248px;flex:none;background:var(--surface-950);border-right:1px solid var(--surface-800);
-    display:flex;flex-direction:column}
+  /* sidebar */
+  .side{width:248px;flex:none;background:var(--surface-950);border-right:1px solid var(--surface-800);display:flex;flex-direction:column}
   .side-id{padding:11px 12px;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:8px}
   .av{width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,var(--brand-500),var(--brand-600));
     display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#1a1206;flex:none}
-  .id-name{font-size:13px;font-weight:600}
-  .id-sub{font-size:10px;color:var(--text-dim);font-family:var(--font-mono)}
-  .new-btn{margin:10px 12px 4px;display:flex;align-items:center;justify-content:center;gap:6px;
-    font-size:12.5px;font-weight:500;color:var(--text-bright);background:var(--surface-800);
-    border:1px solid var(--surface-700);border-radius:8px;padding:7px 0;cursor:pointer}
+  .id-name{font-size:13px;font-weight:600}.id-sub{font-size:10px;color:var(--text-dim);font-family:var(--font-mono)}
+  .new-btn{margin:10px 12px 4px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12.5px;font-weight:500;
+    color:var(--text-bright);background:var(--surface-800);border:1px solid var(--surface-700);border-radius:8px;padding:7px 0;cursor:pointer}
   .tree{flex:1;overflow-y:auto;padding:6px 8px}
   .tree-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);padding:8px 6px 4px}
   .proj{padding:5px 8px;border-radius:6px;font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:7px}
   .proj .fold{color:var(--text-dim);font-size:10px}
-  .sess-i{padding:4px 8px 4px 22px;border-radius:6px;font-size:11.5px;color:var(--text-muted);
-    display:flex;align-items:center;gap:7px;cursor:pointer}
-  .sess-i:hover{background:var(--surface-850)}
-  .sess-i.on{background:var(--surface-800);color:var(--text-primary)}
+  .sess-i{padding:4px 8px 4px 22px;border-radius:6px;font-size:11.5px;color:var(--text-muted);display:flex;align-items:center;gap:7px;cursor:pointer}
+  .sess-i:hover{background:var(--surface-850)}.sess-i.on{background:var(--surface-800);color:var(--text-primary)}
   .dot{width:7px;height:7px;border-radius:50%;flex:none}
   .dot.run{background:var(--st-running);box-shadow:0 0 6px var(--st-running)}
-  .dot.wait{background:var(--st-waiting)} .dot.idle{background:var(--st-idle)}
+  .dot.wait{background:var(--st-waiting)} .dot.idle{background:var(--st-idle)} .dot.red{background:var(--st-error)}
   .sid{font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);margin-left:auto}
-  .soft-note{margin:6px 10px;font-size:10px;line-height:1.5;color:var(--brand-400);
-    background:rgb(245 158 11 / .08);border:1px solid rgb(245 158 11 / .3);border-radius:6px;padding:7px 9px}
+  .soft-note{margin:6px 10px;font-size:10px;line-height:1.5;color:var(--brand-400);background:rgb(245 158 11 / .08);
+    border:1px solid rgb(245 158 11 / .3);border-radius:6px;padding:7px 9px}
   .nav{border-top:1px solid var(--surface-800);padding:6px 8px;display:flex;flex-direction:column;gap:1px}
-  .nav a{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-size:12.5px;
-    color:var(--text-secondary);cursor:pointer;text-decoration:none}
-  .nav a:hover{background:var(--surface-850)}
-  .nav a.on{background:var(--surface-800);color:var(--text-primary)}
+  .nav a{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-size:12.5px;color:var(--text-secondary);cursor:pointer;text-decoration:none}
+  .nav a:hover{background:var(--surface-850)} .nav a.on{background:var(--surface-800);color:var(--text-primary)}
   .nav a .ic{width:15px;text-align:center;font-size:13px;opacity:.85}
-  .nav a .new-pill{margin-left:auto;font-size:9px;font-weight:600;color:var(--brand-500);
-    border:1px solid rgb(245 158 11 / .35);border-radius:999px;padding:1px 6px}
+  .nav a .new-pill{margin-left:auto;font-size:9px;font-weight:600;color:var(--brand-500);border:1px solid rgb(245 158 11 / .35);border-radius:999px;padding:1px 6px}
 
-  /* ===== topbar ===== */
+  /* topbar */
   .main{flex:1;display:flex;flex-direction:column;min-width:0}
-  .top{height:46px;flex:none;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;
-    gap:10px;padding:0 14px;background:var(--surface-900)}
-  .crumb{font-size:13px;font-weight:600}
-  .crumb .dim{color:var(--text-dim);font-weight:400}
+  .top{height:46px;flex:none;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:10px;padding:0 14px;background:var(--surface-900)}
   .conn{width:7px;height:7px;border-radius:50%;background:var(--st-running);box-shadow:0 0 6px var(--st-running)}
-  .pill-cost{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--text-secondary);
-    background:var(--surface-850);border:1px solid var(--surface-700);border-radius:999px;padding:3px 10px}
-  .pill-cost b{color:var(--text-primary)}
-  .tabs{display:flex;gap:2px}
-  .tab{font-size:12px;color:var(--text-muted);padding:4px 10px;border-radius:6px}
-  .tab.on{background:var(--surface-800);color:var(--text-primary)}
+  .crumb{font-size:13px;font-weight:600}
+  .pill-cost{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--text-secondary);background:var(--surface-850);
+    border:1px solid var(--surface-700);border-radius:999px;padding:3px 10px} .pill-cost b{color:var(--text-primary)}
 
-  /* ===== content (real StatusView patterns) ===== */
+  /* content (real StatusView) */
   .scroll{flex:1;overflow-y:auto}
-  .page{padding:24px;max-width:880px;margin:0 auto}
+  .page{padding:22px 24px;max-width:860px;margin:0 auto}
   .page h2{font-size:16px;font-weight:600;margin:0;color:var(--text-primary)}
   .page .lede{margin:4px 0 0;font-size:13px;color:var(--text-secondary)}
-  .cards{margin-top:16px;display:flex;flex-direction:column;gap:12px}
+  .cards{margin-top:14px;display:flex;flex-direction:column;gap:12px}
   .card{border-radius:8px;background:var(--surface-900);border:1px solid rgb(63 63 70 / .6);padding:12px 16px}
   .card.dash{border-style:dashed;border-color:rgb(63 63 70 / .5)}
   .crow{display:flex;align-items:center;gap:10px}
   .cdot{width:10px;height:10px;border-radius:50%;flex:none}
-  .cdot.run{background:var(--st-running)} .cdot.wait{background:var(--st-waiting)}
-  .cdot.idle{background:var(--st-idle)} .cdot.err{background:var(--st-error)}
-  .cname{font-size:14px;font-weight:500}
+  .cdot.run{background:var(--st-running)} .cdot.wait{background:var(--st-waiting)} .cdot.idle{background:var(--st-idle)} .cdot.err{background:var(--st-error)}
+  .cname{font-size:14px;font-weight:500} .vend-claude{color:var(--vendor-claude)} .vend-codex{color:var(--vendor-codex)}
   .csub{font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);margin-top:2px}
-  .vend-claude{color:var(--vendor-claude)} .vend-codex{color:var(--vendor-codex)}
-  .pill{margin-left:auto;font-size:11px;font-weight:500;padding:2px 9px;border-radius:999px}
-  .pill.run{background:rgb(34 197 94 / .15);color:var(--st-running)}
-  .pill.wait{background:rgb(251 191 36 / .15);color:var(--st-waiting)}
-  .pill.amber{background:rgb(245 158 11 / .15);color:var(--brand-400)}
-  .pill.idle{background:rgb(113 113 122 / .15);color:var(--text-muted)}
-  .pill.err{background:rgb(239 68 68 / .15);color:var(--st-error)}
+  .pill{font-size:11px;font-weight:500;padding:2px 9px;border-radius:999px}
+  .pill.run{background:rgb(34 197 94 / .15);color:var(--st-running)} .pill.wait{background:rgb(251 191 36 / .15);color:var(--st-waiting)}
+  .pill.idle{background:rgb(113 113 122 / .15);color:var(--text-muted)} .pill.err{background:rgb(239 68 68 / .15);color:var(--st-error)}
   .checks{margin-top:11px;display:flex;flex-direction:column;gap:6px}
   .ck{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:var(--text-secondary)}
-  .ck .m{width:13px;text-align:center;flex:none;font-weight:600}
-  .ck.ok .m{color:var(--st-running)} .ck.no .m{color:var(--brand-400)}
-  .ck code,.mono{font-family:var(--font-mono);font-size:11px}
+  .ck .m{width:13px;text-align:center;flex:none;font-weight:600}.ck.ok .m{color:var(--st-running)}.ck.no .m{color:var(--brand-400)}
+  code,.mono{font-family:var(--font-mono);font-size:11px}
   .fix{margin:3px 0 0 21px;display:flex;align-items:center;gap:8px}
-  .cmd{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);background:var(--surface-950);
-    border:1px solid var(--surface-700);border-radius:6px;padding:3px 8px}
-  .mini{font-size:10.5px;color:var(--text-secondary);background:var(--surface-800);border:1px solid var(--surface-700);
-    border-radius:6px;padding:3px 8px;cursor:pointer}
+  .cmd{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);background:var(--surface-950);border:1px solid var(--surface-700);border-radius:6px;padding:3px 8px}
+  .mini{font-size:10.5px;color:var(--text-secondary);background:var(--surface-800);border:1px solid var(--surface-700);border-radius:6px;padding:3px 8px;cursor:pointer}
   .mini.act{color:#1a1206;background:var(--brand-500);border-color:var(--brand-500)}
-  .meta{margin-top:10px;padding-top:9px;border-top:1px solid var(--surface-800);display:flex;gap:16px;
-    font-size:11px;color:var(--text-muted)}
-  .meta b{color:var(--text-primary)}
+  .meta{margin-top:10px;padding-top:9px;border-top:1px solid var(--surface-800);display:flex;gap:16px;font-size:11px;color:var(--text-muted)} .meta b{color:var(--text-primary)}
   .note{font-size:10.5px;color:var(--text-dim);margin:3px 0 0 21px}
 
+  .cardhead{display:flex;align-items:center;font-size:13px;font-weight:500;margin-bottom:6px}
+  .togg{margin-left:auto;font-size:10.5px;color:var(--accent-500);background:rgb(20 184 166 / .1);border:1px solid rgb(20 184 166 / .3);
+    border-radius:999px;padding:3px 10px;cursor:pointer;user-select:none}
+  .togg.on{color:#06231d;background:var(--accent-500);border-color:var(--accent-500)}
   /* fleet rows = StatusView session lines */
-  .frow{display:flex;align-items:center;gap:10px;font-size:12.5px;padding:9px 0;border-bottom:1px solid rgb(28 28 31 / .6)}
+  .frow{display:flex;align-items:center;gap:10px;font-size:12.5px;padding:9px 2px;border-bottom:1px solid rgb(28 28 31 / .6)}
   .frow:last-child{border-bottom:none}
   .fproj{font-family:var(--font-mono);font-size:11.5px;color:var(--text-dim)}
-  .fcost{font-family:var(--font-mono);font-size:11.5px;color:var(--text-primary);margin-left:6px}
-  .future{margin-top:14px;font-size:11px;color:var(--text-dim);background:rgb(20 184 166 / .06);
-    border:1px solid rgb(20 184 166 / .25);border-radius:8px;padding:9px 12px;line-height:1.55}
-  .future b{color:var(--accent-500)}
+  .fcost{font-family:var(--font-mono);font-size:11.5px;color:var(--text-primary)}
+  .colhdr{display:flex;align-items:center;gap:10px;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim);padding:0 2px 6px}
+  .grow{flex:1}
+  /* loop preview columns — hidden until toggled */
+  .loopcol{display:none;align-items:center;gap:5px;font-size:11px}
+  .show-loop .loopcol{display:flex}
+  .show-loop .frow{background:rgb(20 184 166 / .03)}
+  .gate-tag{font-size:10px;color:var(--st-waiting);background:rgb(251 191 36 / .14);border-radius:5px;padding:1px 6px}
+  .gate-tag.none{color:var(--text-dim);background:transparent}
+  .loop-cap{margin-top:10px;font-size:11px;color:var(--text-dim);background:rgb(20 184 166 / .06);border:1px solid rgb(20 184 166 / .25);
+    border-radius:8px;padding:9px 12px;line-height:1.55;display:none} .show-loop .loop-cap{display:block} .loop-cap b{color:var(--accent-500)}
+
+  .roadmap{margin-top:14px;display:flex;gap:8px}
+  .rm{flex:1;border-radius:8px;border:1px solid var(--surface-800);background:var(--surface-950);padding:10px 11px}
+  .rm.now{border-color:rgb(245 158 11 / .4)} .rm .t{font-size:11px;font-weight:600;margin-bottom:4px}
+  .rm.now .t{color:var(--brand-400)} .rm .d{font-size:10.5px;color:var(--text-muted);line-height:1.5}
+  .rm .tag{font-size:9px;color:var(--text-dim);font-family:var(--font-mono)}
+
+  .hostbar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-secondary);
+    background:var(--surface-950);border:1px solid var(--surface-800);border-radius:8px;padding:9px 13px;margin-bottom:4px}
+  .hostbar .hn{font-family:var(--font-mono);color:var(--text-primary);font-weight:500}
   .hide{display:none}
 </style>
 </head>
 <body>
 <div class="app">
 
-  <!-- ============ SIDEBAR (real shell) ============ -->
+  <!-- SIDEBAR -->
   <aside class="side">
-    <div class="side-id">
-      <span class="av">A</span>
-      <div><div class="id-name">@alice</div><div class="id-sub">经 Telegram 配对</div></div>
-    </div>
+    <div class="side-id"><span class="av">A</span>
+      <div><div class="id-name">@alice</div><div class="id-sub">经 Telegram 配对</div></div></div>
     <div class="new-btn">＋ 新建 session</div>
-
     <div class="tree">
       <div class="tree-label">我的项目</div>
       <div class="proj"><span class="fold">▾</span> excore</div>
@@ -140,127 +130,136 @@
       <div class="sess-i"><span class="dot idle"></span> s33 · 空闲 <span class="sid">s33</span></div>
       <div class="proj"><span class="fold">▾</span> lap</div>
       <div class="sess-i"><span class="dot wait"></span> s28 · 等输入 <span class="sid">s28</span></div>
-      <div class="soft-note">⚠ 软隔离·非安全 —— 你只看见自己的项目;@bob 的不列(同 uid 磁盘仍互读)。</div>
+      <div class="soft-note">⚠ 软隔离·非安全 —— 只列你自己的项目;@bob 的不列(同 uid 磁盘仍互读)。</div>
     </div>
-
     <nav class="nav">
       <a onclick="nav('market',this)"><span class="ic">🧩</span> 插件市场</a>
-      <a class="on" onclick="nav('env',this)"><span class="ic">🩺</span> 环境 <span class="new-pill">NEW</span></a>
-      <a onclick="nav('fleet',this)"><span class="ic">📡</span> 舰队 <span class="new-pill">NEW</span></a>
-      <a onclick="nav('status',this)"><span class="ic">📊</span> Status</a>
+      <a class="on" onclick="nav('console',this)"><span class="ic">📊</span> Status</a>
+      <a onclick="nav('access',this)"><span class="ic">🔌</span> 接入 <span class="new-pill">NEW</span></a>
       <a onclick="nav('set',this)"><span class="ic">⚙️</span> Settings</a>
     </nav>
   </aside>
 
-  <!-- ============ MAIN ============ -->
+  <!-- MAIN -->
   <div class="main">
-    <div class="top">
-      <span class="conn"></span>
-      <span class="crumb" id="crumb">环境 · 体检</span>
-      <span class="pill-cost">今日 <b>$4.21</b> / $20</span>
-    </div>
-
+    <div class="top"><span class="conn"></span><span class="crumb" id="crumb">Status · 控制台</span>
+      <span class="pill-cost">今日 <b>$4.21</b> / $20</span></div>
     <div class="scroll">
 
-      <!-- ENV (柱1A) -->
-      <div class="page" id="p-env">
-        <h2>环境 · 体检</h2>
-        <p class="lede">每个 agent 装没装好、登录没、连没连上 ccteam —— 取代逐个进终端查。</p>
+      <!-- CONSOLE = Status 长大(fleet) -->
+      <div class="page" id="p-console">
+        <h2>Status · 控制台</h2>
+        <p class="lede">daemon + 所有 session 在跑啥 + 各花多少。本版把旧 Status(只有总数/总成本)长成 fleet —— 看得到、管得了单条。</p>
         <div class="cards">
           <div class="card">
-            <div class="crow">
-              <span class="cdot run"></span>
-              <div><div class="cname">Claude Code <span class="vend-claude" style="font-size:11px">claude</span></div>
-                <div class="csub">claude v2.1.185 · ~/.local/bin/claude</div></div>
-              <span class="pill run">就绪</span>
+            <div class="crow"><span class="cdot run"></span><span class="cname">daemon healthy</span>
+              <span class="pill run" style="margin-left:auto">MCP sock OK</span></div>
+          </div>
+
+          <div class="card" id="fleet-card">
+            <div class="cardhead">会话（2 live · 1 idle）
+              <span class="togg" id="lt" onclick="toggleLoop()">预览 loop 版 ▸</span></div>
+            <div class="colhdr"><span style="width:7px"></span><span class="fproj" style="width:54px">项目</span>
+              <span style="width:96px">agent · sid</span><span class="loopcol" style="width:54px">预言机</span>
+              <span class="loopcol" style="width:70px">等门</span><span class="grow"></span><span style="width:48px">成本</span><span style="width:50px">状态</span></div>
+            <div id="fleet-rows">
+              <div class="frow"><span class="dot run"></span><span class="fproj" style="width:54px">excore</span>
+                <span class="vend-claude" style="width:96px">claude · s31</span>
+                <span class="loopcol" style="width:54px"><span class="dot run"></span>🟢 绿</span>
+                <span class="loopcol gate-tag none" style="width:70px">—</span>
+                <span class="grow"></span><span class="fcost" style="width:48px">$2.83</span><span class="pill run">working</span></div>
+
+              <div class="frow"><span class="dot wait"></span><span class="fproj" style="width:54px">lap</span>
+                <span class="vend-claude" style="width:96px">claude · s28</span>
+                <span class="loopcol" style="width:54px"><span class="dot red"></span>🔴 红</span>
+                <span class="loopcol" style="width:70px"><span class="gate-tag">⏸ 合并?</span></span>
+                <span class="grow"></span><span class="fcost" style="width:48px">$1.05</span><span class="pill wait">等输入</span></div>
+
+              <div class="frow"><span class="dot idle"></span><span class="fproj" style="width:54px">excore</span>
+                <span class="vend-codex" style="width:96px">codex · s33</span>
+                <span class="loopcol" style="width:54px">—</span>
+                <span class="loopcol gate-tag none" style="width:70px">—</span>
+                <span class="grow"></span><span class="fcost" style="width:48px">$0.33</span><span class="pill idle">idle</span></div>
             </div>
+            <div class="loop-cap">📡 <b>「预言机 / 等门」两列 loop 版才填。</b> session 行就地变 loop 行 —— 同一个控制台,不是新页面。这就是「舰队=loop 运维台骨架」的意思:先建壳(显示 session),后填 loop。</div>
+          </div>
+
+          <div class="card">
+            <div class="crow"><span class="cname">今日成本</span>
+              <b style="margin-left:auto;font-family:var(--font-mono);font-size:14px">$4.21 <span style="color:var(--text-dim);font-weight:400">/ $20</span></b></div>
+            <div style="margin-top:6px;font-size:12px;color:var(--text-secondary)"><span class="vend-claude">claude $3.88</span> · <span class="vend-codex">codex $0.33</span></div>
+          </div>
+        </div>
+
+        <div class="roadmap">
+          <div class="rm"><div class="t">今天</div><div class="d">Status 概览:daemon + 会话数 + 今日总成本</div><div class="tag">已有</div></div>
+          <div class="rm now"><div class="t">v0.8.18 ←本版</div><div class="d">长成 fleet:每条 session 状态+成本,identity scope</div><div class="tag">控制台</div></div>
+          <div class="rm"><div class="t">loop 版</div><div class="d">同 fleet 加「预言机 + 等门」两列,session 行→loop 行</div><div class="tag">loop 运维台</div></div>
+        </div>
+      </div>
+
+      <!-- ACCESS = 接入(原 环境,改名 + hostname) -->
+      <div class="page hide" id="p-access">
+        <h2>接入</h2>
+        <p class="lede">哪些 agent / MCP 接进来了(装没装 / 登录 / 连上)。注意:这是 setup(很少变),不是 Status 的 runtime(一直变)。</p>
+        <div class="hostbar">🖥 host <span class="hn" id="hn">cloud-sg-1</span> · 4 vCPU · linux · ccteam 0.8.18 :7331
+          <span style="margin-left:auto;font-size:10.5px;color:var(--text-dim)">将来多 host → 每台一页</span></div>
+        <div class="cards">
+          <div class="card">
+            <div class="crow"><span class="cdot run"></span>
+              <div><div class="cname">Claude Code <span class="vend-claude" style="font-size:11px">claude</span></div>
+                <div class="csub">claude v2.1.185 · /home/ubuntu/.local/bin/claude · @cloud-sg-1</div></div>
+              <span class="pill run" style="margin-left:auto">就绪</span></div>
             <div class="checks">
               <div class="ck ok"><span class="m">✓</span><span>已登录 (oauth)</span></div>
               <div class="ck ok"><span class="m">✓</span><span>ccteam MCP 已注册 <code>~/.claude.json</code></span></div>
-              <div class="ck ok"><span class="m">✓</span><span>hook 段已写入 <code>settings.local.json</code></span></div>
             </div>
-            <div class="meta"><span>默认模型 <b>opus-4-8[1m]</b></span><span>effort <b>max</b></span></div>
           </div>
-
           <div class="card">
-            <div class="crow">
-              <span class="cdot wait"></span>
+            <div class="crow"><span class="cdot wait"></span>
               <div><div class="cname">Codex <span class="vend-codex" style="font-size:11px">codex</span></div>
-                <div class="csub">codex v0.42 · ~/.local/bin/codex</div></div>
-              <span class="pill wait">需配置</span>
-            </div>
+                <div class="csub">codex v0.42 · /home/ubuntu/.local/bin/codex · @cloud-sg-1</div></div>
+              <span class="pill wait" style="margin-left:auto">需配置</span></div>
             <div class="checks">
-              <div class="ck no"><span class="m">✗</span><span>未登录</span></div>
-              <div class="fix"><span class="cmd">codex login</span><span class="mini" onclick="cp(this)">复制</span></div>
-              <div class="note">登录是 vendor 身份 —— ccteam 只给命令,不替你跑</div>
-              <div class="ck no" id="cx-mcp"><span class="m">✗</span><span>ccteam MCP 未注册</span></div>
-              <div class="fix" id="cx-fix"><span class="cmd">ccteam config</span><span class="mini" onclick="cp(this)">复制</span><span class="mini" onclick="reg()">一键注册</span></div>
-              <div class="note">唯一能从 web 一键写的 = ccteam 自己的足迹</div>
+              <div class="ck no"><span class="m">✗</span><span>未登录 → <span class="cmd">codex login</span> <span class="mini" onclick="cp(this)">复制</span></span></div>
+              <div class="ck no" id="cx-mcp"><span class="m">✗</span><span>ccteam MCP 未注册 → <span class="cmd">ccteam config</span> <span class="mini" onclick="cp(this)">复制</span> <span class="mini" onclick="reg()">一键注册</span></span></div>
             </div>
+            <div class="note" style="margin-left:0">登录是 vendor 身份(只给命令);MCP 注册是 ccteam 自己的足迹(唯一可一键写)。</div>
           </div>
-
           <div class="card dash">
-            <div class="crow">
-              <span class="cdot idle"></span>
-              <div><div class="cname">Gemini CLI</div><div class="csub">未在 PATH 找到 gemini</div></div>
-              <span class="pill idle">未安装</span>
-            </div>
-            <div class="fix" style="margin-left:0;margin-top:10px"><span class="cmd">npm i -g @google/gemini-cli</span><span class="mini" onclick="cp(this)">复制</span></div>
-            <div class="note" style="margin-left:0">装好点右上「重新探测」即就绪;ccteam 不替你装</div>
-          </div>
-
-          <div class="card">
-            <div class="crow">
-              <span class="cdot run"></span>
-              <div><div class="cname">ccteam daemon</div><div class="csub">0.8.18 · uptime 4h · :7331</div></div>
-              <span class="pill run">健康</span>
-            </div>
-            <div class="checks">
-              <div class="ck ok"><span class="m">✓</span><span>~/.ccteam 布局规范 <span class="mono" style="color:var(--text-dim)">无 home-drift</span></span></div>
-              <div class="ck ok"><span class="m">✓</span><span>MCP 工具面完整 <span class="mono" style="color:var(--text-dim)">15/15 · 0 stub</span></span></div>
-            </div>
+            <div class="crow"><span class="cdot idle"></span>
+              <div><div class="cname">Gemini CLI</div><div class="csub">未在 @cloud-sg-1 的 PATH 找到 gemini</div></div>
+              <span class="pill idle" style="margin-left:auto">未安装</span></div>
+            <div class="fix" style="margin-left:0;margin-top:8px"><span class="cmd">npm i -g @google/gemini-cli</span><span class="mini" onclick="cp(this)">复制</span></div>
           </div>
         </div>
       </div>
 
-      <!-- FLEET (柱1B) -->
-      <div class="page hide" id="p-fleet">
-        <h2>舰队 · 今日</h2>
-        <p class="lede">所有 session 的状态 + 成本一眼看全(扩 GET /api/v1/status)。</p>
-        <div class="cards">
-          <div class="card">
-            <div class="crow"><span class="cname">今日成本</span><b class="fcost" style="margin-left:auto;font-size:14px">$4.21 <span style="color:var(--text-dim);font-weight:400">/ $20</span></b></div>
-            <div style="margin-top:8px;font-size:12px;color:var(--text-secondary)"><span class="vend-claude">claude $3.88</span> · <span class="vend-codex">codex $0.33</span></div>
-          </div>
-          <div class="card">
-            <div style="font-size:13px;font-weight:500;margin-bottom:4px">会话（2 live · 1 idle）</div>
-            <div class="frow"><span class="dot run"></span><span class="fproj">excore</span><span class="vend-claude">claude · s31</span><span class="fcost">$2.83</span><span class="pill run">working</span></div>
-            <div class="frow"><span class="dot wait"></span><span class="fproj">lap</span><span class="vend-claude">claude · s28</span><span class="fcost">$1.05</span><span class="pill wait">等输入</span></div>
-            <div class="frow"><span class="dot idle"></span><span class="fproj">excore</span><span class="vend-codex">codex · s33</span><span class="fcost">$0.33</span><span class="pill idle">idle</span></div>
-          </div>
-          <div class="future">📡 <b>这就是 loop 运维台的骨架。</b> 本版卡片显示 session;下一版 loop 把「预言机 🟢🔴⏸ + 等哪道门」填进**同一批卡片** —— 同一个视图,先建壳后填 loop。</div>
-        </div>
-      </div>
-
-      <div class="page hide" id="p-status"><h2>Status · 运维总览</h2><p class="lede">已存在,不动(daemon 健康 + 会话 + 今日成本)。</p></div>
       <div class="page hide" id="p-market"><h2>插件市场</h2><p class="lede">已存在,不动。</p></div>
       <div class="page hide" id="p-set"><h2>Settings</h2><p class="lede">已存在,不动(IM token · 偏好 · 预算)。</p></div>
-
     </div>
   </div>
 </div>
 
 <script>
-  var titles={env:'环境 · 体检',fleet:'舰队 · 今日',status:'Status · 运维总览',market:'插件市场',set:'Settings'};
+  var titles={console:'Status · 控制台',access:'接入',market:'插件市场',set:'Settings'};
   function nav(id,el){
-    ['env','fleet','status','market','set'].forEach(k=>document.getElementById('p-'+k).classList.add('hide'));
+    ['console','access','market','set'].forEach(k=>document.getElementById('p-'+k).classList.add('hide'));
     document.getElementById('p-'+id).classList.remove('hide');
-    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on'));
-    el.classList.add('on'); document.getElementById('crumb').textContent=titles[id];
-    document.querySelector('.scroll').scrollTop=0;
+    document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on')); el.classList.add('on');
+    document.getElementById('crumb').textContent=titles[id]; document.querySelector('.scroll').scrollTop=0;
+  }
+  function toggleLoop(){
+    var c=document.getElementById('fleet-card'),b=document.getElementById('lt');
+    c.classList.toggle('show-loop');
+    var on=c.classList.contains('show-loop');
+    b.classList.toggle('on',on); b.textContent=on?'◂ 收起 loop 列':'预览 loop 版 ▸';
   }
   function cp(el){var o=el.textContent;el.textContent='已复制';el.classList.add('act');setTimeout(()=>{el.textContent=o;el.classList.remove('act')},1000)}
-  function reg(){var r=document.getElementById('cx-mcp');r.classList.remove('no');r.classList.add('ok');r.querySelector('.m').textContent='✓';r.querySelector('span:last-child').innerHTML='ccteam MCP 已注册 <code>~/.codex/config.toml</code>';document.getElementById('cx-fix').style.display='none';document.querySelector('#p-env .pill.wait').className='pill run';document.querySelector('#p-env .pill.run').textContent='就绪';document.querySelector('#p-env .cdot.wait').className='cdot run'}
+  function reg(){var r=document.getElementById('cx-mcp');r.classList.remove('no');r.classList.add('ok');r.querySelector('.m').textContent='✓';
+    r.querySelector('span:last-child').innerHTML='ccteam MCP 已注册 <code>~/.codex/config.toml</code>';
+    document.querySelector('#p-access .pill.wait').className='pill run';document.querySelector('#p-access .pill.run').textContent='就绪';
+    document.querySelector('#p-access .cdot.wait').className='cdot run'}
 </script>
 </body>
 </html>
