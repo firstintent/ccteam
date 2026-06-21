@@ -44,6 +44,29 @@ pub enum Outbound {
     Other,
 }
 
+/// Deserialize a slash-command table claude sends as EITHER a bare string
+/// array OR an array of `{name,…}` objects (the `system:commands_changed`
+/// form). Extracts each name; anything else is skipped. Tolerant by design — a
+/// command-table line must never fail the whole transport parse (the bug this
+/// fixes: `commands` objects parsed into `Vec<String>` → "expected a string").
+fn de_command_names<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    c.as_str()
+                        .map(String::from)
+                        .or_else(|| c.get("name").and_then(Value::as_str).map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// `system` message body. Only `subtype: "init"` is meaningful today.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SystemMsg {
@@ -56,7 +79,11 @@ pub struct SystemMsg {
     /// The slash-command table claude exposes for this session — names
     /// only (dialog/local-jsx commands are already filtered out by the
     /// CLI). The bridge gate (Wave 2) keys known-vs-unknown off this.
-    #[serde(default, alias = "commands")]
+    /// claude sends `commands` as an array of OBJECTS (`{name,description,…}`),
+    /// e.g. in a stdout `system:commands_changed` line — `de_command_names`
+    /// accepts that (extracting `.name`) AND a bare string array, so neither
+    /// form trips a parse failure.
+    #[serde(default, alias = "commands", deserialize_with = "de_command_names")]
     pub slash_commands: Vec<String>,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -240,6 +267,24 @@ mod tests {
                 assert!(s.is_init());
                 assert_eq!(s.session_id, "u-1");
                 assert!(s.slash_commands.contains(&"compact".to_string()));
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_commands_changed_object_array_without_failing() {
+        // Regression: claude sends `system:commands_changed` with `commands` as
+        // an array of OBJECTS — it must parse (extracting names), not fail the
+        // transport with "invalid type: map, expected a string".
+        let line = r#"{"type":"system","subtype":"commands_changed","commands":[
+            {"name":"goal","description":"Set a goal","argumentHint":""},
+            {"name":"review","description":"Review a PR","argumentHint":""}]}"#;
+        let out: Outbound = serde_json::from_str(line).expect("must parse, not error");
+        match out {
+            Outbound::System(s) => {
+                assert_eq!(s.subtype, "commands_changed");
+                assert_eq!(s.slash_commands, vec!["goal".to_string(), "review".to_string()]);
             }
             other => panic!("expected System, got {other:?}"),
         }
