@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ccteam v0.8.18 · 多用户体验走查(真实 shell)</title>
+<!-- 基于真实 SPA(ChatConsole 壳 + StatusView 卡片 + index.css @theme)。
+     让你「体验」多用户:新用户首次登录 → 用起来 → 切到另一个用户看完全不同的私有世界。 -->
+<style>
+  :root{
+    --surface-700:#3f3f46; --surface-800:#2c2c30; --surface-850:#262629; --surface-900:#1c1c1f; --surface-950:#141416;
+    --brand-400:#fbbf24; --brand-500:#f59e0b; --brand-600:#d97706; --accent-500:#14b8a6;
+    --vendor-claude:#d97757; --vendor-codex:#10a37f;
+    --text-primary:#e4e4e7; --text-secondary:#a1a1aa; --text-muted:#71717a; --text-dim:#52525b; --text-bright:#fafafa;
+    --st-running:#22c55e; --st-waiting:#fbbf24; --st-idle:#71717a; --st-error:#ef4444;
+    --font-sans:'Geist Sans',system-ui,-apple-system,sans-serif;
+    --font-mono:'Geist Mono',ui-monospace,'SFMono-Regular',monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;font-family:var(--font-sans);background:var(--surface-950);
+    color:var(--text-primary);-webkit-font-smoothing:antialiased;display:flex;flex-direction:column;align-items:center;gap:14px;padding:20px}
+
+  /* demo control bar (clearly a mockup control) */
+  .demo{display:flex;align-items:center;gap:10px;background:var(--surface-900);border:1px solid var(--surface-700);
+    border-radius:10px;padding:9px 14px;font-size:12.5px}
+  .demo .lbl{color:var(--text-dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
+  .demo button{font-family:var(--font-sans);font-size:12.5px;color:var(--text-secondary);background:var(--surface-850);
+    border:1px solid var(--surface-700);border-radius:7px;padding:6px 12px;cursor:pointer}
+  .demo button.on{color:var(--text-bright);background:var(--surface-800);border-color:var(--brand-600)}
+  .demo .who{margin-left:6px;color:var(--text-dim)}
+  .demo .who b{color:var(--brand-400)}
+
+  .app{width:1040px;height:600px;display:flex;border:1px solid var(--surface-700);border-radius:12px;overflow:hidden;
+    box-shadow:0 24px 70px -30px #000;background:var(--surface-900)}
+  .side{width:244px;flex:none;background:var(--surface-950);border-right:1px solid var(--surface-800);display:flex;flex-direction:column}
+  .side-id{padding:11px 12px;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:8px}
+  .av{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#1a1206;flex:none}
+  .av.bob{background:linear-gradient(135deg,#5aa6f0,#3b82c4)} .av.alice{background:linear-gradient(135deg,var(--brand-500),var(--brand-600))}
+  .id-name{font-size:13px;font-weight:600}.id-sub{font-size:10px;color:var(--text-dim);font-family:var(--font-mono)}
+  .new-btn{margin:10px 12px 4px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12.5px;font-weight:500;
+    color:var(--text-bright);background:var(--surface-800);border:1px solid var(--surface-700);border-radius:8px;padding:7px 0;cursor:pointer}
+  .tree{flex:1;overflow-y:auto;padding:6px 8px}
+  .tree-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);padding:8px 6px 4px}
+  .proj{padding:5px 8px;border-radius:6px;font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:7px}
+  .proj .fold{color:var(--text-dim);font-size:10px}
+  .sess-i{padding:4px 8px 4px 22px;border-radius:6px;font-size:11.5px;color:var(--text-muted);display:flex;align-items:center;gap:7px}
+  .sess-i.on{background:var(--surface-800);color:var(--text-primary)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dot.run{background:var(--st-running);box-shadow:0 0 6px var(--st-running)} .dot.wait{background:var(--st-waiting)} .dot.idle{background:var(--st-idle)}
+  .sid{font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);margin-left:auto}
+  .empty-tree{margin:14px 10px;font-size:11.5px;color:var(--text-dim);text-align:center;line-height:1.6}
+  .soft-note{margin:6px 10px;font-size:10px;line-height:1.5;color:var(--brand-400);background:rgb(245 158 11 / .08);
+    border:1px solid rgb(245 158 11 / .3);border-radius:6px;padding:7px 9px}
+  .nav{border-top:1px solid var(--surface-800);padding:6px 8px;display:flex;flex-direction:column;gap:1px}
+  .nav a{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:7px;font-size:12px;color:var(--text-secondary)}
+  .nav a.on{background:var(--surface-800);color:var(--text-primary)} .nav a .ic{width:14px;text-align:center;font-size:12px;opacity:.85}
+
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .top{height:44px;flex:none;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:10px;padding:0 14px}
+  .conn{width:7px;height:7px;border-radius:50%;background:var(--st-running);box-shadow:0 0 6px var(--st-running)}
+  .crumb{font-size:13px;font-weight:600}
+  .pill-cost{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--text-secondary);background:var(--surface-850);
+    border:1px solid var(--surface-700);border-radius:999px;padding:3px 10px} .pill-cost b{color:var(--text-primary)}
+  .scroll{flex:1;overflow-y:auto;padding:22px 24px}
+  .page{max-width:760px;margin:0 auto}
+  .page h2{font-size:16px;font-weight:600;margin:0;color:var(--text-primary)}
+  .lede{margin:4px 0 0;font-size:13px;color:var(--text-secondary)}
+  .cards{margin-top:14px;display:flex;flex-direction:column;gap:12px}
+  .card{border-radius:8px;background:var(--surface-900);border:1px solid rgb(63 63 70 / .6);padding:12px 16px}
+  .frow{display:flex;align-items:center;gap:10px;font-size:12.5px;padding:9px 2px;border-bottom:1px solid rgb(28 28 31 / .6)}
+  .frow:last-child{border-bottom:none}
+  .fproj{font-family:var(--font-mono);font-size:11.5px;color:var(--text-dim)}
+  .fcost{font-family:var(--font-mono);font-size:11.5px;color:var(--text-primary);margin-left:auto}
+  .vend-claude{color:var(--vendor-claude)} .vend-codex{color:var(--vendor-codex)}
+  .pill{font-size:11px;font-weight:500;padding:2px 9px;border-radius:999px;margin-left:8px}
+  .pill.run{background:rgb(34 197 94 / .15);color:var(--st-running)} .pill.wait{background:rgb(251 191 36 / .15);color:var(--st-waiting)} .pill.idle{background:rgb(113 113 122 / .15);color:var(--text-muted)}
+
+  /* onboarding steps (scene 1) */
+  .ob{border-radius:8px;background:var(--surface-900);border:1px solid var(--surface-700);padding:16px 18px}
+  .ob h3{margin:0 0 2px;font-size:14px}
+  .ob .sub{font-size:12px;color:var(--text-secondary);margin-bottom:12px}
+  .step{display:flex;gap:11px;padding:9px 0;border-top:1px solid var(--surface-800)}
+  .step:first-of-type{border-top:none}
+  .step .n{width:20px;height:20px;border-radius:50%;background:var(--surface-800);border:1px solid var(--surface-700);
+    color:var(--brand-400);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none}
+  .step .b{font-size:12.5px;color:var(--text-secondary);line-height:1.5}
+  .step .b b{color:var(--text-primary)}
+  .step code{font-family:var(--font-mono);font-size:11px;color:#cfe2ff;background:var(--surface-950);border:1px solid var(--surface-700);border-radius:5px;padding:1px 5px}
+  .login-card{border-radius:8px;background:var(--surface-900);border:1px solid var(--surface-700);padding:18px;text-align:center;max-width:420px;margin:24px auto}
+  .login-card .t{font-size:14px;font-weight:600} .login-card .u{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin:8px 0 14px;word-break:break-all}
+  .login-card button{font-family:var(--font-sans);font-size:13px;font-weight:600;color:#1a1206;background:var(--brand-500);border:none;border-radius:8px;padding:9px 18px;cursor:pointer}
+  .tip{font-size:11px;color:var(--text-dim);margin-top:14px;text-align:center}
+  .flash{animation:fl .5s ease}@keyframes fl{from{background:rgb(34 197 94 / .12)}to{background:transparent}}
+</style>
+</head>
+<body>
+
+  <div class="demo">
+    <span class="lbl">演示视角</span>
+    <button id="b-new" class="on" onclick="scene('new')">① 新用户首次</button>
+    <button id="b-bob" onclick="scene('bob')">② @bob 的世界</button>
+    <button id="b-alice" onclick="scene('alice')">⇄ 切到 @alice</button>
+    <span class="who" id="who">你现在看的是:<b>新用户 bob 首次登录</b></span>
+  </div>
+
+  <div class="app">
+    <aside class="side">
+      <div class="side-id"><span class="av bob" id="av">B</span>
+        <div><div class="id-name" id="idname">@bob</div><div class="id-sub" id="idsub">经 Telegram 配对</div></div></div>
+      <div class="new-btn">＋ 新建 session</div>
+      <div class="tree" id="tree"></div>
+      <nav class="nav">
+        <a><span class="ic">🧩</span> 插件市场</a>
+        <a class="on"><span class="ic">📊</span> Status</a>
+        <a><span class="ic">🔌</span> 接入</a>
+        <a><span class="ic">⚙️</span> Settings</a>
+      </nav>
+    </aside>
+    <div class="main">
+      <div class="top"><span class="conn"></span><span class="crumb" id="crumb">首次登录</span>
+        <span class="pill-cost" id="cost">今日 <b>$0.00</b> / $20</span></div>
+      <div class="scroll" id="scroll"></div>
+    </div>
+  </div>
+
+  <div style="max-width:1040px;font-size:11.5px;color:var(--text-muted);line-height:1.7">
+    <b style="color:var(--text-secondary)">怎么体验:</b> ①「新用户首次」= bob 拿到专属链接登录 → 空 → 建项目的全过程。点「② @bob 的世界」看他用起来后的控制台。
+    点「⇄ 切到 @alice」—— <b style="color:var(--brand-400)">整个 app 变成 alice 的私有世界</b>(她的项目、她的 session、她的成本),bob 的一概看不见。这就是多用户:同一台机、同一个 daemon,各看各的。顶部横幅诚实标注「软隔离·非安全」(同 uid 磁盘仍互读)。
+  </div>
+
+<script>
+  var DATA={
+    new:{av:'B',avc:'bob',name:'@bob',sub:'刚配对 · 首次',crumb:'首次登录',cost:'$0.00',
+      tree:'<div class="empty-tree">你还没有项目。<br>按右上「新建 session」<br>或 <code style="font-family:var(--font-mono);color:#cfe2ff">cd ~/bob/api-server && ccteam init</code></div>',
+      main:onboardHTML()},
+    bob:{av:'B',avc:'bob',name:'@bob',sub:'经 Telegram 配对',crumb:'Status · 控制台',cost:'$0.41',
+      tree:treeHTML([{p:'api-server',path:'~/bob/api-server',ss:[{d:'run',t:'s40 · REST 端点',sid:'opus'}]}]),
+      main:consoleHTML('@bob',[{d:'run',proj:'api-server',v:'claude · s40',cost:'$0.41',pill:'run',pl:'working'}],'$0.41','claude $0.41',1,0)},
+    alice:{av:'A',avc:'alice',name:'@alice',sub:'经 Telegram 配对',crumb:'Status · 控制台',cost:'$4.21',
+      tree:treeHTML([
+        {p:'excore',path:'~/alice/excore',ss:[{d:'run',t:'s31 · matching engine',sid:'opus[1m]'},{d:'idle',t:'s33 · 空闲',sid:'s33'}]},
+        {p:'lap',path:'~/alice/lap',ss:[{d:'wait',t:'s28 · 等输入',sid:'s28'}]}]),
+      main:consoleHTML('@alice',[
+        {d:'run',proj:'excore',v:'claude · s31',cost:'$2.83',pill:'run',pl:'working'},
+        {d:'wait',proj:'lap',v:'claude · s28',cost:'$1.05',pill:'wait',pl:'等输入'},
+        {d:'idle',proj:'excore',v:'codex · s33',cost:'$0.33',pill:'idle',pl:'idle'}],'$4.21','claude $3.88 · codex $0.33',2,1)}
+  };
+
+  function treeHTML(projs){
+    var h='<div class="tree-label">我的项目</div>';
+    projs.forEach(function(p){
+      h+='<div class="proj"><span class="fold">▾</span> '+p.p+'</div>';
+      p.ss.forEach(function(s,i){h+='<div class="sess-i'+(i===0?' on':'')+'"><span class="dot '+s.d+'"></span> '+s.t+' <span class="sid">'+s.sid+'</span></div>';});
+    });
+    h+='<div class="soft-note">⚠ 软隔离·非安全 —— 只列你自己的项目;别人的不列(同 uid 磁盘仍互读)。</div>';
+    return h;
+  }
+  function consoleHTML(who,rows,total,split,live,idle){
+    var r='';
+    rows.forEach(function(x){
+      r+='<div class="frow"><span class="dot '+x.d+'"></span><span class="fproj" style="width:64px">'+x.proj+'</span>'+
+         '<span class="'+(x.v.indexOf('codex')>=0?'vend-codex':'vend-claude')+'" style="width:104px">'+x.v+'</span>'+
+         '<span class="fcost">'+x.cost+'</span><span class="pill '+x.pill+'">'+x.pl+'</span></div>';
+    });
+    return '<div class="page"><h2>Status · 控制台</h2><p class="lede">'+who+' 的控制台 —— 只有你自己的 session 和成本。</p>'+
+      '<div class="cards"><div class="card"><div style="font-size:13px;font-weight:500;margin-bottom:4px">会话（'+live+' live · '+idle+' idle）</div>'+r+'</div>'+
+      '<div class="card"><div style="display:flex;align-items:center"><span style="font-size:14px;font-weight:500">今日成本</span>'+
+      '<b style="margin-left:auto;font-family:var(--font-mono);font-size:14px">'+total+' <span style="color:var(--text-dim);font-weight:400">/ $20</span></b></div>'+
+      '<div style="margin-top:6px;font-size:12px;color:var(--text-secondary)">'+split+'</div></div></div></div>';
+  }
+  function onboardHTML(){
+    return '<div class="page"><div class="login-card"><div class="t">🔑 用你的专属链接登录</div>'+
+      '<div class="u">https://team-box/?token=ccteam:8f3a…b7</div>'+
+      '<button onclick="document.getElementById(\'b-bob\').click()">打开 → 进入为 @bob</button>'+
+      '<div class="tip">链接 bot 私信给你(<code style="font-family:var(--font-mono)">/web</code>),或管理员铸。每人一个,不共用。</div></div>'+
+      '<div class="ob"><h3>新用户加入(一次性)</h3><div class="sub">同一台机、共用一个 ccteam,但各看各的。</div>'+
+      '<div class="step"><span class="n">1</span><span class="b"><b>注册</b>:你 DM bot → 管理员批准把你加进名单(<code>ccteam user add bob</code> 或 /telegram:access)。注册天生管理员门控。</span></div>'+
+      '<div class="step"><span class="n">2</span><span class="b"><b>拿链接</b>:bot 私信你专属 web 链接;IM 这边批准后直接可用。</span></div>'+
+      '<div class="step"><span class="n">3</span><span class="b"><b>登录</b>:开链接 → 自动设 cookie → 你就是 @bob(上面那张卡)。</span></div>'+
+      '<div class="step"><span class="n">4</span><span class="b"><b>建项目</b>:<code>cd ~/bob/api-server && ccteam init</code> → 项目归你。你的控制台只列你的。</span></div>'+
+      '<div class="step"><span class="n">5</span><span class="b"><b>协作(可选)</b>:谁想共享 → <code>/share &lt;project&gt; @对方</code>。</span></div></div></div>';
+  }
+
+  function scene(k){
+    var d=DATA[k];
+    document.getElementById('av').className='av '+d.avc; document.getElementById('av').textContent=d.av;
+    document.getElementById('idname').textContent=d.name; document.getElementById('idsub').textContent=d.sub;
+    document.getElementById('crumb').textContent=d.crumb;
+    document.getElementById('cost').innerHTML='今日 <b>'+d.cost+'</b> / $20';
+    document.getElementById('tree').innerHTML=d.tree;
+    var sc=document.getElementById('scroll'); sc.innerHTML=d.main; sc.classList.remove('flash'); void sc.offsetWidth; sc.classList.add('flash');
+    ['new','bob','alice'].forEach(function(x){document.getElementById('b-'+x).classList.toggle('on',x===k);});
+    var w={new:'新用户 bob 首次登录',bob:'@bob —— 他自己的项目和 session',alice:'@alice —— 完全不同的私有世界'};
+    document.getElementById('who').innerHTML='你现在看的是:<b>'+w[k]+'</b>';
+  }
+  scene('new');
+</script>
+</body>
+</html>

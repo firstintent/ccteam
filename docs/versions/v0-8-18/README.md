@@ -41,7 +41,9 @@ loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的
 
 ## 柱 2 · 身份(多用户软分区 · 档 0)
 
-详 [`../../research/multi-user-soft-partition.md`](../../research/multi-user-soft-partition.md)。共用一个 daemon、同一个 OS 账号下,**最小**去掉「会话串」:
+> **新用户操作步骤 + 可点走查**:[`multi-user-onboarding.md`](multi-user-onboarding.md) + 原型 [`prototype/multi-user-walkthrough.html`](prototype/multi-user-walkthrough.html)(切「新用户首次 / @bob / @alice」体验各看各的私有世界)。**owner 这关先过这俩**。设计详 [`../../research/multi-user-soft-partition.md`](../../research/multi-user-soft-partition.md)。
+
+共用一个 daemon、同一个 OS 账号下,**最小**去掉「会话串」:
 
 - **档 0(本版必需,几行)**:ACL 收 **own-only** —— 删 `chat_can_access`(`gateway.rs:1219`)的「同 project 互看」+「web-operator 通看」两条漏。IM 本就 per-chat(Telegram `chat_id` = 免费身份),立刻互不可见。**零新字段/token,不碰 `ccteam config`**(bot 是 daemon 级,一个 bot 多 chat)。
 - **档 1(本版选配,web)**:web 单 token = 单操作员通看。复用 web 已有「一次绑一个 chat」(`state.rs:96`)→ 每人预绑自己 chat 的个人链接 + own-only scope。或 v0:web 当 admin 面,其他人用 IM。
