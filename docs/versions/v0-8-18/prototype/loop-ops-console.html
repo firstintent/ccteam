@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ccteam · loop 运维台原型</title>
+<style>
+  :root{
+    --bg:#0a0d13; --frame:#0e131c; --panel:#121925; --panel2:#0f1620;
+    --border:#1e2836; --border2:#283446;
+    --text:#d6dee8; --muted:#7d8aa0; --faint:#576074;
+    --green:#3fb950; --amber:#d6a435; --red:#f06a5d; --grey:#5a6577; --blue:#5aa6f0; --violet:#9a86f0;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 50% -10%, #16202e 0%, var(--bg) 60%);
+    min-height:100vh;font-family:var(--sans);color:var(--text);
+    display:flex;flex-wrap:wrap;gap:34px;justify-content:center;align-items:flex-start;padding:34px 18px 60px;}
+  .wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+  .cap{font-size:12px;color:var(--faint)} .cap b{color:var(--muted);font-weight:600}
+
+  .phone{width:412px;height:858px;background:var(--frame);border:1px solid var(--border2);border-radius:30px;
+    box-shadow:0 30px 80px -30px #000, inset 0 0 0 1px #0c1119;display:flex;flex-direction:column;overflow:hidden}
+  .notch{height:26px;display:flex;align-items:center;justify-content:center}
+  .notch::after{content:"";width:96px;height:6px;border-radius:4px;background:#222b39}
+
+  .top{display:flex;align-items:center;gap:8px;padding:6px 16px 12px;border-bottom:1px solid var(--border)}
+  .brand{font-weight:700;letter-spacing:.4px;font-size:15px}.brand .dot{color:var(--green)}
+  .spacer{flex:1}
+  .pill{font-family:var(--mono);font-size:11px;background:#16202e;border:1px solid var(--border2);border-radius:999px;padding:3px 9px}
+  .pill .lo{color:var(--muted)}
+  .pill.warn{color:var(--amber);border-color:#3a3320;background:#241f10}
+
+  .scroll{flex:1;overflow-y:auto;padding:14px 14px 8px}.scroll::-webkit-scrollbar{width:0}
+  .h{display:flex;align-items:baseline;gap:8px;margin:2px 2px 10px}
+  .h .t{font-size:17px;font-weight:700}.h .s{font-size:11px;color:var(--faint)}
+
+  .sumstrip{display:flex;gap:8px;margin-bottom:12px}
+  .sumcard{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:11px;padding:9px 10px;text-align:center}
+  .sumcard .n{font-family:var(--mono);font-size:19px;font-weight:700;line-height:1.1}
+  .sumcard .l{font-size:10px;color:var(--muted);margin-top:3px}
+  .sumcard.gate{border-color:#3a3320}.sumcard.gate .n{color:var(--amber)}
+
+  /* loop card */
+  .loop{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);border:1px solid var(--border);
+    border-radius:14px;padding:12px;margin-bottom:12px;position:relative}
+  .loop.gate{border-color:#5a4a1a;box-shadow:0 0 0 1px #3a3320, 0 10px 30px -16px #d6a43533}
+  .lhead{display:flex;align-items:center;gap:9px}
+  .repo{font-weight:700;font-size:15px}
+  .badges{display:flex;gap:5px;margin-top:4px;flex-wrap:wrap}
+  .b{font-size:9.5px;font-weight:600;padding:2px 6px;border-radius:5px;border:1px solid var(--border2);color:var(--muted);font-family:var(--mono)}
+  .b.native{color:var(--green);border-color:#1f3a2a;background:#0f2418}
+  .b.buildable{color:var(--blue);border-color:#1b3146;background:#0c1622}
+  .b.weak{color:var(--grey)}
+  .b.mode{color:var(--violet);border-color:#2e2a4a;background:#16132a}
+  .ostat{margin-left:auto;text-align:right;flex:none}
+  .ostat .dot{font-size:11px;font-weight:700;display:flex;align-items:center;gap:5px;justify-content:flex-end}
+  .ostat .grn{color:var(--green)}.ostat .red{color:var(--red)}.ostat .amb{color:var(--amber)}
+  .ostat .sub{font-size:9.5px;color:var(--faint);font-family:var(--mono);margin-top:2px}
+
+  .spine{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;font-family:var(--mono);font-size:10px;color:var(--muted)}
+  .spine span{background:#0c131d;border:1px solid var(--border2);border-radius:5px;padding:2px 6px}
+  .spine b{color:var(--text);font-weight:600}
+
+  .act{margin-top:9px;font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .act .blip{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 7px -1px var(--green);animation:pulse 1.6s infinite}
+  .act .blip.red{background:var(--red);box-shadow:0 0 7px -1px var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  .cost{margin-top:9px}
+  .cbar{height:5px;border-radius:4px;background:#16202e;overflow:hidden}
+  .cbar > i{display:block;height:100%;background:linear-gradient(90deg,var(--green),#2ea043)}
+  .cbar.hot > i{background:linear-gradient(90deg,var(--amber),var(--red))}
+  .cmeta{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:5px}
+  .cmeta b{color:var(--text)}
+
+  /* gate banner */
+  .gatebar{margin-top:11px;background:#1c1708;border:1px solid #4a3d12;border-radius:10px;padding:10px 11px}
+  .gatebar .gl{font-size:10px;color:var(--amber);font-weight:700;letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;gap:6px}
+  .gatebar .gq{font-size:12.5px;color:var(--text);margin:6px 0 3px;line-height:1.4}
+  .gatebar .gq code{font-family:var(--mono);font-size:11px;color:#ffd9a8;background:#2a2008;border:1px solid #4a3d12;border-radius:5px;padding:1px 5px}
+  .gatebar .why{font-size:10px;color:var(--faint);margin-bottom:9px}
+  .gbtns{display:flex;gap:8px}
+  .gbtn{flex:1;text-align:center;font-size:12.5px;font-weight:700;padding:8px 0;border-radius:9px;cursor:pointer;user-select:none;border:1px solid}
+  .gbtn.ok{color:#0a0d13;background:var(--green);border-color:var(--green)}
+  .gbtn.no{color:var(--red);background:#1a0f0e;border-color:#4a1f1c}
+  .gbtn:active{transform:scale(.97)}
+  .resolved{margin-top:11px;font-size:11.5px;color:var(--green);display:flex;align-items:center;gap:7px}
+
+  .nav{display:flex;border-top:1px solid var(--border);background:#0b1019}
+  .nav button{flex:1;background:none;border:none;color:var(--faint);font-family:var(--sans);padding:10px 0 13px;font-size:10.5px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px}
+  .nav button .ic{font-size:17px;line-height:1}.nav button.on{color:var(--text)}
+  .nav .badge{position:absolute;margin:-4px 0 0 16px;background:var(--amber);color:#0a0d13;font-size:9px;font-weight:700;border-radius:999px;padding:0 5px;line-height:14px}
+  .navwrap{position:relative;flex:1;display:flex}
+
+  .foot{max-width:412px;font-size:11.5px;color:var(--muted);line-height:1.65}
+  .foot h4{color:var(--text);font-size:12.5px;margin:0 0 6px}
+  .foot code{font-family:var(--mono);font-size:11px;color:#cfe2ff;background:#0c1622;border:1px solid #1b3146;border-radius:5px;padding:1px 5px}
+  .foot .rl{color:var(--amber)} .foot .x{color:var(--red)}
+  .foot ul{margin:6px 0 0;padding-left:18px}.foot li{margin:4px 0}
+  .own{display:flex;gap:8px;margin:8px 0 2px;flex-wrap:wrap}
+  .own div{flex:1;min-width:118px;background:#0f1620;border:1px solid var(--border);border-radius:9px;padding:8px 9px;font-size:11px}
+  .own h5{margin:0 0 4px;font-size:11px}
+  .own .v{color:var(--green)} .own .r{color:var(--blue)} .own .c{color:var(--amber)}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="top">
+      <span class="brand"><span class="dot">●</span> ccteam</span>
+      <span class="spacer"></span>
+      <span class="pill warn">⏸ 1 等门</span>
+      <span class="pill"><span class="lo">今日</span> $7.40 <span class="lo">/$30</span></span>
+    </div>
+
+    <div class="scroll">
+      <div class="h"><span class="t">Loops</span><span class="s">/ 你的 loop 在云端跑,你在手机上盯 + 放行</span></div>
+
+      <div class="sumstrip">
+        <div class="sumcard"><div class="n">3</div><div class="l">运行中</div></div>
+        <div class="sumcard gate"><div class="n">1</div><div class="l">等人工门</div></div>
+        <div class="sumcard"><div class="n">🔴 1</div><div class="l">预言机红</div></div>
+      </div>
+
+      <!-- LOOP 1: gate — oracle-diff gate (THE killer) -->
+      <div class="loop gate" id="loop-harden">
+        <div class="lhead">
+          <div>
+            <div class="repo">excore · harden</div>
+            <div class="badges">
+              <span class="b native">oracle: native</span>
+              <span class="b mode">⛓ Workflow · 宽度</span>
+            </div>
+          </div>
+          <div class="ostat">
+            <div class="dot amb">⏸ 等门</div>
+            <div class="sub">已暂停 2m</div>
+          </div>
+        </div>
+        <div class="spine"><span>阶段 <b>2b · D 类分布式</b></span><span>backlog <b>7</b></span><span>last <b>a8fbd23</b></span></div>
+
+        <div class="gatebar" id="gate-harden">
+          <div class="gl">🛑 人工门 · 动了预言机</div>
+          <div class="gq">verifier 拦下:本轮想改 <code>vN/vectors/eth_swap.json</code>(金样向量)+ <code>AGENTS.md</code> 的 INV-5。</div>
+          <div class="why">git diff --stat 预言机目录 非空 → 不是实现改动,是改裁判。loop 不能自己放行。</div>
+          <div class="gbtns">
+            <div class="gbtn ok" onclick="resolve('harden','放行了 —— loop 继续(你已确认这是有意改契约)')">同意改契约</div>
+            <div class="gbtn no" onclick="resolve('harden','驳回 —— loop 回到只改实现,预言机不动')">驳回</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- LOOP 2: red, iterating -->
+      <div class="loop">
+        <div class="lhead">
+          <div>
+            <div class="repo">excore · build</div>
+            <div class="badges">
+              <span class="b native">oracle: native</span>
+              <span class="b mode">🎯 /goal · 深度</span>
+            </div>
+          </div>
+          <div class="ostat">
+            <div class="dot red">🔴 红</div>
+            <div class="sub">iter 4/12</div>
+          </div>
+        </div>
+        <div class="spine"><span>阶段 <b>2a · Oracle trait</b></span><span>backlog <b>3</b></span><span>红 <b>INV-3 状态根</b></span></div>
+        <div class="act"><span class="blip red"></span>verifier 跑 cargo test —— 差分逐帧状态根 != 参考实现,回 maker 第 4 轮</div>
+        <div class="cost">
+          <div class="cbar"><i style="width:34%"></i></div>
+          <div class="cmeta"><span>opus · max effort</span><span><b>$3.10</b> / $12</span></div>
+        </div>
+      </div>
+
+      <!-- LOOP 3: green cadence watcher -->
+      <div class="loop">
+        <div class="lhead">
+          <div>
+            <div class="repo">lap · ci-watch</div>
+            <div class="badges">
+              <span class="b buildable">oracle: buildable</span>
+              <span class="b mode">🔁 /loop 10m · 持续</span>
+            </div>
+          </div>
+          <div class="ostat">
+            <div class="dot grn">🟢 绿</div>
+            <div class="sub">下次 6m 后</div>
+          </div>
+        </div>
+        <div class="spine"><span>看 <b>CI failures</b></span><span>triage → <b>Telegram</b></span><span>last <b>无新发现</b></span></div>
+        <div class="act"><span class="blip"></span>空闲 · 心跳监控,有红才喊你</div>
+        <div class="cost">
+          <div class="cbar"><i style="width:9%"></i></div>
+          <div class="cmeta"><span>haiku · 只读便宜档</span><span><b>$1.20</b> / $8</span></div>
+        </div>
+      </div>
+
+      <div style="margin:2px 2px 6px;font-size:11px;color:var(--faint)">
+        点底栏 <b style="color:var(--muted)">环境</b> 看 agent 装机健康 · loop skill 从<b style="color:var(--muted)">插件市场</b>装
+      </div>
+      <div style="height:4px"></div>
+    </div>
+
+    <div class="nav">
+      <div class="navwrap"><button onclick="void 0"><span class="ic">🧩</span>插件市场</button></div>
+      <div class="navwrap"><button onclick="void 0"><span class="ic">🩺</span>环境</button></div>
+      <div class="navwrap"><span class="badge" id="navbadge">1</span><button class="on" onclick="void 0"><span class="ic">🔁</span>Loops</button></div>
+      <div class="navwrap"><button onclick="void 0"><span class="ic">⚙️</span>Settings</button></div>
+    </div>
+  </div>
+
+  <div class="cap"><b>loop 运维台原型</b> · 同一手机驾驶舱壳 · 可点:门上 [同意改契约]/[驳回] → loop 续跑</div>
+</div>
+
+<div class="foot">
+  <h4>这屏在说什么:ccteam = loop 的运维控制面,只拥有 loop 外面那层壳</h4>
+  <div class="own">
+    <div><h5 class="v">vendor 拥 loop 引擎</h5><code>/goal</code> <code>/loop</code> Workflow worktree subagent hooks —— ccteam 只透传,<b class="x">绝不在 Rust 重写</b></div>
+    <div><h5 class="r">repo 拥预言机</h5>AGENTS.md + vectors + .loop/state.md —— 人写、loop 只读,ccteam 红线本就不碰</div>
+    <div><h5 class="c">ccteam 拥壳</h5>启动 / 看见 / 卡门 / 控预算 / 续命 / 推 triage</div>
+  </div>
+  <ul>
+    <li><b>每张卡 = 一个 loop</b>:预言机就绪档(native/buildable/weak)+ 模式(深度 <code>/goal</code> · 持续 <code>/loop</code> · 宽度 Workflow)+ 预言机 🟢/🔴/⏸ + 状态脊柱(阶段/backlog/last SHA,读自 repo 的 <code>.loop/state.md</code>,只读)+ 成本条。</li>
+    <li><span class="rl">杀手级耦合:loop 的三个人工门(动预言机 / 架构跃迁 / 合并)→ ccteam 现成 HITL → 手机 [同意][拒绝]。</span> 第一张卡演示 <b>oracle-diff 门</b>:verifier 跑 <code>git diff --stat &lt;预言机目录&gt;</code> 非空 → ccteam 升门到你手机。ccteam <b>只路由不评判</b>(不注入、pattern-agnostic、纯壳)。</li>
+    <li><b>成本是 loop 的安全带</b>:每 loop 模型分层(贵模型抠验证 / 便宜模型做只读心跳)+ budget 上限,触顶 auto-disable —— 治「半夜烧光额度」。已落地。</li>
+    <li><b>续命</b>:部署/重启后 loop 会话按 sid 续,保住 model/effort。已落地。</li>
+    <li><span class="x">不做</span>:loop 引擎(vendor 的)、预言机(repo 的)、跨 vendor 路由(prompt 层 <code>pk</code> skill)。<b>ccteam 造不出预言机</b> —— oracle-weak 项目收益本就低,救不了。</li>
+    <li><b>分发</b>:loop skill(oracle-first 模板 / excore-verify)住 ccteam-hub → 插件市场一键装进项目 <code>.claude/skills/</code>。</li>
+  </ul>
+</div>
+
+<script>
+  function resolve(id, msg){
+    var bar=document.getElementById('gate-'+id);
+    bar.outerHTML='<div class="resolved">✓ '+msg+'</div>';
+    document.getElementById('loop-'+id).classList.remove('gate');
+    var os=document.querySelector('#loop-'+id+' .ostat');
+    os.querySelector('.dot').className='dot grn'; os.querySelector('.dot').textContent='🟢 续跑';
+    os.querySelector('.sub').textContent='刚放行';
+    var b=document.getElementById('navbadge'); if(b) b.style.display='none';
+    var p=document.querySelector('.pill.warn'); if(p){p.textContent='0 等门'; p.className='pill';}
+    document.querySelector('.sumcard.gate .n').textContent='0';
+  }
+</script>
+</body>
+</html>
