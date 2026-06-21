@@ -1,6 +1,6 @@
 # v0.8.18 PRD — Loop 地基(driving cockpit + identity)
 
-> 状态:**讨论稿(doc-first,代码未动)**。owner 定调(2026-06-21):**loop 移到下一版本;本版只做 loop 的地基**,且每块都自己就有用。
+> 状态:**已落地 dev(v0.8.18,无 tag,等 owner review)** —— 实现总结 + 验收结果见 [`handoff.md`](handoff.md)。**档1(per-user web token)按「选配」延后到后续 patch。** owner 定调(2026-06-21):**loop 移到下一版本;本版只做 loop 的地基**,且每块都自己就有用。
 > 原型(**基于真实 `ChatConsole` 壳**:sidebar + topbar + main,照搬 `web/src/index.css` 的 @theme 配色/Geist 字体/status 状态色 —— 增量不重画):**[`v0818-real-shell.html`](prototype/v0818-real-shell.html)** = 柱1(控制台 + 主机)+ 柱2(身份 scope)一屏可点,**视觉以此为准**。早期 phone-shell 草图(`environment-cockpit` / `multi-user-soft-partition` / `loop-ops-console`)仅留作内容参考,配色/布局已被上面这版取代。
 > loop 本身的设计见 [`../../research/loop-engineering-ccteam.md`](../../research/loop-engineering-ccteam.md)(**下一版**)。
 > **🚀 开发提示词**:[`dev-goal-prompt.md`](dev-goal-prompt.md) —— 新会话 `/goal` 整版实现(owner review 原型后启动)。

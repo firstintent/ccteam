@@ -397,14 +397,15 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 
 **每个 session 独立页(per-session web)**:打开 `http://<host>:7331/app/chat/s/<sid>`(`<sid>` = `s1`/`s2`…,与 IM 的 `/use s1` 同命名空间)进入某个 session 的独立视图 —— 自己的历史(读该 session 的 `turns.jsonl`)、按 sid 过滤的实时事件流、干净不混流的切换。HITL 批准也会在这里渲染成「session sX 要跑…」+ 每个选项一个按钮(web 点击 resolve 是 best-effort,稳妥批准走 IM 按钮)。
 
-**统一界面**:本版 web 是**一个 chat 风格外壳** —— 顶栏有面包屑 + 连接状态 + **cost pill**(今日成本 / 预算,实时);每个 session 有 **Chat | 终端** 两个 tab;底部全局导航三页 = **插件市场 / Status / Settings**(旧的多页 operator 仪表盘已收敛掉)。
+**统一界面**:本版 web 是**一个 chat 风格外壳** —— 顶栏有面包屑 + 连接状态 + **cost pill**(今日成本 / 预算,实时);每个 session 有 **Chat | 终端** 两个 tab;底部全局导航**四页** = **插件市场 / Status / 主机 / Settings**(旧的多页 operator 仪表盘已收敛掉)。**界面语言**在左上**头像**里切 **中文 / English**(默认中文,导航随之渲染),头像里还有个人设置(显示名 / 头像 / 登出)。
 
 **控制台页签**(浏览器里点点就能用,不必记命令):
 
 - **新建项目**:新建会话弹窗里选「＋ 新建项目…」,填 slug(名)+ 路径即可在任意目录 scaffold 一个项目(走 `POST /api/v1/projects`),建好直接在里头起会话。
 - **新建会话弹窗**:role 是从该项目 `.claude/agents/` 拉的**真实 role 下拉**(显示 role + 说明),外加一个「(无角色 / 裸 claude)」选项起 roleless 会话;不选则默认 cto。
 - **插件市场页**:浏览 ccteam-hub 的 role/skill/workflow 插件(**官方 ccteam 插件置顶**,其余如 agency-agents 等开源依次),**点开看正文预览**(install 前 review),**一键装进当前项目**(sha256 校验,带「已装」状态标)。取代了旧的只读 Roles 页 —— 装完 IM 里 `/role <role>` 即用。
-- **Status 页**:轻量状态总览 —— daemon 健康 + 会话 live/idle 数 + 今日成本/预算(同 `GET /api/v1/status`,也是 cost pill 的来源)。
+- **Status 页**:轻量状态总览 —— daemon 健康 + 会话 live/idle 数 + **每条会话的成本**(舰队骨架,best-effort)+ 今日成本/预算(同 `GET /api/v1/status`,也是 cost pill 的来源)。
+- **主机 页**(v0.8.18):这台机器(host=`local`,将来分布式会列多台)的 agent 状态 —— hostname / 系统 / ccteam 版本,每个 vendor(claude / codex)装没装(带 `--version`)、ccteam MCP 注册没、**就绪 / 需配置 / 未安装**。唯一可写动作 = **「注册 ccteam MCP」**(把 ccteam 自己的 MCP server 写进 vendor 配置,幂等);ccteam **绝不**从 web 写 vendor 登录、绝不装 CLI。读 `GET /api/v1/hosts`。
 - **Settings 页**:在浏览器里配 IM 凭证 —— Telegram(bot token + 异步抓 chat_id:存好 token 后给 bot 发条消息,页面轮询自动捕获)与 Lark/飞书(App ID / Secret / region / allowlist)。**秘密只显示掩码**(`…last4`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅 daemon 启动时加载一次,无热重载)—— 页面会提示 `restart required`,照 §5 `ccteam stop && ccteam start`。
 - **web 终端**(per-session):按会话解析到对应 pane,稳定连(不再秒断重连)。**本版默认 mux backend(rmux)即逐字节保真**(裸 ANSI / 光标 / 换行/对齐都对,连上回放当前屏幕),不再需要 `CCTEAM_MUX_BACKEND=tmux`。终端 UI 当前只对 claude 会话开放。
 
@@ -438,8 +439,12 @@ GET    /api/v1/marketplace/{id}/body         插件正文预览(install 前 revi
 GET    /api/v1/projects/{slug}/marketplace   catalog + 该项目「已装」状态
 POST   /api/v1/projects/{slug}/marketplace/install   装一个插件进项目(sha256 校验)
 
-GET    /api/v1/status                        daemon 健康 + 会话 live/idle + 今日 cost/budget
+GET    /api/v1/status                        daemon 健康 + 会话 live/idle + 今日 cost/budget + 每会话成本
 GET    /api/v1/capabilities                  当前可用 harness(× provider)动态列表(PATH 探测)
+
+GET    /api/v1/hosts                          host-keyed agent 报告(本机 local;将来多台)
+GET    /api/v1/hosts/{host}                   单 host 详情（?refresh=true 重探;hostname/os/arch/version + 每 vendor 装/版本/MCP/就绪)
+POST   /api/v1/hosts/{host}/register-mcp      注册 ccteam 自身 MCP 进 vendor 配置(唯一可写、幂等;?vendor=claude|codex)
 
 GET    /api/v1/openapi.json                   OpenAPI 3.1 spec(由同一套路由注册生成,防漂移)
 GET    /api/docs                              Scalar 交互式 API 文档(浏览器里试调)

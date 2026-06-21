@@ -38,12 +38,12 @@ ccteam is a **self-hosted control plane for coding agents.** One resident daemon
 ## Three ways to drive it
 
 - **From IM** — DM a bot to work a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`). The agent's full slash-command surface works straight from chat.
-- **From a web console** — one chat-style local console: create projects, open and switch sessions, watch live transcripts and a byte-faithful per-session terminal, one-click-install plugins from the marketplace, and see a live cost pill — plus a standard, self-documenting HTTP API at `/api/v1` (`GET /api/docs`).
+- **From a web console** — one chat-style local console (in 中文 or English): create projects, open and switch sessions, watch live transcripts and a byte-faithful per-session terminal, one-click-install plugins from the marketplace, check each host's agent install / MCP-registration status, and see a live cost pill plus per-session spend — plus a standard, self-documenting HTTP API at `/api/v1` (`GET /api/docs`).
 - **Inside a session** — the `mcp__ccteam__*` MCP tools are the programmatic surface (register a bot, send a file to chat, screenshot, run a vote). The default `cto` manager can spawn a work-role session, dispatch a task to it, and collect the result.
 
 ## The model: chat ⇄ project ⇄ session ⇄ role
 
-- A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat is fully isolated.
+- A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat — another person, even sharing the same machine and daemon — sees only its own sessions (soft per-chat isolation under one OS account).
 - A **project** is a local directory you ran `ccteam init` on.
 - A **session** is an independent, resident agent handle (`s<N>`) with its own context (`/compact` and `/clear` are per-session) — exactly like a native Claude Code session. `/new` spawns, `/sessions` lists (handle, project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Two sessions of the same role never cross-talk.
 - A **role** is who a session *is* — a plain Markdown persona at `.claude/agents/<role>.md`, or no role at all (a bare `claude` driven by your project's `CLAUDE.md`). `ccteam init` seeds a `cto` manager that recommends the right work-role; swap any session's role live with `/role`.
