@@ -1,116 +1,77 @@
-# v0.8.18 PRD — 环境驾驶舱(多 agent 装机/健康检测面)
+# v0.8.18 PRD — Loop 地基(driving cockpit + identity)
 
-> 状态:**讨论稿(doc-first,代码未动)**。先看原型,再定方案。
-> 原型:[`prototype/environment-cockpit.html`](prototype/environment-cockpit.html)(浏览器直接打开,可点:复制 / 一键注册 / 重新探测 / 切屏)。
-
----
-
-## 〇、一句话
-
-把「N 个本地 agent CLI(claude / codex / …)各自装没装好、登没登录、连没连上 ccteam」从**逐个进终端查**,收成 web 上一张 **`环境体检`** 面板 + 一个 `GET /api/v1/environment`。
-
-这是「**ccteam = 多 agent 驾驶舱**」论题的**第一条腿(A · Day-0 装机/健康)**。不是孤立 feature。
+> 状态:**讨论稿(doc-first,代码未动)**。owner 定调(2026-06-21):**loop 移到下一版本;本版只做 loop 的地基**,且每块都自己就有用。
+> 原型:[`environment-cockpit.html`](prototype/environment-cockpit.html)(柱1A)· [`loop-ops-console.html`](prototype/loop-ops-console.html)(柱1B 的将来形态,本版先用它显示 session)· [`multi-user-soft-partition.html`](prototype/multi-user-soft-partition.html)(柱2)。
+> loop 本身的设计见 [`../../research/loop-engineering-ccteam.md`](../../research/loop-engineering-ccteam.md)(**下一版**)。
 
 ---
 
-## 一、为什么(痛点映射 → `docs/requirements.md`)
+## 0. 一句话
 
-OpenRouter 解决「太多 LLM provider,各有 key/SDK/定价 → 给我一个」。agent-CLI 世界的等价痛点不是「太多可选」(多数人就 1–2 个),而是:
+loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的「看 + 管 + 谁的」底座** —— 两根柱子,loop 本身不在内,但每根现在就有用:
 
-- 每个 agent CLI 是**终端绑定**的:装机、登录、注册 MCP、模型怪癖,全在终端逐个手搓。
-- ccteam 已经替你解决了「**从任何地方驱动**」(IM/web 网关)和「**可恢复**」(持久 sid + 双 SoT),但**装好 / 看见健康**这一层还在终端里。
-- 从手机想确认「我那台云机上 codex 到底连上没」—— 现在做不到。
+- **柱 1 · 驾驶舱(看 + 管)** = 环境体检 + 舰队/成本视图 → 就是 loop 运维台的骨架,本版先显示 **session**,下一版 loop 直接 slot 进来。
+- **柱 2 · 身份(多用户档 0)** = ACL own-only + 个人 scope → 既治当前「会话串」,又是无人值守多用户 loop 的硬前置。
 
-**护城河对齐**(见 memory `ccteam-moat-is-the-shell-not-features`):ccteam 的护城河是**结构位置**(云端终端壳),不是聪明逻辑。本版只把**已有信息**(配置路径、PATH 探测、doctor 检查)**汇成一个面**,不引入任何 vendor 会自己吃掉的智能逻辑。
-
-### OpenRouter 类比的边界(写进 PRD 免得跑偏)
-
-| | OpenRouter | ccteam |
-|---|---|---|
-| 坐在钱/API 路径上 | 是(代理每次调用) | **否**(驱动本地 CLI,各自向 vendor 登录,ccteam 不碰钱) |
-| 能做的 | 统一 key/账单/路由/计量 | **统一驾驶舱**:装好→看见→驱动→盯住 |
-
-→ ccteam 做 OpenRouter 的 **Activity/Credits/Keys 面板那一半,减去 proxy**。**跨 vendor 计费路由器对 ccteam 结构性不可能,本版及以后都不追。**
+> 为什么是地基:loop 给 ccteam 的价值 = **看 + 管 + 卡门**。这两根柱子正是「看/管/身份」的底座。它们 ship 了,下一版 loop = 往现成驾驶舱里塞 loop + 加 on-ramp + oracle-diff 门,风险大降。
 
 ---
 
-## 二、设计(以原型为准)
+## 柱 1 · 驾驶舱(看 + 管)
 
-### 2.1 后端:`GET /api/v1/environment`(web-token 门后)
+### 1A. 环境体检 —— `GET /api/v1/environment`
 
-把 `crates/ccteam-web/src/routes/capabilities.rs`(现在只探 `--version` 二态、写死 claude/codex)升级成真正的环境报告。形状:
+把现在只探 `--version` 二态、写死 claude/codex 的 `capabilities.rs` 升级成真正的环境报告:每 vendor 一卡(装了吗 path+**version** / 登录了吗 / **ccteam MCP 注册了吗** / hook+settings / daemon home-drift)+ 红黄绿 + 缺啥给**可复制命令**。
 
-```jsonc
-{
-  "daemon": { "version":"0.8.17","uptime_s":15120,"port":7331,
-              "home_drift":false,"mcp_tools":{"total":15,"stub":0},
-              "sessions":{"total":3,"live":2},"cost_today_usd":4.21,"budget_usd":20.0 },
-  "vendors": [
-    { "id":"claude-code","vendor":"claude","status":"ready",
-      "bin":{"present":true,"path":"~/.local/bin/claude","version":"2.1.185"},
-      "auth":{"ok":true,"detail":"oauth"},
-      "mcp":{"registered":true},
-      "settings":{"hook_block":true},
-      "default_model":"claude-opus-4-8[1m]","effort":"max",
-      "fixes":[] },
-    { "id":"codex","vendor":"codex","status":"needs_config",
-      "bin":{"present":true,"path":"~/.local/bin/codex","version":"0.42"},
-      "auth":{"ok":false}, "mcp":{"registered":false},
-      "fixes":[
-        {"label":"登录 Codex","cmd":"codex login","kind":"manual"},
-        {"label":"注册 ccteam MCP","cmd":"ccteam config","kind":"ccteam_footprint","action":"register_mcp"}
-      ] },
-    { "id":"gemini","vendor":"gemini","status":"not_installed",
-      "bin":{"present":false},
-      "fixes":[{"label":"安装 Gemini CLI","cmd":"npm i -g @google/gemini-cli","kind":"manual"}] }
-  ]
-}
-```
+- **唯一可从 web 写的** = ccteam 自己的足迹(一键注册 MCP,重跑 `ccteam config` 那段,幂等);**绝不**从 web 写 vendor 登录/key、**绝不**从 web 装 CLI(执行面红线)。
+- vendor-可扩展(`AgentVendor` + 每 vendor `ProbeSpec` 数据)+ 手动 re-probe(破 daemon-终身 cache)。
+- **为 loop 准备**:下一版「云端起跑一个 loop on vendor X」前,得先知道 X 装好/登录/可用。
 
-- `status` ∈ `ready | needs_config | not_installed | broken`(对应原型四个状态点 绿/黄/灰/红)。
-- **`fixes[].kind` 编码了红线**:`manual` = 只给命令、前端复制;`ccteam_footprint` = ccteam 自己的足迹,**允许**一个写端点执行。
+### 1B. 舰队 + 成本视图
 
-### 2.2 写端点(唯一一个):`POST /api/v1/environment/register-mcp`
+web 里一个真正的 fleet 视图:列**所有 session** 的状态(live/idle/活动)+ per-session/项目 **成本** + 今日 spend/budget。后端 = 扩 `GET /api/v1/status`(已有 sessions live/idle + 今日 cost/budget);前端 = 一个 fleet 卡片视图。
 
-body `{ "vendor": "codex" }` → 调现成的 `mcp_serve::install_mcp` / `install_codex_mcp`(就是 `ccteam config` 跑的那段,幂等)。**这是从 web 唯一能写的东西。** 复用现有逻辑,零新执行面。
-
-### 2.3 前端:底部导航加 `环境`(可能再加 `舰队` 预览)
-
-挂在现有 Status/Settings 旁。每 vendor 一卡(原型已画全):状态点 + 标题/path/version + 勾叉清单(登录/MCP/hook)+ 缺啥给可复制命令 + daemon 卡。右上 `↻ 探测` 手动刷新(破现在 daemon-终身 cache)。
-
-### 2.4 vendor 可扩展
-
-把写死的 claude/codex 两条改成 `AgentVendor` enum + 每 vendor 一个 `ProbeSpec`(bin 名、version 参数、auth 探测怎么做、配置文件路径)。加 gemini/grok = 填一条数据,不改路由代码。
+- **为 loop 准备**:这就是 `loop-ops-console.html` 的骨架 —— 本版卡片显示 **session**(预言机/门那几栏先空着或 N/A),下一版 loop 把「预言机 🟢🔴⏸ + 等哪道门」填进同一批卡片。**先建壳,后填 loop。**
+- 现在就有用:你终于能一眼看全 N 个 session + 卡预算(loop 来之前就值)。
 
 ---
 
-## 三、范围切口(这是判断,不是选项)
+## 柱 2 · 身份(多用户软分区 · 档 0)
 
-| | 做 | 不做 |
-|---|---|---|
-| 检测 | 装/登录/MCP/hook/version/home-drift,只读汇总 | — |
-| 写 | **仅** ccteam 自身足迹(一键注册 MCP) | ❌ 从 web 写 vendor 身份(登录 / API key) |
-| 安装 | 给可复制命令 | ❌ 从 web 跑 install 脚本(包管理器/执行面) |
-| cache | 加手动 re-probe | — |
-| 路由 | — | ❌ 跨 vendor 路由/fallback(prompt 层,`pk` skill,不进 Rust) |
-| 舰队 | 原型放预览定方向 | ❌ 真做(留下个 minor,B 腿) |
+详 [`../../research/multi-user-soft-partition.md`](../../research/multi-user-soft-partition.md)。共用一个 daemon、同一个 OS 账号下,**最小**去掉「会话串」:
 
-**红线**(与 CLAUDE.md §三一致):①「ccteam executes nothing」—— 除自身 MCP 注册外不执行任何 vendor 命令;②「绝不碰 `settings.json`」—— hook 检测只读,任何写仍走 `settings.local.json`;③ No-prompt-injection 不受影响(本版不碰 spawn 路径)。
+- **档 0(本版必需,几行)**:ACL 收 **own-only** —— 删 `chat_can_access`(`gateway.rs:1219`)的「同 project 互看」+「web-operator 通看」两条漏。IM 本就 per-chat(Telegram `chat_id` = 免费身份),立刻互不可见。**零新字段/token,不碰 `ccteam config`**(bot 是 daemon 级,一个 bot 多 chat)。
+- **档 1(本版选配,web)**:web 单 token = 单操作员通看。复用 web 已有「一次绑一个 chat」(`state.rs:96`)→ 每人预绑自己 chat 的个人链接 + own-only scope。或 v0:web 当 admin 面,其他人用 IM。
+- **诚实红线**:同 uid = **软隔离非安全**(同机互读),UI 横幅标注;不拆进程/不开沙箱。
+- **为 loop 准备**:无人值守的多用户 loop 跑起来前,必须先有身份分区,否则 A 的 loop 被 B 看见/操作。`chat_id` 这根身份键也是将来「真隔离 = 路由到自己沙箱」的同一根。
 
 ---
 
-## 四、验收
+## 范围切口 / 不做
 
-1. `GET /api/v1/environment` 在 claude 装好/codex 没装的机器上,返回 `claude=ready` + `codex=not_installed`,带 version 串。
-2. `POST …/register-mcp {vendor:codex}` 幂等:codex 装了但没注册 → 注册后 `mcp.registered=true`;重复调不报错。
-3. 探测用确定性 fake(`CCTEAM_CLAUDE_BIN`/`CCTEAM_CODEX_BIN` 指向假脚本)→ 不依赖真实 binary。
-4. web 面板:四态(就绪/需配置/未安装/故障)渲染正确;复制按钮出命令;一键注册翻 ✗→✓;↻ 重新探测不重启 daemon。
+| 做(本版) | 不做(留给 loop 版 / 不碰) |
+|---|---|
+| 环境体检(只读 + 仅写 ccteam 自身足迹) | ❌ 从 web 写 vendor 登录/装 CLI |
+| 舰队/成本视图(显示 session) | ❌ loop 运维台的 loop 专属栏(预言机/门)—— 下一版填 |
+| 多用户档 0(ACL own-only)+ 档 1 选配 | ❌ on-ramp(loop-skill 库 + 云端起跑)· oracle-diff 门 · loop 版本管理 —— 得有 loop 才有意义 |
+| — | ❌ 跨 vendor 路由 · 拆进程/沙箱 · 改 session 存储 |
+
+**红线**(同 CLAUDE.md §三):ccteam executes nothing(除自身 MCP 注册);绝不碰 `settings.json`;No-prompt-injection(本版不碰 spawn);软隔离诚实标注非安全。
+
+---
+
+## 验收
+
+1. `GET /api/v1/environment`:claude 装好/codex 没装 → `claude=ready`+`codex=not_installed` 带 version;`POST …/register-mcp` 幂等。
+2. 舰队视图:列全部 session 的 live/idle + 成本;卡片结构预留 loop 专属栏(下一版填)不报错。
+3. 多用户档 0:A、B 各 IM pair → 各自 `/use`/`/cd` 只能碰自己的 session;旧「同 project 互看」漏堵上。
+4. 探测/分区用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)+ 假 chat_id,不依赖真 binary。
 5. baseline 不退:`cargo test --workspace --exclude ccteam-web` ≥ 现状;clippy 0 warning;`cargo fmt --all` clean;vitest/Playwright 不退。
 
 ---
 
-## 五、落地节奏(若拍板)
+## 落地姿势
 
-doc-first(本文)→ 你 review 原型 + PRD → 一个 minor(v0.8.18),约两步:① 后端 `environment` 路由 + register-mcp 写端点(扩 `capabilities.rs`);② SPA 面板 + 底部导航项。直接在 dev 落、按 memory `ship-flow` 不发 tag。
+doc-first(本文)→ owner review 范围 → 一个 minor(v0.8.18):① 后端 `environment` 路由 + register-mcp + `status` 扩 fleet/cost;② SPA 环境面板 + 舰队视图;③ gateway ACL own-only(+ 选配 web 个人 token)。直接在 dev 落、按 [[ship-flow]] 不发 tag。**下一版**接 loop(运维台填 loop 栏 + on-ramp + oracle-diff 门)。
 
-**本轮只讨论 + 出原型/PRD,代码不碰。**
+> 本轮只讨论 + reframe PRD,代码不碰。
