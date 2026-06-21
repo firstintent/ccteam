@@ -131,15 +131,15 @@
 <script>
   var DATA={
     new:{av:'B',avc:'bob',name:'@bob',sub:'刚配对 · 首次',crumb:'首次登录',cost:'$0.00',
-      tree:'<div class="empty-tree">你还没有项目。<br>按右上「新建 session」<br>或 <code style="font-family:var(--font-mono);color:#cfe2ff">cd ~/bob/api-server && ccteam init</code></div>',
+      tree:'<div class="empty-tree">你还没有项目。<br>按右上「新建」指向任意目录<br>或 <code style="font-family:var(--font-mono);color:#cfe2ff">ccteam init --owner bob</code></div>',
       main:onboardHTML()},
     bob:{av:'B',avc:'bob',name:'@bob',sub:'经 Telegram 配对',crumb:'Status · 控制台',cost:'$0.41',
-      tree:treeHTML([{p:'api-server',path:'~/bob/api-server',ss:[{d:'run',t:'s40 · REST 端点',sid:'opus'}]}]),
+      tree:treeHTML([{p:'api-server',path:'/home/ubuntu/api-server',ss:[{d:'run',t:'s40 · REST 端点',sid:'opus'}]}]),
       main:consoleHTML('@bob',[{d:'run',proj:'api-server',v:'claude · s40',cost:'$0.41',pill:'run',pl:'working'}],'$0.41','claude $0.41',1,0)},
     alice:{av:'A',avc:'alice',name:'@alice',sub:'经 Telegram 配对',crumb:'Status · 控制台',cost:'$4.21',
       tree:treeHTML([
-        {p:'excore',path:'~/alice/excore',ss:[{d:'run',t:'s31 · matching engine',sid:'opus[1m]'},{d:'idle',t:'s33 · 空闲',sid:'s33'}]},
-        {p:'lap',path:'~/alice/lap',ss:[{d:'wait',t:'s28 · 等输入',sid:'s28'}]}]),
+        {p:'excore',path:'/home/ubuntu/excore',ss:[{d:'run',t:'s31 · matching engine',sid:'opus[1m]'},{d:'idle',t:'s33 · 空闲',sid:'s33'}]},
+        {p:'lap',path:'/home/ubuntu/lap',ss:[{d:'wait',t:'s28 · 等输入',sid:'s28'}]}]),
       main:consoleHTML('@alice',[
         {d:'run',proj:'excore',v:'claude · s31',cost:'$2.83',pill:'run',pl:'working'},
         {d:'wait',proj:'lap',v:'claude · s28',cost:'$1.05',pill:'wait',pl:'等输入'},
@@ -177,7 +177,7 @@
       '<div class="step"><span class="n">1</span><span class="b"><b>注册</b>:你 DM bot → 管理员批准把你加进名单(<code>ccteam user add bob</code> 或 /telegram:access)。注册天生管理员门控。</span></div>'+
       '<div class="step"><span class="n">2</span><span class="b"><b>拿链接</b>:bot 私信你专属 web 链接;IM 这边批准后直接可用。</span></div>'+
       '<div class="step"><span class="n">3</span><span class="b"><b>登录</b>:开链接 → 自动设 cookie → 你就是 @bob(上面那张卡)。</span></div>'+
-      '<div class="step"><span class="n">4</span><span class="b"><b>建项目</b>:<code>cd ~/bob/api-server && ccteam init</code> → 项目归你。你的控制台只列你的。</span></div>'+
+      '<div class="step"><span class="n">4</span><span class="b"><b>建项目</b>(目录随便放,归属看 owner 字段不看路径):web/IM 点「新建」指向任意目录,或 CLI <code>ccteam init --owner bob</code> → 项目 owner=@bob。<b>同账号没有 ~/bob/</b>,共用 /home/ubuntu。</span></div>'+
       '<div class="step"><span class="n">5</span><span class="b"><b>协作(可选)</b>:谁想共享 → <code>/share &lt;project&gt; @对方</code>。</span></div></div></div>';
   }
 

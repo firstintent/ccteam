@@ -30,7 +30,10 @@
    - **web**:打开专属链接 → 自动设 cookie → 进去就是 **@bob**(`TokenEntryPage` 现成 URL-shim)。每人一个链接,不共用。
    - **IM**:DM bot(已批准)→ 直接用,身份 = 你的 chat_id。
 2. **首次**:看到空状态「你还没有项目」。
-3. **建项目**:`cd ~/bob/api-server && ccteam init`(或 web/IM 点「新建」)→ 项目归 **@bob**。
+3. **建项目**(目录**随便放**,归属看 `owner` 字段、**不看路径**):
+   - web/IM 点「新建」指向**任意**目录(如 `/home/ubuntu/api-server`)→ 你已登录是 @bob → 项目 `owner=@bob`。
+   - 或 CLI `ccteam init --owner bob`(裸 `ccteam init` 跑在 shell = **admin 身份**,默认 admin-owned;`--owner` 显式归属,或管理员事后 `ccteam project chown <slug> bob`)。
+   - ⚠ **同账号没有 `~/bob/`** —— 大家共用 `/home/ubuntu`。路径只是「代码在哪」,`owner` 才是记录的归属键。可选地按 `/home/ubuntu/<user>/` 分目录只是人类整理习惯,**不是归属规则**(ccteam 不按路径前缀猜 owner)。
 4. **用起来**:你的控制台只列**你的**项目 / session / 成本;alice 的你看不见(顶部「软隔离·非安全」横幅诚实标注)。
 5. **协作(可选)**:谁想共享某项目 → `/share <project> @对方`。
 
@@ -38,7 +41,7 @@
 
 ## C. 体验「隔离」(走查原型里点这个)
 
-- @bob 登录 → 只见 `~/bob/api-server` + 他的 s40 + 他今日 $0.41。
+- @bob 登录 → 只见 `/home/ubuntu/api-server`(owner=@bob)+ 他的 s40 + 他今日 $0.41。
 - 切到 @alice → 整个 app 变成她的世界:`excore`/`lap` + s31/s28/s33 + 今日 $4.21。**bob 的一概不在**。
 - 同一台机、同一个 daemon —— 各看各的。
 
