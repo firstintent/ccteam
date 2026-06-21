@@ -827,7 +827,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             let Some(level) = normalize_effort(&d.args) else {
                 return Ok(DirectiveOutcome::Rejected {
                     reason: format!(
-                        "用法: /effort <{}>（reasoning effort；写入 settings，下次 /new 生效）",
+                        "用法: /effort <{}>（reasoning effort；写入 settings，会话下次启动生效）",
                         EFFORT_LEVELS.join("|")
                     ),
                 });
@@ -837,12 +837,15 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     "写入 effortLevel 失败: {e}"
                 )));
             }
-            if let Ok(mut s) = live.status.lock() {
-                s.effort = Some(level.clone());
-            }
+            // NOT reflected in the live status: a running stream-json session
+            // can't hot-change effort (the bridge has no `set_effort`), so the
+            // statusline must keep showing the REAL running level (via the
+            // get_settings tap) — optimistically writing `level` here would flip
+            // to it and then revert on the next turn, which read as "没生效".
             return Ok(DirectiveOutcome::Done {
                 receipt: format!(
-                    "已设 effort → {level}（写入 settings.local.json，下次 /new 生效）"
+                    "effort={level} 已写入 .claude/settings.local.json。运行中的 stream-json \
+                     会话热改不了 effort（协议无 set_effort）——会话下次启动时读取生效。"
                 ),
             });
         }
@@ -881,19 +884,18 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             if let Ok(mut s) = live.status.lock() {
                 s.model = Some(model.clone());
             }
-            // Optional effort rides along — but it's a startup setting, not a
-            // live control, so it applies on `/new` (model is live now).
+            // Optional effort: the model switch is live (set_model), but effort
+            // is NOT a live control — it's the startup `effortLevel` setting. So
+            // it's written but NOT reflected in the live status (the get_settings
+            // tap keeps the statusline on the REAL running level; an optimistic
+            // write would flip then revert on the next turn → reads "没生效").
+            // It takes effect on the session's next launch.
             let mut receipt = format!("已切换 model → {model}（live）");
             if let Some(level) = effort {
                 match set_effort_level(&live.cwd, &level) {
-                    Ok(()) => {
-                        if let Ok(mut s) = live.status.lock() {
-                            s.effort = Some(level.clone());
-                        }
-                        receipt.push_str(&format!(
-                            "；effort → {level}（写入 settings，下次 /new 生效）"
-                        ));
-                    }
+                    Ok(()) => receipt.push_str(&format!(
+                        "；effort={level} 已写入 settings（运行中会话热改不了 effort，会话下次启动生效）"
+                    )),
                     Err(e) => receipt.push_str(&format!("；effort 设置失败: {e}")),
                 }
             }
