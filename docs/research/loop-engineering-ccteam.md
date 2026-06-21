@@ -117,9 +117,9 @@ excore 是 Oracle-First 的 worked example(按构造 oracle-first:先写 spec+ve
 
 ---
 
-## 8. 与 v0.8.18 环境驾驶舱的关系
+## 8. 与 v0.8.18 地基的关系
 
-上一轮聊的「驾驶舱」分两条腿:A 环境体检(装机/健康)、B 舰队(跨会话观测)。**loop 运维台 = B 腿长大后的样子** —— 舰队视图的杀手内容就是 loop(每个 loop 的预言机状态 + 成本 + 等哪道门)。两个原型共用同一手机壳、同一底栏(插件市场 / 环境 / Loops / Settings)。
+v0.8.18(loop 地基)两柱:**① Status 长成控制台**(fleet:每条 session 状态+成本)+ **② 主机页 Hosts**(`/api/v1/hosts`,每台机器的 agent 接入)+ 身份分区。**loop 运维台 = 控制台再长一版** —— 同一批行就地加「预言机 🟢🔴⏸ + 等哪道门」两列,session 行变 loop 行。所以 loop 不新开页,是控制台连续生长(v0.8.18 原型「预览 loop 版」按钮已演示)。
 
 → 落地次序建议:先 A(v0.8.18,小、低风险、Day-0 价值)→ 再把 B 直接做成 loop 运维台(本 thesis)。A 是入口,loop 台是它的灵魂。
 
