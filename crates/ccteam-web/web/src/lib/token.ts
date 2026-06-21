@@ -19,7 +19,8 @@ const STORAGE_KEY = "aoe_auth_token";
  *  TokenEntryPage (V0.3.2 F58) so it can accept either a raw token or a
  *  pasted dashboard URL without re-implementing this logic. */
 export function extractTokenFromQuery(href?: string): string | null {
-  const input = href ?? (typeof window !== "undefined" ? window.location.href : "");
+  const input =
+    href ?? (typeof window !== "undefined" && window.location ? window.location.href : "");
   if (!input) return null;
   try {
     const url = new URL(input);
@@ -31,7 +32,9 @@ export function extractTokenFromQuery(href?: string): string | null {
 }
 
 function captureFromUrl(): void {
-  if (typeof window === "undefined") return;
+  // Runs at module load — must not throw on a partial environment (the
+  // node-env vitest suite stubs a minimal `window` without `location`).
+  if (typeof window === "undefined" || !window.location) return;
   const token = extractTokenFromQuery(window.location.href);
   if (!token) return;
 

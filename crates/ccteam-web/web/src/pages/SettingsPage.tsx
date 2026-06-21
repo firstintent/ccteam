@@ -131,7 +131,36 @@ export default function SettingsPage() {
 
       <TelegramSection status={config.telegram} onSaved={reload} />
       <LarkSection status={config.lark} onSaved={reload} />
+      <UserManagementSection />
     </div>
+  );
+}
+
+// --------------------------------------------------------------------------
+// v0.8.18 柱2/UI — multi-user (soft-partition) management section. Honest
+// scope: 档0 isolates IM chats per chat_id; per-user web links + a tenant
+// registry are 档1 (a later patch). No live tenant list yet (no backend
+// registry), so this section explains the model + the honest boundary.
+// --------------------------------------------------------------------------
+
+function UserManagementSection() {
+  return (
+    <Section
+      testId="settings-users"
+      title="用户管理 · Multi-user"
+      subtitle="软分区(档 0):每个 IM 会话(Telegram chat_id)各看各的 session / project。"
+    >
+      <div className="flex flex-col gap-2 text-[11px] font-mono leading-relaxed text-text-secondary">
+        <p>
+          多用户共用这台机器、这一个 daemon。会话已按 chat 隔离(own-only)。诚实边界:
+          <b className="text-text-primary"> 同 OS 账号下是软隔离(UX)、不是安全边界</b>。
+        </p>
+        <p className="text-text-dim">
+          本版 = 多用户档 0 地基。给每个人开独立 web 入口(per-user token + 用户注册表,
+          即 <span className="text-brand-400">ccteam user add</span>)是档 1,作为后续 patch 落地。
+        </p>
+      </div>
+    </Section>
   );
 }
 

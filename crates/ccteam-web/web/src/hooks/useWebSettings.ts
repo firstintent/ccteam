@@ -8,6 +8,15 @@ export interface WebSettings {
   autoOpenKeyboard: boolean;
   diffViewMode: "flat" | "tree";
   collapsedDiffDirs: string[];
+  // v0.8.18 柱2/UI — personal settings (the avatar popover). Per-browser in
+  // 档0 (no per-user web identity yet); 档1 ties them to the server identity.
+  /** Interface language. `zh` (中文, default) | `en` (English). Full UI i18n
+   *  is staged — this drives the nav + key labels now. */
+  language: "zh" | "en";
+  /** Display name shown on the avatar (empty ⇒ a generic glyph). */
+  displayName: string;
+  /** Avatar swatch (an emoji from a small fixed palette). */
+  avatar: string;
 }
 
 function getDefaults(): WebSettings {
@@ -17,6 +26,9 @@ function getDefaults(): WebSettings {
     autoOpenKeyboard: true,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     collapsedDiffDirs: [],
+    language: "zh",
+    displayName: "",
+    avatar: "🟧",
   };
 }
 
@@ -58,7 +70,10 @@ function getStableSnapshot(): WebSettings {
 }
 
 export function useWebSettings() {
-  const settings = useSyncExternalStore(subscribe, getStableSnapshot);
+  // `getDefaults` as the server snapshot keeps `useSyncExternalStore` SSR-safe:
+  // the node-env vitest suite renders shells via `renderToString`, where there
+  // is no localStorage — so the server falls back to defaults (language 中文).
+  const settings = useSyncExternalStore(subscribe, getStableSnapshot, getDefaults);
 
   const update = useCallback((patch: Partial<WebSettings>) => {
     const current = getSnapshot();

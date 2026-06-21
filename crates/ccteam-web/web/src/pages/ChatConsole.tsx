@@ -28,6 +28,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
 import { MessageSquare, Menu, Plus, X } from "lucide-react";
 import CostPill from "../components/CostPill";
+import AvatarMenu from "../components/AvatarMenu";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
 import HostsView from "./HostsView";
@@ -44,6 +45,8 @@ import {
 import { toastBus } from "../lib/toastBus";
 import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import { mergeProjectSlugs } from "./projectList";
+import { useWebSettings } from "../hooks/useWebSettings";
+import { navLabel } from "../lib/i18n";
 
 /** A switcher entry — one live gateway session, grouped under its project. */
 type RailSession = SessionSummary;
@@ -61,14 +64,9 @@ function globalViewFor(pathname: string): GlobalView {
   return null;
 }
 
-/** Crumb label for each global view (shown in the top bar in place of the
- *  session crumb). */
-const GLOBAL_VIEW_LABEL: Record<NonNullable<GlobalView>, string> = {
-  marketplace: "插件市场",
-  status: "Status",
-  hosts: "主机",
-  settings: "Settings",
-};
+// v0.8.18 柱2/UI — crumb + bottom-nav labels are now language-aware; see
+// `navLabel(key, lang)` in `lib/i18n.ts` (default 中文, switchable to English
+// from the avatar popover).
 
 /** One sidebar bottom-nav row (prototype `.nav a` / `.nav a.on`). `NavLink`
  *  drives the active highlight off the current route so a deep-link lands on
@@ -113,6 +111,8 @@ export default function ChatConsole() {
   // On a global route (插件市场 / Status / Settings) the shell hosts that
   // view in its main area instead of the per-session chat/terminal.
   const globalView = globalViewFor(location.pathname);
+  const { settings } = useWebSettings();
+  const lang = settings.language;
 
   // The switcher's session list (gateway `s{n}`), fanned out across every
   // project from /api/v1/projects → /api/v1/projects/{slug}/sessions.
@@ -281,6 +281,7 @@ export default function ChatConsole() {
         <span className="flex-1" />
         {/* Cost pill — today's daily-spend / 24h-budget rollup; click → /status. */}
         <CostPill />
+        <AvatarMenu />
       </header>
 
       <div className="flex flex-1 min-h-0">
@@ -419,25 +420,25 @@ export default function ChatConsole() {
               <SidebarNavLink
                 to="/marketplace"
                 icon="🧩"
-                label="插件市场"
+                label={navLabel("marketplace", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
               <SidebarNavLink
                 to="/status"
                 icon="📊"
-                label="Status"
+                label={navLabel("status", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
               <SidebarNavLink
                 to="/hosts"
                 icon="🖥"
-                label="主机"
+                label={navLabel("hosts", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
               <SidebarNavLink
                 to="/settings"
                 icon="⚙︎"
-                label="Settings"
+                label={navLabel("settings", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
             </div>
@@ -452,7 +453,7 @@ export default function ChatConsole() {
             <>
               <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
                 <span className="text-xs font-semibold text-text-primary">
-                  {GLOBAL_VIEW_LABEL[globalView]}
+                  {navLabel(globalView, lang)}
                 </span>
               </div>
               <div className="flex-1 min-h-0 overflow-y-auto">
