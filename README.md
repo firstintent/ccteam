@@ -4,12 +4,35 @@
 
 ccteam is a **self-hosted control plane for coding agents.** One resident daemon sits in front of the stock [Claude Code](https://code.claude.com/) and OpenAI Codex agents and owns everything *around* the work — routing, session identity, lifecycle, and budget — while never touching the work itself: no injected prompts, no scraped terminals, no forked runtime. You drive the real Claude Code / Codex, every native capability intact.
 
+## Architecture
+
+```text
+   IM (Telegram · Slack · Lark)        web console        MCP tools (in a session)
+              │                            │                        │
+              └─────────────────────────────┼────────────────────────┘
+                                            ▼
+                  ┌───────────────────────────────────────┐
+                  │              ccteam daemon             │   one resident process —
+                  │   IM gateway · web · /api/v1 · MCP     │   routes, owns session
+                  │         (resident, no tick loop)       │   identity · lifecycle ·
+                  └───────────────────┬───────────────────┘   budget; never the work
+                     spawn on demand · resume by id · release when idle
+           ┌─────────────────┬─────────┴────────┬─────────────────┐
+           ▼                 ▼                  ▼
+      ┌─────────┐       ┌─────────┐        ┌─────────┐
+      │ s1 cto  │       │ s2 dev  │        │ s3  …   │    independent sessions, each its
+      │ claude  │       │ claude  │        │ codex   │    own role + context (handle s<N>)
+      └────┬────┘       └────┬────┘        └────┬────┘
+           └───────  the real Claude Code / Codex  ───────┘   --agent <role>, no injection
+                              │
+           your machine · your files · state on disk (resumes after any restart)
+```
+
 ## Why
 
-- **Remote-first** — your phone is a terminal into your machine. Drive agents from IM (Telegram, Slack, …) or a local web console; when an agent asks a question mid-task, you answer it right in chat.
-- **Always-on** — the agents run on *your* computer, read your files, run your commands, and keep working after you close the lid.
-- **A team, not a chat** — many addressable sessions run side by side across projects, each with its own role and context.
-- **Durable** — sessions survive daemon restarts and reboots; state lives on disk, so a restart resumes instead of forgetting.
+- **Remote-first** — your phone is a terminal into your machine; answer an agent's mid-task questions right in chat.
+- **Always-on** — runs on *your* computer and keeps working after you close the lid.
+- **A team, not a chat** — many independent sessions run side by side, not one serialized conversation.
 - **Vendor-native, zero lock-in** — a new Claude Code / Codex feature works the day it ships; the vendor is a per-session attribute, not a platform bet.
 
 ## Three ways to drive it
@@ -22,7 +45,7 @@ ccteam is a **self-hosted control plane for coding agents.** One resident daemon
 
 - A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat is fully isolated.
 - A **project** is a local directory you ran `ccteam init` on.
-- A **session** is an independent, resident agent handle (`s<N>`) with its own context (`/compact` and `/clear` are per-session) — exactly like a native Claude Code session, and durable across daemon restarts. `/new` spawns, `/sessions` lists (handle, project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Two sessions of the same role never cross-talk.
+- A **session** is an independent, resident agent handle (`s<N>`) with its own context (`/compact` and `/clear` are per-session) — exactly like a native Claude Code session. `/new` spawns, `/sessions` lists (handle, project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Two sessions of the same role never cross-talk.
 - A **role** is who a session *is* — a plain Markdown persona at `.claude/agents/<role>.md`, or no role at all (a bare `claude` driven by your project's `CLAUDE.md`). `ccteam init` seeds a `cto` manager that recommends the right work-role; swap any session's role live with `/role`.
 
 Build your team by dropping `.md` files into `.claude/agents/` — or one-click-install roles, skills, and workflows from the **plugin marketplace** (the web console, or `ccteam role search` / `add`): a curated catalog — official ccteam plugins first, then tracked open-source libraries like [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills) — that pins each upstream at a revision (pointers, not copies) and content-integrity-checks every install.
