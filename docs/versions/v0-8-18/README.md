@@ -53,6 +53,20 @@ loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的
 
 ---
 
+## 界面一致性(owner 1240/1241)
+
+多用户 + 多机 落地后,UI 要整体跟上:
+
+- **菜单中英双语**:导航标签 = 中 + EN(默认双语,如「主机 Hosts」)。
+- **个人设置 vs 全局设置(两个面分清)**:
+  - **点头像 → 个人设置(per-user,存身份名下)**:显示名 · 头像 · **界面语言(中文/English/双语)** · 登出。语言归个人,从头像进。
+  - **底栏「设置 Settings」(global/admin)**:IM token(telegram/lark)· 预算 · **用户管理**(列租户 + `ccteam user add` 铸 web 链接)。主机/Hosts 是独立页,不进 Settings。
+- **i18n 范围(诚实)**:双语导航 + 头像里的语言开关(UI 件)**便宜,本版做**;但「选 English → 整个 UI 全英文」= 真 i18n(上框架 + 抽所有字符串翻译 + 维护两份文案),**分阶段**:本版先骨架(导航 + Settings + 关键页可切),全量 i18n 当独立小版本推。
+
+> 原型 `v0818-real-shell.html` 已含:点头像弹个人设置(可切语言,导航跟着变 双语/中/EN)+ 双语导航 + 全局 Settings 页(IM/预算/用户管理)。
+
+---
+
 ## 范围切口 / 不做
 
 | 做(本版) | 不做(留给 loop 版 / 不碰) |
@@ -61,6 +75,7 @@ loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的
 | 主机页 Hosts(`/api/v1/hosts`,per-host + hostname;只读 + 仅写 ccteam 自身足迹) | ❌ 从 web 写 vendor 登录/装 CLI |
 | — | ❌ 另开「舰队」页(并入 Status)· `environment` 命名(改 `hosts`,host-first) |
 | — | ❌ 真·分布式多 host 调度(host 轴本版只「列」,起跑/路由留后)|
+| 双语导航 + 头像个人设置(语言/显示名/头像)+ 全局 Settings(IM/预算/用户管理) | ❌ 全量 UI i18n(每页每条提示翻译)—— 独立小版本 |
 | 多用户档 0(ACL own-only)+ 档 1 选配 | ❌ on-ramp(loop-skill 库 + 云端起跑)· oracle-diff 门 · loop 版本管理 —— 得有 loop 才有意义 |
 | — | ❌ 跨 vendor 路由 · 拆进程/沙箱 · 改 session 存储 |
 

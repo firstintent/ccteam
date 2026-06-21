@@ -112,6 +112,23 @@
   .hostbar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-secondary);
     background:var(--surface-950);border:1px solid var(--surface-800);border-radius:8px;padding:9px 13px;margin-bottom:4px}
   .hostbar .hn{font-family:var(--font-mono);color:var(--text-primary);font-weight:500}
+  /* avatar personal popover */
+  .side{position:relative} .side-id{cursor:pointer} .side-id .chev{margin-left:auto;color:var(--text-dim);font-size:10px}
+  .pop{position:absolute;top:50px;left:10px;width:226px;z-index:30;background:var(--surface-900);border:1px solid var(--surface-700);
+    border-radius:10px;box-shadow:0 18px 50px -20px #000;padding:8px;display:none}
+  .pop.on{display:block}
+  .pop-id{display:flex;align-items:center;gap:8px;padding:6px 6px 9px;border-bottom:1px solid var(--surface-800)}
+  .pop-sec{font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim);padding:9px 6px 5px}
+  .pop-row{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--text-secondary);padding:5px 6px}
+  .pinp{margin-left:auto;width:96px;background:var(--surface-950);border:1px solid var(--surface-700);border-radius:6px;
+    color:var(--text-primary);font-family:var(--font-mono);font-size:11px;padding:3px 7px}
+  .swatch{cursor:pointer;opacity:.45;font-size:13px} .swatch.on{opacity:1}
+  .seg{margin-left:auto;display:flex;gap:2px}
+  .seg button{font-family:var(--font-sans);font-size:10.5px;color:var(--text-secondary);background:var(--surface-850);
+    border:1px solid var(--surface-700);border-radius:6px;padding:3px 7px;cursor:pointer}
+  .seg button.on{color:var(--text-bright);background:var(--surface-800);border-color:var(--brand-600)}
+  .pop-logout{margin-top:6px;border-top:1px solid var(--surface-800);padding:8px 6px 4px;font-size:11.5px;color:var(--st-error);cursor:pointer}
+  .nav a .lbl{flex:1}
   .hide{display:none}
 </style>
 </head>
@@ -120,8 +137,16 @@
 
   <!-- SIDEBAR -->
   <aside class="side">
-    <div class="side-id"><span class="av">A</span>
-      <div><div class="id-name">@alice</div><div class="id-sub">经 Telegram 配对</div></div></div>
+    <div class="side-id" onclick="togglePop()"><span class="av">A</span>
+      <div><div class="id-name">@alice</div><div class="id-sub">经 Telegram 配对</div></div><span class="chev">▾</span></div>
+    <div class="pop" id="pop">
+      <div class="pop-id"><span class="av">A</span><div><div class="id-name">@alice</div><div class="id-sub">个人 · Personal</div></div></div>
+      <div class="pop-sec">个性化 · Personalization</div>
+      <div class="pop-row">显示名 Name <input class="pinp" value="alice"></div>
+      <div class="pop-row">头像 Avatar <span style="margin-left:auto"></span><span class="swatch on">🟧</span><span class="swatch">🟦</span><span class="swatch">🟩</span><span class="swatch">🖼</span></div>
+      <div class="pop-row">界面语言 <span class="seg"><button class="on" id="lg-both" onclick="setLang('both')">双语</button><button id="lg-zh" onclick="setLang('zh')">中</button><button id="lg-en" onclick="setLang('en')">EN</button></span></div>
+      <div class="pop-logout">⎋ 登出 · Log out（清你的 token）</div>
+    </div>
     <div class="new-btn">＋ 新建 session</div>
     <div class="tree">
       <div class="tree-label">我的项目</div>
@@ -133,10 +158,10 @@
       <div class="soft-note">⚠ 软隔离·非安全 —— 只列你自己的项目;@bob 的不列(同 uid 磁盘仍互读)。</div>
     </div>
     <nav class="nav">
-      <a onclick="nav('market',this)"><span class="ic">🧩</span> 插件市场</a>
-      <a class="on" onclick="nav('console',this)"><span class="ic">📊</span> Status</a>
-      <a onclick="nav('access',this)"><span class="ic">🖥</span> 主机 <span class="new-pill">NEW</span></a>
-      <a onclick="nav('set',this)"><span class="ic">⚙️</span> Settings</a>
+      <a id="nav-market" onclick="nav('market',this)"><span class="ic">🧩</span> <span class="lbl"></span></a>
+      <a id="nav-console" class="on" onclick="nav('console',this)"><span class="ic">📊</span> <span class="lbl"></span></a>
+      <a id="nav-access" onclick="nav('access',this)"><span class="ic">🖥</span> <span class="lbl"></span> <span class="new-pill">NEW</span></a>
+      <a id="nav-set" onclick="nav('set',this)"><span class="ic">⚙️</span> <span class="lbl"></span></a>
     </nav>
   </aside>
 
@@ -236,19 +261,41 @@
       </div>
 
       <div class="page hide" id="p-market"><h2>插件市场</h2><p class="lede">已存在,不动。</p></div>
-      <div class="page hide" id="p-set"><h2>Settings</h2><p class="lede">已存在,不动(IM token · 偏好 · 预算)。</p></div>
+      <div class="page hide" id="p-set">
+        <h2>设置 Settings</h2>
+        <p class="lede">全局 / 管理员:接入凭据、预算、用户管理。<b>个人设置</b>(显示名 / 头像 / 界面语言)在左上<b>头像</b>里(per-user)。</p>
+        <div class="cards">
+          <div class="card"><div class="crow"><span class="cname">接入凭据 · IM</span><span class="pill idle" style="margin-left:auto">admin</span></div>
+            <div class="checks"><div class="ck ok"><span class="m">✓</span><span>Telegram bot · token ••••3f2a</span></div>
+              <div class="ck no"><span class="m">○</span><span>Lark · 未配置</span></div></div></div>
+          <div class="card"><div class="crow"><span class="cname">预算 · Budget</span><b style="margin-left:auto;font-family:var(--font-mono);font-size:13px">$20 / 24h</b></div>
+            <div class="note" style="margin-left:0;margin-top:6px">触顶 auto-disable(红线)· loop 跑起来后尤其重要</div></div>
+          <div class="card"><div class="crow"><span class="cname">用户管理 · Users</span><span class="pill idle" style="margin-left:auto">admin</span></div>
+            <div class="checks"><div class="ck ok"><span class="m">•</span><span>@alice <span style="color:var(--text-dim)">(你 · admin)</span></span></div>
+              <div class="ck ok"><span class="m">•</span><span>@bob</span></div></div>
+            <div class="fix" style="margin-left:0"><span class="cmd">ccteam user add &lt;handle&gt;</span><span class="mini">新增 + 铸 web 链接</span></div></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-  var titles={console:'Status · 控制台',access:'主机 · Hosts',market:'插件市场',set:'Settings'};
+  var NAV={market:{zh:'插件市场',en:'Marketplace'},console:{zh:'控制台',en:'Status'},access:{zh:'主机',en:'Hosts'},set:{zh:'设置',en:'Settings'}};
+  var LANG='both', CUR='console';
+  function lab(k){var l=NAV[k];return LANG==='both'?l.zh+' '+l.en:LANG==='zh'?l.zh:l.en;}
+  function renderNav(){Object.keys(NAV).forEach(function(k){document.querySelector('#nav-'+k+' .lbl').textContent=lab(k);});
+    document.getElementById('crumb').textContent=lab(CUR);}
   function nav(id,el){
     ['console','access','market','set'].forEach(k=>document.getElementById('p-'+k).classList.add('hide'));
     document.getElementById('p-'+id).classList.remove('hide');
     document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on')); el.classList.add('on');
-    document.getElementById('crumb').textContent=titles[id]; document.querySelector('.scroll').scrollTop=0;
+    CUR=id; renderNav(); document.querySelector('.scroll').scrollTop=0;
   }
+  function setLang(m){LANG=m;['both','zh','en'].forEach(function(x){document.getElementById('lg-'+x).classList.toggle('on',x===m);});renderNav();}
+  function togglePop(){document.getElementById('pop').classList.toggle('on');}
+  document.addEventListener('click',function(e){var p=document.getElementById('pop'),si=document.querySelector('.side-id');
+    if(p.classList.contains('on')&&!p.contains(e.target)&&!si.contains(e.target))p.classList.remove('on');});
   function toggleLoop(){
     var c=document.getElementById('fleet-card'),b=document.getElementById('lt');
     c.classList.toggle('show-loop');
@@ -260,6 +307,7 @@
     r.querySelector('span:last-child').innerHTML='ccteam MCP 已注册 <code>~/.codex/config.toml</code>';
     document.querySelector('#p-access .pill.wait').className='pill run';document.querySelector('#p-access .pill.run').textContent='就绪';
     document.querySelector('#p-access .cdot.wait').className='cdot run'}
+  renderNav();
 </script>
 </body>
 </html>
