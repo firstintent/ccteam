@@ -30,6 +30,7 @@ import { MessageSquare, Menu, Plus, X } from "lucide-react";
 import CostPill from "../components/CostPill";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
+import HostsView from "./HostsView";
 import SettingsPage from "./SettingsPage";
 import SessionView from "./SessionView";
 import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
@@ -50,11 +51,12 @@ type RailSession = SessionSummary;
 /** The three bottom-nav global views — each is a full route the shell hosts
  *  in its main area (sidebar persists, Chat|终端 tabs hide). `null` = a
  *  session-chat surface (a selected session or the empty state). */
-type GlobalView = "marketplace" | "status" | "settings" | null;
+type GlobalView = "marketplace" | "status" | "hosts" | "settings" | null;
 
 function globalViewFor(pathname: string): GlobalView {
   if (pathname.startsWith("/marketplace")) return "marketplace";
   if (pathname.startsWith("/status")) return "status";
+  if (pathname.startsWith("/hosts")) return "hosts";
   if (pathname.startsWith("/settings")) return "settings";
   return null;
 }
@@ -64,6 +66,7 @@ function globalViewFor(pathname: string): GlobalView {
 const GLOBAL_VIEW_LABEL: Record<NonNullable<GlobalView>, string> = {
   marketplace: "插件市场",
   status: "Status",
+  hosts: "主机",
   settings: "Settings",
 };
 
@@ -426,6 +429,12 @@ export default function ChatConsole() {
                 onNavigate={() => setSidebarOpen(false)}
               />
               <SidebarNavLink
+                to="/hosts"
+                icon="🖥"
+                label="主机"
+                onNavigate={() => setSidebarOpen(false)}
+              />
+              <SidebarNavLink
                 to="/settings"
                 icon="⚙︎"
                 label="Settings"
@@ -451,6 +460,8 @@ export default function ChatConsole() {
                   <SettingsPage />
                 ) : globalView === "marketplace" ? (
                   <MarketplaceView />
+                ) : globalView === "hosts" ? (
+                  <HostsView />
                 ) : (
                   <StatusView rail={railSessions} />
                 )}

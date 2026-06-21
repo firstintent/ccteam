@@ -8,9 +8,22 @@
 //   401 → throw Error("UNAUTHENTICATED")  (global TokenEntryGate kicks in)
 //   other non-2xx → throw Error("HTTP <status>")
 
+/** v0.8.18 柱1 — one live session's fleet-view row (`SessionCostRow`). The
+ *  loop-ops console skeleton: per-session cost today, oracle/gate columns
+ *  next version. `cost_usd` is best-effort (see status.rs). */
+export interface SessionCostRow {
+  sid: string;
+  project: string;
+  role: string;
+  vendor: string;
+  status: string;
+  cost_usd: number;
+}
+
 /** `GET /api/v1/status` response (`StatusResponse`). `budget_cap_24h` is null
  *  when no project configures a cap; `cost_24h_by_vendor` is keyed by vendor
- *  (`"claude"`, `"codex"`, …) and may be empty. */
+ *  (`"claude"`, `"codex"`, …) and may be empty. `sessions` is the per-session
+ *  fleet list (empty on the standalone no-gateway path). */
 export interface StatusSnapshot {
   daemon_healthy: boolean;
   sessions_live: number;
@@ -18,6 +31,7 @@ export interface StatusSnapshot {
   cost_24h_usd: number;
   cost_24h_by_vendor: Record<string, number>;
   budget_cap_24h: number | null;
+  sessions?: SessionCostRow[];
 }
 
 /** `GET /api/v1/status`. */

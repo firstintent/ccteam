@@ -203,4 +203,41 @@ describe("StatusCards (seeded success state)", () => {
     const html = renderToString(<StatusCards status={snap} rail={RAIL} />);
     expect(html).not.toContain('data-testid="status-budget-warn"');
   });
+
+  it("renders per-session cost from status.sessions joined to the rail by sid", () => {
+    // v0.8.18 柱1 — the fleet cost column: each rail row shows its sid's cost
+    // from status.sessions. A rail sid absent from status.sessions shows $0.00.
+    const snap: StatusSnapshot = {
+      daemon_healthy: true,
+      sessions_live: 2,
+      sessions_idle: 0,
+      cost_24h_usd: 1.68,
+      cost_24h_by_vendor: { claude: 1.23, codex: 0.45 },
+      budget_cap_24h: null,
+      sessions: [
+        { sid: "s5", project: "ideas", role: "architect", vendor: "claude", status: "live", cost_usd: 1.23 },
+        { sid: "s7", project: "ideas", role: "cto", vendor: "codex", status: "live", cost_usd: 0.45 },
+      ],
+    };
+    const html = renderToString(<StatusCards status={snap} rail={RAIL} />);
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="session-cost-s5"');
+    expect(html).toContain('data-testid="session-cost-s7"');
+    expect(text).toContain("$1.23");
+    expect(text).toContain("$0.45");
+  });
+
+  it("shows $0.00 cost for a rail session with no cost row yet", () => {
+    const snap: StatusSnapshot = {
+      daemon_healthy: true,
+      sessions_live: 1,
+      sessions_idle: 0,
+      cost_24h_usd: 0,
+      cost_24h_by_vendor: {},
+      budget_cap_24h: null,
+      sessions: [],
+    };
+    const html = renderToString(<StatusCards status={snap} rail={[RAIL[0]]} />);
+    expect(visibleText(html)).toContain("$0.00");
+  });
 });

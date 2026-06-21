@@ -104,6 +104,10 @@ export function StatusCards({
 }) {
   const severity = budgetSeverity(status.cost_24h_usd, status.budget_cap_24h);
   const vendorSplit = vendorCostSplit(status.cost_24h_by_vendor);
+  // v0.8.18 柱1 — per-session cost from /status's fleet list, joined to the
+  // live rail by sid. The loop-ops console skeleton: this column is the seam
+  // the loop version grows oracle/gate columns onto.
+  const costBySid = new Map((status.sessions ?? []).map((s) => [s.sid, s.cost_usd]));
 
   return (
     <>
@@ -156,6 +160,13 @@ export function StatusCards({
                   {[s.vendor, s.role || "(无 role)"].filter(Boolean).join(" · ")}
                 </span>
                 <span className="font-mono text-text-dim">{s.sid}</span>
+                  <span
+                    data-testid={`session-cost-${s.sid}`}
+                    className="font-mono text-text-secondary"
+                    title="本会话累计成本（best-effort）"
+                  >
+                    {formatUsd(costBySid.get(s.sid) ?? 0)}
+                  </span>
                   {typeof s.last_activity_seconds === "number" ? (
                     <span className="text-[10px] text-text-dim">
                       最近活动 {formatActivityAge(s.last_activity_seconds)}前

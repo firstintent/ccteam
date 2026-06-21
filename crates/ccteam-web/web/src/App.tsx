@@ -15,6 +15,8 @@
 //                              global view (placeholder this phase).
 //   - `/status`              → the shell hosting the lightweight Status
 //                              global view (placeholder this phase).
+//   - `/hosts`               → the shell hosting the 主机/Hosts host-keyed
+//                              agent report (install/MCP status per machine).
 //   - `/settings`            → the shell hosting the IM-config Settings view.
 //
 // On a global route the sidebar persists, the main area shows the global
@@ -56,6 +58,7 @@ export default function App() {
           <Route path="/chat/s/:sid" element={<ChatConsole />} />
           <Route path="/marketplace" element={<ChatConsole />} />
           <Route path="/status" element={<ChatConsole />} />
+          <Route path="/hosts" element={<ChatConsole />} />
           <Route path="/settings" element={<ChatConsole />} />
           {/* Unknown routes fall back to the empty shell. */}
           <Route path="*" element={<ChatConsole />} />

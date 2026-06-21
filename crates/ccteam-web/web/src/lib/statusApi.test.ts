@@ -65,4 +65,23 @@ describe("getStatus", () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(500, {}));
     await expect(getStatus()).rejects.toThrow("HTTP 500");
   });
+
+  it("carries the per-session fleet cost rows when present", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(200, {
+        daemon_healthy: true,
+        sessions_live: 1,
+        sessions_idle: 0,
+        cost_24h_usd: 1.23,
+        cost_24h_by_vendor: { claude: 1.23 },
+        budget_cap_24h: null,
+        sessions: [
+          { sid: "s1", project: "demo", role: "cto", vendor: "claude", status: "live", cost_usd: 1.23 },
+        ],
+      }),
+    );
+    const got = await getStatus();
+    expect(got.sessions?.[0].sid).toBe("s1");
+    expect(got.sessions?.[0].cost_usd).toBe(1.23);
+  });
 });
