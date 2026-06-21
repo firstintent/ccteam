@@ -3,6 +3,7 @@
 > 状态:**讨论稿(doc-first,代码未动)**。owner 定调(2026-06-21):**loop 移到下一版本;本版只做 loop 的地基**,且每块都自己就有用。
 > 原型(**基于真实 `ChatConsole` 壳**:sidebar + topbar + main,照搬 `web/src/index.css` 的 @theme 配色/Geist 字体/status 状态色 —— 增量不重画):**[`v0818-real-shell.html`](prototype/v0818-real-shell.html)** = 柱1(控制台 + 主机)+ 柱2(身份 scope)一屏可点,**视觉以此为准**。早期 phone-shell 草图(`environment-cockpit` / `multi-user-soft-partition` / `loop-ops-console`)仅留作内容参考,配色/布局已被上面这版取代。
 > loop 本身的设计见 [`../../research/loop-engineering-ccteam.md`](../../research/loop-engineering-ccteam.md)(**下一版**)。
+> **🚀 开发提示词**:[`dev-goal-prompt.md`](dev-goal-prompt.md) —— 新会话 `/goal` 整版实现(owner review 原型后启动)。
 
 ---
 
@@ -57,13 +58,13 @@ loop 是大赌注,单独一版做;但它的底座该先在。**本版 = loop 的
 
 多用户 + 多机 落地后,UI 要整体跟上:
 
-- **菜单中英双语**:导航标签 = 中 + EN(默认双语,如「主机 Hosts」)。
+- **菜单语言**:导航标签随界面语言渲染,**默认中文**(「主机」),可切英文(「Hosts」)。
 - **个人设置 vs 全局设置(两个面分清)**:
-  - **点头像 → 个人设置(per-user,存身份名下)**:显示名 · 头像 · **界面语言(中文/English/双语)** · 登出。语言归个人,从头像进。
+  - **点头像 → 个人设置(per-user,存身份名下)**:显示名 · 头像 · **界面语言(中文 / English,默认中文)** · 登出。语言归个人,从头像进。
   - **底栏「设置 Settings」(global/admin)**:IM token(telegram/lark)· 预算 · **用户管理**(列租户 + `ccteam user add` 铸 web 链接)。主机/Hosts 是独立页,不进 Settings。
 - **i18n 范围(诚实)**:双语导航 + 头像里的语言开关(UI 件)**便宜,本版做**;但「选 English → 整个 UI 全英文」= 真 i18n(上框架 + 抽所有字符串翻译 + 维护两份文案),**分阶段**:本版先骨架(导航 + Settings + 关键页可切),全量 i18n 当独立小版本推。
 
-> 原型 `v0818-real-shell.html` 已含:点头像弹个人设置(可切语言,导航跟着变 双语/中/EN)+ 双语导航 + 全局 Settings 页(IM/预算/用户管理)。
+> 原型 `v0818-real-shell.html` 已含:点头像弹个人设置(切语言 中文/English,导航跟着切,默认中文)+ 全局 Settings 页(IM/预算/用户管理)。
 
 ---
 

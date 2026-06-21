@@ -144,7 +144,7 @@
       <div class="pop-sec">个性化 · Personalization</div>
       <div class="pop-row">显示名 Name <input class="pinp" value="alice"></div>
       <div class="pop-row">头像 Avatar <span style="margin-left:auto"></span><span class="swatch on">🟧</span><span class="swatch">🟦</span><span class="swatch">🟩</span><span class="swatch">🖼</span></div>
-      <div class="pop-row">界面语言 <span class="seg"><button class="on" id="lg-both" onclick="setLang('both')">双语</button><button id="lg-zh" onclick="setLang('zh')">中</button><button id="lg-en" onclick="setLang('en')">EN</button></span></div>
+      <div class="pop-row">界面语言 <span class="seg"><button class="on" id="lg-zh" onclick="setLang('zh')">中文</button><button id="lg-en" onclick="setLang('en')">English</button></span></div>
       <div class="pop-logout">⎋ 登出 · Log out（清你的 token）</div>
     </div>
     <div class="new-btn">＋ 新建 session</div>
@@ -282,8 +282,8 @@
 
 <script>
   var NAV={market:{zh:'插件市场',en:'Marketplace'},console:{zh:'控制台',en:'Status'},access:{zh:'主机',en:'Hosts'},set:{zh:'设置',en:'Settings'}};
-  var LANG='both', CUR='console';
-  function lab(k){var l=NAV[k];return LANG==='both'?l.zh+' '+l.en:LANG==='zh'?l.zh:l.en;}
+  var LANG='zh', CUR='console';
+  function lab(k){var l=NAV[k];return LANG==='en'?l.en:l.zh;}
   function renderNav(){Object.keys(NAV).forEach(function(k){document.querySelector('#nav-'+k+' .lbl').textContent=lab(k);});
     document.getElementById('crumb').textContent=lab(CUR);}
   function nav(id,el){
@@ -292,7 +292,7 @@
     document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('on')); el.classList.add('on');
     CUR=id; renderNav(); document.querySelector('.scroll').scrollTop=0;
   }
-  function setLang(m){LANG=m;['both','zh','en'].forEach(function(x){document.getElementById('lg-'+x).classList.toggle('on',x===m);});renderNav();}
+  function setLang(m){LANG=m;['zh','en'].forEach(function(x){document.getElementById('lg-'+x).classList.toggle('on',x===m);});renderNav();}
   function togglePop(){document.getElementById('pop').classList.toggle('on');}
   document.addEventListener('click',function(e){var p=document.getElementById('pop'),si=document.querySelector('.side-id');
     if(p.classList.contains('on')&&!p.contains(e.target)&&!si.contains(e.target))p.classList.remove('on');});
