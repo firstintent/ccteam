@@ -1,7 +1,7 @@
 # v0.8.18 PRD — Loop 地基(driving cockpit + identity)
 
 > 状态:**讨论稿(doc-first,代码未动)**。owner 定调(2026-06-21):**loop 移到下一版本;本版只做 loop 的地基**,且每块都自己就有用。
-> 原型:[`environment-cockpit.html`](prototype/environment-cockpit.html)(柱1A)· [`loop-ops-console.html`](prototype/loop-ops-console.html)(柱1B 的将来形态,本版先用它显示 session)· [`multi-user-soft-partition.html`](prototype/multi-user-soft-partition.html)(柱2)。
+> 原型(**基于真实 `ChatConsole` 壳**:sidebar + topbar + main,照搬 `web/src/index.css` 的 @theme 配色/Geist 字体/status 状态色 —— 增量不重画):**[`v0818-real-shell.html`](prototype/v0818-real-shell.html)** = 柱1(环境 + 舰队)+ 柱2(身份 scope)一屏可点,**视觉以此为准**。早期 phone-shell 草图(`environment-cockpit` / `multi-user-soft-partition` / `loop-ops-console`)仅留作内容参考,配色/布局已被上面这版取代。
 > loop 本身的设计见 [`../../research/loop-engineering-ccteam.md`](../../research/loop-engineering-ccteam.md)(**下一版**)。
 
 ---
