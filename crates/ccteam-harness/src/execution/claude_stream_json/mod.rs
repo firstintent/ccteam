@@ -156,6 +156,25 @@ fn spawn_hitl_dispatcher(
     });
 }
 
+/// Carry the `[1m]` context-window tag from the CURRENT model onto the API's
+/// `message.model` (which omits it). The user requests 1M via `set_model
+/// opus[1m]`, but claude's API model id is the bare `claude-opus-4-8`; without
+/// this the status tap would re-stamp the session bare → the window heuristic
+/// (`context_window_for_model`) reads 200k and the `[1m]` display is lost. A
+/// later `set_model` resets the current model (with or without `[1m]`), so this
+/// only preserves the live intent — it never invents a tag the user didn't ask
+/// for, and a switch to a non-`[1m]` model clears it.
+fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
+    let had_1m = current
+        .map(|c| c.to_ascii_lowercase().ends_with("[1m]"))
+        .unwrap_or(false);
+    if had_1m && !api_model.to_ascii_lowercase().ends_with("[1m]") {
+        format!("{api_model}[1m]")
+    } else {
+        api_model.to_string()
+    }
+}
+
 /// Spawn the per-session status tap: fold each `assistant`/`result`
 /// message's token `usage` (and the assistant's live `message.model`) into
 /// the shared [`ThreadStatus`], so [`HarnessAdapter::thread_status`] reports
@@ -181,13 +200,20 @@ fn spawn_status_tap(
                 msg = sub.recv() => match msg {
                     Ok(Outbound::Assistant(env)) => {
                         if let Some(usage) = env.message.get("usage") {
-                            let model = env.message.get("model").and_then(|v| v.as_str());
-                            let ctx = context_usage_from_usage(usage, model);
+                            let api_model = env.message.get("model").and_then(|v| v.as_str());
                             let snapshot = if let Ok(mut s) = status.lock() {
-                                if let Some(m) = model.filter(|m| !m.is_empty()) {
-                                    s.model = Some(m.to_string());
+                                // Re-stamp the model from the API id, but carry over
+                                // a user-set `[1m]` tag (the API omits it) so the
+                                // window heuristic below + the display keep 1M.
+                                if let Some(m) = api_model.filter(|m| !m.is_empty()) {
+                                    s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
                                 }
-                                s.context = Some(ctx);
+                                // Window from the `[1m]`-preserved model (the
+                                // result branch's get_context_usage is authoritative
+                                // when it answers; this keeps the per-message update
+                                // from flickering an `opus[1m]` session back to 200k).
+                                s.context =
+                                    Some(context_usage_from_usage(usage, s.model.as_deref()));
                                 Some(s.clone())
                             } else {
                                 None
@@ -1025,7 +1051,34 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 
 #[cfg(test)]
 mod effort_tests {
-    use super::{normalize_effort, set_effort_level, split_model_effort, EFFORT_LEVELS};
+    use super::{
+        normalize_effort, preserve_1m_tag, set_effort_level, split_model_effort, EFFORT_LEVELS,
+    };
+
+    #[test]
+    fn preserve_1m_tag_carries_user_intent_without_inventing_it() {
+        // User set `opus[1m]`; the API id is bare → carry the tag over (so the
+        // window heuristic keeps 1M and the statusline keeps showing [1m]).
+        assert_eq!(
+            preserve_1m_tag(Some("opus[1m]"), "claude-opus-4-8"),
+            "claude-opus-4-8[1m]"
+        );
+        assert_eq!(
+            preserve_1m_tag(Some("claude-opus-4-8[1m]"), "claude-opus-4-8"),
+            "claude-opus-4-8[1m]"
+        );
+        // No [1m] in the current model → never invent one (a 200k model stays 200k).
+        assert_eq!(
+            preserve_1m_tag(Some("claude-sonnet-4-6"), "claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(preserve_1m_tag(None, "claude-opus-4-8"), "claude-opus-4-8");
+        // API id already carries [1m] → don't double it.
+        assert_eq!(
+            preserve_1m_tag(Some("opus[1m]"), "claude-opus-4-8[1m]"),
+            "claude-opus-4-8[1m]"
+        );
+    }
 
     #[test]
     fn normalize_effort_accepts_levels_case_insensitively_and_rejects_others() {
