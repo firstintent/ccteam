@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ccteam · 多用户软分区原型</title>
+<style>
+  :root{
+    --bg:#0a0d13; --frame:#0e131c; --panel:#121925; --panel2:#0f1620;
+    --border:#1e2836; --border2:#283446;
+    --text:#d6dee8; --muted:#7d8aa0; --faint:#576074;
+    --green:#3fb950; --amber:#d6a435; --red:#f06a5d; --grey:#5a6577; --blue:#5aa6f0;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 50% -10%, #16202e 0%, var(--bg) 60%);
+    min-height:100vh;font-family:var(--sans);color:var(--text);
+    display:flex;flex-wrap:wrap;gap:34px;justify-content:center;align-items:flex-start;padding:34px 18px 60px;}
+  .wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+  .cap{font-size:12px;color:var(--faint)} .cap b{color:var(--muted);font-weight:600}
+
+  .phone{width:412px;height:858px;background:var(--frame);border:1px solid var(--border2);border-radius:30px;
+    box-shadow:0 30px 80px -30px #000, inset 0 0 0 1px #0c1119;display:flex;flex-direction:column;overflow:hidden}
+  .notch{height:26px;display:flex;align-items:center;justify-content:center}
+  .notch::after{content:"";width:96px;height:6px;border-radius:4px;background:#222b39}
+
+  .top{display:flex;align-items:center;gap:8px;padding:6px 14px 11px;border-bottom:1px solid var(--border)}
+  .brand{font-weight:700;font-size:15px}.brand .dot{color:var(--green)}
+  .who{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12px;background:#101a14;
+    border:1px solid #1f3a2a;border-radius:999px;padding:3px 10px;color:#9fe0b4}
+  .who .av{width:16px;height:16px;border-radius:50%;background:linear-gradient(135deg,#3fb950,#2ea043);
+    display:flex;align-items:center;justify-content:center;font-size:9px;color:#06210f;font-weight:800}
+
+  .scroll{flex:1;overflow-y:auto;padding:13px 13px 8px}.scroll::-webkit-scrollbar{width:0}
+
+  .softbar{background:#1c1708;border:1px solid #4a3d12;border-radius:11px;padding:9px 11px;margin-bottom:12px}
+  .softbar .l{font-size:10px;color:var(--amber);font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+  .softbar .t{font-size:11px;color:#e8d9b0;margin-top:4px;line-height:1.45}
+
+  .h{display:flex;align-items:baseline;gap:8px;margin:2px 2px 9px}
+  .h .t{font-size:16px;font-weight:700}.h .s{font-size:11px;color:var(--faint)}
+
+  .sess{background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);border:1px solid var(--border);
+    border-radius:13px;padding:11px 12px;margin-bottom:10px}
+  .srow{display:flex;align-items:center;gap:9px}
+  .sid{font-family:var(--mono);font-weight:700;font-size:14px}
+  .proj{font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .dot2{width:8px;height:8px;border-radius:50%;flex:none}
+  .dot2.g{background:var(--green);box-shadow:0 0 7px -1px var(--green)} .dot2.a{background:var(--amber)}
+  .stag{margin-left:auto;font-size:10px;font-family:var(--mono);color:var(--muted)}
+  .ssub{margin-top:7px;font-size:11px;color:var(--muted)}
+  .sfoot{margin-top:9px;display:flex;gap:7px;align-items:center}
+  .mini{font-size:10.5px;color:var(--muted);background:#131c28;border:1px solid var(--border2);
+    border-radius:6px;padding:4px 9px;cursor:pointer;user-select:none}
+  .mini:active{transform:scale(.95)}
+  .shared{font-size:10px;color:#9fe0b4;background:#101a14;border:1px solid #1f3a2a;border-radius:6px;padding:3px 8px}
+  .pic{font-size:15px;flex:none}
+  .sinner{margin-top:8px;padding-left:3px;display:flex;flex-direction:column;gap:5px}
+  .sln{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:7px;font-family:var(--mono)}
+  .sln .dot2{margin:0}
+  .stag2{margin-left:auto;font-size:9.5px;color:var(--faint)}
+
+  .ghost{background:#0d121b;border:1px dashed var(--border2);border-radius:13px;padding:13px 12px;margin-bottom:10px;
+    color:var(--faint);font-size:11.5px;line-height:1.5}
+  .ghost b{color:var(--muted)}
+  .ghost .gh{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:5px;display:flex;align-items:center;gap:6px}
+  .lock{opacity:.5;font-size:13px}
+
+  .howbar{margin-top:4px;font-size:11px;color:var(--faint);background:var(--panel2);border:1px solid var(--border);
+    border-radius:10px;padding:9px 11px;line-height:1.5}
+  .howbar code{font-family:var(--mono);font-size:10.5px;color:#cfe2ff;background:#0c1622;border:1px solid #1b3146;border-radius:5px;padding:1px 5px}
+
+  .nav{display:flex;border-top:1px solid var(--border);background:#0b1019}
+  .nav button{flex:1;background:none;border:none;color:var(--faint);font-family:var(--sans);padding:10px 0 13px;font-size:10.5px;display:flex;flex-direction:column;align-items:center;gap:4px}
+  .nav button .ic{font-size:17px}.nav button.on{color:var(--text)}
+
+  .foot{max-width:412px;font-size:11.5px;color:var(--muted);line-height:1.65}
+  .foot h4{color:var(--text);font-size:12.5px;margin:0 0 6px}
+  .foot code{font-family:var(--mono);font-size:11px;color:#cfe2ff;background:#0c1622;border:1px solid #1b3146;border-radius:5px;padding:1px 5px}
+  .foot .rl{color:var(--amber)} .foot .x{color:var(--red)} .foot .ok{color:var(--green)}
+  .foot ul{margin:6px 0 0;padding-left:18px}.foot li{margin:4px 0}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="top">
+      <span class="brand"><span class="dot">●</span> ccteam</span>
+      <span class="who"><span class="av">A</span> @alice</span>
+    </div>
+
+    <div class="scroll">
+      <div class="softbar">
+        <div class="l">⚠ 软隔离 · 非安全</div>
+        <div class="t">你和 @bob 同一台机器、同一个 OS 账号 → 这只防 UI 误串,不防同机窥探(同 uid 可读彼此文件)。互信同事用刚好;要真隔离 = 一人一实例/沙箱。</div>
+      </div>
+
+      <div class="h"><span class="t">我的项目</span><span class="s">/ 按 owner 分区,只列你的</span></div>
+
+      <div class="sess">
+        <div class="srow">
+          <span class="pic">📁</span>
+          <span class="sid">excore</span><span class="proj">~/alice/excore</span>
+          <span class="stag">2 session</span>
+        </div>
+        <div class="sinner">
+          <div class="sln"><span class="dot2 g"></span> s31 · 运行中 · 编辑 matching engine<span class="stag2">opus[1m]</span></div>
+          <div class="sln"><span class="dot2 a"></span> s33 · 空闲 5m</div>
+        </div>
+        <div class="sfoot">
+          <span class="mini">进入</span>
+          <span class="mini" onclick="this.textContent='已 share @bob';this.className='shared'">/share 项目</span>
+        </div>
+      </div>
+
+      <div class="sess">
+        <div class="srow">
+          <span class="pic">📁</span>
+          <span class="sid">lap</span><span class="proj">~/alice/lap</span>
+          <span class="stag">1 session</span>
+        </div>
+        <div class="sinner">
+          <div class="sln"><span class="dot2 a"></span> s28 · 空闲 12m</div>
+        </div>
+        <div class="sfoot">
+          <span class="mini">进入</span>
+          <span class="shared">已 share @bob</span>
+        </div>
+      </div>
+
+      <div class="ghost">
+        <div class="gh"><span class="lock">🔒</span> @bob 的项目</div>
+        bob 的项目目录是他自己的(<b>~/bob/…</b>),在你这儿根本不列。即便你俩各有个叫 excore 的项目,也互不可见 —— owner 不同。除非他 <b>/share 项目</b> 给你。
+      </div>
+
+      <div class="howbar">
+        你怎么进来的:在 Telegram 给 bot 发 <code>/web</code> → 它私信你**专属链接**(token 绑你的 telegram 身份)。每个配对用户一个 token,不是大家共用一个。
+      </div>
+
+      <div style="height:6px"></div>
+    </div>
+
+    <div class="nav">
+      <button class="on"><span class="ic">💬</span>会话</button>
+      <button><span class="ic">🧩</span>插件市场</button>
+      <button><span class="ic">🩺</span>环境</button>
+      <button><span class="ic">⚙️</span>Settings</button>
+    </div>
+  </div>
+
+  <div class="cap"><b>多用户软分区原型</b> · 同 ubuntu 账号 + 共用一个 daemon · 点 /share 演示显式共享</div>
+</div>
+
+<div class="foot">
+  <h4>这屏在说什么:给共享 daemon 加一个「身份」键(最简)</h4>
+  <ul>
+    <li><span style="color:var(--blue)">owner 的简化</span>:按 <b>project</b> 分区。现实里每个用户项目目录本就独立 → project 是天然租户边界,session 从所属 project 继承归属,连 per-session 共享都省了。</li>
+    <li><span class="ok">两个白送</span>:IM 已 per-chat(Telegram 给每人不同 chat_id = 租户身份);存储已 per-sid 物理不撞。<code>ccteam config</code> IM 不失效(bot 是 daemon 级,一个 bot 多个 chat)。串只是「视图/ACL」问题。</li>
+    <li><span class="rl">最小改动 = 档 0</span>:ACL 收 own-only(删 gateway.rs:1219「同 project 互看」+「web 通看」两条漏),几行、治好 IM 串。<b>档 1/2(选)</b>:web 个人链接(复用 state.rs:96 绑 chat)+ <code>ProjectState.owner</code>(state.rs:86)过滤。本图 = 档 1+2 最终视图。</li>
+    <li><span class="x">红线</span>:同 uid = <b>软隔离非安全</b>,横幅诚实标注;不拆进程/不开沙箱。</li>
+    <li><b>地基不浪费</b>:今天「身份→按 project 过滤」(软)= 将来「身份→路由到你自己的沙箱」(硬)的同一根键。</li>
+  </ul>
+</div>
+</body>
+</html>

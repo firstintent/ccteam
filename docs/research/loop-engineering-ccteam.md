@@ -2,8 +2,8 @@
 
 > **类型**:战略/定位 thesis(非版本 PRD,非竞品报告)。
 > **日期**:2026-06-21 · **状态**:讨论稿,代码未动。
-> **源**:Addy Osmani《Loop Engineering》+ chainup `agent-research/loop-dev-paradigm`(Oracle-First)。归档参考:`/home/ubuntu/chainup/agent-research/loop-engineering-20260621.md`、`loop-dev-paradigm-20260621.md`。
-> **原型**:[`../versions/v0-8-18/prototype/loop-ops-console.html`](../versions/v0-8-18/prototype/loop-ops-console.html)(手机壳,门可点)。
+> **源**:Addy Osmani《Loop Engineering》+ chainup `agent-research/loop-dev-paradigm`(Oracle-First)+ 新智元《Claude Code 之父删了 IDE!干掉提示词,只写循环》。归档:`/home/ubuntu/chainup/agent-research/{loop-engineering-20260621,loop-dev-paradigm-20260621,loop-engineering-xinzhiyuan202606}.md`。
+> **原型**:[`loop-onramp.html`](../versions/v0-8-18/prototype/loop-onramp.html)(入门启动:loop 库→云端起跑)+ [`loop-ops-console.html`](../versions/v0-8-18/prototype/loop-ops-console.html)(控制面板:门可点)。
 
 ---
 
@@ -45,6 +45,32 @@ loop 的两个文档都强调:机械层是**商品件**(全内置 vendor),真工
 | **loop 外的壳** | **ccteam** | 启动 / 看见 / 卡门 / 控预算 / 续命 / 推 triage | **这是 ccteam 的活,且大半已落地(§1)** |
 
 > 这套切分跟 [[orchestration-pattern-agnostic]] 完全一致:编排/智能逻辑是 prompt 层(vendor + skill),ccteam 守结构位置。loop 没有改变这个结论,只是把「结构位置」具体化成「loop 的运维台」。
+
+---
+
+## 2.5 owner 定调:ccteam 三件事 + 永不硬编码 loop
+
+owner 把它收成三件事(2026-06-21):**入门启动 + 稳定运行 + 控制面板**,外加一条硬红线。
+
+🚫 **红线:ccteam 永不硬编码 loop。** loop 的 `plan → act → verify → reflect` 住在**用户写的 skill**(`SKILL.md`,声明式语义),**不进 Rust**。ccteam 代码里没有固定 loop 状态机 —— 它只在任何 loop 外面提供壳。开发者会写多种多样的 loop,ccteam 提供基座、不替他们定义循环。(与「不 vendor 编排逻辑」「moat=壳」一脉。)
+
+| 件 | 是什么 | ccteam 怎么做 |
+|---|---|---|
+| **A. 入门启动(on-ramp)** | 把门槛从「写一堆 bash」降到「装个 skill 点启动」 | hub 里一个**起步 loop-skill 库**(那「七条可抄循环」+ elorm + oracle-first 模板)→ 一条命令「装这 loop + 指向 repo + 设预算/节奏 + 云端起跑」。原型 `loop-onramp.html` |
+| **B. 稳定运行(差异化)** | CC/Codex **给不了**的、让无人值守 loop 跑稳的功能 | 见下表 —— ccteam 在「loop 稳定运行」上的独有价值 |
+| **C. 控制面板** | 看 N 个 loop 的预言机 🟢🔴⏸ + 成本 + 等哪道门 | 原型 `loop-ops-console.html` |
+
+**B 的清单(= CC/Codex 没有)**:新智元里 THE HIVE 第一层 `/loop`「关掉电脑就停」—— ccteam 正好补这一类:
+
+- 🌥 **云端常驻**:关机/掉线/重启/重部署都不停(resume-by-sid)
+- 💰 **硬预算上限**:跨多 agent 扇出触顶 auto-disable(治 5-10x token 爆炸)
+- 📱 **门到手机**:loop 半夜要合 PR/改契约 → 你一拍放行,非桌面弹窗
+- ♻️ **状态可恢复**:dual-SoT 跨基建 churn
+- ⛓ **跨 vendor**:同一 loop 跑 Claude 或 Codex(Anthropic Routines 只 Claude)
+
+**loop 有版本(reflect 步)**:owner 的「人之后只改循环本身的 v1/v2」—— loop 想改自己(改它那个 skill)= 跟改预言机/CLAUDE.md 同级 → **升人工门**到你手机。ccteam 把「哪个 loop@哪版在哪跑」做成一等(loop-skill 带 pin 版本,经 hub 分发)。
+
+> THE HIVE 三层映射:本地 `/loop`(关机停)→ 云端 Routines → `/batch` 集群,飞轮每周蒸馏 CLAUDE.md。ccteam 不造这三层(vendor 的),但把它们**搬上云端常驻壳 + 跨 vendor + 门到手机** —— 让本地层不再「关机即停」,让蒸馏改 CLAUDE.md 走人工门。
 
 ---
 
