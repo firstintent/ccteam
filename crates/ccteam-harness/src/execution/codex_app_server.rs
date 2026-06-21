@@ -1737,6 +1737,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
             // doesn't surface it yet — statusline effort is stream-json (Claude)
             // only for now; None keeps the Codex suffix unchanged.
             effort: None,
+            // Codex has a native `/goal` (thread/goal/*); surfacing it in the
+            // statusline is a follow-up — None for now.
+            goal: None,
         })
     }
 }

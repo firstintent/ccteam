@@ -427,6 +427,7 @@ pub(crate) async fn handle_session_status(
         "sid": sid,
         "model": status.model,
         "effort": status.effort,
+        "goal": status.goal,
         "context": context,
         "status_line": status.status_suffix(),
     }))

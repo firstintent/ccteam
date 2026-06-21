@@ -461,6 +461,67 @@ fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
     serde_json::from_str(&body).ok()
 }
 
+/// Read at most the trailing `max_bytes` of a file as a UTF-8 string (lossy).
+/// Bounds a `goal_status` scan so a huge transcript can't stall the statusline;
+/// a partial first line (when we seek mid-file) just fails to parse and is
+/// skipped by the caller.
+fn read_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > max_bytes {
+        f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The session's current `/goal`, read from the Claude transcript. Claude
+/// writes the active goal as a `{type:"attachment", attachment:{type:
+/// "goal_status", condition, met}}` record on the user turn — it is NOT on the
+/// stream-json stdout stream and has no control_request (both verified by live
+/// probe), so the only read path is the transcript jsonl (the same file the TUI
+/// adapter tails — reading it is the blessed path, not terminal scraping).
+/// Returns the LAST such record (the current goal); `None` when no goal is set,
+/// it was cleared (empty condition), or the transcript is absent.
+fn read_latest_goal_status(cwd: &Path, uuid: &str) -> Option<crate::GoalStatus> {
+    let path = anthropic_project_dir(cwd)?.join(format!("{uuid}.jsonl"));
+    let body = read_transcript_tail(&path, 8 * 1024 * 1024)?;
+    parse_latest_goal_status(&body)
+}
+
+/// Scan transcript jsonl lines for the LAST `goal_status` attachment. A later
+/// `/goal clear` (or an empty condition) resets it to `None`. Pure (no fs) so
+/// it is unit-testable; `read_latest_goal_status` wraps it with the file read.
+fn parse_latest_goal_status(body: &str) -> Option<crate::GoalStatus> {
+    let mut latest: Option<crate::GoalStatus> = None;
+    for line in body.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(att) = v.get("attachment") else {
+            continue;
+        };
+        if att.get("type").and_then(|t| t.as_str()) != Some("goal_status") {
+            continue;
+        }
+        let condition = att
+            .get("condition")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let met = att.get("met").and_then(|m| m.as_bool()).unwrap_or(false);
+        // A cleared goal carries an empty condition → no active goal.
+        latest = if condition.trim().is_empty() {
+            None
+        } else {
+            Some(crate::GoalStatus { condition, met })
+        };
+    }
+    latest
+}
+
 /// Translate one outbound message and forward its events to the stream's
 /// channel. `Err(())` means the consumer dropped the stream (stop).
 async fn forward(
@@ -651,6 +712,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // Effort is unknown until the first turn — the status tap reads the
             // vendor's runtime-resolved level via `get_settings`.
             effort: None,
+            // Goal is read from the transcript on `thread_status`, not the tap.
+            goal: None,
         }));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
@@ -1023,37 +1086,72 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let live = self
             .lookup(&h.identity)
             .map(|l| l.status.lock().unwrap().clone());
-        if let Some(s) = &live {
-            if s.context.is_some() {
-                return Ok(s.clone());
+        let live_ready = live.as_ref().map(|s| s.context.is_some()).unwrap_or(false);
+        let mut status = if live_ready {
+            live.unwrap()
+        } else {
+            let persisted = h
+                .raw_extras
+                .get("project_dir")
+                .and_then(|v| v.as_str())
+                .zip(h.raw_extras.get("sid").and_then(|v| v.as_str()))
+                .and_then(|(pd, sid)| read_status_file(Path::new(pd), sid));
+            match (live, persisted) {
+                // Live (model from init, no turn yet) + persisted context → show
+                // the live model with the last-known context.
+                (Some(l), Some(p)) => ThreadStatus {
+                    model: l.model.or(p.model),
+                    context: p.context,
+                    effort: l.effort.or(p.effort),
+                    goal: None,
+                },
+                (Some(l), None) => l,
+                (None, Some(p)) => p,
+                (None, None) => ThreadStatus::default(),
             }
+        };
+        // The `/goal` is NOT on the stream-json stream and has no control_request
+        // (probed) — read the current one from the transcript (cwd + the vendor
+        // uuid name the file). Overrides any goal from a persisted snapshot.
+        if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
+            status.goal = read_latest_goal_status(Path::new(cwd), &h.identity);
         }
-        let persisted = h
-            .raw_extras
-            .get("project_dir")
-            .and_then(|v| v.as_str())
-            .zip(h.raw_extras.get("sid").and_then(|v| v.as_str()))
-            .and_then(|(pd, sid)| read_status_file(Path::new(pd), sid));
-        Ok(match (live, persisted) {
-            // Live (model from init, no turn yet) + persisted context → show
-            // the live model with the last-known context.
-            (Some(l), Some(p)) => ThreadStatus {
-                model: l.model.or(p.model),
-                context: p.context,
-                effort: l.effort.or(p.effort),
-            },
-            (Some(l), None) => l,
-            (None, Some(p)) => p,
-            (None, None) => ThreadStatus::default(),
-        })
+        Ok(status)
     }
 }
 
 #[cfg(test)]
 mod effort_tests {
     use super::{
-        normalize_effort, preserve_1m_tag, set_effort_level, split_model_effort, EFFORT_LEVELS,
+        normalize_effort, parse_latest_goal_status, preserve_1m_tag, set_effort_level,
+        split_model_effort, EFFORT_LEVELS,
     };
+
+    #[test]
+    fn parse_latest_goal_status_takes_the_last_record_and_honors_clear() {
+        // No goal record → None.
+        assert!(parse_latest_goal_status(r#"{"type":"user"}"#).is_none());
+        // One active goal.
+        let one = r#"{"type":"assistant"}
+{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship payments"}}"#;
+        let g = parse_latest_goal_status(one).unwrap();
+        assert_eq!(g.condition, "ship payments");
+        assert!(!g.met);
+        // The LAST record wins (met flips true).
+        let two = format!(
+            "{one}\n{}",
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":true,"condition":"ship payments"}}"#
+        );
+        assert!(parse_latest_goal_status(&two).unwrap().met);
+        // A trailing clear (empty condition) → no active goal.
+        let cleared = format!(
+            "{one}\n{}",
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":""}}"#
+        );
+        assert!(parse_latest_goal_status(&cleared).is_none());
+        // Half-flushed / non-JSON lines are skipped, not fatal.
+        assert!(parse_latest_goal_status("{partial\n{\"x\":1}").is_none());
+    }
 
     #[test]
     fn preserve_1m_tag_carries_user_intent_without_inventing_it() {

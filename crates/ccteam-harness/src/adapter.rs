@@ -559,6 +559,22 @@ pub struct ThreadStatus {
     /// an older persisted `status.json` (no `effort`) still deserializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The session's long-running goal (Claude / Codex `/goal`), surfaced in
+    /// the statusline. `None` when no goal is set. Default-skipped for
+    /// back-compat with older persisted `status.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalStatus>,
+}
+
+/// A long-running session goal (`/goal`). `condition` is the objective text;
+/// `met` flips true when the agent reports it achieved. For Claude stream-json
+/// this is sourced from the session transcript's `goal_status` attachment —
+/// the bridge exposes no control_request or stream message for it (verified by
+/// live probe), so it is read from the transcript like the TUI does.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GoalStatus {
+    pub condition: String,
+    pub met: bool,
 }
 
 impl ThreadStatus {
@@ -579,6 +595,19 @@ impl ThreadStatus {
         }
         if let Some(ctx) = &self.context {
             parts.push(format!("ctx {}", ctx.render()));
+        }
+        if let Some(g) = &self.goal {
+            let cond = g.condition.trim();
+            if !cond.is_empty() {
+                // Truncate a long objective so the one-line suffix stays tidy.
+                let shown: String = if cond.chars().count() > 48 {
+                    format!("{}…", cond.chars().take(47).collect::<String>())
+                } else {
+                    cond.to_string()
+                };
+                let marker = if g.met { "✅" } else { "🎯" };
+                parts.push(format!("{marker} {shown}"));
+            }
         }
         if parts.is_empty() {
             None
@@ -1222,6 +1251,7 @@ mod tests {
                 window_tokens: 1_000_000,
             }),
             effort: None,
+            goal: None,
         };
         assert_eq!(
             full.status_suffix().as_deref(),
@@ -1236,11 +1266,35 @@ mod tests {
             with_effort.status_suffix().as_deref(),
             Some("claude-opus-4-8[1m] · xhigh · ctx 188k / 1M (19%)")
         );
+        // With a goal: it trails the context segment (🎯 active / ✅ met).
+        let with_goal = ThreadStatus {
+            goal: Some(GoalStatus {
+                condition: "ship the payment module".into(),
+                met: false,
+            }),
+            ..full.clone()
+        };
+        assert_eq!(
+            with_goal.status_suffix().as_deref(),
+            Some("claude-opus-4-8[1m] · ctx 188k / 1M (19%) · 🎯 ship the payment module")
+        );
+        let met_goal = ThreadStatus {
+            goal: Some(GoalStatus {
+                condition: "ship the payment module".into(),
+                met: true,
+            }),
+            ..full.clone()
+        };
+        assert_eq!(
+            met_goal.status_suffix().as_deref(),
+            Some("claude-opus-4-8[1m] · ctx 188k / 1M (19%) · ✅ ship the payment module")
+        );
         // Model only.
         let model_only = ThreadStatus {
             model: Some("gpt-5".into()),
             context: None,
             effort: None,
+            goal: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
         // Default (statusless) → nothing to append.

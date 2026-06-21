@@ -1148,10 +1148,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .map_err(|e| HarnessError::SubmitFailed(format!("read transcript status: {e}")))?;
         // TUI sessions don't surface a reasoning-effort axis (no stream-json
         // get_settings tap); leave it None so the statusline omits it.
+        // Goal display is stream-json-only for now (read from the transcript
+        // there); the TUI path leaves it None.
         Ok(ThreadStatus {
             model,
             context,
             effort: None,
+            goal: None,
         })
     }
 }

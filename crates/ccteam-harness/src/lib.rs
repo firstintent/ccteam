@@ -49,11 +49,12 @@ pub use adapter::{
     parse_pid_from_state, pluck, pluck_f64, pluck_pct, pluck_str, sigkill_pid, sigterm_pid,
     state_json_path, AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalRisk,
     ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection, ContextUsage,
-    Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot,
-    PermissionMode, SessionHandle, SessionProtocol, SpawnCtx, SpawnOpts, SubagentState,
-    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
-    TurnId, TurnInput, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID,
+    Directive, DirectiveOutcome, ExecutionMode, GoalStatus, HarnessAdapter, HarnessError,
+    HarnessSnapshot, PermissionMode, SessionHandle, SessionProtocol, SpawnCtx, SpawnOpts,
+    SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails,
+    ThreadStatus, TurnId, TurnInput, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV,
+    CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES,
+    DEFAULT_CLAUDE_SID,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
