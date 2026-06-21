@@ -17,6 +17,7 @@ fn sample_state() -> ProjectState {
     #[allow(deprecated)]
     ProjectState {
         slug: "bookmark-mgr-a3f9".into(),
+        owner: None,
         team: "dev".into(),
         team_kind: TeamKind::Workflow,
         created_at: t0,
@@ -218,4 +219,30 @@ fn legacy_state_without_f49_fields_loads_as_workflow_with_empty_sessions() {
     loaded.save(&main).unwrap();
     let saved = std::fs::read_to_string(&main).unwrap();
     assert!(!saved.contains("team_kind"));
+}
+
+#[test]
+fn owner_defaults_none_and_round_trips() {
+    // v0.8.18 柱2 — owner is serde-default None (so pre-0.8.18 state.json, which
+    // lacks the key, loads cleanly) and skip-serialized when None; a set owner
+    // round-trips through save/load.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("state.json");
+
+    let base = ProjectState::initial("demo".into());
+    assert_eq!(base.owner, None);
+    base.save(&path).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains("\"owner\""),
+        "None owner is not serialized"
+    );
+    let reloaded = ProjectState::load(&path).unwrap();
+    assert_eq!(reloaded.owner, None);
+
+    let mut owned = ProjectState::initial("demo".into());
+    owned.owner = Some("telegram:339498819".into());
+    owned.save(&path).unwrap();
+    let back = ProjectState::load(&path).unwrap();
+    assert_eq!(back.owner.as_deref(), Some("telegram:339498819"));
 }

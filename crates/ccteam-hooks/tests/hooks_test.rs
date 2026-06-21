@@ -46,6 +46,7 @@ impl Fixture {
         #[allow(deprecated)]
         let state = ProjectState {
             slug: slug.into(),
+            owner: None,
             team: "dev".into(),
             team_kind: TeamKind::Workflow,
             created_at: now,

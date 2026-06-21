@@ -774,7 +774,11 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn web_chat_cross_entry_use_routes_reply_to_active_driver() {
+    async fn web_chat_sessions_are_own_only_across_chats() {
+        // v0.8.18 柱2 档0 — own-only over the live web-chat bridge: a second web
+        // chat (distinct chat_id) can neither see nor /use a session another
+        // chat created. Reverses the pre-0.8.18 cross-entry sharing; same-user
+        // cross-frontend reach returns via 档1 (a shared identity).
         let _guard = env_lock();
         let home = TempDir::new().unwrap();
         let ccteam_home = home.path().join(".ccteam");
@@ -790,27 +794,22 @@ mod tests {
         send_text(&mut s1, "new", "/new claude reviewer").await;
         recv_reply_contains(&mut s1, "created session s1").await;
 
-        // chat-2 (a different web console) sees s1 via the global list and uses it.
+        // chat-2 (a different web chat) cannot /use chat-1's session — own-only
+        // refuses it as unknown (no existence leak).
         let mut s2 = connect_chat_as(stack.addr, "chat-2", "bob").await;
-        send_text(&mut s2, "sessions", "/sessions").await;
-        let listed = recv_sessions(&mut s2).await;
+        send_text(&mut s2, "use", "/use s1").await;
+        recv_reply_contains(&mut s2, "unknown session for this chat: s1").await;
+
+        // The OWNER (chat-1) still sees + drives its own session — isolation
+        // doesn't break the owner's flow, and the reply routes back to it.
+        send_text(&mut s1, "sessions", "/sessions").await;
+        let listed = recv_sessions(&mut s1).await;
         assert!(
             listed.iter().any(|s| s.session.as_deref() == Some("s1")),
-            "chat-2 global view should list s1: {listed:?}"
+            "owner chat-1 should see its own session: {listed:?}"
         );
-        send_text(&mut s2, "use", "/use s1").await;
-        recv_reply_contains(&mut s2, "using session s1").await;
-
-        // chat-2 drives s1 → the agent reply routes back to chat-2 (option ①).
-        send_text(&mut s2, "drive", "drive from chat-2").await;
-        recv_reply_contains(&mut s2, "Claude echo: drive from chat-2").await;
-
-        // ...and chat-1 (the creator) does NOT receive chat-2's reply.
-        let leaked = tokio::time::timeout(std::time::Duration::from_millis(400), s1.next()).await;
-        assert!(
-            leaked.is_err(),
-            "creator chat-1 must not receive the active driver's reply"
-        );
+        send_text(&mut s1, "drive", "drive from chat-1").await;
+        recv_reply_contains(&mut s1, "Claude echo: drive from chat-1").await;
 
         drop(s1);
         drop(s2);

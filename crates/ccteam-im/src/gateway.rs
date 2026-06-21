@@ -56,6 +56,14 @@ impl ChatKey {
             user_id: user_id.to_string(),
         }
     }
+
+    /// v0.8.18 柱2 — canonical owner identity (`"channel:chat_id"`) recorded on
+    /// a project this chat creates. The `chat_id` is the free per-chat identity
+    /// (Telegram chat_id / Lark open_id); `user_id` is excluded so the project
+    /// is owned by the CHAT, not a single member of it.
+    fn identity(&self) -> String {
+        format!("{}:{}", self.channel, self.chat_id)
+    }
 }
 
 #[derive(Clone)]
@@ -1167,19 +1175,24 @@ impl Gateway {
                 let id = parts
                     .next()
                     .ok_or_else(|| anyhow!("/use requires a session id"))?;
-                // `/use <sid>` is the explicit "switch to this session" verb, so
-                // it works for ANY live session regardless of the chat's current
-                // project or who created it — it MOVES the chat's current project
-                // to the target's below, which is the whole point. (This is why a
-                // session you drove from the web console, or one in another
-                // project, is reachable from IM by id without a prior `/cd`.) The
-                // pairing ACL upstream already gates who reaches the daemon;
-                // plain-message routing still respects the current focus, and
-                // replies follow the per-turn submitter (`reply_to` retarget).
-                let session = self
+                // `/use <sid>` switches the chat's focus to one of ITS OWN
+                // sessions (it then moves the chat's current project to the
+                // target's). v0.8.18 柱2 档0 — own-only: a chat can no longer
+                // `/use` a session another chat owns (it reads as unknown), so two
+                // IM chats on one machine stay isolated. Same-user cross-frontend
+                // reach (web↔IM) returns via 档1. The pairing ACL upstream gates
+                // who reaches the daemon at all; replies follow the per-turn
+                // submitter (`reply_to`).
+                let session = match self
                     .sessions
                     .get(id)
-                    .ok_or_else(|| anyhow!("unknown session: {id}"))?;
+                    .filter(|s| Self::chat_can_access(chat, s))
+                {
+                    Some(s) => s,
+                    // Own-only: a non-owner (or a typo'd id) reads as unknown —
+                    // a clean message, not a raw error, and no existence leak.
+                    None => return Ok(Some(format!("unknown session for this chat: {id}"))),
+                };
                 let sid = session.id.clone();
                 // v0.8.10 — capture the target session's project so the switch can
                 // also move the chat's project context (below).
@@ -1216,13 +1229,11 @@ impl Gateway {
                         anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
                     })?
                     .to_string();
-                // Same access scope as /use — own session, web operator, or any
-                // session in the chat's current project (cross-frontend sharing).
-                let cur_project = self.current_project_for(chat);
+                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
                 let accessible = self
                     .sessions
                     .get(&sid)
-                    .map(|s| Self::chat_can_access(chat, s, &cur_project))
+                    .map(|s| Self::chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
@@ -1250,11 +1261,10 @@ impl Gateway {
                         .cloned()
                         .ok_or_else(|| anyhow!("/screen 需要一个活动会话(或 /screen <sid>)"))?,
                 };
-                let cur_project = self.current_project_for(chat);
                 let slug = self
                     .sessions
                     .get(&sid)
-                    .filter(|s| Self::chat_can_access(chat, s, &cur_project))
+                    .filter(|s| Self::chat_can_access(chat, s))
                     .map(|s| s.project.clone())
                     .ok_or_else(|| anyhow!("unknown session for this chat: {sid}"))?;
                 // v0.8.11 E2 — a stream-json session has no pane to capture;
@@ -1346,7 +1356,8 @@ impl Gateway {
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
                     .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
-                self.create_project(slug, path).map(Some)
+                self.create_project(slug, path, Some(&chat.identity()))
+                    .map(Some)
             }
             "/sessions" => Ok(Some(self.render_sessions(chat).await)),
             "/projects" => Ok(Some(self.render_projects())),
@@ -1361,7 +1372,12 @@ impl Gateway {
     /// an absolute directory (existing repos are adopted in place, empty
     /// dirs are created — `bootstrap_project_at_dir` leaves user files
     /// alone). Requires [`Gateway::enable_project_creation`].
-    fn create_project(&mut self, slug: &str, raw_path: &str) -> Result<String> {
+    fn create_project(
+        &mut self,
+        slug: &str,
+        raw_path: &str,
+        owner: Option<&str>,
+    ) -> Result<String> {
         let paths = self
             .project_paths
             .clone()
@@ -1376,6 +1392,22 @@ impl Gateway {
         let abs = expand_project_path(raw_path)?;
         bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
             .with_context(|| format!("scaffold project {slug} at {}", abs.display()))?;
+        // v0.8.18 柱2 — record the creating chat as owner (explicit field; NOT
+        // path-derived). Best-effort: a load/save miss just leaves owner unset.
+        if let Some(owner) = owner {
+            let state_path = paths.project_state(&slug);
+            match ccteam_core::ProjectState::load(&state_path) {
+                Ok(mut state) => {
+                    state.owner = Some(owner.to_string());
+                    if let Err(err) = state.save(&state_path) {
+                        tracing::warn!(%slug, error = %err, "set project owner failed");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%slug, error = %err, "load state to set owner failed")
+                }
+            }
+        }
         upsert_project(
             &paths.root,
             ProjectEntry {
@@ -2529,18 +2561,22 @@ impl Gateway {
     }
 
     /// Session access scope — visibility (`/sessions`) AND addressing
-    /// (`/use` / `/stop` / `/screen`). A chat may reach a session it OWNS,
-    /// any session when it is the web operator console (`channel == "web"`),
-    /// or **any session in the chat's current project** (cross-frontend
-    /// sharing: IM can see + drive sessions a web chat created in the same
-    /// project, and vice versa). Reply routing is unaffected — it follows the
-    /// per-turn submitter via `reply_to`, so a session driven from Telegram
-    /// answers Telegram and one driven from web answers web, regardless of who
-    /// created it. `cur_project` is the caller's [`current_project_for`] (passed
-    /// in so this stays a borrow-free predicate usable inside `sessions`
-    /// iteration).
-    fn chat_can_access(chat: &ChatKey, session: &GatewaySession, cur_project: &str) -> bool {
-        session.owner == *chat || chat.channel == "web" || session.project == cur_project
+    /// (`/use` / `/stop` / `/screen`).
+    ///
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN-ONLY**: a chat reaches
+    /// only the sessions it OWNS. The two pre-0.8.18 leaks are removed:
+    /// - a `web`-channel chat seeing every session (web-operator 通看), and
+    /// - any chat in the session's current project seeing it (the v0.8.13
+    ///   cross-frontend-by-project sharing).
+    ///
+    /// So two IM chats (distinct telegram `chat_id`s) on the same machine never
+    /// cross. Reply routing is unaffected — it follows the per-turn submitter
+    /// via `reply_to`. HONEST SCOPE: soft (UX) isolation under one OS uid, NOT a
+    /// security boundary (same uid can still read another's files / process
+    /// env). Cross-frontend sharing for ONE user returns via 档1 (per-user web
+    /// token → a shared identity), deferred.
+    fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
+        session.owner == *chat
     }
 
     /// Point the chat's active session at an existing session owned by this
@@ -2591,15 +2627,12 @@ impl Gateway {
     }
 
     async fn render_sessions(&self, chat: &ChatKey) -> String {
-        // The web console is a global operator view and lists every chat
-        // session; an IM channel sees sessions in its CURRENT project
-        // (cross-frontend sharing — incl. web-created ones), plus any it owns.
-        let global = chat.channel == "web";
-        let cur_project = self.current_project_for(chat);
+        // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
+        // (the web-global + same-project leaks are gone). Soft per-chat isolation.
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| global || Self::chat_can_access(chat, s, &cur_project))
+            .filter(|s| Self::chat_can_access(chat, s))
             .collect();
         if visible.is_empty() {
             return "no sessions".to_string();
@@ -5503,14 +5536,14 @@ mod tests {
         );
     }
 
-    /// Task 3 — cross-frontend sharing by project: a session created by one
-    /// chat (here `chat-1`; the web console / another frontend is the same
-    /// owner≠querier case) is visible AND addressable from a DIFFERENT chat
-    /// whose current project matches — not just its owner. So IM can see + `/use`
-    /// a web-created session in the same project. (Reply routing is unchanged —
-    /// it follows the per-turn submitter via `reply_to`.)
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — own-only isolation: a
+    /// session created by one chat is NOT visible OR addressable from a
+    /// DIFFERENT chat, even in the same project. This REVERSES the v0.8.13
+    /// cross-frontend-by-project sharing so two IM chats (distinct `chat_id`s)
+    /// on one machine never cross. The OWNER keeps full visibility + addressing.
+    /// (Same-user web↔IM cross-frontend reach returns via 档1.)
     #[tokio::test]
-    async fn gateway_sessions_shared_across_frontends_by_project() {
+    async fn gateway_sessions_are_own_only_across_chats() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
         // chat-1 creates a session in the default project "alpha".
@@ -5519,34 +5552,34 @@ mod tests {
             .await
             .unwrap();
 
-        // chat-2 (a different frontend/user) owns no session, but its current
-        // project defaults to "alpha" — so it now SEES the shared session
-        // (pre-fix: owner mismatch → "no sessions").
+        // chat-2 (a different chat/user) in the SAME default project "alpha"
+        // does NOT see chat-1's session (own-only; pre-0.8.18 the same-project
+        // leak would have shown it).
         let seen = gateway
             .handle_text("mock", "chat-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(seen, vec!["no sessions"]);
 
-        // …and can ADDRESS it: /use succeeds (addressing scope broadened too).
+        // …and cannot ADDRESS it: /use is refused for a non-owner and reads as
+        // unknown (no existence leak).
         let used = gateway
             .handle_text("mock", "chat-2", "bob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1"]);
+        assert_eq!(used, vec!["unknown session for this chat: s1"]);
 
-        // A chat in a DIFFERENT project does NOT see it (scope is the project,
-        // not "everything"): chat-3 switches to beta, then /sessions is empty.
-        gateway.register_project("beta", "/tmp/beta");
-        gateway
-            .handle_text("mock", "chat-3", "carol", "/cd beta")
+        // The OWNER still sees + uses its own session.
+        let owner_sees = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        let other = gateway
-            .handle_text("mock", "chat-3", "carol", "/sessions")
+        assert_eq!(owner_sees, vec!["s1:alpha:Claude:reviewer"]);
+        let owner_uses = gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(other, vec!["no sessions"]);
+        assert_eq!(owner_uses, vec!["using session s1"]);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -6622,10 +6655,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn gateway_web_is_global_view_and_drives_im_created_session() {
-        // Sync reply path (no event_sink) — the async pump's reply routing is
-        // covered by the web_chat_bridge harness (its adapter keeps the event
-        // stream alive; this FakeAdapter ends it on an empty queue).
+    async fn gateway_sessions_isolated_across_frontends_own_only() {
+        // v0.8.18 柱2 档0 — own-only across frontends: a web chat (and another
+        // IM chat) does NOT see or address a session a DIFFERENT chat created.
+        // The pre-0.8.18 "web is a global operator view" + cross-frontend-by-
+        // project sharing are gone; both return for ONE user via 档1 (a shared
+        // identity linking the web token to the chat_id).
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
 
@@ -6635,43 +6670,49 @@ mod tests {
             .await
             .unwrap();
 
-        // The web console is a global view: it sees the session it didn't create.
+        // The web console no longer sees a session it didn't create (own-only).
         let listing = gateway
             .handle_text("web", "web-chat", "web-user", "/sessions")
             .await
             .unwrap();
-        assert!(
-            listing
-                .iter()
-                .any(|r| r.contains("s1:alpha:Claude:assistant")),
-            "web /sessions should list the Telegram session: {listing:?}"
+        assert_eq!(
+            listing,
+            vec!["no sessions"],
+            "web should NOT see the IM-created session under own-only: {listing:?}"
         );
 
-        // Web can /use it (cross-entry) and drive it; the reply comes back.
+        // …and cannot /use it (refused as unknown — no existence leak).
         let used = gateway
             .handle_text("web", "web-chat", "web-user", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1"]);
-        let reply = gateway
-            .handle_text("web", "web-chat", "web-user", "hello from web")
-            .await
-            .unwrap();
-        assert!(
-            reply.iter().any(|r| r.contains("echo: hello from web")),
-            "web drive reply: {reply:?}"
-        );
+        assert_eq!(used, vec!["unknown session for this chat: s1"]);
 
-        // Cross-frontend sharing by project (task 3): a different Telegram chat
-        // whose current project matches now SEES tg-1's session — sharing is by
-        // project, not by creator. (Cross-PROJECT isolation still holds; see
-        // gateway_sessions_shared_across_frontends_by_project. Reply routing is
-        // unchanged — it follows the per-turn submitter via `reply_to`.)
+        // A different Telegram chat in the same default project also does NOT
+        // see it (the same-project sharing leak is gone).
         let other = gateway
             .handle_text("telegram", "tg-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(other, vec!["s1:alpha:Claude:assistant"]);
+        assert_eq!(other, vec!["no sessions"]);
+
+        // The OWNER (tg-1) still sees AND addresses its own session — isolation
+        // doesn't break the owner's own flow.
+        let owner_sees = gateway
+            .handle_text("telegram", "tg-1", "rob", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            owner_sees
+                .iter()
+                .any(|r| r.contains("s1:alpha:Claude:assistant")),
+            "owner should see its own session: {owner_sees:?}"
+        );
+        let owner_uses = gateway
+            .handle_text("telegram", "tg-1", "rob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(owner_uses, vec!["using session s1"]);
     }
 
     #[tokio::test]

@@ -85,6 +85,13 @@ pub struct PhaseHistoryEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub slug: String,
+    /// v0.8.18 柱2 (multi-user soft-partition) — owner identity
+    /// (`"channel:chat_id"`) for soft per-tenant scoping. `None` for
+    /// CLI-created projects (no chat identity) and ALL pre-0.8.18 state.json
+    /// (serde default keeps them loadable). Set when a project is created from
+    /// a chat. EXPLICIT field — ownership is NEVER derived from the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Team this project runs under. serde-default `"dev"` keeps state.json
     /// files written before M3.1 loadable as the dev team, no migration
     /// script needed.
@@ -218,6 +225,7 @@ impl ProjectState {
         Self {
             tmux_session: format!("ccteam-{slug}"),
             slug,
+            owner: None,
             team,
             team_kind: TeamKind::Workflow,
             created_at: now,
