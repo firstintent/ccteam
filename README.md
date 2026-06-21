@@ -50,15 +50,18 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 ```
 
 ```bash
-# 2. Turn any directory into a ccteam project:
-ccteam init
+# 2. Turn a directory into a ccteam project (operates on the current directory):
+cd ~/code/myproject && ccteam init      # or, from anywhere:  ccteam init --in ~/code/myproject
 
 # 3. One-time setup — registers the ccteam MCP server for Claude and Codex,
 #    sets your IM token and preferences (interactive menu, or `config <key> <value>`):
 ccteam config
 
-# 4. Start the gateway (IM gateway + web console + resource API + MCP socket):
-ccteam start            # stop cleanly with Ctrl+C, or `ccteam stop`
+# 4. Start the gateway (IM gateway + web console + resource API + MCP socket).
+#    It runs in the FOREGROUND — for an always-on daemon, run it detached
+#    (or install it as a systemd / launchd service):
+nohup ccteam start > ~/ccteam.log 2>&1 &
+#    Foreground instead? just `ccteam start` (Ctrl+C to stop). Stop anytime: `ccteam stop`
 ```
 
 ```text
