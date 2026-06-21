@@ -470,7 +470,12 @@ fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
 pub fn persisted_session_model(project_dir: &Path, sid: &str) -> Option<String> {
     read_status_file(project_dir, sid)
         .and_then(|s| s.model)
-        .filter(|m| !m.trim().is_empty())
+        // Real model ids never contain `<`/`>`; reject a placeholder like
+        // `<synthetic>` (legacy / never-resolved) so it can't reach `--model`.
+        .filter(|m| {
+            let m = m.trim();
+            !m.is_empty() && !m.contains('<') && !m.contains('>')
+        })
 }
 
 /// Read at most the trailing `max_bytes` of a file as a UTF-8 string (lossy).
