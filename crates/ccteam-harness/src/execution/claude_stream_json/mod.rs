@@ -354,6 +354,46 @@ fn set_effort_level(cwd: &Path, level: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+/// Live-apply a settings delta to a running stream-json session via the
+/// `apply_flag_settings` control_request — vendor doc: *"Merges the provided
+/// settings into the flag settings layer, updating the active configuration."*
+/// i.e. an IMMEDIATE, no-restart settings change (the same control iOS/remote
+/// clients use for runtime config — there is no per-setting control like a
+/// `set_effort`; this generic merge is the mechanism). Verified empirically
+/// against the live vendor (`applied.effort` flips high→low with no restart).
+///
+/// This is the generic hook every live-config command rides on (`/effort`
+/// today, `/set <key> <value>` for anything else, more dedicated commands
+/// later). `settings` is the JSON object to merge (e.g. `{"effortLevel":"max"}`).
+/// Returns Ok on a `success` control_response, else Err(vendor reason).
+async fn apply_flag_settings_live(
+    live: &LiveSession,
+    settings: serde_json::Value,
+) -> Result<(), String> {
+    let body = live
+        .transport
+        .request_control(
+            "apply_flag_settings",
+            json!({ "settings": settings }),
+            init_timeout(),
+        )
+        .await
+        .map_err(|e| format!("apply_flag_settings 失败: {e}"))?;
+    if body.subtype != "success" {
+        return Err(body
+            .error
+            .unwrap_or_else(|| "vendor rejected apply_flag_settings".into()));
+    }
+    Ok(())
+}
+
+/// Settings keys a chat `/set` command must NEVER live-mutate: the
+/// safety / HITL / execution boundary. (`apply_flag_settings` is powerful — it
+/// can merge ANY settings key into the active config — so the user-facing
+/// escape hatch is fenced to keep a chat command from silently weakening
+/// permissions, hooks, or the MCP surface.)
+const SET_PROTECTED_KEYS: &[&str] = &["permissions", "hooks", "mcpServers"];
+
 /// Persisted per-session status snapshot path, next to the turns mirror:
 /// `<project_dir>/.ccteam/chat/<sid>/status.json`. ccteam-owned (no
 /// Anthropic-internal dependency). Unlike the TUI adapter — which re-derives
@@ -813,11 +853,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // picker on). Real-vendor `set_model` support is confirmed at smoke; an
         // unsupported build returns an error subtype → an honest refusal here.
         // `/effort <level>` — set the reasoning effort. There is NO live
-        // `set_effort` control (the bridge exposes set_model /
-        // set_max_thinking_tokens / set_permission_mode only), so it lands in
-        // the project's `settings.local.json` `effortLevel` — the vendor key
-        // claude reads at startup — and applies on the session's next start
-        // (`/new`). The live status reflects it now so the statusline updates.
+        // `set_effort` control, but `apply_flag_settings` merges `{effortLevel}`
+        // into the runtime flagSettings layer and updates the active config
+        // IMMEDIATELY — no restart, no context loss (the mechanism iOS/remote
+        // clients use; verified empirically). Also persist to settings.local.json
+        // so the level survives an idle-release / `--resume`.
         if name == "effort" {
             let Some(live) = self.lookup(&h.identity) else {
                 return Err(HarnessError::SubmitFailed(
@@ -827,29 +867,60 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             let Some(level) = normalize_effort(&d.args) else {
                 return Ok(DirectiveOutcome::Rejected {
                     reason: format!(
-                        "用法: /effort <{}>（reasoning effort；写入 settings，会话下次启动生效）",
+                        "用法: /effort <{}>（reasoning effort，live 生效）",
                         EFFORT_LEVELS.join("|")
                     ),
                 });
             };
-            if let Err(e) = set_effort_level(&live.cwd, &level) {
-                return Err(HarnessError::SubmitFailed(format!(
-                    "写入 effortLevel 失败: {e}"
-                )));
+            return match apply_flag_settings_live(&live, json!({ "effortLevel": level })).await {
+                Ok(()) => {
+                    // Live now → persist for resume + reflect truthfully.
+                    let _ = set_effort_level(&live.cwd, &level);
+                    if let Ok(mut s) = live.status.lock() {
+                        s.effort = Some(level.clone());
+                    }
+                    Ok(DirectiveOutcome::Done {
+                        receipt: format!("已切换 effort → {level}（live 生效）"),
+                    })
+                }
+                Err(why) => Ok(DirectiveOutcome::Rejected {
+                    reason: format!("/effort 切换失败: {why}"),
+                }),
+            };
+        } else if name == "set" {
+            // Generic live-config escape hatch: `/set <key> <value>` merges one
+            // setting into the active config via `apply_flag_settings` (the same
+            // runtime-settings hook `/effort` uses). Value = JSON if it parses,
+            // else a bare string. Fenced off the safety/HITL boundary.
+            let Some(live) = self.lookup(&h.identity) else {
+                return Err(HarnessError::SubmitFailed(
+                    "set: no live stream-json session for this handle".into(),
+                ));
+            };
+            let args = d.args.trim();
+            let mut it = args.splitn(2, char::is_whitespace);
+            let key = it.next().unwrap_or("").trim();
+            let raw = it.next().unwrap_or("").trim();
+            if key.is_empty() || raw.is_empty() {
+                return Ok(DirectiveOutcome::Rejected {
+                    reason: "用法: /set <settings-key> <value>（live 应用一个 Claude 设置，如 /set effortLevel xhigh）".into(),
+                });
             }
-            // NOT reflected in the live status: a running stream-json session
-            // can't hot-change effort (the bridge has no `set_effort`), so the
-            // statusline must keep showing the REAL running level (via the
-            // get_settings tap) — optimistically writing `level` here would flip
-            // to it and then revert on the next turn, which read as "没生效".
-            return Ok(DirectiveOutcome::Done {
-                receipt: format!(
-                    "effort={level} 已写入 .claude/settings.local.json。运行中的 stream-json \
-                     会话热改不了 effort（协议无 set_effort）——会话下次启动时读取生效。"
-                ),
-            });
-        }
-        if name == "model" {
+            if SET_PROTECTED_KEYS.contains(&key) {
+                return Ok(DirectiveOutcome::Rejected {
+                    reason: format!("/set 不允许改 `{key}`（安全/HITL 边界，受保护）"),
+                });
+            }
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|_| json!(raw));
+            return match apply_flag_settings_live(&live, json!({ key: value.clone() })).await {
+                Ok(()) => Ok(DirectiveOutcome::Done {
+                    receipt: format!("已 live 应用: {key} = {value}"),
+                }),
+                Err(why) => Ok(DirectiveOutcome::Rejected {
+                    reason: format!("/set {key} 失败: {why}"),
+                }),
+            };
+        } else if name == "model" {
             let arg = d.args.trim();
             let Some(live) = self.lookup(&h.identity) else {
                 return Err(HarnessError::SubmitFailed(
@@ -859,7 +930,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             if arg.is_empty() {
                 return Ok(DirectiveOutcome::Rejected {
                     reason:
-                        "用法: /model <model-id> [effort]（无交互选择器，直接给 model id；可选 effort=low|medium|high|xhigh|max）"
+                        "用法: /model <model-id> [effort]（无交互选择器，直接给 model id；可选 effort=low|medium|high|xhigh|max，live 生效）"
                             .into(),
                 });
             }
@@ -879,24 +950,21 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     reason: format!("/model 切换失败: {why}"),
                 });
             }
-            // Reflect the switch in the live status immediately (context
-            // refreshes on the next turn's usage).
             if let Ok(mut s) = live.status.lock() {
                 s.model = Some(model.clone());
             }
-            // Optional effort: the model switch is live (set_model), but effort
-            // is NOT a live control — it's the startup `effortLevel` setting. So
-            // it's written but NOT reflected in the live status (the get_settings
-            // tap keeps the statusline on the REAL running level; an optimistic
-            // write would flip then revert on the next turn → reads "没生效").
-            // It takes effect on the session's next launch.
+            // Optional effort rides along — now also LIVE via apply_flag_settings.
             let mut receipt = format!("已切换 model → {model}（live）");
             if let Some(level) = effort {
-                match set_effort_level(&live.cwd, &level) {
-                    Ok(()) => receipt.push_str(&format!(
-                        "；effort={level} 已写入 settings（运行中会话热改不了 effort，会话下次启动生效）"
-                    )),
-                    Err(e) => receipt.push_str(&format!("；effort 设置失败: {e}")),
+                match apply_flag_settings_live(&live, json!({ "effortLevel": level })).await {
+                    Ok(()) => {
+                        let _ = set_effort_level(&live.cwd, &level);
+                        if let Ok(mut s) = live.status.lock() {
+                            s.effort = Some(level.clone());
+                        }
+                        receipt.push_str(&format!("；effort → {level}（live）"));
+                    }
+                    Err(why) => receipt.push_str(&format!("；effort 切换失败: {why}")),
                 }
             }
             return Ok(DirectiveOutcome::Done { receipt });
