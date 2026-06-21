@@ -215,24 +215,17 @@ fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
     let bin = resolve_bin(spec);
     let probe = probe_bin(&bin, refresh);
     let registered = mcp_registered(spec.vendor);
-    let (status, hint): (&str, Option<String>) = if !probe.installed {
-        (
-            "not_installed",
-            Some(format!(
-                "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
-                spec.vendor, spec.bin_env
-            )),
-        )
-    } else if registered {
-        ("ready", None)
-    } else {
-        (
-            "needs_config",
-            Some(format!(
-                "register the ccteam MCP server: POST /api/v1/hosts/{LOCAL_HOST}/register-mcp?vendor={}",
-                spec.vendor
-            )),
-        )
+    let status = classify_status(probe.installed, registered);
+    let hint: Option<String> = match status {
+        "not_installed" => Some(format!(
+            "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
+            spec.vendor, spec.bin_env
+        )),
+        "needs_config" => Some(format!(
+            "register the ccteam MCP server: POST /api/v1/hosts/{LOCAL_HOST}/register-mcp?vendor={}",
+            spec.vendor
+        )),
+        _ => None,
     };
     AgentHealth {
         vendor: spec.vendor.to_string(),
@@ -243,6 +236,20 @@ fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
         mcp_registered: registered,
         status: status.to_string(),
         hint,
+    }
+}
+
+/// The `ready | needs_config | not_installed` tri-state: `not_installed` when
+/// the binary isn't runnable; `ready` when it is AND the ccteam MCP is
+/// registered; `needs_config` when installed but the MCP isn't registered yet
+/// (the one thing `register-mcp` fixes).
+fn classify_status(installed: bool, registered: bool) -> &'static str {
+    if !installed {
+        "not_installed"
+    } else if registered {
+        "ready"
+    } else {
+        "needs_config"
     }
 }
 
@@ -458,6 +465,17 @@ mod tests {
             let r = probe_bin("/bin/true", true);
             assert!(r.installed);
         }
+    }
+
+    #[test]
+    fn classify_status_covers_the_tri_state() {
+        // not installed dominates regardless of registration.
+        assert_eq!(classify_status(false, false), "not_installed");
+        assert_eq!(classify_status(false, true), "not_installed");
+        // installed but MCP not registered → needs_config (register-mcp fixes it).
+        assert_eq!(classify_status(true, false), "needs_config");
+        // installed + MCP registered → ready (the acceptance: claude ready).
+        assert_eq!(classify_status(true, true), "ready");
     }
 
     #[test]
