@@ -39,6 +39,8 @@ pub mod defaults;
 pub mod execution;
 // V0.6.0 F115 — agent handoff doc mechanism (`.ccteam/handoffs/`).
 pub mod handoff;
+// v0.8.18 柱1 — OS host identity (hostname) for the `GET /api/v1/hosts` report.
+pub mod host;
 // v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) raw-content base
 // URL + the pure path/filename utils the installer reuses. Leaf-crate part
 // only: the async fetch + sha256-verify + install backend lives in
@@ -47,6 +49,11 @@ pub mod handoff;
 pub mod hub;
 // Delegated vendor-plugin install (marketplace pointer → settings.local.json).
 pub mod marketplace_plugin;
+// v0.8.18 柱1 — ccteam's own MCP-server registration into vendor configs
+// (Claude `~/.claude.json` + Codex `config.toml`). The ONE allowed write to
+// a vendor footprint; the CLI's `mcp_serve` re-exports these seams and the
+// web host page calls them for `register-mcp`.
+pub mod mcp_register;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;

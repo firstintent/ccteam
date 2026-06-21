@@ -1,0 +1,487 @@
+//! v0.8.18 柱1 — `GET /api/v1/hosts` host-keyed agent report.
+//!
+//! The host-first successor to the flat [`super::capabilities`] probe: a
+//! machine is the主轴. Today one host (`local` = this machine); the host
+//! axis (every session reserves `host`, `"local"` only so far) makes this
+//! multi-machine-ready — future satellites each add a row, and a session
+//! will carry which host it runs on. Per host we report hostname, os/arch,
+//! and ccteam version. Per agent vendor we report whether it is installed
+//! (plus its `--version`), whether the ccteam MCP server is registered, and
+//! a `ready` / `needs_config` / `not_installed` status with a copy-paste
+//! remediation hint.
+//!
+//! **The only writable endpoint** is `POST .../register-mcp`: ccteam
+//! writing its OWN MCP server into the vendor config — the single allowed
+//! write to a vendor footprint (red line: ccteam never writes a vendor
+//! login / key and never installs a CLI from the web; it `execute`s
+//! nothing else). It delegates to [`ccteam_core::mcp_register`], the same
+//! idempotent seam `ccteam config` uses.
+//!
+//! Merged into the `/api/v1` [`OpenApiRouter`] (see [`super::openapi`]) so
+//! the shared web-token gate applies for free.
+
+use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// The id of this machine — the single host until the v0.9 host axis adds
+/// satellites.
+pub const LOCAL_HOST: &str = "local";
+
+/// A vendor ccteam can probe + register its MCP into. **Vendor-extensible**:
+/// add a row to [`PROBE_SPECS`] to surface a new agent on the host page —
+/// no other code changes. `bin_env` mirrors the `CCTEAM_*_BIN` overrides the
+/// harness adapters honor, so a test points the probe at a fake script.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProbeSpec {
+    /// Stable vendor token (`claude` / `codex`) — matches `AgentVendor`'s
+    /// lowercase serde form and what `POST .../sessions` accepts.
+    pub vendor: &'static str,
+    /// Harness id label (`claude-code` / `codex`).
+    pub harness_id: &'static str,
+    /// Env override for the binary path (`CCTEAM_CLAUDE_BIN` / `_CODEX_BIN`).
+    pub bin_env: &'static str,
+    /// Default binary name resolved on `PATH` when the env override is unset.
+    pub default_bin: &'static str,
+}
+
+/// The agent vendors surfaced on the host page. Extend here to add a vendor.
+pub(crate) const PROBE_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        vendor: "claude",
+        harness_id: "claude-code",
+        bin_env: CLAUDE_BIN_ENV,
+        default_bin: "claude",
+    },
+    ProbeSpec {
+        vendor: "codex",
+        harness_id: "codex",
+        bin_env: CODEX_BIN_ENV,
+        default_bin: "codex",
+    },
+];
+
+/// One agent's health on a host.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AgentHealth {
+    /// Vendor token (`claude` / `codex`).
+    pub vendor: String,
+    /// Harness id (`claude-code` / `codex`).
+    pub harness_id: String,
+    /// Whether `<bin> --version` ran and exited 0.
+    pub installed: bool,
+    /// First line of `<bin> --version` (e.g. `"claude 1.2.3"`); `null` when
+    /// not installed.
+    pub version: Option<String>,
+    /// Resolved binary path the probe ran (env override or `PATH` name).
+    pub bin: String,
+    /// Whether the ccteam MCP server is registered in this vendor's config
+    /// (`~/.claude.json` / Codex `config.toml`). The single thing
+    /// `register-mcp` can flip.
+    pub mcp_registered: bool,
+    /// `ready` (installed + MCP registered) / `needs_config` (installed,
+    /// MCP not registered) / `not_installed`.
+    pub status: String,
+    /// Copy-paste remediation when not `ready`; `null` when ready.
+    pub hint: Option<String>,
+}
+
+/// Collection row for `GET /api/v1/hosts`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostSummary {
+    /// Host id (`local`).
+    pub host: String,
+    /// OS hostname (or `local` when unresolved).
+    pub hostname: String,
+    /// `true` for this machine.
+    pub is_local: bool,
+    /// Number of agent vendors probed.
+    pub agent_count: usize,
+    /// How many agents are `ready`.
+    pub agents_ready: usize,
+}
+
+/// Detail for `GET /api/v1/hosts/{host}`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostDetail {
+    pub host: String,
+    pub hostname: String,
+    pub is_local: bool,
+    /// `std::env::consts::OS` (`linux` / `macos`).
+    pub os: String,
+    /// `std::env::consts::ARCH` (`x86_64` / `aarch64`).
+    pub arch: String,
+    /// ccteam build version driving this host.
+    pub ccteam_version: String,
+    pub agents: Vec<AgentHealth>,
+}
+
+/// `GET /api/v1/hosts` response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostsResponse {
+    pub hosts: Vec<HostSummary>,
+}
+
+/// Result of one `<bin> --version` probe.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeResult {
+    pub installed: bool,
+    pub version: Option<String>,
+}
+
+/// Process-lifetime probe cache keyed by resolved binary path. Keyed by
+/// path (not vendor) so a test pointing `CCTEAM_*_BIN` at a fake script gets
+/// an independent entry. A `refresh` probe bypasses + overwrites the entry —
+/// the manual re-probe that breaks the daemon-lifetime cache (a vendor
+/// installed after the daemon started flips `installed` without a restart).
+fn probe_cache() -> &'static Mutex<HashMap<String, ProbeResult>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ProbeResult>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a vendor's binary path: `CCTEAM_*_BIN` override, else the `PATH`
+/// name.
+pub(crate) fn resolve_bin(spec: &ProbeSpec) -> String {
+    std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
+}
+
+/// Probe `<bin> --version`: capture exit status + the first stdout line as
+/// the version string. Cached by path; `refresh` bypasses the cache and
+/// re-runs. Any spawn error (binary not on PATH) folds to
+/// `{installed:false, version:None}`. This is the SINGLE probe impl —
+/// [`super::capabilities`] reuses it (no second `--version` shell-out path).
+pub(crate) fn probe_bin(bin: &str, refresh: bool) -> ProbeResult {
+    if !refresh {
+        if let Ok(cache) = probe_cache().lock() {
+            if let Some(hit) = cache.get(bin) {
+                return hit.clone();
+            }
+        }
+    }
+    let result = match Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            ProbeResult {
+                installed: true,
+                version,
+            }
+        }
+        _ => ProbeResult {
+            installed: false,
+            version: None,
+        },
+    };
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.insert(bin.to_string(), result.clone());
+    }
+    result
+}
+
+/// Is the ccteam MCP server registered in this vendor's config? Read-only,
+/// best-effort (a missing / unreadable config reads as `false`).
+fn mcp_registered(vendor: &str) -> bool {
+    match vendor {
+        "claude" => ccteam_core::projects::resolve_claude_json_path()
+            .map(|p| ccteam_core::mcp_register::claude_mcp_registered(&p))
+            .unwrap_or(false),
+        "codex" => ccteam_core::mcp_register::resolve_codex_config_path()
+            .map(|p| ccteam_core::mcp_register::codex_mcp_registered(&p))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Build one agent's health row (probe + MCP-registration check + tri-state).
+fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
+    let bin = resolve_bin(spec);
+    let probe = probe_bin(&bin, refresh);
+    let registered = mcp_registered(spec.vendor);
+    let (status, hint): (&str, Option<String>) = if !probe.installed {
+        (
+            "not_installed",
+            Some(format!(
+                "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
+                spec.vendor, spec.bin_env
+            )),
+        )
+    } else if registered {
+        ("ready", None)
+    } else {
+        (
+            "needs_config",
+            Some(format!(
+                "register the ccteam MCP server: POST /api/v1/hosts/{LOCAL_HOST}/register-mcp?vendor={}",
+                spec.vendor
+            )),
+        )
+    };
+    AgentHealth {
+        vendor: spec.vendor.to_string(),
+        harness_id: spec.harness_id.to_string(),
+        installed: probe.installed,
+        version: probe.version,
+        bin,
+        mcp_registered: registered,
+        status: status.to_string(),
+        hint,
+    }
+}
+
+/// Resolve this machine's hostname, defaulting to [`LOCAL_HOST`].
+fn local_hostname() -> String {
+    ccteam_core::host::read_hostname().unwrap_or_else(|| LOCAL_HOST.to_string())
+}
+
+/// Probe every spec (off the async runtime — each shells out).
+async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
+    tokio::task::spawn_blocking(move || {
+        PROBE_SPECS
+            .iter()
+            .map(|spec| agent_health(spec, refresh))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(?err, "hosts: agent probe worker failed");
+        Vec::new()
+    })
+}
+
+/// `GET /api/v1/hosts` — list every host (today just this machine).
+#[utoipa::path(
+    get,
+    path = "/api/v1/hosts",
+    tag = "hosts",
+    responses((status = 200, description = "Hosts ccteam drives (today one: `local`)", body = HostsResponse)),
+)]
+pub(crate) async fn handle_hosts() -> impl IntoResponse {
+    let agents = probe_all_agents(false).await;
+    let agents_ready = agents.iter().filter(|a| a.status == "ready").count();
+    Json(HostsResponse {
+        hosts: vec![HostSummary {
+            host: LOCAL_HOST.to_string(),
+            hostname: local_hostname(),
+            is_local: true,
+            agent_count: agents.len(),
+            agents_ready,
+        }],
+    })
+}
+
+/// Query for `GET /api/v1/hosts/{host}` — `?refresh=true` forces a re-probe.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct HostDetailQuery {
+    /// Bypass the probe cache and re-run `<bin> --version` (manual re-probe).
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// `GET /api/v1/hosts/{host}` — one host's full agent report. 404 for any
+/// host other than `local` (no satellites yet).
+#[utoipa::path(
+    get,
+    path = "/api/v1/hosts/{host}",
+    tag = "hosts",
+    params(
+        ("host" = String, Path, description = "Host id (`local`)"),
+        HostDetailQuery,
+    ),
+    responses(
+        (status = 200, description = "Host detail `{host, hostname, os, arch, ccteam_version, agents[]}`", body = HostDetail),
+        (status = 404, description = "Unknown host (only `local` exists today)"),
+    ),
+)]
+pub(crate) async fn handle_host_detail(
+    Path(host): Path<String>,
+    Query(q): Query<HostDetailQuery>,
+) -> impl IntoResponse {
+    if host != LOCAL_HOST {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({"error": format!("unknown host: {host} (only `local` today)")}),
+            ),
+        )
+            .into_response();
+    }
+    let agents = probe_all_agents(q.refresh).await;
+    Json(HostDetail {
+        host: LOCAL_HOST.to_string(),
+        hostname: local_hostname(),
+        is_local: true,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        ccteam_version: ccteam_core::VERSION.to_string(),
+        agents,
+    })
+    .into_response()
+}
+
+/// Query for `POST .../register-mcp` — optional `?vendor=claude|codex`
+/// (omitted ⇒ register every vendor).
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct RegisterMcpQuery {
+    /// Restrict to one vendor (`claude` / `codex`); omit to register all.
+    #[serde(default)]
+    pub vendor: Option<String>,
+}
+
+/// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN MCP
+/// server into the vendor config(s). **Idempotent** (merge, never clobber)
+/// and the ONLY write this surface performs. ccteam executes nothing else:
+/// it never writes a vendor login/key and never installs a CLI. 404 for a
+/// non-`local` host; 400 for an unknown `vendor`; 500 if the binary path
+/// can't be resolved.
+#[utoipa::path(
+    post,
+    path = "/api/v1/hosts/{host}/register-mcp",
+    tag = "hosts",
+    params(
+        ("host" = String, Path, description = "Host id (`local`)"),
+        RegisterMcpQuery,
+    ),
+    responses(
+        (status = 200, description = "Registered; `{registered:[vendor], paths:{vendor:path}}`", body = serde_json::Value),
+        (status = 400, description = "Unknown vendor"),
+        (status = 404, description = "Unknown host"),
+        (status = 500, description = "Cannot resolve the ccteam binary path"),
+    ),
+)]
+pub(crate) async fn handle_register_mcp(
+    Path(host): Path<String>,
+    Query(q): Query<RegisterMcpQuery>,
+) -> impl IntoResponse {
+    if host != LOCAL_HOST {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("unknown host: {host}")})),
+        )
+            .into_response();
+    }
+    let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(v) if PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown vendor: {other} (expected claude|codex)")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || register_mcp_blocking(want.as_deref())).await;
+    match result {
+        Ok(Ok(paths)) => Json(serde_json::json!({
+            "registered": paths.keys().collect::<Vec<_>>(),
+            "paths": paths,
+        }))
+        .into_response(),
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "register-mcp failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err}")})),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(?err, "register-mcp worker panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "register-mcp worker failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Do the (blocking) MCP registration for the requested vendor(s). Returns a
+/// `vendor → written-config-path` map. `want = None` registers every vendor.
+fn register_mcp_blocking(
+    want: Option<&str>,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let bin = ccteam_core::current_ccteam_bin()?;
+    let mut written = std::collections::BTreeMap::new();
+    let do_vendor = |v: &str| want.is_none() || want == Some(v);
+
+    if do_vendor("claude") {
+        let path = ccteam_core::projects::resolve_claude_json_path()?;
+        ccteam_core::mcp_register::install_mcp_into(&path, &bin)?;
+        written.insert("claude".to_string(), path.display().to_string());
+    }
+    if do_vendor("codex") {
+        let path = ccteam_core::mcp_register::resolve_codex_config_path()?;
+        ccteam_core::mcp_register::install_codex_mcp_into(&path, &bin)?;
+        written.insert("codex".to_string(), path.display().to_string());
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_bin_missing_binary_is_not_installed() {
+        let r = probe_bin("/nonexistent/ccteam-fake-binary-zzz", true);
+        assert!(!r.installed);
+        assert!(r.version.is_none());
+    }
+
+    #[test]
+    fn probe_bin_true_binary_is_installed() {
+        // `/bin/true --version` exits 0 (GNU coreutils ignores the flag) — a
+        // stand-in for a runnable vendor binary.
+        if std::path::Path::new("/bin/true").exists() {
+            let r = probe_bin("/bin/true", true);
+            assert!(r.installed);
+        }
+    }
+
+    #[test]
+    fn agent_health_status_is_not_installed_for_missing_bin() {
+        let spec = ProbeSpec {
+            vendor: "claude",
+            harness_id: "claude-code",
+            // Point at a path that cannot exist so the probe fails regardless
+            // of the host's real claude install.
+            bin_env: "CCTEAM_TEST_UNSET_BIN_ENV_ZZZ",
+            default_bin: "/nonexistent/ccteam-fake-zzz",
+        };
+        let h = agent_health(&spec, true);
+        assert!(!h.installed);
+        assert_eq!(h.status, "not_installed");
+        assert!(h.hint.is_some());
+    }
+
+    #[test]
+    fn register_mcp_query_rejects_unknown_vendor_token() {
+        // The handler validates against PROBE_SPECS; assert the membership
+        // check that gates the 400.
+        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "claude"));
+        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "codex"));
+        assert!(!PROBE_SPECS.iter().any(|s| s.vendor == "gemini"));
+    }
+}

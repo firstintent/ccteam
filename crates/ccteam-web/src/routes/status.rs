@@ -63,6 +63,35 @@ pub struct StatusResponse {
     /// The aggregate 24h budget cap (USD) summed across every project's
     /// `workflow.yaml` budget. `null` when no project configures a cap.
     pub budget_cap_24h: Option<f64>,
+    /// v0.8.18 柱1 — one row per LIVE gateway session (the fleet view): the
+    /// loop-ops console skeleton. Empty on the standalone (no-gateway) web
+    /// path. The loop version grows this same row with oracle/gate columns.
+    #[serde(default)]
+    pub sessions: Vec<SessionCostRow>,
+}
+
+/// v0.8.18 柱1 — one live session's fleet-view row. `cost_usd` is
+/// **best-effort**: summed from the per-session `chat_turn_completed`
+/// usage mirrored to `progress.jsonl` (stream-json sessions, the default),
+/// priced via [`ccteam_cost::estimate_cost`]. The model is not tracked
+/// per-turn, so pricing falls back to the vendor's default rate sheet —
+/// approximate by design for a glance (the loop version formalizes it).
+/// `0.0` when a session has emitted no usage yet (e.g. tmux sessions, whose
+/// hook path carries no usage).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionCostRow {
+    /// Gateway session id (`s{n}`).
+    pub sid: String,
+    /// Project slug the session runs in.
+    pub project: String,
+    /// Agent role (empty for a roleless session).
+    pub role: String,
+    /// Vendor (`claude` / `codex`).
+    pub vendor: String,
+    /// Cheap liveness label from the gateway (`live`).
+    pub status: String,
+    /// Best-effort accrued cost (USD) for this session — see the struct doc.
+    pub cost_usd: f64,
 }
 
 /// Minimal `workflow.yaml` projection: only the `budgets_v060` block (the
@@ -110,14 +139,20 @@ pub(crate) async fn handle_status(State(app): State<AppState>) -> impl IntoRespo
     // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
     // Either way we only need the COUNT of tracked sessions; the live/idle
     // split is daemon health (the gateway has no finer per-session bit).
+    let mut session_rows: Vec<SessionCostRow> = Vec::new();
     let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
         // session_views() is sync once we hold the lock (no `.await` under it).
-        let guard = gw.lock().await;
-        guard.session_views().len() as u32
+        let views = {
+            let guard = gw.lock().await;
+            guard.session_views()
+        };
+        // v0.8.18 柱1 — decorate each live session with its best-effort cost.
+        session_rows = build_session_cost_rows(&app.paths, &views);
+        views.len() as u32
     } else {
         // Standalone web (no daemon gateway): fall back to the persisted route
         // table the CLI's `run_status` reads. A missing / unreadable file is an
-        // empty list, never an error.
+        // empty list, never an error. No live map ⇒ no per-session fleet rows.
         ccteam_im::gateway::tracked_chat_sessions(&ccteam_im::gateway_state_path_in(
             &app.paths.root,
         ))
@@ -157,5 +192,172 @@ pub(crate) async fn handle_status(State(app): State<AppState>) -> impl IntoRespo
         cost_24h_usd,
         cost_24h_by_vendor,
         budget_cap_24h,
+        sessions: session_rows,
     })
+}
+
+/// Build one [`SessionCostRow`] per live gateway session, joining each to its
+/// best-effort accrued cost. Reads `progress.jsonl` ONCE per project that has
+/// a live session (not every project), summing the per-session
+/// `chat_turn_completed` usage and pricing it with the session's own vendor.
+fn build_session_cost_rows(
+    paths: &ccteam_core::CcteamPaths,
+    views: &[ccteam_im::gateway::SessionView],
+) -> Vec<SessionCostRow> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // Read progress only for projects with a live session.
+    let live_projects: BTreeSet<&str> = views.iter().map(|v| v.project.as_str()).collect();
+    let mut usage_by_sid: HashMap<String, ccteam_cost::UnifiedTokenUsage> = HashMap::new();
+    for slug in live_projects {
+        let events =
+            ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
+        for ev in &events {
+            if ev.get("event").and_then(|v| v.as_str())
+                != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+            {
+                continue;
+            }
+            let Some(sid) = ev.get("sid").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(usage) = ev.get("usage").and_then(|u| {
+                serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(u.clone()).ok()
+            }) else {
+                continue;
+            };
+            accumulate_usage(usage_by_sid.entry(sid.to_string()).or_default(), &usage);
+        }
+    }
+
+    views
+        .iter()
+        .map(|v| {
+            let usage = usage_by_sid.get(&v.sid).copied().unwrap_or_default();
+            // Model isn't tracked per-turn → fallback rate sheet (best-effort).
+            let cost = ccteam_cost::estimate_cost(&usage, vendor_from_str(&v.vendor), "");
+            SessionCostRow {
+                sid: v.sid.clone(),
+                project: v.project.clone(),
+                role: v.role.clone(),
+                vendor: v.vendor.clone(),
+                status: v.status.clone(),
+                cost_usd: cost,
+            }
+        })
+        .collect()
+}
+
+/// Field-wise add of one usage block into an accumulator. The vendor-only
+/// `Option` buckets stay `None` until at least one side reports them (so
+/// Claude's `cache_creation` / Codex's `reasoning` don't materialize as a
+/// spurious `Some(0)`).
+fn accumulate_usage(acc: &mut ccteam_cost::UnifiedTokenUsage, u: &ccteam_cost::UnifiedTokenUsage) {
+    acc.input_tokens += u.input_tokens;
+    acc.cached_input_tokens += u.cached_input_tokens;
+    acc.output_tokens += u.output_tokens;
+    acc.cache_creation_input_tokens = match (
+        acc.cache_creation_input_tokens,
+        u.cache_creation_input_tokens,
+    ) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+    acc.reasoning_output_tokens = match (acc.reasoning_output_tokens, u.reasoning_output_tokens) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    };
+}
+
+/// Map a `SessionView` vendor token to the pricing [`ccteam_cost::Vendor`]
+/// (defaulting to Claude for an unknown token — the dominant vendor).
+fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
+    match vendor.trim().to_ascii_lowercase().as_str() {
+        "codex" => ccteam_cost::Vendor::Codex,
+        _ => ccteam_cost::Vendor::Claude,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {
+        ccteam_core::CcteamPaths {
+            root: root.join(".ccteam"),
+            projects_root: root.join("projects"),
+        }
+    }
+
+    fn view(sid: &str, project: &str, vendor: &str) -> ccteam_im::gateway::SessionView {
+        ccteam_im::gateway::SessionView {
+            sid: sid.into(),
+            project: project.into(),
+            role: "cto".into(),
+            vendor: vendor.into(),
+            permission_mode: "skip".into(),
+            protocol: "stream-json".into(),
+            host: "local".into(),
+            current: true,
+            status: "live".into(),
+            last_activity_seconds: None,
+        }
+    }
+
+    #[test]
+    fn vendor_from_str_maps_tokens() {
+        assert_eq!(vendor_from_str("claude"), ccteam_cost::Vendor::Claude);
+        assert_eq!(vendor_from_str("Codex"), ccteam_cost::Vendor::Codex);
+        assert_eq!(vendor_from_str("weird"), ccteam_cost::Vendor::Claude);
+    }
+
+    #[test]
+    fn accumulate_usage_sums_token_buckets() {
+        let mut acc = ccteam_cost::UnifiedTokenUsage::default();
+        let a = ccteam_cost::UnifiedTokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        accumulate_usage(&mut acc, &a);
+        accumulate_usage(&mut acc, &a);
+        assert_eq!(acc.input_tokens, 200);
+        assert_eq!(acc.output_tokens, 40);
+        // No vendor-only bucket reported ⇒ stays None (no spurious Some(0)).
+        assert!(acc.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn build_session_cost_rows_prices_chat_turn_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        // Seed a chat_turn_completed event with usage tagged to sid s1.
+        let usage = ccteam_cost::UnifiedTokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        let ev = ccteam_core::progress::build_chat_turn_completed_event("cto", "s1", "t1", &usage);
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &ev).unwrap();
+
+        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sid, "s1");
+        assert_eq!(rows[0].vendor, "claude");
+        assert!(
+            rows[0].cost_usd > 0.0,
+            "nonzero usage should price to a positive cost"
+        );
+    }
+
+    #[test]
+    fn build_session_cost_rows_zero_cost_when_no_usage() {
+        // A live session that has emitted no chat_turn_completed usage yet is
+        // still listed, at 0.0 (best-effort: e.g. a tmux session).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let rows = build_session_cost_rows(&paths, &[view("s9", "demo", "claude")]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cost_usd, 0.0);
+    }
 }

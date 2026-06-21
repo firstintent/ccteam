@@ -284,7 +284,10 @@ mod tests {
         match out {
             Outbound::System(s) => {
                 assert_eq!(s.subtype, "commands_changed");
-                assert_eq!(s.slash_commands, vec!["goal".to_string(), "review".to_string()]);
+                assert_eq!(
+                    s.slash_commands,
+                    vec!["goal".to_string(), "review".to_string()]
+                );
             }
             other => panic!("expected System, got {other:?}"),
         }

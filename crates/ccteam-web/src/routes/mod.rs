@@ -18,10 +18,14 @@ pub mod api_v1;
 pub mod assets;
 // v0.8.6 W5b ResDisk — resource API: capabilities probe.
 pub mod capabilities;
+// v0.8.18 柱1 — host-keyed agent report (`GET /api/v1/hosts` + `/{host}` +
+// the only writable endpoint `POST .../register-mcp`). The host-first
+// successor to the flat `capabilities` probe; shares `hosts::probe_bin`.
 pub mod chat_ws;
 pub mod dashboard;
 pub mod harness_sse;
 pub mod health;
+pub mod hosts;
 // v0.8.8 F4 — web IM credential configuration (Telegram + Lark; masked
 // read that never echoes secrets; validate-before-persist; restart-required).
 pub mod im_config;

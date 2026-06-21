@@ -22,7 +22,6 @@
 //! by `\n`. Notifications (no `id`) get no reply. Errors follow the
 //! JSON-RPC 2.0 error object shape (interfaces §12).
 
-use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -699,57 +698,11 @@ async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()
 /// pattern, so the operator never sees a "Trust this folder?" prompt
 /// for the ccteam MCP server itself.
 pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::Path) -> Result<()> {
-    let bin = ccteam_bin
-        .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8"))?;
-    let mut root = if claude_json.exists() {
-        let bytes = std::fs::read(claude_json)
-            .with_context(|| format!("read {}", claude_json.display()))?;
-        if bytes.is_empty() {
-            serde_json::Map::new()
-        } else {
-            match serde_json::from_slice::<Value>(&bytes) {
-                Ok(Value::Object(m)) => m,
-                _ => serde_json::Map::new(),
-            }
-        }
-    } else {
-        serde_json::Map::new()
-    };
-    let servers = root
-        .entry("mcpServers")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let map = match servers {
-        Value::Object(m) => m,
-        _ => {
-            *servers = Value::Object(serde_json::Map::new());
-            servers.as_object_mut().unwrap()
-        }
-    };
-    map.insert(
-        "ccteam".into(),
-        json!({
-            "command": bin,
-            "args": ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec(),
-            "env": {},
-        }),
-    );
-
-    let body = serde_json::to_string_pretty(&Value::Object(root))?;
-    if let Some(parent) = claude_json.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut tmp_os = claude_json.as_os_str().to_owned();
-    tmp_os.push(".ccteam-mcp.tmp");
-    let tmp = std::path::PathBuf::from(tmp_os);
-    {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(body.as_bytes())?;
-    }
-    std::fs::rename(&tmp, claude_json)
-        .with_context(|| format!("rename {} → {}", tmp.display(), claude_json.display()))?;
-    Ok(())
+    // v0.8.18 柱1 — the canonical merge logic moved to
+    // `ccteam_core::mcp_register` so `ccteam-web`'s host-page `register-mcp`
+    // shares ONE impl; this stays as a thin delegating wrapper for the CLI's
+    // existing callers + tests.
+    ccteam_core::mcp_register::install_mcp_into(claude_json, ccteam_bin)
 }
 
 /// Production path: locate `~/.claude.json` and the running binary,
@@ -787,70 +740,8 @@ pub fn install_codex_mcp_into(
     config_toml: &std::path::Path,
     ccteam_bin: &std::path::Path,
 ) -> Result<()> {
-    let bin = ccteam_bin
-        .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8"))?;
-
-    // Parse the existing config (or start empty). A non-table / unparseable
-    // root is treated as "start fresh" rather than failing the install,
-    // mirroring `install_mcp_into`'s tolerance for a junk `~/.claude.json`.
-    let mut root: toml::Table = if config_toml.exists() {
-        let body = std::fs::read_to_string(config_toml)
-            .with_context(|| format!("read {}", config_toml.display()))?;
-        if body.trim().is_empty() {
-            toml::Table::new()
-        } else {
-            toml::from_str::<toml::Table>(&body)
-                .with_context(|| format!("parse existing {}", config_toml.display()))?
-        }
-    } else {
-        toml::Table::new()
-    };
-
-    // Ensure `[mcp_servers]` is a table, preserving any sibling servers.
-    let servers_entry = root
-        .entry("mcp_servers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if !servers_entry.is_table() {
-        anyhow::bail!(
-            "{}: `mcp_servers` exists but is not a TOML table",
-            config_toml.display()
-        );
-    }
-    let servers = servers_entry.as_table_mut().expect("checked above");
-
-    // Build the ccteam server entry: command + shared args const.
-    let mut entry = toml::Table::new();
-    entry.insert("command".to_string(), toml::Value::String(bin.to_string()));
-    entry.insert(
-        "args".to_string(),
-        toml::Value::Array(
-            ccteam_core::CCTEAM_MCP_SERVE_ARGS
-                .iter()
-                .map(|s| toml::Value::String((*s).to_string()))
-                .collect(),
-        ),
-    );
-    servers.insert(
-        ccteam_core::CCTEAM_MCP_SERVER_KEY.to_string(),
-        toml::Value::Table(entry),
-    );
-
-    let body = toml::to_string_pretty(&root).context("serialize codex config.toml")?;
-    if let Some(parent) = config_toml.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut tmp_os = config_toml.as_os_str().to_owned();
-    tmp_os.push(".ccteam-mcp.tmp");
-    let tmp = std::path::PathBuf::from(tmp_os);
-    {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(body.as_bytes())?;
-    }
-    std::fs::rename(&tmp, config_toml)
-        .with_context(|| format!("rename {} → {}", tmp.display(), config_toml.display()))?;
-    Ok(())
+    // v0.8.18 柱1 — canonical impl moved to `ccteam_core::mcp_register`.
+    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, ccteam_bin)
 }
 
 /// Production path: resolve `$CODEX_HOME/config.toml` (CODEX_HOME falling

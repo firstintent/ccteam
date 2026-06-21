@@ -55,6 +55,10 @@ async fn spawn(state: AppState) -> SocketAddr {
 fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
     [
         ("GET", "/api/v1/capabilities"),
+        // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp).
+        ("GET", "/api/v1/hosts"),
+        ("GET", "/api/v1/hosts/{host}"),
+        ("POST", "/api/v1/hosts/{host}/register-mcp"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
         // projects
