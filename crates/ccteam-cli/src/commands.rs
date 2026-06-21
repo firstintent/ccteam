@@ -1000,6 +1000,21 @@ fn block_on_async<F: std::future::Future>(fut: F) -> Result<F::Output> {
     Ok(rt.block_on(fut))
 }
 
+/// Best-effort: tell a running daemon to reload IM channels from the
+/// freshly-saved `credentials.json` over its mcp.sock (`ccteam/reload`). This
+/// makes `ccteam config` take effect WITHOUT a daemon restart or any agent-
+/// session restart. Entirely best-effort: a down daemon (no socket) or a send
+/// error is swallowed — the "ccteam start will pick these up" message still
+/// applies, so the config command MUST NOT fail when this can't be delivered.
+fn notify_daemon_im_reload() {
+    let Ok(paths) = ccteam_core::CcteamPaths::from_env() else {
+        return;
+    };
+    let socket = ccteam_core::daemon_socket_path(&paths);
+    let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ccteam/reload"});
+    let _ = block_on_async(crate::mcp_serve::forward_to_socket(&socket, &req));
+}
+
 /// Interactively hand the controlling tty over to an existing mux session by
 /// its exact name, honoring `CCTEAM_MUX_BACKEND`. Read-only handover — it never
 /// captures pane text (R6); it only checks existence and execs the attach.
@@ -3902,6 +3917,10 @@ pub fn run_config_set_im_token(token: &str) -> Result<String> {
     creds.telegram = Some(result.creds);
     ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
 
+    // Best-effort in-place reload of a running daemon's IM listeners (no
+    // restart needed). Down daemon → silently skipped.
+    notify_daemon_im_reload();
+
     Ok(format!(
         "ccteam config: Telegram token saved\n\n  \
          bot           {}\n  \
@@ -3994,6 +4013,14 @@ pub fn run_config_set_lark_creds_with_base(
     };
     creds.lark = Some(result.creds);
     ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
+
+    // Best-effort in-place reload of a running daemon's IM listeners (no
+    // restart needed). Down daemon → silently skipped. Skipped on the test
+    // seam (`creds_path_override` set) so unit tests never poke a live daemon
+    // socket from `from_env()`.
+    if creds_path_override.is_none() {
+        notify_daemon_im_reload();
+    }
 
     let allow_note = if allow_count == 0 {
         "  allowlist     EMPTY — fail-closed: the bot answers NO ONE.\n  \

@@ -165,6 +165,13 @@ pub struct Gateway {
     /// This is an honesty label only: it never blocks spawn and never changes
     /// adapter/model behavior.
     model_warned: HashSet<(AgentVendor, String)>,
+    /// Signal to the daemon's IM-reload task that `credentials.json` changed
+    /// and the credential-driven channel listeners should be rebuilt in place
+    /// (no daemon restart, no agent-session restart). Wired by the daemon via
+    /// [`Gateway::set_im_reload_trigger`]; `None` on the standalone / test path
+    /// (where there is no reload task), so [`Gateway::request_im_reload`] is a
+    /// safe no-op that returns `false`.
+    im_reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 /// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
@@ -641,7 +648,28 @@ impl Gateway {
             project_paths: None,
             config: None,
             model_warned: HashSet::new(),
+            im_reload_tx: None,
         }
+    }
+
+    /// Wire the daemon's IM-reload trigger (the daemon owns the reload task +
+    /// the channel listeners). After this, [`request_im_reload`](Self::request_im_reload)
+    /// signals that task to rebuild the credential-driven channels from
+    /// `credentials.json`. The standalone / test path never calls this, so
+    /// `request_im_reload` stays a safe no-op there.
+    pub fn set_im_reload_trigger(&mut self, tx: tokio::sync::mpsc::Sender<()>) {
+        self.im_reload_tx = Some(tx);
+    }
+
+    /// Signal the daemon to reload IM channels from `credentials.json`. Returns
+    /// `false` if no daemon reload task is wired (standalone / test). Non-blocking
+    /// (the reload task coalesces; a full buffer just means a reload is already
+    /// pending, so a dropped extra signal is harmless).
+    pub fn request_im_reload(&self) -> bool {
+        self.im_reload_tx
+            .as_ref()
+            .map(|tx| tx.try_send(()).is_ok())
+            .unwrap_or(false)
     }
 
     /// Enable async delivery of [`HarnessAdapter::events`] back to IM.

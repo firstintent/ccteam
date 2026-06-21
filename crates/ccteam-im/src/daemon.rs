@@ -7,12 +7,12 @@
 //! - a SIGTERM future for graceful shutdown,
 //! - an optional max-runtime watchdog (test-only — production is `0`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -255,10 +255,10 @@ where
     // v0.8.5 P1 — advertise the gateway's own commands in each channel's
     // native menu (Telegram `setMyCommands`; default no-op elsewhere). Done
     // once at startup; passthrough vendor slashes are intentionally absent.
+    let menu_specs = crate::gateway::menu_command_specs();
     {
-        let specs = crate::gateway::menu_command_specs();
         for (name, ch) in channels.iter() {
-            if let Err(err) = ch.register_commands(&specs).await {
+            if let Err(err) = ch.register_commands(&menu_specs).await {
                 tracing::warn!(
                     channel = %name,
                     error = %err,
@@ -268,6 +268,14 @@ where
         }
     }
     replay_durable_outbox(&channels).await;
+    // In-place IM hot-reload: share the channel map so the inbound + event
+    // consumers read the live set while a reload swaps credential-driven
+    // entries underneath them. `last_creds` lets a reload no-op when
+    // `credentials.json` is byte-identical (a pref-only `ccteam config` must
+    // not blip Telegram). `menu_specs` is captured once and re-published to
+    // each rebuilt channel on reload.
+    let shared_channels: Arc<RwLock<ChannelMap>> = Arc::new(RwLock::new(channels));
+    let last_creds: Arc<StdMutex<Credentials>> = Arc::new(StdMutex::new(creds.clone()));
     // V0.8.6 W5b — use the caller-provided gateway handle when `ccteam start`
     // built one (so the web `AppState` and this daemon drive the SAME session
     // map); else build + own one (standalone `ccteam-im run`). The post-build
@@ -288,6 +296,14 @@ where
             (Some(tx), Some(rx)) => (tx, rx),
             _ => tokio::sync::mpsc::unbounded_channel::<GatewayEvent>(),
         };
+    // In-place IM hot-reload signal: `ccteam config` → mcp.sock `ccteam/reload`
+    // → `gateway.request_im_reload()` → `try_send(())` here → the reload arm of
+    // the daemon select-loop rebuilds the credential-driven channels. A small
+    // buffer (4) coalesces bursts; a full buffer just means a reload is already
+    // pending. Always wired here because a gateway always exists by this point
+    // (caller-supplied or daemon-built); on the standalone path with no mcp.sock
+    // the trigger simply never fires.
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(4);
     {
         // Hold the gateway lock only for synchronous setup. Restored-session
         // resume can wait on vendor startup (stream-json `system:init`), and
@@ -304,6 +320,7 @@ where
         }
         log_orphan_chat_sessions(&g).await;
         g.set_event_sink(gateway_event_tx);
+        g.set_im_reload_trigger(reload_tx);
     }
     let restore_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {
@@ -314,30 +331,36 @@ where
     // channel. Each listener pushes ChannelMessages into a shared mpsc
     // that the inbound consumer drains.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<ChannelMessage>(INBOUND_BUF);
-    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for (name, ch) in channels.iter() {
-        let tx = inbound_tx.clone();
-        let ch = ch.clone();
-        let name_log = name.clone();
-        listener_handles.push(tokio::spawn(async move {
-            if let Err(err) = ch.listen(tx).await {
-                tracing::warn!(
-                    channel = %name_log,
-                    error = %err,
-                    "imd: channel listener exited with error"
-                );
-            } else {
-                tracing::debug!(channel = %name_log, "imd: channel listener exited cleanly");
-            }
-        }));
-        tracing::info!(
-            channel = %name,
-            bots = initial.len(),
-            "imd: {} channel listener spawned bots={}",
-            name,
-            initial.len()
-        );
+    // Listener registry keyed by channel name so an in-place reload can abort
+    // exactly the credential-driven listener it rebuilds (was a flat `Vec`).
+    let listeners: Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    {
+        // Clone out the (name, ch) pairs under the read lock, then drop the
+        // guard before spawning (never hold a std lock across spawn/await).
+        let pairs: Vec<(String, Arc<dyn Channel + Send + Sync>)> = {
+            let g = shared_channels.read().unwrap();
+            g.iter().map(|(n, c)| (n.clone(), c.clone())).collect()
+        };
+        let mut reg = listeners.lock().unwrap();
+        for (name, ch) in pairs {
+            let h = spawn_channel_listener(name.clone(), ch, inbound_tx.clone());
+            reg.insert(name.clone(), h);
+            tracing::info!(
+                channel = %name,
+                bots = initial.len(),
+                "imd: {} channel listener spawned bots={}",
+                name,
+                initial.len()
+            );
+        }
     }
+    // Keep a separate clone alive across the whole daemon lifetime so a reload
+    // can spawn fresh listeners onto the same inbound channel. The original
+    // `inbound_tx` is still dropped below to end the consumer on shutdown; this
+    // clone holds the channel open until daemon teardown (the consumer just
+    // drains until then — exactly the desired behavior).
+    let inbound_tx_for_reload = inbound_tx.clone();
     // Drop our extra clone so the consumer's `recv()` returns `None`
     // once every listener exits.
     drop(inbound_tx);
@@ -347,12 +370,17 @@ where
     // are legacy helpers and are not part of the daemon hot path.
     let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
 
-    let inbound_consumer =
-        spawn_inbound_consumer(inbound_rx, channels.clone(), sec.clone(), gateway.clone());
-    let gateway_event_consumer = spawn_gateway_event_consumer(gateway_event_rx, channels.clone());
+    let inbound_consumer = spawn_inbound_consumer(
+        inbound_rx,
+        shared_channels.clone(),
+        sec.clone(),
+        gateway.clone(),
+    );
+    let gateway_event_consumer =
+        spawn_gateway_event_consumer(gateway_event_rx, shared_channels.clone());
 
     tracing::info!(
-        channels = channels.len(),
+        channels = shared_channels.read().unwrap().len(),
         bots = initial.len(),
         "ccteam-im: gateway router started (no supervisor tick)"
     );
@@ -363,14 +391,32 @@ where
         None => Box::pin(std::future::pending()),
     };
 
-    let result = tokio::select! {
-        _ = &mut shutdown => {
-            tracing::info!("ccteam-im: shutdown signalled; exiting cleanly");
-            Ok(())
-        }
-        _ = &mut max_runtime => {
-            tracing::info!("max_runtime reached; exiting");
-            Ok(())
+    // Select-LOOP (not a one-shot select) so the IM-reload signal can fire
+    // repeatedly over the daemon's life. Reload rebuilds ONLY the
+    // credential-driven channel listeners in place — agent sessions, the
+    // gateway, the consumers, the event pumps, the web/`extra_channels`/`mock`
+    // channels are all untouched.
+    let result: Result<()> = loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("ccteam-im: shutdown signalled; exiting cleanly");
+                break Ok(());
+            }
+            _ = &mut max_runtime => {
+                tracing::info!("max_runtime reached; exiting");
+                break Ok(());
+            }
+            Some(()) = reload_rx.recv() => {
+                reload_im_channels(
+                    &shared_channels,
+                    &listeners,
+                    &inbound_tx_for_reload,
+                    &args,
+                    &last_creds,
+                    &menu_specs,
+                )
+                .await;
+            }
         }
     };
 
@@ -378,12 +424,118 @@ where
     // daemon doesn't leak background tokio tasks. `JoinHandle::abort`
     // is best-effort but matches the rest of the F130 supervisor's
     // shutdown semantics.
-    for h in listener_handles {
-        h.abort();
+    {
+        let mut reg = listeners.lock().unwrap();
+        for (_name, h) in reg.drain() {
+            h.abort();
+        }
     }
     inbound_consumer.abort();
     gateway_event_consumer.abort();
     result
+}
+
+/// Spawn one `Channel::listen` task. Factored out of startup so the in-place
+/// IM reload can spawn a fresh listener for a rebuilt channel with identical
+/// semantics (log on error / clean exit). The returned handle is stored in the
+/// per-name listener registry so a later reload can `abort()` exactly it.
+fn spawn_channel_listener(
+    name: String,
+    ch: Arc<dyn Channel + Send + Sync>,
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = ch.listen(tx).await {
+            tracing::warn!(
+                channel = %name,
+                error = %err,
+                "imd: channel listener exited with error"
+            );
+        } else {
+            tracing::debug!(channel = %name, "imd: channel listener exited cleanly");
+        }
+    })
+}
+
+/// In-place IM channel reload (no daemon restart, no agent-session restart).
+///
+/// Triggered by `ccteam config` over the mcp.sock `ccteam/reload` control call
+/// → [`Gateway::request_im_reload`] → the reload arm of the daemon select-loop.
+/// Re-reads `credentials.json` and rebuilds ONLY the credential-driven channels
+/// ([`CHANNEL_BUILDERS`]) — `extra_channels` (web), `mock`, the gateway, the
+/// consumers, and all agent sessions are left untouched. A byte-identical
+/// credentials doc is a no-op (a pref-only `ccteam config` must not blip the
+/// live IM listeners).
+async fn reload_im_channels(
+    shared: &Arc<RwLock<ChannelMap>>,
+    listeners: &Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    inbound_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    args: &DaemonArgs,
+    last_creds: &Arc<StdMutex<Credentials>>,
+    menu_specs: &[crate::transport::CommandSpec],
+) {
+    // Re-read credentials.
+    let new_creds = match credentials::load(args.credentials.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "imd: reload could not read credentials");
+            return;
+        }
+    };
+    // No-op when nothing changed (e.g. a pref-only `ccteam config`).
+    {
+        let prev = last_creds.lock().unwrap();
+        if *prev == new_creds {
+            tracing::debug!("imd: reload — credentials unchanged, no-op");
+            return;
+        }
+    }
+    // Rebuild credential-driven channels ONLY, using the SAME table the startup
+    // path walks and the current bot registrations (loaded the same way startup
+    // loads `initial`). `list_bots` failing leaves the bot set empty — channels
+    // still rebuild from the new creds (telegram unions registered bots into its
+    // allowlist; an empty set just means no extra chats, same as a fresh start).
+    let bots = list_bots().unwrap_or_default();
+    let mut rebuilt: ChannelMap = HashMap::new();
+    for (name, builder) in CHANNEL_BUILDERS {
+        if let Some(ch) = builder(&new_creds, &bots) {
+            rebuilt.insert((*name).to_string(), ch);
+        }
+    }
+    // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
+    // and (re)publish its command menu.
+    for (name, ch) in rebuilt.iter() {
+        if let Some(old) = listeners.lock().unwrap().remove(name) {
+            old.abort();
+        }
+        let h = spawn_channel_listener(name.clone(), ch.clone(), inbound_tx.clone());
+        listeners.lock().unwrap().insert(name.clone(), h);
+        if let Err(e) = ch.register_commands(menu_specs).await {
+            tracing::warn!(channel = %name, error = %e, "imd: reload register_commands failed");
+        }
+    }
+    // Remove credential-driven channels whose creds vanished (present before,
+    // gone now) and publish the rebuilt set into the shared map.
+    {
+        let creds_driven: HashSet<&str> = CHANNEL_BUILDERS.iter().map(|(n, _)| *n).collect();
+        let mut map = shared.write().unwrap();
+        let vanished: Vec<String> = map
+            .keys()
+            .filter(|k| creds_driven.contains(k.as_str()) && !rebuilt.contains_key(*k))
+            .cloned()
+            .collect();
+        for k in vanished {
+            map.remove(&k);
+            if let Some(h) = listeners.lock().unwrap().remove(&k) {
+                h.abort();
+            }
+        }
+        for (name, ch) in rebuilt {
+            map.insert(name, ch);
+        }
+    }
+    *last_creds.lock().unwrap() = new_creds;
+    tracing::info!("imd: IM channels reloaded from credentials.json (sessions untouched)");
 }
 
 /// V0.6.1 F132 — channel-listener mpsc buffer. 64 is enough headroom
@@ -715,7 +867,7 @@ pub fn sec_gate_payload(outcome: SecOutcome, has_nontext_payload: bool) -> Optio
 /// `ChannelMessage` directly through the v8.1 gateway.
 fn spawn_inbound_consumer(
     mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
-    channels: ChannelMap,
+    channels: Arc<RwLock<ChannelMap>>,
     sec: Arc<Mutex<ThreeLayerSec>>,
     gateway: Arc<Mutex<Gateway>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -730,7 +882,13 @@ fn spawn_inbound_consumer(
                 channel = %msg.channel,
                 "latency imd.route.begin"
             );
-            let Some(channel) = channels.get(&msg.channel).cloned() else {
+            // Clone the channel out under the read lock, then DROP the guard
+            // before any `.await` (never hold a std RwLock guard across await).
+            let channel = {
+                let g = channels.read().unwrap();
+                g.get(&msg.channel).cloned()
+            };
+            let Some(channel) = channel else {
                 tracing::debug!(
                     channel = %msg.channel,
                     sender = %msg.sender,
@@ -823,7 +981,7 @@ struct StatusHandle {
 
 fn spawn_gateway_event_consumer(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
-    channels: ChannelMap,
+    channels: Arc<RwLock<ChannelMap>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // One editable status message per `status_key` (a turn's progress
@@ -831,7 +989,13 @@ fn spawn_gateway_event_consumer(
         // turn and removed when the turn finalizes (`done`).
         let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
         while let Some(evt) = rx.recv().await {
-            let Some(channel) = channels.get(&evt.channel).cloned() else {
+            // Clone the channel out under the read lock, then DROP the guard
+            // before any `.await` (never hold a std RwLock guard across await).
+            let channel = {
+                let g = channels.read().unwrap();
+                g.get(&evt.channel).cloned()
+            };
+            let Some(channel) = channel else {
                 tracing::warn!(
                     channel = %evt.channel,
                     event_id = %evt.id,

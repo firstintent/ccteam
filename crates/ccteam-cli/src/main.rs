@@ -2228,6 +2228,24 @@ async fn handle_mcp_socket_connection(
             // BEFORE handle_request so it never loops back into the stdio
             // forward branch (same pattern as chat_send_file).
             Some(execute_session_tool(&req, gateway.as_ref()).await)
+        } else if is_reload_call(&req) {
+            // In-place IM hot-reload: `ccteam config` sends `ccteam/reload`
+            // over this socket after writing credentials.json. We own the
+            // gateway handle, so signal its daemon reload task (rebuilds the
+            // credential-driven IM channel listeners — sessions untouched).
+            // Non-blocking; `reloaded:false` when no daemon reload task is
+            // wired (e.g. standalone mcp-serve with no gateway).
+            let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let ok = if let Some(gw) = gateway.as_ref() {
+                gw.lock().await.request_im_reload()
+            } else {
+                false
+            };
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "reloaded": ok },
+            }))
         } else {
             mcp_serve::handle_request(&paths, &req).await
         };
@@ -2672,6 +2690,14 @@ async fn execute_interaction_ask(
 /// hook's `permission/ask` RPC (raw JSON-RPC `method`, not a `tools/call`).
 fn is_permission_ask_call(req: &serde_json::Value) -> bool {
     req.get("method").and_then(|m| m.as_str()) == Some("permission/ask")
+}
+
+/// In-place IM hot-reload — `ccteam config` sends `{"method":"ccteam/reload"}`
+/// over the daemon's mcp.sock after persisting `credentials.json`. The handler
+/// signals the gateway's daemon reload task to rebuild the credential-driven
+/// IM channel listeners without restarting any agent session or the daemon.
+fn is_reload_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("ccteam/reload")
 }
 
 /// v0.8.7 W2 (DB.3/DB.4) — handle one `permission/ask` request from a HITL
