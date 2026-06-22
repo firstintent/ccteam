@@ -21,7 +21,8 @@
 - `~/.ccteam/tenants.json` 租户注册表(`ccteam_core::tenants`:`Tenant{id,handle,web_token,linked_chat?,created_at}` + 原子存盘 + `by_token` 常量时比较)。
 - web auth 从单 token 升成 **`token→Identity{admin|tenant}`**:admin=bootstrap owner token、tenant=注册表 token;`auth_layer` 注入 `Extension<Identity>`(no-auth/loopback 也注入 admin)。
 - REST `GET/POST /api/v1/users` + `DELETE …/{id}`(**admin-gated**;POST 回一次性 personal link `?token=ccteam:<hex>`,GET 永不回 token)。
-- **per-user session 归属**:`create_session_api_proto(…, web_owner)` —— admin/内部 → 共享 `web-api` 池;tenant → `web:<id>`。`Gateway::session_views_for_web(id,is_admin)`(web peer of `chat_can_access`)= admin 见全部 / tenant 只见自己;两 web REST handler 取 `Extension<Identity>` scope。**IM `chat_can_access` 不动**。
+- **项目归属 ACL**(owner 拍板「项目=归属单元、会话属于项目→属于用户」;改掉初版 per-session owner = 撤 `session_views_for_web`/`web_owner_chat`/`create_session_api_proto(web_owner)`):web 建项目盖 `ProjectState.owner=web:<tenant>`;**session 继承其 project**(`session.owner` 只留回信路由)。web REST 全按 `can_see_project(identity,slug)` 鉴权 —— project 列表/详情(404)/创建 + 该 project 下 session 列表/创建/按-sid(`gate_sid`:history/status/turn/resolve/events/stop)。**IM `chat_can_access` 不动**。
+- **全局·运维面 admin-gated**(`auth::deny_non_admin`→403):IM 凭据 `config/im*`、主机 `hosts`+`register-mcp`、`status`、用户 `users`。`GET /api/v1/me` → SPA 按身份隐藏 Status/主机/Settings nav + IM 凭据段(fail-closed `useMe`/`meApi`)。共享核 `Identity::{web_owner,can_see_owner}`。
 - Settings **用户管理 UI**(`lib/usersApi.ts`:添加/列/删 + 个人链接复制;403→只读提示)。
 - **无 `ccteam user` CLI**(owner 决策:runtime 写归 web/IM/REST,CLI 只 bootstrap)。
 
@@ -47,15 +48,16 @@
 
 - core:`src/host.rs`(新)· `src/mcp_register.rs`(新)· **`src/tenants.rs`(新,档1 注册表)** · `src/state.rs`(owner 字段)· `src/paths.rs`(`tenants_json`)
 - cli:`src/mcp_serve.rs`(委托核到 core)· `src/web_chat_bridge.rs`(ACL 测试)
-- im:`src/gateway.rs`(ACL + `ChatKey::identity` + `create_project` owner + **档1 `session_views_for_web` / `web_owner_chat` / `create_session_api_proto(web_owner)`**)
+- im:`src/gateway.rs`(ACL + `ChatKey::identity` + `create_project` owner; 档1 项目归属模型 = web session 复用 `web_api_chat` 池,ACL 移到 web 层)
+- web 档1 隔离:`src/auth.rs`(`Identity::{web_owner,can_see_owner}` + `deny_non_admin`)· `routes/api_v1.rs`(`can_see_project` + `handle_me` + project 过滤)· `routes/sessions_api.rs`(`gate_sid` + project 门)· `routes/{im_config,hosts,status}.rs`(admin 门)· SPA `lib/meApi.ts` + `hooks/useMe.ts` + `ChatConsole`/`SettingsPage`(按身份隐藏)
 - web:**`src/auth.rs`(档1 `Identity`/`resolve_identity`,`auth_layer` 注入)** · `src/routes/{hosts.rs(新),users.rs(新,档1),sessions_api.rs(Identity scope),capabilities,status,openapi,mod}` + `tests/openapi_test.rs`
 - SPA:`pages/HostsView.tsx`(新)· `components/AvatarMenu.tsx`(新)· `lib/{hostsApi,i18n}.ts`(新)· **`lib/usersApi.ts`(新,档1)** · `pages/{ChatConsole,StatusView,SettingsPage(用户管理)}.tsx` · `hooks/useWebSettings.ts` · `lib/{statusApi,token}.ts` · `App.tsx`
 
 ## 验收结果(全绿)
 
-- `cargo test --workspace --exclude ccteam-web`:**2040 / 0**(baseline 2016;含档1 +7)
-- `ccteam-web`:**290 / 0**;vitest **186 / 0**;tsc + eslint + vite build clean
-- 档1:`resolve_identity`(admin/tenant/unknown)· `deny_non_admin` · `TenantView`-不漏-token · `session_views_for_web_scopes_to_the_owning_tenant`(alice/bob/carol/admin)· `usersApi`(GET/POST/DELETE + 401/403/500 映射)
+- `cargo test --workspace --exclude ccteam-web`:**2039 / 0**(baseline 2016)
+- `ccteam-web`:**292 / 0**;vitest **188 / 0**;tsc + eslint + vite build clean
+- 档1:`resolve_identity` · `deny_non_admin` · `can_see_owner`(admin/tenant) · `TenantView`-不漏-token · **`tenant_acl_test`**(端到端:tenant token → im_config/hosts/status 403 + users 403 + projects [] + `/me` 身份)· `usersApi`/`meApi`(401/403/500 映射)
 - `cargo clippy --workspace --all-targets -- -D warnings`:0;`cargo fmt --all -- --check`:clean
 - `GET /api/v1/hosts`:host=`local` + claude=ready(带 version)/ codex=not_installed;`register-mcp` 幂等(确定性 fake `CCTEAM_*_BIN`)
 - ACL:两个 `chat_id` 互不可见 / 不可 `/use`(确定性假 `chat_id`)
