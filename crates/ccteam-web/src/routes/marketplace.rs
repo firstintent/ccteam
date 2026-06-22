@@ -29,7 +29,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use ccteam_im::hub::{self, HubError};
 use serde::Deserialize;
@@ -41,8 +41,17 @@ use crate::state::AppState;
 /// Reject an unknown project with a 404 JSON body (mirrors
 /// [`super::roles`]'s guard — keyed on the project's `state.json`). Returns
 /// `Some(resp)` when the project is unknown so callers can `return` it.
-fn reject_unknown_project(app: &AppState, slug: &str) -> Option<Response> {
-    if app.paths.project_state(slug).exists() {
+fn reject_unknown_project(
+    app: &AppState,
+    identity: &crate::auth::Identity,
+    slug: &str,
+) -> Option<Response> {
+    // v0.8.18 档1 — 404 an unknown project AND one the caller can't see: the
+    // marketplace is project-scoped (install writes into that project's
+    // `.claude`), so it follows the project-ownership ACL.
+    if app.paths.project_state(slug).exists()
+        && crate::routes::api_v1::can_see_project(app, identity, slug)
+    {
         return None;
     }
     Some(
@@ -222,10 +231,11 @@ pub(crate) async fn handle_marketplace_body(
 )]
 pub(crate) async fn handle_project_marketplace(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
     Query(q): Query<CatalogQuery>,
 ) -> Response {
-    if let Some(resp) = reject_unknown_project(&app, &slug) {
+    if let Some(resp) = reject_unknown_project(&app, &identity, &slug) {
         return resp;
     }
     let index = match hub::load_catalog(&hub::hub_base(), &app.paths, q.refresh).await {
@@ -295,10 +305,11 @@ pub(crate) async fn handle_project_marketplace(
 )]
 pub(crate) async fn handle_project_marketplace_install(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<InstallForm>,
 ) -> Response {
-    if let Some(resp) = reject_unknown_project(&app, &slug) {
+    if let Some(resp) = reject_unknown_project(&app, &identity, &slug) {
         return resp;
     }
     // Resolve the id in the (cached) catalog before any install I/O so an

@@ -46,6 +46,14 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     reg.save(&paths.tenants_json()).unwrap();
     let tenant_tok = tenant.web_token.clone();
 
+    // An admin-owned project on disk (owner = the shared web-api pool). Written
+    // directly (no scaffold → never touches the real ~/.claude.json).
+    let admin_state = paths.project_state("adminproj");
+    std::fs::create_dir_all(admin_state.parent().unwrap()).unwrap();
+    let mut st = ccteam_core::ProjectState::initial_for_team("adminproj".into(), "dev".into());
+    st.owner = Some("web:web-api".into());
+    st.save(&admin_state).unwrap();
+
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;
     let c = client();
@@ -119,4 +127,27 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
         Some(0),
         "a tenant sees none of the admin's projects",
     );
+
+    // The admin-owned project: the tenant 404s on its detail AND its
+    // marketplace (project-scoped install follows the same ACL).
+    for path in [
+        "/api/v1/projects/adminproj",
+        "/api/v1/projects/adminproj/marketplace",
+    ] {
+        let r = c
+            .get(format!("http://{addr}{path}"))
+            .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "tenant must 404 on the admin's {path}");
+    }
+    // The admin reaches its own project's detail.
+    let r = c
+        .get(format!("http://{addr}/api/v1/projects/adminproj"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "admin sees its own project detail");
 }
