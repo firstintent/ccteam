@@ -12,7 +12,7 @@
 
 **柱2 · 多用户软分区档0**
 
-- `chat_can_access` 收 **own-only**(`session.owner == *chat`):删「web-channel 通看」+「同-current-project 互看」两漏(后者**反转 v0.8.13 跨前端按项目共享**);`/use`/`/stop`/`/screen`/`render_sessions` 全过它(`/use` 之前**没有** owner 门,本版补上)。
+- `chat_can_access` = **own + 共享 web 池**(`session.owner == *chat || session.owner.channel == "web"`):一个 chat 见/驱动自己的 session + 所有 web 控制台创建的 session(web 是单一共享操作台,到档1 才 per-user;支撑「web 建、手机驱动」单用户流),**IM 之间各自建的 session 互相隔离**。删「同-current-project 互看」(**反转 v0.8.13 跨前端按项目共享**);`/use`/`/stop`/`/screen`/`render_sessions` 全过它(`/use` 之前**没有** owner 门,本版补上)。<br>**注**:初版 own-only 把 web 也隔离了,导致 owner 在 web 建的 session 在 TG 看不到(部署后实测发现)→ 已修成 own + web 池。
 - `ProjectState.owner: Option<String>`(serde-default,旧 state.json 照载;`ChatKey::identity()` → `channel:chat_id`;`create_project`(IM `/newproject`)时记)。**显式字段、非路径派生**。
 - **诚实:同 OS uid 软隔离(UX)、非安全边界。**
 
@@ -31,7 +31,7 @@
 
 ## Risks / 行为变化(owner 须知)
 
-- **跨前端共享反转**:同一用户的 web 会话与 IM 会话不再自动互见(各 `chat_id` 隔离),直到档1 用共享身份打通。这是有意的多用户隔离;CLAUDE.md §三 新增 own-only 红线、勿再加回。
+- **共享模型**:web 控制台是**单一共享操作台池** —— 所有 chat(含 IM)都能看/驱动 web 创建的 session(支撑「web 建、手机驱动」单用户流);但 **IM 之间各自建的 session 互相隔离**。同-current-project 互看(v0.8.13)被反转、勿加回。档1(per-user web token)让 web 池也 per-user。CLAUDE.md §三 有红线。
 - per-session 成本是 best-effort(fallback 定价 + 仅 stream-json 会话写 usage);tmux 会话显示 0.00。下版可正式化(把 vendor `total_cost_usd` 接到 gateway 累加器)。
 
 ## Files(主要)

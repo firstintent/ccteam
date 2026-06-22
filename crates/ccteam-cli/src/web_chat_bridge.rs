@@ -774,11 +774,12 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn web_chat_sessions_are_own_only_across_chats() {
-        // v0.8.18 柱2 档0 — own-only over the live web-chat bridge: a second web
-        // chat (distinct chat_id) can neither see nor /use a session another
-        // chat created. Reverses the pre-0.8.18 cross-entry sharing; same-user
-        // cross-frontend reach returns via 档1 (a shared identity).
+    async fn web_chat_sessions_share_the_web_console_pool() {
+        // v0.8.18 柱2 档0 — the web console is ONE shared operator pool (until
+        // 档1 per-user tokens): a session created from one web chat is visible +
+        // addressable from another web chat (the single-user "create on web,
+        // drive from phone" flow). IM-created sessions instead stay PRIVATE to
+        // their chat — covered by the gateway own-only tests.
         let _guard = env_lock();
         let home = TempDir::new().unwrap();
         let ccteam_home = home.path().join(".ccteam");
@@ -789,27 +790,22 @@ mod tests {
         let adapter_state = Arc::new(RecordingState::default());
         let stack = spawn_stack(paths.clone(), Arc::clone(&adapter_state)).await;
 
-        // chat-1 creates a session.
+        // chat-1 (web) creates a session.
         let mut s1 = connect_chat_as(stack.addr, "chat-1", "alice").await;
         send_text(&mut s1, "new", "/new claude reviewer").await;
         recv_reply_contains(&mut s1, "created session s1").await;
 
-        // chat-2 (a different web chat) cannot /use chat-1's session — own-only
-        // refuses it as unknown (no existence leak).
+        // chat-2 (a different web chat) SEES it via the shared web pool and can
+        // /use it.
         let mut s2 = connect_chat_as(stack.addr, "chat-2", "bob").await;
-        send_text(&mut s2, "use", "/use s1").await;
-        recv_reply_contains(&mut s2, "unknown session for this chat: s1").await;
-
-        // The OWNER (chat-1) still sees + drives its own session — isolation
-        // doesn't break the owner's flow, and the reply routes back to it.
-        send_text(&mut s1, "sessions", "/sessions").await;
-        let listed = recv_sessions(&mut s1).await;
+        send_text(&mut s2, "sessions", "/sessions").await;
+        let listed = recv_sessions(&mut s2).await;
         assert!(
             listed.iter().any(|s| s.session.as_deref() == Some("s1")),
-            "owner chat-1 should see its own session: {listed:?}"
+            "web chat-2 should see the shared web-pool session: {listed:?}"
         );
-        send_text(&mut s1, "drive", "drive from chat-1").await;
-        recv_reply_contains(&mut s1, "Claude echo: drive from chat-1").await;
+        send_text(&mut s2, "use", "/use s1").await;
+        recv_reply_contains(&mut s2, "using session s1").await;
 
         drop(s1);
         drop(s2);

@@ -2563,20 +2563,27 @@ impl Gateway {
     /// Session access scope — visibility (`/sessions`) AND addressing
     /// (`/use` / `/stop` / `/screen`).
     ///
-    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN-ONLY**: a chat reaches
-    /// only the sessions it OWNS. The two pre-0.8.18 leaks are removed:
-    /// - a `web`-channel chat seeing every session (web-operator 通看), and
-    /// - any chat in the session's current project seeing it (the v0.8.13
-    ///   cross-frontend-by-project sharing).
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared web pool**: a
+    /// chat reaches the sessions it OWNS, PLUS every session created by the web
+    /// console (`owner.channel == "web"`). The web console is ONE shared
+    /// operator identity (`web-api`) until 档1 gives per-user web tokens, so its
+    /// sessions must stay reachable from IM — the common single-user flow is
+    /// "create it on web, drive it from your phone". IM-created sessions stay
+    /// PRIVATE to their chat: two distinct telegram `chat_id`s never see each
+    /// other's IM-created sessions.
     ///
-    /// So two IM chats (distinct telegram `chat_id`s) on the same machine never
-    /// cross. Reply routing is unaffected — it follows the per-turn submitter
-    /// via `reply_to`. HONEST SCOPE: soft (UX) isolation under one OS uid, NOT a
-    /// security boundary (same uid can still read another's files / process
-    /// env). Cross-frontend sharing for ONE user returns via 档1 (per-user web
-    /// token → a shared identity), deferred.
+    /// The two pre-0.8.18 leaks are still gone: a `web` QUERIER no longer sees
+    /// IM sessions (an IM session only matches `owner == chat`, never the web
+    /// clause), and the same-current-project leak (the v0.8.13 cross-frontend-
+    /// by-project sharing) is removed. Reply routing is unaffected (per-turn
+    /// submitter via `reply_to`). HONEST SCOPE: soft (UX) isolation under one OS
+    /// uid, NOT a security boundary. 档1 makes the web pool per-user too — then
+    /// the `owner.channel == "web"` clause narrows to the owning user.
     fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
-        session.owner == *chat
+        // Own sessions, plus the shared web-console operator pool (see doc): the
+        // single-user "create on web, drive from phone" flow. IM-created
+        // sessions (owner.channel == telegram/lark) stay private to their chat.
+        session.owner == *chat || session.owner.channel == "web"
     }
 
     /// Point the chat's active session at an existing session owned by this
@@ -5580,6 +5587,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner_uses, vec!["using session s1"]);
+    }
+
+    /// v0.8.18 柱2 档0 (regression fix) — the web console is a SHARED operator
+    /// pool: a session created from the web console (`owner.channel == "web"`)
+    /// is visible AND addressable from an IM chat. This is the common
+    /// single-user flow (create it on web, drive it from your phone) and the
+    /// exact case the first cut of own-only broke. IM-created sessions instead
+    /// stay private to their chat (see `gateway_sessions_are_own_only_across_chats`).
+    #[tokio::test]
+    async fn gateway_web_owned_session_visible_from_im() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // A session created from the web console (channel "web").
+        gateway
+            .handle_text("web", "web-api", "web-api", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // A telegram chat SEES it (shared web pool) and can /use it.
+        let seen = gateway
+            .handle_text("telegram", "339498819", "rob", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(seen, vec!["s1:alpha:Claude:reviewer"]);
+        let used = gateway
+            .handle_text("telegram", "339498819", "rob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1"]);
     }
 
     #[allow(clippy::await_holding_lock)]
