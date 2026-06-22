@@ -539,9 +539,15 @@ fn build_workflow_session_detail(
     tag = "auth",
     responses((status = 200, description = "`{wire_token: \"ccteam:<hex>\" | null}`", body = AuthToken)),
 )]
-pub(crate) async fn handle_auth_token(State(app): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn handle_auth_token(
+    presented: Option<Extension<crate::auth::PresentedToken>>,
+) -> impl IntoResponse {
+    // v0.8.18 档1 — return the CALLER's OWN wire token, NEVER the admin's: a
+    // tenant must not receive the bootstrap token (= privilege escalation).
+    // Absent (no-auth/loopback) → null = auth not required. The SPA only reads
+    // presence (`authRequired`), so this is contract-compatible.
     Json(AuthToken {
-        wire_token: app.auth.wire_token(),
+        wire_token: presented.map(|Extension(t)| t.0),
     })
 }
 
@@ -796,6 +802,7 @@ pub struct ActiveSessionWithSlug {
 )]
 pub(crate) async fn handle_active_sessions_aggregate(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
 ) -> impl IntoResponse {
     let summaries = match ccteam_core::collect_projects(&app.paths) {
         Ok(v) => v,
@@ -810,6 +817,11 @@ pub(crate) async fn handle_active_sessions_aggregate(
     };
     let mut out: Vec<ActiveSessionWithSlug> = Vec::new();
     for s in summaries {
+        // v0.8.18 档1 — this aggregate spans ALL projects, so it must filter to
+        // the ones the caller owns (the middleware only covers `/projects/{slug}`).
+        if !identity.can_see_owner(s.state.owner.as_deref()) {
+            continue;
+        }
         let slug = s.state.slug;
         match ccteam_core::active_sessions(&slug, &app.paths) {
             Ok(rows) => {

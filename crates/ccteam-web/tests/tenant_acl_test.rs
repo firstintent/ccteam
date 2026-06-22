@@ -112,6 +112,28 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     assert_eq!(me_tenant["is_admin"], serde_json::json!(false));
     assert_eq!(me_tenant["handle"], serde_json::json!("alice"));
 
+    // `/auth/token` returns the CALLER's own wire token — NEVER the admin's (a
+    // tenant getting the bootstrap token would be a privilege escalation).
+    let tok: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tok["wire_token"],
+        serde_json::json!(format!("ccteam:{tenant_tok}")),
+        "tenant gets its OWN token",
+    );
+    assert_ne!(
+        tok["wire_token"],
+        serde_json::json!(format!("ccteam:{ADMIN_HEX}")),
+        "must NOT leak the admin/bootstrap token",
+    );
+
     // Projects: the tenant owns none → empty list (admin's projects don't leak).
     let projects: serde_json::Value = c
         .get(format!("http://{addr}/api/v1/projects"))

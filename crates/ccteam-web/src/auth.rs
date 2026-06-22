@@ -184,6 +184,13 @@ pub fn deny_non_admin(identity: &Identity) -> Option<Response> {
     }
 }
 
+/// v0.8.18 档1 — the caller's OWN presented wire token (`ccteam:<hex>`), stashed
+/// by [`auth_layer`] so `GET /api/v1/auth/token` returns the CALLER's token, not
+/// the admin's (a tenant must never receive the bootstrap token = escalation).
+/// Absent on the no-auth/loopback path → the endpoint reports auth-not-required.
+#[derive(Debug, Clone)]
+pub struct PresentedToken(pub String);
+
 /// v0.8.18 档1 — the project-ownership gate for **every** `/api/v1/projects/
 /// {slug}/...` route (the single choke point: no project-scoped route can leak,
 /// and new ones are covered automatically — vs. gating each handler). Runs
@@ -348,7 +355,10 @@ pub async fn auth_layer(
         if let Some(presented) = parse_bearer(h) {
             if let Some(bare) = bare_hex(presented) {
                 if let Some(id) = resolve_identity(bare, expected, &tenants) {
+                    // Own the token before the &mut borrow (it borrows req.headers).
+                    let presented = presented.to_string();
                     req.extensions_mut().insert(id);
+                    req.extensions_mut().insert(PresentedToken(presented));
                     return next.run(req).await;
                 }
             }
@@ -378,7 +388,9 @@ pub async fn auth_layer(
     // 3. Cookie carry-over for subsequent GETs / SSE.
     if let Some(cookie_val) = cookie_token(&jar) {
         if let Some(id) = resolve_identity(cookie_val, expected, &tenants) {
+            let wire = format!("{TOKEN_PREFIX}{cookie_val}");
             req.extensions_mut().insert(id);
+            req.extensions_mut().insert(PresentedToken(wire));
             return next.run(req).await;
         }
     }
