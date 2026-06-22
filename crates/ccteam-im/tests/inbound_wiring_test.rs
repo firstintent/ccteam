@@ -1264,9 +1264,12 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         "unexpected timeout content: {:?}",
         contents[1]
     );
+    // v0.8.18 (owner request): WARN-ONLY — the watchdog must NOT interrupt the
+    // turn (a long silent command like a benchmark is real work); it only flags
+    // the silence + tells the user it did not touch the turn.
     assert!(
-        contents[1].contains("interrupted it"),
-        "watchdog must report it interrupted the turn: {:?}",
+        !contents[1].contains("interrupted it") && contents[1].contains("does NOT interrupt"),
+        "watchdog must be heads-up only (no interrupt): {:?}",
         contents[1]
     );
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);

@@ -3236,13 +3236,13 @@ fn spawn_turn_timeout_watchdog(
     let reply_to = Arc::clone(&session.reply_to);
     let owner = session.owner.clone();
     let turn_id = turn_id.to_string();
-    // v0.8.9 (owner request) — the watchdog TERMINATES a stalled turn, not just
-    // notifies. v0.8.15 (owner request) — "stalled" is now IDLE-based: reset on
-    // any activity so a long-but-working turn (tool calls / streaming for
-    // minutes) is never killed; only TRUE silence for the whole window trips
-    // it. Clone the adapter + thread so the task can send `esc` on a real stall.
-    let adapter = Arc::clone(&session.adapter);
-    let thread = session.thread.clone();
+    // IDLE-based silence detector (v0.8.15): reset on any activity so a
+    // long-but-working turn (tool calls / streaming for minutes) never trips it;
+    // only TRUE silence for the whole window does. v0.8.18 (owner request) —
+    // **WARN-ONLY**: the watchdog NEVER interrupts / never `esc`s, on ANY
+    // protocol (tmux / rmux / stream-json). A long SILENT command (a benchmark,
+    // a big build) is real work — mis-killing it is worse than a stray heads-up.
+    // The user `/stop`s if it is genuinely stuck.
     tokio::spawn(async move {
         // Poll at a fraction of the idle window (cap so turn-completion is still
         // noticed promptly on a long window). Reset `idle` whenever the activity
@@ -3285,46 +3285,20 @@ fn spawn_turn_timeout_watchdog(
                 );
             }
         }
-        // No answer within the timeout = a stalled / infinitely-looping turn
-        // (e.g. a roleless model spinning on tool calls). INTERRUPT it via the
-        // adapter's vendor-agnostic `esc` directive (Claude → Esc keystroke).
-        // This terminates the TURN, NOT the session — the pane stays alive
-        // ("never auto-kill a long session"); the user can simply send again.
-        // Best-effort: on failure we still notify (the user can `/stop`).
-        let esc = Directive {
-            name: "esc".to_string(),
-            args: String::new(),
-            choice: None,
-        };
-        let interrupted = match adapter.handle_directive(&thread, esc).await {
-            Ok(_) => true,
-            Err(err) => {
-                tracing::warn!(
-                    session = %session_id,
-                    error = %err,
-                    "turn-watchdog: failed to interrupt the runaway turn"
-                );
-                false
-            }
-        };
+        // v0.8.18 (owner request) — WARN-ONLY: never interrupt. A turn that
+        // produced NO events for the whole window is FLAGGED, not killed — a
+        // long silent command (a benchmark, a big build) is real work, and an
+        // `esc` here mis-kills it. The user `/stop`s if it is genuinely stuck.
         let (channel, chat_id) = match reply_to.lock() {
             Ok(target) => (target.channel.clone(), target.chat_id.clone()),
             Err(_) => (owner.channel.clone(), owner.chat_id.clone()),
         };
-        let content = if interrupted {
-            format!(
-                "⏱️ turn {turn_id} went silent for {timeout:?} (no tokens, tool calls or \
-                 progress) — the watchdog treated it as stalled and interrupted it (the \
-                 session is still alive; just send again). A long-but-active turn is NOT \
-                 killed; if this fired on real work, raise the idle window via \
-                 CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS."
-            )
-        } else {
-            format!(
-                "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}; the watchdog \
-                 could not interrupt it — you may need to /stop the session."
-            )
-        };
+        let content = format!(
+            "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id} (no tokens, tool \
+             calls or progress). Heads-up only — the watchdog does NOT interrupt it (a long \
+             command like a benchmark legitimately emits no events). If it is truly stuck, \
+             `/stop` the session; tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+        );
         let _ = tx.send(GatewayEvent {
             id: format!("gateway-timeout-{session_id}-{turn_id}"),
             channel,
