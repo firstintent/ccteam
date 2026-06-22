@@ -100,6 +100,8 @@ pub mod stall;
 pub mod state;
 pub mod team;
 pub mod team_resolver;
+// v0.8.18 档1 — per-user web tenant registry (web-first user management).
+pub mod tenants;
 // V0.5.0 F95 — Anthropic Agent Teams config/inbox/task parsers (pure
 // diff helpers). The wiring into the daemon-level watcher lives in
 // `artifact_watcher::AgentTeamsWatcher`; these modules are kept

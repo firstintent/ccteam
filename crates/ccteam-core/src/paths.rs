@@ -73,6 +73,11 @@ impl CcteamPaths {
         self.root.join("inbox")
     }
 
+    /// v0.8.18 档1 — the per-user web tenant registry (`~/.ccteam/tenants.json`).
+    pub fn tenants_json(&self) -> PathBuf {
+        self.root.join("tenants.json")
+    }
+
     pub fn control_dir(&self) -> PathBuf {
         self.root.join("control")
     }
