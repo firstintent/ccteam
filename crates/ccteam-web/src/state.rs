@@ -39,23 +39,6 @@ pub struct AppState {
     /// `<slug>` (or `<slug>/<sid>`) creates the FIFO + `pipe-pane`;
     /// the last drop tears them down.
     pub pty: PtyRegistry,
-    /// V0.5.0 F96 — Anthropic `~/.claude/` root for Agent Teams.
-    /// Resolved at AppState construction via
-    /// `crate::teams::claude_home()` (env override
-    /// `CCTEAM_CLAUDE_HOME` honored). Read-only data path; the
-    /// orchestrator never writes here.
-    pub claude_home: Arc<PathBuf>,
-    /// V0.5.0 F96 — path to the global teams progress jsonl
-    /// (`~/.ccteam/teams-progress.jsonl`). Distinct from per-project
-    /// `~/.ccteam/progress/<slug>.jsonl`. The teams SSE channel tails
-    /// this file. Tests override via `with_teams_progress_path`.
-    ///
-    /// F95 added `CcteamPaths::teams_progress_jsonl()` as the
-    /// canonical resolver. We construct the same string here
-    /// (`paths.root.join("teams-progress.jsonl")`) — when F95 lands in
-    /// this worktree the line below becomes
-    /// `paths.teams_progress_jsonl()` with no behaviour change.
-    pub teams_progress_path: Arc<PathBuf>,
     /// Browser chat inbound bridge. `ccteam-web` owns only the neutral
     /// JSON shape; `ccteam-cli` translates this into the IM gateway.
     pub chat_inbound: Option<mpsc::Sender<WebChannelMessage>>,
@@ -154,24 +137,12 @@ impl AppState {
                 EventBus::inert()
             }
         };
-        let claude_home = crate::teams::claude_home().unwrap_or_else(|err| {
-            tracing::warn!(
-                ?err,
-                "ccteam-web: claude_home() resolution failed; defaulting to /tmp/.claude"
-            );
-            PathBuf::from("/tmp/.claude")
-        });
-        // F95 canonicalised the path; switch over now that it's
-        // available (was `paths.root.join("teams-progress.jsonl")` pre-F95).
-        let teams_progress_path = paths.teams_progress_jsonl();
         let (chat_outbound, _) = broadcast::channel(256);
         Self {
             paths: Arc::new(paths),
             bus,
             auth: Arc::new(auth),
             pty: PtyRegistry::new(),
-            claude_home: Arc::new(claude_home),
-            teams_progress_path: Arc::new(teams_progress_path),
             chat_inbound: None,
             chat_outbound,
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
@@ -180,48 +151,6 @@ impl AppState {
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// Construct an `AppState` with a pre-built bus. Used by tests
-    /// that want to publish events directly via
-    /// [`EventBus::publish_for_test`] without spinning a watcher.
-    #[cfg(test)]
-    pub fn with_bus(paths: CcteamPaths, bus: EventBus) -> Self {
-        let claude_home =
-            crate::teams::claude_home().unwrap_or_else(|_| PathBuf::from("/tmp/.claude"));
-        let teams_progress_path = paths.teams_progress_jsonl();
-        let (chat_outbound, _) = broadcast::channel(256);
-        Self {
-            paths: Arc::new(paths),
-            bus,
-            auth: Arc::new(AuthState::disabled()),
-            pty: PtyRegistry::new(),
-            claude_home: Arc::new(claude_home),
-            teams_progress_path: Arc::new(teams_progress_path),
-            chat_inbound: None,
-            chat_outbound,
-            chat_backlog: Arc::new(Mutex::new(Vec::new())),
-            chat_conns: Arc::new(Mutex::new(HashMap::new())),
-            gateway: None,
-            creds_path: Arc::new(ccteam_im::credentials::default_path()),
-            im_poll: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// V0.5.0 F96 — replace the Anthropic teams root for tests that
-    /// stage `<tmp>/.claude/teams/<>/` without touching the real
-    /// `$HOME/.claude`. Returns the modified state by value so
-    /// callers can chain on `AppState::new(...)`.
-    pub fn with_claude_home(mut self, claude_home: PathBuf) -> Self {
-        self.claude_home = Arc::new(claude_home);
-        self
-    }
-
-    /// V0.5.0 F96 — override the teams progress jsonl path. Tests
-    /// point this at a tempdir file the test seeds + appends to.
-    pub fn with_teams_progress_path(mut self, path: PathBuf) -> Self {
-        self.teams_progress_path = Arc::new(path);
-        self
     }
 
     pub fn with_chat_bridge(

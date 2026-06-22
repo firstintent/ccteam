@@ -42,7 +42,6 @@ pub mod queries;
 pub mod routes;
 pub mod state;
 pub mod status;
-pub mod teams;
 pub mod token;
 pub mod views;
 pub mod watcher;

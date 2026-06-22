@@ -112,7 +112,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
     info(
         title = "ccteam resource API",
         description = "The `/api/v1` resource surface: capabilities, projects, roles, \
-                       sessions (+ turn / events / stop), workflow panels, and teams. \
+                       sessions (+ turn / events / stop), and workflow panels. \
                        Auth: the same web-token gate as every other `/api/v1` route \
                        (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie).",
         version = env!("CARGO_PKG_VERSION"),
@@ -126,7 +126,6 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
-        (name = "teams", description = "Read-only Anthropic Agent Teams mirror"),
         (name = "auth", description = "Web-token introspection"),
         (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
         (name = "marketplace", description = "ccteam-hub plugin catalog (browse / body preview / per-project install)"),
@@ -205,13 +204,6 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::marketplace::handle_marketplace_body))
         .routes(routes!(super::marketplace::handle_project_marketplace))
         .routes(routes!(super::marketplace::handle_project_marketplace_install))
-        // teams
-        .routes(routes!(super::teams_api::handle_list))
-        .routes(routes!(super::teams_api::handle_detail))
-        .routes(routes!(super::teams_api::handle_tasks))
-        .routes(routes!(super::teams_api::handle_inbox))
-        .routes(routes!(super::teams_api::handle_definition))
-        .routes(routes!(super::teams_sse::handle_team_events))
 }
 
 /// The complete `/api/v1` router PLUS its self-documenting endpoints.

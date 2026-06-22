@@ -60,9 +60,6 @@ pub mod status;
 // 共用,避免 vendor 分支两份漂移)。
 pub mod session_pane;
 pub mod sse;
-// V0.5.0 F96 — Agent Teams JSON API + SSE channel.
-pub mod teams_api;
-pub mod teams_sse;
 // v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
 pub mod users;
 
