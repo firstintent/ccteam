@@ -153,6 +153,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::users::handle_delete_user))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
+        .routes(routes!(super::api_v1::handle_me))
         // projects — GET list + POST create share `/api/v1/projects`;
         // GET detail + DELETE share `/api/v1/projects/{slug}`.
         .routes(routes!(

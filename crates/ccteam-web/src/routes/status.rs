@@ -37,10 +37,15 @@
 
 use std::collections::BTreeMap;
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::State,
+    response::{IntoResponse, Response},
+    Extension, Json,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::auth::{deny_non_admin, Identity};
 use crate::state::AppState;
 
 /// `GET /api/v1/status` response — the daemon-wide snapshot the cost pill +
@@ -133,7 +138,14 @@ fn project_budget_cap_24h(project_dir: &std::path::Path) -> Option<f64> {
         (status = 200, description = "Daemon-wide status snapshot", body = StatusResponse),
     ),
 )]
-pub(crate) async fn handle_status(State(app): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn handle_status(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    // v0.8.18 档1 — the daemon-wide status/cost fleet is an operator/admin view.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
     // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
@@ -194,6 +206,7 @@ pub(crate) async fn handle_status(State(app): State<AppState>) -> impl IntoRespo
         budget_cap_24h,
         sessions: session_rows,
     })
+    .into_response()
 }
 
 /// Build one [`SessionCostRow`] per live gateway session, joining each to its

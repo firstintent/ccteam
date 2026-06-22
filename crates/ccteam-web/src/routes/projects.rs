@@ -28,7 +28,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use ccteam_core::ProjectEntry;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ pub struct CreatedProject {
 )]
 pub(crate) async fn handle_create_project(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     FormOrJson(form, mode): FormOrJson<CreateProjectForm>,
 ) -> Response {
     let team = form
@@ -131,6 +132,10 @@ pub(crate) async fn handle_create_project(
     let slug_for_blocking = slug.clone();
     let abs_for_blocking = abs.clone();
     let team_for_blocking = team.clone();
+    // v0.8.18 档1 — bind the new project to its creating web user
+    // (`web:<id>`; admin → the shared `web-api` pool). Project is the unit of
+    // ownership; its sessions inherit it.
+    let owner_for_blocking = identity.web_owner();
     let scaffold = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         ccteam_core::bootstrap_project_at_dir(
             &paths,
@@ -139,6 +144,15 @@ pub(crate) async fn handle_create_project(
             "(created from web resource API)",
             &team_for_blocking,
         )?;
+        // Best-effort owner stamp (mirrors `Gateway::create_project`): a
+        // load/save miss just leaves owner unset (admin-visible, not tenant).
+        let state_path = paths.project_state(&slug_for_blocking);
+        if let Ok(mut state) = ccteam_core::ProjectState::load(&state_path) {
+            state.owner = Some(owner_for_blocking.clone());
+            if let Err(err) = state.save(&state_path) {
+                tracing::warn!(slug = %slug_for_blocking, error = %err, "set project owner failed");
+            }
+        }
         ccteam_core::upsert_project_in_config(
             &paths.root,
             ProjectEntry {

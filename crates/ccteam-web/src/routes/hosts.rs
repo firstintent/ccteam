@@ -27,12 +27,14 @@ use std::sync::{Mutex, OnceLock};
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
-    response::IntoResponse,
-    Json,
+    response::{IntoResponse, Response},
+    Extension, Json,
 };
 use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+use crate::auth::{deny_non_admin, Identity};
 
 /// The id of this machine — the single host until the v0.9 host axis adds
 /// satellites.
@@ -280,7 +282,11 @@ async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
     tag = "hosts",
     responses((status = 200, description = "Hosts ccteam drives (today one: `local`)", body = HostsResponse)),
 )]
-pub(crate) async fn handle_hosts() -> impl IntoResponse {
+pub(crate) async fn handle_hosts(Extension(identity): Extension<Identity>) -> Response {
+    // v0.8.18 档1 — the host-keyed agent report is an operator/admin surface.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let agents = probe_all_agents(false).await;
     let agents_ready = agents.iter().filter(|a| a.status == "ready").count();
     Json(HostsResponse {
@@ -292,6 +298,7 @@ pub(crate) async fn handle_hosts() -> impl IntoResponse {
             agents_ready,
         }],
     })
+    .into_response()
 }
 
 /// Query for `GET /api/v1/hosts/{host}` — `?refresh=true` forces a re-probe.
@@ -318,9 +325,13 @@ pub struct HostDetailQuery {
     ),
 )]
 pub(crate) async fn handle_host_detail(
+    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<HostDetailQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     if host != LOCAL_HOST {
         return (
             StatusCode::NOT_FOUND,
@@ -374,9 +385,13 @@ pub struct RegisterMcpQuery {
     ),
 )]
 pub(crate) async fn handle_register_mcp(
+    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<RegisterMcpQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     if host != LOCAL_HOST {
         return (
             StatusCode::NOT_FOUND,

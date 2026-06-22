@@ -65,6 +65,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("DELETE", "/api/v1/users/{id}"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
+        // v0.8.18 档1 — caller identity (SPA branches admin-only surfaces).
+        ("GET", "/api/v1/me"),
         // projects
         ("GET", "/api/v1/projects"),
         ("POST", "/api/v1/projects"),

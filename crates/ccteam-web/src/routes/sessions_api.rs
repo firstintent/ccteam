@@ -65,7 +65,7 @@ use axum::{
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol, ThreadStatus};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
@@ -132,22 +132,63 @@ pub(crate) async fn handle_list_sessions(
     Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
 ) -> Response {
+    // v0.8.18 档1 — session visibility derives from the project (project is the
+    // unit of ownership): if you can't see the project, you see none of its
+    // sessions. 404 (not 403) so an unowned slug isn't revealed.
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
     // session_views() is sync after the lock — no `.await` is held under it.
-    // v0.8.18 档1 — scope the list to the caller: the admin sees every session
-    // in the project; a per-user tenant sees only the ones it owns.
     let mut views = {
         let guard = gw.lock().await;
         guard
-            .session_views_for_web(&identity.id, identity.is_admin)
+            .session_views()
             .into_iter()
             .filter(|v| v.project == slug)
             .collect::<Vec<_>>()
     };
     apply_progress_activity_status(&app.paths, &slug, &mut views);
     Json(views).into_response()
+}
+
+/// 404 for a project the caller can't see (per-user isolation; 404 not 403 so
+/// an unowned slug's existence isn't revealed).
+fn project_not_visible(slug: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("project not found: {slug}")})),
+    )
+        .into_response()
+}
+
+/// v0.8.18 档1 — gate a by-`sid` endpoint by the session's PROJECT (project is
+/// the unit of ownership; a session inherits its project's owner). Resolves
+/// `sid` → project via the gateway, then checks the caller may see it. Returns
+/// `Some(404)` when the sid is unknown OR its project isn't visible (the two
+/// are indistinguishable, so sids in other users' projects can't be probed).
+/// `None` = allowed (admin, no-gateway → the handler does its own check, or a
+/// visible project).
+async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -> Option<Response> {
+    if identity.is_admin {
+        return None;
+    }
+    // No live gateway → the handler runs its own no-gateway path; don't gate.
+    let gw = app.gateway.as_ref()?;
+    let project = {
+        let guard = gw.lock().await;
+        guard
+            .session_views()
+            .into_iter()
+            .find(|v| v.sid == sid)
+            .map(|v| v.project)
+    };
+    match project {
+        Some(p) if crate::routes::api_v1::can_see_project(app, identity, &p) => None,
+        _ => Some(unknown_session(sid)),
+    }
 }
 
 fn apply_progress_activity_status(
@@ -235,6 +276,11 @@ pub(crate) async fn handle_create_session(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
+    // v0.8.18 档1 — can't create a session in a project you can't see (the
+    // session would inherit that project's ownership).
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
     // v0.8.8 F2-web — an EMPTY role is now a valid "roleless" session (bare
     // claude that self-reads the project CLAUDE.md): pass the trimmed string
     // through verbatim. The gateway's `create_session_api` accepts "" (its
@@ -265,7 +311,6 @@ pub(crate) async fn handle_create_session(
                 vendor,
                 permission_mode,
                 protocol,
-                &identity.id,
             )
             .await
     };
@@ -323,8 +368,12 @@ pub(crate) async fn handle_create_session(
 )]
 pub(crate) async fn handle_session_history(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
 ) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -399,8 +448,12 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 )]
 pub(crate) async fn handle_session_status(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
 ) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -467,9 +520,13 @@ pub struct TurnForm {
 )]
 pub(crate) async fn handle_session_turn(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
     FormOrJson(form, mode): FormOrJson<TurnForm>,
 ) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -542,9 +599,13 @@ pub struct ResolveForm {
 )]
 pub(crate) async fn handle_session_resolve(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
     FormOrJson(form, mode): FormOrJson<ResolveForm>,
 ) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -613,8 +674,14 @@ pub(crate) async fn handle_session_resolve(
 )]
 pub(crate) async fn handle_session_events(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
+    // v0.8.18 档1 — gate by the session's project (per-user isolation); a
+    // tenant can't subscribe to a session in a project it can't see.
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     // Subscribe under a brief lock (subscribe_events only clones a Sender +
     // registers a Receiver; no `.await` is held under the guard). `None`
     // gateway keeps the standalone no-gateway contract.
@@ -643,9 +710,12 @@ pub(crate) async fn handle_session_events(
                 }
             })
             .left_stream(),
-        None => futures::stream::iter(vec![Ok(gateway_unavailable_event())]).right_stream(),
+        None => futures::stream::iter(vec![Ok::<Event, Infallible>(gateway_unavailable_event())])
+            .right_stream(),
     };
-    Sse::new(stream).keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default().interval(KEEPALIVE_INTERVAL))
+        .into_response()
 }
 
 /// `POST /api/v1/sessions/{sid}/stop`
@@ -666,8 +736,12 @@ pub(crate) async fn handle_session_events(
 )]
 pub(crate) async fn handle_session_stop(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
 ) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };

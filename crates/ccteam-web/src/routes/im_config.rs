@@ -42,7 +42,9 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
+use axum::{
+    extract::State, http::StatusCode, response::IntoResponse, response::Response, Extension, Json,
+};
 use ccteam_im::credentials::{self, Credentials, LarkCreds, TelegramCreds};
 use ccteam_im::onboarding::{
     lark_setup_with_base, telegram_poll_chat_id_with_base, telegram_validate_token_with_base,
@@ -53,6 +55,7 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
 use super::actions::FormOrJson;
+use crate::auth::{deny_non_admin, Identity};
 use crate::state::{AppState, TelegramChatIdPoll};
 
 /// Total budget (seconds) for the async Telegram `chat_id` capture. The
@@ -257,7 +260,15 @@ fn json_500(msg: String) -> Response {
         (status = 500, description = "Credentials file could not be read"),
     ),
 )]
-pub(crate) async fn handle_get_im_config(State(app): State<AppState>) -> Response {
+pub(crate) async fn handle_get_im_config(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    // v0.8.18 档1 — IM credentials are the daemon's single GLOBAL bot config
+    // (no per-user bot routing); only the admin/owner may read or change them.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let creds = match load_creds(&app) {
         Ok(c) => c,
         Err(e) => return json_500(e),
@@ -303,8 +314,12 @@ pub(crate) async fn handle_get_im_config(State(app): State<AppState>) -> Respons
 )]
 pub(crate) async fn handle_put_telegram(
     State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
     FormOrJson(form, _mode): FormOrJson<TelegramConfigForm>,
 ) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let token = form.bot_token.trim();
     if token.is_empty() {
         return json_400("bot_token must not be empty".to_string());
@@ -363,7 +378,13 @@ pub(crate) async fn handle_put_telegram(
         (status = 500, description = "Credentials file could not be read"),
     ),
 )]
-pub(crate) async fn handle_telegram_chat_id_start(State(app): State<AppState>) -> Response {
+pub(crate) async fn handle_telegram_chat_id_start(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let creds = match load_creds(&app) {
         Ok(c) => c,
         Err(e) => return json_500(e),
@@ -428,7 +449,13 @@ fn spawn_chat_id_poll(
         (status = 500, description = "Credentials file read/write failed during persist"),
     ),
 )]
-pub(crate) async fn handle_telegram_chat_id_poll(State(app): State<AppState>) -> Response {
+pub(crate) async fn handle_telegram_chat_id_poll(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     // Snapshot the slot, then drop the lock before any disk IO.
     let state = { app.im_poll.lock().await.clone() };
     match state {
@@ -503,8 +530,12 @@ pub(crate) async fn handle_telegram_chat_id_poll(State(app): State<AppState>) ->
 )]
 pub(crate) async fn handle_put_lark(
     State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
     FormOrJson(form, _mode): FormOrJson<LarkConfigForm>,
 ) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let app_id = form.app_id.trim();
     let app_secret = form.app_secret.trim();
     if app_id.is_empty() || app_secret.is_empty() {

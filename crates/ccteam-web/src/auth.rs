@@ -61,11 +61,13 @@ use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
+    Json,
 };
 use axum_extra::extract::{
     cookie::{Cookie, SameSite},
     CookieJar,
 };
+use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use ccteam_core::session_secret;
@@ -144,6 +146,41 @@ impl Identity {
             id,
             is_admin: false,
         }
+    }
+
+    /// This identity's owner tag for resources it creates on the web
+    /// (a project's `ProjectState.owner` / a session owner, `"channel:chat_id"`).
+    /// The admin uses the shared `web-api` pool; a per-user tenant owns
+    /// `web:<id>`. Mirrors the gateway's `web_owner_chat`.
+    pub fn web_owner(&self) -> String {
+        if self.is_admin {
+            "web:web-api".to_string()
+        } else {
+            format!("web:{}", self.id)
+        }
+    }
+
+    /// Whether this identity may see a resource owned by `owner` (a project's
+    /// `ProjectState.owner` or a session owner). The admin/owner sees
+    /// everything; a per-user tenant sees only what it owns (`web:<id>`).
+    pub fn can_see_owner(&self, owner: Option<&str>) -> bool {
+        self.is_admin || owner == Some(self.web_owner().as_str())
+    }
+}
+
+/// `Some(403)` unless the caller is the admin/owner — the shared gate for every
+/// admin-only route (user management, IM credentials, hosts, global config).
+pub fn deny_non_admin(identity: &Identity) -> Option<Response> {
+    if identity.is_admin {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin only: this surface is owner-gated"})),
+            )
+                .into_response(),
+        )
     }
 }
 
@@ -390,6 +427,22 @@ mod tests {
         assert_eq!(bare_hex("ccteam:deadbeef"), Some("deadbeef"));
         assert_eq!(bare_hex("deadbeef"), None);
         assert_eq!(bare_hex("Bearer ccteam:x"), None);
+    }
+
+    #[test]
+    fn can_see_owner_admin_sees_all_tenant_sees_own() {
+        let admin = Identity::admin();
+        assert_eq!(admin.web_owner(), "web:web-api");
+        assert!(admin.can_see_owner(None));
+        assert!(admin.can_see_owner(Some("web:u1")));
+        assert!(admin.can_see_owner(Some("telegram:123")));
+
+        let t = Identity::tenant("u1".to_string());
+        assert_eq!(t.web_owner(), "web:u1");
+        assert!(t.can_see_owner(Some("web:u1")), "owns it");
+        assert!(!t.can_see_owner(Some("web:u2")), "another tenant's");
+        assert!(!t.can_see_owner(None), "legacy/admin-pool project");
+        assert!(!t.can_see_owner(Some("telegram:1")), "IM-owned");
     }
 
     #[test]

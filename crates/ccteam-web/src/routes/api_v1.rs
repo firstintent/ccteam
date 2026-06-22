@@ -24,7 +24,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use ccteam_core::{
     cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
@@ -126,8 +126,11 @@ pub struct AuthToken {
         (status = 500, description = "Project collect failed"),
     ),
 )]
-pub(crate) async fn handle_projects(State(app): State<AppState>) -> impl IntoResponse {
-    match build_projects(&app) {
+pub(crate) async fn handle_projects(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+) -> impl IntoResponse {
+    match build_projects(&app, &identity) {
         Ok(rows) => Json(rows).into_response(),
         Err(err) => {
             tracing::error!(?err, "GET /api/v1/projects build failed");
@@ -140,10 +143,18 @@ pub(crate) async fn handle_projects(State(app): State<AppState>) -> impl IntoRes
     }
 }
 
-fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
+fn build_projects(
+    app: &AppState,
+    identity: &crate::auth::Identity,
+) -> anyhow::Result<Vec<DashboardRow>> {
     let summaries = ccteam_core::collect_projects(&app.paths)?;
     let mut rows = Vec::with_capacity(summaries.len());
     for s in summaries {
+        // v0.8.18 档1 — per-user project isolation: the admin sees every
+        // project; a tenant sees only the ones it owns (`web:<id>`).
+        if !identity.can_see_owner(s.state.owner.as_deref()) {
+            continue;
+        }
         let events = slug_recent_events(&app.paths, &s.state.slug, STATUS_EVENT_LIMIT);
         let badge = status_badge(&s.state, &events, s.stall_silent_seconds);
         let last_event_label = match s.state.last_progress_event_at {
@@ -175,6 +186,63 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
     Ok(rows)
 }
 
+/// `GET /api/v1/me` response — the authenticated caller's identity, so the SPA
+/// shows admin-only surfaces (user management, IM credentials, hosts, status)
+/// only to the owner.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    /// `"admin"` for the owner (bootstrap token), else the tenant id.
+    pub id: String,
+    /// Display handle: `"owner"` for the admin, else the tenant's handle.
+    pub handle: String,
+    pub is_admin: bool,
+}
+
+/// `GET /api/v1/me` — who am I? Lets the SPA branch the UI by identity.
+#[utoipa::path(
+    get,
+    path = "/api/v1/me",
+    tag = "status",
+    responses((status = 200, description = "The caller's identity", body = MeResponse)),
+)]
+pub(crate) async fn handle_me(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+) -> impl IntoResponse {
+    let handle = if identity.is_admin {
+        "owner".to_string()
+    } else {
+        ccteam_core::tenants::TenantRegistry::load(&app.paths.tenants_json())
+            .by_id(&identity.id)
+            .map(|t| t.handle.clone())
+            .unwrap_or_else(|| identity.id.clone())
+    };
+    Json(MeResponse {
+        id: identity.id.clone(),
+        handle,
+        is_admin: identity.is_admin,
+    })
+}
+
+/// v0.8.18 档1 — whether `identity` may see project `slug`. Project is the unit
+/// of ownership; a session's visibility derives from its project's. Reads the
+/// project's `state.json` owner: the admin sees every project, a tenant only
+/// one it owns (`web:<id>`). A missing/unreadable project is not visible to a
+/// tenant. The single source the session endpoints consult to scope by project.
+pub(crate) fn can_see_project(
+    app: &AppState,
+    identity: &crate::auth::Identity,
+    slug: &str,
+) -> bool {
+    if identity.is_admin {
+        return true;
+    }
+    match ProjectState::load(&app.paths.project_state(slug)) {
+        Ok(state) => identity.can_see_owner(state.owner.as_deref()),
+        Err(_) => false,
+    }
+}
+
 /// `GET /api/v1/projects/{slug}` → project detail summary.
 #[utoipa::path(
     get,
@@ -189,6 +257,7 @@ fn build_projects(app: &AppState) -> anyhow::Result<Vec<DashboardRow>> {
 )]
 pub(crate) async fn handle_project(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
     let state_path = app.paths.project_state(&slug);
@@ -212,6 +281,16 @@ pub(crate) async fn handle_project(
                 .into_response();
         }
     };
+
+    // v0.8.18 档1 — per-user isolation: a tenant may only see its own projects.
+    // 404 (not 403) so an unowned slug's existence isn't revealed.
+    if !identity.can_see_owner(state.owner.as_deref()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("project not found: {slug}")})),
+        )
+            .into_response();
+    }
 
     let status_events = slug_recent_events(&app.paths, &slug, STATUS_EVENT_LIMIT);
     let display_start = status_events
@@ -661,9 +740,12 @@ pub(crate) async fn handle_cost_history(
 )]
 pub(crate) async fn handle_active_sessions(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    if !app.paths.project_state(&slug).exists() {
+    // v0.8.18 档1 — per-user isolation: 404 a project the caller can't see
+    // (covers both the unknown-project and the not-visible-to-tenant cases).
+    if !app.paths.project_state(&slug).exists() || !can_see_project(&app, &identity, &slug) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("project not found: {slug}")})),

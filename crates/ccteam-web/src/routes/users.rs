@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::ToSchema;
 
-use crate::auth::{Identity, TOKEN_PREFIX};
+use crate::auth::{deny_non_admin, Identity, TOKEN_PREFIX};
 use crate::state::AppState;
 
 /// One tenant as the API exposes it — **never** carries the web token (that is
@@ -65,21 +65,6 @@ pub struct CreateUserResponse {
     /// Personal entry link — a relative path (`/?token=ccteam:<hex>`) the user
     /// opens on the web console host to sign in as this tenant.
     pub personal_link: String,
-}
-
-/// 403 unless the caller is the admin/owner.
-fn deny_non_admin(identity: &Identity) -> Option<Response> {
-    if identity.is_admin {
-        None
-    } else {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "admin only: user management requires the owner token"})),
-            )
-                .into_response(),
-        )
-    }
 }
 
 /// `POST /api/v1/users` — mint a tenant + return its personal link (admin only).

@@ -46,6 +46,7 @@ import { toastBus } from "../lib/toastBus";
 import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import { mergeProjectSlugs } from "./projectList";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useMe } from "../hooks/useMe";
 import { navLabel } from "../lib/i18n";
 
 /** A switcher entry — one live gateway session, grouped under its project. */
@@ -113,6 +114,9 @@ export default function ChatConsole() {
   const globalView = globalViewFor(location.pathname);
   const { settings } = useWebSettings();
   const lang = settings.language;
+  // v0.8.18 档1 — Status / 主机 / Settings are operator/admin surfaces; a
+  // per-user tenant only gets Marketplace + their own projects/sessions.
+  const { isAdmin } = useMe();
 
   // The switcher's session list (gateway `s{n}`), fanned out across every
   // project from /api/v1/projects → /api/v1/projects/{slug}/sessions.
@@ -423,24 +427,28 @@ export default function ChatConsole() {
                 label={navLabel("marketplace", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
-              <SidebarNavLink
-                to="/status"
-                icon="📊"
-                label={navLabel("status", lang)}
-                onNavigate={() => setSidebarOpen(false)}
-              />
-              <SidebarNavLink
-                to="/hosts"
-                icon="🖥"
-                label={navLabel("hosts", lang)}
-                onNavigate={() => setSidebarOpen(false)}
-              />
-              <SidebarNavLink
-                to="/settings"
-                icon="⚙︎"
-                label={navLabel("settings", lang)}
-                onNavigate={() => setSidebarOpen(false)}
-              />
+              {isAdmin && (
+                <>
+                  <SidebarNavLink
+                    to="/status"
+                    icon="📊"
+                    label={navLabel("status", lang)}
+                    onNavigate={() => setSidebarOpen(false)}
+                  />
+                  <SidebarNavLink
+                    to="/hosts"
+                    icon="🖥"
+                    label={navLabel("hosts", lang)}
+                    onNavigate={() => setSidebarOpen(false)}
+                  />
+                  <SidebarNavLink
+                    to="/settings"
+                    icon="⚙︎"
+                    label={navLabel("settings", lang)}
+                    onNavigate={() => setSidebarOpen(false)}
+                  />
+                </>
+              )}
             </div>
           </nav>
         </aside>

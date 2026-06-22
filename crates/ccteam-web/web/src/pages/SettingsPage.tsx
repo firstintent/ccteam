@@ -36,6 +36,7 @@ import {
 } from "../lib/configApi";
 import { toastBus } from "../lib/toastBus";
 import { createUser, deleteUser, listUsers, type TenantView } from "../lib/usersApi";
+import { useMe } from "../hooks/useMe";
 
 /** Poll interval for the async Telegram `chat_id` capture. */
 const CHAT_ID_POLL_MS = 1500;
@@ -56,6 +57,9 @@ const GHOST_BTN_CLASS =
   "disabled:opacity-50 disabled:cursor-not-allowed";
 
 export default function SettingsPage() {
+  // v0.8.18 档1 — this page is admin-only (IM credentials + user management are
+  // GLOBAL daemon config); a tenant gets a pointer to the avatar menu instead.
+  const { me } = useMe();
   const [config, setConfig] = useState<ImConfigStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -70,6 +74,8 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
+    // Tenants never load the global IM config (the endpoint 403s for them).
+    if (!me?.is_admin) return;
     let cancelled = false;
     getImConfig()
       .then((c) => {
@@ -83,8 +89,39 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [me]);
 
+  // While the identity loads (and the test's never-resolving fetch), show the
+  // loading placeholder.
+  if (me === null) {
+    return (
+      <div
+        data-testid="settings-loading"
+        className="p-4 text-xs text-text-dim font-mono"
+      >
+        loading settings…
+      </div>
+    );
+  }
+  // A per-user tenant has no global settings here — personal settings live in
+  // the top-right avatar menu.
+  if (!me.is_admin) {
+    return (
+      <div
+        data-testid="settings-tenant"
+        className="p-4 max-w-md mx-auto flex flex-col gap-2 text-[11px] font-mono text-text-secondary leading-relaxed"
+      >
+        <h1 className="text-sm font-medium text-text-primary">设置 · Settings</h1>
+        <p>
+          这一页是<b className="text-text-primary">管理员设置</b>(IM 凭据 / 用户管理),仅 owner 可见。
+        </p>
+        <p className="text-text-dim">
+          你的个人设置(显示名 / 头像 / 界面语言 / 登出)在
+          <b className="text-text-secondary">右上角头像菜单</b>里。
+        </p>
+      </div>
+    );
+  }
   if (error) {
     return (
       <div
