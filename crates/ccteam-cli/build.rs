@@ -30,5 +30,10 @@ fn main() {
         .filter(|s| !s.is_empty())
     {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        // `HEAD` (a symref to the branch) only changes on checkout; a `git
+        // commit` on the SAME branch updates the branch ref + the reflog, not
+        // HEAD — so also watch `logs/HEAD` (touched on every commit, incl. in a
+        // worktree) to keep `--version` accurate after a commit.
+        println!("cargo:rerun-if-changed={git_dir}/logs/HEAD");
     }
 }
