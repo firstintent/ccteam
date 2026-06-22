@@ -60,7 +60,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
+    Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
 use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol, ThreadStatus};
@@ -129,16 +129,19 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
 )]
 pub(crate) async fn handle_list_sessions(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
 ) -> Response {
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
     // session_views() is sync after the lock — no `.await` is held under it.
+    // v0.8.18 档1 — scope the list to the caller: the admin sees every session
+    // in the project; a per-user tenant sees only the ones it owns.
     let mut views = {
         let guard = gw.lock().await;
         guard
-            .session_views()
+            .session_views_for_web(&identity.id, identity.is_admin)
             .into_iter()
             .filter(|v| v.project == slug)
             .collect::<Vec<_>>()
@@ -225,6 +228,7 @@ pub struct CreateSessionForm {
 )]
 pub(crate) async fn handle_create_session(
     State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<CreateSessionForm>,
 ) -> Response {
@@ -261,6 +265,7 @@ pub(crate) async fn handle_create_session(
                 vendor,
                 permission_mode,
                 protocol,
+                &identity.id,
             )
             .await
     };

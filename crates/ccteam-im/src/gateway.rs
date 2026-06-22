@@ -2796,6 +2796,24 @@ impl Gateway {
         views
     }
 
+    /// v0.8.18 档1 — the web REST session list scoped to a web identity: the
+    /// admin/owner sees every session; a per-user tenant sees only the ones it
+    /// owns (`web:<id>`). The IM path keeps its own `chat_can_access` rule —
+    /// this is the web peer of that gate.
+    pub fn session_views_for_web(&self, identity_id: &str, is_admin: bool) -> Vec<SessionView> {
+        let mut views = self.session_views();
+        if !is_admin {
+            let owned: std::collections::HashSet<String> = self
+                .sessions
+                .values()
+                .filter(|s| s.owner.channel == "web" && s.owner.chat_id == identity_id)
+                .map(|s| s.id.clone())
+                .collect();
+            views.retain(|v| owned.contains(&v.sid));
+        }
+        views
+    }
+
     /// Resolve a session id to the data a collector needs to tail its
     /// transcript (v0.8.7 W1 — cto `session_collect`). Returns the role
     /// (the `<bot>` segment of `.ccteam/chat/<bot>/turns.jsonl`) and the
@@ -2908,6 +2926,7 @@ impl Gateway {
             vendor,
             permission_mode,
             SessionProtocol::default(),
+            "",
         )
         .await
     }
@@ -2922,8 +2941,12 @@ impl Gateway {
         vendor: AgentVendor,
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
+        web_owner: &str,
     ) -> Result<CreateSessionOutcome> {
-        let owner = web_api_chat();
+        // v0.8.18 档1 — own the new session by the caller's web identity: the
+        // admin/owner (and every internal path) lands in the shared `web-api`
+        // pool; a per-user tenant owns `web:<id>` so the REST list scopes to it.
+        let owner = web_owner_chat(web_owner);
         // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
         // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
         let handle = role.clone();
@@ -3090,6 +3113,18 @@ fn vendor_str(v: AgentVendor) -> &'static str {
 /// per-`sid` SSE filter keys on `chat_id == sid` via [`pump_target`].
 fn web_api_chat() -> ChatKey {
     ChatKey::new("web", "web-api", "web-api")
+}
+
+/// v0.8.18 档1 — the owning [`ChatKey`] for a web-created session, keyed by the
+/// caller's web identity. The admin/owner (bootstrap token) and every internal
+/// path keep the shared `web-api` pool (the admin sees every session anyway); a
+/// per-user tenant owns `web:<tenant-id>` so the REST list scopes to it.
+fn web_owner_chat(identity_id: &str) -> ChatKey {
+    if identity_id.is_empty() || identity_id == "admin" || identity_id == "web-api" {
+        web_api_chat()
+    } else {
+        ChatKey::new("web", identity_id, identity_id)
+    }
 }
 
 /// Reconcile live `ccteam-chat-*` process names against a set of *tracked*
@@ -4878,6 +4913,7 @@ mod tests {
                 AgentVendor::Claude,
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
+                "",
             )
             .await
             .unwrap();
@@ -5622,6 +5658,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(used, vec!["using session s1"]);
+    }
+
+    /// v0.8.18 档1 — the web REST list filter: each per-user tenant sees only
+    /// the sessions it owns (`web:<id>`), an unrelated tenant sees none, and the
+    /// admin/owner sees every session.
+    #[tokio::test]
+    async fn session_views_for_web_scopes_to_the_owning_tenant() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // Two per-user web tenants each create a session (owner = web:<id>).
+        gateway
+            .handle_text("web", "u_alice", "u_alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("web", "u_bob", "u_bob", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let alice = gateway.session_views_for_web("u_alice", false);
+        let bob = gateway.session_views_for_web("u_bob", false);
+        assert_eq!(alice.len(), 1, "alice sees only her own");
+        assert_eq!(bob.len(), 1, "bob sees only his own");
+        assert_ne!(alice[0].sid, bob[0].sid, "distinct sessions");
+        assert!(
+            gateway.session_views_for_web("u_carol", false).is_empty(),
+            "an unrelated tenant sees nothing",
+        );
+        assert_eq!(
+            gateway.session_views_for_web("admin", true).len(),
+            2,
+            "the admin sees every session",
+        );
     }
 
     /// v0.8.18 (owner) — IM `/new` with NO role token creates a ROLELESS session
