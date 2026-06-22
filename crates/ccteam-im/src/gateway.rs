@@ -1122,12 +1122,14 @@ impl Gateway {
             }
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
-                let role = parts.next().unwrap_or("cto").to_string();
-                // v0.8.7 W2 (DB.1) — optional trailing `hitl` token enables
-                // human-in-the-loop approval. v0.8.11 E2 — optional `terminal`
-                // token selects the tmux/terminal protocol. Both are order-
-                // independent (`/new claude cto hitl terminal` ≡
-                // `/new claude cto terminal hitl`); defaults = skip + stream-json.
+                // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
+                // self-reads the project `CLAUDE.md`); no explicit `-` needed. The
+                // first NON-flag token is the role; `hitl`/`skip`/`terminal`/… are
+                // order-independent flags, so `/new claude` AND `/new claude hitl`
+                // are both roleless, while `/new claude reviewer hitl` is role
+                // `reviewer` + hitl. Defaults = skip + stream-json.
+                let mut role = String::new();
+                let mut role_set = false;
                 let mut permission_mode = PermissionMode::Skip;
                 let mut protocol = SessionProtocol::StreamJson;
                 for tok in parts {
@@ -1140,9 +1142,13 @@ impl Gateway {
                             protocol =
                                 SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
                         }
+                        other if !role_set => {
+                            role = other.to_string();
+                            role_set = true;
+                        }
                         other => {
                             return Err(anyhow!(
-                                "/new: unknown option `{other}` (expected hitl / terminal)"
+                                "/new: unexpected token `{other}` (give one role + optional hitl / terminal)"
                             ));
                         }
                     }
@@ -5618,6 +5624,38 @@ mod tests {
         assert_eq!(used, vec!["using session s1"]);
     }
 
+    /// v0.8.18 (owner) — IM `/new` with NO role token creates a ROLELESS session
+    /// (bare claude). `hitl`/`terminal` are flags, never mistaken for a role, so
+    /// `/new claude` and `/new claude hitl` are both roleless; an explicit role
+    /// still works.
+    #[tokio::test]
+    async fn gateway_new_without_role_is_roleless() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        gateway
+            .handle_text("tg", "c1", "u1", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("tg", "c1", "u1", "/new claude hitl")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("tg", "c1", "u1", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let views = gateway.session_views();
+        let s1 = views.iter().find(|v| v.sid == "s1").expect("s1");
+        let s2 = views.iter().find(|v| v.sid == "s2").expect("s2");
+        let s3 = views.iter().find(|v| v.sid == "s3").expect("s3");
+        assert_eq!(s1.role, "", "/new claude → roleless");
+        assert_eq!(s2.role, "", "/new claude hitl → roleless (hitl is a flag)");
+        assert_eq!(s2.permission_mode, "hitl", "the hitl flag still applies");
+        assert_eq!(s3.role, "reviewer", "/new claude reviewer → explicit role");
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn gateway_reply_wait_can_capture_realistic_delayed_event() {
@@ -6827,7 +6865,7 @@ mod tests {
 
         // Start a default `cto` session (s1) and confirm the role binding.
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new")
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
             .await
             .unwrap();
         let cto_reply = gateway
@@ -6891,7 +6929,7 @@ mod tests {
         // Start a default `cto` session (s1) and drive it once so the pane is
         // demonstrably live.
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new")
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
             .await
             .unwrap();
         let cto_reply = gateway

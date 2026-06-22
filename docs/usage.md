@@ -251,7 +251,7 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 /projects                   列 daemon 已知项目(= 已 init 且 daemon 已加载)
 ```
 
-`/new` 每次都**铸一个全新会话**(新 `s<N>`,绝不复用旧的),回一个句柄给你;`/use s<N>` 在已有会话间切。同一项目可并存任意多会话,各自独立——开两个 `reviewer` 也是两条互不串台的对话。**roleless**:IM 的 `/new` 至少给 cto;要起一个**裸 claude(无角色)**会话,用 web 控制台新建会话弹窗里的「(无角色 / 裸 claude)」选项,或资源 API `POST …/sessions` 传空 role(brain 走项目 `CLAUDE.md`)。
+`/new` 每次都**铸一个全新会话**(新 `s<N>`,绝不复用旧的),回一个句柄给你;`/use s<N>` 在已有会话间切。同一项目可并存任意多会话,各自独立——开两个 `reviewer` 也是两条互不串台的对话。**roleless(无角色 / 裸 claude)**:IM 的 `/new` **不带 role 就是 roleless**(v0.8.18)—— `/new claude`(或带 flag 的 `/new claude hitl` / `/new claude terminal`)起一个**裸 claude**(自读项目 `CLAUDE.md` 当 brain);要带 role 才显式写 `/new claude reviewer`。也可用 web 控制台新建会话弹窗的「(无角色 / 裸 claude)」选项,或资源 API `POST …/sessions` 传空 role。(注:进项目后**第一条消息**仍默认起一个 `cto` 管家;roleless 是显式 `/new` 的默认。)
 
 **协议通道(stream-json 默认 | terminal)**:Claude session 默认走 **stream-json** 通道 —— 长驻 `claude` 子进程 + NDJSON 管道,更轻、活动部件更少,适合纯聊天。要**逐字节终端镜像 / attach / `/screen` 截图**,起会话时显式选 **terminal**(`/new claude <role> terminal`,或 web 新建弹窗里的 protocol 选「terminal(高级)」)。stream-json session **无终端 pane**:web 隐藏它的「终端」tab,`/screen` 会人话告诉你该 session 没法截图(回复直接走聊天)。`/role` 切换 + daemon 重启都保留 session 的通道。寻址(`/use` / `@handle`)对两种通道完全一致。
 
