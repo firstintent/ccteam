@@ -1,7 +1,7 @@
 # v0.8.18 Handoff — Loop 地基(已落地)
 
 > 状态:**已落地 dev**(无 tag,等 owner review)。PRD = [`README.md`](README.md);视觉 SoT = [`prototype/v0818-real-shell.html`](prototype/v0818-real-shell.html)。
-> 实现姿势:在隔离 git worktree 里实现 + 分步提交推送 dev(Wave A→D),主仓不动(控制会话的 telegram/MCP 桥不掉)。**档1(per-user web token)按 PRD「选配」延后**到后续 patch。
+> 实现姿势:在隔离 git worktree 里实现 + 分步提交推送 dev(Wave A→D + Wave E),主仓不动(控制会话的 telegram/MCP 桥不掉)。**档1(per-user web,web-first)已作本版后续增量落地**(Wave E,owner 拍板「统一到 web 写入、CLI 只 bootstrap」);web↔IM 同一人复联仍延后。
 
 ## Decided(本版做了什么)
 
@@ -16,15 +16,24 @@
 - `ProjectState.owner: Option<String>`(serde-default,旧 state.json 照载;`ChatKey::identity()` → `channel:chat_id`;`create_project`(IM `/newproject`)时记)。**显式字段、非路径派生**。
 - **诚实:同 OS uid 软隔离(UX)、非安全边界。**
 
+**柱2b · 多用户档1(per-user web,web-first 后续增量 / Wave E)**
+
+- `~/.ccteam/tenants.json` 租户注册表(`ccteam_core::tenants`:`Tenant{id,handle,web_token,linked_chat?,created_at}` + 原子存盘 + `by_token` 常量时比较)。
+- web auth 从单 token 升成 **`token→Identity{admin|tenant}`**:admin=bootstrap owner token、tenant=注册表 token;`auth_layer` 注入 `Extension<Identity>`(no-auth/loopback 也注入 admin)。
+- REST `GET/POST /api/v1/users` + `DELETE …/{id}`(**admin-gated**;POST 回一次性 personal link `?token=ccteam:<hex>`,GET 永不回 token)。
+- **per-user session 归属**:`create_session_api_proto(…, web_owner)` —— admin/内部 → 共享 `web-api` 池;tenant → `web:<id>`。`Gateway::session_views_for_web(id,is_admin)`(web peer of `chat_can_access`)= admin 见全部 / tenant 只见自己;两 web REST handler 取 `Extension<Identity>` scope。**IM `chat_can_access` 不动**。
+- Settings **用户管理 UI**(`lib/usersApi.ts`:添加/列/删 + 个人链接复制;403→只读提示)。
+- **无 `ccteam user` CLI**(owner 决策:runtime 写归 web/IM/REST,CLI 只 bootstrap)。
+
 **UI 一致性**
 
 - 界面语言 **中文(默认)/ English**:`useWebSettings` 加 `language/displayName/avatar`(+ SSR-safe server snapshot)+ `lib/i18n.ts`(`tr`/`navLabel`);ChatConsole 导航 + 面包屑随语言。
 - 点头像 → 个人设置弹层(`components/AvatarMenu.tsx` + 纯 `AvatarPopover`,SSR-可测):显示名 / 头像 swatch / 语言 / 登出。
-- 全局 Settings 加多用户档0 段(诚实说明边界 + 指向档1 的 `ccteam user add`)。
+- 全局 Settings 加**用户管理 UI**(档1,web-first:添加/列/删用户 + 一次性个人链接复制;`lib/usersApi.ts`)。
 
 ## Rejected / Deferred
 
-- **档1(per-user web token + 用户注册表 + `ccteam user` CLI)**:PRD 标「选配/不阻塞本版」,延后到后续 patch(半成品多租户比干净延后更糟)。Settings 段 + ACL 注释已指向它。
+- **web↔IM 同一人复联**(`linked_chat`:tenant 的 web 身份 ↔ 其 IM chat):注册表字段 + 方法已留,但 tenant 当前 **web-only**(IM 接入要另走 bot allowlist)→ 延后。**`ccteam user` CLI** 不做(owner 决策:runtime 写归 web/IM/REST,CLI 只 bootstrap)。
 - 全量 UI i18n(每条字符串翻译):本版只 nav + 关键 label;全量是独立小版本。
 - 真·分布式 host 调度:本版 host 只「列」(一台 `local`),起跑 / 路由留后。
 - loop 运维台的「预言机 / 门」列、on-ramp、oracle-diff 门:loop 本身是下一版(本版只是地基)。
@@ -36,21 +45,23 @@
 
 ## Files(主要)
 
-- core:`src/host.rs`(新)· `src/mcp_register.rs`(新)· `src/state.rs`(owner 字段)
-- cli:`src/mcp_serve.rs`(委托核到 core)· `src/web_chat_bridge.rs`(own-only 测试)
-- im:`src/gateway.rs`(own-only ACL + `ChatKey::identity` + `create_project` owner)
-- web:`src/routes/{hosts.rs(新),capabilities.rs,status.rs,openapi.rs,mod.rs}` + `tests/openapi_test.rs`
-- SPA:`pages/HostsView.tsx`(新)· `components/AvatarMenu.tsx`(新)· `lib/{hostsApi,i18n}.ts`(新)· `pages/{ChatConsole,StatusView,SettingsPage}.tsx` · `hooks/useWebSettings.ts` · `lib/{statusApi,token}.ts` · `App.tsx`
+- core:`src/host.rs`(新)· `src/mcp_register.rs`(新)· **`src/tenants.rs`(新,档1 注册表)** · `src/state.rs`(owner 字段)· `src/paths.rs`(`tenants_json`)
+- cli:`src/mcp_serve.rs`(委托核到 core)· `src/web_chat_bridge.rs`(ACL 测试)
+- im:`src/gateway.rs`(ACL + `ChatKey::identity` + `create_project` owner + **档1 `session_views_for_web` / `web_owner_chat` / `create_session_api_proto(web_owner)`**)
+- web:**`src/auth.rs`(档1 `Identity`/`resolve_identity`,`auth_layer` 注入)** · `src/routes/{hosts.rs(新),users.rs(新,档1),sessions_api.rs(Identity scope),capabilities,status,openapi,mod}` + `tests/openapi_test.rs`
+- SPA:`pages/HostsView.tsx`(新)· `components/AvatarMenu.tsx`(新)· `lib/{hostsApi,i18n}.ts`(新)· **`lib/usersApi.ts`(新,档1)** · `pages/{ChatConsole,StatusView,SettingsPage(用户管理)}.tsx` · `hooks/useWebSettings.ts` · `lib/{statusApi,token}.ts` · `App.tsx`
 
 ## 验收结果(全绿)
 
-- `cargo test --workspace --exclude ccteam-web`:**2031 / 0**(baseline 2016)
-- `ccteam-web`:**285 / 0**;vitest **182 / 0**;tsc + eslint clean
+- `cargo test --workspace --exclude ccteam-web`:**2040 / 0**(baseline 2016;含档1 +7)
+- `ccteam-web`:**290 / 0**;vitest **186 / 0**;tsc + eslint + vite build clean
+- 档1:`resolve_identity`(admin/tenant/unknown)· `deny_non_admin` · `TenantView`-不漏-token · `session_views_for_web_scopes_to_the_owning_tenant`(alice/bob/carol/admin)· `usersApi`(GET/POST/DELETE + 401/403/500 映射)
 - `cargo clippy --workspace --all-targets -- -D warnings`:0;`cargo fmt --all -- --check`:clean
 - `GET /api/v1/hosts`:host=`local` + claude=ready(带 version)/ codex=not_installed;`register-mcp` 幂等(确定性 fake `CCTEAM_*_BIN`)
 - ACL:两个 `chat_id` 互不可见 / 不可 `/use`(确定性假 `chat_id`)
 
 ## 上线还需(owner)
 
-- daemon **重部署**(0.8.18 binary)+ SPA **重 build**(主机页 / 语言 / 成本列要新 bundle)+ 用户 `/mcp` 重连。
+- daemon **重部署**(0.8.18 binary,含档1 注册表 + roleless `/new`)+ SPA **重 build**(主机页 / 语言 / 成本列 / 用户管理要新 bundle)+ 用户 `/mcp` 重连。
+- **首个 web 用户**:owner 用 bootstrap web token 进 Settings → 用户管理 添加 → 复制个人链接发给对方;对方打开即以自己身份登录,只看自己的 session。
 - **tag 仍 HOLD** —— 等 owner review。
