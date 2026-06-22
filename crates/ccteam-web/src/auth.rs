@@ -184,6 +184,43 @@ pub fn deny_non_admin(identity: &Identity) -> Option<Response> {
     }
 }
 
+/// v0.8.18 档1 — the project-ownership gate for **every** `/api/v1/projects/
+/// {slug}/...` route (the single choke point: no project-scoped route can leak,
+/// and new ones are covered automatically — vs. gating each handler). Runs
+/// AFTER [`auth_layer`] (so [`Identity`] is in the request extensions). If the
+/// caller can't see the addressed project, 404 before the handler runs. The
+/// bare `/api/v1/projects` collection (list/create) has no slug → not gated
+/// here (the list is filtered per-identity in `build_projects`).
+pub async fn project_acl_layer(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(slug) = project_slug_from_path(req.uri().path()) {
+        let identity = req
+            .extensions()
+            .get::<Identity>()
+            .cloned()
+            .unwrap_or_else(Identity::admin);
+        if !crate::routes::api_v1::can_see_project(&app, &identity, slug) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("project not found: {slug}")})),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Extract `{slug}` from `/api/v1/projects/{slug}` or `…/{slug}/...`. `None` for
+/// the bare collection path (`/api/v1/projects`) or any non-project path.
+fn project_slug_from_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/v1/projects/")?;
+    let slug = rest.split('/').next().unwrap_or(rest);
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
 /// Strip the `ccteam:` wire prefix from a presented token → the bare hex (the
 /// value compared / stored in the cookie). `None` when the prefix is absent.
 fn bare_hex(presented: &str) -> Option<&str> {

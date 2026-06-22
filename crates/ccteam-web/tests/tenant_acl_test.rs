@@ -128,11 +128,13 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
         "a tenant sees none of the admin's projects",
     );
 
-    // The admin-owned project: the tenant 404s on its detail AND its
-    // marketplace (project-scoped install follows the same ACL).
+    // The admin-owned project: the tenant 404s on EVERY project-scoped route —
+    // the `project_acl_layer` middleware covers them all (detail, marketplace,
+    // roles, …), not just the handlers with a per-handler gate.
     for path in [
         "/api/v1/projects/adminproj",
         "/api/v1/projects/adminproj/marketplace",
+        "/api/v1/projects/adminproj/roles",
     ] {
         let r = c
             .get(format!("http://{addr}{path}"))
@@ -142,6 +144,15 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
             .unwrap();
         assert_eq!(r.status(), 404, "tenant must 404 on the admin's {path}");
     }
+    // …including the destructive DELETE (a tenant can't drop the admin's project).
+    let r = c
+        .delete(format!("http://{addr}/api/v1/projects/adminproj"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "tenant can't DELETE the admin's project");
+
     // The admin reaches its own project's detail.
     let r = c
         .get(format!("http://{addr}/api/v1/projects/adminproj"))

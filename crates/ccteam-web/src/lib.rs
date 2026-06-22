@@ -112,6 +112,10 @@ pub fn router() -> Result<Router> {
 /// `auth::auth_layer`).
 pub fn router_with_state(state: AppState) -> Router {
     let stateful = routes::stateful_router()
+        // v0.8.18 档1 — project-ownership ACL for every `/projects/{slug}/...`
+        // route. Layered INSIDE `auth_layer` (which is added after it, so it
+        // wraps this) → auth injects `Identity` first, then this gate reads it.
+        .layer(from_fn_with_state(state.clone(), auth::project_acl_layer))
         .layer(from_fn_with_state(state.clone(), auth::auth_layer))
         .with_state(state);
     Router::new()
