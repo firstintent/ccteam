@@ -63,6 +63,8 @@ pub mod sse;
 // V0.5.0 F96 — Agent Teams JSON API + SSE channel.
 pub mod teams_api;
 pub mod teams_sse;
+// v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
+pub mod users;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an

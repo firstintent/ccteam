@@ -59,6 +59,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/hosts"),
         ("GET", "/api/v1/hosts/{host}"),
         ("POST", "/api/v1/hosts/{host}/register-mcp"),
+        // v0.8.18 档1 — per-user web tenant management (admin-gated).
+        ("POST", "/api/v1/users"),
+        ("GET", "/api/v1/users"),
+        ("DELETE", "/api/v1/users/{id}"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
         // projects

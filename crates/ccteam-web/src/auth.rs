@@ -54,6 +54,7 @@
 //! Architecture refs: `docs/versions/v0-3/prd.md` §6.2.4 / §6.2.5 / §9.
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use axum::{
     extract::{Request, State},
@@ -66,6 +67,9 @@ use axum_extra::extract::{
     CookieJar,
 };
 use subtle::ConstantTimeEq;
+
+use ccteam_core::session_secret;
+use ccteam_core::tenants::TenantRegistry;
 
 use crate::state::AppState;
 
@@ -111,6 +115,54 @@ impl AuthState {
     pub fn wire_token(&self) -> Option<String> {
         self.token.as_ref().map(|t| format!("{TOKEN_PREFIX}{t}"))
     }
+}
+
+/// v0.8.18 档1 — the resolved identity of an authenticated request, injected
+/// into the request extensions by [`auth_layer`] so handlers can scope to the
+/// caller. The bootstrap (owner) web token from `ccteam config` resolves to
+/// `admin`; per-user tokens from the tenant registry resolve to that tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// `"admin"` for the bootstrap token (the owner), else the tenant id.
+    pub id: String,
+    /// Whether this is the admin/owner (manages users; sees everything).
+    pub is_admin: bool,
+}
+
+impl Identity {
+    /// The owner / bootstrap-token identity (full access, manages users).
+    pub fn admin() -> Self {
+        Self {
+            id: "admin".to_string(),
+            is_admin: true,
+        }
+    }
+
+    /// A per-user tenant identity.
+    pub fn tenant(id: String) -> Self {
+        Self {
+            id,
+            is_admin: false,
+        }
+    }
+}
+
+/// Strip the `ccteam:` wire prefix from a presented token → the bare hex (the
+/// value compared / stored in the cookie). `None` when the prefix is absent.
+fn bare_hex(presented: &str) -> Option<&str> {
+    presented.strip_prefix(TOKEN_PREFIX)
+}
+
+/// Resolve a bare-hex token to an [`Identity`]: the admin token (the bootstrap
+/// web token) → admin; else a per-user tenant token from the registry → that
+/// tenant; else `None`. Constant-time compares throughout.
+pub fn resolve_identity(bare: &str, admin_hex: &str, tenants_path: &Path) -> Option<Identity> {
+    if session_secret::ct_eq(bare, admin_hex) {
+        return Some(Identity::admin());
+    }
+    TenantRegistry::load(tenants_path)
+        .by_token(bare)
+        .map(|t| Identity::tenant(t.id.clone()))
 }
 
 /// Decide whether a `SocketAddr` is loopback (auth defaults off) or
@@ -201,46 +253,58 @@ fn query_token(query: &str) -> Option<&str> {
 pub async fn auth_layer(
     State(app): State<AppState>,
     jar: CookieJar,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let auth = app.auth.clone();
     if !auth.enabled {
+        // Loopback / --no-auth: the local operator IS the owner → admin identity.
+        req.extensions_mut().insert(Identity::admin());
         return next.run(req).await;
     }
     let Some(expected) = auth.token.as_deref() else {
         // Defensive: enabled=true but no token loaded → fail closed.
         return (StatusCode::INTERNAL_SERVER_ERROR, "auth misconfigured").into_response();
     };
+    // v0.8.18 档1 — the bootstrap token → admin; per-user tokens → their tenant.
+    let tenants = app.paths.tenants_json();
 
     // 1. Authorization header.
     if let Some(h) = req.headers().get(header::AUTHORIZATION) {
         if let Some(presented) = parse_bearer(h) {
-            if validate_bearer(presented, expected) {
-                return next.run(req).await;
+            if let Some(bare) = bare_hex(presented) {
+                if let Some(id) = resolve_identity(bare, expected, &tenants) {
+                    req.extensions_mut().insert(id);
+                    return next.run(req).await;
+                }
             }
         }
     }
 
-    // 2. URL shim — `?token=ccteam:<hex>` query → cookie + redirect.
+    // 2. URL shim — `?token=ccteam:<hex>` query → cookie + redirect. The cookie
+    //    stores the BARE hex the user presented (admin OR per-user), so the
+    //    carry-over below resolves to the SAME identity.
     if let Some(q) = req.uri().query() {
         if let Some(presented) = query_token(q) {
-            if validate_bearer(presented, expected) {
-                let clean = uri_without_token(req.uri());
-                let cookie = Cookie::build((COOKIE_NAME, expected.to_string()))
-                    .http_only(true)
-                    .same_site(SameSite::Strict)
-                    .path("/")
-                    .build();
-                let jar = jar.add(cookie);
-                return (jar, Redirect::to(&clean)).into_response();
+            if let Some(bare) = bare_hex(presented) {
+                if resolve_identity(bare, expected, &tenants).is_some() {
+                    let clean = uri_without_token(req.uri());
+                    let cookie = Cookie::build((COOKIE_NAME, bare.to_string()))
+                        .http_only(true)
+                        .same_site(SameSite::Strict)
+                        .path("/")
+                        .build();
+                    let jar = jar.add(cookie);
+                    return (jar, Redirect::to(&clean)).into_response();
+                }
             }
         }
     }
 
     // 3. Cookie carry-over for subsequent GETs / SSE.
     if let Some(cookie_val) = cookie_token(&jar) {
-        if cookie_val.as_bytes().ct_eq(expected.as_bytes()).into() {
+        if let Some(id) = resolve_identity(cookie_val, expected, &tenants) {
+            req.extensions_mut().insert(id);
             return next.run(req).await;
         }
     }
@@ -319,5 +383,33 @@ mod tests {
         assert!(!is_loopback(&lan));
         let any: SocketAddr = "0.0.0.0:7331".parse().unwrap();
         assert!(!is_loopback(&any));
+    }
+
+    #[test]
+    fn bare_hex_strips_only_the_wire_prefix() {
+        assert_eq!(bare_hex("ccteam:deadbeef"), Some("deadbeef"));
+        assert_eq!(bare_hex("deadbeef"), None);
+        assert_eq!(bare_hex("Bearer ccteam:x"), None);
+    }
+
+    #[test]
+    fn resolve_identity_admin_tenant_and_unknown() {
+        use ccteam_core::tenants::TenantRegistry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("tenants.json");
+        let mut reg = TenantRegistry::default();
+        let alice = reg.add("alice");
+        reg.save(&path).unwrap();
+
+        // The bootstrap (admin) hex → the admin/owner identity.
+        let admin = resolve_identity("adminhex", "adminhex", &path).unwrap();
+        assert!(admin.is_admin);
+        assert_eq!(admin.id, "admin");
+        // A per-user token → that tenant (not admin).
+        let t = resolve_identity(&alice.web_token, "adminhex", &path).unwrap();
+        assert!(!t.is_admin);
+        assert_eq!(t.id, alice.id);
+        // Neither → None.
+        assert!(resolve_identity("nope", "adminhex", &path).is_none());
     }
 }
