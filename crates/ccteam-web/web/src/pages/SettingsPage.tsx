@@ -35,6 +35,7 @@ import {
   type ImConfigStatus,
 } from "../lib/configApi";
 import { toastBus } from "../lib/toastBus";
+import { createUser, deleteUser, listUsers, type TenantView } from "../lib/usersApi";
 
 /** Poll interval for the async Telegram `chat_id` capture. */
 const CHAT_ID_POLL_MS = 1500;
@@ -137,29 +138,220 @@ export default function SettingsPage() {
 }
 
 // --------------------------------------------------------------------------
-// v0.8.18 柱2/UI — multi-user (soft-partition) management section. Honest
-// scope: 档0 isolates IM chats per chat_id; per-user web links + a tenant
-// registry are 档1 (a later patch). No live tenant list yet (no backend
-// registry), so this section explains the model + the honest boundary.
+// v0.8.18 档1 — multi-user management (web-first). The admin/owner mints a
+// per-user tenant; each gets a one-time personal link (?token=ccteam:<hex>)
+// that signs them in as themselves and scopes the session list to their own.
+// Backend SoT: `crates/ccteam-web/src/routes/users.rs`; client `lib/usersApi`.
+// Admin-gated: a non-admin caller 403s → we show the read-only note instead of
+// the management form. There is deliberately NO `ccteam user` CLI — runtime
+// user writes live here on the web.
 // --------------------------------------------------------------------------
 
 function UserManagementSection() {
+  const [users, setUsers] = useState<TenantView[] | null>(null);
+  const [forbidden, setForbidden] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [handle, setHandle] = useState("");
+  const [creating, setCreating] = useState(false);
+  // The one-time personal link surfaced after a create (token shown once).
+  const [newLink, setNewLink] = useState<{ handle: string; link: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    listUsers()
+      .then((list) => {
+        setUsers(list);
+        setForbidden(false);
+        setError(null);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg === "UNAUTHENTICATED") return;
+        if (msg === "FORBIDDEN") {
+          setForbidden(true);
+          setUsers([]);
+          return;
+        }
+        setError(msg);
+      });
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function onCreate(e: React.FormEvent) {
+    e.preventDefault();
+    const h = handle.trim();
+    if (creating || h.length === 0) return;
+    setCreating(true);
+    try {
+      const res = await createUser(h);
+      const origin =
+        typeof window !== "undefined" && window.location ? window.location.origin : "";
+      setNewLink({ handle: res.tenant.handle, link: `${origin}${res.personal_link}` });
+      setHandle("");
+      load();
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "create failed");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  function onDelete(id: string) {
+    deleteUser(id)
+      .then(() => {
+        setConfirmDelete(null);
+        load();
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+        toastBus.handler?.error(err instanceof Error ? err.message : "delete failed");
+      });
+  }
+
+  function copyLink(link: string) {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard
+        .writeText(link)
+        .then(() => toastBus.handler?.info("链接已复制 / Link copied"), () => {});
+    }
+  }
+
   return (
     <Section
       testId="settings-users"
-      title="用户管理 · Multi-user"
-      subtitle="软分区(档 0):每个 IM 会话(Telegram chat_id)各看各的 session / project。"
+      title="用户管理 · Users"
+      subtitle="给每个人开独立 web 入口:添加用户 → 复制个人链接发给他;他打开即以自己的身份登录,只看自己的 session。"
     >
-      <div className="flex flex-col gap-2 text-[11px] font-mono leading-relaxed text-text-secondary">
-        <p>
-          多用户共用这台机器、这一个 daemon。会话已按 chat 隔离(own-only)。诚实边界:
-          <b className="text-text-primary"> 同 OS 账号下是软隔离(UX)、不是安全边界</b>。
+      {forbidden ? (
+        <p
+          data-testid="settings-users-forbidden"
+          className="text-[11px] font-mono text-text-dim leading-relaxed"
+        >
+          仅 <b className="text-text-primary">管理员(owner token)</b> 可管理用户;你当前以普通用户身份登录。
         </p>
-        <p className="text-text-dim">
-          本版 = 多用户档 0 地基。给每个人开独立 web 入口(per-user token + 用户注册表,
-          即 <span className="text-brand-400">ccteam user add</span>)是档 1,作为后续 patch 落地。
-        </p>
-      </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <form onSubmit={onCreate} className="flex flex-col gap-2">
+            <label
+              htmlFor="settings-user-handle"
+              className="text-[11px] text-text-muted font-medium"
+            >
+              新用户名 / Handle
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="settings-user-handle"
+                type="text"
+                autoComplete="off"
+                value={handle}
+                onChange={(e) => setHandle(e.target.value)}
+                disabled={creating}
+                spellCheck={false}
+                placeholder="alice"
+                className={FIELD_CLASS}
+              />
+              <button
+                type="submit"
+                disabled={creating || handle.trim().length === 0}
+                className={`${PRIMARY_BTN_CLASS} whitespace-nowrap`}
+              >
+                {creating ? "…" : "添加用户"}
+              </button>
+            </div>
+          </form>
+
+          {newLink ? (
+            <div
+              data-testid="settings-user-newlink"
+              className="flex flex-col gap-1.5 rounded-lg border border-brand-600/30 bg-brand-600/10 px-3 py-2"
+            >
+              <p className="text-[11px] font-mono text-brand-400">
+                <b className="text-text-primary">{newLink.handle}</b>{" "}
+                的个人链接(只显示这一次,复制发给他):
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-[10px] text-text-secondary break-all bg-surface-900 rounded px-2 py-1 border border-surface-700/60">
+                  {newLink.link}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => copyLink(newLink.link)}
+                  className={GHOST_BTN_CLASS}
+                >
+                  复制
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => setNewLink(null)}
+                className="text-[10px] text-text-dim hover:text-text-secondary self-start"
+              >
+                知道了,关闭
+              </button>
+            </div>
+          ) : null}
+
+          {error ? (
+            <p className="text-[11px] font-mono text-status-error">加载失败: {error}</p>
+          ) : users === null ? (
+            <p className="text-[11px] font-mono text-text-dim">loading…</p>
+          ) : users.length === 0 ? (
+            <p className="text-[11px] font-mono text-text-dim">还没有用户。添加一个吧。</p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {users.map((u) => (
+                <li
+                  key={u.id}
+                  className="flex items-center justify-between gap-2 text-[11px] font-mono rounded-lg border border-surface-700/40 bg-surface-900/60 px-3 py-1.5"
+                >
+                  <span className="flex flex-col">
+                    <span className="text-text-primary">{u.handle}</span>
+                    <span className="text-text-dim text-[10px]">
+                      {u.linked_chat ? `IM: ${u.linked_chat}` : "未绑定 IM"}
+                    </span>
+                  </span>
+                  {confirmDelete === u.id ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-status-error">删除?</span>
+                      <button
+                        type="button"
+                        onClick={() => onDelete(u.id)}
+                        className={GHOST_BTN_CLASS}
+                      >
+                        确认
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(null)}
+                        className={GHOST_BTN_CLASS}
+                      >
+                        取消
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete(u.id)}
+                      className={GHOST_BTN_CLASS}
+                    >
+                      删除
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <p className="text-[10px] font-mono text-text-dim leading-relaxed">
+            诚实边界:同一台机器、同一个 OS 账号下是
+            <b className="text-text-secondary">软隔离(UX)</b>、不是安全边界。
+          </p>
+        </div>
+      )}
     </Section>
   );
 }
