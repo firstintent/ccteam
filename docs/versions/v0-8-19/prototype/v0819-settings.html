@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ccteam v0.8.19 · Settings 重设计 + 明暗主题</title>
+<!-- Settings 真实结构(SettingsPage.tsx 866 行:窄 max-w-md 单列 + Telegram/Lark/用户管理三段 + FIELD_CLASS/*_BTN_CLASS)
+     → Card 化 + 用户表格 + 测试连接;带 ☀/🌙。参考 LAP app/settings(卡片 split + Test/Save 调性)。token=真实 index.css。 -->
+<style>
+  :root{
+    --surface-700:#3f3f46; --surface-800:#2c2c30; --surface-850:#262629; --surface-900:#1c1c1f; --surface-950:#141416;
+    --brand-400:#fbbf24; --brand-500:#f59e0b; --brand-600:#d97706; --brand-dim:#7a5012; --accent-500:#14b8a6;
+    --vendor-claude:#d97757; --vendor-codex:#10a37f;
+    --text-primary:#e4e4e7; --text-secondary:#a1a1aa; --text-muted:#71717a; --text-dim:#52525b; --text-bright:#fafafa;
+    --st-running:#22c55e; --st-waiting:#fbbf24; --st-idle:#71717a; --st-error:#ef4444;
+    --font-sans:'Geist Sans',system-ui,-apple-system,sans-serif;
+    --font-mono:'Geist Mono',ui-monospace,'SFMono-Regular',monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;font-family:var(--font-sans);background:var(--surface-950);color:var(--text-primary);
+    -webkit-font-smoothing:antialiased;font-feature-settings:"cv02","cv03","cv04","cv11";font-variant-numeric:tabular-nums}
+  ::selection{background:color-mix(in srgb, var(--brand-500) 30%, transparent)}
+  body.light{
+    --surface-700:#d4d4d8; --surface-800:#e7e7ea; --surface-850:#eeeef0; --surface-900:#ffffff; --surface-950:#f4f4f5;
+    --brand-400:#d97706; --brand-500:#d97706; --brand-600:#b45309; --brand-dim:#fde9c8; --accent-500:#0d9488;
+    --vendor-claude:#c2410c; --vendor-codex:#0f766e;
+    --text-primary:#18181b; --text-secondary:#52525b; --text-muted:#71717a; --text-dim:#a1a1aa; --text-bright:#09090b;
+    --st-running:#16a34a; --st-waiting:#ca8a04; --st-idle:#a1a1aa; --st-error:#dc2626;
+    background:var(--surface-950);color:var(--text-primary);
+  }
+  body.light .btn-default{color:#fff}
+  .no-transition *{transition:none !important}
+  .wrap{max-width:900px;margin:0 auto;padding:0 20px 40px}
+
+  .bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;padding:14px 0 12px;background:linear-gradient(var(--surface-950) 75%,transparent)}
+  .bar h1{font-size:15px;font-weight:600;margin:0} .bar h1 b{color:var(--brand-500)}
+  .toggle{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-secondary)}
+  .seg{display:flex;gap:2px;background:var(--surface-900);border:1px solid var(--surface-800);border-radius:8px;padding:2px}
+  .seg button{font-family:var(--font-sans);font-size:11.5px;color:var(--text-secondary);background:transparent;border:none;border-radius:6px;padding:4px 11px;cursor:pointer}
+  .seg button.on{color:var(--text-bright);background:var(--surface-800)} .seg button.on.acc{color:#06231d;background:var(--accent-500)}
+  .vline{width:1px;height:18px;background:var(--surface-700);margin:0 2px}
+
+  .proto-old{display:none} body.show-old .proto-old{display:block}
+  .proto-new{display:block} body.show-old .proto-new{display:none}
+  .state{font-size:11.5px;border-radius:8px;padding:8px 13px;margin-bottom:16px;line-height:1.5}
+  .state.old{color:var(--text-muted);background:rgb(113 113 122 / .08);border:1px solid var(--surface-800)}
+  .state.new{color:var(--accent-500);background:rgb(20 184 166 / .07);border:1px solid rgb(20 184 166 / .3)}
+
+  h2.sec{font-size:13px;font-weight:600;margin:18px 0 9px;color:var(--text-primary)}
+  .lede{font-size:11.5px;color:var(--text-muted);margin:-4px 0 10px}
+
+  /* btn / badge / input primitives */
+  .btn{font-family:var(--font-sans);font-size:12px;border-radius:7px;padding:6px 13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;
+    transition:background .12s,transform .05s;border:1px solid transparent;outline:none}
+  .btn:active{transform:translateY(1px)} .btn:focus-visible{box-shadow:0 0 0 3px rgb(217 119 6 / .4)}
+  .btn-default{background:var(--brand-500);color:#1a1206} .btn-default:hover{background:var(--brand-400)}
+  .btn-outline{background:transparent;color:var(--text-primary);border-color:var(--surface-700)} .btn-outline:hover{background:var(--surface-800)}
+  .btn-ghost{background:transparent;color:var(--text-secondary)} .btn-ghost:hover{background:var(--surface-800);color:var(--text-bright)}
+  .btn-destructive{background:rgb(239 68 68 / .12);color:#fca5a5;border-color:rgb(239 68 68 / .35)}
+  .btn-sm{font-size:11px;padding:4px 10px} .btn-xs{font-size:10.5px;padding:3px 9px;border-radius:6px}
+  .badge{font-size:10.5px;font-weight:500;border-radius:999px;padding:1px 9px;display:inline-flex;align-items:center;gap:4px;line-height:18px}
+  .badge-run{color:var(--st-running);background:rgb(34 197 94 / .15)} .badge-idle{color:var(--text-muted);background:rgb(113 113 122 / .15)}
+  .badge-admin{color:var(--brand-500);background:rgb(245 158 11 / .15)} .badge-tenant{color:var(--accent-500);background:rgb(20 184 166 / .15)}
+  .inp{background:var(--surface-850);border:1px solid var(--surface-700);border-radius:8px;color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:7px 10px;outline:none;transition:border-color .12s,box-shadow .12s;width:100%}
+  .inp:focus{border-color:var(--brand-600);box-shadow:0 0 0 3px rgb(217 119 6 / .25)}
+  .lab{font-size:10.5px;color:var(--text-dim);display:block;margin-bottom:4px}
+
+  /* NEW card */
+  .card{border-radius:10px;background:var(--surface-900);box-shadow:inset 0 0 0 1px rgb(228 228 231 / .1);overflow:hidden;margin-bottom:12px}
+  body.light .card{box-shadow:inset 0 0 0 1px rgb(0 0 0 / .08), 0 1px 2px rgb(0 0 0 / .04)}
+  .card .ch{display:flex;align-items:center;gap:9px;padding:11px 15px;border-bottom:1px solid var(--surface-800)}
+  .card .ch .ico{width:20px;text-align:center} .card .ch b{font-size:13px} .card .ch .act{margin-left:auto;display:flex;gap:7px}
+  .card .cb{padding:13px 15px;display:grid;grid-template-columns:1fr 220px;gap:16px}
+  .card .cb.single{grid-template-columns:1fr}
+  .field{margin-bottom:9px}
+  .readout{border-left:1px solid var(--surface-800);padding-left:14px;font-size:11px;display:flex;flex-direction:column;gap:7px}
+  .ro-row{display:flex;justify-content:space-between;gap:8px} .ro-row .k{color:var(--text-dim)} .ro-row .v{font-family:var(--font-mono);color:var(--text-secondary);text-align:right}
+  .ro-row .v.ok{color:var(--st-running)}
+  .card .cf{padding:8px 15px;border-top:1px solid var(--surface-800);background:rgb(127 127 130 / .04);font-size:10.5px;color:var(--text-dim);display:flex;align-items:center;gap:8px}
+
+  /* NEW table (user management) */
+  .tbl{width:100%;border-collapse:collapse;font-size:12px}
+  .tbl th{text-align:left;padding:7px 12px;font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim);border-bottom:1px solid var(--surface-700)}
+  .tbl td{padding:9px 12px;border-bottom:1px solid var(--surface-800);color:var(--text-secondary);vertical-align:middle}
+  .tbl tr:last-child td{border-bottom:none} .tbl tbody tr:hover{background:rgb(127 127 130 / .05)}
+  .tbl .u{color:var(--text-primary);font-weight:500} .tbl .mono{font-family:var(--font-mono);font-size:11px;color:var(--text-dim)}
+  .linknote{font-size:10.5px;color:var(--text-dim);margin-top:8px;padding:8px 11px;border-radius:7px;background:rgb(245 158 11 / .06);border:1px solid rgb(245 158 11 / .2)}
+
+  /* OLD (cramped, inconsistent) */
+  .old-col{max-width:448px}
+  .old-sec{border:1px solid var(--surface-700);border-radius:8px;padding:12px;margin-bottom:14px}
+  .old-h{font-size:13px;font-weight:600;margin-bottom:8px}
+  .old-inp{width:100%;background:var(--surface-900);border:1px solid rgb(63 63 70 / .6);border-radius:8px;color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:8px 10px;margin-bottom:8px;outline:none}
+  .old-btn-a{font-size:11px;color:#fff;background:var(--brand-600);border:none;border-radius:8px;padding:6px 11px;cursor:pointer}
+  .old-btn-b{font-size:11px;color:var(--text-secondary);background:transparent;border:1px solid rgb(63 63 70 / .6);border-radius:8px;padding:6px 11px;cursor:pointer;margin-left:6px}
+  .old-mask{font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-bottom:8px}
+  .old-uli{display:flex;align-items:center;gap:8px;font-size:12px;padding:5px 0;color:var(--text-secondary)}
+  .old-note{font-size:11px;color:var(--text-dim)}
+
+  .foot{margin-top:18px;border-radius:10px;background:var(--surface-900);border:1px solid var(--surface-800);padding:12px 15px;font-size:11px;line-height:1.6;color:var(--text-muted)}
+  .foot b{color:var(--text-secondary)} .foot .y{color:var(--st-running)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="bar">
+    <h1>ccteam · <b>设置 Settings</b> 重设计</h1>
+    <div class="toggle">看
+      <div class="seg"><button id="s-old" onclick="setState(true)">现状</button><button class="on" id="s-new" onclick="setState(false)">改版</button></div>
+      <span class="vline"></span>
+      <div class="seg"><button class="on" id="t-dark" onclick="setTheme('dark')">🌙 暗</button><button id="t-light" onclick="setTheme('light')">☀️ 亮</button></div>
+    </div>
+  </div>
+
+  <div class="state old proto-old">⚠ <b>现状</b>:<code style="font-family:var(--font-mono)">p-4 max-w-md</code> 窄单列(448px)挤;三段手搓,按钮 <code style="font-family:var(--font-mono)">*_BTN_CLASS</code> 风格不一;用户是列表非表格。已对的:masked token 不回显 + 两步覆盖确认(保留)。</div>
+  <div class="state new proto-new">✓ <b>改版</b>:Card 化(每 provider 头+身+脚,右侧 label→mono 状态读出)+ 用户管理表格化 + 测试连接 + 走新原语(灭 *_CLASS)。点上面切「现状」/「☀ 亮」对比。</div>
+
+  <!-- ════ NEW ════ -->
+  <div class="proto-new">
+    <h2 class="sec">IM 凭据 · Credentials <span class="badge badge-idle" style="vertical-align:middle">管理员 · 全局</span></h2>
+    <p class="lede">连一个聊天通道,ccteam 才能找到你。下次重启生效。</p>
+
+    <div class="card">
+      <div class="ch"><span class="ico">✈️</span><b>Telegram</b><span class="badge badge-run">● 已连接</span>
+        <span class="act"><button class="btn btn-ghost btn-xs">测试连接</button><button class="btn btn-outline btn-xs">重置 token</button></span></div>
+      <div class="cb">
+        <div>
+          <div class="field"><label class="lab">Bot token</label><input class="inp" value="•••••••••••••3f2a" readonly></div>
+          <div class="old-note" style="font-size:10.5px">重置会要求两步确认(破坏性)· token 永不回显,仅显末 4 位。</div>
+        </div>
+        <div class="readout">
+          <div class="ro-row"><span class="k">Bot</span><span class="v">@ccteam_bot</span></div>
+          <div class="ro-row"><span class="k">chat_id</span><span class="v ok">✓ 339498819</span></div>
+          <div class="ro-row"><span class="k">连通</span><span class="v ok">✓ getMe 200</span></div>
+        </div>
+      </div>
+      <div class="cf">最近保存 2 分钟前 · 下次 daemon 重启生效</div>
+    </div>
+
+    <div class="card">
+      <div class="ch"><span class="ico">🪶</span><b>Lark / 飞书</b><span class="badge badge-idle">未配置</span></div>
+      <div class="cb">
+        <div>
+          <div class="field"><label class="lab">App ID</label><input class="inp" placeholder="cli_xxx"></div>
+          <div class="field"><label class="lab">App Secret</label><input class="inp" placeholder="(永不回显)"></div>
+        </div>
+        <div class="readout">
+          <div class="ro-row"><span class="k">区域</span><span class="v">飞书 / Lark</span></div>
+          <div class="ro-row"><span class="k">allowlist</span><span class="v">open_id …</span></div>
+          <div style="margin-top:auto"><button class="btn btn-default btn-sm" style="width:100%">保存</button></div>
+        </div>
+      </div>
+      <div class="cf">app secret 永不回显;重配显「(已配置 ····wxyz)」+ 空白框</div>
+    </div>
+
+    <div class="card">
+      <div class="ch"><span class="ico">💰</span><b>预算 · Budget</b><span style="margin-left:auto;font-family:var(--font-mono);font-size:14px;font-weight:600">$20 <span style="color:var(--text-dim);font-weight:400">/ 24h</span></span></div>
+      <div class="cb single" style="padding-top:9px;padding-bottom:11px"><div class="old-note">触顶 auto-disable(红线)· loop 跑起来后尤其重要</div></div>
+    </div>
+
+    <h2 class="sec">用户管理 · Users <span class="badge badge-idle" style="vertical-align:middle">管理员</span></h2>
+    <p class="lede">per-user web 身份(档1)。添加回一次性个人链接;列表永不回 token。</p>
+    <div class="card" style="padding:0">
+      <table class="tbl">
+        <thead><tr><th>用户</th><th>角色</th><th>创建</th><th style="text-align:right">操作</th></tr></thead>
+        <tbody>
+          <tr><td><span class="u">@alice</span> <span class="mono">(你)</span></td><td><span class="badge badge-admin">admin</span></td><td class="mono">—</td>
+            <td style="text-align:right"><button class="btn btn-ghost btn-xs">复制个人链接</button></td></tr>
+          <tr><td><span class="u">@bob</span></td><td><span class="badge badge-tenant">tenant</span></td><td class="mono">2026-06-20</td>
+            <td style="text-align:right"><button class="btn btn-ghost btn-xs">复制链接</button> <button class="btn btn-destructive btn-xs" onclick="confirmDel(this)">删除</button></td></tr>
+        </tbody>
+      </table>
+      <div style="padding:10px 12px;border-top:1px solid var(--surface-800)"><button class="btn btn-default btn-sm">＋ 添加用户</button></div>
+    </div>
+    <div class="linknote">🔗 新增用户铸一次性链接 <span style="font-family:var(--font-mono)">?token=ccteam:&lt;hex&gt;</span> —— 只显一次,复制给本人;删除走两步内联确认(非原生 confirm)。</div>
+  </div>
+
+  <!-- ════ OLD ════ -->
+  <div class="proto-old old-col">
+    <div class="old-sec">
+      <div class="old-h">IM Credentials</div>
+      <div class="old-note" style="margin-bottom:10px">Connect a chat transport. Changes apply on next restart.</div>
+      <div class="old-h" style="font-size:12px">Telegram</div>
+      <div class="old-mask">(set, ····3f2a) · chat_id 339498819</div>
+      <input class="old-inp" placeholder="new bot token">
+      <button class="old-btn-a">Save</button><button class="old-btn-b">Cancel</button>
+    </div>
+    <div class="old-sec">
+      <div class="old-h" style="font-size:12px">Lark</div>
+      <input class="old-inp" placeholder="app id"><input class="old-inp" placeholder="app secret">
+      <button class="old-btn-a">Save</button>
+    </div>
+    <div class="old-sec">
+      <div class="old-h" style="font-size:12px">用户管理</div>
+      <div class="old-uli">• @alice <span style="color:var(--text-dim)">(你 · admin)</span></div>
+      <div class="old-uli">• @bob <button class="old-btn-b" style="margin-left:auto;padding:3px 8px">删除</button></div>
+      <div class="old-note" style="margin-top:8px">ccteam user add &lt;handle&gt; —— 新增 + 铸 web 链接</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>Settings 改了什么</b>:窄单列 → Card(头+身+脚 + 右侧状态读出)· 用户列表 → 可排序表格 + 角色徽章 + 一次性链接 · 加「测试连接」(getMe)· 全走 <code style="font-family:var(--font-mono)">components/ui</code>(灭 FIELD_CLASS/*_BTN_CLASS)。
+    <b>红线保留</b>:<span class="y">secret 永不回显</span> · <span class="y">两步内联覆盖确认</span>(强于原生 confirm)· admin-gate · 主题切换不碰后端/不动 secrets。
+    <span style="float:right;color:var(--text-dim)">v0.8.19 原型 · 基于真实 SettingsPage 结构</span>
+  </div>
+</div>
+
+<script>
+  function setState(old){
+    document.body.classList.toggle('show-old',old);
+    document.getElementById('s-old').classList.toggle('on',old);
+    document.getElementById('s-new').classList.toggle('on',!old);
+  }
+  function setTheme(t){
+    var light=t==='light';
+    document.body.classList.add('no-transition');
+    document.body.classList.toggle('light',light);
+    document.getElementById('t-dark').classList.toggle('on',!light);
+    document.getElementById('t-light').classList.toggle('on',light);
+    requestAnimationFrame(function(){requestAnimationFrame(function(){document.body.classList.remove('no-transition');});});
+  }
+  function confirmDel(b){
+    if(b.dataset.armed){b.textContent='已删除';b.disabled=true;return;}
+    b.dataset.armed='1';b.textContent='确认删除?';setTimeout(function(){if(b.dataset.armed&&b.textContent==='确认删除?'){b.textContent='删除';delete b.dataset.armed;}},2500);
+  }
+</script>
+</body>
+</html>

@@ -120,6 +120,20 @@
   .foot{margin-top:18px;border-radius:10px;background:var(--surface-900);border:1px solid var(--surface-800);padding:13px 15px;font-size:11px;line-height:1.6;color:var(--text-muted)}
   .foot b{color:var(--text-secondary)} .foot .y{color:var(--st-running)} .foot .dec{color:var(--accent-500)}
   .dotgrid{background-image:radial-gradient(circle at 1px 1px, rgb(255 255 255 / .025) 1px, transparent 0);background-size:24px 24px}
+
+  /* ── 浅色主题(C 块):重声明同名 token,演示「@theme inline + .light 覆盖」翻主题 ── */
+  body.light{
+    --surface-700:#d4d4d8; --surface-800:#e7e7ea; --surface-850:#eeeef0; --surface-900:#ffffff; --surface-950:#f4f4f5;
+    --brand-400:#d97706; --brand-500:#d97706; --brand-600:#b45309; --brand-dim:#fde9c8;
+    --accent-500:#0d9488; --vendor-claude:#c2410c; --vendor-codex:#0f766e;
+    --text-primary:#18181b; --text-secondary:#52525b; --text-muted:#71717a; --text-dim:#a1a1aa; --text-bright:#09090b;
+    --st-running:#16a34a; --st-waiting:#ca8a04; --st-idle:#a1a1aa; --st-error:#dc2626;
+    background:var(--surface-950);color:var(--text-primary);
+  }
+  body.light .bar{background:linear-gradient(var(--surface-950) 75%,transparent)}
+  body.light .dotgrid{background-image:radial-gradient(circle at 1px 1px, rgb(0 0 0 / .045) 1px, transparent 0)}
+  body.light .b1{color:#fff} body.light .btn-default{color:#fff} /* 浅色下深底琥珀按钮用白字 */
+  .no-transition *{transition:none !important}
 </style>
 </head>
 <body>
@@ -129,6 +143,8 @@
     <div><h1>ccteam · <b>前端地基</b> / 组件原语库</h1><div class="sub">整前端,不止 chat · 参考 LAP components/ui/* · token=真实 index.css</div></div>
     <div class="toggle">看
       <div class="seg"><button class="on" id="s-old" onclick="setState(false)">现状</button><button id="s-new" onclick="setState(true)">改版</button></div>
+      <span style="width:1px;height:18px;background:var(--surface-700);margin:0 2px"></span>
+      <div class="seg"><button class="on" id="t-dark" onclick="setTheme('dark')">🌙 暗</button><button id="t-light" onclick="setTheme('light')">☀️ 亮</button></div>
     </div>
   </div>
 
@@ -255,6 +271,14 @@
     document.getElementById('s-old').classList.toggle('on',!isNew);
     var n=document.getElementById('s-new');n.classList.toggle('on',isNew);n.classList.toggle('new',isNew);
     document.getElementById('wrap').classList.toggle('dotgrid',isNew);
+  }
+  function setTheme(t){
+    var light=t==='light';
+    document.body.classList.add('no-transition'); /* LAP disableTransitionOnChange:切换不闪 */
+    document.body.classList.toggle('light',light);
+    document.getElementById('t-dark').classList.toggle('on',!light);
+    document.getElementById('t-light').classList.toggle('on',light);
+    requestAnimationFrame(function(){requestAnimationFrame(function(){document.body.classList.remove('no-transition');});});
   }
   var scrim=document.getElementById('scrim');
   function openDlg(){scrim.classList.add('on');}
