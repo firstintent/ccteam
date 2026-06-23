@@ -55,12 +55,12 @@ SPA = `crates/ccteam-web/web/`(React19 + Vite + Tailwind4,token 在 `index.css @
 抄 LAP 整套配方(`layout.tsx:49`+`theme-toggle.tsx`+`globals.css` 双 token 集):
 1. **token 层改主题感知**:`index.css` 的 `@theme` → **`@theme inline`**(让 `--color-*` 变运行时可覆盖,LAP 正是这么做),保留暗色为默认;加 `:root.light { --color-surface-900:…; --color-text-primary:… }` 覆盖块**重声明同名变量**(`bg-surface-900` 等工具引用 `var()`,改 var 即翻主题)。
 2. **设计一套浅色盘**:浅表面(zinc-50/100/white)+ 深文字(zinc-900/600)+ 品牌琥珀走 `brand-600/700`(浅底对比)+ teal/vendor 保留 + status 升到 `-600`(浅底对比)。
-3. **切换入口**:AvatarMenu 在语言下加 **☀ 亮 / 🌙 暗 / 💻 系统**(`useWebSettings` 加 `theme` 字段,写 `<html>` class)。
+3. **切换入口**:AvatarMenu 在语言下加**一个**图标按钮(lucide Sun/Moon,**单图标**非两个 —— 暗态显 Sun=点亮、亮态显 Moon=点暗),`useWebSettings` 加 `theme` 字段写 `<html>` class;初始默认跟随系统 `prefers-color-scheme`。
 4. **不闪**:`index.html` 内联 pre-paint 脚本按存储值先打 class(免 FOUC)+ 切换时加 `.no-transition` 一帧(LAP 的 `disableTransitionOnChange`)。
 - **诚实**:① 值命名 token(`surface-900`)在浅色语义会反转(900 变浅)—— 当「基准表面」抽象用即可,或做更大的「角色命名 token(bg/fg/card/border)」重构(churn 大,记为 option)。② 工作量 **中-大**(每个面要在浅色下核对对比度)。这就是它之前压 P2 的原因;owner 既要,纳入。
 
 ### D. 整体质感(贯穿所有 wave,不是单独一波)
-累积出「production 非 demo」的手感,做成质量条:tabular-nums(数字稳)· 点阵背景 + 主题选区 · 8px 间距节奏 + 统一 radius scale · 微交互(按钮 1px 下沉、卡片发丝环、focus 环、hover 才显的次级操作)· 有品味的浮层/toast 进出动画(全配 reduced-motion)· 排版(Geist 字形特性 `cv02..`、标题 `text-wrap:balance`)· 一致的空/加载态(骨架非文字)· 「配色只表语义」纪律。**每条改动都按这把尺收口。**
+累积出「production 非 demo」的手感,做成质量条:tabular-nums(数字稳)· 点阵背景 + 主题选区 · 8px 间距节奏 + 统一 radius scale · 微交互(按钮 1px 下沉、卡片发丝环、focus 环、hover 才显的次级操作)· 有品味的浮层/toast 进出动画(全配 reduced-motion)· 排版(Geist 字形特性 `cv02..`、标题 `text-wrap:balance`)· 一致的空/加载态(骨架非文字)· 「配色只表语义」纪律 · **图标统一 lucide**(已是依赖 `^1.14.0`,仅 3 处用 → 推广全站 UI 图标)+ 新增 `brand-icons.tsx`(vendor/transport 品牌 SVG,lucide 无 logo);**清零 emoji** —— ChatConsole 底部导航 4 glyph(`:426-446`)、AvatarMenu 头像盘 🟧🟦🟩🟪⬛ → 纯色圆点(`:17` + `useWebSettings:31` 默认 + `AvatarMenu.test.tsx`)。**每条改动都按这把尺收口。**
 
 ### P2 / 视目标再做:S3 ProductSwitcher · S4 图标轨折叠(先核对 `useEdgeSwipe`)· X3 Inspector 事件面板 · CR5 provider 网格 · CR6 OAuth 回跳 toast · S2 iframe 态 · S5 轮询角标。
 
@@ -91,7 +91,8 @@ SPA = `crates/ccteam-web/web/`(React19 + Vite + Tailwind4,token 在 `index.css @
 - [ ] 中文输入法选词回车**不发送**;切 session 草稿还在;markdown(含代码块/表格)正确渲染、代码块可复制。
 - [ ] 全站按钮/卡片/徽章/输入框走 `components/ui/`,无重复 `*_CLASS`;焦点/禁用/按压一致。
 - [ ] 浮层走 base-ui(焦点陷阱/Esc/键盘);无原生 `<select>`。
-- [ ] **明暗主题**:AvatarMenu 可切 亮/暗/系统;切换不闪、不漏未染色面;浅色下对比度达标(正文 ≥ 4.5:1)。
+- [ ] **明暗主题**:AvatarMenu **单个**图标按钮切明暗(非两个);切换不闪、不漏未染色面;浅色下对比度达标(正文 ≥ 4.5:1)。
+- [ ] **0 emoji**:全站图标走 lucide + `brand-icons.tsx`;ChatConsole nav / AvatarMenu 头像盘无 emoji(`grep -rE "🧩|📊|🖥|⚙|🟧" src` = 0)。
 - [ ] **Settings**:Card 化 + 用户管理表格化 + 测试连接;无 `FIELD_CLASS`/`*_BTN_CLASS`;masked-token / 内联确认保留。
 - [ ] 质感:成本/计时列 `tabular-nums` 不抖;加载=骨架、空态=图标+CTA;按压/焦点微交互到位。
 - [ ] **每 wave baseline 不退**:`cargo test --workspace --exclude ccteam-web` ≥ 现值;`ccteam-web`+vitest+Playwright 不退;clippy 0 warning;`cargo fmt --all` 干净。

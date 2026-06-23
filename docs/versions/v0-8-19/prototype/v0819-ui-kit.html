@@ -134,9 +134,37 @@
   body.light .dotgrid{background-image:radial-gradient(circle at 1px 1px, rgb(0 0 0 / .045) 1px, transparent 0)}
   body.light .b1{color:#fff} body.light .btn-default{color:#fff} /* 浅色下深底琥珀按钮用白字 */
   .no-transition *{transition:none !important}
+  .svi{width:1em;height:1em;display:inline-block;vertical-align:-0.14em;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:none}
+  .iconbtn{display:grid;place-items:center;width:30px;height:28px;background:var(--surface-900);border:1px solid var(--surface-800);border-radius:8px;color:var(--text-secondary);cursor:pointer}
+  .iconbtn:hover{color:var(--text-bright);background:var(--surface-800)}
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="ic-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+<symbol id="ic-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="ic-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/></symbol>
+<symbol id="ic-settings" viewBox="0 0 24 24"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></symbol>
+<symbol id="ic-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="ic-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="ic-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="ic-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+<symbol id="ic-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="ic-square" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="ic-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+<symbol id="ic-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="ic-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="ic-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="ic-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="ic-wallet" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></symbol>
+<symbol id="ic-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="ic-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="ic-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="ic-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.9" y1="4.9" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.1" y2="19.1"/><line x1="4.9" y1="19.1" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.1" y2="4.9"/></symbol>
+<symbol id="ic-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+<symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+</defs></svg>
+
 <div class="wrap" id="wrap">
 
   <div class="bar">
@@ -144,11 +172,11 @@
     <div class="toggle">看
       <div class="seg"><button class="on" id="s-old" onclick="setState(false)">现状</button><button id="s-new" onclick="setState(true)">改版</button></div>
       <span style="width:1px;height:18px;background:var(--surface-700);margin:0 2px"></span>
-      <div class="seg"><button class="on" id="t-dark" onclick="setTheme('dark')">🌙 暗</button><button id="t-light" onclick="setTheme('light')">☀️ 亮</button></div>
+      <button class="iconbtn" id="theme-btn" title="切换明暗" onclick="toggleTheme()"><svg class="svi"><use href="#ic-sun"/></svg></button>
     </div>
   </div>
 
-  <div class="state old proto-old">⚠ <b>现状</b>:没有 <code style="font-family:var(--font-mono)">components/ui/</code> —— 每页从裸 Tailwind 重拼,class 串重复(<code style="font-family:var(--font-mono)">FIELD_CLASS</code>/<code style="font-family:var(--font-mono)">*_BTN_CLASS</code> 又内联重抄)。焦点/禁用/按压/徽章拼写各页不一致 = demo 感来源。</div>
+  <div class="state old proto-old"><svg class="svi"><use href="#ic-alert"/></svg> <b>现状</b>:没有 <code style="font-family:var(--font-mono)">components/ui/</code> —— 每页从裸 Tailwind 重拼,class 串重复(<code style="font-family:var(--font-mono)">FIELD_CLASS</code>/<code style="font-family:var(--font-mono)">*_BTN_CLASS</code> 又内联重抄)。焦点/禁用/按压/徽章拼写各页不一致 = demo 感来源。</div>
   <div class="state new proto-new">✓ <b>改版</b>:立 <code style="font-family:var(--font-mono)">components/ui/</code> + <code style="font-family:var(--font-mono)">cn()</code> + CVA 变体;overlay 采 @base-ui。一处定按压/焦点/禁用,全站一致。点上面「现状」来回切感受 delta。</div>
 
   <div class="grid">
@@ -216,7 +244,7 @@
       <p class="cap proto-old">纯文字</p>
       <p class="cap proto-new">图标 + 文案 + CTA → 变下一步动作</p>
       <div class="empty-old proto-old">还没有用户。添加一个吧。</div>
-      <div class="empty-new proto-new"><div class="ic">👤</div><div class="t">还没有用户</div><button class="btn btn-default btn-sm">＋ 添加第一个用户</button></div>
+      <div class="empty-new proto-new"><div class="ic"><svg class="svi"><use href="#ic-users"/></svg></div><div class="t">还没有用户</div><button class="btn btn-default btn-sm">＋ 添加第一个用户</button></div>
     </div>
 
     <!-- SELECT / COMBOBOX -->
@@ -225,7 +253,7 @@
       <p class="cap proto-old">原生 <code>&lt;select&gt;</code> 不可染色、不能搜,破暗色</p>
       <p class="cap proto-new">可搜 · portal · 翻转感知 combobox(<code>model-select.tsx</code>)</p>
       <div class="proto-old"><select class="sel-old"><option>opus[1m]</option><option>sonnet</option><option>haiku</option></select></div>
-      <div class="proto-new combo"><div class="si">🔎 <input placeholder="搜模型…" oninput="filterCombo(this)"></div>
+      <div class="proto-new combo"><div class="si"><svg class="svi"><use href="#ic-search"/></svg> <input placeholder="搜模型…" oninput="filterCombo(this)"></div>
         <div id="copts"><div class="opt on">opus[1m] <span class="ck">✓</span></div><div class="opt">sonnet 4.6</div><div class="opt">haiku 4.5</div><div class="opt">opus[max]</div></div></div>
     </div>
 
@@ -272,12 +300,12 @@
     var n=document.getElementById('s-new');n.classList.toggle('on',isNew);n.classList.toggle('new',isNew);
     document.getElementById('wrap').classList.toggle('dotgrid',isNew);
   }
-  function setTheme(t){
-    var light=t==='light';
-    document.body.classList.add('no-transition'); /* LAP disableTransitionOnChange:切换不闪 */
-    document.body.classList.toggle('light',light);
-    document.getElementById('t-dark').classList.toggle('on',!light);
-    document.getElementById('t-light').classList.toggle('on',light);
+  var __light=false;
+  function toggleTheme(){
+    __light=!__light;
+    document.body.classList.add('no-transition');
+    document.body.classList.toggle('light',__light);
+    document.querySelector('#theme-btn use').setAttribute('href', __light ? '#ic-moon' : '#ic-sun');
     requestAnimationFrame(function(){requestAnimationFrame(function(){document.body.classList.remove('no-transition');});});
   }
   var scrim=document.getElementById('scrim');
