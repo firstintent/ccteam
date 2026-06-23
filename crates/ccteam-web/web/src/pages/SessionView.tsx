@@ -26,7 +26,9 @@
 // approval routes through the gateway's pending machinery (NOT a turn).
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MessageSquare, Send, Square, Terminal } from "lucide-react";
+import { MessageSquare, Square, Terminal } from "lucide-react";
+import { Composer } from "../components/Composer";
+import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import {
@@ -66,8 +68,10 @@ export default function SessionView({
   session: SessionSummary | null;
   onSessionChanged?: () => void;
 }) {
-  const [draft, setDraft] = useState("");
   const [view, setView] = useState<"chat" | "terminal">("chat");
+  // A turn is "in flight" from submit until the next `done` SSE frame; drives
+  // the composer's Send⇄Stop morph.
+  const [busy, setBusy] = useState(false);
 
   // Per-sid transcript. Seeded from localStorage on MOUNT, then from mirrored
   // history, then live-appended from SSE. Because `sid` is fixed per instance,
@@ -149,23 +153,31 @@ export default function SessionView({
     };
   }, [sid, doneCount]);
 
+  // Un-morph the composer (Stop→Send) when the running turn finishes: a new
+  // `done` SSE frame advances doneCount.
+  useEffect(() => {
+    setBusy(false);
+  }, [doneCount]);
+
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
   }, []);
 
   // ---- send a turn -------------------------------------------------------
-  const submit = useCallback(() => {
-    const content = draft.trim();
-    if (!content) return;
-    pushRow({ kind: "user", content });
-    setDraft("");
-    submitTurn(sid, content).catch((e) => {
-      pushRow({
-        kind: "system",
-        content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
+  const submitText = useCallback(
+    (content: string) => {
+      pushRow({ kind: "user", content });
+      setBusy(true);
+      submitTurn(sid, content).catch((e) => {
+        setBusy(false);
+        pushRow({
+          kind: "system",
+          content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
+        });
       });
-    });
-  }, [draft, sid, pushRow]);
+    },
+    [sid, pushRow],
+  );
 
   // ---- resolve a W2 approval prompt (R-H1) -------------------------------
   // The per-sid SSE tags the ChoicePrompt with sid + each option's {label,id}
@@ -379,46 +391,26 @@ export default function SessionView({
                   </div>
                 );
               }
+              // assistant = full-width Markdown document; user = right-aligned
+              // plain bubble; tool = mono. Only the assistant content is
+              // Markdown-rendered (user text stays literal).
               return (
                 <div
                   key={row.id}
-                  className={`max-w-[760px] rounded-md px-3 py-2 text-sm leading-6 whitespace-pre-wrap break-words ${
+                  className={`max-w-[760px] rounded-md px-3 py-2 text-sm ${
                     row.kind === "user"
-                      ? "ml-auto bg-brand-dim/40 border border-brand-500/20"
+                      ? "ml-auto leading-6 whitespace-pre-wrap break-words bg-brand-dim/40 border border-brand-500/20"
                       : row.kind === "tool"
-                        ? "bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
+                        ? "leading-6 whitespace-pre-wrap break-words bg-surface-800/70 border border-surface-700/50 text-text-secondary font-mono text-xs"
                         : "bg-surface-800 border border-surface-700/40"
                   }`}
                 >
-                  {row.content}
+                  {row.kind === "assistant" ? <Markdown content={row.content} /> : row.content}
                 </div>
               );
             })}
           </div>
-          <div className="border-t border-surface-700/40 p-3">
-            <div className="flex gap-2">
-              <textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    submit();
-                  }
-                }}
-                className="min-h-11 max-h-32 flex-1 resize-y rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-brand-500"
-                placeholder="发消息 / 命令(/compact /clear …)…"
-              />
-              <button
-                type="button"
-                onClick={submit}
-                className="h-11 w-11 shrink-0 rounded-md bg-brand-500 text-surface-950 hover:bg-brand-400 grid place-items-center"
-                title="发送"
-              >
-                <Send className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
+          <Composer sid={sid} busy={busy} onSubmit={submitText} onStop={stopActive} />
         </>
       )}
     </>
