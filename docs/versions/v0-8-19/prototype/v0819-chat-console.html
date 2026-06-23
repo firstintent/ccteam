@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ccteam v0.8.19 · session 窗口改版(真实 shell)</title>
+<!-- 基于真实 SPA crates/ccteam-web/web/src(ChatConsole 壳 + SessionView 主面 + index.css @theme)。
+     参考 references/litellm-agent-platform/src/ui(message-block / composer / .sessions-md)。
+     只画「会话窗口」—— v0818 原型画了 Status/Hosts,这版补上被吐槽 demo 感的 SessionView。增量,不重画。 -->
+<style>
+  :root{
+    --surface-700:#3f3f46; --surface-800:#2c2c30; --surface-850:#262629; --surface-900:#1c1c1f; --surface-950:#141416;
+    --brand-400:#fbbf24; --brand-500:#f59e0b; --brand-600:#d97706; --brand-dim:#7a5012; --accent-500:#14b8a6;
+    --vendor-claude:#d97757; --vendor-codex:#10a37f;
+    --text-primary:#e4e4e7; --text-secondary:#a1a1aa; --text-muted:#71717a; --text-dim:#52525b; --text-bright:#fafafa;
+    --st-running:#22c55e; --st-waiting:#fbbf24; --st-idle:#71717a; --st-error:#ef4444;
+    --font-sans:'Geist Sans',system-ui,-apple-system,sans-serif;
+    --font-mono:'Geist Mono',ui-monospace,'SFMono-Regular',monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;font-family:var(--font-sans);background:#0c0c0e;
+    color:var(--text-primary);-webkit-font-smoothing:antialiased;display:flex;justify-content:center;align-items:center;padding:18px}
+  .app{width:1080px;height:724px;display:flex;border:1px solid var(--surface-700);border-radius:12px;overflow:hidden;
+    box-shadow:0 24px 70px -30px #000;background:var(--surface-900)}
+
+  /* ── sidebar (real ChatConsole shell, trimmed) ── */
+  .side{width:248px;flex:none;background:var(--surface-950);border-right:1px solid var(--surface-800);display:flex;flex-direction:column}
+  .side-top{height:46px;flex:none;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:8px;padding:0 12px}
+  .logo{font-size:13px;font-weight:600;color:var(--text-primary)} .logo b{color:var(--brand-500)}
+  .new-btn{margin:10px 12px 4px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12.5px;font-weight:500;
+    color:var(--text-bright);background:var(--surface-800);border:1px solid var(--surface-700);border-radius:8px;padding:7px 0;cursor:pointer}
+  .tree{flex:1;overflow-y:auto;padding:6px 8px}
+  .tree-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);padding:8px 6px 4px}
+  .proj{padding:5px 8px;border-radius:6px;font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:7px}
+  .proj .fold{color:var(--text-dim);font-size:10px}
+  .sess-i{padding:4px 8px 4px 22px;border-radius:6px;font-size:11.5px;color:var(--text-muted);display:flex;align-items:center;gap:7px;cursor:pointer}
+  .sess-i:hover{background:var(--surface-850)} .sess-i.on{background:var(--surface-800);color:var(--text-primary)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dot.run{background:var(--st-running);box-shadow:0 0 6px var(--st-running)}
+  .dot.wait{background:var(--st-waiting)} .dot.idle{background:var(--st-idle)}
+  .vp{font-size:9px;font-weight:600;padding:0 5px;border-radius:999px;line-height:15px}
+  .vp.claude{color:var(--vendor-claude);background:rgb(217 119 87 / .13)} .vp.codex{color:var(--vendor-codex);background:rgb(16 163 127 / .13)}
+  .sid{font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);margin-left:auto}
+  .nav{border-top:1px solid var(--surface-800);padding:6px 8px;display:flex;flex-direction:column;gap:1px}
+  .nav a{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-size:12.5px;color:var(--text-secondary);cursor:pointer;text-decoration:none}
+  .nav a:hover{background:var(--surface-850)} .nav a.on{background:var(--surface-800);color:var(--text-primary)}
+  .nav a .ic{width:15px;text-align:center;font-size:13px;opacity:.85}
+
+  /* ── main / session surface ── */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .top{height:46px;flex:none;border-bottom:1px solid var(--surface-800);display:flex;align-items:center;gap:10px;padding:0 14px;background:var(--surface-900)}
+  .conn{width:7px;height:7px;border-radius:50%;background:var(--st-running);box-shadow:0 0 6px var(--st-running)}
+  .crumb{font-size:12.5px;color:var(--text-secondary)} .crumb b{color:var(--text-primary);font-weight:600}
+  .crumb .sep{color:var(--text-dim);margin:0 5px}
+  .pill-cost{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--text-secondary);background:var(--surface-850);
+    border:1px solid var(--surface-700);border-radius:999px;padding:3px 10px} .pill-cost b{color:var(--text-primary)}
+  .av{width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,var(--brand-500),var(--brand-600));
+    display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#1a1206;flex:none}
+
+  /* session sub-bar: breadcrumb + stop + Chat|终端 tabs (real SessionView) */
+  .subbar{flex:none;border-bottom:1px solid rgb(63 63 70 / .35);display:flex;align-items:center;gap:10px;padding:7px 14px}
+  .sb-stop{font-size:11px;color:var(--st-error);background:rgb(239 68 68 / .1);border:1px solid rgb(239 68 68 / .3);border-radius:6px;padding:3px 9px;cursor:pointer}
+  .tabs{margin-left:auto;display:flex;gap:2px;background:var(--surface-950);border:1px solid var(--surface-800);border-radius:8px;padding:2px}
+  .tabs button{font-family:var(--font-sans);font-size:11.5px;color:var(--text-secondary);background:transparent;border:none;border-radius:6px;padding:3px 11px;cursor:pointer}
+  .tabs button.on{color:var(--text-bright);background:var(--surface-800)}
+  .tabs button:disabled{color:var(--text-dim);cursor:not-allowed}
+  .proto-toggle{font-size:10.5px;color:var(--accent-500);background:rgb(20 184 166 / .1);border:1px solid rgb(20 184 166 / .3);
+    border-radius:999px;padding:3px 10px;cursor:pointer;user-select:none}
+  .proto-toggle.on{color:#06231d;background:var(--accent-500);border-color:var(--accent-500)}
+  .statusline{flex:none;padding:4px 14px;font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);border-bottom:1px solid rgb(63 63 70 / .3)}
+
+  /* transcript */
+  .scroll{flex:1;overflow-y:auto;position:relative}
+  .transcript{padding:16px 18px;display:flex;flex-direction:column;gap:14px;max-width:880px;margin:0 auto}
+  .msg{font-size:13.5px;line-height:1.55}
+  /* user = right-aligned capped bubble (litellm asymmetry) */
+  .msg.user{margin-left:auto;max-width:560px;background:rgb(122 80 18 / .38);border:1px solid rgb(245 158 11 / .22);
+    border-radius:14px 14px 4px 14px;padding:9px 13px;white-space:pre-wrap;color:var(--text-primary)}
+  /* assistant = full-width document, no bubble, no avatar */
+  .msg.assistant{max-width:760px}
+  .msg.system{text-align:center;font-size:11px;color:var(--text-dim)}
+
+  /* the CURRENT (bad) rendering: raw text in a flat box */
+  .raw-bubble{max-width:760px;background:var(--surface-800);border:1px solid rgb(63 63 70 / .4);border-radius:8px;
+    padding:9px 12px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;color:var(--text-primary)}
+
+  /* markdown (port of index.css .cockpit-markdown + litellm .sessions-md) */
+  .md{color:var(--text-primary);overflow-wrap:anywhere}
+  .md > * + *{margin-top:.7rem} .md p{margin:0}
+  .md h1{font-size:1.18rem;font-weight:650;margin:.4rem 0 .3rem} .md h2{font-size:1.05rem;font-weight:600;margin:.5rem 0 .25rem}
+  .md h3{font-size:.95rem;font-weight:600;margin:.4rem 0 .2rem}
+  .md ul,.md ol{margin:.4rem 0;padding-left:1.4rem} .md ul{list-style:disc} .md ol{list-style:decimal} .md li{margin:.12rem 0}
+  .md strong{font-weight:650;color:var(--text-bright)}
+  .md a{color:var(--brand-500);text-decoration:underline;text-underline-offset:2px} .md a:hover{color:var(--brand-400)}
+  .md blockquote{border-left:2px solid var(--surface-700);padding-left:.75rem;color:var(--text-secondary);margin:.4rem 0}
+  .md :not(pre) > code{background:var(--surface-800);border:1px solid var(--surface-700);border-radius:.3rem;
+    padding:.02rem .3rem;font-family:var(--font-mono);font-size:.85em;color:#fcd9a8}
+  .md table{width:100%;border-collapse:collapse;font-size:.9em;margin:.2rem 0}
+  .md th{text-align:left;padding:.34rem .6rem;font-size:.7rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--text-dim);border-bottom:1px solid var(--surface-700);white-space:nowrap}
+  .md td{padding:.32rem .6rem;font-family:var(--font-mono);font-size:.78rem;color:var(--text-secondary);border-bottom:1px solid rgb(28 28 31 / .6)}
+  .md tbody tr:nth-child(even){background:rgb(28 28 31 / .35)}
+
+  /* code block with chrome + copy (litellm pre + a per-block copy override) */
+  .codeblock{margin:.55rem 0;border:1px solid var(--surface-700);border-radius:8px;overflow:hidden;background:var(--surface-950)}
+  .cb-head{display:flex;align-items:center;height:26px;padding:0 8px 0 11px;background:rgb(20 20 22 / .8);border-bottom:1px solid var(--surface-800)}
+  .cb-lang{font-family:var(--font-mono);font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em}
+  .cb-copy{margin-left:auto;font-size:10px;color:var(--text-secondary);background:transparent;border:none;cursor:pointer;padding:2px 6px;border-radius:5px}
+  .cb-copy:hover{background:var(--surface-800);color:var(--text-bright)}
+  .codeblock pre{margin:0;padding:9px 12px;overflow-x:auto;font-family:var(--font-mono);font-size:11.5px;line-height:1.6;color:#d7d7db}
+  .tok-k{color:#c08bd9} .tok-s{color:#9ece6a} .tok-c{color:var(--text-dim)} .tok-f{color:#7aa2f7}
+
+  /* tool cluster (litellm groupRenderItems → one "活动" block) */
+  .tools{border:1px solid rgb(63 63 70 / .45);border-radius:8px;background:rgb(20 20 22 / .5);overflow:hidden;max-width:760px}
+  .tools-head{display:flex;align-items:center;gap:8px;padding:7px 11px;cursor:pointer;font-size:12px;color:var(--text-secondary)}
+  .tools-head:hover{background:var(--surface-850)} .tools-head .chev{color:var(--text-dim);font-size:10px;transition:transform .15s}
+  .tools.open .tools-head .chev{transform:rotate(90deg)}
+  .tools-head .cap{margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--text-dim)}
+  .tools-body{display:none;border-top:1px solid var(--surface-800);padding:4px 0}
+  .tools.open .tools-body{display:block}
+  .trow{display:flex;align-items:center;gap:9px;padding:5px 12px;font-size:11.5px}
+  .trow .ti{width:14px;text-align:center;color:var(--text-muted)}
+  .trow .tn{color:var(--text-secondary)} .trow .td{font-family:var(--font-mono);font-size:10.5px;color:var(--text-dim);margin-left:2px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:330px}
+  .trow .ts{margin-left:auto;font-size:10px;font-weight:600;padding:1px 7px;border-radius:999px}
+  .ts.ok{color:var(--st-running);background:rgb(34 197 94 / .14)} .ts.run{color:var(--st-waiting);background:rgb(251 191 36 / .14)}
+
+  /* approval card (real, but richer per litellm tool-approval-panel) */
+  .approval{max-width:760px;border:1px solid rgb(245 158 11 / .3);background:rgb(245 158 11 / .08);border-radius:10px;padding:11px 13px}
+  .approval .at{color:var(--brand-400);font-size:12.5px;margin-bottom:3px} .approval .ad{font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);margin-bottom:9px}
+  .approval .ab{display:flex;gap:8px} .approval button{font-size:11.5px;border-radius:7px;padding:5px 14px;cursor:pointer;border:1px solid}
+  .ap-ok{color:#1a1206;background:var(--brand-500);border-color:var(--brand-500)} .ap-no{color:var(--text-secondary);background:transparent;border-color:var(--surface-700)}
+  .approval.done .ab{display:none} .approval .resolved{font-size:11px;color:var(--st-running)}
+
+  /* streaming indicator (3-dot, litellm) */
+  .typing{display:flex;gap:4px;align-items:center;padding:3px 0}
+  .typing i{width:6px;height:6px;border-radius:50%;background:var(--text-muted);opacity:.5;animation:tp 1s infinite}
+  .typing i:nth-child(2){animation-delay:.15s} .typing i:nth-child(3){animation-delay:.3s}
+  @keyframes tp{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:.9;transform:translateY(-2px)}}
+
+  /* per-turn hover meta footer (litellm) */
+  .turn{display:flex;flex-direction:column;gap:8px}
+  .meta{font-family:var(--font-mono);font-size:10px;color:rgb(113 113 122 / .55);display:flex;gap:9px;flex-wrap:wrap;transition:color .15s}
+  .turn:hover .meta{color:var(--text-muted)}
+  .meta .hb{padding:0 6px;border-radius:5px;background:rgb(217 119 87 / .15);color:var(--vendor-claude);font-weight:600}
+
+  /* back-to-bottom pill */
+  .b2b{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--text-bright);
+    background:var(--surface-800);border:1px solid var(--surface-700);border-radius:999px;padding:4px 12px;cursor:pointer;box-shadow:0 6px 20px -8px #000;display:none}
+
+  /* composer (the #1 fix) */
+  .composer-wrap{flex:none;border-top:1px solid rgb(63 63 70 / .4);padding:10px 14px 12px}
+  .composer{max-width:880px;margin:0 auto;border:1px solid var(--surface-700);border-radius:12px;background:var(--surface-850);
+    transition:border-color .15s,box-shadow .15s}
+  .composer.focus{border-color:var(--brand-600);box-shadow:0 0 0 1px rgb(217 119 6 / .4)}
+  .composer textarea{display:block;width:100%;resize:none;background:transparent;border:none;outline:none;color:var(--text-primary);
+    font-family:var(--font-sans);font-size:13.5px;line-height:1.5;padding:10px 13px 4px;min-height:24px;max-height:160px;field-sizing:content}
+  .composer textarea::placeholder{color:var(--text-dim)}
+  .cbar{display:flex;align-items:center;gap:10px;padding:4px 9px 7px 13px}
+  .chint{font-size:10.5px;color:var(--text-dim);display:flex;align-items:center;gap:7px}
+  .chint kbd{font-family:var(--font-mono);font-size:9.5px;color:var(--text-secondary);background:var(--surface-900);border:1px solid var(--surface-700);
+    border-radius:4px;padding:0 4px;line-height:15px}
+  .chint .ime{color:var(--accent-500)}
+  .cmodel{margin-left:auto;font-family:var(--font-mono);font-size:10.5px;color:var(--text-muted)}
+  .send{width:30px;height:30px;flex:none;border-radius:8px;border:none;cursor:pointer;display:grid;place-items:center;font-size:14px}
+  .send.go{background:var(--brand-500);color:#1a1206} .send.go:hover{background:var(--brand-400)}
+  .send.go:disabled{opacity:.35;cursor:default} .send.stop{background:var(--st-error);color:#fff}
+
+  .foot{border-top:1px solid var(--surface-800);padding:8px 14px;font-size:9.5px;line-height:1.5;color:var(--text-dim);background:var(--surface-950)}
+  .foot b{color:var(--text-muted)} .foot .y{color:var(--accent-500)} .foot .n{color:var(--text-dim)}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── SIDEBAR (real ChatConsole shell) ── -->
+  <aside class="side">
+    <div class="side-top"><span class="logo">ccteam <b>chat</b></span></div>
+    <div class="new-btn">＋ 新建 session</div>
+    <div class="tree">
+      <div class="tree-label">所有 session</div>
+      <div class="proj"><span class="fold">▾</span> excore</div>
+      <div class="sess-i on"><span class="dot run"></span><span class="vp claude">claude</span> cto <span class="sid">s31</span></div>
+      <div class="sess-i"><span class="dot idle"></span><span class="vp codex">codex</span> reviewer <span class="sid">s33</span></div>
+      <div class="proj"><span class="fold">▾</span> lap</div>
+      <div class="sess-i"><span class="dot wait"></span><span class="vp claude">claude</span> 裸 <span class="sid">s28</span></div>
+    </div>
+    <nav class="nav">
+      <a><span class="ic">🧩</span> 插件市场</a>
+      <a><span class="ic">📊</span> Status</a>
+      <a><span class="ic">🖥</span> 主机</a>
+      <a><span class="ic">⚙️</span> Settings</a>
+    </nav>
+  </aside>
+
+  <!-- ── MAIN = SessionView ── -->
+  <div class="main">
+    <div class="top">
+      <span class="conn"></span>
+      <span class="crumb"><b>excore</b><span class="sep">/</span>claude · cto<span class="sep">/</span><span style="font-family:var(--font-mono);color:var(--text-secondary)">s31</span></span>
+      <span class="pill-cost">今日 <b>$4.21</b> / $20</span>
+      <span class="av" style="margin-left:10px">A</span>
+    </div>
+
+    <div class="subbar">
+      <span class="proto-toggle" id="pt" onclick="toggleProto()">看现在的渲染 ▸</span>
+      <button class="sb-stop">停止</button>
+      <div class="tabs">
+        <button class="on" id="tab-chat" onclick="setTab('chat')">Chat</button>
+        <button id="tab-term" onclick="setTab('term')">终端</button>
+      </div>
+    </div>
+    <div class="statusline" id="statusline">opus[1m] · max effort · ctx 34k / 1M (3%) · 目标:把 matching engine 跑通</div>
+
+    <!-- CHAT -->
+    <div class="scroll" id="scroll" onscroll="onScroll()">
+      <div class="transcript" id="transcript">
+
+        <!-- user turn -->
+        <div class="msg user">帮我看下 matching engine 的撮合主循环，价格优先时间优先有没有写对？顺便给我一段跑单元测试的命令。</div>
+
+        <!-- assistant turn: tool cluster + rendered markdown + meta -->
+        <div class="turn">
+          <!-- ▼ NEW: tool activity collapses into one block -->
+          <div class="tools open proto-new" id="tc">
+            <div class="tools-head" onclick="document.getElementById('tc').classList.toggle('open')">
+              <span class="chev">▸</span> 活动 · 读了 2 个文件、跑了 1 条命令
+              <span class="cap">3 步 · 1.9s</span>
+            </div>
+            <div class="tools-body">
+              <div class="trow"><span class="ti">📄</span><span class="tn">Read</span><span class="td">crates/engine/src/match_loop.rs</span><span class="ts ok">✓ 完成</span></div>
+              <div class="trow"><span class="ti">📄</span><span class="tn">Read</span><span class="td">crates/engine/src/orderbook.rs</span><span class="ts ok">✓ 完成</span></div>
+              <div class="trow"><span class="ti">⌘</span><span class="tn">Bash</span><span class="td">cargo test -p engine match_loop</span><span class="ts ok">✓ 完成</span></div>
+            </div>
+          </div>
+
+          <!-- NEW rendered markdown -->
+          <div class="msg assistant md proto-new">
+            <p>撮合主循环整体是对的，<strong>价格优先</strong>已正确实现，但<strong>时间优先</strong>有一个边界 bug。</p>
+            <h3>问题</h3>
+            <p>同价位多笔挂单时，你用的是 <code>BTreeMap&lt;Price, Vec&lt;Order&gt;&gt;</code>，但 <code>Vec</code> 末尾 <code>push</code>、撮合却从 <code>pop()</code> 取——这会变成<strong>后到先成交（LIFO）</strong>，违反时间优先。</p>
+            <ul>
+              <li>应改成从队首取：用 <code>VecDeque</code> 的 <code>pop_front()</code>，或 <code>orders.remove(0)</code>。</li>
+              <li>撤单逻辑同理要按到达顺序保序。</li>
+            </ul>
+            <h3>价格 vs 时间优先 自检表</h3>
+            <table>
+              <thead><tr><th>场景</th><th>当前</th><th>应为</th></tr></thead>
+              <tbody>
+                <tr><td>不同价位</td><td>高买/低卖优先</td><td>价格优先 ✓</td></tr>
+                <tr><td>同价位</td><td>LIFO（错）</td><td>FIFO 时间优先</td></tr>
+              </tbody>
+            </table>
+            <h3>跑单元测试</h3>
+            <div class="codeblock">
+              <div class="cb-head"><span class="cb-lang">bash</span><button class="cb-copy" onclick="copyCode(this)">⧉ 复制</button></div>
+<pre><span class="tok-c"># 只跑撮合主循环相关用例</span>
+<span class="tok-f">cargo</span> test -p engine match_loop -- --nocapture
+
+<span class="tok-c"># 全量 + 看覆盖</span>
+<span class="tok-f">cargo</span> test -p engine <span class="tok-k">&amp;&amp;</span> <span class="tok-f">cargo</span> llvm-cov -p engine</pre>
+            </div>
+            <p>要我直接改 <code>match_loop.rs</code> 这个 bug 并补一条同价位 FIFO 的回归测试吗？</p>
+          </div>
+
+          <!-- OLD raw rendering (toggled in) -->
+          <div class="raw-bubble proto-old hide">撮合主循环整体是对的，**价格优先**已正确实现，但**时间优先**有一个边界 bug。
+
+### 问题
+同价位多笔挂单时，你用的是 `BTreeMap&lt;Price, Vec&lt;Order&gt;&gt;`，但 `Vec` 末尾 `push`、撮合却从 `pop()` 取——这会变成**后到先成交（LIFO）**，违反时间优先。
+
+- 应改成从队首取：用 `VecDeque` 的 `pop_front()`，或 `orders.remove(0)`。
+- 撤单逻辑同理要按到达顺序保序。
+
+### 跑单元测试
+```bash
+# 只跑撮合主循环相关用例
+cargo test -p engine match_loop -- --nocapture
+```
+
+要我直接改 `match_loop.rs` 这个 bug 并补一条同价位 FIFO 的回归测试吗？</div>
+
+          <div class="meta proto-new"><span class="hb">claude-code</span><span>opus[1m]</span><span>1.9s</span><span>↑ 4,210 ↓ 880 cache 30k</span><span>$0.041</span></div>
+        </div>
+
+        <!-- approval card (HITL) -->
+        <div class="approval proto-new" id="ap">
+          <div class="at">⏸ 需要批准 · Edit</div>
+          <div class="ad">crates/engine/src/match_loop.rs — 把 pop() 改成 pop_front()</div>
+          <div class="ab">
+            <button class="ap-ok" onclick="resolveAp('同意')">同意并继续</button>
+            <button class="ap-no" onclick="resolveAp('拒绝')">拒绝</button>
+          </div>
+          <div class="resolved hide"></div>
+        </div>
+
+        <div class="msg system proto-new">— 你切到了 opus[1m] · max effort —</div>
+      </div>
+
+      <button class="b2b" id="b2b" onclick="toBottom()">↓ 回到最新</button>
+    </div>
+
+    <!-- TERMINAL (stub) -->
+    <div class="scroll hide" id="termview" style="align-items:center;justify-content:center;display:none">
+      <div style="margin:auto;text-align:center;color:var(--text-dim);font-size:12px;font-family:var(--font-mono)">
+        逐字节保真终端（@wterm PTY）<br><span style="color:var(--text-muted)">stream-json session 无终端;terminal session 才显示</span>
+      </div>
+    </div>
+
+    <!-- COMPOSER (the #1 fix — live, IME-safe) -->
+    <div class="composer-wrap" id="composerwrap">
+      <div class="composer" id="composer">
+        <textarea id="ta" rows="1" placeholder="发消息 / 命令(/compact /clear /model …)… —— 试试输入中文按回车,不会再误发"></textarea>
+        <div class="cbar">
+          <div class="chint">
+            <span><kbd>Enter</kbd> 发送</span><span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+            <span class="ime" id="imehint">· 输入法候选回车不误发 ✓</span>
+          </div>
+          <span class="cmodel">opus[1m] · max</span>
+          <button class="send go" id="send" onclick="send()" title="发送">↑</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <b>这版做什么</b> · <span class="y">前端</span> 输入框(IME 守卫 + Shift+Enter + Send/Stop + 草稿保留 + 自增高) · <span class="y">前端</span> 消息渲染(markdown/代码块/表格 + 用户气泡/助手文档不对称 + 工具活动折叠 + 流式三点 + 贴底滚动 + hover 元信息) ·
+      <span class="y">小后端</span> SSE 事件补出 tool/thinking part(<b>chatTranscript.eventToRow</b> 现在丢掉了它们)。
+      <b>不碰</b>:<span class="n">No prompt injection / 不解析终端输出 / progress.jsonl SoT / session=一等实体</span> 红线;markdown 依赖(marked·remark-gfm)已装、<b>.cockpit-markdown</b> 样式已在,只是没接进会话。
+      <span style="float:right;color:var(--text-muted)">v0.8.19 原型 · 参考 litellm-agent-platform · 基于真实 SPA</span>
+    </div>
+  </div>
+</div>
+
+<script>
+  /* before/after rendering toggle */
+  var showOld=false;
+  function toggleProto(){
+    showOld=!showOld;
+    document.querySelectorAll('.proto-new').forEach(function(e){e.classList.toggle('hide',showOld);});
+    document.querySelectorAll('.proto-old').forEach(function(e){e.classList.toggle('hide',!showOld);});
+    var pt=document.getElementById('pt');
+    pt.classList.toggle('on',showOld);
+    pt.textContent=showOld?'◂ 看改版后':'看现在的渲染 ▸';
+    document.getElementById('statusline').classList.toggle('hide',showOld);
+  }
+
+  /* Chat | 终端 tab */
+  function setTab(t){
+    var chat=t==='chat';
+    document.getElementById('scroll').classList.toggle('hide',!chat);
+    document.getElementById('composerwrap').classList.toggle('hide',!chat);
+    document.getElementById('termview').style.display=chat?'none':'flex';
+    document.getElementById('tab-chat').classList.toggle('on',chat);
+    document.getElementById('tab-term').classList.toggle('on',!chat);
+  }
+
+  /* copy-code */
+  function copyCode(b){var o=b.textContent;b.textContent='✓ 已复制';setTimeout(function(){b.textContent=o;},1100);}
+
+  /* approval */
+  function resolveAp(v){var a=document.getElementById('ap');a.classList.add('done');
+    var r=a.querySelector('.resolved');r.classList.remove('hide');r.textContent='已回应:'+v;}
+
+  /* back-to-bottom */
+  var sc=document.getElementById('scroll'), nearBottom=true;
+  function onScroll(){var d=sc.scrollHeight-(sc.scrollTop+sc.clientHeight);nearBottom=d<120;
+    document.getElementById('b2b').style.display=nearBottom?'none':'block';}
+  function toBottom(){sc.scrollTop=sc.scrollHeight;}
+
+  /* ── LIVE composer — the actual fix, testable ── */
+  var ta=document.getElementById('ta'), composer=document.getElementById('composer'),
+      sendBtn=document.getElementById('send'), composing=false, busy=false;
+
+  ta.addEventListener('compositionstart',function(){composing=true;flashIme(true);});
+  ta.addEventListener('compositionend',function(){composing=false;flashIme(false);});
+  ta.addEventListener('focus',function(){composer.classList.add('focus');});
+  ta.addEventListener('blur',function(){composer.classList.remove('focus');});
+  ta.addEventListener('input',refreshBtn);
+  ta.addEventListener('keydown',function(e){
+    if(e.key==='Enter' && !e.shiftKey){
+      if(composing || e.isComposing || e.keyCode===229){return;} /* ← IME 守卫:候选回车不发送 */
+      e.preventDefault();
+      send();
+    }
+  });
+  function flashIme(on){var h=document.getElementById('imehint');
+    h.textContent=on?'· 正在输入法选词(回车=选字,不发送)':'· 输入法候选回车不误发 ✓';
+    h.style.color=on?'var(--brand-400)':'var(--accent-500)';}
+  function refreshBtn(){if(busy)return;sendBtn.disabled=ta.value.trim().length===0;}
+  function setBusy(on){busy=on;
+    sendBtn.className='send '+(on?'stop':'go');
+    sendBtn.textContent=on?'■':'↑';sendBtn.title=on?'停止':'发送';
+    if(!on)refreshBtn();else sendBtn.disabled=false;}
+
+  function send(){
+    if(busy){ /* morph = Stop */ setBusy(false); ta.focus(); return;}
+    var t=ta.value.trim(); if(!t)return;
+    addUser(t);
+    var keep=t; ta.value=''; refreshBtn(); toBottom(); setBusy(true);
+    /* simulate streaming reply so 三点指示器 + 渲染 都看得到 */
+    var turn=addAssistantTyping();
+    setTimeout(function(){
+      turn.querySelector('.typing').outerHTML=
+        '<div class="msg assistant md"><p>收到 ✓ 已把 <code>'+esc(keep.slice(0,40))+(keep.length>40?'…':'')+'</code> 作为一条 turn 发给 s31。</p>'+
+        '<p style="color:var(--text-muted);font-size:12px">（原型:真实环境这里会流式渲染 agent 的 markdown 回复)</p></div>'+
+        '<div class="meta"><span class="hb">claude-code</span><span>opus[1m]</span><span>0.6s</span><span>↑ 120 ↓ 64</span></div>';
+      setBusy(false); toBottom();
+    },1300);
+  }
+  function addUser(t){var d=document.createElement('div');d.className='msg user';d.textContent=t;
+    document.getElementById('transcript').appendChild(d);}
+  function addAssistantTyping(){var w=document.createElement('div');w.className='turn';
+    w.innerHTML='<div class="typing"><i></i><i></i><i></i></div>';
+    document.getElementById('transcript').appendChild(w);return w;}
+  function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  refreshBtn();
+</script>
+</body>
+</html>
