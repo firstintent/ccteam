@@ -5,15 +5,36 @@
 // Data: `GET /api/v1/status` (statusApi). Best-effort backend — a down daemon
 // degrades to `daemon_healthy:false` + zeroed cost, never a 500, so the view
 // always renders. The live session rail the shell already built is passed in
-// to enrich the sessions card (per-session lines), independent of the
-// aggregate counts.
+// to enrich the sessions card (a sortable @tanstack/react-table fleet table),
+// independent of the aggregate counts.
 //
 // Four states (v0.8.8 baseline): loading / error / empty (no sessions/cost) /
 // success. Theme tokens only (surface-*/brand-*/text-*/status-* + vendor-*).
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  flexRender,
+  getCoreRowModel,
+  getSortedRowModel,
+  useReactTable,
+  type ColumnDef,
+  type SortingState,
+} from "@tanstack/react-table";
+import { Inbox } from "lucide-react";
 import { getStatus, type StatusSnapshot } from "../lib/statusApi";
 import type { SessionView } from "../lib/sessionsApi";
+import {
+  Badge,
+  EmptyState,
+  SkeletonRows,
+  SortableHeader,
+  Table,
+  TableBody,
+  TableCell,
+  TableHeader,
+  TableRow,
+  type SortDirection,
+} from "../components/ui";
 import {
   budgetSeverity,
   formatCostBudget,
@@ -73,11 +94,8 @@ export default function StatusView({ rail }: { rail: SessionView[] }) {
 
       <div className="mt-4 space-y-3">
         {state.kind === "loading" ? (
-          <div
-            data-testid="status-loading"
-            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
-          >
-            加载运维状态中…
+          <div data-testid="status-loading">
+            <SkeletonRows rows={3} />
           </div>
         ) : state.kind === "error" ? (
           <div
@@ -95,6 +113,18 @@ export default function StatusView({ rail }: { rail: SessionView[] }) {
   );
 }
 
+/** One row of the fleet table — a live rail session joined to its per-sid cost. */
+interface FleetRow {
+  sid: string;
+  project: string;
+  vendor: string;
+  role: string;
+  cost: number;
+  /** Seconds since last activity, or null when the session never reported. */
+  activitySeconds: number | null;
+  status: string;
+}
+
 export function StatusCards({
   status,
   rail,
@@ -107,7 +137,25 @@ export function StatusCards({
   // v0.8.18 柱1 — per-session cost from /status's fleet list, joined to the
   // live rail by sid. The loop-ops console skeleton: this column is the seam
   // the loop version grows oracle/gate columns onto.
-  const costBySid = new Map((status.sessions ?? []).map((s) => [s.sid, s.cost_usd]));
+  const costBySid = useMemo(
+    () => new Map((status.sessions ?? []).map((s) => [s.sid, s.cost_usd])),
+    [status.sessions],
+  );
+
+  const rows: FleetRow[] = useMemo(
+    () =>
+      rail.map((s) => ({
+        sid: s.sid,
+        project: s.project,
+        vendor: s.vendor,
+        role: s.role || "(无 role)",
+        cost: costBySid.get(s.sid) ?? 0,
+        activitySeconds:
+          typeof s.last_activity_seconds === "number" ? s.last_activity_seconds : null,
+        status: s.status,
+      })),
+    [rail, costBySid],
+  );
 
   return (
     <>
@@ -144,43 +192,15 @@ export function StatusCards({
         <div className="text-sm font-medium text-text-primary mb-1.5">
           会话（{status.sessions_live} live · {status.sessions_idle} idle）
         </div>
-        {rail.length === 0 ? (
-          <div className="text-xs text-text-dim">没有活动会话。</div>
+        {rows.length === 0 ? (
+          <EmptyState
+            icon={Inbox}
+            title="没有活动会话"
+            description="从聊天面板或新建会话开始，会话会出现在这里。"
+            className="border-0 bg-transparent py-6"
+          />
         ) : (
-          <div className="space-y-1">
-            {rail.map((s) => {
-              const activity = sessionActivityMeta(s.status);
-              return (
-                <div key={s.sid} className="text-xs text-text-secondary flex items-center gap-2">
-                  <span className="font-mono text-text-dim">{s.project}</span>
-                  <span className="text-text-dim">/</span>
-                  <span
-                    className={s.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}
-                >
-                  {[s.vendor, s.role || "(无 role)"].filter(Boolean).join(" · ")}
-                </span>
-                <span className="font-mono text-text-dim">{s.sid}</span>
-                  <span
-                    data-testid={`session-cost-${s.sid}`}
-                    className="font-mono text-text-secondary"
-                    title="本会话累计成本（best-effort）"
-                  >
-                    {formatUsd(costBySid.get(s.sid) ?? 0)}
-                  </span>
-                  {typeof s.last_activity_seconds === "number" ? (
-                    <span className="text-[10px] text-text-dim">
-                      最近活动 {formatActivityAge(s.last_activity_seconds)}前
-                    </span>
-                  ) : null}
-                  <span
-                    className={`ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-full ${activity.className}`}
-                  >
-                    {activity.label}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+          <FleetTable rows={rows} />
         )}
       </div>
 
@@ -229,6 +249,147 @@ export function StatusCards({
         ) : null}
       </div>
     </>
+  );
+}
+
+/** The sortable fleet table — one row per live rail session. Sorting is a
+ *  client enhancement; the initial (sid-ascending) server render already emits
+ *  every row + value so the SSR smoke tests see the data without a DOM. */
+function FleetTable({ rows }: { rows: FleetRow[] }) {
+  // Default sort by sid asc so the SSR order is stable + deterministic.
+  const [sorting, setSorting] = useState<SortingState>([{ id: "sid", desc: false }]);
+
+  const columns = useMemo<ColumnDef<FleetRow>[]>(
+    () => [
+      {
+        accessorKey: "project",
+        header: ({ column }) => (
+          <SortableHeader sorted={column.getIsSorted() as SortDirection} onSort={column.getToggleSortingHandler()}>
+            项目
+          </SortableHeader>
+        ),
+        cell: ({ row }) => (
+          <span className="font-mono text-text-secondary">{row.original.project}</span>
+        ),
+      },
+      {
+        id: "sid",
+        accessorKey: "sid",
+        header: ({ column }) => (
+          <SortableHeader sorted={column.getIsSorted() as SortDirection} onSort={column.getToggleSortingHandler()}>
+            agent · sid
+          </SortableHeader>
+        ),
+        cell: ({ row }) => (
+          <span className="flex items-center gap-2">
+            <span
+              className={
+                row.original.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"
+              }
+            >
+              {[row.original.vendor, row.original.role].filter(Boolean).join(" · ")}
+            </span>
+            <span className="font-mono text-text-dim">{row.original.sid}</span>
+          </span>
+        ),
+      },
+      {
+        accessorKey: "cost",
+        header: ({ column }) => (
+          <SortableHeader
+            sorted={column.getIsSorted() as SortDirection}
+            onSort={column.getToggleSortingHandler()}
+            align="right"
+          >
+            成本
+          </SortableHeader>
+        ),
+        cell: ({ row }) => (
+          <span
+            data-testid={`session-cost-${row.original.sid}`}
+            className="block text-right font-mono tabular-nums text-text-secondary"
+            title="本会话累计成本（best-effort）"
+          >
+            {formatUsd(row.original.cost)}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "activitySeconds",
+        header: ({ column }) => (
+          <SortableHeader
+            sorted={column.getIsSorted() as SortDirection}
+            onSort={column.getToggleSortingHandler()}
+            align="right"
+          >
+            最近活动
+          </SortableHeader>
+        ),
+        // null (never reported) sorts last when ascending.
+        sortUndefined: "last",
+        cell: ({ row }) => (
+          <span className="block text-right tabular-nums text-text-dim">
+            {row.original.activitySeconds === null
+              ? "—"
+              : `${formatActivityAge(row.original.activitySeconds)}前`}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "status",
+        header: ({ column }) => (
+          <SortableHeader
+            sorted={column.getIsSorted() as SortDirection}
+            onSort={column.getToggleSortingHandler()}
+            align="right"
+          >
+            状态
+          </SortableHeader>
+        ),
+        cell: ({ row }) => {
+          const meta = sessionActivityMeta(row.original.status);
+          return (
+            <span className="flex justify-end">
+              <Badge className={meta.className}>{meta.label}</Badge>
+            </span>
+          );
+        },
+      },
+    ],
+    [],
+  );
+
+  // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Table returns non-memoizable functions; the React Compiler skips this component, which is fine (the fleet table is small + re-renders cheaply).
+  const table = useReactTable({
+    data: rows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  return (
+    <Table data-testid="fleet-table">
+      <TableHeader>
+        {table.getHeaderGroups().map((hg) => (
+          <tr key={hg.id}>
+            {hg.headers.map((h) =>
+              flexRender(h.column.columnDef.header, h.getContext()),
+            )}
+          </tr>
+        ))}
+      </TableHeader>
+      <TableBody>
+        {table.getRowModel().rows.map((r) => (
+          <TableRow key={r.id}>
+            {r.getVisibleCells().map((c) => (
+              <TableCell key={c.id}>{flexRender(c.column.columnDef.cell, c.getContext())}</TableCell>
+            ))}
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   );
 }
 

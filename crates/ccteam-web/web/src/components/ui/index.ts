@@ -9,3 +9,15 @@ export { Textarea } from "./textarea";
 export { Label } from "./label";
 export { Dialog, type DialogProps } from "./dialog";
 export { Combobox, type ComboboxOption, type ComboboxProps } from "./combobox";
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+  SortableHeader,
+  type SortDirection,
+} from "./table";
+export { Skeleton, SkeletonRows } from "./skeleton";
+export { EmptyState } from "./empty-state";

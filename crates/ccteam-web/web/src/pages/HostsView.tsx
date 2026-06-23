@@ -6,16 +6,31 @@
 // server into the vendor config — never a vendor login, never a CLI install).
 //
 // Data: `GET /api/v1/hosts/{host}` (hostsApi); `refresh` forces a re-probe.
-// Theme tokens only (surface-*/brand-*/text-*/status-* + vendor-*), reusing
-// the StatusView card shape so the two setup/runtime surfaces feel one.
+// Theme tokens only (surface-*/brand-*/text-*/status-* + vendor-*). The
+// per-agent cards stay CARDS (not a table): each is a header status badge +
+// install/version/MCP detail + an optional register CTA — a card pattern, and
+// at most a couple agents per host. They standardize on the Card primitive so
+// the surface reads one with Status/Marketplace.
 
 import { useCallback, useEffect, useState } from "react";
+import { RefreshCw, ServerOff } from "lucide-react";
 import {
   getHostDetail,
   registerMcp,
   type AgentHealth,
   type HostDetail,
 } from "../lib/hostsApi";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+  Skeleton,
+  type BadgeProps,
+} from "../components/ui";
 
 type LoadState =
   | { kind: "loading" }
@@ -95,15 +110,17 @@ export default function HostsView() {
             这台机器装了哪些 agent、登录/MCP 注册状态。机器为主轴，将来分布式会列出每台。
           </p>
         </div>
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           data-testid="hosts-refresh"
           onClick={onRefresh}
           disabled={busy !== null}
-          className="ml-auto shrink-0 rounded-md border border-surface-700/60 bg-surface-800 px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:border-surface-700 disabled:opacity-50"
+          className="ml-auto shrink-0"
         >
+          <RefreshCw className={busy === REFRESH ? "animate-spin" : ""} />
           {busy === REFRESH ? "重探中…" : "重新探测"}
-        </button>
+        </Button>
       </div>
 
       {actionError ? (
@@ -118,11 +135,10 @@ export default function HostsView() {
 
       <div className="mt-4 space-y-3">
         {state.kind === "loading" ? (
-          <div
-            data-testid="hosts-loading"
-            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
-          >
-            探测主机中…
+          <div data-testid="hosts-loading" className="space-y-3">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-24 w-full" />
+            <Skeleton className="h-24 w-full" />
           </div>
         ) : state.kind === "error" ? (
           <div
@@ -154,28 +170,34 @@ export function HostDetailCards({
       {/* hostname / machine bar */}
       <div
         data-testid="host-bar"
-        className="rounded-lg bg-surface-900 border border-surface-700/60 px-4 py-3 flex items-center gap-2.5 flex-wrap"
+        className="rounded-lg bg-surface-900 ring-1 ring-surface-700/50 px-4 py-3 flex items-center gap-2.5 flex-wrap"
       >
         <span className="h-2.5 w-2.5 rounded-full bg-status-running" aria-hidden />
         <span className="text-sm font-semibold text-text-primary">{host.hostname}</span>
-        <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-brand-500/15 text-brand-400">
-          {host.is_local ? "本机 local" : host.host}
-        </span>
-        <span className="ml-auto font-mono text-[11px] text-text-dim">
+        <Badge variant="brand">{host.is_local ? "本机 local" : host.host}</Badge>
+        <span className="ml-auto font-mono text-[11px] text-text-dim tabular-nums">
           {host.os}/{host.arch} · ccteam {host.ccteam_version}
         </span>
       </div>
 
       {/* agents */}
-      {host.agents.map((agent) => (
-        <AgentCard
-          key={agent.vendor}
-          agent={agent}
-          busy={busy === agent.vendor}
-          disabled={busy !== null}
-          onRegister={() => onRegister(agent.vendor)}
+      {host.agents.length === 0 ? (
+        <EmptyState
+          icon={ServerOff}
+          title="这台主机没有探测到 agent"
+          description="未在 PATH 上发现 claude / codex。安装后点上方「重新探测」。"
         />
-      ))}
+      ) : (
+        host.agents.map((agent) => (
+          <AgentCard
+            key={agent.vendor}
+            agent={agent}
+            busy={busy === agent.vendor}
+            disabled={busy !== null}
+            onRegister={() => onRegister(agent.vendor)}
+          />
+        ))
+      )}
     </>
   );
 }
@@ -194,56 +216,57 @@ function AgentCard({
   const sev = statusMeta(agent.status);
   const vendorClass = agent.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex";
   return (
-    <div
-      data-testid={`agent-card-${agent.vendor}`}
-      className="rounded-lg bg-surface-900 border border-surface-700/60 px-4 py-3"
-    >
-      <div className="flex items-center gap-2">
-        <span className={`text-sm font-medium ${vendorClass}`}>{agent.vendor}</span>
+    <Card data-testid={`agent-card-${agent.vendor}`}>
+      <CardHeader>
+        <CardTitle className={vendorClass}>{agent.vendor}</CardTitle>
         <span className="text-[11px] text-text-dim">{agent.harness_id}</span>
-        <span
+        <Badge
+          variant={sev.variant}
+          className={sev.className}
           data-testid={`agent-status-${agent.vendor}`}
-          className={`ml-auto text-[11px] font-medium px-2 py-0.5 rounded-full ${sev.className}`}
         >
           {sev.label}
-        </span>
-      </div>
+        </Badge>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-center gap-2 text-xs text-text-secondary flex-wrap">
+          <span>{agent.installed ? "已安装" : "未安装"}</span>
+          {agent.version ? <span className="font-mono text-text-dim">{agent.version}</span> : null}
+          <span className="text-text-dim">·</span>
+          <span>{agent.mcp_registered ? "MCP 已注册" : "MCP 未注册"}</span>
+        </div>
 
-      <div className="mt-1.5 flex items-center gap-2 text-xs text-text-secondary flex-wrap">
-        <span>{agent.installed ? "已安装" : "未安装"}</span>
-        {agent.version ? <span className="font-mono text-text-dim">{agent.version}</span> : null}
-        <span className="text-text-dim">·</span>
-        <span>{agent.mcp_registered ? "MCP 已注册" : "MCP 未注册"}</span>
-      </div>
+        {agent.hint ? <div className="mt-2 text-[11px] text-text-dim">{agent.hint}</div> : null}
 
-      {agent.hint ? (
-        <div className="mt-2 text-[11px] text-text-dim">{agent.hint}</div>
-      ) : null}
-
-      {agent.installed && !agent.mcp_registered ? (
-        <button
-          type="button"
-          data-testid={`register-mcp-${agent.vendor}`}
-          onClick={onRegister}
-          disabled={disabled}
-          className="mt-2 rounded-md border border-brand-500/40 bg-brand-500/10 px-3 py-1.5 text-xs font-medium text-brand-400 hover:bg-brand-500/20 disabled:opacity-50"
-        >
-          {busy ? "注册中…" : "注册 ccteam MCP"}
-        </button>
-      ) : null}
-    </div>
+        {agent.installed && !agent.mcp_registered ? (
+          <Button
+            size="sm"
+            data-testid={`register-mcp-${agent.vendor}`}
+            onClick={onRegister}
+            disabled={disabled}
+            className="mt-2 border border-brand-500/40 bg-brand-500/10 text-brand-400 hover:bg-brand-500/20"
+          >
+            {busy ? "注册中…" : "注册 ccteam MCP"}
+          </Button>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 
-function statusMeta(status: string): { label: string; className: string } {
+function statusMeta(status: string): {
+  label: string;
+  variant: BadgeProps["variant"];
+  className?: string;
+} {
   switch (status) {
     case "ready":
-      return { label: "就绪", className: "bg-status-running/15 text-status-running" };
+      return { label: "就绪", variant: "running" };
     case "needs_config":
-      return { label: "需配置", className: "bg-status-waiting/15 text-status-waiting" };
+      return { label: "需配置", variant: "waiting" };
     case "not_installed":
-      return { label: "未安装", className: "bg-surface-700/50 text-text-dim" };
+      return { label: "未安装", variant: "idle", className: "bg-surface-700/50 text-text-dim" };
     default:
-      return { label: status, className: "bg-surface-700/50 text-text-dim" };
+      return { label: status, variant: "idle", className: "bg-surface-700/50 text-text-dim" };
   }
 }

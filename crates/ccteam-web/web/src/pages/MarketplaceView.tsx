@@ -24,8 +24,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-import { ExternalLink, RefreshCw, X } from "lucide-react";
-import { Combobox, Dialog, type ComboboxOption } from "../components/ui";
+import { ExternalLink, PackageOpen, RefreshCw, X } from "lucide-react";
+import {
+  Button,
+  Combobox,
+  Dialog,
+  EmptyState,
+  Skeleton,
+  type ComboboxOption,
+} from "../components/ui";
 import { fetchDashboard } from "../lib/dashboardApi";
 import {
   getMarketplace,
@@ -312,9 +319,23 @@ export default function MarketplaceView() {
         {state.kind === "loading" ? (
           <div
             data-testid="marketplace-loading"
-            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
+            className="grid gap-3"
+            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" }}
           >
-            加载市场目录中…
+            {Array.from({ length: 6 }, (_, i) => (
+              <div
+                key={i}
+                className="flex flex-col gap-2 rounded-lg bg-surface-900 border border-surface-700/60 p-3.5"
+              >
+                <Skeleton className="h-4 w-2/3" />
+                <Skeleton className="h-3 w-full" />
+                <Skeleton className="h-3 w-5/6" />
+                <div className="mt-1 flex items-center gap-2">
+                  <Skeleton className="h-3 w-10" />
+                  <Skeleton className="ml-auto h-6 w-16" />
+                </div>
+              </div>
+            ))}
           </div>
         ) : state.kind === "error" ? (
           <div
@@ -332,14 +353,22 @@ export default function MarketplaceView() {
             </button>
           </div>
         ) : visible.length === 0 ? (
-          <div
+          <EmptyState
             data-testid="marketplace-empty"
-            className="rounded-lg border border-dashed border-surface-700/60 bg-surface-900/40 px-4 py-8 text-center text-xs text-text-dim"
-          >
-            {query.trim()
-              ? `没有匹配「${query.trim()}」的插件。`
-              : "该类目暂无插件。"}
-          </div>
+            icon={PackageOpen}
+            title={query.trim() ? `没有匹配「${query.trim()}」的插件` : "该类目暂无插件"}
+            description={
+              query.trim()
+                ? "换个关键词，或清空搜索看全部。"
+                : "切换上方类目/来源，或刷新目录重新拉取 hub。"
+            }
+            action={
+              <Button variant="outline" size="sm" onClick={() => reload(true)} disabled={refreshing}>
+                <RefreshCw className={refreshing ? "animate-spin" : ""} />
+                刷新目录
+              </Button>
+            }
+          />
         ) : (
           <div
             data-testid="marketplace-grid"
