@@ -69,9 +69,10 @@ export default function SessionView({
   onSessionChanged?: () => void;
 }) {
   const [view, setView] = useState<"chat" | "terminal">("chat");
-  // A turn is "in flight" from submit until the next `done` SSE frame; drives
-  // the composer's Send⇄Stop morph.
-  const [busy, setBusy] = useState(false);
+  // Composer Send⇄Stop morph. Derived (NOT a setState-in-effect): we mark the
+  // done-count captured at submit; `busy` holds until a new `done` SSE frame
+  // advances the count past that mark.
+  const [busyMark, setBusyMark] = useState<number | null>(null);
 
   // Per-sid transcript. Seeded from localStorage on MOUNT, then from mirrored
   // history, then live-appended from SSE. Because `sid` is fixed per instance,
@@ -138,6 +139,7 @@ export default function SessionView({
   // light effect on it (no timer/polling).
   const [statusLine, setStatusLine] = useState<string | null>(null);
   const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
+  const busy = busyMark !== null && doneCount === busyMark;
   useEffect(() => {
     let cancelled = false;
     getSessionStatus(sid)
@@ -153,12 +155,6 @@ export default function SessionView({
     };
   }, [sid, doneCount]);
 
-  // Un-morph the composer (Stop→Send) when the running turn finishes: a new
-  // `done` SSE frame advances doneCount.
-  useEffect(() => {
-    setBusy(false);
-  }, [doneCount]);
-
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
   }, []);
@@ -167,16 +163,16 @@ export default function SessionView({
   const submitText = useCallback(
     (content: string) => {
       pushRow({ kind: "user", content });
-      setBusy(true);
+      setBusyMark(doneCount);
       submitTurn(sid, content).catch((e) => {
-        setBusy(false);
+        setBusyMark(null);
         pushRow({
           kind: "system",
           content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
         });
       });
     },
-    [sid, pushRow],
+    [sid, pushRow, doneCount],
   );
 
   // ---- resolve a W2 approval prompt (R-H1) -------------------------------

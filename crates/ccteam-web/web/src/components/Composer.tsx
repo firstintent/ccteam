@@ -12,12 +12,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Send, Square } from "lucide-react";
+import { Button } from "./ui/button";
 
 /** Pure decision for the composer's Enter keydown — extracted so the IME guard
  *  (the owner's #1 bug) is unit-testable in the node/SSR test env. Returns
  *  false while a CJK candidate is composing (`isComposing` / legacy keyCode
  *  229), on Shift+Enter (newline), and for any non-Enter key; true for a plain
  *  Enter or Cmd/Ctrl+Enter on a finished line. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure predicate co-located with the Composer so it's unit-testable in node.
 export function shouldSubmitOnEnter(e: {
   key: string;
   shiftKey: boolean;
@@ -121,26 +123,26 @@ export function Composer({
           placeholder={placeholder ?? "发消息 / 命令(/compact /clear /model …)…"}
         />
         {showStop ? (
-          <button
-            type="button"
+          <Button
+            size="icon"
             data-testid="composer-stop"
             onClick={onStop}
             title="停止当前回合"
-            className="m-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-status-error text-white hover:opacity-90"
+            className="m-1 shrink-0 bg-status-error text-white hover:bg-status-error/90"
           >
-            <Square className="h-4 w-4" />
-          </button>
+            <Square />
+          </Button>
         ) : (
-          <button
-            type="button"
+          <Button
+            size="icon"
             data-testid="composer-send"
             onClick={send}
             disabled={!draft.trim()}
             title="发送 (Enter)"
-            className="m-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40"
+            className="m-1 shrink-0"
           >
-            <Send className="h-4 w-4" />
-          </button>
+            <Send />
+          </Button>
         )}
       </div>
       <div className="mt-1 px-1 text-[10px] text-text-dim">
