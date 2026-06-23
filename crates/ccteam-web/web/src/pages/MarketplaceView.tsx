@@ -25,6 +25,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { ExternalLink, RefreshCw, X } from "lucide-react";
+import { Combobox, Dialog, type ComboboxOption } from "../components/ui";
 import { fetchDashboard } from "../lib/dashboardApi";
 import {
   getMarketplace,
@@ -151,6 +152,16 @@ export default function MarketplaceView() {
     [state],
   );
 
+  // Combobox option lists (project target + source filter).
+  const projectOptions: ComboboxOption[] = useMemo(
+    () => projects.map((p) => ({ value: p, label: p })),
+    [projects],
+  );
+  const sourceOptions: ComboboxOption[] = useMemo(
+    () => [{ value: SRC_ALL, label: "全部来源" }, ...sources.map((s) => ({ value: s, label: s }))],
+    [sources],
+  );
+
   // The cards to show = category + source + search filtered.
   const visible = useMemo(() => {
     if (state.kind !== "ready") return [];
@@ -236,24 +247,22 @@ export default function MarketplaceView() {
       <div className="mt-4 flex flex-wrap items-center gap-2.5">
         <label className="flex items-center gap-1.5 text-xs text-text-dim">
           安装到
-          <select
+          <Combobox
             value={project}
-            onChange={(e) => {
+            onChange={(v) => {
               // Switching the install target re-fetches (the load effect keys
               // on `project`); show the loading state immediately for feedback.
-              setProject(e.target.value);
+              setProject(v);
               setState({ kind: "loading" });
             }}
-            className="h-8 rounded-md bg-surface-800 border border-surface-700 px-2.5 text-xs text-text-primary outline-none focus:border-brand-500"
-            aria-label="安装目标项目"
-          >
-            {projects.length === 0 ? <option value="">（无项目 · 仅浏览）</option> : null}
-            {projects.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
+            options={projectOptions}
+            searchable={projects.length > 8}
+            placeholder="（无项目 · 仅浏览）"
+            searchPlaceholder="搜索项目…"
+            ariaLabel="安装目标项目"
+            className="min-w-[160px]"
+            buttonClassName="h-8 text-xs"
+          />
         </label>
 
         <div className="flex items-center gap-0.5 rounded-md bg-surface-800 p-0.5" role="tablist">
@@ -278,19 +287,16 @@ export default function MarketplaceView() {
           ))}
         </div>
 
-        <select
+        <Combobox
           value={source}
-          onChange={(e) => setSource(e.target.value)}
-          className="h-8 rounded-md bg-surface-800 border border-surface-700 px-2.5 text-xs text-text-primary outline-none focus:border-brand-500"
-          aria-label="来源筛选"
-        >
-          <option value={SRC_ALL}>全部来源</option>
-          {sources.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
+          onChange={setSource}
+          options={sourceOptions}
+          searchable={sources.length > 8}
+          searchPlaceholder="搜索来源…"
+          ariaLabel="来源筛选"
+          className="min-w-[140px]"
+          buttonClassName="h-8 text-xs"
+        />
 
         <input
           value={query}
@@ -566,23 +572,12 @@ export function PluginDrawer({
   }, [plugin.id]);
 
   return (
-    <div
-      className="fixed inset-0 z-50 bg-black/50 flex justify-end"
-      onClick={onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label={`插件详情 ${plugin.name || plugin.id}`}
-    >
-      <div
-        className="w-full max-w-xl h-full bg-surface-900 border-l border-surface-700 shadow-xl flex flex-col animate-slide-in-right"
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.preventDefault();
-            onClose();
-          }
-        }}
-      >
+    <Dialog
+      open
+      onClose={onClose}
+      placement="end"
+      ariaLabel={`插件详情 ${plugin.name || plugin.id}`}
+      header={
         <div className="h-12 shrink-0 px-4 flex items-center gap-2 border-b border-surface-700/50">
           <b className="text-sm text-text-primary truncate">{plugin.name || plugin.id}</b>
           <SourceBadge source={plugin.source} />
@@ -596,8 +591,9 @@ export function PluginDrawer({
             <X className="h-4 w-4" />
           </button>
         </div>
-
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+      }
+    >
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
           <p className="text-sm text-text-secondary">{plugin.description}</p>
           <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-text-dim">
             <span>id: {plugin.id}</span>
@@ -678,7 +674,6 @@ export function PluginDrawer({
             </button>
           )}
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }

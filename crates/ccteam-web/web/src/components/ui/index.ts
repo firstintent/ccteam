@@ -7,3 +7,5 @@ export { Badge, badgeVariants, type BadgeProps } from "./badge";
 export { Input } from "./input";
 export { Textarea } from "./textarea";
 export { Label } from "./label";
+export { Dialog, type DialogProps } from "./dialog";
+export { Combobox, type ComboboxOption, type ComboboxProps } from "./combobox";

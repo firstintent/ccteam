@@ -29,6 +29,7 @@ import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
 import { Activity, MessageSquare, Menu, Plus, Puzzle, Server, Settings, X } from "lucide-react";
 import CostPill from "../components/CostPill";
 import AvatarMenu from "../components/AvatarMenu";
+import { Combobox, type ComboboxOption } from "../components/ui";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
 import HostsView from "./HostsView";
@@ -677,6 +678,16 @@ export function NewSessionModal({
   // set (existing + new project), so a roleless session is always reachable
   // and never the silent default (resolveRole keeps `cto` as the no-pick
   // fallback).
+  // Project picker options: the registered ∪ session projects, then the
+  // "＋ new project…" sentinel. The "(no existing projects)" empty marker is
+  // only offered when the list is truly empty (and not already creating one).
+  const projectOptions: ComboboxOption[] = useMemo(() => {
+    const opts: ComboboxOption[] = projects.map((p) => ({ value: p, label: p }));
+    if (projects.length === 0 && !isNew) opts.push({ value: "", label: "（暂无已有项目）" });
+    opts.push({ value: NEW_PROJECT, label: "＋ 新建项目…" });
+    return opts;
+  }, [projects, isNew]);
+
   const roleChoices: { value: string; label: string }[] = useMemo(() => {
     const roleless = { value: ROLELESS, label: "(无角色 / 裸 claude)" };
     if (!isNew && roleState.kind === "ready" && roleState.roles.length > 0) {
@@ -769,22 +780,15 @@ export function NewSessionModal({
         </div>
         <div className="p-4 space-y-3">
           <label className="block text-xs text-text-dim">项目</label>
-          <select
+          <Combobox
             value={project}
-            onChange={(event) => setProject(event.target.value)}
+            onChange={setProject}
+            options={projectOptions}
             disabled={pending}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
-          >
-            {projects.length === 0 && !isNew ? (
-              <option value="">（暂无已有项目）</option>
-            ) : null}
-            {projects.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-            <option value={NEW_PROJECT}>＋ 新建项目…</option>
-          </select>
+            searchable={projects.length > 8}
+            searchPlaceholder="搜索项目…"
+            ariaLabel="项目"
+          />
 
           {isNew ? (
             <div className="space-y-3 rounded-md border border-brand-500/30 bg-brand-500/5 p-3">
@@ -845,18 +849,15 @@ export function NewSessionModal({
               <span className="text-[10px] text-text-dim">加载角色中…</span>
             ) : null}
           </div>
-          <select
+          <Combobox
             value={selectedRole}
-            onChange={(event) => setRole(event.target.value)}
+            onChange={setRole}
+            options={roleChoices}
             disabled={pending || roleLoading}
-            className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-3 text-sm outline-none focus:border-brand-500 disabled:opacity-40"
-          >
-            {roleChoices.map((c) => (
-              <option key={c.value} value={c.value}>
-                {c.label}
-              </option>
-            ))}
-          </select>
+            searchable={roleChoices.length > 8}
+            searchPlaceholder="搜索角色…"
+            ariaLabel="Role"
+          />
 
           <label className="flex items-center gap-2 text-xs text-text-secondary">
             <input
