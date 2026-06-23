@@ -1,20 +1,30 @@
 // v0.8.18 柱2/UI — the avatar button + personal-settings popover (top bar).
 //
-// Personal settings (display name / avatar / interface language / logout) live
-// behind the avatar, distinct from the global/admin Settings page. Stored
-// per-browser via useWebSettings in 档0 (no per-user web identity yet); 档1
-// ties them to the server identity.
+// Personal settings (display name / avatar / interface language / theme /
+// logout) live behind the avatar, distinct from the global/admin Settings
+// page. Stored per-browser via useWebSettings in 档0 (no per-user web identity
+// yet); 档1 ties them to the server identity.
 //
 // `AvatarPopover` is split out as a PURE, props-driven component so it is
 // SSR-testable (the node-env vitest suite has no DOM / click events).
+//
+// v0.8.19 — emoji avatar swatches → color dots; added the single-icon
+// light/dark theme toggle (Sun in dark = go light, Moon in light = go dark).
 
 import { useState } from "react";
+import { LogOut, Moon, Sun } from "lucide-react";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { clearToken } from "../lib/token";
 import { tr, type Lang } from "../lib/i18n";
 
-/** The fixed avatar palette. */
-const AVATARS = ["🟧", "🟦", "🟩", "🟪", "⬛"];
+/** The fixed avatar color palette (hex) — replaces the old emoji swatches. */
+const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
+
+/** A stored avatar is a hex color; fall back to the default for any legacy
+ *  (emoji) value so old localStorage never renders a broken swatch. */
+function avatarColor(v: string): string {
+  return /^#[0-9a-fA-F]{3,8}$/.test(v) ? v : "#f59e0b";
+}
 
 /** Pure, props-driven popover body — no hooks, so it renders under SSR for
  *  tests. The stateful [`AvatarMenu`] wraps it. */
@@ -22,17 +32,21 @@ export function AvatarPopover({
   lang,
   displayName,
   avatar,
+  theme,
   onLanguage,
   onName,
   onAvatar,
+  onTheme,
   onLogout,
 }: {
   lang: Lang;
   displayName: string;
   avatar: string;
+  theme: "dark" | "light";
   onLanguage: (l: Lang) => void;
   onName: (n: string) => void;
   onAvatar: (a: string) => void;
+  onTheme: () => void;
   onLogout: () => void;
 }) {
   return (
@@ -64,12 +78,14 @@ export function AvatarPopover({
             data-testid={`avatar-swatch-${a}`}
             onClick={() => onAvatar(a)}
             aria-pressed={avatar === a}
-            className={`grid h-6 w-6 place-items-center rounded ${
-              avatar === a ? "ring-2 ring-brand-500" : "opacity-70 hover:opacity-100"
+            aria-label={a}
+            style={{ backgroundColor: a }}
+            className={`h-6 w-6 rounded-full transition-opacity ${
+              avatar === a
+                ? "ring-2 ring-text-bright"
+                : "opacity-60 hover:opacity-100"
             }`}
-          >
-            <span aria-hidden>{a}</span>
-          </button>
+          />
         ))}
       </div>
 
@@ -105,13 +121,28 @@ export function AvatarPopover({
         </div>
       </div>
 
+      <div className="mt-3 flex items-center gap-2">
+        <span className="text-[11px] text-text-dim">{tr(lang, "主题", "Theme")}</span>
+        <button
+          type="button"
+          data-testid="theme-toggle"
+          onClick={onTheme}
+          aria-label={tr(lang, "切换明暗", "Toggle theme")}
+          title={tr(lang, "切换明暗", "Toggle theme")}
+          className="ml-auto grid h-7 w-7 place-items-center rounded-md border border-surface-700/60 text-text-secondary hover:bg-surface-800 hover:text-text-primary"
+        >
+          {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+        </button>
+      </div>
+
       <button
         type="button"
         data-testid="avatar-logout"
         onClick={onLogout}
-        className="mt-3 w-full border-t border-surface-800 pt-2 text-left text-[11px] text-status-error hover:text-status-error/80"
+        className="mt-3 flex w-full items-center gap-1.5 border-t border-surface-800 pt-2 text-left text-[11px] text-status-error hover:text-status-error/80"
       >
-        {tr(lang, "⎋ 登出（清你的 token）", "⎋ Log out (clears your token)")}
+        <LogOut className="h-3.5 w-3.5" />
+        {tr(lang, "登出（清你的 token）", "Log out (clears your token)")}
       </button>
     </div>
   );
@@ -122,6 +153,7 @@ export default function AvatarMenu() {
   const { settings, update } = useWebSettings();
   const [open, setOpen] = useState(false);
   const lang = settings.language;
+  const initial = (settings.displayName || "").trim().slice(0, 1).toUpperCase();
 
   const logout = () => {
     clearToken();
@@ -138,9 +170,10 @@ export default function AvatarMenu() {
         data-testid="avatar-button"
         onClick={() => setOpen((o) => !o)}
         aria-label={tr(lang, "个人设置", "Personal settings")}
-        className="grid h-8 w-8 place-items-center rounded-full border border-surface-700/60 bg-surface-800 text-base hover:border-brand-500/50"
+        style={{ backgroundColor: avatarColor(settings.avatar) }}
+        className="grid h-8 w-8 place-items-center rounded-full text-[11px] font-semibold text-surface-950 ring-1 ring-surface-700/60 hover:ring-brand-500/60"
       >
-        <span aria-hidden>{settings.avatar || "🟧"}</span>
+        <span aria-hidden>{initial}</span>
       </button>
       {open ? (
         <>
@@ -155,9 +188,11 @@ export default function AvatarMenu() {
             lang={lang}
             displayName={settings.displayName}
             avatar={settings.avatar}
+            theme={settings.theme}
             onLanguage={(l) => update({ language: l })}
             onName={(n) => update({ displayName: n })}
             onAvatar={(a) => update({ avatar: a })}
+            onTheme={() => update({ theme: settings.theme === "dark" ? "light" : "dark" })}
             onLogout={logout}
           />
         </>

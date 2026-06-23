@@ -22,15 +22,17 @@ import AvatarMenu, { AvatarPopover } from "./AvatarMenu";
 
 const noop = () => {};
 
-function popover(lang: "zh" | "en", avatar = "🟧") {
+function popover(lang: "zh" | "en", avatar = "#f59e0b") {
   return renderToString(
     <AvatarPopover
       lang={lang}
       displayName="rob"
       avatar={avatar}
+      theme="dark"
       onLanguage={noop}
       onName={noop}
       onAvatar={noop}
+      onTheme={noop}
       onLogout={noop}
     />,
   );
@@ -64,9 +66,13 @@ describe("AvatarPopover (pure)", () => {
   });
 
   it("marks the selected avatar swatch pressed", () => {
-    const html = popover("zh", "🟩");
-    expect(html).toContain('data-testid="avatar-swatch-🟩"');
+    const html = popover("zh", "#22c55e");
+    expect(html).toContain('data-testid="avatar-swatch-#22c55e"');
     expect(html).toContain('aria-pressed="true"');
+  });
+
+  it("shows the single light/dark theme toggle", () => {
+    expect(popover("zh")).toContain('data-testid="theme-toggle"');
   });
 });
 

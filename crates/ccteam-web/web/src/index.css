@@ -118,11 +118,68 @@ body {
   height: 100%;
   overflow: hidden;
   font-family: var(--font-sans);
-  background: var(--color-surface-900);
+  background-color: var(--color-surface-900);
+  /* D3 — subtle dot-grid texture so empty Status/Hosts/Marketplace canvases
+     don't read flat. The light theme swaps the dot color below. */
+  background-image: radial-gradient(circle at 1px 1px, rgb(255 255 255 / 0.02) 1px, transparent 0);
+  background-size: 22px 22px;
   color: var(--color-text-primary);
   overscroll-behavior: none;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* D1 — tabular figures so cost/timer columns don't jitter width + Geist
+     character variants. */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* D4 — themed selection (a brand wash, not default blue). */
+::selection {
+  background: color-mix(in srgb, var(--color-brand-500) 30%, transparent);
+}
+
+/* v0.8.19 W2 — light theme. ccteam is dark by default (its identity); the
+   avatar menu's single Sun/Moon toggle adds `.light` on <html> (an inline
+   pre-paint script in index.html applies the stored choice before first paint
+   → no flash). Tailwind v4 utilities reference var(--color-*), so re-declaring
+   the tokens under this selector flips the whole UI. */
+:root.light {
+  --color-brand-400: #d97706;
+  --color-brand-500: #d97706;
+  --color-brand-600: #b45309;
+  --color-brand-700: #92400e;
+  --color-brand-dim: #fde9c8;
+  --color-vendor-claude: #c2410c;
+  --color-vendor-codex: #0f766e;
+  --color-accent-500: #0d9488;
+  --color-accent-600: #0f766e;
+  --color-accent-700: #115e59;
+  --color-surface-700: #d4d4d8;
+  --color-surface-800: #e6e6e9;
+  --color-surface-850: #efeff1;
+  --color-surface-900: #ffffff;
+  --color-surface-950: #f5f5f6;
+  --color-text-primary: #18181b;
+  --color-text-secondary: #52525b;
+  --color-text-muted: #71717a;
+  --color-text-dim: #a1a1aa;
+  --color-text-bright: #09090b;
+  --color-status-running: #16a34a;
+  --color-status-waiting: #ca8a04;
+  --color-status-fresh-idle: #d97706;
+  --color-status-idle: #a1a1aa;
+  --color-status-error: #dc2626;
+  --color-status-starting: #d97706;
+  --color-status-stopped: #a1a1aa;
+  color-scheme: light;
+}
+:root.light body {
+  background-image: radial-gradient(circle at 1px 1px, rgb(0 0 0 / 0.04) 1px, transparent 0);
+}
+
+/* Suppress the color cross-fade during a theme flip (LAP disableTransitionOnChange). */
+.theme-switching * {
+  transition: none !important;
 }
 
 /* Cockpit markdown — assistant-ui's MarkdownTextPrimitive renders

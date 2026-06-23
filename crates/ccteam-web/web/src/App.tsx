@@ -24,10 +24,26 @@
 // token-gate (`TokenEntryGate` + `useAuthState`) still wraps the whole tree
 // so a 401 swaps the SPA for `TokenEntryPage` at full real estate.
 
+import { useEffect } from "react";
 import { Route, Routes } from "react-router-dom";
 import ChatConsole from "./pages/ChatConsole";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { useAuthState } from "./hooks/useAuthState";
+import { useWebSettings } from "./hooks/useWebSettings";
+
+/** Keep the `<html>` `.light` class in sync with the chosen theme. The inline
+ *  script in index.html sets the initial class before first paint (no flash);
+ *  this syncs it whenever the avatar-menu toggle changes it. */
+function useThemeClass() {
+  const { settings } = useWebSettings();
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.add("theme-switching");
+    root.classList.toggle("light", settings.theme === "light");
+    const t = window.setTimeout(() => root.classList.remove("theme-switching"), 1);
+    return () => window.clearTimeout(t);
+  }, [settings.theme]);
+}
 
 /** When the backend says auth is required AND a 401 has been observed on any
  *  /api/* call, swap the entire SPA shell for the token entry page. Bootstrap
@@ -45,6 +61,7 @@ function TokenEntryGate({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  useThemeClass();
   return (
     <TokenEntryGate>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">

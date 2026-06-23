@@ -26,7 +26,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
-import { MessageSquare, Menu, Plus, X } from "lucide-react";
+import { Activity, MessageSquare, Menu, Plus, Puzzle, Server, Settings, X } from "lucide-react";
 import CostPill from "../components/CostPill";
 import AvatarMenu from "../components/AvatarMenu";
 import MarketplaceView from "./MarketplaceView";
@@ -80,7 +80,7 @@ function SidebarNavLink({
   onNavigate,
 }: {
   to: string;
-  icon: string;
+  icon: React.ReactNode;
   label: string;
   onNavigate?: () => void;
 }) {
@@ -96,7 +96,7 @@ function SidebarNavLink({
         }`
       }
     >
-      <span className="w-4 text-center" aria-hidden>
+      <span className="grid w-4 place-items-center" aria-hidden>
         {icon}
       </span>
       {label}
@@ -423,7 +423,7 @@ export default function ChatConsole() {
             <div className="space-y-0.5">
               <SidebarNavLink
                 to="/marketplace"
-                icon="🧩"
+                icon={<Puzzle className="h-4 w-4" />}
                 label={navLabel("marketplace", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
@@ -431,19 +431,19 @@ export default function ChatConsole() {
                 <>
                   <SidebarNavLink
                     to="/status"
-                    icon="📊"
+                    icon={<Activity className="h-4 w-4" />}
                     label={navLabel("status", lang)}
                     onNavigate={() => setSidebarOpen(false)}
                   />
                   <SidebarNavLink
                     to="/hosts"
-                    icon="🖥"
+                    icon={<Server className="h-4 w-4" />}
                     label={navLabel("hosts", lang)}
                     onNavigate={() => setSidebarOpen(false)}
                   />
                   <SidebarNavLink
                     to="/settings"
-                    icon="⚙︎"
+                    icon={<Settings className="h-4 w-4" />}
                     label={navLabel("settings", lang)}
                     onNavigate={() => setSidebarOpen(false)}
                   />

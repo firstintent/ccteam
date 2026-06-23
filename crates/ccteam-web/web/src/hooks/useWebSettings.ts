@@ -13,10 +13,12 @@ export interface WebSettings {
   /** Interface language. `zh` (中文, default) | `en` (English). Full UI i18n
    *  is staged — this drives the nav + key labels now. */
   language: "zh" | "en";
-  /** Display name shown on the avatar (empty ⇒ a generic glyph). */
+  /** Display name shown on the avatar (its initial). */
   displayName: string;
-  /** Avatar swatch (an emoji from a small fixed palette). */
+  /** Avatar color (a hex from a small fixed palette). */
   avatar: string;
+  /** Color theme. `dark` (default — ccteam's identity) | `light`. */
+  theme: "dark" | "light";
 }
 
 function getDefaults(): WebSettings {
@@ -28,7 +30,8 @@ function getDefaults(): WebSettings {
     collapsedDiffDirs: [],
     language: "zh",
     displayName: "",
-    avatar: "🟧",
+    avatar: "#f59e0b",
+    theme: "dark",
   };
 }
 

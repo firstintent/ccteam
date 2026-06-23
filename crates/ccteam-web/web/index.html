@@ -8,6 +8,16 @@
     <meta name="theme-color" content="#18181b" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- v0.8.19 — apply the stored light/dark choice BEFORE first paint so the
+         theme never flashes. Default (unset) = dark (ccteam's identity). -->
+    <script>
+      try {
+        var s = JSON.parse(localStorage.getItem("aoe-web-settings") || "{}");
+        if (s.theme === "light") document.documentElement.classList.add("light");
+      } catch (e) {
+        /* ignore */
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
