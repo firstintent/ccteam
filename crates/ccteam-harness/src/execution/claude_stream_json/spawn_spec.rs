@@ -102,7 +102,13 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
 
     if let Some(model) = input.model_id.map(str::trim).filter(|m| !m.is_empty()) {
         argv.push("--model".into());
-        argv.push(model.to_string());
+        // The `[1m]` suffix is ccteam's 1M-context DISPLAY tag, not part of any
+        // claude model id. `--model claude-…[1m]` is rejected and claude falls
+        // back to its DEFAULT model (sonnet) — the model-loss-on-restart bug.
+        // Strip it so resume gets a valid base id (claude `--model` accepts both
+        // short aliases and full ids); the 1M window is re-requested post-init
+        // via `set_model` (the live `/model` path that DOES accept `[1m]`).
+        argv.push(strip_context_tag(model).to_string());
     }
 
     // Permission posture. Skip = no prompts (today's default); Hitl =
@@ -129,6 +135,19 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     argv.push(input.session_uuid.to_string());
 
     argv
+}
+
+/// Strip a trailing `[1m]` (case-insensitive) — ccteam's 1M-context display
+/// tag — from a model id. claude's `--model` rejects the tagged form (`…[1m]`)
+/// and silently defaults to sonnet; the bare base id (short alias or full id)
+/// is accepted. The 1M window is re-requested separately via `set_model`.
+pub(crate) fn strip_context_tag(model: &str) -> &str {
+    let m = model.trim();
+    if m.len() >= 4 && m[m.len() - 4..].eq_ignore_ascii_case("[1m]") {
+        m[..m.len() - 4].trim_end()
+    } else {
+        m
+    }
 }
 
 /// Env pairs forwarded into the stream-json child. Mirrors the tmux
@@ -334,6 +353,37 @@ mod tests {
         assert!(with_role.iter().any(|a| a == "--agent"));
         let roleless = build_argv("claude", &input("", "u-1", false));
         assert!(!roleless.iter().any(|a| a == "--agent"));
+    }
+
+    #[test]
+    fn strip_context_tag_removes_1m_suffix() {
+        assert_eq!(strip_context_tag("claude-opus-4-8[1m]"), "claude-opus-4-8");
+        assert_eq!(strip_context_tag("opus[1m]"), "opus");
+        assert_eq!(
+            strip_context_tag("claude-sonnet-4-6[1M]"),
+            "claude-sonnet-4-6"
+        );
+        // No tag → unchanged.
+        assert_eq!(strip_context_tag("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(strip_context_tag("sonnet"), "sonnet");
+    }
+
+    #[test]
+    fn resume_model_arg_strips_1m_tag() {
+        // The model-loss-on-restart fix: `--model` must carry the BASE id, never
+        // the `[1m]`-tagged form claude rejects (→ silent default to sonnet).
+        let mut inp = input("", "u-1", true);
+        inp.model_id = Some("claude-opus-4-8[1m]");
+        let argv = build_argv("claude", &inp);
+        let i = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        assert_eq!(argv[i + 1], "claude-opus-4-8", "must strip [1m]: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.contains("[1m]")),
+            "no [1m] anywhere in argv: {argv:?}"
+        );
     }
 
     #[test]

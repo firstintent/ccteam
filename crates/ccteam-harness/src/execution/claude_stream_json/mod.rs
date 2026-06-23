@@ -754,6 +754,35 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 self.resolver.clone(),
             );
         }
+        // v0.8.19 — restore the 1M context window on resume. `build_argv`
+        // stripped the `[1m]` tag from `--model` (claude rejects `…[1m]` and
+        // would silently default to sonnet), so claude came up on the correct
+        // BASE model. Re-request the persisted `[1m]` model via `set_model` —
+        // the SAME control the live `/model` path uses, which DOES accept
+        // `[1m]` — to put the resumed session back on 1M. Best-effort: on
+        // failure the (correct) base model stands; never fail the spawn.
+        if let Some(m) = ctx.model_id.as_deref() {
+            if m.len() >= 4 && m[m.len() - 4..].eq_ignore_ascii_case("[1m]") {
+                match transport
+                    .request_control("set_model", json!({ "model": m }), init_timeout())
+                    .await
+                {
+                    Ok(body) if body.subtype == "success" => {
+                        if let Ok(mut s) = status.lock() {
+                            s.model = Some(m.to_string());
+                        }
+                    }
+                    Ok(body) => tracing::warn!(
+                        sid = %ctx.sid, model = %m, why = ?body.error,
+                        "claude-stream-json: post-resume set_model([1m]) rejected; base model stands"
+                    ),
+                    Err(e) => tracing::warn!(
+                        sid = %ctx.sid, model = %m, error = %e,
+                        "claude-stream-json: post-resume set_model([1m]) failed; base model stands"
+                    ),
+                }
+            }
+        }
         let live = LiveSession {
             identity: identity.clone(),
             transport,
@@ -1056,8 +1085,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     reason: format!("/model 切换失败: {why}"),
                 });
             }
-            if let Ok(mut s) = live.status.lock() {
+            // v0.8.19 — persist the live /model to status.json IMMEDIATELY so it
+            // survives a daemon restart even before the next turn's status-tap
+            // write (else resume reads the stale prior model). Resume strips the
+            // `[1m]` for `--model` + re-requests 1M via set_model, so persisting
+            // the user-typed form here is safe.
+            let model_snap = if let Ok(mut s) = live.status.lock() {
                 s.model = Some(model.clone());
+                Some(s.clone())
+            } else {
+                None
+            };
+            if let Some(snap) = model_snap {
+                write_status_file(&live.cwd, &live.identity.sid, &snap);
             }
             // Optional effort rides along — now also LIVE via apply_flag_settings.
             let mut receipt = format!("已切换 model → {model}（live）");
