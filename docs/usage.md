@@ -397,7 +397,7 @@ Chat 面板走 `ccteam-chat.v1` WebSocket;Terminal 面板走既有 `ccteam-pty.v
 
 **每个 session 独立页(per-session web)**:打开 `http://<host>:7331/app/chat/s/<sid>`(`<sid>` = `s1`/`s2`…,与 IM 的 `/use s1` 同命名空间)进入某个 session 的独立视图 —— 自己的历史(读该 session 的 `turns.jsonl`)、按 sid 过滤的实时事件流、干净不混流的切换。HITL 批准也会在这里渲染成「session sX 要跑…」+ 每个选项一个按钮(web 点击 resolve 是 best-effort,稳妥批准走 IM 按钮)。
 
-**统一界面**:本版 web 是**一个 chat 风格外壳** —— 顶栏有面包屑 + 连接状态 + **cost pill**(今日成本 / 预算,实时);每个 session 有 **Chat | 终端** 两个 tab;底部全局导航**四页** = **插件市场 / Status / 主机 / Settings**(旧的多页 operator 仪表盘已收敛掉)。**界面语言**在左上**头像**里切 **中文 / English**(默认中文,导航随之渲染),头像里还有个人设置(显示名 / 头像 / 登出)。
+**统一界面**:本版 web 是**一个 chat 风格外壳** —— 顶栏有面包屑 + 连接状态 + **cost pill**(今日成本 / 预算,实时);每个 session 有 **Chat | 终端** 两个 tab;底部全局导航**四页** = **插件市场 / Status / 主机 / Settings**(旧的多页 operator 仪表盘已收敛掉)。**界面语言**在左上**头像**里切 **中文 / English**(默认中文,导航随之渲染),头像里还有个人设置(显示名 / 头像 / **明暗主题**(一个 Sun/Moon 图标切换,默认暗)/ 登出)。会话里**助手消息按 markdown 渲染**(标题 / 列表 / 表格 / 代码块,代码块右上角一键复制);输入框 **Enter 发送 · Shift+Enter 换行 · 输入法选词回车不误发**,发送中可一键停止。
 
 **控制台页签**(浏览器里点点就能用,不必记命令):
 

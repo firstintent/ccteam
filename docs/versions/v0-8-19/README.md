@@ -1,8 +1,24 @@
 # v0.8.19+ — web 前端可交付质量(整个前端)
 
-> **状态:设计 + 原型(等 review)**。owner:web 端「简陋的像个 demo」+「整个前端考虑,不止 chat」+「还有 Setting、浅色暗色主题、整体质感」。
+> **状态:已落地 dev(branch `v0819-impl`,等 review/部署;无 tag)**。owner:web 端「简陋的像个 demo」+「整个前端考虑,不止 chat」+「还有 Setting、浅色暗色主题、整体质感」+「去 ai 味 emoji 用开源 ico 库」+「明暗切换图标用一个」。
 > 参考 **LAP** = `references/litellm-agent-platform/src/ui`(Next16 但**同栈** React19 + Tailwind4 + base-ui/shadcn + CVA;patterns 可直接抄)。owner 允许小范围后端改动配合。
-> 原型(自包含、离线):① 会话窗口 [`prototype/v0819-chat-console.html`](prototype/v0819-chat-console.html) ② 前端地基/原语库(带 ☀/🌙 主题切换)[`prototype/v0819-ui-kit.html`](prototype/v0819-ui-kit.html) ③ Settings 重设计(带主题切换)[`prototype/v0819-settings.html`](prototype/v0819-settings.html)。都带前后/明暗对比。
+> 原型(自包含、离线;即设计 spec):① 会话窗口 [`prototype/v0819-chat-console.html`](prototype/v0819-chat-console.html) ② 前端地基/原语库(单图标主题切换)[`prototype/v0819-ui-kit.html`](prototype/v0819-ui-kit.html) ③ Settings 重设计(单图标主题切换)[`prototype/v0819-settings.html`](prototype/v0819-settings.html)。
+
+## 实现结果(已落地,见 [`handoff.md`](handoff.md))
+
+7 波,逐波过 `tsc + eslint(0/0) + vitest + vite build`;**纯 SPA + 文档,0 Rust 改动** → cargo `2039/0` / clippy / fmt 不动。vitest **188→198**(+IME 守卫/原语/主题/combobox 单测)。
+
+- **W1**(`40c0a90`)会话窗口:`Composer`(IME 守卫 + Shift/Cmd+Enter + Send⇄Stop + per-sid 草稿 + 自增高)+ 助手 markdown(`lib/markdown` marked+DOMPurify → `.cockpit-markdown`)+ 代码块复制。
+- **W2a**(`72f8fd6`)原语库:`tailwind-merge`+CVA + `cn()` + `components/ui`(Button/Card/Badge/Input/Textarea/Label)。
+- **W2b**(`8ba373a`)浅/暗主题(`:root.light` 覆盖 var token + 单图标 Sun/Moon + 预绘不闪)+ D1-D4 + 去 emoji(lucide 导航 + 色点头像)。
+- **W3a**(`997058e`)浮层:手搓 SSR-safe `Dialog`+`Combobox`(@base-ui 因 SSR 空渲染卸掉),4 原生 `<select>` 全换 + 市场抽屉 → Dialog。
+- **W3b**(`23cff89`)Settings 重设计:card-per-provider + 用户表格 + 状态读出,灭 `*_CLASS`,红线保(masked-token / 两步内联确认 / admin-gate);测试连接没加(无 getMe-only 接口,不造后端)。
+- **W4a**(`404141f`)`@tanstack/react-table` Status 舰队可排序 + `Skeleton`/`EmptyState` 原语;Hosts 仍卡片 + 骨架 + 空态。
+- **W4b**(`3de519b`)chat 打磨:回到最新按钮 + 流式三点指示。
+
+**Deferred(诚实,§四 W4 详)**:结构化 tool/thinking 上 web —— `GatewayEventKind`(web SSE 消费的)只有 Answer/Progress;tool/reasoning 在 `progress.rs` 被折进 Progress 给 IM,**不作为独立 gateway 事件外露**。上 web 要新 `GatewayEventKind::Tool` 穿 gateway/pump/adapter/IM 投递并定义投递语义 —— **超「小后端」且动活 IM Progress 路**,留后续;W4b 的流式指示已覆盖安全信号。
+
+> 部署:dev 落地无 tag → 需 **SPA 重 build + daemon 重部署 + 用户 `/mcp` 重连**。
 
 ---
 
