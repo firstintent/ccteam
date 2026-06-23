@@ -16,7 +16,9 @@
 - **W4a**(`404141f`)`@tanstack/react-table` Status 舰队可排序 + `Skeleton`/`EmptyState` 原语;Hosts 仍卡片 + 骨架 + 空态。
 - **W4b**(`3de519b`)chat 打磨:回到最新按钮 + 流式三点指示。
 
-**Deferred(诚实,§四 W4 详)**:结构化 tool/thinking 上 web —— `GatewayEventKind`(web SSE 消费的)只有 Answer/Progress;tool/reasoning 在 `progress.rs` 被折进 Progress 给 IM,**不作为独立 gateway 事件外露**。上 web 要新 `GatewayEventKind::Tool` 穿 gateway/pump/adapter/IM 投递并定义投递语义 —— **超「小后端」且动活 IM Progress 路**,留后续;W4b 的流式指示已覆盖安全信号。
+- **W4b 后端结构化活动**(`96401c2`,owner 追加「按更优雅/通用方式去改」):新 `GatewayEventKind::Activity{status_key, SessionActivity}` 一等中立事件。设计:① 结构化数据本就到 pump(`ThreadEvent`/`ThreadItemDetails`),不需往上游 replumb;② `progress.rs::activity_for` **共享 summarizer** → IM 状态行 + web 摘要同源、构造上不漂移;③ IM 消费 **no-op** → Answer/Progress 投递 byte-identical、零回归;④ web SSE 出 `kind:activity` + 结构化体 → SPA 紧凑活动行(lucide 图标)。blast radius = 恰 2 个 exhaustive match。baseline cargo `2039→2045` · ccteam-web `257→258` · vitest `198→207`,clippy/fmt clean。
+
+**仍 Deferred(小)**:stream-json 的 tool-result **体** —— `tool_result` 块缺 tool name + 需 item-id 重键,不冒险改 adapter;tool 名 / 入参 / 思考文本已全外露,只差结果体。
 
 > 部署:dev 落地无 tag → 需 **SPA 重 build + daemon 重部署 + 用户 `/mcp` 重连**。
 

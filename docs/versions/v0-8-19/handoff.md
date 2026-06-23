@@ -35,7 +35,7 @@
 
 ## Remaining(deferred / 后续)
 
-1. **结构化 tool/thinking 上 web**(最大项):新 `GatewayEventKind::Tool { name, … }` —— 在 `gateway.rs` 加变体 + `spawn_event_pump` 从 adapter 事件 emit + 每个 `match GatewayEventKind` 消费者(web SSE `session_event_payload` + IM 投递)加臂 + 定义投递语义(Tool 是否 ping / 编进 status)。前端 `useSessionEvents.SessionEvent.kind` + `chatTranscript.eventToRow` 加 `tool`/`thinking` → 工具活动折叠块。**风险面 = 活的 IM Progress 路**,需 owner 拍板后单独做。
+1. ~~结构化 tool/thinking 上 web~~ **已落地**(`96401c2`,owner 追加「按更优雅/通用方式」):新 `GatewayEventKind::Activity{status_key, SessionActivity}` 中立事件 + `progress::activity_for` 共享 summarizer(IM/web 同源不漂移)+ IM no-op(零回归)+ web `kind:activity` → SPA 活动行。blast radius 恰 2 个 exhaustive match(web payload + IM 消费)。**仅剩 stream-json 的 tool-result 体**(`tool_result` 块缺 name + 需 item-id 重键 → 不冒险改 adapter;tool 名/入参/思考已全外露)。
 2. **per-turn 元信息**:model·延迟·token·成本 按 turn 外露到 web SSE(后端)→ chat hover footer。
 3. **浅色盘真机核对** + 可选「跟随系统」第三态。
 4. **Playwright/e2e**:本环境 inotify-busy 未跑(env-gated,非本版回归);CI/真机复测。
