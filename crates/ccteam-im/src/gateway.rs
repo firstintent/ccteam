@@ -182,6 +182,58 @@ pub struct Gateway {
     im_reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
+/// One structured step of session activity (v0.8.19). Carried by
+/// [`GatewayEventKind::Activity`] alongside the folded `Progress` event: IM
+/// ignores it (the folded status string still drives the status message),
+/// the web chat renders it as activity cards. The `summary` is computed by
+/// the SAME [`crate::progress`] helpers the IM fold uses, so the two
+/// surfaces can never drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionActivity {
+    /// What kind of step this is (tool call / thinking / file change …).
+    pub kind: ActivityKind,
+    /// Tool / category name; empty for [`ActivityKind::Thinking`].
+    pub name: String,
+    /// One-line human summary (the same preview `progress.rs` computes).
+    pub summary: String,
+    /// Lifecycle phase (started / completed / update) of this step.
+    pub status: ActivityStatus,
+    /// Adapter item id — lets the web dedup/merge a start↔complete pair.
+    pub item_id: String,
+}
+
+/// The category of one [`SessionActivity`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    /// A tool invocation (`ToolCall` item).
+    ToolCall,
+    /// A tool's result (reserved; not emitted on stream-json yet).
+    ToolResult,
+    /// Model reasoning / thinking (`Reasoning` item).
+    Thinking,
+    /// A file edit/write (`FileChange` item).
+    FileChange,
+    /// A web search (`WebSearch` item).
+    WebSearch,
+    /// A shell command execution (`CommandExecution` item).
+    CommandExec,
+}
+
+/// Lifecycle of one [`SessionActivity`] step, mapped from the source
+/// [`ThreadEvent`] variant (`ItemStarted`→`Started`, `ItemCompleted`→
+/// `Completed`, `ItemUpdated`→`Update`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityStatus {
+    /// The step has just started (`ItemStarted`).
+    Started,
+    /// The step has completed (`ItemCompleted`).
+    Completed,
+    /// The step was updated in place (`ItemUpdated`, e.g. streamed reasoning).
+    Update,
+}
+
 /// How the daemon should deliver a [`GatewayEvent`] (V0.8.4 P1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GatewayEventKind {
@@ -199,6 +251,16 @@ pub enum GatewayEventKind {
         status_key: String,
         /// Final update — finalize + forget after delivering.
         done: bool,
+    },
+    /// Structured per-step activity (v0.8.19). Reuses the turn's Progress
+    /// `status_key`. IM ignores it (the folded Progress event still drives
+    /// the status message); web renders it as activity cards.
+    Activity {
+        /// The current progress epoch's `status_key` (`{sid}-{epoch}`), so
+        /// the web can correlate an activity with its turn.
+        status_key: String,
+        /// The structured per-step activity payload the web renders.
+        activity: SessionActivity,
     },
 }
 
@@ -2063,17 +2125,35 @@ impl Gateway {
                             }) {
                                 break;
                             }
-                        } else if progress_on && fold.apply(&evt) {
-                            // ----- PROGRESS -----
-                            dirty = true;
-                            let ready = last_emit.map(|t| t.elapsed() >= throttle).unwrap_or(true);
-                            if ready
-                                && !flush_progress(
-                                    &tx, &session, &session_id, epoch, &fold,
-                                    &mut last_sent, &mut last_emit, &mut dirty,
-                                )
-                            {
-                                break;
+                        } else if progress_on {
+                            // ----- PROGRESS (IM, unchanged) -----
+                            // The fold drives the IM status string; its dirty
+                            // signal gates the throttled status edit exactly as
+                            // before — IM behavior is byte-identical.
+                            if fold.apply(&evt) {
+                                dirty = true;
+                                let ready =
+                                    last_emit.map(|t| t.elapsed() >= throttle).unwrap_or(true);
+                                if ready
+                                    && !flush_progress(
+                                        &tx, &session, &session_id, epoch, &fold,
+                                        &mut last_sent, &mut last_emit, &mut dirty,
+                                    )
+                                {
+                                    break;
+                                }
+                            }
+                            // ----- ACTIVITY (web-only, v0.8.19) -----
+                            // Emit the SAME event's structured form, computed by
+                            // the shared `progress::activity_for` summarizer. It
+                            // fires for EVERY renderable item event (start /
+                            // update / complete), independent of whether the
+                            // fold bucketed it — both fire. IM drops it (strict
+                            // no-op arm); web renders activity cards.
+                            if let Some(activity) = crate::progress::activity_for(&evt) {
+                                if !emit_activity(&tx, &session, &session_id, epoch, activity) {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3439,6 +3519,37 @@ fn emit_progress(
         content: content.to_string(),
         sid: Some(session_id.to_string()),
         kind: GatewayEventKind::Progress { status_key, done },
+        attachments: Vec::new(),
+        options: Vec::new(),
+    })
+}
+
+/// Emit one structured `Activity` gateway event (v0.8.19) for the given
+/// step, keyed to the same progress `status_key` as the turn's folded
+/// status. IM drops it (a strict no-op arm); web renders it. The `content`
+/// mirrors the summary so a generic consumer still has a human line.
+/// Returns `false` only if the sink is closed (pump should stop).
+fn emit_activity(
+    tx: &GatewayEventSink,
+    session: &GatewaySession,
+    session_id: &str,
+    epoch: u64,
+    activity: SessionActivity,
+) -> bool {
+    let (channel, chat_id) = pump_target(session);
+    let status_key = format!("{session_id}-{epoch}");
+    let content = activity.summary.clone();
+    tx.send(GatewayEvent {
+        id: format!("gateway-activity-{status_key}-{}", activity.item_id),
+        channel,
+        chat_id,
+        thread_ts: None,
+        content,
+        sid: Some(session_id.to_string()),
+        kind: GatewayEventKind::Activity {
+            status_key,
+            activity,
+        },
         attachments: Vec::new(),
         options: Vec::new(),
     })

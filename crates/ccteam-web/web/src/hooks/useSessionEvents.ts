@@ -29,19 +29,38 @@ export interface SessionEventOption {
   id: string;
 }
 
+/** One structured per-step activity (v0.8.19) — a tool call, reasoning,
+ *  command, file change, or web search the session is doing. `kind` is the
+ *  category (`tool_call` / `thinking` / `command_exec` / `file_change` /
+ *  `web_search` / `tool_result`); `name` is the tool/category name (empty
+ *  for thinking); `summary` is the one-line preview; `status` is the
+ *  lifecycle phase (`started` / `completed` / `update`); `item_id` lets the
+ *  UI dedup/merge a start↔complete pair. Mirrors the Rust `SessionActivity`
+ *  serde shape. */
+export interface SessionActivity {
+  kind: string;
+  name: string;
+  summary: string;
+  status: string;
+  item_id: string;
+}
+
 /** One event line off the per-session SSE stream (the W2 payload shape).
- *  `kind` is "answer" (assistant reply / approval prompt) or "progress"
- *  (status edit, `done` on the finalizing one). `options` present + non-
- *  empty marks an approval prompt; `token` is then the pending-resolution
- *  token the web resolve path POSTs back (R-H1). */
+ *  `kind` is "answer" (assistant reply / approval prompt), "progress"
+ *  (status edit, `done` on the finalizing one), or "activity" (a structured
+ *  per-step `activity` payload, v0.8.19). `options` present + non-empty
+ *  marks an approval prompt; `token` is then the pending-resolution token
+ *  the web resolve path POSTs back (R-H1). */
 export interface SessionEvent {
   id?: string;
   sid?: string;
-  kind: "answer" | "progress";
+  kind: "answer" | "progress" | "activity";
   content: string;
   done?: boolean;
   options?: SessionEventOption[];
   token?: string;
+  /** Present on an "activity" frame: the structured per-step payload. */
+  activity?: SessionActivity;
 }
 
 export interface UseSessionEventsResult {
@@ -82,7 +101,10 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const obj = parsed as Record<string, unknown>;
-  const kind = obj.kind === "progress" ? "progress" : "answer";
+  // Three-way kind; anything unrecognized degrades to "answer" (the parser
+  // never throws on a future/garbage kind — the next frame lands clean).
+  const kind =
+    obj.kind === "progress" ? "progress" : obj.kind === "activity" ? "activity" : "answer";
   const event: SessionEvent = {
     kind,
     content: typeof obj.content === "string" ? obj.content : "",
@@ -90,6 +112,19 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   if (typeof obj.id === "string") event.id = obj.id;
   if (typeof obj.sid === "string") event.sid = obj.sid;
   if (obj.done === true) event.done = true;
+  // v0.8.19 — the structured per-step activity object (DOM-free, defensive:
+  // a malformed `activity` is simply dropped, leaving a bare "activity" event
+  // whose `content` line still renders).
+  if (typeof obj.activity === "object" && obj.activity !== null) {
+    const a = obj.activity as Record<string, unknown>;
+    event.activity = {
+      kind: typeof a.kind === "string" ? a.kind : "",
+      name: typeof a.name === "string" ? a.name : "",
+      summary: typeof a.summary === "string" ? a.summary : "",
+      status: typeof a.status === "string" ? a.status : "",
+      item_id: typeof a.item_id === "string" ? a.item_id : "",
+    };
+  }
   if (Array.isArray(obj.options)) {
     // v0.8.7 review-fix (R-H1) — options are `{label, id}` objects; the id is
     // the decision value the resolve path sends back as `selection`. Drop any

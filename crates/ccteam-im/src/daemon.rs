@@ -1024,6 +1024,11 @@ fn spawn_gateway_event_consumer(
                     )
                     .await;
                 }
+                // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
+                // status is fully driven by the folded `Progress` event above,
+                // so this is a strict no-op (no send / no edit): IM delivery
+                // stays byte-identical to before the Activity event existed.
+                GatewayEventKind::Activity { .. } => {}
             }
         }
         tracing::debug!("imd: gateway event consumer exited");

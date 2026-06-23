@@ -41,6 +41,7 @@ import {
 } from "../lib/sessionsApi";
 import { formatStatusLine } from "../lib/statusLine";
 import {
+  activityIcon,
   appendRow,
   eventToRow,
   historyToRows,
@@ -398,6 +399,26 @@ export default function SessionView({
                 return (
                   <div key={row.id} className="text-center text-[11px] text-text-dim">
                     {row.content}
+                  </div>
+                );
+              }
+              // v0.8.19 — a structured per-step activity (tool call / thinking
+              // / command / file change / web search). A compact mono line,
+              // dimmer than messages, with a lucide icon by kind. A subtle
+              // left border + tight spacing makes consecutive activities read
+              // as one visual cluster (theme tokens only — no emoji).
+              if (row.kind === "activity") {
+                const Icon = activityIcon(row.activity?.kind ?? "", row.activity?.name ?? "");
+                const thinking = row.activity?.kind === "thinking";
+                return (
+                  <div
+                    key={row.id}
+                    className="flex items-start gap-2 -my-1.5 pl-2 border-l border-surface-700/40 text-[11px] font-mono text-text-muted"
+                  >
+                    <Icon className="h-3 w-3 mt-0.5 shrink-0 text-text-dim" />
+                    <span className={`min-w-0 break-words ${thinking ? "italic" : ""}`}>
+                      {row.content}
+                    </span>
                   </div>
                 );
               }

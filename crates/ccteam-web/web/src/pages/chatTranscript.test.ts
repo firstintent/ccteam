@@ -6,7 +6,10 @@
 
 import { describe, expect, it } from "vitest";
 
+import { Brain, FileText, Search, Terminal, Wrench } from "lucide-react";
+
 import {
+  activityIcon,
   appendRow,
   eventToRow,
   historyToRows,
@@ -129,6 +132,40 @@ describe("chatTranscript eventToRow", () => {
     expect(r!.content).toContain("wants to run");
   });
 
+  it("maps an activity event to a compact activity row carrying the payload (v0.8.19)", () => {
+    const r = eventToRow(
+      ev({
+        kind: "activity",
+        content: "Bash(ls -la)",
+        id: "act1",
+        activity: {
+          kind: "tool_call",
+          name: "Bash",
+          summary: "Bash(ls -la)",
+          status: "started",
+          item_id: "t1",
+        },
+      }),
+    );
+    expect(r).not.toBeNull();
+    expect(r!.kind).toBe("activity");
+    expect(r!.content).toBe("Bash(ls -la)");
+    expect(r!.id).toBe("act1");
+    // The structured activity rides onto the row (so SessionView picks an icon).
+    expect(r!.activity).toMatchObject({ kind: "tool_call", name: "Bash" });
+  });
+
+  it("falls back to the event content when an activity frame has no summary", () => {
+    const r = eventToRow(ev({ kind: "activity", content: "$ cargo build" }));
+    expect(r).not.toBeNull();
+    expect(r!.kind).toBe("activity");
+    expect(r!.content).toBe("$ cargo build");
+  });
+
+  it("drops an activity frame with nothing to show", () => {
+    expect(eventToRow(ev({ kind: "activity", content: "" }))).toBeNull();
+  });
+
   it("drops empty non-final progress (status churn is noise)", () => {
     expect(eventToRow(ev({ kind: "progress", content: "" }))).toBeNull();
   });
@@ -137,6 +174,26 @@ describe("chatTranscript eventToRow", () => {
     const r = eventToRow(ev({ kind: "progress", content: "turn done", done: true }));
     expect(r).not.toBeNull();
     expect(r!.kind).toBe("system");
+  });
+});
+
+describe("chatTranscript activityIcon (v0.8.19 icon-by-kind)", () => {
+  it("maps thinking → Brain regardless of name", () => {
+    expect(activityIcon("thinking", "")).toBe(Brain);
+  });
+  it("maps command_exec / web_search to Terminal / Search", () => {
+    expect(activityIcon("command_exec", "bash")).toBe(Terminal);
+    expect(activityIcon("web_search", "web")).toBe(Search);
+  });
+  it("disambiguates a generic tool_call by tool name", () => {
+    expect(activityIcon("tool_call", "Bash")).toBe(Terminal);
+    expect(activityIcon("tool_call", "Read")).toBe(FileText);
+    expect(activityIcon("tool_call", "Grep")).toBe(Search);
+    // an unknown tool falls back to the generic Wrench.
+    expect(activityIcon("tool_call", "SomeMcpTool")).toBe(Wrench);
+  });
+  it("falls back to Wrench for an unknown kind", () => {
+    expect(activityIcon("mystery", "x")).toBe(Wrench);
   });
 });
 

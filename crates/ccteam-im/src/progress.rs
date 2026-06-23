@@ -24,6 +24,8 @@ use std::collections::HashSet;
 use ccteam_harness::{ThreadEvent, ThreadItemDetails};
 use serde_json::Value;
 
+use crate::gateway::{ActivityKind, ActivityStatus, SessionActivity};
+
 /// Phone-sized cap (chars) for a tool's argument preview.
 pub const PREVIEW_MAX: usize = 200;
 /// How many recent steps to expand below the folded summary.
@@ -102,7 +104,7 @@ pub fn truncate_for_preview(s: &str) -> String {
 /// Pull a human-meaningful field out of a tool's JSON args for the
 /// preview line (command / path / pattern / query), falling back to a
 /// compact JSON rendering.
-fn preview_args(args: &Value) -> String {
+pub(crate) fn preview_args(args: &Value) -> String {
     let picked = [
         "command",
         "file_path",
@@ -122,6 +124,75 @@ fn preview_args(args: &Value) -> String {
         },
     };
     truncate_for_preview(&raw)
+}
+
+/// Map a lifecycle [`ThreadEvent`] to its [`ActivityStatus`]. Item events
+/// only — non-item events never reach this (the caller short-circuits).
+fn activity_status(evt: &ThreadEvent) -> Option<ActivityStatus> {
+    match evt {
+        ThreadEvent::ItemStarted { .. } => Some(ActivityStatus::Started),
+        ThreadEvent::ItemCompleted { .. } => Some(ActivityStatus::Completed),
+        ThreadEvent::ItemUpdated { .. } => Some(ActivityStatus::Update),
+        _ => None,
+    }
+}
+
+/// The SHARED per-step summarizer (v0.8.19). Inspects the SAME
+/// [`ThreadItemDetails`] cases [`ProgressFold::apply`] does and reuses the
+/// same preview helpers ([`tool_category`] / [`preview_args`] /
+/// [`truncate_for_preview`]), so the IM status string and the web activity
+/// summary are computed from one place and can never drift.
+///
+/// Returns the structured [`SessionActivity`] for a renderable item event,
+/// or `None` for the answer (`AgentMessage`), errors, and any non-item
+/// lifecycle event (turn started/completed/failed, thread started) — those
+/// the pump routes separately and must not show up as activity.
+pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
+    let (item, status) = match evt {
+        ThreadEvent::ItemStarted { item }
+        | ThreadEvent::ItemCompleted { item }
+        | ThreadEvent::ItemUpdated { item } => (item, activity_status(evt)?),
+        _ => return None,
+    };
+    match &item.details {
+        ThreadItemDetails::ToolCall { name, args } => Some(SessionActivity {
+            kind: ActivityKind::ToolCall,
+            name: name.clone(),
+            summary: format!("{name}({})", preview_args(args)),
+            status,
+            item_id: item.id.clone(),
+        }),
+        ThreadItemDetails::CommandExecution { cmd, .. } => Some(SessionActivity {
+            kind: ActivityKind::CommandExec,
+            name: "bash".to_string(),
+            summary: format!("$ {}", truncate_for_preview(cmd)),
+            status,
+            item_id: item.id.clone(),
+        }),
+        ThreadItemDetails::FileChange { path, kind } => Some(SessionActivity {
+            kind: ActivityKind::FileChange,
+            name: kind.clone(),
+            summary: format!("{kind} {}", path.display()),
+            status,
+            item_id: item.id.clone(),
+        }),
+        ThreadItemDetails::WebSearch { query } => Some(SessionActivity {
+            kind: ActivityKind::WebSearch,
+            name: "web".to_string(),
+            summary: truncate_for_preview(query),
+            status,
+            item_id: item.id.clone(),
+        }),
+        ThreadItemDetails::Reasoning(text) => Some(SessionActivity {
+            kind: ActivityKind::Thinking,
+            name: String::new(),
+            summary: truncate_for_preview(text),
+            status: ActivityStatus::Update,
+            item_id: item.id.clone(),
+        }),
+        // The answer + errors are not activity (the pump routes them).
+        ThreadItemDetails::AgentMessage(_) | ThreadItemDetails::Error(_) => None,
+    }
 }
 
 /// One folded count bucket, kept in first-seen order for stable render.
@@ -424,6 +495,128 @@ mod tests {
         f.apply(&started_tool("t2", "Edit", json!({"file_path": "/a"})));
         f.mark_done();
         assert_eq!(f.render(), "✅ done · 2 tools · 1 files");
+    }
+
+    // ----- v0.8.19 shared activity summarizer -----
+
+    #[test]
+    fn activity_for_maps_tool_call_started() {
+        // The shared summarizer turns an ItemStarted{ToolCall} into a
+        // structured SessionActivity with the SAME preview the fold computes.
+        let ev = started_tool("t1", "Bash", json!({"command": "ls -la"}));
+        let act = activity_for(&ev).expect("tool call is activity");
+        assert_eq!(act.kind, ActivityKind::ToolCall);
+        assert_eq!(act.name, "Bash");
+        assert_eq!(act.summary, "Bash(ls -la)");
+        assert_eq!(act.status, ActivityStatus::Started);
+        assert_eq!(act.item_id, "t1");
+    }
+
+    #[test]
+    fn activity_for_maps_tool_call_completed_status() {
+        // The lifecycle variant drives `status`: a completion → Completed.
+        let act = activity_for(&completed_tool("t1", "Bash")).expect("activity");
+        assert_eq!(act.kind, ActivityKind::ToolCall);
+        assert_eq!(act.status, ActivityStatus::Completed);
+        assert_eq!(act.item_id, "t1");
+    }
+
+    #[test]
+    fn activity_for_maps_reasoning_to_thinking() {
+        let ev = ThreadEvent::ItemUpdated {
+            item: ThreadItem {
+                id: "r1".into(),
+                details: ThreadItemDetails::Reasoning("let me think about this".into()),
+            },
+        };
+        let act = activity_for(&ev).expect("reasoning is activity");
+        assert_eq!(act.kind, ActivityKind::Thinking);
+        assert!(act.name.is_empty(), "thinking has no name");
+        assert_eq!(act.summary, "let me think about this");
+        assert_eq!(act.status, ActivityStatus::Update);
+        assert_eq!(act.item_id, "r1");
+    }
+
+    #[test]
+    fn activity_for_maps_codex_command_and_file_change_and_websearch() {
+        let cmd = activity_for(&ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "c1".into(),
+                details: ThreadItemDetails::CommandExecution {
+                    cmd: "cargo build".into(),
+                    status: "ok".into(),
+                },
+            },
+        })
+        .expect("command exec is activity");
+        assert_eq!(cmd.kind, ActivityKind::CommandExec);
+        assert_eq!(cmd.summary, "$ cargo build");
+
+        let fc = activity_for(&ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "fc1".into(),
+                details: ThreadItemDetails::FileChange {
+                    path: "/src/lib.rs".into(),
+                    kind: "modified".into(),
+                },
+            },
+        })
+        .expect("file change is activity");
+        assert_eq!(fc.kind, ActivityKind::FileChange);
+        assert!(fc.summary.contains("/src/lib.rs"));
+
+        let ws = activity_for(&ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "w1".into(),
+                details: ThreadItemDetails::WebSearch {
+                    query: "rust serde".into(),
+                },
+            },
+        })
+        .expect("web search is activity");
+        assert_eq!(ws.kind, ActivityKind::WebSearch);
+        assert_eq!(ws.summary, "rust serde");
+    }
+
+    #[test]
+    fn activity_for_returns_none_for_agent_message_and_lifecycle() {
+        // The answer is NOT activity (the pump routes it as an Answer event).
+        let answer = ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "a1".into(),
+                details: ThreadItemDetails::AgentMessage("final reply".into()),
+            },
+        };
+        assert!(activity_for(&answer).is_none());
+        // Errors are not activity either.
+        let err = ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "e1".into(),
+                details: ThreadItemDetails::Error("boom".into()),
+            },
+        };
+        assert!(activity_for(&err).is_none());
+        // Non-item lifecycle events (turn boundaries) are not activity.
+        assert!(activity_for(&ThreadEvent::TurnStarted {
+            turn_id: "turn-1".into()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn activity_for_summary_matches_the_fold_preview() {
+        // THE no-drift guarantee: the activity summary reuses the SAME helpers
+        // the IM fold renders, so a tool's activity summary equals what the
+        // fold pushed into its `recent` detail line (minus the emoji prefix).
+        let ev = started_tool("t1", "Read", json!({"file_path": "/etc/hosts"}));
+        let act = activity_for(&ev).expect("activity");
+        let mut f = ProgressFold::new();
+        f.apply(&ev);
+        let detail = f.render();
+        // The fold's detail line is `📖 Read(/etc/hosts)`; the activity summary
+        // is the same `Read(/etc/hosts)` payload (no emoji).
+        assert_eq!(act.summary, "Read(/etc/hosts)");
+        assert!(detail.contains(&act.summary), "fold detail: {detail}");
     }
 
     #[test]

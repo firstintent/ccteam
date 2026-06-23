@@ -78,6 +78,55 @@ describe("parseSessionEvent (W2 payload shape)", () => {
     expect(ev!.token).toBe("ptok");
   });
 
+  it("parses an activity frame with the nested structured payload (v0.8.19)", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({
+        id: "a1",
+        sid: "s3",
+        kind: "activity",
+        content: "Bash(ls -la)",
+        activity: {
+          kind: "tool_call",
+          name: "Bash",
+          summary: "Bash(ls -la)",
+          status: "started",
+          item_id: "t1",
+        },
+      }),
+    );
+    expect(ev!.kind).toBe("activity");
+    expect(ev!.content).toBe("Bash(ls -la)");
+    expect(ev!.activity).toEqual({
+      kind: "tool_call",
+      name: "Bash",
+      summary: "Bash(ls -la)",
+      status: "started",
+      item_id: "t1",
+    });
+  });
+
+  it("tolerates a malformed activity object (drops it, keeps the frame)", () => {
+    // A non-object activity is ignored; the bare "activity" frame still parses
+    // (its `content` line renders).
+    const ev = parseSessionEvent(
+      JSON.stringify({ kind: "activity", content: "thinking…", activity: "garbage" }),
+    );
+    expect(ev!.kind).toBe("activity");
+    expect(ev!.content).toBe("thinking…");
+    expect(ev!.activity).toBeUndefined();
+    // A partial activity object fills missing string fields with "".
+    const partial = parseSessionEvent(
+      JSON.stringify({ kind: "activity", content: "x", activity: { kind: "thinking" } }),
+    );
+    expect(partial!.activity).toEqual({
+      kind: "thinking",
+      name: "",
+      summary: "",
+      status: "",
+      item_id: "",
+    });
+  });
+
   it("defaults an unknown kind to answer and missing content to ''", () => {
     const ev = parseSessionEvent(JSON.stringify({ foo: "bar" }));
     expect(ev).toMatchObject({ kind: "answer", content: "" });

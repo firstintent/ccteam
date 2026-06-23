@@ -9,15 +9,24 @@
 // owns its OWN transcript (a per-sid localStorage key), so switching the
 // sid view NEVER mixes two sessions' rows.
 
-import type { SessionEvent, SessionEventOption } from "../hooks/useSessionEvents";
+import { Brain, FileText, Pencil, Search, Terminal, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
+import type {
+  SessionActivity,
+  SessionEvent,
+  SessionEventOption,
+} from "../hooks/useSessionEvents";
 import type { SessionHistoryEvent } from "../lib/sessionsApi";
 
-export type RowKind = "user" | "assistant" | "tool" | "system" | "approval";
+export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
 
 /** One rendered transcript row. `approval` rows carry the W2 ChoicePrompt
  *  options (`{label, id}`) so ChatConsole can render clickable
  *  [Approve][Deny] chips, plus the `token` the web resolve path POSTs back
- *  (R-H1); `resolved` flips once the user clicks (so the chips disable). */
+ *  (R-H1); `resolved` flips once the user clicks (so the chips disable).
+ *  `activity` rows carry the structured per-step payload (v0.8.19) for a
+ *  compact mono activity line. */
 export interface TranscriptRow {
   id: string;
   kind: RowKind;
@@ -29,6 +38,9 @@ export interface TranscriptRow {
   token?: string;
   /** Approval-only: true once an option was clicked. */
   resolved?: boolean;
+  /** Activity-only: the structured per-step payload (kind/name/summary/…),
+   *  so SessionView can pick an icon + render it compactly (v0.8.19). */
+  activity?: SessionActivity;
 }
 
 export const ROWS_CAP = 400;
@@ -54,9 +66,10 @@ export function appendRow(rows: TranscriptRow[], row: TranscriptRow): Transcript
 
 /** Map one SSE {@link SessionEvent} to a transcript row, or `null` when it
  *  carries nothing to render (an empty non-final progress edit). An event
- *  with non-empty `options` becomes an `approval` row (the W2 prompt);
- *  otherwise an `answer` becomes an assistant bubble and a `progress`
- *  becomes a system note. */
+ *  with non-empty `options` becomes an `approval` row (the W2 prompt); an
+ *  `activity` event becomes a compact `activity` row (v0.8.19); otherwise an
+ *  `answer` becomes an assistant bubble and a `progress` becomes a system
+ *  note. */
 export function eventToRow(ev: SessionEvent): TranscriptRow | null {
   if (ev.options && ev.options.length > 0) {
     return {
@@ -65,6 +78,20 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       content: ev.content || "needs approval",
       options: ev.options,
       token: ev.token,
+    };
+  }
+  // v0.8.19 — a structured per-step activity (tool call / thinking / …)
+  // renders as a compact mono row. Drop a frame with no usable summary
+  // (nothing to show); the structured `activity` rides onto the row so
+  // SessionView can pick an icon by kind.
+  if (ev.kind === "activity") {
+    const summary = ev.activity?.summary || ev.content;
+    if (!summary) return null;
+    return {
+      id: ev.id ?? nextRowId("activity"),
+      kind: "activity",
+      content: summary,
+      activity: ev.activity,
     };
   }
   if (ev.kind === "answer") {
@@ -76,6 +103,35 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
     return { id: ev.id ?? nextRowId("system"), kind: "system", content: ev.content };
   }
   return null;
+}
+
+/** Pick a lucide icon for a structured activity row (v0.8.19). Keys off the
+ *  activity `kind` first, then the tool `name` to distinguish a bash/command
+ *  call (Terminal) from a read (FileText) or a grep/search (Search) within a
+ *  generic `tool_call`. Pure + dependency-light (only lucide types) so the
+ *  mapping is unit-testable and shared. */
+export function activityIcon(kind: string, name: string): LucideIcon {
+  switch (kind) {
+    case "thinking":
+      return Brain;
+    case "command_exec":
+      return Terminal;
+    case "file_change":
+      return Pencil;
+    case "web_search":
+      return Search;
+    case "tool_call":
+    case "tool_result": {
+      const n = name.toLowerCase();
+      if (["bash", "bashoutput", "killbash", "killshell"].includes(n)) return Terminal;
+      if (["read", "ls", "notebookread"].includes(n)) return FileText;
+      if (["grep", "glob", "websearch", "webfetch"].includes(n)) return Search;
+      if (["edit", "multiedit", "write", "notebookedit"].includes(n)) return Pencil;
+      return Wrench;
+    }
+    default:
+      return Wrench;
+  }
 }
 
 /** Seed a transcript from mirrored history (`GET /sessions/{sid}`). Each

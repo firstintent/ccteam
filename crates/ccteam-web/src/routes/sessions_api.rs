@@ -797,6 +797,8 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     let (kind, done) = match &ev.kind {
         GatewayEventKind::Answer => ("answer", false),
         GatewayEventKind::Progress { done, .. } => ("progress", *done),
+        // v0.8.19 — structured per-step activity (web-only; IM drops it).
+        GatewayEventKind::Activity { .. } => ("activity", false),
     };
     let mut payload = json!({
         "id": ev.id,
@@ -806,6 +808,12 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     });
     if done {
         payload["done"] = serde_json::Value::Bool(true);
+    }
+    // v0.8.19 — attach the structured activity form so the web chat can render
+    // it as an activity card (the shared `progress::activity_for` summary +
+    // kind + item_id for start↔complete dedup). IM never sees this branch.
+    if let GatewayEventKind::Activity { activity, .. } = &ev.kind {
+        payload["activity"] = serde_json::to_value(activity).unwrap_or(serde_json::Value::Null);
     }
     if !ev.options.is_empty() {
         payload["options"] = serde_json::Value::Array(
@@ -1068,6 +1076,41 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    /// v0.8.19 — a structured `Activity` event serializes `kind:"activity"`
+    /// plus the nested `activity` object (kind / name / summary / status /
+    /// item_id) the web chat renders as an activity card. IM never reaches
+    /// this branch (strict no-op arm), so this is purely the web wire shape.
+    #[test]
+    fn session_event_serializes_activity() {
+        use ccteam_im::gateway::{ActivityKind, ActivityStatus, GatewayEventKind, SessionActivity};
+        let mut ev = gw_event(Some("s3"));
+        ev.content = "Bash(ls -la)".into();
+        ev.kind = GatewayEventKind::Activity {
+            status_key: "s3-0".into(),
+            activity: SessionActivity {
+                kind: ActivityKind::ToolCall,
+                name: "Bash".into(),
+                summary: "Bash(ls -la)".into(),
+                status: ActivityStatus::Started,
+                item_id: "t1".into(),
+            },
+        };
+        let payload = session_event_payload(&ev);
+        assert_eq!(payload["kind"], "activity");
+        assert_eq!(payload["sid"], "s3");
+        // The human content line mirrors the summary.
+        assert_eq!(payload["content"], "Bash(ls -la)");
+        // No `done` key on an activity frame.
+        assert!(payload.get("done").is_none());
+        // The nested structured activity (snake_case enums via serde).
+        let act = &payload["activity"];
+        assert_eq!(act["kind"], "tool_call");
+        assert_eq!(act["name"], "Bash");
+        assert_eq!(act["summary"], "Bash(ls -la)");
+        assert_eq!(act["status"], "started");
+        assert_eq!(act["item_id"], "t1");
     }
 
     /// v0.8.7 review-fix (R-H1) — an approval ChoicePrompt event serializes its
