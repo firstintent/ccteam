@@ -26,7 +26,7 @@
 // approval routes through the gateway's pending machinery (NOT a turn).
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MessageSquare, Square, Terminal } from "lucide-react";
+import { ArrowDown, MessageSquare, Square, Terminal } from "lucide-react";
 import { Composer } from "../components/Composer";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
@@ -239,12 +239,25 @@ export default function SessionView({
   const canTerminal = session?.vendor === "claude" && !isStreamJson;
   const showTerminal = view === "terminal" && canTerminal;
 
-  // Auto-scroll to the newest message only when already near the bottom.
+  // Auto-scroll to the newest message only when already near the bottom; a
+  // "back to latest" button appears once the user scrolls up to read history
+  // (so a streaming reply never yanks them back down).
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   const onTranscriptScroll = useCallback(() => {
     const el = scrollRef.current;
-    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    atBottomRef.current = atBottom;
+    setShowJump(!atBottom);
+  }, []);
+  const jumpToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    atBottomRef.current = true;
+    setShowJump(false);
   }, []);
   useLayoutEffect(() => {
     if (!showTerminal && atBottomRef.current && scrollRef.current) {
@@ -348,10 +361,11 @@ export default function SessionView({
               截图请新建 terminal session。
             </div>
           ) : null}
+          <div className="relative flex-1 min-h-0">
           <div
             ref={scrollRef}
             onScroll={onTranscriptScroll}
-            className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
+            className="h-full overflow-y-auto p-4 space-y-3"
           >
             {rows.map((row) => {
               if (row.kind === "approval") {
@@ -405,6 +419,25 @@ export default function SessionView({
                 </div>
               );
             })}
+            {/* streaming indicator — a turn is in flight (the assistant is
+                thinking / replying); clears on the `done` frame. */}
+            {busy ? (
+              <div className="flex items-center gap-1.5 px-1 py-0.5" aria-label="生成中">
+                <span className="h-1.5 w-1.5 rounded-full bg-text-muted animate-pulse motion-reduce:animate-none" />
+                <span className="h-1.5 w-1.5 rounded-full bg-text-muted animate-pulse motion-reduce:animate-none [animation-delay:150ms]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-text-muted animate-pulse motion-reduce:animate-none [animation-delay:300ms]" />
+              </div>
+            ) : null}
+          </div>
+          {showJump ? (
+            <button
+              type="button"
+              onClick={jumpToBottom}
+              className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-surface-700 bg-surface-800 px-3 py-1 text-xs text-text-bright shadow-lg hover:bg-surface-700"
+            >
+              <ArrowDown className="h-3.5 w-3.5" /> 回到最新
+            </button>
+          ) : null}
           </div>
           <Composer sid={sid} busy={busy} onSubmit={submitText} onStop={stopActive} />
         </>
