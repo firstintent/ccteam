@@ -157,8 +157,17 @@ pub struct ThreadLive {
     /// The in-flight turn id, if any. Drives steer-vs-start (D2.2) and
     /// `/interrupt`'s `expectedTurnId`.
     pub active_turn: Option<String>,
-    /// Model id for this thread (from spawn ctx / `thread/start`).
+    /// Model id for this thread. Seeded deterministically from the spawn
+    /// ctx (user's explicit intent) else codex's resolved `result.model`
+    /// echoed by the `thread/start` / `thread/resume` response — see
+    /// [`pluck_model`]. Never inferred; `None` only if codex reports none.
     pub model: Option<String>,
+    /// Reasoning-effort the thread runs at (codex `reasoningEffort`,
+    /// lowercase: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/custom).
+    /// Seeded from the `thread/start` / `thread/resume` response
+    /// ([`pluck_effort`]) or a `/model <id> <effort>` directive. `None`
+    /// when codex reports no effort. Surfaced in the `/sessions` statusline.
+    pub effort: Option<String>,
 }
 
 /// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
@@ -1365,11 +1374,26 @@ impl HarnessAdapter for CodexAppServerAdapter {
             })
             .await;
         }
-        // v0.8.5 D2.4 — seed the tracker's model for this thread from the
-        // spawn ctx so `/status` + `thread_status` can report it before the
-        // first tokenUsage notification arrives.
-        if ctx.model_id.is_some() {
-            self.tracker.lock().await.entry(&thread_id).model = ctx.model_id.clone();
+        // v0.8.5 D2.4 / v0.8.19 — seed the tracker's model + effort for this
+        // thread so `/status` + `thread_status` can report them before the
+        // first tokenUsage notification arrives. DETERMINISTIC precedence:
+        // the user's explicit `ctx.model_id` wins; otherwise codex's RESOLVED
+        // model echoed in the `thread/start` response (`result.model` — see
+        // [`pluck_model`]). Never inferred. This fixes the blank statusline
+        // model for sessions started without an explicit model (codex's
+        // server default). Effort comes only from the response (codex owns
+        // it; `result.reasoningEffort`).
+        {
+            let model = ctx.model_id.clone().or_else(|| pluck_model(&result));
+            let effort = pluck_effort(&result);
+            let mut tracker = self.tracker.lock().await;
+            let entry = tracker.entry(&thread_id);
+            if model.is_some() {
+                entry.model = model;
+            }
+            if effort.is_some() {
+                entry.effort = effort;
+            }
         }
         // V0.6.1 F122 — register a progress bridge so the events()
         // stream can mirror turn boundaries into progress.jsonl.
@@ -1620,6 +1644,25 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("thread/resume: {e:#}")))?;
         let thread_id = pluck_thread_id(&result).unwrap_or_else(|| persistent_id.to_string());
+        // v0.8.19 — seed the tracker's model + effort from the resume
+        // response (`result.model` / `result.reasoningEffort` — see
+        // [`pluck_model`]). Resumed threads have no `ctx.model_id` (resume
+        // takes a bare persistent id), so codex's RESOLVED model is the sole
+        // deterministic source. This is what fixes the blank statusline model
+        // on a daemon-restart-resumed codex session (e.g. the live s28).
+        // Never inferred; only set from a real value codex reports.
+        {
+            let model = pluck_model(&result);
+            let effort = pluck_effort(&result);
+            let mut tracker = self.tracker.lock().await;
+            let entry = tracker.entry(&thread_id);
+            if model.is_some() {
+                entry.model = model;
+            }
+            if effort.is_some() {
+                entry.effort = effort;
+            }
+        }
         Ok(ThreadHandle {
             vendor: AgentVendor::Codex,
             mode: ExecutionMode::Chat,
@@ -1733,10 +1776,11 @@ impl HarnessAdapter for CodexAppServerAdapter {
         Ok(ThreadStatus {
             model: live.model,
             context: live.usage,
-            // Codex carries a `/model <id> [effort]` axis, but the tracker
-            // doesn't surface it yet — statusline effort is stream-json (Claude)
-            // only for now; None keeps the Codex suffix unchanged.
-            effort: None,
+            // v0.8.19 — codex's RESOLVED reasoning effort, captured
+            // deterministically from the `thread/start` / `thread/resume`
+            // response (`result.reasoningEffort`). `None` when codex reports
+            // none (keeps the Codex suffix unchanged in that case).
+            effort: live.effort,
             // Codex has a native `/goal` (thread/goal/*); surfacing it in the
             // statusline is a follow-up — None for now.
             goal: None,
@@ -2923,6 +2967,51 @@ fn pluck_turn_id(v: &Value) -> Option<String> {
         .or_else(|| pluck_str(v, "turn_id", "turnId").map(str::to_string))
 }
 
+/// v0.8.19 — pull codex's RESOLVED model id from a `thread/start` /
+/// `thread/resume` response so the `/sessions` statusline can show it for
+/// sessions started without an explicit `ctx.model_id` (codex's server
+/// default). DETERMINISTIC, never inferred: the real wire (verified live
+/// against codex-cli 0.141.0 + `app-server-protocol/.../v2/thread.rs`
+/// `ThreadStartResponse` / `ThreadResumeResponse`) puts the model at the
+/// response TOP LEVEL `result.model` (a sibling of `result.thread`, NOT
+/// inside the `Thread` object — `Thread` carries only `modelProvider`).
+/// Camel-case-first via [`pluck_str`]; the defensive `thread.model` /
+/// `threadSettings.model` paths cover a `ThreadSettings`-style payload
+/// (`thread/settings/updated`) without ever fabricating a value. Empty
+/// strings are treated as absent. Returns `None` (→ blank model) when
+/// codex genuinely reports none.
+fn pluck_model(v: &Value) -> Option<String> {
+    pluck_str(v, "model", "model")
+        .or_else(|| v.get("thread").and_then(|t| pluck_str(t, "model", "model")))
+        .or_else(|| {
+            v.get("threadSettings")
+                .or_else(|| v.get("thread_settings"))
+                .and_then(|s| pluck_str(s, "model", "model"))
+        })
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// v0.8.19 — pull codex's resolved reasoning effort from a `thread/start`
+/// / `thread/resume` response. Real wire: `result.reasoningEffort`
+/// (`ReasoningEffort` serializes as a lowercase string — `none` /
+/// `minimal` / `low` / `medium` / `high` / `xhigh` / custom — verified
+/// live). The `threadSettings.effort` fallback covers a
+/// `ThreadSettings`-style payload (it names the field `effort`, not
+/// `reasoningEffort`). Lowercased to match the `/model <id> <effort>`
+/// directive's stored form (`SessionOverride.effort`). `None` when codex
+/// reports none (statusline omits effort).
+fn pluck_effort(v: &Value) -> Option<String> {
+    pluck_str(v, "reasoning_effort", "reasoningEffort")
+        .or_else(|| {
+            v.get("threadSettings")
+                .or_else(|| v.get("thread_settings"))
+                .and_then(|s| pluck_str(s, "effort", "effort"))
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+}
+
 fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
     let raw = v
         .get("usage")
@@ -3536,6 +3625,74 @@ mod tests {
         assert_eq!(
             pluck_turn_id(&json!({ "turnId": "turn_flat" })),
             Some("turn_flat".to_string())
+        );
+    }
+
+    #[test]
+    fn pluck_model_resolves_real_wire_top_level_model() {
+        // v0.8.19 — realistic `thread/start` response shape captured live
+        // against codex-cli 0.141.0: the RESOLVED model is at the response
+        // TOP LEVEL `result.model` (sibling of `thread`), NOT inside the
+        // `thread` object (which carries only `modelProvider`).
+        let resp = json!({
+            "thread": {
+                "id": "019ef6de-960a-7d93-86a4-8e37c9bfbdb0",
+                "modelProvider": "openai",
+                "status": { "type": "idle" }
+            },
+            "model": "gpt-5.5",
+            "modelProvider": "openai",
+            "reasoningEffort": "high"
+        });
+        assert_eq!(pluck_model(&resp), Some("gpt-5.5".to_string()));
+        assert_eq!(pluck_effort(&resp), Some("high".to_string()));
+
+        // Defensive fallback: a `ThreadSettings`-style payload nests the
+        // model under `threadSettings.model` and effort under
+        // `threadSettings.effort` (the short field name, not reasoningEffort).
+        let settings = json!({
+            "threadId": "t1",
+            "threadSettings": { "model": "gpt-5.5-codex", "effort": "Low" }
+        });
+        assert_eq!(pluck_model(&settings), Some("gpt-5.5-codex".to_string()));
+        // Effort is lowercased to match the /model directive's stored form.
+        assert_eq!(pluck_effort(&settings), Some("low".to_string()));
+
+        // Defensive: a model inlined on the thread object is still found.
+        let on_thread = json!({ "thread": { "model": "o3" } });
+        assert_eq!(pluck_model(&on_thread), Some("o3".to_string()));
+
+        // Honest None: codex reports no model / no effort → blank statusline,
+        // never inferred. Empty strings are treated as absent.
+        assert_eq!(
+            pluck_model(&json!({ "thread": { "modelProvider": "openai" } })),
+            None
+        );
+        assert_eq!(pluck_model(&json!({ "model": "" })), None);
+        assert_eq!(pluck_effort(&json!({ "model": "gpt-5.5" })), None);
+        assert_eq!(pluck_effort(&json!({ "reasoningEffort": "" })), None);
+    }
+
+    #[test]
+    fn ctx_model_id_takes_precedence_over_resolved_model() {
+        // v0.8.19 — the seeding expression is
+        //   ctx.model_id.clone().or_else(|| pluck_model(&result))
+        // The user's explicit intent (ctx.model_id) wins; codex's resolved
+        // model only fills the gap. Deterministic on both arms.
+        let result = json!({ "model": "gpt-5.5", "reasoningEffort": "high" });
+
+        // Explicit ctx model present → it wins (codex's resolved model ignored).
+        let ctx_model: Option<String> = Some("gpt-5.5-codex".to_string());
+        assert_eq!(
+            ctx_model.clone().or_else(|| pluck_model(&result)),
+            Some("gpt-5.5-codex".to_string())
+        );
+
+        // No ctx model (codex server default) → fall back to resolved model.
+        let no_ctx: Option<String> = None;
+        assert_eq!(
+            no_ctx.or_else(|| pluck_model(&result)),
+            Some("gpt-5.5".to_string())
         );
     }
 
