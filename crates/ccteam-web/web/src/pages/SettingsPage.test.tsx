@@ -61,7 +61,13 @@ describe("Settings sections", () => {
       <TelegramSection status={null} onSaved={() => {}} />,
     );
     expect(html).toContain('data-testid="settings-telegram"');
-    expect(html).toContain("Not configured");
+    // v0.8.19 W3b — the not-configured state now reads via the "未配置" status
+    // badge (the card-based redesign replaced the English "Not configured"
+    // copy). Also assert the readout shows no fingerprint (em-dash) and the
+    // token field still renders empty (red line: never pre-filled).
+    expect(html).toContain("未配置");
+    expect(html).toContain('type="password"');
+    expect(html).toContain('value=""');
   });
 
   it("LarkSection (configured) renders its testid + masked app id + region", () => {

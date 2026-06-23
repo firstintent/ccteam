@@ -1,22 +1,35 @@
-// v0.8.8 F4 — Settings page: configure IM credentials (Telegram + Lark)
-// from the web UI. Backend SoT: `crates/ccteam-web/src/routes/im_config.rs`,
-// client: `lib/configApi.ts`.
+// v0.8.8 F4 — Settings page: configure IM credentials (Telegram + Lark) +
+// per-user (tenant) management from the web UI.
+// Backend SoT: `crates/ccteam-web/src/routes/im_config.rs` (+ `users.rs`);
+// clients: `lib/configApi.ts` + `lib/usersApi.ts`.
 //
-// Shape mirrors SessionsListPage's four-state top level (loading / error /
-// empty / success) keyed off `getImConfig()`. Each provider gets a section
-// that shows its masked status when configured and an edit form to (re)set
-// the secret.
+// v0.8.19 W3b — rewritten from a cramped `max-w-md` single column of three
+// hand-rolled sections into a card-based layout on the shared primitive
+// library (`components/ui`): each IM provider is a `Card` (header = name +
+// status `Badge` + actions, body = form, optional right-side label→mono
+// status read-out, footer = "下次重启生效"); user management is a real
+// semantic `<table>`. The `FIELD_CLASS` / `*_BTN_CLASS` constants are gone —
+// `Input` / `Label` / `Button` / `Badge` carry the styling now (so it reads
+// correctly in BOTH dark and light theme via the `@theme` tokens).
 //
-// 红线(red lines):
+// 红线(red lines) — UNCHANGED behavior:
 //   - Secrets are NEVER pre-filled or echoed: `getImConfig` carries only
 //     last-4 fingerprints (configApi has no plaintext field), and the
 //     <input> for a token/secret always starts empty. Re-configuring shows
 //     "(set, …wxyz)" + a fresh blank field, never the value.
 //   - Web-token rides along automatically (same-origin fetch via configApi).
 //   - Overwriting an already-configured secret is destructive → an inline
-//     two-step confirm (NOT window.confirm, which clashes with the dark
+//     two-step confirm (NOT window.confirm, which clashes with the dark/light
 //     SPA chrome).
-//   - Theme: surface-*/brand-*/status-error only (no bare amber-*/red-*).
+//   - Admin-gate: this page is admin-only (IM creds + user management are
+//     GLOBAL daemon config). A tenant gets a pointer to the avatar menu.
+//   - Theme tokens only (surface-*/brand-*/text-*/status-*), no bare colors.
+//
+// NOTE — no "测试连接 / Test connection" button: configApi exposes no
+// getMe-only endpoint (the only Telegram validation rides INSIDE
+// `saveTelegramToken`, which validates via getMe server-side and echoes the
+// bot @username on save). Per the W3b brief we do NOT invent a backend, so
+// the prototype's standalone test button is intentionally omitted.
 //
 // Telegram `chat_id` capture is async: after the token saves we tell the
 // operator to DM the bot, fire `startTelegramChatId()`, then poll
@@ -25,6 +38,7 @@
 // re-run (cleanup `clearTimeout`) so navigating away never leaks a timer.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link2, MessageSquare, Send, Users } from "lucide-react";
 import {
   getImConfig,
   pollTelegramChatId,
@@ -37,24 +51,21 @@ import {
 import { toastBus } from "../lib/toastBus";
 import { createUser, deleteUser, listUsers, type TenantView } from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  Input,
+  Label,
+  Textarea,
+} from "../components/ui";
 
 /** Poll interval for the async Telegram `chat_id` capture. */
 const CHAT_ID_POLL_MS = 1500;
-
-// Shared field/control class strings — kept in one place so both sections
-// stay visually identical and on-theme (brand focus ring, no bare colors).
-const FIELD_CLASS =
-  "w-full px-3 py-2 bg-surface-900 border border-surface-700/60 rounded-lg " +
-  "text-text-primary text-sm font-mono placeholder:text-text-dim " +
-  "focus:outline-none focus:ring-2 focus:ring-brand-600 focus:border-transparent " +
-  "disabled:opacity-50 transition-colors";
-const PRIMARY_BTN_CLASS =
-  "px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white text-xs font-medium " +
-  "rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer";
-const GHOST_BTN_CLASS =
-  "px-3 py-1.5 border border-surface-700/60 text-text-secondary hover:text-text-primary " +
-  "hover:bg-surface-800 text-xs font-medium rounded-lg transition-colors cursor-pointer " +
-  "disabled:opacity-50 disabled:cursor-not-allowed";
 
 export default function SettingsPage() {
   // v0.8.18 档1 — this page is admin-only (IM credentials + user management are
@@ -95,10 +106,7 @@ export default function SettingsPage() {
   // loading placeholder.
   if (me === null) {
     return (
-      <div
-        data-testid="settings-loading"
-        className="p-4 text-xs text-text-dim font-mono"
-      >
+      <div data-testid="settings-loading" className="p-4 text-xs text-text-dim font-mono">
         loading settings…
       </div>
     );
@@ -109,7 +117,7 @@ export default function SettingsPage() {
     return (
       <div
         data-testid="settings-tenant"
-        className="p-4 max-w-md mx-auto flex flex-col gap-2 text-[11px] font-mono text-text-secondary leading-relaxed"
+        className="p-6 max-w-xl mx-auto flex flex-col gap-2 text-[11px] font-mono text-text-secondary leading-relaxed"
       >
         <h1 className="text-sm font-medium text-text-primary">设置 · Settings</h1>
         <p>
@@ -135,301 +143,84 @@ export default function SettingsPage() {
   }
   if (config === null) {
     return (
-      <div
-        data-testid="settings-loading"
-        className="p-4 text-xs text-text-dim font-mono"
-      >
+      <div data-testid="settings-loading" className="p-4 text-xs text-text-dim font-mono">
         loading settings…
       </div>
     );
   }
 
   return (
-    <div
-      data-testid="settings-page"
-      className="p-4 max-w-md mx-auto flex flex-col gap-5"
-    >
-      <header className="flex flex-col gap-1">
-        <h1 className="text-sm font-medium text-text-primary">IM Credentials</h1>
-        <p className="text-xs text-text-dim font-mono">
-          Connect a chat transport so ccteam can reach you. Changes apply on
-          the next restart.
-        </p>
-      </header>
+    <div data-testid="settings-page" className="p-4 sm:p-6 max-w-3xl mx-auto flex flex-col gap-8">
+      <section className="flex flex-col gap-4">
+        <SectionHeading
+          title="IM 凭据 · Credentials"
+          badge="管理员 · 全局"
+          subtitle="连一个聊天通道,ccteam 才能找到你。下次重启生效。"
+        />
 
-      {config.transport_warning ? (
-        <div
-          data-testid="settings-transport-warning"
-          role="status"
-          className="text-[11px] font-mono text-brand-400 bg-brand-600/10 border border-brand-600/30 rounded-lg px-3 py-2"
-        >
-          {config.transport_warning}
-        </div>
-      ) : null}
+        {config.transport_warning ? (
+          <div
+            data-testid="settings-transport-warning"
+            role="status"
+            className="text-[11px] font-mono text-brand-400 bg-brand-500/10 border border-brand-500/30 rounded-lg px-3 py-2"
+          >
+            {config.transport_warning}
+          </div>
+        ) : null}
 
-      <TelegramSection status={config.telegram} onSaved={reload} />
-      <LarkSection status={config.lark} onSaved={reload} />
+        <TelegramSection status={config.telegram} onSaved={reload} />
+        <LarkSection status={config.lark} onSaved={reload} />
+      </section>
+
       <UserManagementSection />
     </div>
   );
 }
 
 // --------------------------------------------------------------------------
-// v0.8.18 档1 — multi-user management (web-first). The admin/owner mints a
-// per-user tenant; each gets a one-time personal link (?token=ccteam:<hex>)
-// that signs them in as themselves and scopes the session list to their own.
-// Backend SoT: `crates/ccteam-web/src/routes/users.rs`; client `lib/usersApi`.
-// Admin-gated: a non-admin caller 403s → we show the read-only note instead of
-// the management form. There is deliberately NO `ccteam user` CLI — runtime
-// user writes live here on the web.
+// Shared chrome
 // --------------------------------------------------------------------------
 
-function UserManagementSection() {
-  const [users, setUsers] = useState<TenantView[] | null>(null);
-  const [forbidden, setForbidden] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [handle, setHandle] = useState("");
-  const [creating, setCreating] = useState(false);
-  // The one-time personal link surfaced after a create (token shown once).
-  const [newLink, setNewLink] = useState<{ handle: string; link: string } | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    listUsers()
-      .then((list) => {
-        setUsers(list);
-        setForbidden(false);
-        setError(null);
-      })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg === "UNAUTHENTICATED") return;
-        if (msg === "FORBIDDEN") {
-          setForbidden(true);
-          setUsers([]);
-          return;
-        }
-        setError(msg);
-      });
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  async function onCreate(e: React.FormEvent) {
-    e.preventDefault();
-    const h = handle.trim();
-    if (creating || h.length === 0) return;
-    setCreating(true);
-    try {
-      const res = await createUser(h);
-      const origin =
-        typeof window !== "undefined" && window.location ? window.location.origin : "";
-      setNewLink({ handle: res.tenant.handle, link: `${origin}${res.personal_link}` });
-      setHandle("");
-      load();
-    } catch (err) {
-      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-      toastBus.handler?.error(err instanceof Error ? err.message : "create failed");
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  function onDelete(id: string) {
-    deleteUser(id)
-      .then(() => {
-        setConfirmDelete(null);
-        load();
-      })
-      .catch((err) => {
-        if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-        toastBus.handler?.error(err instanceof Error ? err.message : "delete failed");
-      });
-  }
-
-  function copyLink(link: string) {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      navigator.clipboard
-        .writeText(link)
-        .then(() => toastBus.handler?.info("链接已复制 / Link copied"), () => {});
-    }
-  }
-
-  return (
-    <Section
-      testId="settings-users"
-      title="用户管理 · Users"
-      subtitle="给每个人开独立 web 入口:添加用户 → 复制个人链接发给他;他打开即以自己的身份登录,只看自己的 session。"
-    >
-      {forbidden ? (
-        <p
-          data-testid="settings-users-forbidden"
-          className="text-[11px] font-mono text-text-dim leading-relaxed"
-        >
-          仅 <b className="text-text-primary">管理员(owner token)</b> 可管理用户;你当前以普通用户身份登录。
-        </p>
-      ) : (
-        <div className="flex flex-col gap-3">
-          <form onSubmit={onCreate} className="flex flex-col gap-2">
-            <label
-              htmlFor="settings-user-handle"
-              className="text-[11px] text-text-muted font-medium"
-            >
-              新用户名 / Handle
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                id="settings-user-handle"
-                type="text"
-                autoComplete="off"
-                value={handle}
-                onChange={(e) => setHandle(e.target.value)}
-                disabled={creating}
-                spellCheck={false}
-                placeholder="alice"
-                className={FIELD_CLASS}
-              />
-              <button
-                type="submit"
-                disabled={creating || handle.trim().length === 0}
-                className={`${PRIMARY_BTN_CLASS} whitespace-nowrap`}
-              >
-                {creating ? "…" : "添加用户"}
-              </button>
-            </div>
-          </form>
-
-          {newLink ? (
-            <div
-              data-testid="settings-user-newlink"
-              className="flex flex-col gap-1.5 rounded-lg border border-brand-600/30 bg-brand-600/10 px-3 py-2"
-            >
-              <p className="text-[11px] font-mono text-brand-400">
-                <b className="text-text-primary">{newLink.handle}</b>{" "}
-                的个人链接(只显示这一次,复制发给他):
-              </p>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 text-[10px] text-text-secondary break-all bg-surface-900 rounded px-2 py-1 border border-surface-700/60">
-                  {newLink.link}
-                </code>
-                <button
-                  type="button"
-                  onClick={() => copyLink(newLink.link)}
-                  className={GHOST_BTN_CLASS}
-                >
-                  复制
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={() => setNewLink(null)}
-                className="text-[10px] text-text-dim hover:text-text-secondary self-start"
-              >
-                知道了,关闭
-              </button>
-            </div>
-          ) : null}
-
-          {error ? (
-            <p className="text-[11px] font-mono text-status-error">加载失败: {error}</p>
-          ) : users === null ? (
-            <p className="text-[11px] font-mono text-text-dim">loading…</p>
-          ) : users.length === 0 ? (
-            <p className="text-[11px] font-mono text-text-dim">还没有用户。添加一个吧。</p>
-          ) : (
-            <ul className="flex flex-col gap-1">
-              {users.map((u) => (
-                <li
-                  key={u.id}
-                  className="flex items-center justify-between gap-2 text-[11px] font-mono rounded-lg border border-surface-700/40 bg-surface-900/60 px-3 py-1.5"
-                >
-                  <span className="flex flex-col">
-                    <span className="text-text-primary">{u.handle}</span>
-                    <span className="text-text-dim text-[10px]">
-                      {u.linked_chat ? `IM: ${u.linked_chat}` : "未绑定 IM"}
-                    </span>
-                  </span>
-                  {confirmDelete === u.id ? (
-                    <span className="flex items-center gap-1.5">
-                      <span className="text-status-error">删除?</span>
-                      <button
-                        type="button"
-                        onClick={() => onDelete(u.id)}
-                        className={GHOST_BTN_CLASS}
-                      >
-                        确认
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDelete(null)}
-                        className={GHOST_BTN_CLASS}
-                      >
-                        取消
-                      </button>
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDelete(u.id)}
-                      className={GHOST_BTN_CLASS}
-                    >
-                      删除
-                    </button>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <p className="text-[10px] font-mono text-text-dim leading-relaxed">
-            诚实边界:同一台机器、同一个 OS 账号下是
-            <b className="text-text-secondary">软隔离(UX)</b>、不是安全边界。
-          </p>
-        </div>
-      )}
-    </Section>
-  );
-}
-
-// --------------------------------------------------------------------------
-// Section chrome
-// --------------------------------------------------------------------------
-
-function Section({
-  testId,
+/** A section heading: title + an admin-scope badge + a one-line lede. */
+function SectionHeading({
   title,
+  badge,
   subtitle,
-  children,
 }: {
-  testId: string;
   title: string;
+  badge: string;
   subtitle: string;
-  children: React.ReactNode;
 }) {
   return (
-    <section
-      data-testid={testId}
-      className="flex flex-col gap-3 bg-surface-850/60 border border-surface-700/40 rounded-lg p-4"
-    >
-      <div className="flex flex-col gap-0.5">
-        <h2 className="text-xs font-medium text-text-primary uppercase tracking-wide">
-          {title}
-        </h2>
-        <p className="text-[11px] text-text-dim font-mono">{subtitle}</p>
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
+        <Badge variant="idle">{badge}</Badge>
       </div>
-      {children}
-    </section>
+      <p className="text-[11px] text-text-muted">{subtitle}</p>
+    </div>
   );
 }
 
-/** A masked "already configured" summary line. */
-function MaskedLine({ label, value }: { label: string; value: string }) {
+/** One row of the right-side label→mono status read-out. `ok` greens it. */
+function ReadoutRow({ label, value, ok }: { label: string; value: string; ok?: boolean }) {
   return (
-    <div className="flex items-center justify-between gap-2 text-[11px] font-mono">
-      <span className="text-text-muted">{label}</span>
-      <span className="text-text-secondary">{value}</span>
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-text-dim">{label}</span>
+      <span
+        className={`font-mono text-right ${ok ? "text-status-running" : "text-text-secondary"}`}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/** The right-side read-out column (a hairline-separated label→value stack). */
+function Readout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-2 text-[11px] sm:border-l sm:border-surface-800 sm:pl-4">
+      {children}
     </div>
   );
 }
@@ -541,90 +332,104 @@ export function TelegramSection({
       .then(() => setPollNonce((n) => n + 1))
       .catch((err) => {
         if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-        toastBus.handler?.error(
-          err instanceof Error ? err.message : "could not restart capture",
-        );
+        toastBus.handler?.error(err instanceof Error ? err.message : "could not restart capture");
         setChatIdStatus("error");
       });
   }
 
+  const bound = (status?.chat_id_count ?? 0) > 0;
+
   return (
-    <Section
-      testId="settings-telegram"
-      title="Telegram"
-      subtitle="Bot token from @BotFather; you DM the bot to bind your chat."
-    >
-      {configured && status ? (
-        <div className="flex flex-col gap-1 pb-1">
-          <MaskedLine label="bot token" value={`(set, ${status.bot_token_last4})`} />
-          <MaskedLine label="bound chats" value={String(status.chat_id_count)} />
-          {status.chat_id_count === 0 ? (
-            <p className="text-[11px] font-mono text-status-error pt-1">
-              No chat bound yet — set the token and DM the bot below.
+    <Card data-testid="settings-telegram">
+      <CardHeader>
+        <Send className="text-text-secondary" />
+        <CardTitle className="flex-1">Telegram</CardTitle>
+        {configured ? (
+          <Badge variant="running">已连接</Badge>
+        ) : (
+          <Badge variant="idle">未配置</Badge>
+        )}
+      </CardHeader>
+
+      <CardContent className="grid gap-5 sm:grid-cols-[1fr_220px]">
+        <div className="flex flex-col gap-3">
+          <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+            <Label htmlFor="settings-telegram-token">
+              {configured ? "重置 bot token" : "Bot token"}
+            </Label>
+            {/* Red line: the password field always starts EMPTY — the
+                fingerprint is text-only, never the input value. */}
+            <Input
+              id="settings-telegram-token"
+              type="password"
+              autoComplete="off"
+              value={token}
+              onChange={(e) => {
+                setToken(e.target.value);
+                if (confirming) setConfirming(false);
+              }}
+              disabled={pending}
+              spellCheck={false}
+              placeholder="123456:ABC-DEF…"
+              className="font-mono"
+            />
+            <div className="flex items-center gap-2 justify-end">
+              {confirming ? (
+                <>
+                  <span className="text-[11px] font-mono text-status-error mr-auto">
+                    覆盖已配置的 token?
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setConfirming(false)}
+                    disabled={pending}
+                  >
+                    取消
+                  </Button>
+                  <Button type="submit" size="sm" variant="destructive" disabled={pending}>
+                    {pending ? "保存中…" : "确认覆盖"}
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={pending || token.trim().length === 0}
+                >
+                  {pending ? "保存中…" : configured ? "重置 token" : "保存 token"}
+                </Button>
+              )}
+            </div>
+          </form>
+          <p className="text-[10px] font-mono text-text-dim leading-relaxed">
+            token 永不回显,仅显末 4 位;重置走两步确认(破坏性)。从 @BotFather 取 token,保存后 DM 机器人绑定你的 chat。
+          </p>
+        </div>
+
+        <Readout>
+          <ReadoutRow
+            label="bot token"
+            value={configured && status ? `(set, ${status.bot_token_last4})` : "—"}
+            ok={configured}
+          />
+          <ReadoutRow
+            label="bound chats"
+            value={configured && status ? String(status.chat_id_count) : "—"}
+            ok={bound}
+          />
+          {configured && status && status.chat_id_count === 0 ? (
+            <p className="text-[11px] font-mono text-status-error leading-relaxed">
+              尚未绑定 chat —— 设好 token 后在下方 DM 机器人。
             </p>
           ) : null}
-        </div>
-      ) : (
-        <p className="text-[11px] font-mono text-text-dim pb-1">Not configured.</p>
-      )}
+        </Readout>
+      </CardContent>
 
-      <form onSubmit={handleSubmit} className="flex flex-col gap-2">
-        <label
-          htmlFor="settings-telegram-token"
-          className="text-[11px] text-text-muted font-medium"
-        >
-          {configured ? "Replace bot token" : "Bot token"}
-        </label>
-        <input
-          id="settings-telegram-token"
-          type="password"
-          autoComplete="off"
-          value={token}
-          onChange={(e) => {
-            setToken(e.target.value);
-            if (confirming) setConfirming(false);
-          }}
-          disabled={pending}
-          spellCheck={false}
-          placeholder="123456:ABC-DEF…"
-          className={FIELD_CLASS}
-        />
-        <div className="flex items-center gap-2 justify-end">
-          {confirming ? (
-            <>
-              <span className="text-[11px] font-mono text-status-error mr-auto">
-                Overwrite the existing token?
-              </span>
-              <button
-                type="button"
-                onClick={() => setConfirming(false)}
-                disabled={pending}
-                className={GHOST_BTN_CLASS}
-              >
-                Cancel
-              </button>
-              <button type="submit" disabled={pending} className={PRIMARY_BTN_CLASS}>
-                {pending ? "Saving…" : "Confirm overwrite"}
-              </button>
-            </>
-          ) : (
-            <button
-              type="submit"
-              disabled={pending || token.trim().length === 0}
-              className={PRIMARY_BTN_CLASS}
-            >
-              {pending ? "Saving…" : configured ? "Replace token" : "Save token"}
-            </button>
-          )}
-        </div>
-      </form>
+      <ChatIdCapture status={chatIdStatus} chatIdLast4={chatIdLast4} onRetry={retryCapture} />
 
-      <ChatIdCapture
-        status={chatIdStatus}
-        chatIdLast4={chatIdLast4}
-        onRetry={retryCapture}
-      />
-    </Section>
+      <CardFooter>{configured ? "下次 daemon 重启生效" : "未配置"}</CardFooter>
+    </Card>
   );
 }
 
@@ -642,47 +447,37 @@ function ChatIdCapture({
   return (
     <div
       data-testid="settings-telegram-chatid"
-      className="text-[11px] font-mono rounded-lg border border-surface-700/40 bg-surface-900/60 px-3 py-2 flex flex-col gap-1"
+      className="text-[11px] font-mono border-t border-surface-800 bg-surface-950/40 px-4 py-2 flex flex-col gap-1"
     >
       {status === "pending" ? (
         <span className="text-brand-400">
-          Waiting for your DM — open Telegram and send the bot any message…
+          等待你的 DM —— 打开 Telegram 给机器人发任意消息…
         </span>
       ) : null}
       {status === "captured" ? (
         <>
           <span className="text-status-running">
-            Chat bound{chatIdLast4 ? ` (${chatIdLast4})` : ""}.
+            已绑定 chat{chatIdLast4 ? ` (${chatIdLast4})` : ""}。
           </span>
           <span className="text-text-dim">
-            Restart ccteam (`ccteam stop && ccteam start`) to apply.
+            重启 ccteam(`ccteam stop && ccteam start`)生效。
           </span>
         </>
       ) : null}
       {status === "timeout" ? (
         <>
-          <span className="text-status-error">
-            No message captured yet — did you DM the bot?
-          </span>
-          <button
-            type="button"
-            onClick={onRetry}
-            className={`${GHOST_BTN_CLASS} self-start mt-1`}
-          >
-            Retry capture
-          </button>
+          <span className="text-status-error">还没收到消息 —— 你 DM 机器人了吗?</span>
+          <Button variant="ghost" size="sm" onClick={onRetry} className="self-start mt-1">
+            重试捕获
+          </Button>
         </>
       ) : null}
       {status === "error" ? (
         <>
-          <span className="text-status-error">Capture failed.</span>
-          <button
-            type="button"
-            onClick={onRetry}
-            className={`${GHOST_BTN_CLASS} self-start mt-1`}
-          >
-            Retry capture
-          </button>
+          <span className="text-status-error">捕获失败。</span>
+          <Button variant="ghost" size="sm" onClick={onRetry} className="self-start mt-1">
+            重试捕获
+          </Button>
         </>
       ) : null}
     </div>
@@ -717,8 +512,7 @@ export function LarkSection({
   const [confirming, setConfirming] = useState(false);
 
   const userIds = parseUserIds(userIdsRaw);
-  const canSubmit =
-    !pending && appId.trim().length > 0 && appSecret.trim().length > 0;
+  const canSubmit = !pending && appId.trim().length > 0 && appSecret.trim().length > 0;
 
   async function persist() {
     setPending(true);
@@ -755,149 +549,423 @@ export function LarkSection({
   }
 
   return (
-    <Section
-      testId="settings-lark"
-      title="Lark / Feishu"
-      subtitle="App ID + secret; allowlist open_ids (empty = no one can reach the bot)."
-    >
-      {configured && status ? (
-        <div className="flex flex-col gap-1 pb-1">
-          <MaskedLine label="app id" value={`(set, ${status.app_id_last4})`} />
-          <MaskedLine
-            label="region"
-            value={status.use_feishu ? "Feishu (CN)" : "Lark (intl)"}
-          />
-          <MaskedLine
-            label="allowed users"
-            value={String(status.allowed_user_id_count)}
-          />
-        </div>
-      ) : (
-        <p className="text-[11px] font-mono text-text-dim pb-1">Not configured.</p>
-      )}
-
-      <form onSubmit={handleSubmit} className="flex flex-col gap-2">
-        <label
-          htmlFor="settings-lark-appid"
-          className="text-[11px] text-text-muted font-medium"
-        >
-          App ID
-        </label>
-        <input
-          id="settings-lark-appid"
-          type="text"
-          autoComplete="off"
-          value={appId}
-          onChange={(e) => {
-            setAppId(e.target.value);
-            if (confirming) setConfirming(false);
-          }}
-          disabled={pending}
-          spellCheck={false}
-          placeholder="cli_…"
-          className={FIELD_CLASS}
-        />
-
-        <label
-          htmlFor="settings-lark-secret"
-          className="text-[11px] text-text-muted font-medium"
-        >
-          App secret
-        </label>
-        <input
-          id="settings-lark-secret"
-          type="password"
-          autoComplete="off"
-          value={appSecret}
-          onChange={(e) => {
-            setAppSecret(e.target.value);
-            if (confirming) setConfirming(false);
-          }}
-          disabled={pending}
-          spellCheck={false}
-          placeholder="••••••••"
-          className={FIELD_CLASS}
-        />
-
-        <fieldset className="flex flex-col gap-1.5 pt-1">
-          <legend className="text-[11px] text-text-muted font-medium pb-1">
-            Region
-          </legend>
-          <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
-            <input
-              type="radio"
-              name="settings-lark-region"
-              checked={useFeishu}
-              onChange={() => setUseFeishu(true)}
-              disabled={pending}
-              className="accent-brand-600"
-            />
-            Feishu (CN)
-          </label>
-          <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
-            <input
-              type="radio"
-              name="settings-lark-region"
-              checked={!useFeishu}
-              onChange={() => setUseFeishu(false)}
-              disabled={pending}
-              className="accent-brand-600"
-            />
-            Lark (international)
-          </label>
-        </fieldset>
-
-        <label
-          htmlFor="settings-lark-users"
-          className="text-[11px] text-text-muted font-medium pt-1"
-        >
-          Allowed open_ids (comma or newline separated)
-        </label>
-        <textarea
-          id="settings-lark-users"
-          value={userIdsRaw}
-          onChange={(e) => setUserIdsRaw(e.target.value)}
-          disabled={pending}
-          rows={3}
-          spellCheck={false}
-          placeholder="ou_abc…, ou_def…"
-          className={`${FIELD_CLASS} resize-y`}
-        />
-        {userIds.length === 0 ? (
-          <p className="text-[11px] font-mono text-status-error">
-            Empty allowlist = fail-closed: the bot will answer no one.
-          </p>
+    <Card data-testid="settings-lark">
+      <CardHeader>
+        <MessageSquare className="text-text-secondary" />
+        <CardTitle className="flex-1">Lark / 飞书</CardTitle>
+        {configured ? (
+          <Badge variant="running">已连接</Badge>
         ) : (
-          <p className="text-[11px] font-mono text-text-dim">
-            {userIds.length} user{userIds.length === 1 ? "" : "s"} allowed.
-          </p>
+          <Badge variant="idle">未配置</Badge>
         )}
+      </CardHeader>
 
-        <div className="flex items-center gap-2 justify-end pt-1">
-          {confirming ? (
-            <>
-              <span className="text-[11px] font-mono text-status-error mr-auto">
-                Overwrite the existing Lark credentials?
-              </span>
-              <button
-                type="button"
-                onClick={() => setConfirming(false)}
+      <CardContent className="grid gap-5 sm:grid-cols-[1fr_220px]">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="settings-lark-appid">App ID</Label>
+            <Input
+              id="settings-lark-appid"
+              type="text"
+              autoComplete="off"
+              value={appId}
+              onChange={(e) => {
+                setAppId(e.target.value);
+                if (confirming) setConfirming(false);
+              }}
+              disabled={pending}
+              spellCheck={false}
+              placeholder="cli_…"
+              className="font-mono"
+            />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            {/* Red line: app secret field always starts EMPTY. */}
+            <Label htmlFor="settings-lark-secret">App secret</Label>
+            <Input
+              id="settings-lark-secret"
+              type="password"
+              autoComplete="off"
+              value={appSecret}
+              onChange={(e) => {
+                setAppSecret(e.target.value);
+                if (confirming) setConfirming(false);
+              }}
+              disabled={pending}
+              spellCheck={false}
+              placeholder="(永不回显)"
+              className="font-mono"
+            />
+          </div>
+
+          <fieldset className="flex flex-col gap-1.5">
+            <legend className="text-xs font-medium text-text-dim pb-1">区域 · Region</legend>
+            <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
+              <input
+                type="radio"
+                name="settings-lark-region"
+                checked={useFeishu}
+                onChange={() => setUseFeishu(true)}
                 disabled={pending}
-                className={GHOST_BTN_CLASS}
-              >
-                Cancel
-              </button>
-              <button type="submit" disabled={!canSubmit} className={PRIMARY_BTN_CLASS}>
-                {pending ? "Saving…" : "Confirm overwrite"}
-              </button>
-            </>
-          ) : (
-            <button type="submit" disabled={!canSubmit} className={PRIMARY_BTN_CLASS}>
-              {pending ? "Saving…" : configured ? "Replace credentials" : "Save"}
-            </button>
-          )}
+                className="accent-brand-500"
+              />
+              Feishu (CN)
+            </label>
+            <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
+              <input
+                type="radio"
+                name="settings-lark-region"
+                checked={!useFeishu}
+                onChange={() => setUseFeishu(false)}
+                disabled={pending}
+                className="accent-brand-500"
+              />
+              Lark (international)
+            </label>
+          </fieldset>
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="settings-lark-users">允许的 open_id(逗号或换行分隔)</Label>
+            <Textarea
+              id="settings-lark-users"
+              value={userIdsRaw}
+              onChange={(e) => setUserIdsRaw(e.target.value)}
+              disabled={pending}
+              rows={3}
+              spellCheck={false}
+              placeholder="ou_abc…, ou_def…"
+              className="font-mono"
+            />
+            {userIds.length === 0 ? (
+              <p className="text-[11px] font-mono text-status-error">
+                空 allowlist = fail-closed:机器人谁也不回。
+              </p>
+            ) : (
+              <p className="text-[11px] font-mono text-text-dim">
+                {userIds.length} user{userIds.length === 1 ? "" : "s"} allowed.
+              </p>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 justify-end">
+            {confirming ? (
+              <>
+                <span className="text-[11px] font-mono text-status-error mr-auto">
+                  覆盖已配置的 Lark 凭据?
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setConfirming(false)}
+                  disabled={pending}
+                >
+                  取消
+                </Button>
+                <Button type="submit" size="sm" variant="destructive" disabled={!canSubmit}>
+                  {pending ? "保存中…" : "确认覆盖"}
+                </Button>
+              </>
+            ) : (
+              <Button type="submit" size="sm" disabled={!canSubmit}>
+                {pending ? "保存中…" : configured ? "重置凭据" : "保存"}
+              </Button>
+            )}
+          </div>
+        </form>
+
+        <Readout>
+          <ReadoutRow
+            label="app id"
+            value={configured && status ? `(set, ${status.app_id_last4})` : "—"}
+            ok={configured}
+          />
+          <ReadoutRow
+            label="region"
+            value={
+              configured && status
+                ? status.use_feishu
+                  ? "Feishu (CN)"
+                  : "Lark (intl)"
+                : useFeishu
+                  ? "Feishu (CN)"
+                  : "Lark (intl)"
+            }
+          />
+          <ReadoutRow
+            label="allowed users"
+            value={configured && status ? String(status.allowed_user_id_count) : "—"}
+          />
+        </Readout>
+      </CardContent>
+
+      <CardFooter>app secret 永不回显;重配显「(set, ····wxyz)」+ 空白框 · 下次重启生效</CardFooter>
+    </Card>
+  );
+}
+
+// --------------------------------------------------------------------------
+// v0.8.18 档1 — multi-user management (web-first). The admin/owner mints a
+// per-user tenant; each gets a one-time personal link (?token=ccteam:<hex>)
+// that signs them in as themselves and scopes the session list to their own.
+// Backend SoT: `crates/ccteam-web/src/routes/users.rs`; client `lib/usersApi`.
+// Admin-gated: a non-admin caller 403s → we show the read-only note instead of
+// the management table. There is deliberately NO `ccteam user` CLI — runtime
+// user writes live here on the web.
+// --------------------------------------------------------------------------
+
+function UserManagementSection() {
+  const [users, setUsers] = useState<TenantView[] | null>(null);
+  const [forbidden, setForbidden] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [handle, setHandle] = useState("");
+  const [creating, setCreating] = useState(false);
+  // The one-time personal link surfaced after a create (token shown once).
+  const [newLink, setNewLink] = useState<{ handle: string; link: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    listUsers()
+      .then((list) => {
+        setUsers(list);
+        setForbidden(false);
+        setError(null);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg === "UNAUTHENTICATED") return;
+        if (msg === "FORBIDDEN") {
+          setForbidden(true);
+          setUsers([]);
+          return;
+        }
+        setError(msg);
+      });
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function onCreate(e: React.FormEvent) {
+    e.preventDefault();
+    const h = handle.trim();
+    if (creating || h.length === 0) return;
+    setCreating(true);
+    try {
+      const res = await createUser(h);
+      const origin =
+        typeof window !== "undefined" && window.location ? window.location.origin : "";
+      setNewLink({ handle: res.tenant.handle, link: `${origin}${res.personal_link}` });
+      setHandle("");
+      load();
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "create failed");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  function onDelete(id: string) {
+    deleteUser(id)
+      .then(() => {
+        setConfirmDelete(null);
+        load();
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+        toastBus.handler?.error(err instanceof Error ? err.message : "delete failed");
+      });
+  }
+
+  function copyLink(link: string) {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(link).then(
+        () => toastBus.handler?.info("链接已复制 / Link copied"),
+        () => {},
+      );
+    }
+  }
+
+  return (
+    <section data-testid="settings-users" className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <Users className="size-4 text-text-secondary" />
+          <h2 className="text-sm font-semibold text-text-primary">用户管理 · Users</h2>
+          <Badge variant="idle">管理员</Badge>
         </div>
-      </form>
-    </Section>
+        <p className="text-[11px] text-text-muted">
+          给每个人开独立 web 入口:添加用户 → 复制个人链接发给他;他打开即以自己的身份登录,只看自己的 session。
+        </p>
+      </div>
+
+      {forbidden ? (
+        <p
+          data-testid="settings-users-forbidden"
+          className="text-[11px] font-mono text-text-dim leading-relaxed"
+        >
+          仅 <b className="text-text-primary">管理员(owner token)</b> 可管理用户;你当前以普通用户身份登录。
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {newLink ? (
+            <div
+              data-testid="settings-user-newlink"
+              className="flex flex-col gap-1.5 rounded-lg border border-brand-500/30 bg-brand-500/10 px-3 py-2"
+            >
+              <p className="text-[11px] font-mono text-brand-400">
+                <b className="text-text-primary">{newLink.handle}</b> 的个人链接(只显示这一次,复制发给他):
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-[10px] text-text-secondary break-all bg-surface-950 rounded px-2 py-1 border border-surface-700/60">
+                  {newLink.link}
+                </code>
+                <Button variant="outline" size="sm" onClick={() => copyLink(newLink.link)}>
+                  复制
+                </Button>
+              </div>
+              <Button
+                variant="link"
+                size="sm"
+                onClick={() => setNewLink(null)}
+                className="self-start px-0 text-[10px] text-text-dim no-underline hover:text-text-secondary"
+              >
+                知道了,关闭
+              </Button>
+            </div>
+          ) : null}
+
+          <Card className="p-0">
+            <table className="w-full border-collapse text-[12px]">
+              <thead>
+                <tr className="border-b border-surface-700">
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-text-dim">
+                    用户
+                  </th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-text-dim">
+                    角色
+                  </th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-text-dim">
+                    创建
+                  </th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold uppercase tracking-wider text-text-dim">
+                    操作
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {error ? (
+                  <tr>
+                    <td colSpan={4} className="px-3 py-3 text-[11px] font-mono text-status-error">
+                      加载失败: {error}
+                    </td>
+                  </tr>
+                ) : users === null ? (
+                  <tr>
+                    <td colSpan={4} className="px-3 py-3 text-[11px] font-mono text-text-dim">
+                      loading…
+                    </td>
+                  </tr>
+                ) : users.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-3 py-3 text-[11px] font-mono text-text-dim">
+                      还没有用户。添加一个吧。
+                    </td>
+                  </tr>
+                ) : (
+                  users.map((u) => (
+                    <tr
+                      key={u.id}
+                      className="border-b border-surface-800 last:border-b-0 hover:bg-surface-800/40"
+                    >
+                      <td className="px-3 py-2.5">
+                        <div className="flex flex-col">
+                          <span className="font-medium text-text-primary">{u.handle}</span>
+                          <span className="font-mono text-[10px] text-text-dim">
+                            {u.linked_chat ? `IM: ${u.linked_chat}` : "未绑定 IM"}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <Badge variant="accent">tenant</Badge>
+                      </td>
+                      <td className="px-3 py-2.5 font-mono text-[11px] text-text-dim">
+                        {u.created_at ? u.created_at.slice(0, 10) : "—"}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        {confirmDelete === u.id ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <span className="text-[11px] font-mono text-status-error">删除?</span>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={() => onDelete(u.id)}
+                            >
+                              确认
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setConfirmDelete(null)}
+                            >
+                              取消
+                            </Button>
+                          </span>
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setConfirmDelete(u.id)}
+                          >
+                            删除
+                          </Button>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+
+            <div className="border-t border-surface-800 px-3 py-2.5">
+              <form onSubmit={onCreate} className="flex items-end gap-2">
+                <div className="flex flex-1 flex-col gap-1.5">
+                  <Label htmlFor="settings-user-handle">新用户名 / Handle</Label>
+                  <Input
+                    id="settings-user-handle"
+                    type="text"
+                    autoComplete="off"
+                    value={handle}
+                    onChange={(e) => setHandle(e.target.value)}
+                    disabled={creating}
+                    spellCheck={false}
+                    placeholder="alice"
+                    className="font-mono"
+                  />
+                </div>
+                <Button
+                  type="submit"
+                  size="default"
+                  disabled={creating || handle.trim().length === 0}
+                >
+                  {creating ? "…" : "添加用户"}
+                </Button>
+              </form>
+            </div>
+          </Card>
+
+          <p className="flex items-start gap-1.5 text-[10px] font-mono text-text-dim leading-relaxed">
+            <Link2 className="size-3.5 shrink-0 translate-y-0.5" />
+            <span>
+              新增用户铸一次性链接 <span className="text-text-secondary">?token=ccteam:&lt;hex&gt;</span>{" "}
+              —— 只显一次,复制给本人;列表永不回 token。诚实边界:同一台机器、同一个 OS 账号下是
+              <b className="text-text-secondary">软隔离(UX)</b>、不是安全边界。
+            </span>
+          </p>
+        </div>
+      )}
+    </section>
   );
 }
