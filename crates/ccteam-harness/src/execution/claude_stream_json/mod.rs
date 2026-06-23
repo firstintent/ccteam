@@ -175,23 +175,19 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
     }
 }
 
-/// Spawn the per-session status tap: fold each `assistant`/`result`
-/// message's token `usage` (and the assistant's live `message.model`) into
-/// the shared [`ThreadStatus`], so [`HarnessAdapter::thread_status`] reports
-/// the current model + context-window usage without parsing a transcript.
-/// Runs for the session's whole life (ends when the transport closes). An
-/// `assistant` message carries BOTH `model` and `usage`; the per-turn
-/// `result` updates context against the last-known model. Reuses the single
-/// compute point
-/// [`context_usage_from_usage`](crate::execution::transcript_tail::context_usage_from_usage)
-/// so the number matches the TUI transcript path byte-for-byte.
+/// Spawn the per-session status tap: keep the shared [`ThreadStatus`] current
+/// so [`HarnessAdapter::thread_status`] reports the live model + context-window
+/// usage without parsing a transcript. The `assistant` message updates the
+/// model id; the per-turn `result` reads context STRICTLY from claude's own
+/// `get_context_usage` (totalTokens / maxTokens) — never a heuristic estimate,
+/// and clears the context (statusline shows none) when the vendor can't answer.
+/// Runs for the session's whole life (ends when the transport closes).
 fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
     status: Arc<StdMutex<ThreadStatus>>,
     project_dir: PathBuf,
     sid: String,
 ) {
-    use crate::execution::transcript_tail::context_usage_from_usage;
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
         loop {
@@ -199,21 +195,18 @@ fn spawn_status_tap(
                 _ = transport.wait_closed() => return,
                 msg = sub.recv() => match msg {
                     Ok(Outbound::Assistant(env)) => {
-                        if let Some(usage) = env.message.get("usage") {
-                            let api_model = env.message.get("model").and_then(|v| v.as_str());
+                        // Keep the live model id current from the API `model` field,
+                        // carrying over a user-set `[1m]` tag (the API omits it).
+                        // Context is NOT computed here — it comes ONLY from claude's
+                        // own get_context_usage on TurnResult (never a heuristic).
+                        let api_model = env
+                            .message
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .filter(|m| !m.is_empty());
+                        if let Some(m) = api_model {
                             let snapshot = if let Ok(mut s) = status.lock() {
-                                // Re-stamp the model from the API id, but carry over
-                                // a user-set `[1m]` tag (the API omits it) so the
-                                // window heuristic below + the display keep 1M.
-                                if let Some(m) = api_model.filter(|m| !m.is_empty()) {
-                                    s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
-                                }
-                                // Window from the `[1m]`-preserved model (the
-                                // result branch's get_context_usage is authoritative
-                                // when it answers; this keeps the per-message update
-                                // from flickering an `opus[1m]` session back to 200k).
-                                s.context =
-                                    Some(context_usage_from_usage(usage, s.model.as_deref()));
+                                s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
                                 Some(s.clone())
                             } else {
                                 None
@@ -223,12 +216,11 @@ fn spawn_status_tap(
                             }
                         }
                     }
-                    Ok(Outbound::TurnResult(r)) => {
-                        // Prefer claude's OWN context accounting
-                        // (`get_context_usage` → real totalTokens + maxTokens, no
-                        // hardcoded [1m]/200k window). Fall back to the
-                        // result.usage token-sum + model heuristic only if the
-                        // vendor build doesn't answer.
+                    Ok(Outbound::TurnResult(_)) => {
+                        // Context is read STRICTLY from claude's OWN accounting
+                        // (`get_context_usage` → real totalTokens + maxTokens). No
+                        // heuristic estimate: if the vendor build doesn't answer, the
+                        // context is cleared (None) and the statusline shows none.
                         let real = get_context_usage(&transport).await;
                         // The vendor's runtime-resolved reasoning effort (Opus
                         // 4.6+ / Codex), e.g. `xhigh`. None on an older CLI
@@ -238,16 +230,11 @@ fn spawn_status_tap(
                             if let Some(e) = effort {
                                 s.effort = Some(e);
                             }
-                            if let Some((used, window)) = real {
-                                s.context = Some(crate::ContextUsage {
-                                    used_tokens: used,
-                                    window_tokens: window,
-                                });
-                            } else if let Some(usage) = &r.usage {
-                                let model = s.model.clone();
-                                s.context =
-                                    Some(context_usage_from_usage(usage, model.as_deref()));
-                            }
+                            // ONLY claude's own number; otherwise no context at all.
+                            s.context = real.map(|(used, window)| crate::ContextUsage {
+                                used_tokens: used,
+                                window_tokens: window,
+                            });
                             // Show the FULL model id (…[1m]) when the real window
                             // is 1M — both statusline surfaces tag the 1M id the
                             // same way (rmux derives the window FROM the [1m];
