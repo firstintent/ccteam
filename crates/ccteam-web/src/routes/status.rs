@@ -75,14 +75,19 @@ pub struct StatusResponse {
     pub sessions: Vec<SessionCostRow>,
 }
 
-/// v0.8.18 柱1 — one live session's fleet-view row. `cost_usd` is
-/// **best-effort**: summed from the per-session `chat_turn_completed`
-/// usage mirrored to `progress.jsonl` (stream-json sessions, the default),
-/// priced via [`ccteam_cost::estimate_cost`]. The model is not tracked
-/// per-turn, so pricing falls back to the vendor's default rate sheet —
-/// approximate by design for a glance (the loop version formalizes it).
-/// `0.0` when a session has emitted no usage yet (e.g. tmux sessions, whose
-/// hook path carries no usage).
+/// v0.8.18 柱1 — one live session's fleet-view row. `cost_usd` is priced
+/// **deterministically per-turn**: each `chat_turn_completed` event mirrored
+/// to `progress.jsonl` carries its turn's canonical `model` (the stream-json
+/// translator fills it from the transcript's `message.model`), so the row
+/// sums `estimate_cost(usage, vendor, model)` over the session's turns.
+///
+/// `cost_usd` is `Some` only when at least one turn priced against a
+/// table-matched model; it is `None` (rendered "—" in the UI) when the
+/// session has priced no turn — e.g. a session that emitted no usage yet,
+/// a tmux session (whose hook path carries no per-turn usage/model), or
+/// turns whose model is not in the pricing table. There is **no silent
+/// fallback** to a wrong model's rate. `unpriced_turns` exposes how many
+/// turns were skipped for lacking a priceable model.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SessionCostRow {
     /// Gateway session id (`s{n}`).
@@ -95,8 +100,13 @@ pub struct SessionCostRow {
     pub vendor: String,
     /// Cheap liveness label from the gateway (`live`).
     pub status: String,
-    /// Best-effort accrued cost (USD) for this session — see the struct doc.
-    pub cost_usd: f64,
+    /// Deterministic per-turn accrued cost (USD), or `null` when nothing
+    /// priceable — see the struct doc. `null` renders "—", never a faked 0.
+    pub cost_usd: Option<f64>,
+    /// Count of turns skipped because their model wasn't in the pricing
+    /// table (exposes partial pricing; `0` when fully priced / no turns).
+    #[serde(default)]
+    pub unpriced_turns: usize,
 }
 
 /// Minimal `workflow.yaml` projection: only the `budgets_v060` block (the
@@ -209,10 +219,23 @@ pub(crate) async fn handle_status(
     .into_response()
 }
 
-/// Build one [`SessionCostRow`] per live gateway session, joining each to its
-/// best-effort accrued cost. Reads `progress.jsonl` ONCE per project that has
-/// a live session (not every project), summing the per-session
-/// `chat_turn_completed` usage and pricing it with the session's own vendor.
+/// Per-session priced accumulator — sum of priced turns + a count of turns
+/// skipped for lacking a table-matched model.
+#[derive(Default, Clone, Copy)]
+struct SessionPriced {
+    cost_usd: f64,
+    priced_turns: usize,
+    unpriced_turns: usize,
+}
+
+/// Build one [`SessionCostRow`] per live gateway session, pricing each
+/// **deterministically per-turn** by the turn's own canonical `model`. Reads
+/// `progress.jsonl` ONCE per project that has a live session (not every
+/// project); for each `chat_turn_completed` event it prices that turn's
+/// `usage × model` via [`ccteam_cost::estimate_cost`] and sums the `Some`
+/// results per sid. A turn whose `model` is absent / not in the table is
+/// skipped (counted) — there is no fallback to a wrong rate. A session with
+/// zero priced turns yields `cost_usd: None` (rendered "—").
 fn build_session_cost_rows(
     paths: &ccteam_core::CcteamPaths,
     views: &[ccteam_im::gateway::SessionView],
@@ -221,7 +244,14 @@ fn build_session_cost_rows(
 
     // Read progress only for projects with a live session.
     let live_projects: BTreeSet<&str> = views.iter().map(|v| v.project.as_str()).collect();
-    let mut usage_by_sid: HashMap<String, ccteam_cost::UnifiedTokenUsage> = HashMap::new();
+    // Vendor per sid (from the view) so each turn prices against the
+    // session's vendor table; default Claude for the rare missing case.
+    let vendor_by_sid: HashMap<&str, ccteam_cost::Vendor> = views
+        .iter()
+        .map(|v| (v.sid.as_str(), vendor_from_str(&v.vendor)))
+        .collect();
+
+    let mut priced_by_sid: HashMap<String, SessionPriced> = HashMap::new();
     for slug in live_projects {
         let events =
             ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
@@ -239,47 +269,41 @@ fn build_session_cost_rows(
             }) else {
                 continue;
             };
-            accumulate_usage(usage_by_sid.entry(sid.to_string()).or_default(), &usage);
+            // The turn's canonical model (written by the pump from the
+            // stream-json translator). Absent → unpriceable (exposed).
+            let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let vendor = vendor_by_sid
+                .get(sid)
+                .copied()
+                .unwrap_or(ccteam_cost::Vendor::Claude);
+            let acc = priced_by_sid.entry(sid.to_string()).or_default();
+            match ccteam_cost::estimate_cost(&usage, vendor, model) {
+                Some(cost) => {
+                    acc.cost_usd += cost;
+                    acc.priced_turns += 1;
+                }
+                None => acc.unpriced_turns += 1,
+            }
         }
     }
 
     views
         .iter()
         .map(|v| {
-            let usage = usage_by_sid.get(&v.sid).copied().unwrap_or_default();
-            // Model isn't tracked per-turn → fallback rate sheet (best-effort).
-            let cost = ccteam_cost::estimate_cost(&usage, vendor_from_str(&v.vendor), "");
+            let acc = priced_by_sid.get(&v.sid).copied().unwrap_or_default();
+            // `Some` only when a real, table-matched model priced a turn.
+            let cost_usd = (acc.priced_turns > 0).then_some(acc.cost_usd);
             SessionCostRow {
                 sid: v.sid.clone(),
                 project: v.project.clone(),
                 role: v.role.clone(),
                 vendor: v.vendor.clone(),
                 status: v.status.clone(),
-                cost_usd: cost,
+                cost_usd,
+                unpriced_turns: acc.unpriced_turns,
             }
         })
         .collect()
-}
-
-/// Field-wise add of one usage block into an accumulator. The vendor-only
-/// `Option` buckets stay `None` until at least one side reports them (so
-/// Claude's `cache_creation` / Codex's `reasoning` don't materialize as a
-/// spurious `Some(0)`).
-fn accumulate_usage(acc: &mut ccteam_cost::UnifiedTokenUsage, u: &ccteam_cost::UnifiedTokenUsage) {
-    acc.input_tokens += u.input_tokens;
-    acc.cached_input_tokens += u.cached_input_tokens;
-    acc.output_tokens += u.output_tokens;
-    acc.cache_creation_input_tokens = match (
-        acc.cache_creation_input_tokens,
-        u.cache_creation_input_tokens,
-    ) {
-        (None, None) => None,
-        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-    };
-    acc.reasoning_output_tokens = match (acc.reasoning_output_tokens, u.reasoning_output_tokens) {
-        (None, None) => None,
-        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-    };
 }
 
 /// Map a `SessionView` vendor token to the pricing [`ccteam_cost::Vendor`]
@@ -325,52 +349,78 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_usage_sums_token_buckets() {
-        let mut acc = ccteam_cost::UnifiedTokenUsage::default();
-        let a = ccteam_cost::UnifiedTokenUsage {
-            input_tokens: 100,
-            output_tokens: 20,
-            ..Default::default()
-        };
-        accumulate_usage(&mut acc, &a);
-        accumulate_usage(&mut acc, &a);
-        assert_eq!(acc.input_tokens, 200);
-        assert_eq!(acc.output_tokens, 40);
-        // No vendor-only bucket reported ⇒ stays None (no spurious Some(0)).
-        assert!(acc.cache_creation_input_tokens.is_none());
-    }
-
-    #[test]
-    fn build_session_cost_rows_prices_chat_turn_usage() {
+    fn build_session_cost_rows_prices_per_turn_canonical_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
-        // Seed a chat_turn_completed event with usage tagged to sid s1.
-        let usage = ccteam_cost::UnifiedTokenUsage {
-            input_tokens: 1000,
-            output_tokens: 500,
+        // Two turns on DIFFERENT canonical models — they must price at their
+        // OWN rate, not one collapsed fallback. 1M output @ opus-4-8 = $25,
+        // 1M output @ sonnet-4-6 = $15 → sum $40 (not 2×fallback).
+        let m_out = ccteam_cost::UnifiedTokenUsage {
+            output_tokens: 1_000_000,
             ..Default::default()
         };
-        let ev = ccteam_core::progress::build_chat_turn_completed_event("cto", "s1", "t1", &usage);
-        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &ev).unwrap();
+        let opus = ccteam_core::progress::build_chat_turn_completed_event(
+            "cto",
+            "s1",
+            "t1",
+            &m_out,
+            Some("claude-opus-4-8"),
+        );
+        let sonnet = ccteam_core::progress::build_chat_turn_completed_event(
+            "cto",
+            "s1",
+            "t2",
+            &m_out,
+            Some("claude-sonnet-4-6"),
+        );
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &opus).unwrap();
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &sonnet).unwrap();
 
         let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sid, "s1");
-        assert_eq!(rows[0].vendor, "claude");
+        let cost = rows[0].cost_usd.expect("priced");
         assert!(
-            rows[0].cost_usd > 0.0,
-            "nonzero usage should price to a positive cost"
+            (cost - 40.0).abs() < 0.01,
+            "per-turn canonical pricing: opus $25 + sonnet $15 = $40, got {cost}",
         );
+        assert_eq!(rows[0].unpriced_turns, 0);
     }
 
     #[test]
-    fn build_session_cost_rows_zero_cost_when_no_usage() {
+    fn build_session_cost_rows_none_when_no_priceable_turn() {
         // A live session that has emitted no chat_turn_completed usage yet is
-        // still listed, at 0.0 (best-effort: e.g. a tmux session).
+        // still listed, at cost_usd: None → rendered "—" (never a faked 0).
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         let rows = build_session_cost_rows(&paths, &[view("s9", "demo", "claude")]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].cost_usd, 0.0);
+        assert!(rows[0].cost_usd.is_none(), "no turns ⇒ None, not 0.0");
+        assert_eq!(rows[0].unpriced_turns, 0);
+    }
+
+    #[test]
+    fn build_session_cost_rows_exposes_unpriced_synthetic_model() {
+        // A turn whose model isn't in the table (e.g. `<synthetic>`) is
+        // skipped + counted, NOT billed at a fallback rate. With ONLY such a
+        // turn the session is unpriced (None) with unpriced_turns == 1.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let m_out = ccteam_cost::UnifiedTokenUsage {
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let synthetic = ccteam_core::progress::build_chat_turn_completed_event(
+            "cto",
+            "s1",
+            "t1",
+            &m_out,
+            Some("<synthetic>"),
+        );
+        ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &synthetic).unwrap();
+
+        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
+        assert!(rows[0].cost_usd.is_none(), "unknown model must not price");
+        assert_eq!(rows[0].unpriced_turns, 1, "the synthetic turn is exposed");
     }
 }

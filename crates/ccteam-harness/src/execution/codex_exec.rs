@@ -418,6 +418,9 @@ impl HarnessAdapter for CodexExecAdapter {
                         let _ = tx_for_task.send(ThreadEvent::TurnCompleted {
                             turn_id: turn_id_for_task.0.clone(),
                             usage: UnifiedTokenUsage::default(),
+                            // Synthetic clean-exit completion: no usage, no
+                            // model on the wire → unpriced (exposed).
+                            model: None,
                         });
                     }
                     Ok(s) => {
@@ -635,9 +638,20 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                 .get("usage")
                 .and_then(|u| serde_json::from_value(u.clone()).ok())
                 .unwrap_or_default();
+            // Codex carries the canonical model on the result/turn object
+            // when present (`result.model` / `model`); used for
+            // deterministic per-turn cost. Absent → priced via ctx.model
+            // downstream, else unpriced.
+            let model = v
+                .get("model")
+                .or_else(|| v.get("result").and_then(|r| r.get("model")))
+                .and_then(|m| m.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
             vec![ThreadEvent::TurnCompleted {
                 turn_id: turn_id.0.clone(),
                 usage,
+                model,
             }]
         }
         "turn.failed" => vec![ThreadEvent::TurnFailed {

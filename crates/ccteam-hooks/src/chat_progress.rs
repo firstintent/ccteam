@@ -126,9 +126,11 @@ pub fn handle_chat_progress(paths: &CcteamPaths, event: &str, stdin: &Value) -> 
                 .unwrap_or("");
             // No structured usage on the Stop hook — the cost pipeline
             // reads it from the transcript / state.json. Emit with a
-            // default-shaped usage so consumers can join on schema.
+            // default-shaped usage so consumers can join on schema. No
+            // per-turn model on the hook → `None` (the transcript path is
+            // the deterministic cost source for tmux sessions).
             let usage = ccteam_harness::UnifiedTokenUsage::default();
-            build_chat_turn_completed_event(&role, &ccteam_sid, turn_id, &usage)
+            build_chat_turn_completed_event(&role, &ccteam_sid, turn_id, &usage, None)
         }
         "subagent-stop" => json!({
             "event": "chat_subagent_completed",

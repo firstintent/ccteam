@@ -320,6 +320,13 @@ pub enum ThreadEvent {
     TurnCompleted {
         turn_id: String,
         usage: UnifiedTokenUsage,
+        /// Canonical model id for this turn (e.g. `claude-opus-4-8` from
+        /// the transcript/stream `message.model`; codex `result.model`),
+        /// for deterministic per-turn cost pricing. `None` when the
+        /// channel carries no model (e.g. the tmux Stop hook) → the turn
+        /// is unpriced (exposed, never billed at a fallback rate).
+        #[serde(default)]
+        model: Option<String>,
     },
     TurnFailed {
         turn_id: String,
@@ -674,11 +681,11 @@ pub struct SpawnCtx {
     pub cwd: PathBuf,
     pub project_dir: PathBuf,
     pub extra_args: Vec<String>,
-    /// Concrete model id (e.g. `"claude-sonnet-4-5"`, `"gpt-5-codex"`)
+    /// Concrete model id (e.g. `"claude-sonnet-4-5"`, `"gpt-5.5"`)
     /// the adapter should use for this thread. `None` = vendor default
-    /// (resolved at adapter level). Plumbed through to `ccteam-cost`
-    /// for per-model pricing instead of falling back to the vendor's
-    /// `fallback_model`.
+    /// (resolved at adapter level). Plumbed through to `ccteam-cost` for
+    /// deterministic per-model pricing; a model absent from the pricing
+    /// table prices to `None` (exposed as "—"), never a fallback rate.
     pub model_id: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops

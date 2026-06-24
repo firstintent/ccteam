@@ -10,14 +10,18 @@
 
 /** v0.8.18 柱1 — one live session's fleet-view row (`SessionCostRow`). The
  *  loop-ops console skeleton: per-session cost today, oracle/gate columns
- *  next version. `cost_usd` is best-effort (see status.rs). */
+ *  next version. `cost_usd` is priced deterministically per-turn by each
+ *  turn's canonical model (see status.rs); it is `null` when the session
+ *  has priced no turn (rendered "—", never a faked 0). `unpriced_turns`
+ *  counts turns skipped for lacking a table-matched model. */
 export interface SessionCostRow {
   sid: string;
   project: string;
   role: string;
   vendor: string;
   status: string;
-  cost_usd: number;
+  cost_usd: number | null;
+  unpriced_turns?: number;
 }
 
 /** `GET /api/v1/status` response (`StatusResponse`). `budget_cap_24h` is null

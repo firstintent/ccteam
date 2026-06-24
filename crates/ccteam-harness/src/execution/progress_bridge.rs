@@ -156,20 +156,30 @@ pub fn build_chat_turn_user_prompt_event(
     })
 }
 
+/// `model` is the turn's canonical model id (e.g. `claude-opus-4-8`) for
+/// deterministic per-turn cost pricing — written ONLY when present
+/// (`Some`); a `None` (e.g. the tmux Stop hook, which carries no model)
+/// omits the key so the cost path treats the turn as unpriced (exposed,
+/// never billed at a fallback rate).
 pub fn build_chat_turn_completed_event(
     role: &str,
     sid: &str,
     turn_id: &str,
     usage: &ccteam_cost::UnifiedTokenUsage,
+    model: Option<&str>,
 ) -> Value {
-    json!({
+    let mut ev = json!({
         "event": CHAT_TURN_COMPLETED,
         "role": role,
         "sid": sid,
         "turn_id": turn_id,
         "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
         "ts": Utc::now().to_rfc3339(),
-    })
+    });
+    if let Some(model) = model.filter(|m| !m.is_empty()) {
+        ev["model"] = Value::String(model.to_string());
+    }
+    ev
 }
 
 pub fn build_chat_session_reset_event(role: &str, sid: &str) -> Value {

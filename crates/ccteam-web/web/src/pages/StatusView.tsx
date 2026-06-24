@@ -119,7 +119,8 @@ interface FleetRow {
   project: string;
   vendor: string;
   role: string;
-  cost: number;
+  /** Deterministic per-turn cost, or null when nothing priceable → "—". */
+  cost: number | null;
   /** Seconds since last activity, or null when the session never reported. */
   activitySeconds: number | null;
   status: string;
@@ -144,16 +145,21 @@ export function StatusCards({
 
   const rows: FleetRow[] = useMemo(
     () =>
-      rail.map((s) => ({
-        sid: s.sid,
-        project: s.project,
-        vendor: s.vendor,
-        role: s.role || "(无 role)",
-        cost: costBySid.get(s.sid) ?? 0,
-        activitySeconds:
-          typeof s.last_activity_seconds === "number" ? s.last_activity_seconds : null,
-        status: s.status,
-      })),
+      rail.map((s) => {
+        // Preserve null (unknown cost → "—"); a session absent from the fleet
+        // list is likewise unknown, not $0.
+        const c = costBySid.get(s.sid);
+        return {
+          sid: s.sid,
+          project: s.project,
+          vendor: s.vendor,
+          role: s.role || "(无 role)",
+          cost: c === undefined ? null : c,
+          activitySeconds:
+            typeof s.last_activity_seconds === "number" ? s.last_activity_seconds : null,
+          status: s.status,
+        };
+      }),
     [rail, costBySid],
   );
 
@@ -304,13 +310,19 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
             成本
           </SortableHeader>
         ),
+        // null cost (no priceable turn) sorts last when ascending.
+        sortUndefined: "last",
         cell: ({ row }) => (
           <span
             data-testid={`session-cost-${row.original.sid}`}
             className="block text-right font-mono tabular-nums text-text-secondary"
-            title="本会话累计成本（best-effort）"
+            title={
+              row.original.cost === null
+                ? "暂无可定价成本（模型未在价目表 / 该会话尚无用量）"
+                : "本会话按每回合真实模型累计的成本"
+            }
           >
-            {formatUsd(row.original.cost)}
+            {row.original.cost === null ? "—" : formatUsd(row.original.cost)}
           </span>
         ),
       },

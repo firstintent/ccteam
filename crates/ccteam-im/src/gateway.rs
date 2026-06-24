@@ -2047,14 +2047,21 @@ impl Gateway {
                         // this from their Stop hook → gate on protocol to avoid a
                         // double-write.
                         if session.protocol.is_stream_json() {
-                            if let (ThreadEvent::TurnCompleted { turn_id, usage }, Some(ppath)) =
-                                (&evt, progress_path.as_ref())
+                            if let (
+                                ThreadEvent::TurnCompleted {
+                                    turn_id,
+                                    usage,
+                                    model,
+                                },
+                                Some(ppath),
+                            ) = (&evt, progress_path.as_ref())
                             {
                                 let ev = ccteam_core::progress::build_chat_turn_completed_event(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
+                                    model.as_deref(),
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -4415,6 +4422,10 @@ mod tests {
                     ThreadEvent::TurnCompleted {
                         turn_id: format!("turn-{}", h.identity),
                         usage: ccteam_harness::UnifiedTokenUsage::default(),
+                        // A real claude turn carries its canonical model; seed
+                        // one so the pump's chat_turn_completed mirror exercises
+                        // the per-turn model path.
+                        model: Some("claude-sonnet-4-6".to_string()),
                     },
                 ));
             }

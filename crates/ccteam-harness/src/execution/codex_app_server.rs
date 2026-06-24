@@ -2400,6 +2400,9 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
             // fixtures that inline `usage`. Do NOT "fix" it to read the
             // turn object — there is nothing there to read.
             usage: pluck_usage(&notif.params).unwrap_or_default(),
+            // Codex per-turn cost is priced from `ctx.model` in
+            // `build_progress_line` (the wire carries no model here).
+            model: None,
         }),
         // W3b catalog §8.4 defect fix: the mode-3 app-server protocol has
         // **no** `turn/failed` notification. The real wire name for a turn
@@ -2525,25 +2528,34 @@ pub fn build_progress_line(
     ctx: &ProgressBridgeCtx,
 ) -> Option<Value> {
     match evt {
-        ThreadEvent::TurnCompleted { turn_id, usage } => {
-            let cost = ccteam_cost::estimate_cost(
-                usage,
-                ccteam_cost::Vendor::Codex,
-                ctx.model.as_deref().unwrap_or(""),
-            );
-            Some(json!({
+        ThreadEvent::TurnCompleted {
+            turn_id,
+            usage,
+            model,
+        } => {
+            // Prefer the turn's own canonical model; fall back to the spawn
+            // ctx model. Determinism: an unknown / absent model prices to
+            // `None` → `cost_usd` is OMITTED (excluded from sums), never
+            // billed at a fallback rate. The WARN-once in `estimate_cost`
+            // surfaces the unpriced model.
+            let priced_model = model.as_deref().or(ctx.model.as_deref()).unwrap_or("");
+            let cost = ccteam_cost::estimate_cost(usage, ccteam_cost::Vendor::Codex, priced_model);
+            let mut row = json!({
                 "event": "agent_done",
                 "role": ctx.role,
                 "session_id": ctx.sid,
                 "slug": ctx.slug,
                 "status": "completed",
                 "vendor": "codex",
-                "cost_usd": cost,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
                 "ts": Utc::now().to_rfc3339(),
-            }))
+            });
+            if let Some(cost) = cost {
+                row["cost_usd"] = json!(cost);
+            }
+            Some(row)
         }
         ThreadEvent::TurnFailed { turn_id, err } => Some(json!({
             "event": "agent_done",
@@ -3120,7 +3132,7 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").unwrap();
         match e {
-            ThreadEvent::TurnCompleted { turn_id, usage } => {
+            ThreadEvent::TurnCompleted { turn_id, usage, .. } => {
                 assert_eq!(turn_id, "u-1");
                 assert_eq!(usage.input_tokens, 100);
                 assert_eq!(usage.output_tokens, 50);
@@ -3259,7 +3271,7 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").unwrap();
         match e {
-            ThreadEvent::TurnCompleted { turn_id, usage } => {
+            ThreadEvent::TurnCompleted { turn_id, usage, .. } => {
                 assert_eq!(turn_id, "u-1");
                 assert_eq!(usage.input_tokens, 10);
             }
@@ -3504,7 +3516,7 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").unwrap();
         match e {
-            ThreadEvent::TurnCompleted { turn_id, usage } => {
+            ThreadEvent::TurnCompleted { turn_id, usage, .. } => {
                 assert_eq!(turn_id, "u-9");
                 // No usage on the real wire → defaulted to zero.
                 assert_eq!(usage.input_tokens, 0);

@@ -175,7 +175,7 @@ async fn real_codex_reply_roundtrip_proves_model_output() {
                     }
                 }
                 ThreadEvent::ItemStarted { .. } => {}
-                ThreadEvent::TurnCompleted { turn_id, usage } => {
+                ThreadEvent::TurnCompleted { turn_id, usage, .. } => {
                     usage_line = format!(
                         "turn={turn_id} usage={usage:?} agentMessage via ItemUpdated={agent_msg_via_updated} via ItemCompleted={agent_msg_via_completed}"
                     );

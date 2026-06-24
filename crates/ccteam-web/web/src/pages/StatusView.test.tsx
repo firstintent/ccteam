@@ -86,6 +86,31 @@ describe("StatusCards (seeded success state)", () => {
     expect(html).toContain("claude $1.62 · codex $0.52");
   });
 
+  it("renders per-session cost from the fleet list, and '—' for an unpriced session", () => {
+    // Determinism: s5 has a real priced cost ($1.25); s7 priced nothing
+    // (cost_usd: null) → the cost cell must show "—", NOT $0.00.
+    const snap: StatusSnapshot = {
+      daemon_healthy: true,
+      sessions_live: 2,
+      sessions_idle: 0,
+      cost_24h_usd: 1.25,
+      cost_24h_by_vendor: { claude: 1.25 },
+      budget_cap_24h: null,
+      sessions: [
+        { sid: "s5", project: "ideas", role: "architect", vendor: "claude", status: "live", cost_usd: 1.25 },
+        { sid: "s7", project: "ideas", role: "cto", vendor: "codex", status: "live", cost_usd: null, unpriced_turns: 2 },
+      ],
+    };
+    const html = renderToString(<StatusCards status={snap} rail={RAIL} />);
+    // s5's real cost renders as a dollar figure.
+    expect(html).toContain('data-testid="session-cost-s5"');
+    expect(visibleText(html)).toContain("$1.25");
+    // s7's null cost renders the em-dash placeholder, never "$0.00".
+    const s7Cell = html.slice(html.indexOf('data-testid="session-cost-s7"'));
+    expect(s7Cell).toContain("—");
+    expect(s7Cell.slice(0, 120)).not.toContain("$0.00");
+  });
+
   it("shows the daemon-down state when unhealthy", () => {
     const snap: StatusSnapshot = {
       daemon_healthy: false,

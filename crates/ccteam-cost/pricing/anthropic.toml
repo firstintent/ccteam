@@ -13,7 +13,6 @@
 #   - output_per_1m           model output tokens
 
 schema_version = "2026-06-24"
-fallback_model = "claude-sonnet-4-6"
 
 [models."claude-opus-4-8"]
 input_per_1m = 5.0

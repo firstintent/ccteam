@@ -977,11 +977,26 @@ mod tests {
     #[test]
     fn build_chat_turn_completed_event_carries_usage() {
         let usage = ccteam_cost::UnifiedTokenUsage::default();
-        let ev = build_chat_turn_completed_event("carol", "s5", "turn-7", &usage);
+        let ev = build_chat_turn_completed_event("carol", "s5", "turn-7", &usage, None);
         assert_eq!(ev["event"], CHAT_TURN_COMPLETED);
         assert_eq!(ev["sid"], "s5");
         assert_eq!(ev["turn_id"], "turn-7");
         assert!(ev["usage"].is_object());
+        // No model passed → key omitted (unpriced/exposed).
+        assert!(ev.get("model").is_none());
+    }
+
+    #[test]
+    fn build_chat_turn_completed_event_carries_canonical_model() {
+        let usage = ccteam_cost::UnifiedTokenUsage::default();
+        let ev = build_chat_turn_completed_event(
+            "carol",
+            "s5",
+            "turn-7",
+            &usage,
+            Some("claude-opus-4-8"),
+        );
+        assert_eq!(ev["model"], "claude-opus-4-8");
     }
 
     #[test]

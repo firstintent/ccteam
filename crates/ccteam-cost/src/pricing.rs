@@ -1,10 +1,20 @@
 //! V0.6.0 Wave 1 — dual-vendor pricing tables + `estimate_cost`.
 //!
 //! Two TOML tables are bundled via `include_str!` and parsed once per
-//! `Vendor` through a per-vendor `OnceLock<PricingTable>`. Unknown
-//! model ids fall back to the table's `fallback_model` with a WARN-once
-//! per `(vendor, model)` so a model-id drift still returns a sensible
-//! cost rather than `None`.
+//! `Vendor` through a per-vendor `OnceLock<PricingTable>`. A model id
+//! that is **not** a key in the vendor table prices to `None` (the
+//! caller renders "—" / excludes it) with a WARN-once per
+//! `(vendor, model)` so the unknown model surfaces in the logs.
+//!
+//! ## Determinism (no silent fallback)
+//!
+//! There is **no** `fallback_model`: a cost is returned only when the
+//! supplied model is a real, table-matched id. An unknown / absent model
+//! is exposed (returns `None`) rather than being billed at some other
+//! model's rate behind a wrong-but-plausible number. The deterministic
+//! source for the model is the transcript's per-message `message.model`
+//! (canonical — e.g. `claude-opus-4-8`), not the `/model` alias
+//! (`default` / `opus[1m]`).
 //!
 //! ## Cross-vendor field semantics
 //!
@@ -27,9 +37,11 @@
 //!
 //! - **Bundled**, never fetched at runtime. `ccteam doctor
 //!   --check-pricing-version` is the operator-facing staleness warn.
-//! - **Lossy model match** — Claude Code's `respawnFlags --model` value
-//!   sometimes carries the `[1m]` 1M-context suffix; the matcher strips
-//!   it before vendor lookup.
+//! - **`[1m]` suffix tolerance** — a model id may carry the `[1m]`
+//!   1M-context suffix (e.g. `claude-opus-4-8[1m]`); the matcher strips
+//!   it before vendor lookup. (Note: cost is sourced from the canonical
+//!   per-message `message.model`, which is already the bare id — the
+//!   strip covers the rare caller that still passes an aliased id.)
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -115,7 +127,6 @@ pub struct ModelPrices {
 struct PricingTable {
     schema_version: String,
     models: HashMap<String, ModelPrices>,
-    fallback_model: String,
 }
 
 static ANTHROPIC_TABLE: OnceLock<PricingTable> = OnceLock::new();
@@ -136,13 +147,15 @@ fn table_for(vendor: Vendor) -> &'static PricingTable {
 
 /// Compute the dollar cost of one usage block.
 ///
-/// Unknown models fall back to the vendor table's `fallback_model` and
-/// emit a single WARN per process per `(vendor, model)`. The matcher
-/// is permissive: it strips the optional `[1m]` 1M-context suffix
-/// Anthropic attaches to model strings so callers can pass
-/// `claude-opus-4-7[1m]` directly.
-pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> f64 {
-    let prices = resolve(vendor, model);
+/// Returns `None` when `model` (after stripping the optional `[1m]`
+/// 1M-context suffix Anthropic attaches) is **not** a key in the vendor
+/// table — there is no silent fallback to another model's rate. The miss
+/// emits a single WARN per process per `(vendor, model)` so the unknown
+/// id surfaces in the logs; the caller renders the absent cost as "—" /
+/// excludes it from a sum. The matcher is permissive only on the `[1m]`
+/// suffix (so `claude-opus-4-8[1m]` resolves to `claude-opus-4-8`).
+pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
+    let prices = resolve(vendor, model)?;
     let from_input = usage.input_tokens as f64 * prices.input_per_1m;
     let from_cached = usage.cached_input_tokens as f64 * prices.cached_input_per_1m;
     let from_output = usage.output_tokens as f64 * prices.output_per_1m;
@@ -161,7 +174,9 @@ pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> 
         (Some(toks), None) if matches!(vendor, Vendor::Codex) => toks as f64 * prices.output_per_1m,
         _ => 0.0,
     };
-    (from_input + from_cached + from_output + from_cache_create + from_reasoning) / 1_000_000.0
+    Some(
+        (from_input + from_cached + from_output + from_cache_create + from_reasoning) / 1_000_000.0,
+    )
 }
 
 /// Embedded price table's schema version (the more recently dated of
@@ -186,18 +201,16 @@ pub fn pricing_schema_version_for(vendor: Vendor) -> &'static str {
 }
 
 /// Look up `model` in the vendor table. Strips the `[1m]` suffix and
-/// tries the raw id; falls back to the table's `fallback_model`
-/// (WARN-once) on miss.
-fn resolve(vendor: Vendor, model: &str) -> ModelPrices {
+/// tries the raw id; returns `None` (WARN-once) on a miss — no fallback
+/// to another model's rate.
+fn resolve(vendor: Vendor, model: &str) -> Option<ModelPrices> {
     let normalized = normalize_model_id(model);
     let tbl = table_for(vendor);
     if let Some(p) = tbl.models.get(&normalized) {
-        return *p;
+        return Some(*p);
     }
     warn_unknown_model_once(vendor, &normalized);
-    *tbl.models
-        .get(&tbl.fallback_model)
-        .expect("pricing TOML fallback_model row must exist")
+    None
 }
 
 /// `claude-opus-4-7[1m]` → `claude-opus-4-7`. Other suffixes pass
@@ -218,7 +231,7 @@ fn warn_unknown_model_once(vendor: Vendor, model: &str) {
         warn!(
             vendor = ?vendor,
             model = %model,
-            "unknown model id; falling back to vendor pricing table's fallback_model. Bump ccteam pricing table.",
+            "unknown model id; cost is unpriced (shown as \"—\", excluded from sums). Add this model to the ccteam pricing table to price it.",
         );
     }
 }
@@ -244,7 +257,8 @@ mod tests {
             &UnifiedTokenUsage::default(),
             Vendor::Claude,
             "claude-sonnet-4-6",
-        );
+        )
+        .expect("known model prices");
         assert!(cost.abs() < 1e-12);
     }
 
@@ -255,7 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn estimate_cost_unknown_claude_model_falls_back() {
+    fn estimate_cost_unknown_claude_model_is_none() {
+        // No silent fallback: an unknown model exposes itself as `None`
+        // (rendered "—" / excluded from sums), never billed at sonnet's rate.
         let cost = estimate_cost(
             &UnifiedTokenUsage {
                 input_tokens: 1_000_000,
@@ -264,7 +280,42 @@ mod tests {
             Vendor::Claude,
             "claude-future-99",
         );
-        assert!(cost > 0.0);
+        assert!(
+            cost.is_none(),
+            "unknown model must price to None, got {cost:?}"
+        );
+    }
+
+    #[test]
+    fn estimate_cost_synthetic_model_is_none() {
+        // The transcript writes a `<synthetic>` model id for some internal
+        // turns; it is not a real billable model → must price to None.
+        let cost = estimate_cost(
+            &UnifiedTokenUsage {
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+            Vendor::Claude,
+            "<synthetic>",
+        );
+        assert!(
+            cost.is_none(),
+            "<synthetic> must price to None, got {cost:?}"
+        );
+    }
+
+    #[test]
+    fn estimate_cost_empty_model_is_none() {
+        // The legacy `""` escape hatch is gone — an empty model is unknown.
+        assert!(estimate_cost(
+            &UnifiedTokenUsage {
+                output_tokens: 1,
+                ..Default::default()
+            },
+            Vendor::Codex,
+            "",
+        )
+        .is_none());
     }
 
     // -- new in V0.6.0 Wave 1 --------------------------------------------
@@ -276,7 +327,7 @@ mod tests {
             ..Default::default()
         };
         // o3 input = $2 / 1M.
-        let cost = estimate_cost(&one_m_input, Vendor::Codex, "o3");
+        let cost = estimate_cost(&one_m_input, Vendor::Codex, "o3").expect("o3 priced");
         assert!(
             (cost - 2.0).abs() < 0.01,
             "o3 input != $2 / 1M (got {cost})"
@@ -290,7 +341,7 @@ mod tests {
             reasoning_output_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let cost = estimate_cost(&usage, Vendor::Codex, "o3");
+        let cost = estimate_cost(&usage, Vendor::Codex, "o3").expect("o3 priced");
         assert!(
             (cost - 8.0).abs() < 0.01,
             "o3 reasoning != $8 / 1M (got {cost})",
@@ -298,13 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn estimate_cost_codex_unknown_model_falls_back() {
+    fn estimate_cost_codex_unknown_model_is_none() {
+        // No fallback: an imaginary Codex model exposes as None.
         let usage = UnifiedTokenUsage {
             input_tokens: 1_000_000,
             ..Default::default()
         };
         let cost = estimate_cost(&usage, Vendor::Codex, "o9-imaginary");
-        assert!(cost > 0.0, "fallback to gpt-5.5 must yield positive cost");
+        assert!(
+            cost.is_none(),
+            "unknown codex model must be None, got {cost:?}"
+        );
     }
 
     #[test]
@@ -314,8 +369,8 @@ mod tests {
             input_tokens: 1_000_000,
             ..Default::default()
         };
-        let claude = estimate_cost(&usage, Vendor::Claude, "claude-sonnet-4-6"); // $3
-        let codex = estimate_cost(&usage, Vendor::Codex, "o3"); // $2
+        let claude = estimate_cost(&usage, Vendor::Claude, "claude-sonnet-4-6").unwrap(); // $3
+        let codex = estimate_cost(&usage, Vendor::Codex, "o3").unwrap(); // $2
         assert!((claude - 3.0).abs() < 0.01);
         assert!((codex - 2.0).abs() < 0.01);
         assert!(
@@ -331,7 +386,7 @@ mod tests {
             cache_creation_input_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let cost = estimate_cost(&usage, Vendor::Claude, "claude-sonnet-4-6");
+        let cost = estimate_cost(&usage, Vendor::Claude, "claude-sonnet-4-6").unwrap();
         assert!(
             (cost - 3.75).abs() < 0.01,
             "sonnet-4-6 cache_creation != $3.75 / 1M (got {cost})",
@@ -348,12 +403,12 @@ mod tests {
             output_tokens: 1_000_000,
             ..Default::default()
         };
-        let opus = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8");
+        let opus = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8").unwrap();
         assert!(
             (opus - 25.0).abs() < 0.01,
             "opus-4-8 output != $25 / 1M (got {opus}) — is it in the table?",
         );
-        let opus_1m = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8[1m]");
+        let opus_1m = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8[1m]").unwrap();
         assert!(
             (opus_1m - 25.0).abs() < 0.01,
             "opus-4-8[1m] must strip to the same $25 row (got {opus_1m})",
@@ -361,24 +416,23 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_5_priced_and_is_codex_fallback() {
-        // gpt-5.5 = current Codex default AND the table's fallback_model.
-        // 1M output = $30 (NOT the old o3 $8 fallback).
+    fn gpt_5_5_priced_and_unknown_codex_is_none() {
+        // gpt-5.5 = current Codex default. 1M output = $30.
         let m_out = UnifiedTokenUsage {
             output_tokens: 1_000_000,
             ..Default::default()
         };
-        let g = estimate_cost(&m_out, Vendor::Codex, "gpt-5.5");
+        let g = estimate_cost(&m_out, Vendor::Codex, "gpt-5.5").unwrap();
         assert!(
             (g - 30.0).abs() < 0.01,
             "gpt-5.5 output != $30 / 1M (got {g})"
         );
         // An unknown / unpriced Codex model (e.g. gpt-5.3-codex-spark, no public
-        // price) now falls back to gpt-5.5 ($30), not the ancient o3 ($8).
+        // price) now prices to None — exposed, not billed at another rate.
         let spark = estimate_cost(&m_out, Vendor::Codex, "gpt-5.3-codex-spark");
         assert!(
-            (spark - 30.0).abs() < 0.01,
-            "unpriced codex model must fall back to gpt-5.5 $30 (got {spark})",
+            spark.is_none(),
+            "unpriced codex model must be None (exposed), got {spark:?}",
         );
     }
 

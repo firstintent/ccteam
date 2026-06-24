@@ -134,7 +134,8 @@ fn build_progress_line_turn_completed_tags_vendor_codex() {
         role: "codex-bot".into(),
         sid: "sid-1".into(),
         slug: "demo".into(),
-        model: Some("gpt-5-codex".into()),
+        // A real table model (gpt-5.5) so the deterministic price is real.
+        model: Some("gpt-5.5".into()),
     };
     let usage = UnifiedTokenUsage {
         input_tokens: 1_000,
@@ -144,6 +145,7 @@ fn build_progress_line_turn_completed_tags_vendor_codex() {
     let evt = ThreadEvent::TurnCompleted {
         turn_id: "turn-9".into(),
         usage,
+        model: None,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).expect("turn/completed must bridge");
     assert_eq!(row["event"], "agent_done");
@@ -208,7 +210,8 @@ fn cost_summary_rolls_bridged_agent_done_into_codex_bucket() {
         role: "codex-bot".into(),
         sid: "sid-1".into(),
         slug: "demo".into(),
-        model: Some("gpt-5-codex".into()),
+        // A real table model (gpt-5.5) so the deterministic price is real.
+        model: Some("gpt-5.5".into()),
     };
     let usage = UnifiedTokenUsage {
         input_tokens: 10_000,
@@ -218,6 +221,7 @@ fn cost_summary_rolls_bridged_agent_done_into_codex_bucket() {
     let evt = ThreadEvent::TurnCompleted {
         turn_id: "turn-1".into(),
         usage,
+        model: None,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).unwrap();
     let summary = cost_summary_from_events(&[row]).expect("cost summary");
@@ -263,7 +267,9 @@ async fn end_to_end_turn_completed_writes_progress_jsonl_with_vendor_codex() {
         cwd: home.path().to_path_buf(),
         project_dir: home.path().to_path_buf(),
         extra_args: vec![],
-        model_id: Some("gpt-5-codex".into()),
+        // A real table model (gpt-5.5) so the deterministic per-turn price
+        // resolves (an unknown model would correctly OMIT cost_usd now).
+        model_id: Some("gpt-5.5".into()),
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     };

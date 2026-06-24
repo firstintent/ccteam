@@ -77,11 +77,16 @@ describe("getStatus", () => {
         budget_cap_24h: null,
         sessions: [
           { sid: "s1", project: "demo", role: "cto", vendor: "claude", status: "live", cost_usd: 1.23 },
+          // An unpriced session: cost_usd is null (determinism — no fabricated 0).
+          { sid: "s2", project: "demo", role: "qa", vendor: "claude", status: "live", cost_usd: null, unpriced_turns: 1 },
         ],
       }),
     );
     const got = await getStatus();
     expect(got.sessions?.[0].sid).toBe("s1");
     expect(got.sessions?.[0].cost_usd).toBe(1.23);
+    // The null cost survives the round-trip (not coerced to 0).
+    expect(got.sessions?.[1].cost_usd).toBeNull();
+    expect(got.sessions?.[1].unpriced_turns).toBe(1);
   });
 });

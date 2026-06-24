@@ -669,8 +669,8 @@ pub struct AgentSpec {
     /// `None` (YAML field omitted) = vendor-default model.
     ///
     /// Wave 4 D14 — threaded through `SpawnCtx::model_id` so cost
-    /// estimation accounts against the actual model instead of the
-    /// vendor's `fallback_model`.
+    /// estimation accounts against the actual model; a model not in the
+    /// pricing table prices to `None` (exposed), never a fallback rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// What triggers a new session of this role. See [`Trigger`].

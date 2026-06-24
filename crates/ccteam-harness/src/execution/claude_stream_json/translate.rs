@@ -39,6 +39,13 @@ pub struct StreamTranslator {
     acc_text: String,
     /// Item-id counter for tool/reasoning items within a turn.
     item_seq: u64,
+    /// Canonical model id (`message.model`) of the active turn's latest
+    /// assistant message — the deterministic per-turn cost source. The
+    /// `result` line carries no model, so we carry it forward from the
+    /// assistant block(s). A turn can mix models (e.g. a sonnet sub-turn);
+    /// the LAST assistant model wins for the turn's headline cost — the
+    /// transcript path prices the finer per-message split.
+    turn_model: Option<String>,
 }
 
 impl StreamTranslator {
@@ -69,6 +76,7 @@ impl StreamTranslator {
             self.active_turn = Some(id.clone());
             self.acc_text.clear();
             self.item_seq = 0;
+            self.turn_model = None;
             out.push(ThreadEvent::TurnStarted { turn_id: id });
         }
     }
@@ -109,6 +117,13 @@ impl StreamTranslator {
     fn on_assistant(&mut self, env: MessageEnvelope) -> Vec<ThreadEvent> {
         let mut out = Vec::new();
         self.ensure_turn_started(&mut out);
+        // Capture this turn's canonical model id (`message.model`) for the
+        // deterministic per-turn cost on the TurnCompleted boundary.
+        if let Some(m) = env.message.get("model").and_then(|v| v.as_str()) {
+            if !m.is_empty() {
+                self.turn_model = Some(m.to_string());
+            }
+        }
         let (text, items) = extract_blocks(&env.message);
         if !text.is_empty() {
             if !self.acc_text.is_empty() {
@@ -203,7 +218,12 @@ impl StreamTranslator {
             .as_ref()
             .and_then(|u| serde_json::from_value::<UnifiedTokenUsage>(u.clone()).ok())
             .unwrap_or_default();
-        out.push(ThreadEvent::TurnCompleted { turn_id, usage });
+        let model = self.turn_model.take();
+        out.push(ThreadEvent::TurnCompleted {
+            turn_id,
+            usage,
+            model,
+        });
         self.acc_text.clear();
         out
     }
@@ -330,6 +350,46 @@ mod tests {
         let usage = usage.expect("TurnCompleted");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn canonical_message_model_flows_to_turn_completed() {
+        // The assistant message's `message.model` (canonical id) is carried
+        // forward onto the TurnCompleted boundary for deterministic cost.
+        let mut t = StreamTranslator::new();
+        let env = Outbound::Assistant(MessageEnvelope {
+            message: json!({
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "x"}],
+            }),
+            session_id: "u-1".into(),
+            parent_tool_use_id: None,
+        });
+        t.ingest(env);
+        let evs = t.ingest(result_ok("x"));
+        let model = evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnCompleted { model, .. } => model.clone(),
+            _ => None,
+        });
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn turn_completed_model_is_none_without_message_model() {
+        // No `message.model` anywhere in the turn → model is None (unpriced,
+        // exposed — never a fabricated fallback).
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(json!([{"type": "text", "text": "x"}])));
+        let evs = t.ingest(result_ok("x"));
+        let tc = evs
+            .iter()
+            .find(|e| matches!(e, ThreadEvent::TurnCompleted { .. }))
+            .expect("TurnCompleted");
+        match tc {
+            ThreadEvent::TurnCompleted { model, .. } => assert!(model.is_none()),
+            _ => unreachable!(),
+        }
     }
 
     #[test]

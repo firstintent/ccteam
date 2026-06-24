@@ -194,13 +194,14 @@ pub fn classify(value: &Value) -> JobLiveness {
 ///
 /// Resolution order:
 /// 1. Try the transcript JSONL via `linkScanPath` (or cwd+sessionId
-///    fallback) — sums every `message.usage` block, prices via
-///    `pricing.json`. This is the **authoritative** path: state.json's
-///    own `cost_usd_total` reads `0` in production even when real
-///    dollars have accrued (V0.4.6 dex-ui probe).
+///    fallback) — prices **each** assistant turn by its own canonical
+///    `message.model` (the deterministic source; no `--model`/alias
+///    guessing). This is the **authoritative** path: state.json's own
+///    `cost_usd_total` reads `0` in production even when real dollars
+///    have accrued (V0.4.6 dex-ui probe).
 /// 2. Fall back to state.json's `cost_usd` / `cost_usd_total` field
-///    when the transcript can't be located. Emit a WARN-once-per-session
-///    so operators can spot misconfigurations.
+///    when the transcript can't be located OR has no priceable turn.
+///    Emit a WARN-once-per-session so operators can spot misconfigs.
 ///
 /// Returns `0.0` when neither source produces a number.
 pub(crate) fn resolve_cost_usd(value: &Value) -> f64 {
@@ -210,41 +211,26 @@ pub(crate) fn resolve_cost_usd(value: &Value) -> f64 {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
-    let model = model_from_state(value).unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-    match crate::transcript_scanner::session_cost_from_jsonl(value, &model) {
+    match crate::transcript_scanner::session_cost_from_jsonl(value) {
         Some(t_cost) if t_cost > 0.0 => t_cost,
         Some(_zero) => {
-            // Transcript present but zero usage so far (fresh session,
-            // no assistant turn yet). Honor state.json's value — for
-            // some workflows the orchestrator finalizes there before
-            // the transcript catches up.
+            // Transcript priced to ~$0 (fresh session / all-zero turns).
+            // Honor state.json's value — for some workflows the
+            // orchestrator finalizes there before the transcript catches
+            // up.
             state_cost
         }
         None => {
-            // No transcript path resolvable → WARN-once + state.json
-            // fallback. On the host the fallback is usually 0.0; for
-            // unit tests with a hand-crafted state.json::cost_usd it
-            // surfaces that value (still WARN, since the WARN is about
-            // the missing transcript link, not the cost number).
+            // No transcript path resolvable OR zero priceable turns →
+            // WARN-once + state.json fallback. On the host the fallback
+            // is usually 0.0; for unit tests with a hand-crafted
+            // state.json::cost_usd it surfaces that value (still WARN,
+            // since the WARN is about the missing transcript link, not
+            // the cost number).
             warn_link_scan_miss_once(value);
             state_cost
         }
     }
-}
-
-/// Extract the model id following `--model` in
-/// `state.json::respawnFlags`. Mirrors `queries::model_from_respawn_flags`
-/// but is duplicated here because making it `pub` in queries would leak
-/// an internal helper to the public surface; the snippet is six lines.
-fn model_from_state(state: &Value) -> Option<String> {
-    let flags = state.get("respawnFlags")?.as_array()?;
-    let mut it = flags.iter();
-    while let Some(item) = it.next() {
-        if item.as_str() == Some("--model") {
-            return it.next().and_then(|v| v.as_str()).map(String::from);
-        }
-    }
-    None
 }
 
 /// Dedup set for the WARN-once-per-session "linkScanPath missing" log.

@@ -12,7 +12,8 @@
 //! - `pricing` — `UnifiedTokenUsage`, `ModelPrices`, `Vendor`,
 //!   `estimate_cost`, `pricing_schema_version`. Two embedded TOML tables
 //!   (`pricing/anthropic.toml`, `pricing/openai.toml`) loaded once via
-//!   `OnceLock`; unknown model ids fall back per-vendor with WARN-once.
+//!   `OnceLock`; `estimate_cost` returns `Option<f64>` and an unknown
+//!   model id prices to `None` (WARN-once, no silent fallback).
 //! - `level` — `CostLevel` + `classify(cost, soft, hard)` for the F84
 //!   budget-cap watchdog.
 //! - `budget` — `Budgets { claude: BudgetCap, codex: BudgetCap }` —

@@ -2105,10 +2105,10 @@ impl Orchestrator {
         sid: &str,
         slug: &str,
         vendor: AgentVendor,
-        // Wave 4 D14 — the concrete model id the agent was spawned
-        // against (plumbed from `SpawnCtx::model_id`). When `None`,
-        // `ccteam_cost::estimate_cost` falls back to the vendor's
-        // `fallback_model` (legacy V0.5 behaviour).
+        // Wave 4 D14 — the concrete spawn-ctx model id (from
+        // `SpawnCtx::model_id`), used only when the turn carries no
+        // canonical model of its own. An unknown / absent model prices to
+        // `None` → `cost_usd` is omitted (excluded), never a fallback rate.
         model: Option<&str>,
     ) -> Option<serde_json::Value> {
         let vendor_str = match vendor {
@@ -2117,27 +2117,37 @@ impl Orchestrator {
         };
         match evt {
             ThreadEvent::ThreadStarted { .. } => None,
-            ThreadEvent::TurnCompleted { usage, .. } => {
+            ThreadEvent::TurnCompleted {
+                usage,
+                model: turn_model,
+                ..
+            } => {
+                // Prefer the turn's own canonical model; fall back to the
+                // spawn-ctx model. Determinism: an unknown / absent model
+                // prices to `None` → `cost_usd` is OMITTED (excluded from
+                // sums), never billed at a fallback rate.
+                let priced_model = turn_model.as_deref().or(model).unwrap_or("");
                 let cost = ccteam_cost::estimate_cost(
                     usage,
                     match vendor {
                         AgentVendor::Claude => ccteam_cost::Vendor::Claude,
                         AgentVendor::Codex => ccteam_cost::Vendor::Codex,
                     },
-                    // Wave 4 D14: real model id now plumbed (`""` =
-                    // vendor fallback for legacy callers).
-                    model.unwrap_or(""),
+                    priced_model,
                 );
-                Some(json!({
+                let mut row = json!({
                     "event": "agent_done",
                     "role": role,
                     "session_id": sid,
                     "status": "completed",
-                    "cost_usd": cost,
                     "vendor": vendor_str,
                     "slug": slug,
                     "ts": Utc::now().to_rfc3339(),
-                }))
+                });
+                if let Some(cost) = cost {
+                    row["cost_usd"] = json!(cost);
+                }
+                Some(row)
             }
             ThreadEvent::TurnFailed { err, .. } => Some(json!({
                 "event": "agent_done",

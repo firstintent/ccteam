@@ -281,16 +281,37 @@ fn t05_doctor_update_hooks_removes_cost_accumulate() {
 // One test per acceptance bullet in `docs/versions/v0-5-0/prd.md` §F92 §验收.
 // ============================================================
 
-/// Build a transcript JSONL with `turns` rows; each row carries one
-/// `message.usage` block with the supplied counters. Returns the path
-/// the body was written to.
-fn write_transcript(path: &std::path::Path, turns: &[(u64, u64, u64, u64)]) {
+/// One turn's token counters: `(input, cache_create, cache_read, output)`.
+type TurnUsage = (u64, u64, u64, u64);
+/// One transcript row: its canonical `message.model` + that turn's usage.
+type ModeledTurn<'a> = (&'a str, TurnUsage);
+
+/// Build a transcript JSONL with `turns` rows on a single canonical model
+/// (`message.model = model`); each row carries one `message.usage` block
+/// with the supplied counters. The model id is what the per-turn cost
+/// scanner now prices against (the deterministic source).
+fn write_transcript_model(path: &std::path::Path, model: &str, turns: &[TurnUsage]) {
+    let rows: Vec<ModeledTurn> = turns.iter().map(|&t| (model, t)).collect();
+    write_transcript_mixed(path, &rows);
+}
+
+/// Convenience: a single-model transcript on `claude-sonnet-4-6` (the
+/// model most pricing tests assert against).
+fn write_transcript(path: &std::path::Path, turns: &[TurnUsage]) {
+    write_transcript_model(path, "claude-sonnet-4-6", turns);
+}
+
+/// Build a transcript whose turns mix models — each row is
+/// `(canonical_model, (input, cache_create, cache_read, output))`. Proves
+/// the scanner prices EACH turn by its own `message.model`.
+fn write_transcript_mixed(path: &std::path::Path, rows: &[ModeledTurn]) {
     let mut body = String::new();
-    for &(input, cache_create, cache_read, output) in turns {
+    for &(model, (input, cache_create, cache_read, output)) in rows {
         let line = json!({
             "type": "assistant",
             "message": {
                 "role": "assistant",
+                "model": model,
                 "usage": {
                     "input_tokens": input,
                     "cache_creation_input_tokens": cache_create,
@@ -335,7 +356,7 @@ fn t06_link_scan_path_present_sums_usage() {
         "respawnFlags": ["--model", "claude-sonnet-4-6"],
         "state": "working",
     });
-    let got = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let got = session_cost_from_jsonl(&state).unwrap();
     let drift = (got - expected).abs() / expected;
     assert!(
         drift < 0.05,
@@ -349,7 +370,9 @@ fn t07_state_json_field_zero_falls_back_to_transcript() {
     reset_cache_for_tests();
     let tmp = TempDir::new().unwrap();
     let transcript = tmp.path().join("sess.jsonl");
-    write_transcript(&transcript, &[(1_000_000, 0, 0, 0)]);
+    // The canonical per-turn model (transcript `message.model`) is the
+    // deterministic cost source — opus-4-7 here ($5/1M input).
+    write_transcript_model(&transcript, "claude-opus-4-7", &[(1_000_000, 0, 0, 0)]);
     // input_tokens × $5 / 1M on opus-4-7 = $5.00.
     let state = json!({
         "linkScanPath": transcript.to_str().unwrap(),
@@ -425,10 +448,10 @@ fn t09_memoize_second_call_no_reread() {
         "linkScanPath": transcript.to_str().unwrap(),
         "respawnFlags": ["--model", "claude-sonnet-4-6"],
     });
-    let first = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let first = session_cost_from_jsonl(&state).unwrap();
     let reads_after_first = file_read_count();
     assert!(reads_after_first >= 1, "first call must read disk");
-    let second = session_cost_from_jsonl(&state, "claude-sonnet-4-6").unwrap();
+    let second = session_cost_from_jsonl(&state).unwrap();
     let reads_after_second = file_read_count();
     assert!(
         (first - second).abs() < 1e-12,
@@ -449,15 +472,18 @@ fn t10_multi_model_pricing() {
         ..Default::default()
     };
     assert!(
-        (estimate_cost(&one_m_input, Vendor::Claude, "claude-sonnet-4-6") - 3.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-sonnet-4-6").unwrap() - 3.0).abs()
+            < 0.01,
         "sonnet-4-6 input != $3 / 1M",
     );
     assert!(
-        (estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7") - 5.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7").unwrap() - 5.0).abs()
+            < 0.01,
         "opus-4-7 input != $5 / 1M",
     );
     assert!(
-        (estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5") - 1.0).abs() < 0.01,
+        (estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5").unwrap() - 1.0).abs()
+            < 0.01,
         "haiku-4-5 input != $1 / 1M",
     );
 
@@ -467,22 +493,24 @@ fn t10_multi_model_pricing() {
         ..Default::default()
     };
     assert!(
-        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7") - 25.0).abs() < 0.01,
+        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7").unwrap() - 25.0).abs()
+            < 0.01,
         "opus-4-7 output != $25 / 1M",
     );
     // 1M-context suffix passes through.
     assert!(
-        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7[1m]") - 25.0).abs() < 0.01,
+        (estimate_cost(&one_m_output, Vendor::Claude, "claude-opus-4-7[1m]").unwrap() - 25.0).abs()
+            < 0.01,
         "opus-4-7[1m] suffix must resolve to opus-4-7",
     );
 }
 
 #[test]
 fn per_vendor_model_specific_pricing() {
-    // Wave 4 D14 — `SpawnCtx::model_id` is now plumbed through to
-    // `translate_thread_event` → `estimate_cost`. This test pins the
-    // *per-model* rates so a regression that quietly falls back to
-    // the vendor's `fallback_model` (the V0.5 behaviour) is caught.
+    // The concrete model id is priced per-model. This test pins the
+    // *per-model* rates so a regression that quietly collapses to one
+    // rate is caught. Determinism: an unknown / empty model now prices to
+    // `None` (exposed) — there is NO silent fallback.
     //
     // Each assertion uses 1M of a single token kind to make the
     // expected dollars trivially readable against the rate sheet.
@@ -495,13 +523,12 @@ fn per_vendor_model_specific_pricing() {
         ..Default::default()
     };
 
-    // Claude: model-specific differences must not collapse to fallback.
-    let opus_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7");
-    let haiku_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5");
+    // Claude: model-specific differences must not collapse.
+    let opus_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-opus-4-7").unwrap();
+    let haiku_in = estimate_cost(&one_m_input, Vendor::Claude, "claude-haiku-4-5").unwrap();
     assert!(
         opus_in > haiku_in,
-        "opus-4-7 input (${opus_in}) should be 5× haiku-4-5 input (${haiku_in}); \
-         if equal, model_id was dropped and we hit fallback_model",
+        "opus-4-7 input (${opus_in}) should be 5× haiku-4-5 input (${haiku_in})",
     );
     assert!(
         (opus_in - 5.0).abs() < 0.01,
@@ -512,13 +539,12 @@ fn per_vendor_model_specific_pricing() {
         "haiku-4-5 input != $1/1M: ${haiku_in}"
     );
 
-    // Codex: o3 vs gpt-4o-mini differ by ~13× on input — same drop
-    // test.
-    let o3_in = estimate_cost(&one_m_input, Vendor::Codex, "o3");
-    let mini_in = estimate_cost(&one_m_input, Vendor::Codex, "gpt-4o-mini");
+    // Codex: o3 vs gpt-4o-mini differ by ~13× on input.
+    let o3_in = estimate_cost(&one_m_input, Vendor::Codex, "o3").unwrap();
+    let mini_in = estimate_cost(&one_m_input, Vendor::Codex, "gpt-4o-mini").unwrap();
     assert!(
         o3_in > mini_in,
-        "o3 input (${o3_in}) > gpt-4o-mini input (${mini_in}); if equal, fallback hit",
+        "o3 input (${o3_in}) > gpt-4o-mini input (${mini_in})",
     );
     assert!((o3_in - 2.0).abs() < 0.01, "o3 input != $2/1M: ${o3_in}");
     assert!(
@@ -526,16 +552,11 @@ fn per_vendor_model_specific_pricing() {
         "gpt-4o-mini input != $0.15/1M: ${mini_in}",
     );
 
-    // Empty model string -> vendor fallback (legacy V0.5 callers).
-    // For Codex the fallback is now gpt-5.5 (the current default — it
-    // superseded o3 when the gpt-5.x rows landed), so empty "" should
-    // equal the gpt-5.5 rate. This is the exact knob Wave 4 D14 removes
-    // for production callers but keeps as a compatibility escape hatch.
-    let codex_empty_out = estimate_cost(&one_m_output, Vendor::Codex, "");
-    let fallback_out = estimate_cost(&one_m_output, Vendor::Codex, "gpt-5.5");
+    // Empty model string -> NONE (no fallback). The legacy `""` escape
+    // hatch is gone: an absent model is exposed, never billed at a rate.
     assert!(
-        (codex_empty_out - fallback_out).abs() < 0.01,
-        "empty model string must fall back to vendor fallback_model (gpt-5.5)",
+        estimate_cost(&one_m_output, Vendor::Codex, "").is_none(),
+        "empty model must price to None (no silent fallback)",
     );
 }
 
@@ -561,8 +582,7 @@ fn t11_budget_cap_triggers_with_transcript_cost() {
     // route through the `probe` closure with the same transcript-derived
     // cost — that's how `claude_job::resolve_cost_usd` would yield it on
     // a fresh state.json::cost_usd_total == 0.
-    let transcript_cost =
-        session_cost_from_jsonl(&state, "claude-sonnet-4-6").expect("transcript cost");
+    let transcript_cost = session_cost_from_jsonl(&state).expect("transcript cost");
     let threshold = 0.10_f64;
 
     let now = Utc::now();
@@ -590,5 +610,115 @@ fn t11_budget_cap_triggers_with_transcript_cost() {
         (summary.cost_active_usd - 0.21).abs() < 0.02,
         "expected ~$0.21 from transcript flow, got ${}",
         summary.cost_active_usd,
+    );
+}
+
+// ============================================================
+// COST DETERMINISM — per-turn canonical pricing + no fallback.
+// ============================================================
+
+#[test]
+#[serial_test::serial(cost_summary_cache)]
+fn per_turn_pricing_uses_each_messages_own_canonical_model() {
+    // The deterministic win: ONE transcript that mixes models (the real
+    // box does — opus for the user's turns, sonnet for sub-task/title
+    // turns). Summing usage then pricing once would be wrong; we price
+    // EACH turn by its OWN message.model.
+    //   turn 1: opus-4-8,   1M output → $25
+    //   turn 2: sonnet-4-6, 1M output → $15
+    //   total = $40 (NOT 2× one model's rate).
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("mixed.jsonl");
+    write_transcript_mixed(
+        &transcript,
+        &[
+            ("claude-opus-4-8", (0, 0, 0, 1_000_000)),
+            ("claude-sonnet-4-6", (0, 0, 0, 1_000_000)),
+        ],
+    );
+    let state = json!({ "linkScanPath": transcript.to_str().unwrap() });
+    let got = session_cost_from_jsonl(&state).expect("mixed-model transcript prices");
+    assert!(
+        (got - 40.0).abs() < 0.01,
+        "per-turn canonical pricing: opus $25 + sonnet $15 = $40, got ${got}",
+    );
+}
+
+#[test]
+#[serial_test::serial(cost_summary_cache)]
+fn unpriced_turns_are_skipped_not_billed_at_a_fallback() {
+    // A transcript mixing a real model with `<synthetic>` (not in the
+    // table). The synthetic turn contributes NOTHING — it is exposed, not
+    // billed at the real model's rate.
+    //   turn 1: opus-4-8,    1M output → $25
+    //   turn 2: <synthetic>, 1M output → unpriced (skipped)
+    //   total = $25 (the synthetic 1M output does NOT add another $25).
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("synthetic.jsonl");
+    write_transcript_mixed(
+        &transcript,
+        &[
+            ("claude-opus-4-8", (0, 0, 0, 1_000_000)),
+            ("<synthetic>", (0, 0, 0, 1_000_000)),
+        ],
+    );
+    let state = json!({ "linkScanPath": transcript.to_str().unwrap() });
+    let got = session_cost_from_jsonl(&state).expect("the priced turn yields a cost");
+    assert!(
+        (got - 25.0).abs() < 0.01,
+        "only the opus turn prices ($25); <synthetic> must NOT add a fallback $25, got ${got}",
+    );
+}
+
+#[test]
+#[serial_test::serial(cost_summary_cache)]
+fn transcript_with_no_priceable_turn_is_none() {
+    // Every turn is an unknown model → genuinely unknown cost → None
+    // (rendered "—" by the UI), never a fabricated 0.0.
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("all-synthetic.jsonl");
+    write_transcript_mixed(
+        &transcript,
+        &[
+            ("<synthetic>", (0, 0, 0, 1_000_000)),
+            ("model-not-in-table", (1_000_000, 0, 0, 0)),
+        ],
+    );
+    let state = json!({ "linkScanPath": transcript.to_str().unwrap() });
+    assert!(
+        session_cost_from_jsonl(&state).is_none(),
+        "zero priceable turns must be None (unknown), not 0.0",
+    );
+}
+
+#[test]
+#[serial_test::serial(cost_summary_cache)]
+fn transcript_without_model_field_is_unpriced() {
+    // A legacy transcript whose assistant turns carry usage but NO
+    // message.model → unpriceable (the deterministic source is absent).
+    // Honest: None, not a guessed price.
+    reset_cache_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let transcript = tmp.path().join("no-model.jsonl");
+    // Hand-write rows with usage but no `model` key.
+    let mut body = String::new();
+    for _ in 0..2 {
+        body.push_str(
+            &json!({
+                "type": "assistant",
+                "message": { "role": "assistant", "usage": { "output_tokens": 1_000_000 } }
+            })
+            .to_string(),
+        );
+        body.push('\n');
+    }
+    fs::write(&transcript, body).unwrap();
+    let state = json!({ "linkScanPath": transcript.to_str().unwrap() });
+    assert!(
+        session_cost_from_jsonl(&state).is_none(),
+        "no message.model anywhere ⇒ unpriced ⇒ None",
     );
 }
