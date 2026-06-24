@@ -67,6 +67,22 @@ where
         .unwrap_or_default())
 }
 
+/// One entry from claude's `initialize` `response.models[]` — the REAL,
+/// vendor-supplied model list (claude has no `model/list` RPC; the
+/// capability ships on the initialize control_response). `value` is exactly
+/// the `/model <value>` id form; `efforts` is the model's
+/// `supportedEffortLevels` (empty for a no-effort model like haiku). Only
+/// these two fields are typed; everything else (displayName, description,
+/// supportsEffort) is presentation we don't drive the picker from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeModelOption {
+    /// The `/model <value>` id (e.g. `"opus[1m]"`, `"sonnet"`, `"haiku"`).
+    pub value: String,
+    /// `supportedEffortLevels` (e.g. `["low","medium","high","xhigh","max"]`);
+    /// empty when the model has no effort axis (e.g. haiku).
+    pub efforts: Vec<String>,
+}
+
 /// `system` message body. Only `subtype: "init"` is meaningful today.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SystemMsg {
@@ -76,6 +92,14 @@ pub struct SystemMsg {
     pub session_id: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// The REAL model list from the `initialize` control_response
+    /// (`response.models[]`). Drives the bare-`/model` picker
+    /// (`claude_model_options`) — one option per (value, effort). Only the
+    /// `initialize` handshake populates this; a `system:init` stdout line
+    /// leaves it empty (it carries no `models` array). Defaults to empty,
+    /// which the model arm falls back from to the usage-text rejection.
+    #[serde(skip)]
+    pub models: Vec<ClaudeModelOption>,
     /// The slash-command table claude exposes for this session — names
     /// only (dialog/local-jsx commands are already filtered out by the
     /// CLI). The bridge gate (Wave 2) keys known-vs-unknown off this.
@@ -112,25 +136,60 @@ impl SystemMsg {
                     .collect()
             })
             .unwrap_or_default();
-        let model = resp
+        let models_raw = resp
             .and_then(|v| v.get("models"))
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_array());
+        let model = models_raw
             .and_then(|arr| arr.first())
             .and_then(|m| {
-                m.get("model")
+                m.get("value")
+                    .or_else(|| m.get("model"))
                     .or_else(|| m.get("id"))
                     .or_else(|| m.get("name"))
             })
             .and_then(Value::as_str)
             .map(String::from);
+        let models = models_raw
+            .map(|arr| de_model_options(arr))
+            .unwrap_or_default();
         SystemMsg {
             subtype: "init".to_string(),
             session_id: String::new(),
             model,
+            models,
             slash_commands,
             tools: Vec::new(),
         }
     }
+}
+
+/// Parse the `initialize` `response.models[]` array into the REAL model
+/// list. Defensive: each entry needs a `value` (the `/model <value>` id);
+/// `supportedEffortLevels` is optional (absent/empty for a no-effort model
+/// like haiku) and only string members are kept. Entries without a `value`
+/// are skipped rather than failing the whole parse.
+fn de_model_options(models: &[Value]) -> Vec<ClaudeModelOption> {
+    models
+        .iter()
+        .filter_map(|m| {
+            let value = m
+                .get("value")
+                .or_else(|| m.get("model"))
+                .or_else(|| m.get("id"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let efforts = m
+                .get("supportedEffortLevels")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ClaudeModelOption { value, efforts })
+        })
+        .collect()
 }
 
 /// `assistant` / `user` envelope. `message` is the raw Anthropic `Message`
@@ -291,6 +350,47 @@ mod tests {
             }
             other => panic!("expected System, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_initialize_captures_real_model_list() {
+        // The `initialize` control_response carries the REAL model list under
+        // `response.models[]` (claude has no `model/list` RPC). Each entry's
+        // `value` is the `/model <value>` id; `supportedEffortLevels` is the
+        // effort axis (absent for haiku). `from_initialize` must capture all
+        // of them — the bare-`/model` picker is built strictly from this.
+        let body = ControlResponseBody {
+            subtype: "success".to_string(),
+            request_id: "1".to_string(),
+            response: Some(json!({
+                "commands": [{"name":"compact"}, {"name":"context"}],
+                "models": [
+                    {"value":"default","displayName":"Default",
+                     "description":"Opus 4.8 1M, recommended","supportsEffort":true,
+                     "supportedEffortLevels":["low","medium","high","xhigh","max"]},
+                    {"value":"opus[1m]","displayName":"Opus","supportsEffort":true,
+                     "supportedEffortLevels":["low","medium","high","xhigh","max"]},
+                    {"value":"sonnet","displayName":"Sonnet","supportsEffort":true,
+                     "supportedEffortLevels":["low","medium","high","xhigh","max"]},
+                    {"value":"haiku","displayName":"Haiku","supportsEffort":false}
+                ]
+            })),
+            error: None,
+        };
+        let s = SystemMsg::from_initialize(&body);
+        // First model id is captured for the status seed.
+        assert_eq!(s.model.as_deref(), Some("default"));
+        assert!(s.slash_commands.contains(&"compact".to_string()));
+        // Full list captured, in order, with efforts (haiku has none).
+        assert_eq!(s.models.len(), 4);
+        assert_eq!(s.models[0].value, "default");
+        assert_eq!(
+            s.models[0].efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(s.models[1].value, "opus[1m]");
+        assert_eq!(s.models[3].value, "haiku");
+        assert!(s.models[3].efforts.is_empty());
     }
 
     #[test]

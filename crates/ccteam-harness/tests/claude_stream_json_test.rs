@@ -20,8 +20,9 @@ use ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_ses
 use ccteam_harness::execution::claude_stream_json::ClaudeStreamJsonAdapter;
 use ccteam_harness::execution::transcript_tail::anthropic_project_dir;
 use ccteam_harness::{
-    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadItemDetails, TurnInput,
+    AgentSpecBrief, AgentVendor, ChoiceSelection, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadItemDetails,
+    TurnInput,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -415,9 +416,12 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
         "/compact must pass through as a turn, got {compact:?}"
     );
 
-    // /model with NO arg → Rejected with a usage hint (stream-json has no
-    // interactive picker). `/model <id>` instead drives `set_model` → Done —
-    // see `model_directive_drives_set_model` below.
+    // Bare /model (no arg, no choice) → a NeedsChoice picker built strictly
+    // from the REAL captured model list (the `initialize` `response.models[]`;
+    // the fake ships one model `fake-model` with no effort axis → a single
+    // bare-id option). `/model <id>` instead drives `set_model` → Done, and a
+    // picker selection re-enters this same arm with `d.choice` set — see
+    // `model_directive_drives_set_model` / `bare_model_picker_*` below.
     let model = adapter
         .handle_directive(
             &handle,
@@ -430,13 +434,20 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
         .await
         .unwrap();
     match model {
-        DirectiveOutcome::Rejected { reason } => {
+        DirectiveOutcome::NeedsChoice(prompt) => {
             assert!(
-                reason.contains("/model"),
-                "reason should name the command: {reason}"
+                prompt.title.contains("model"),
+                "title should name the choice: {}",
+                prompt.title
             );
+            assert_eq!(
+                prompt.options.len(),
+                1,
+                "fake ships one no-effort model → one bare-id option"
+            );
+            assert_eq!(prompt.options[0].id, "fake-model");
         }
-        other => panic!("bare /model must Reject, got {other:?}"),
+        other => panic!("bare /model must offer a picker, got {other:?}"),
     }
 
     // An unknown command becomes text (never "Unknown skill") → Turn.
@@ -603,6 +614,58 @@ async fn model_directive_drives_set_model() {
     // The switch is reflected in thread_status immediately (model only).
     let st = adapter.thread_status(&handle).await.unwrap();
     assert_eq!(st.model.as_deref(), Some("claude-opus-4-8[1m]"));
+
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// A bare-`/model` picker SELECTION re-enters `handle_directive` with the
+/// ORIGINAL directive (name=model, args="") + `d.choice` carrying the picked
+/// option id, and applies it through the SAME `set_model` path as an explicit
+/// `/model <id>` — symmetric to codex's picker round-trip. The fake ships one
+/// no-effort model whose option id is the bare value `fake-model`; selecting
+/// it must drive set_model → Done + update the live status.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bare_model_picker_selection_applies_via_set_model() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // Re-entry: bare args, but `choice` carries the picked option id.
+    let out = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: Some(ChoiceSelection {
+                    token: "cm0".into(),
+                    ids: vec!["fake-model".into()],
+                    free_text: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert!(
+            receipt.contains("fake-model"),
+            "receipt names the selected model: {receipt}"
+        ),
+        other => panic!("picker selection must apply via set_model (Done), got {other:?}"),
+    }
+    // The selection is reflected in thread_status immediately.
+    let st = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(st.model.as_deref(), Some("fake-model"));
 
     adapter.close_thread(&handle).await.unwrap();
 }

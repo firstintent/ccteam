@@ -49,12 +49,13 @@ use crate::execution::progress_bridge::{
 };
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
-    AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
+    TurnId, TurnInput,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
-use protocol::Outbound;
+use protocol::{ClaudeModelOption, Outbound};
 use spawn_spec::StreamJsonSpawnInput;
 use translate::StreamTranslator;
 use transport::StreamJsonTransport;
@@ -81,6 +82,12 @@ struct LiveSession {
     cwd: PathBuf,
     /// Slash-command table from `system:init` (bridge gate, Wave 2).
     commands: Vec<String>,
+    /// The REAL model list captured from the `initialize` control_response
+    /// (`response.models[]`). A bare `/model` builds its NeedsChoice picker
+    /// strictly from this (`claude_model_options`) — never a hardcoded list.
+    /// Empty (older claude / capture failure) → the model arm falls back to
+    /// the usage-text rejection.
+    models: Vec<ClaudeModelOption>,
     /// Live session status (model + context-window usage) for
     /// [`HarnessAdapter::thread_status`] → IM `/sessions` + the web statusline
     /// bar. Seeded with the `initialize` model; the per-session **status tap**
@@ -318,6 +325,51 @@ pub(crate) fn split_model_effort(arg: &str) -> (String, Option<String>) {
         }
     }
     (arg.to_string(), None)
+}
+
+/// Build the bare-`/model` picker options from claude's REAL model list
+/// (the `initialize` `response.models[]`, captured on [`LiveSession`]). One
+/// [`ChoiceOption`] per (value, effort) so the picked `id` is EXACTLY the
+/// `/model <id> [effort]` arg form the set_model arm parses via
+/// [`split_model_effort`] (`id = "<value> <effort>"`); a model with no effort
+/// axis (e.g. haiku) yields a single bare-id option (`id = "<value>"`).
+/// Strictly deterministic — never a hardcoded list. Mirrors codex's
+/// `model_options`.
+fn claude_model_options(models: &[ClaudeModelOption]) -> Vec<ChoiceOption> {
+    let mut out = Vec::new();
+    for m in models {
+        if m.efforts.is_empty() {
+            out.push(ChoiceOption {
+                id: m.value.clone(),
+                label: m.value.clone(),
+            });
+        } else {
+            for e in &m.efforts {
+                out.push(ChoiceOption {
+                    id: format!("{} {e}", m.value),
+                    label: format!("{} ({e})", m.value),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Build a single-select [`ChoicePrompt`] with a per-prompt unique token
+/// (≤16B ASCII, no `:`). The gateway resolves callbacks token-globally, so a
+/// name-based token would collide when two sessions raise the same picker at
+/// once. Mirrors `claude_tui::claude_popup_prompt`'s `cj{hex}` scheme.
+fn claude_choice_prompt(title: &str, options: Vec<ChoiceOption>) -> ChoicePrompt {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    ChoicePrompt {
+        token: format!("cm{:x}", (nanos as u64) & 0xff_ffff_ffff),
+        title: title.to_string(),
+        options,
+        multi: false,
+    }
 }
 
 /// Read the vendor's REAL runtime-resolved reasoning effort via the
@@ -778,6 +830,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             project_dir: ctx.project_dir.clone(),
             cwd: ctx.cwd.clone(),
             commands: init.slash_commands.clone(),
+            models: init.models.clone(),
             status,
         };
         self.live
@@ -1043,22 +1096,52 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 }),
             };
         } else if name == "model" {
-            let arg = d.args.trim();
             let Some(live) = self.lookup(&h.identity) else {
                 return Err(HarnessError::SubmitFailed(
                     "set_model: no live stream-json session for this handle".into(),
                 ));
             };
+            // Resolve the effective `<model> [effort]` arg. Three forms collapse
+            // here: (1) a picker re-entry — `d.choice` carries the picked option
+            // id (`"<value> <effort>"` or bare `"<value>"`, built by
+            // `claude_model_options`), which `split_model_effort` parses exactly;
+            // (2) an explicit `/model <id> [effort]`; (3) a bare `/model` (no
+            // args, no choice) → offer the picker built strictly from the REAL
+            // captured model list. The gateway re-enters with the ORIGINAL
+            // directive (name=model, args="") + `.choice` set, so a re-entry has
+            // empty args but a present `choice`.
+            let picked = d.choice.as_ref().and_then(|c| {
+                c.ids
+                    .first()
+                    .cloned()
+                    .or_else(|| c.free_text.clone().filter(|s| !s.trim().is_empty()))
+            });
+            let arg = match picked {
+                Some(p) => p,
+                None => d.args.trim().to_string(),
+            };
             if arg.is_empty() {
-                return Ok(DirectiveOutcome::Rejected {
-                    reason:
-                        "用法: /model <model-id> [effort]（无交互选择器，直接给 model id；可选 effort=low|medium|high|xhigh|max，live 生效）"
-                            .into(),
-                });
+                // Bare `/model` → a NeedsChoice picker (one option per
+                // model×effort), built ONLY from the captured init.models. If the
+                // list is empty (older claude that sent no `models`, or capture
+                // failed) fall back to the usage-text rejection — never an empty
+                // picker.
+                let options = claude_model_options(&live.models);
+                if options.is_empty() {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason:
+                            "用法: /model <model-id> [effort]（直接给 model id；可选 effort=low|medium|high|xhigh|max，live 生效）"
+                                .into(),
+                    });
+                }
+                return Ok(DirectiveOutcome::NeedsChoice(claude_choice_prompt(
+                    "Choose a model + reasoning effort:",
+                    options,
+                )));
             }
             // "<model> [effort]" — effort is the trailing token iff a valid level
             // (so `/model opus[1m] xhigh` splits but `/model opus-4-8` doesn't).
-            let (model, effort) = split_model_effort(arg);
+            let (model, effort) = split_model_effort(&arg);
             let body = live
                 .transport
                 .request_control("set_model", json!({ "model": model }), init_timeout())
@@ -1167,8 +1250,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 #[cfg(test)]
 mod effort_tests {
     use super::{
-        normalize_effort, parse_latest_goal_status, preserve_1m_tag, set_effort_level,
-        split_model_effort, EFFORT_LEVELS,
+        claude_model_options, normalize_effort, parse_latest_goal_status, preserve_1m_tag,
+        set_effort_level, split_model_effort, ClaudeModelOption, EFFORT_LEVELS,
     };
 
     #[test]
@@ -1253,6 +1336,60 @@ mod effort_tests {
             split_model_effort("opus[1m]"),
             ("opus[1m]".to_string(), None)
         );
+    }
+
+    #[test]
+    fn claude_model_options_builds_picker_from_real_model_list() {
+        // A realistic init.models slice (claude 2.1.187 live values): models
+        // WITH an effort axis fan out to one option per (value, effort) with
+        // `id = "<value> <effort>"`; haiku (no efforts) yields a single bare-id
+        // option. The id is EXACTLY the `/model <id> [effort]` arg form
+        // `split_model_effort` parses on the picker re-entry.
+        let models = vec![
+            ClaudeModelOption {
+                value: "default".to_string(),
+                efforts: ["low", "medium", "high", "xhigh", "max"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+            ClaudeModelOption {
+                value: "opus[1m]".to_string(),
+                efforts: vec!["low".to_string(), "max".to_string()],
+            },
+            ClaudeModelOption {
+                value: "haiku".to_string(),
+                efforts: vec![],
+            },
+        ];
+        let opts = claude_model_options(&models);
+        // 5 (default) + 2 (opus[1m]) + 1 (haiku) = 8 options, in source order.
+        assert_eq!(opts.len(), 8);
+
+        // First effort-bearing model: `<value> <effort>` id + `<value> (<effort>)` label.
+        assert_eq!(opts[0].id, "default low");
+        assert_eq!(opts[0].label, "default (low)");
+        assert_eq!(opts[4].id, "default max");
+
+        // opus[1m] keeps its `[1m]` tag verbatim in the id (set_model accepts it).
+        assert_eq!(opts[5].id, "opus[1m] low");
+        assert_eq!(opts[6].id, "opus[1m] max");
+        assert_eq!(opts[6].label, "opus[1m] (max)");
+
+        // haiku has NO effort → a single bare-id option (id == label == value),
+        // so the re-entry arg is just `haiku` (split_model_effort → (haiku, None)).
+        assert_eq!(opts[7].id, "haiku");
+        assert_eq!(opts[7].label, "haiku");
+
+        // Every effort-bearing id round-trips through split_model_effort back to
+        // its (value, effort) — the contract the set_model arm relies on.
+        assert_eq!(
+            split_model_effort(&opts[6].id),
+            ("opus[1m]".to_string(), Some("max".to_string()))
+        );
+
+        // Empty model list → no options (the arm then falls back to usage text).
+        assert!(claude_model_options(&[]).is_empty());
     }
 
     #[test]
