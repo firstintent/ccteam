@@ -237,6 +237,22 @@ async fn session_stop_no_gateway_is_503() {
     assert_eq!(resp.status(), 503);
 }
 
+/// The interrupt route (non-destructive twin of stop) is wired + gated the same
+/// way: with no live gateway it 503s (standalone web), proving the endpoint
+/// exists and reaches the spine's `interrupt_session` path.
+#[tokio::test]
+async fn session_interrupt_no_gateway_is_503() {
+    let tmp = TempDir::new().unwrap();
+    let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/v1/sessions/s1/interrupt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
 /// The SSE endpoint must NOT 503 — it keeps the stream open and emits a
 /// one-shot `gateway_unavailable` frame so a browser EventSource shows the
 /// state without hammering reconnects. It is still a 200 text/event-stream.

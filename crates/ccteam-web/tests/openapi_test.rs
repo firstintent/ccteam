@@ -96,6 +96,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/sessions/{sid}/resolve"),
         ("GET", "/api/v1/sessions/{sid}/events"),
         ("POST", "/api/v1/sessions/{sid}/stop"),
+        // v0.8.19 — interrupt the running turn (non-destructive; keeps session).
+        ("POST", "/api/v1/sessions/{sid}/interrupt"),
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
         ("GET", "/api/v1/config/im"),
         ("PUT", "/api/v1/config/im/telegram"),

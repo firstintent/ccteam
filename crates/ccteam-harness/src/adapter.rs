@@ -798,6 +798,38 @@ pub trait HarnessAdapter: Send + Sync {
     /// silently blank for a new vendor. bg / statusless adapters answer
     /// `Ok(ThreadStatus::default())`.
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError>;
+
+    /// Interrupt the session's CURRENTLY-RUNNING turn **without destroying
+    /// the session** — the context survives, so the user can immediately
+    /// `/model` switch / send a follow-up. This is the non-destructive twin
+    /// of [`close_thread`] (which kills the whole session): only the in-flight
+    /// turn stops; the session stays live + idle.
+    ///
+    /// **Out-of-band by contract**: the interrupt MUST reach the vendor even
+    /// while a turn is mid-stream (running tools) — it cannot queue behind the
+    /// running turn. The stream-json transport delivers it as a bidirectional
+    /// `interrupt` control_request; the tmux TUI sends an ESC keypress to the
+    /// pane; codex calls the `turn/interrupt` RPC on the active turn. The
+    /// gateway reaches this via a dedicated `/interrupt` command (NOT the
+    /// submit/turn queue), so the call never serializes behind the turn.
+    ///
+    /// **Red line**: this does NOT violate "never PROACTIVELY kill a turn".
+    /// A user-typed `/interrupt` is an explicit user command (exactly like
+    /// `/stop`), not the daemon autonomously killing work — the watchdog stays
+    /// WARN-only. The default impl is an honest [`HarnessError::NotImplemented`]
+    /// so an adapter without an interrupt mechanism degrades cleanly (the
+    /// gateway surfaces the reason) instead of silently doing nothing.
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let _ = h;
+        Err(HarnessError::NotImplemented {
+            reason: format!(
+                "interrupt not supported for the `{}` adapter (only the current \
+                 turn can be interrupted on stream-json / terminal / codex; use \
+                 /stop to end the session)",
+                self.name()
+            ),
+        })
+    }
 }
 
 // =====================================================================

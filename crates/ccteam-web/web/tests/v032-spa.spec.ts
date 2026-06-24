@@ -176,6 +176,7 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
 
   await page.route("**/api/v1/sessions/s1/turn", captureJson);
   await page.route("**/api/v1/sessions/s1/stop", captureJson);
+  await page.route("**/api/v1/sessions/s1/interrupt", captureJson);
 
   return captured;
 }
@@ -204,13 +205,18 @@ test("session view posts turn and stop through the sid resource API", async ({
   const captured = await mockCcteamApi(page);
   await page.goto("/app/chat/s/s1");
 
-  await page.getByPlaceholder("发消息 / 命令(/compact /clear …)…").fill("ship gate note");
+  await page.getByPlaceholder(/发消息/).fill("ship gate note");
   await page.getByTitle("发送").click();
   await expect
     .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/turn")))
     .toBe(true);
 
-  await page.getByRole("button", { name: /停止/ }).click();
+  // The sub-bar "停止" (title 停止会话) DESTROYS the session → /stop. Target it by
+  // title to disambiguate from the composer's busy-state Stop button (title
+  // 停止当前回合), which instead INTERRUPTS the running turn → /interrupt
+  // (its busy-only visibility depends on SSE timing, so the interrupt wiring is
+  // covered by the deterministic unit test `interruptSession POSTs …`, not here).
+  await page.getByTitle("停止会话").click();
   await expect
     .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/stop")))
     .toBe(true);

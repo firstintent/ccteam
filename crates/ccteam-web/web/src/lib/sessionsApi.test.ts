@@ -10,6 +10,7 @@ import {
   getHistory,
   getRoleDetail,
   getSessionStatus,
+  interruptSession,
   listProjectRoles,
   listSessions,
   resolveApproval,
@@ -180,6 +181,19 @@ describe("sessionsApi", () => {
       body: JSON.stringify({}),
     });
     expect(got.stopped).toBe(true);
+  });
+
+  it("interruptSession POSTs to /sessions/{sid}/interrupt (non-destructive)", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { interrupted: true }));
+    const got = await interruptSession("s3");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions/s3/interrupt", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(got.interrupted).toBe(true);
   });
 
   it("resolveApproval POSTs {token,selection} to /sessions/{sid}/resolve (R-H1)", async () => {

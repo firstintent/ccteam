@@ -34,6 +34,7 @@ import { useSessionEvents } from "../hooks/useSessionEvents";
 import {
   getHistory,
   getSessionStatus,
+  interruptSession as apiInterruptSession,
   resolveApproval as apiResolveApproval,
   stopSession as apiStopSession,
   submitTurn,
@@ -211,7 +212,7 @@ export default function SessionView({
     [sid, pushRow],
   );
 
-  // ---- stop the session --------------------------------------------------
+  // ---- stop the session (destroy) ----------------------------------------
   const stopActive = useCallback(() => {
     apiStopSession(sid)
       .then(() => {
@@ -225,6 +226,23 @@ export default function SessionView({
         });
       });
   }, [sid, pushRow, onSessionChanged]);
+
+  // ---- interrupt the running turn (keep the session) ---------------------
+  // The composer's busy-state Stop button stops only the in-flight turn — the
+  // session survives (context kept), so you can then /model switch or send a
+  // follow-up. Distinct from the sub-bar's "停止" which DESTROYS the session.
+  const interruptActive = useCallback(() => {
+    apiInterruptSession(sid)
+      .then(() => {
+        pushRow({ kind: "system", content: "已中断当前 turn(会话保留)" });
+      })
+      .catch((e) => {
+        pushRow({
+          kind: "system",
+          content: `中断失败: ${e instanceof Error ? e.message : "unknown"}`,
+        });
+      });
+  }, [sid, pushRow]);
 
   // v0.8.8 B5 — claude-only for now. The PTY backend resolves per-sid panes for
   // BOTH vendors, but the codex terminal is unverified on a real codex pane
@@ -460,7 +478,7 @@ export default function SessionView({
             </button>
           ) : null}
           </div>
-          <Composer sid={sid} busy={busy} onSubmit={submitText} onStop={stopActive} />
+          <Composer sid={sid} busy={busy} onSubmit={submitText} onStop={interruptActive} />
         </>
       )}
     </>

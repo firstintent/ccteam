@@ -16,6 +16,7 @@
 //! - `POST   /api/v1/sessions/{sid}/turn`             → submit → 202 `{accepted:true}`
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
 //! - `POST   /api/v1/sessions/{sid}/stop`             → stop → 200 `{stopped:true}`
+//! - `POST   /api/v1/sessions/{sid}/interrupt`        → interrupt running turn → 200 `{interrupted:true}`
 //!
 //! **No-gateway contract (locked W5b)**: the standalone "internal web"
 //! path runs without a daemon gateway ([`AppState::gateway`] = `None`).
@@ -753,6 +754,51 @@ pub(crate) async fn handle_session_stop(
         Ok(()) => Json(json!({"stopped": true})).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "stop_session failed");
+            unknown_session(&sid)
+        }
+    }
+}
+
+/// `POST /api/v1/sessions/{sid}/interrupt`
+///
+/// Interrupts the session's CURRENTLY-RUNNING turn WITHOUT destroying it — the
+/// non-destructive twin of `/stop`. The session stays live + idle (its context
+/// survives), so the client can immediately `/model` switch or send a
+/// follow-up. The spine's [`Gateway::interrupt_session`] reaches the adapter
+/// OUT-OF-BAND (stream-json `interrupt` control_request / TUI ESC / codex
+/// `turn/interrupt`), so the interrupt is NOT queued behind the running turn.
+/// 200 `{interrupted:true}`. 404 for an unknown sid. 503 with no gateway. Same
+/// auth + project ACL (`gate_sid`) as the stop route.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{sid}/interrupt",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "Interrupted the running turn (session kept). `{interrupted:true}`", body = serde_json::Value),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_session_interrupt(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let result = {
+        let mut guard = gw.lock().await;
+        guard.interrupt_session(&sid).await
+    };
+    match result {
+        Ok(()) => Json(json!({"interrupted": true})).into_response(),
+        Err(err) => {
+            tracing::warn!(%sid, %err, "interrupt_session failed");
             unknown_session(&sid)
         }
     }

@@ -1157,6 +1157,31 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             goal: None,
         })
     }
+
+    /// Interrupt the in-flight turn by sending an ESC keypress to the pane —
+    /// the established Claude TUI interrupt (the same write-only `\u{1b}` the
+    /// `/esc` directive uses). ESC reaches the live TUI directly (it is a pane
+    /// keystroke, not a queued turn), so it stops the running turn out-of-band
+    /// while leaving the session fully alive: no kill-session, no `/exit`. A
+    /// following `/model` etc. then drives the same session. Idempotent on a
+    /// dead pane (mirrors `close_thread`): a missing session is a no-op, not an
+    /// error.
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let backend = default_backend();
+        let id = MuxSessionId::new(h.identity.clone());
+        if !backend
+            .exists(&id)
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("mux exists: {e}")))?
+        {
+            return Ok(());
+        }
+        backend
+            .send_escape(&id)
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("send Escape (interrupt): {e}")))?;
+        Ok(())
+    }
 }
 
 impl ClaudeTuiAdapter {

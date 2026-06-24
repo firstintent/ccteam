@@ -95,6 +95,10 @@ while True:
     if isinstance(ctl, dict) and ctl.get("type") == "control_request":
         rid = ctl.get("request_id", "ctl")
         sub = (ctl.get("request") or {}).get("subtype", "")
+        ctl_log = os.environ.get("FAKE_SJ_CTL_LOG")
+        if ctl_log:
+            with open(ctl_log, "a") as f:
+                f.write(sub + "\n")
         if sub == "get_context_usage":
             # Real claude returns the vendor's actual window here. The bare
             # "fake-model" has no [1m] suffix, so the heuristic would give 200k;
@@ -709,6 +713,95 @@ async fn model_directive_rejects_on_vendor_error() {
     }
 
     adapter.close_thread(&handle).await.unwrap();
+}
+
+/// `/interrupt` — `interrupt_turn` sends an `interrupt` control_request (the
+/// fake records the subtype it received) and, on the vendor's `success`
+/// control_response, returns `Ok(())`. CRUCIALLY it does NOT destroy the
+/// session: the same live session still answers a subsequent `set_model`
+/// directive + `thread_status` (the context is kept). This is the contrast
+/// with `/stop` (which closes the thread) — interrupt stops only the turn.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn interrupt_turn_sends_control_request_and_keeps_session() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let ctl_log = tmp.path().join("ctl.log");
+    std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // Interrupt the (notional) running turn → success.
+    adapter
+        .interrupt_turn(&handle)
+        .await
+        .expect("interrupt_turn must succeed on a live session");
+
+    // The fake recorded an `interrupt` control_request subtype — proves the
+    // out-of-band control line was actually sent (not a no-op).
+    let recorded = std::fs::read_to_string(&ctl_log).unwrap_or_default();
+    assert!(
+        recorded.lines().any(|l| l.trim() == "interrupt"),
+        "fake must have received an `interrupt` control_request; saw: {recorded:?}"
+    );
+
+    // Session NOT destroyed: a following directive still drives the SAME live
+    // session (set_model → Done) and thread_status answers — the whole point of
+    // interrupt-vs-stop (context preserved, /model still works).
+    let out = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "model".into(),
+                args: "claude-opus-4-8[1m]".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, DirectiveOutcome::Done { .. }),
+        "the session is still live after interrupt → /model applies, got {out:?}"
+    );
+    let st = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(st.model.as_deref(), Some("claude-opus-4-8[1m]"));
+
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// `interrupt_turn` on a handle with no live session (never spawned / already
+/// closed) is an honest error — never a silent success — so the gateway can
+/// surface it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn interrupt_turn_without_live_session_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let phantom = ccteam_harness::ThreadHandle {
+        vendor: AgentVendor::Claude,
+        mode: ExecutionMode::Chat,
+        identity: "never-spawned-uuid".into(),
+        started_at: chrono::Utc::now(),
+        raw_extras: serde_json::json!({}),
+    };
+    let err = adapter
+        .interrupt_turn(&phantom)
+        .await
+        .expect_err("interrupt on a dead handle must error");
+    assert!(
+        matches!(err, HarnessError::SubmitFailed(_)),
+        "non-live interrupt is a SubmitFailed, got {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

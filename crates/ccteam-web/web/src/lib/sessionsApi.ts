@@ -214,6 +214,15 @@ export function stopSession(sid: string): Promise<{ stopped: boolean }> {
   return postJson<{ stopped: boolean }>(`${sessionUrl(sid)}/stop`, {});
 }
 
+/** `POST /api/v1/sessions/{sid}/interrupt` — interrupt the session's
+ *  CURRENTLY-RUNNING turn WITHOUT destroying it. The non-destructive twin of
+ *  `stopSession`: the session stays live (context preserved), so the user can
+ *  then `/model` switch or send a follow-up. Reaches the adapter out-of-band,
+ *  so it stops the turn even while it's mid-stream. 200 `{interrupted:true}`. */
+export function interruptSession(sid: string): Promise<{ interrupted: boolean }> {
+  return postJson<{ interrupted: boolean }>(`${sessionUrl(sid)}/interrupt`, {});
+}
+
 /** `POST /api/v1/sessions/{sid}/resolve` — resolve a pending HITL choice by
  *  `token` + the chosen option `id` (`selection`). v0.8.7 review-fix (R-H1):
  *  this routes through the SAME gateway pending machinery an IM click uses

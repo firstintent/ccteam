@@ -1245,6 +1245,35 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         }
         Ok(status)
     }
+
+    /// Interrupt the in-flight turn via the bidirectional `interrupt`
+    /// control_request. Because the transport is full-duplex NDJSON, this line
+    /// is written to claude's stdin and answered OUT-OF-BAND — it reaches
+    /// claude even while a turn is streaming tools, which is the whole point
+    /// (the interrupt must NOT queue behind the running turn). The session is
+    /// left fully live: no `close_thread`, no map removal, no pump abort — only
+    /// the current turn stops, so a following `/model` etc. still works on the
+    /// same context.
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let Some(live) = self.lookup(&h.identity) else {
+            return Err(HarnessError::SubmitFailed(format!(
+                "interrupt: no live stream-json session for {} (nothing to interrupt)",
+                h.identity
+            )));
+        };
+        let body = live
+            .transport
+            .request_control("interrupt", json!({}), init_timeout())
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("interrupt control_request: {e:#}")))?;
+        if body.subtype != "success" {
+            return Err(HarnessError::SubmitFailed(format!(
+                "interrupt rejected: {}",
+                body.error.unwrap_or_else(|| body.subtype.clone())
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

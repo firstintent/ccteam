@@ -598,6 +598,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: false,
     },
     GatewayCommandSpec {
+        name: "/interrupt",
+        arg_hint: Some("[id]"),
+        help: "interrupt the running turn (keeps the session; bare = current)",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
         name: "/screen",
         arg_hint: Some("[id]"),
         help: "screenshot a session's pane (bare = current)",
@@ -1308,6 +1314,45 @@ impl Gateway {
                 }
                 self.stop_session(&sid).await?;
                 Ok(Some(format!("stopped session {sid}")))
+            }
+            "/interrupt" => {
+                // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
+                // destroying it — the context survives, so the user can then
+                // `/model` switch / send a follow-up on the same session. This
+                // is the missing middle between a plain turn and `/stop`
+                // (destroy). It is a GATEWAY command (handled here, before
+                // `submit_to_current`), so it reaches the adapter OUT-OF-BAND
+                // via `interrupt_turn` (stream-json `interrupt` control_request
+                // / TUI ESC / codex `turn/interrupt`) and never queues behind
+                // the running turn. Unlike `/stop` (explicit sid for safety), a
+                // bare `/interrupt` targets the CURRENT session — non-destructive,
+                // so fat-fingering it just stops the live turn.
+                let sid = match parts.next() {
+                    Some(id) => id.to_string(),
+                    None => self
+                        .current_session
+                        .read()
+                        .unwrap()
+                        .get(chat)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow!("/interrupt 需要一个活动会话(或 /interrupt <sid>)")
+                        })?,
+                };
+                // Own-only ACL — identical to /stop (a chat can interrupt only
+                // its own / the shared web-pool session).
+                let accessible = self
+                    .sessions
+                    .get(&sid)
+                    .map(|s| Self::chat_can_access(chat, s))
+                    .unwrap_or(false);
+                if !accessible {
+                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                }
+                self.interrupt_session(&sid).await?;
+                Ok(Some(format!(
+                    "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
+                )))
             }
             "/screen" => {
                 // v0.8.10 — capture a session's pane to a PNG and send it as an
@@ -3156,6 +3201,34 @@ impl Gateway {
         self.persist_state()?;
         Ok(())
     }
+
+    /// Interrupt a session's CURRENTLY-RUNNING turn without destroying it (the
+    /// non-destructive twin of [`Self::stop_session`]). Looks up the session,
+    /// calls the owning adapter's `interrupt_turn` (stream-json `interrupt`
+    /// control_request / TUI ESC / codex `turn/interrupt`) — an OUT-OF-BAND
+    /// control that reaches the vendor mid-turn — and returns. The session is
+    /// left fully live + idle: NO pump abort, NO `close_thread`, NO map
+    /// removal, NO `current_session` change, NO persist (nothing changed in the
+    /// registry), so a following `/model` etc. drives the SAME session on the
+    /// SAME context.
+    ///
+    /// This is the ACL-less core shared by the IM `/interrupt` command (which
+    /// applies `chat_can_access` first) and the web `POST
+    /// /sessions/{sid}/interrupt` route (which applies the project ACL via
+    /// `gate_sid` first). Unknown sid → `Err` so the web edge can 404.
+    pub async fn interrupt_session(&mut self, sid: &str) -> Result<()> {
+        let session = self
+            .sessions
+            .get(sid)
+            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        let thread = session.thread.clone();
+        let adapter = Arc::clone(&session.adapter);
+        adapter
+            .interrupt_turn(&thread)
+            .await
+            .map_err(|e| anyhow!("interrupt failed for {sid}: {e}"))?;
+        Ok(())
+    }
 }
 
 /// Stringify a vendor for the [`SessionView`] wire shape. Kept local so
@@ -4223,6 +4296,10 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// v0.8.19 — thread identities passed to `interrupt_turn`, in call
+        /// order, so the `/interrupt` test can assert the gateway invoked the
+        /// adapter's interrupt (not destroy).
+        interrupts: Arc<Mutex<Vec<String>>>,
     }
 
     impl Default for FakeAdapter {
@@ -4247,6 +4324,7 @@ mod tests {
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                interrupts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -4397,6 +4475,13 @@ mod tests {
         async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
             Ok(self.status.lock().await.clone())
         }
+
+        async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+            // Record the interrupt; the session is NOT destroyed (the gateway
+            // keeps the record), so this just notes the turn-stop was driven.
+            self.interrupts.lock().await.push(h.identity.clone());
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -4473,6 +4558,87 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    /// `/interrupt` stops the running turn WITHOUT destroying the session — the
+    /// contrast with `/stop`. It (1) calls the adapter's `interrupt_turn`, (2)
+    /// LEAVES the session in the gateway map (so a follow-up `/model` etc. still
+    /// drives the same context — the whole point), and (3) enforces the
+    /// own-session ACL (a foreign chat can't interrupt). Bare `/interrupt`
+    /// targets the chat's CURRENT session.
+    #[tokio::test]
+    async fn gateway_interrupt_stops_turn_but_keeps_session_and_is_own_only() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        // chat-1 creates a session (its current).
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // Explicit `/interrupt s1` → receipt names the session, the adapter's
+        // interrupt was called, and the session STILL EXISTS (contrast /stop).
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/interrupt s1")
+            .await
+            .unwrap();
+        assert_eq!(reply.len(), 1);
+        assert!(
+            reply[0].contains("已中断 session s1") && reply[0].contains("会话保留"),
+            "interrupt receipt: {:?}",
+            reply[0]
+        );
+        assert_eq!(
+            fake.interrupts.lock().await.as_slice(),
+            &["alpha-reviewer-s1".to_string()],
+            "the adapter's interrupt_turn was invoked once"
+        );
+        // The session is NOT gone (this is the /stop contrast): it's still
+        // listed + addressable, so /model can follow on the same context.
+        assert_eq!(gateway.session_views().len(), 1);
+        let used = gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1"]);
+
+        // Bare `/interrupt` targets the CURRENT session (s1) — non-destructive,
+        // so no explicit sid is required (unlike /stop).
+        let bare = gateway
+            .handle_text("mock", "chat-1", "alice", "/interrupt")
+            .await
+            .unwrap();
+        assert!(bare[0].contains("已中断 session s1"), "bare: {:?}", bare[0]);
+        assert_eq!(
+            fake.interrupts.lock().await.len(),
+            2,
+            "bare interrupt also drove interrupt_turn"
+        );
+
+        // Own-only ACL: a DIFFERENT chat cannot interrupt chat-1's session —
+        // it reads as unknown (no existence leak), and interrupt_turn is NOT
+        // called for it (still 2 total).
+        let foreign = gateway
+            .handle_text("mock", "chat-2", "bob", "/interrupt s1")
+            .await
+            .unwrap();
+        assert_eq!(foreign, vec!["unknown session for this chat: s1"]);
+        assert_eq!(
+            fake.interrupts.lock().await.len(),
+            2,
+            "a foreign chat's interrupt must NOT reach the adapter"
+        );
+
+        // The web/REST core (`interrupt_session`, ACL applied by the route) also
+        // keeps the session: an unknown sid errors so the edge can 404.
+        gateway.interrupt_session("s1").await.unwrap();
+        assert_eq!(
+            gateway.session_views().len(),
+            1,
+            "still live after core interrupt"
+        );
+        assert!(gateway.interrupt_session("s99").await.is_err());
     }
 
     /// Web-path parity: a `/command` submitted via `submit_to_sid` (the network

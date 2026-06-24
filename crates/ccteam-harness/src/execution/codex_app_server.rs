@@ -1786,6 +1786,34 @@ impl HarnessAdapter for CodexAppServerAdapter {
             goal: None,
         })
     }
+
+    /// Interrupt the in-flight turn via codex's `turn/interrupt` RPC (the same
+    /// call the `/interrupt` directive already wired). The active turn id comes
+    /// from the harness-owned tracker (`active_turn`, set on `turn/started`).
+    /// The RPC rides the JSON-RPC client OUT-OF-BAND (it is not a `turn/start`
+    /// in the turn queue), so it reaches codex while the turn is mid-stream and
+    /// leaves the thread alive: no `thread/archive`, no unsubscribe. No active
+    /// turn → a clean no-op (nothing to interrupt), never an error — so a
+    /// gateway `/interrupt` on an idle codex session is harmless.
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let active = self
+            .tracker_snapshot(&h.identity)
+            .await
+            .and_then(|t| t.active_turn);
+        let Some(turn_id) = active else {
+            // No in-flight turn — nothing to stop. Idempotent success.
+            return Ok(());
+        };
+        let client = self.client().await?;
+        client
+            .call(
+                "turn/interrupt",
+                json!({ "threadId": h.identity, "turnId": turn_id }),
+            )
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}")))?;
+        Ok(())
+    }
 }
 
 fn synthetic_command_turn_id(command: &str, thread_id: &str) -> TurnId {

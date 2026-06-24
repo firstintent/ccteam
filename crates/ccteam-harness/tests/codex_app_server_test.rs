@@ -1577,6 +1577,59 @@ async fn d2_interrupt_uses_active_turn_from_tracker() {
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
 
+/// v0.8.19 — the `interrupt_turn` TRAIT method (the gateway `/interrupt` path,
+/// distinct from the `/interrupt` directive) also sends `turn/interrupt`
+/// { threadId, turnId } using the active turn the tracker holds. With NO active
+/// turn it's a clean no-op (no RPC) — so a gateway `/interrupt` on an idle codex
+/// session is harmless. The thread is NOT closed either way (no thread/archive).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn interrupt_turn_method_uses_active_turn_and_noops_when_idle() {
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_notif("interrupt-method").await;
+
+    // No active turn → Ok, no RPC frame.
+    adapter
+        .interrupt_turn(&h)
+        .await
+        .expect("idle interrupt is a no-op success");
+    assert!(find_frame(&seen.lock().unwrap(), "turn/interrupt").is_none());
+    assert!(
+        find_frame(&seen.lock().unwrap(), "thread/archive").is_none(),
+        "interrupt must NOT close the thread"
+    );
+
+    // Drive turn/started into the tracker, then interrupt → turn/interrupt RPC.
+    notif
+        .send(json!({
+            "method": "turn/started",
+            "params": { "threadId": "tid-d2", "turn": { "id": "turn-live" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        async move {
+            a.tracker_snapshot("tid-d2")
+                .await
+                .and_then(|t| t.active_turn)
+                == Some("turn-live".to_string())
+        }
+    })
+    .await;
+
+    seen.lock().unwrap().clear();
+    adapter.interrupt_turn(&h).await.unwrap();
+    let frames = seen.lock().unwrap().clone();
+    assert_eq!(
+        find_frame(&frames, "turn/interrupt").unwrap()["params"],
+        json!({ "threadId": "tid-d2", "turnId": "turn-live" })
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
 /// D2.2 — a plain UserText with an active turn goes via turn/steer
 /// { expectedTurnId } instead of turn/start (turn.rs:160).
 #[tokio::test(flavor = "current_thread")]

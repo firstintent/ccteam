@@ -191,6 +191,9 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::sessions_api::handle_session_resolve))
         .routes(routes!(super::sessions_api::handle_session_events))
         .routes(routes!(super::sessions_api::handle_session_stop))
+        // v0.8.19 — interrupt the running turn WITHOUT destroying the session
+        // (the non-destructive twin of /stop; keeps context for a /model switch).
+        .routes(routes!(super::sessions_api::handle_session_interrupt))
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist
         // PUTs + async telegram chat_id capture). All inside the web-token gate.
         .routes(routes!(super::im_config::handle_get_im_config))
