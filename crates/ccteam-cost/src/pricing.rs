@@ -304,7 +304,7 @@ mod tests {
             ..Default::default()
         };
         let cost = estimate_cost(&usage, Vendor::Codex, "o9-imaginary");
-        assert!(cost > 0.0, "fallback to o3 must yield positive cost");
+        assert!(cost > 0.0, "fallback to gpt-5.5 must yield positive cost");
     }
 
     #[test]
@@ -335,6 +335,50 @@ mod tests {
         assert!(
             (cost - 3.75).abs() < 0.01,
             "sonnet-4-6 cache_creation != $3.75 / 1M (got {cost})",
+        );
+    }
+
+    #[test]
+    fn opus_4_8_is_priced_not_sonnet_fallback() {
+        // The owner's primary model. It MUST have its own row — it was missing,
+        // so usage was silently billed at the sonnet-4-6 fallback ($15/1M out).
+        // 1M output @ opus-4-8 = $25; the `[1m]` 1M-context suffix strips to the
+        // same row.
+        let m_out = UnifiedTokenUsage {
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let opus = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8");
+        assert!(
+            (opus - 25.0).abs() < 0.01,
+            "opus-4-8 output != $25 / 1M (got {opus}) — is it in the table?",
+        );
+        let opus_1m = estimate_cost(&m_out, Vendor::Claude, "claude-opus-4-8[1m]");
+        assert!(
+            (opus_1m - 25.0).abs() < 0.01,
+            "opus-4-8[1m] must strip to the same $25 row (got {opus_1m})",
+        );
+    }
+
+    #[test]
+    fn gpt_5_5_priced_and_is_codex_fallback() {
+        // gpt-5.5 = current Codex default AND the table's fallback_model.
+        // 1M output = $30 (NOT the old o3 $8 fallback).
+        let m_out = UnifiedTokenUsage {
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let g = estimate_cost(&m_out, Vendor::Codex, "gpt-5.5");
+        assert!(
+            (g - 30.0).abs() < 0.01,
+            "gpt-5.5 output != $30 / 1M (got {g})"
+        );
+        // An unknown / unpriced Codex model (e.g. gpt-5.3-codex-spark, no public
+        // price) now falls back to gpt-5.5 ($30), not the ancient o3 ($8).
+        let spark = estimate_cost(&m_out, Vendor::Codex, "gpt-5.3-codex-spark");
+        assert!(
+            (spark - 30.0).abs() < 0.01,
+            "unpriced codex model must fall back to gpt-5.5 $30 (got {spark})",
         );
     }
 

@@ -527,14 +527,15 @@ fn per_vendor_model_specific_pricing() {
     );
 
     // Empty model string -> vendor fallback (legacy V0.5 callers).
-    // For Codex the fallback is o3, so empty "" should equal the o3
-    // rate. This is the exact knob Wave 4 D14 removes for production
-    // callers but keeps as a compatibility escape hatch.
+    // For Codex the fallback is now gpt-5.5 (the current default — it
+    // superseded o3 when the gpt-5.x rows landed), so empty "" should
+    // equal the gpt-5.5 rate. This is the exact knob Wave 4 D14 removes
+    // for production callers but keeps as a compatibility escape hatch.
     let codex_empty_out = estimate_cost(&one_m_output, Vendor::Codex, "");
-    let o3_out = estimate_cost(&one_m_output, Vendor::Codex, "o3");
+    let fallback_out = estimate_cost(&one_m_output, Vendor::Codex, "gpt-5.5");
     assert!(
-        (codex_empty_out - o3_out).abs() < 0.01,
-        "empty model string must fall back to vendor fallback_model (o3)",
+        (codex_empty_out - fallback_out).abs() < 0.01,
+        "empty model string must fall back to vendor fallback_model (gpt-5.5)",
     );
 }
 

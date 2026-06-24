@@ -12,8 +12,14 @@
 #                              (Anthropic's "cache_creation_input_tokens" bucket)
 #   - output_per_1m           model output tokens
 
-schema_version = "2026-05-17"
+schema_version = "2026-06-24"
 fallback_model = "claude-sonnet-4-6"
+
+[models."claude-opus-4-8"]
+input_per_1m = 5.0
+cached_input_per_1m = 0.5
+cache_creation_per_1m = 6.25
+output_per_1m = 25.0
 
 [models."claude-opus-4-7"]
 input_per_1m = 5.0

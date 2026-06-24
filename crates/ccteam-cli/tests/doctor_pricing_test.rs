@@ -4,10 +4,11 @@
 //! `CCTEAM_TEST_NOW=YYYY-MM-DD` so "today" is deterministic regardless
 //! of when CI runs (or how aged the embedded TOML tables drift).
 //!
-//! Per-vendor coverage:
-//! - `pricing.anthropic` `schema_version` = 2026-05-17 (see
+//! Per-vendor coverage (both tables bumped to 2026-06-24 — Opus 4.8 +
+//! gpt-5.x rows):
+//! - `pricing.anthropic` `schema_version` = 2026-06-24 (see
 //!   `crates/ccteam-cost/pricing/anthropic.toml`)
-//! - `pricing.openai`    `schema_version` = 2026-05-19 (see
+//! - `pricing.openai`    `schema_version` = 2026-06-24 (see
 //!   `crates/ccteam-cost/pricing/openai.toml`)
 //!
 //! The `CCTEAM_TEST_NOW` override is consumed by
@@ -49,9 +50,9 @@ fn assert_both_vendor_lines(stdout: &str) {
 
 #[test]
 fn check_pricing_version_ok_when_both_tables_fresh() {
-    // Pin "today" to the openai table's authored date — both vendors
-    // sit within the 180-day window.
-    let (stdout, _stderr, code) = run_doctor_with_now("2026-05-19");
+    // Pin "today" to the tables' authored date — both vendors sit at
+    // age 0, within the 180-day window.
+    let (stdout, _stderr, code) = run_doctor_with_now("2026-06-24");
     assert_eq!(code, 0, "doctor must exit 0. stdout:\n{stdout}");
     assert_both_vendor_lines(&stdout);
     // Both lines should land in the OK bucket — the WARN / ERROR
@@ -77,9 +78,9 @@ fn check_pricing_version_ok_when_both_tables_fresh() {
 
 #[test]
 fn check_pricing_version_warns_when_table_is_200_days_old() {
-    // anthropic.toml schema_version = 2026-05-17 → 200 days later is
-    // 2026-12-03. Both vendors land in (180, 365] → warn (not error).
-    let (stdout, _stderr, code) = run_doctor_with_now("2026-12-03");
+    // Both tables schema_version = 2026-06-24 → 200 days later is
+    // 2027-01-10. Both vendors land in (180, 365] → warn (not error).
+    let (stdout, _stderr, code) = run_doctor_with_now("2027-01-10");
     assert_eq!(code, 0);
     assert_both_vendor_lines(&stdout);
     assert!(
@@ -98,9 +99,9 @@ fn check_pricing_version_warns_when_table_is_200_days_old() {
 
 #[test]
 fn check_pricing_version_errors_when_table_is_400_days_old() {
-    // anthropic.toml schema_version = 2026-05-17 → 400 days later is
-    // 2027-06-21. Both vendors land in (365, ∞) → error.
-    let (stdout, _stderr, code) = run_doctor_with_now("2027-06-21");
+    // Both tables schema_version = 2026-06-24 → 400 days later is
+    // 2027-07-29. Both vendors land in (365, ∞) → error.
+    let (stdout, _stderr, code) = run_doctor_with_now("2027-07-29");
     assert_eq!(code, 0);
     assert_both_vendor_lines(&stdout);
     assert!(
@@ -120,7 +121,7 @@ fn doctor_without_flag_runs_pricing_check_implicitly() {
     // it when they remember the explicit flag).
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
-        .env("CCTEAM_TEST_NOW", "2026-05-19")
+        .env("CCTEAM_TEST_NOW", "2026-06-24")
         .arg("doctor")
         .output()
         .expect("spawn ccteam doctor");
