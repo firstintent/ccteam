@@ -107,6 +107,6 @@ Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|n
 | Architecture — components, data protocols, design rationale | [docs/tech-design.md](docs/tech-design.md) |
 | Requirements — the problems ccteam solves, and for whom | [docs/requirements.md](docs/requirements.md) |
 
-## License & acknowledgements
+## License
 
-MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) and OpenAI Codex, with [openhuman/channels](https://github.com/openhuman/channels) for IM connectivity. The IM-bot pattern (tmux + send-keys + transcript polling) is inspired by `ccgram` and `oh-my-claudecode`.
+MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) and OpenAI Codex.

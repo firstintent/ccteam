@@ -694,9 +694,7 @@ impl Channel for TelegramChannel {
         chat_id: &str,
         message_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let mid = message_id.parse::<i64>().map_err(|_| {
-            anyhow::anyhow!("telegram setMessageReaction: non-numeric message_id {message_id}")
-        })?;
+        let mid = parse_tg_message_id(message_id)?;
         let body = set_message_reaction_body(chat_id, mid, true);
         self.post_set_message_reaction(chat_id, message_id, &body)
             .await?;
@@ -713,9 +711,7 @@ impl Channel for TelegramChannel {
         message_id: &str,
         _handle: Option<&str>,
     ) -> anyhow::Result<()> {
-        let mid = message_id.parse::<i64>().map_err(|_| {
-            anyhow::anyhow!("telegram setMessageReaction: non-numeric message_id {message_id}")
-        })?;
+        let mid = parse_tg_message_id(message_id)?;
         let body = set_message_reaction_body(chat_id, mid, false);
         self.post_set_message_reaction(chat_id, message_id, &body)
             .await?;
@@ -778,6 +774,22 @@ fn set_my_commands_body(
         body["scope"] = scope.clone();
     }
     body
+}
+
+/// Parse a Telegram message id for `setMessageReaction`, tolerating ccteam's
+/// `tg-<n>` inbound-id namespacing (the gateway carries IM message ids as
+/// `tg-<n>`, but the Bot API needs the BARE numeric `<n>`). Without the strip,
+/// the 👀 ack failed on EVERY real telegram turn ("non-numeric message_id
+/// tg-6249") — the mock channel doesn't exercise this numeric parse, so it
+/// went unnoticed. Bare numeric ids (no prefix) still parse.
+fn parse_tg_message_id(message_id: &str) -> anyhow::Result<i64> {
+    message_id
+        .strip_prefix("tg-")
+        .unwrap_or(message_id)
+        .parse::<i64>()
+        .map_err(|_| {
+            anyhow::anyhow!("telegram setMessageReaction: non-numeric message_id {message_id}")
+        })
 }
 
 /// Build the `setMessageReaction` request body (pure + isolated so the
@@ -933,6 +945,18 @@ mod tests {
         assert_eq!(reaction.len(), 1);
         assert_eq!(reaction[0]["type"], "emoji");
         assert_eq!(reaction[0]["emoji"], "👀");
+    }
+
+    #[test]
+    fn parse_tg_message_id_strips_the_namespacing_prefix() {
+        // The 👀-ack fix: the gateway carries inbound telegram ids as `tg-<n>`,
+        // but the Bot API needs the BARE numeric — strip the prefix.
+        assert_eq!(parse_tg_message_id("tg-6249").unwrap(), 6249);
+        // A bare numeric id (no prefix) still parses.
+        assert_eq!(parse_tg_message_id("42").unwrap(), 42);
+        // Genuinely non-numeric → error (id preserved in the message for the log).
+        assert!(parse_tg_message_id("tg-abc").is_err());
+        assert!(parse_tg_message_id("nope").is_err());
     }
 
     #[test]
