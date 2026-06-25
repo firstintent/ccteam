@@ -42,3 +42,4 @@ graphify-out/
 /config.yaml
 ccteam-hub/
 cleat/
+__pycache__/
