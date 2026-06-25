@@ -175,11 +175,31 @@ impl Identity {
     }
 
     /// Whether this identity may see a resource owned by `owner` (a project's
-    /// `ProjectState.owner` or a session owner). The admin/owner sees
-    /// everything; a per-user tenant sees only what it owns (`user:<id>`).
+    /// `ProjectState.owner` or a session owner). Own resources are always
+    /// visible (the admin's `user:web-api` pool, or a tenant's `user:<id>`). The
+    /// admin/operator additionally sees every NON-tenant resource — unowned
+    /// (legacy CLI projects, `None`) and IM-owned (`telegram:*`) — but NOT a
+    /// per-user tenant's resources (`user:<id>`), which stay private to that
+    /// tenant (档1 owner ruling: admin does not peek into tenants' projects). A
+    /// tenant sees ONLY its own.
     pub fn can_see_owner(&self, owner: Option<&str>) -> bool {
-        self.is_admin || owner == Some(self.owner_tag().as_str())
+        let tag = self.owner_tag();
+        if owner == Some(tag.as_str()) {
+            return true; // own resources (admin pool or the tenant's own)
+        }
+        // The operator sees everything EXCEPT a tenant's private resources.
+        self.is_admin && !is_tenant_owned(owner)
     }
+}
+
+/// Whether `owner` is a per-user TENANT's tag (`user:<id>`, excluding the shared
+/// admin pool `user:web-api`). Tenant-owned resources are private to that tenant
+/// — not even the admin sees them (档1 owner ruling). Unowned (`None`) and
+/// IM-owned (`telegram:*`) tags are NOT tenant-owned.
+fn is_tenant_owned(owner: Option<&str>) -> bool {
+    owner
+        .and_then(|o| o.strip_prefix("user:"))
+        .is_some_and(|id| id != "web-api")
 }
 
 /// `Some(403)` unless the caller is the admin/owner — the shared gate for every
@@ -505,12 +525,18 @@ mod tests {
     }
 
     #[test]
-    fn can_see_owner_admin_sees_all_tenant_sees_own() {
+    fn can_see_owner_admin_sees_non_tenant_tenant_sees_own() {
+        // 档1 owner ruling: the admin/operator does NOT see a per-user tenant's
+        // projects (`user:<id>`), but DOES see its own pool, unowned, + IM-owned.
         let admin = Identity::admin();
         assert_eq!(admin.owner_tag(), "user:web-api");
-        assert!(admin.can_see_owner(None));
-        assert!(admin.can_see_owner(Some("user:u1")));
-        assert!(admin.can_see_owner(Some("telegram:123")));
+        assert!(admin.can_see_owner(Some("user:web-api")), "own admin pool");
+        assert!(admin.can_see_owner(None), "unowned legacy/CLI project");
+        assert!(admin.can_see_owner(Some("telegram:123")), "IM-owned");
+        assert!(
+            !admin.can_see_owner(Some("user:u1")),
+            "a tenant's project is PRIVATE from admin"
+        );
 
         let t = Identity::tenant("u1".to_string());
         assert_eq!(t.owner_tag(), "user:u1");
@@ -518,6 +544,19 @@ mod tests {
         assert!(!t.can_see_owner(Some("user:u2")), "another tenant's");
         assert!(!t.can_see_owner(None), "legacy/admin-pool project");
         assert!(!t.can_see_owner(Some("telegram:1")), "IM-owned");
+        assert!(
+            !t.can_see_owner(Some("user:web-api")),
+            "the admin pool is not the tenant's"
+        );
+    }
+
+    #[test]
+    fn is_tenant_owned_only_for_per_user_tags() {
+        assert!(is_tenant_owned(Some("user:u1")));
+        assert!(is_tenant_owned(Some("user:abc123")));
+        assert!(!is_tenant_owned(Some("user:web-api")), "shared admin pool");
+        assert!(!is_tenant_owned(Some("telegram:1")), "IM-owned");
+        assert!(!is_tenant_owned(None), "unowned");
     }
 
     #[test]

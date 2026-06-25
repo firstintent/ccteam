@@ -226,17 +226,16 @@ pub(crate) async fn handle_me(
 
 /// v0.8.18 档1 — whether `identity` may see project `slug`. Project is the unit
 /// of ownership; a session's visibility derives from its project's. Reads the
-/// project's `state.json` owner: the admin sees every project, a tenant only
-/// one it owns (`user:<id>`). A missing/unreadable project is not visible to a
-/// tenant. The single source the session endpoints consult to scope by project.
+/// project's `state.json` owner and delegates to [`Identity::can_see_owner`]:
+/// the operator/admin sees its own + unowned + IM-owned projects but NOT a
+/// per-user tenant's (`user:<id>`); a tenant sees only one it owns. A
+/// missing/unreadable project is not visible. The single source the session
+/// endpoints consult to scope by project.
 pub(crate) fn can_see_project(
     app: &AppState,
     identity: &crate::auth::Identity,
     slug: &str,
 ) -> bool {
-    if identity.is_admin {
-        return true;
-    }
     match ProjectState::load(&app.paths.project_state(slug)) {
         Ok(state) => identity.can_see_owner(state.owner.as_deref()),
         Err(_) => false,

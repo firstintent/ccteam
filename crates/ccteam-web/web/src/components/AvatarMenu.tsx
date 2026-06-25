@@ -14,6 +14,7 @@
 import { useState } from "react";
 import { LogOut, Moon, Sun } from "lucide-react";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useMe } from "../hooks/useMe";
 import { clearToken } from "../lib/token";
 import { tr, type Lang } from "../lib/i18n";
 
@@ -30,6 +31,7 @@ function avatarColor(v: string): string {
  *  tests. The stateful [`AvatarMenu`] wraps it. */
 export function AvatarPopover({
   lang,
+  handle,
   displayName,
   avatar,
   theme,
@@ -40,6 +42,9 @@ export function AvatarPopover({
   onLogout,
 }: {
   lang: Lang;
+  /** The signed-in identity's name from `/api/v1/me` (tenant handle / "owner"),
+   *  or null until it loads. Shown so a tenant sees whose console this is. */
+  handle: string | null;
   displayName: string;
   avatar: string;
   theme: "dark" | "light";
@@ -54,8 +59,19 @@ export function AvatarPopover({
       data-testid="avatar-popover"
       className="absolute right-0 top-10 z-50 w-64 rounded-lg border border-surface-700/60 bg-surface-900 p-3 shadow-xl"
     >
-      <div className="text-xs font-semibold text-text-primary">
-        {tr(lang, "个人设置", "Personal settings")}
+      <div className="flex items-baseline justify-between gap-2">
+        <div className="text-xs font-semibold text-text-primary">
+          {tr(lang, "个人设置", "Personal settings")}
+        </div>
+        {handle ? (
+          <span
+            data-testid="avatar-handle"
+            title={tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`)}
+            className="truncate text-[11px] font-mono text-text-secondary"
+          >
+            @{handle}
+          </span>
+        ) : null}
       </div>
 
       <label className="mt-2 block text-[11px] text-text-dim">
@@ -151,9 +167,16 @@ export function AvatarPopover({
 /** Avatar button + personal-settings popover. Persists to useWebSettings. */
 export default function AvatarMenu() {
   const { settings, update } = useWebSettings();
+  const { me } = useMe();
   const [open, setOpen] = useState(false);
   const lang = settings.language;
-  const initial = (settings.displayName || "").trim().slice(0, 1).toUpperCase();
+  const handle = me?.handle ?? null;
+  // Prefer the locally-chosen display name for the avatar initial; fall back to
+  // the signed-in identity's handle so a tenant who never set a name still sees
+  // a meaningful letter.
+  const initial = ((settings.displayName || "").trim() || handle || "")
+    .slice(0, 1)
+    .toUpperCase();
 
   const logout = () => {
     clearToken();
@@ -169,7 +192,12 @@ export default function AvatarMenu() {
         type="button"
         data-testid="avatar-button"
         onClick={() => setOpen((o) => !o)}
-        aria-label={tr(lang, "个人设置", "Personal settings")}
+        aria-label={
+          handle
+            ? tr(lang, `个人设置(${handle})`, `Personal settings (${handle})`)
+            : tr(lang, "个人设置", "Personal settings")
+        }
+        title={handle ? tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`) : undefined}
         style={{ backgroundColor: avatarColor(settings.avatar) }}
         className="grid h-8 w-8 place-items-center rounded-full text-[11px] font-semibold text-surface-950 ring-1 ring-surface-700/60 hover:ring-brand-500/60"
       >
@@ -186,6 +214,7 @@ export default function AvatarMenu() {
           />
           <AvatarPopover
             lang={lang}
+            handle={handle}
             displayName={settings.displayName}
             avatar={settings.avatar}
             theme={settings.theme}

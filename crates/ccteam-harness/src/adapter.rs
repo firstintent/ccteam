@@ -595,6 +595,30 @@ pub struct AccountUsage {
     pub credits_pct: Option<u8>,
 }
 
+/// One in-flight subagent / workflow task, reflected from the harness's OWN
+/// task lifecycle — claude's stream-json `system:task_started` → terminal
+/// `task_updated`/`task_notification`. ccteam does NOT fold or count events to
+/// derive this: a task is "running" iff its `task_started` arrived with no
+/// terminal status yet, so the list mirrors exactly what claude reports. A
+/// plain `Agent` subagent and a workflow task both flow through the same
+/// events; `task_type` (`"local_agent"` …) distinguishes them. Surfaced by
+/// [`HarnessAdapter::running_tasks`] → the IM `/status` current-session view
+/// (nested under the working session).
+#[derive(Debug, Clone)]
+pub struct RunningTask {
+    /// claude's stable task id (`task_started.task_id`); the de-dup / removal key.
+    pub task_id: String,
+    /// The `subagent_type` (e.g. `general-purpose`, `code-reviewer`).
+    pub kind: String,
+    /// The task's short description (`task_started.description`).
+    pub description: String,
+    /// The task kind (`task_started.task_type`, e.g. `local_agent`).
+    pub task_type: String,
+    /// When `task_started` arrived — for the elapsed-time display. In-memory
+    /// only (never persisted / serialized).
+    pub started: std::time::Instant,
+}
+
 /// A long-running session goal (`/goal`). `condition` is the objective text;
 /// `met` flips true when the agent reports it achieved. For Claude stream-json
 /// this is sourced from the session transcript's `goal_status` attachment —
@@ -836,6 +860,15 @@ pub trait HarnessAdapter: Send + Sync {
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
         None
+    }
+
+    /// The session's currently-running subagent / workflow tasks, as reported by
+    /// the harness's OWN task lifecycle (never folded or counted by ccteam).
+    /// OPTIONAL (default empty): only adapters with task introspection
+    /// implement it (Claude stream-json reflects its `system:task_*` events).
+    /// `/status` lists these under the current working session.
+    async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
+        Vec::new()
     }
 
     /// Interrupt the session's CURRENTLY-RUNNING turn **without destroying

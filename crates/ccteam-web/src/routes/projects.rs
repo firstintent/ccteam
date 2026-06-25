@@ -96,26 +96,41 @@ pub(crate) async fn handle_create_project(
         Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
     };
 
-    // 2. Reject a slug already registered (idempotency guard mirroring
-    //    Gateway::create_project) — a re-POST shouldn't silently clobber.
-    match ccteam_core::lookup_project_in_config(&app.paths.root, &slug) {
-        Ok(Some(_)) => {
-            return create_error(
-                StatusCode::CONFLICT,
-                format!("project already exists: {slug}"),
-                mode,
-            );
+    // 2. On a slug collision, AUTO-APPEND (demo → demo2 → demo3 …) instead of
+    //    rejecting — the same rule `ccteam init` uses. Two users (or two
+    //    different working trees) can then both create a "demo": their paths
+    //    differ; the numeric suffix just disambiguates the globally-unique slug
+    //    (the REST/key identity). The 201 returns the slug actually used.
+    //    Bounded so a pathological registry can't spin forever.
+    let slug = {
+        let base = slug;
+        let mut candidate = base.clone();
+        let mut n = 1u32;
+        loop {
+            match ccteam_core::lookup_project_in_config(&app.paths.root, &candidate) {
+                Ok(None) => break candidate,
+                Ok(Some(_)) => {
+                    n += 1;
+                    if n > 999 {
+                        return create_error(
+                            StatusCode::CONFLICT,
+                            format!("too many projects named {base}"),
+                            mode,
+                        );
+                    }
+                    candidate = format!("{base}{n}");
+                }
+                Err(err) => {
+                    tracing::error!(slug = %candidate, %err, "lookup_project_in_config failed");
+                    return create_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("registry read failed: {err}"),
+                        mode,
+                    );
+                }
+            }
         }
-        Ok(None) => {}
-        Err(err) => {
-            tracing::error!(%slug, %err, "lookup_project_in_config failed");
-            return create_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("registry read failed: {err}"),
-                mode,
-            );
-        }
-    }
+    };
 
     // 3. Resolve the working-tree dir. `~`-expansion + absolute-path
     //    enforcement; we keep this local (the gateway's `expand_project_
@@ -144,9 +159,14 @@ pub(crate) async fn handle_create_project(
             "(created from web resource API)",
             &team_for_blocking,
         )?;
-        // Best-effort owner stamp (mirrors `Gateway::create_project`): a
-        // load/save miss just leaves owner unset (admin-visible, not tenant).
-        let state_path = paths.project_state(&slug_for_blocking);
+        // Owner stamp — bind the project to its creator so the tenant can see
+        // its own project. Use the KNOWN project path (`abs`), NOT
+        // `paths.project_state(slug)`: that resolves the dir through the config
+        // registry, which does not yet contain this project (the upsert is
+        // below) → it would fall back to the wrong path, the load would miss,
+        // and the owner would never persist → the creating tenant could not see
+        // its own project (404). `abs` IS the project working tree.
+        let state_path = ccteam_core::CcteamPaths::project_state_in(&abs_for_blocking);
         if let Ok(mut state) = ccteam_core::ProjectState::load(&state_path) {
             state.owner = Some(owner_for_blocking.clone());
             if let Err(err) = state.save(&state_path) {

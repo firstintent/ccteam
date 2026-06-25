@@ -18,8 +18,8 @@ use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     chat_session_name, parse_chat_session_name, AccountUsage, AgentSpecBrief, AgentVendor,
     ChoicePrompt, ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, HarnessError,
-    PermissionMode, ProcessBackend, SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadItemDetails, TurnInput,
+    PermissionMode, ProcessBackend, RunningTask, SessionProtocol, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -3054,122 +3054,160 @@ impl Gateway {
         if visible.is_empty() {
             return "no sessions — start one with /new".to_string();
         }
-        // Idle/stuck threshold: the watchdog's idle window, or a fixed 300s when
-        // the watchdog is disabled (so the 🔴 state is still derivable).
+        // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
+        // the full fleet list. Resolve the focused sid; if none is set (or it has
+        // gone), point at /use rather than guess which session is "current".
+        let cur_sid = self
+            .current_session
+            .read()
+            .ok()
+            .and_then(|m| m.get(chat).cloned());
+        let Some(s) = cur_sid
+            .as_ref()
+            .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid))
+        else {
+            return format!(
+                "无当前会话 —— 用 /use <id> 选一个驱动(你有 {} 个会话;/sessions 看全部)",
+                visible.len()
+            );
+        };
+
+        // Pull live facts FROM the harness — never folded by ccteam: the
+        // model/effort/ctx/goal status, the running subagent/workflow list
+        // (claude's own `system:task_*` lifecycle), and account usage.
+        let status = s.adapter.thread_status(&s.thread).await.ok();
+        let running = s.adapter.running_tasks(&s.thread).await;
+        // Account usage is ACCOUNT-scoped (same for every session): prefer the
+        // current session, else the first visible session whose adapter answers
+        // (so usage still shows when the current session is idle/released).
+        let mut account = s.adapter.account_usage(&s.thread).await;
+        if account.is_none() {
+            for o in &visible {
+                if let Some(u) = o.adapter.account_usage(&o.thread).await {
+                    account = Some(u);
+                    break;
+                }
+            }
+        }
+
+        // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
+        // 🔴 stuck — EXCEPT running subagents are an AUTHORITATIVE "still working"
+        // signal (straight from claude) that overrides the silence heuristic, so
+        // a main session quietly awaiting subagents never mis-reads idle/stuck.
         let mut stuck_after = gateway_turn_timeout_duration();
         if stuck_after.is_zero() {
             stuck_after = std::time::Duration::from_secs(300);
         }
         let now = Instant::now();
-        // v0.8.20 /status v2 ③ — ACCOUNT-level usage (5h / weekly / credits) for
-        // the dashboard header: query `get_usage` on the first session whose
-        // adapter answers (account-scoped — any one live claude session answers
-        // for all; non-claude/non-live return None via the default). Best-effort.
-        let mut account: Option<AccountUsage> = None;
-        for s in &visible {
-            if let Some(u) = s.adapter.account_usage(&s.thread).await {
-                account = Some(u);
-                break;
+        let started = s.turn_started_at.lock().ok().and_then(|g| *g);
+        let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
+        let silent_for = started.map(|t| match last_event {
+            Some(ev) => now.saturating_duration_since(ev),
+            None => now.saturating_duration_since(t),
+        });
+        let (state, detail) = match (started, silent_for) {
+            (None, _) => ("🟢", "idle".to_string()),
+            // Running subagents ⇒ definitively working (overrides silence).
+            (Some(t), _) if !running.is_empty() => (
+                "🔵",
+                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+            ),
+            (Some(_), Some(silent)) if silent >= stuck_after => {
+                ("🔴", format!("STUCK {} silent", humanize_dur(silent)))
             }
-        }
-        let mut rows: Vec<String> = Vec::with_capacity(visible.len());
-        // ① aggregate tally — the operator summary that makes /status a dashboard
-        // (vs the bare /sessions list).
-        let (mut n_work, mut n_idle, mut n_stuck) = (0u32, 0u32, 0u32);
-        let mut projects: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for s in visible {
-            projects.insert(s.project.as_str());
-            let started = s.turn_started_at.lock().ok().and_then(|g| *g);
-            let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
-            // Has the last event gone silent past the idle window? Treat a
-            // missing last-event timestamp on an in-flight turn as silent so a
-            // turn that produced NO event at all eventually reads 🔴 (matching
-            // the watchdog, which trips on total silence).
-            let silent_for = started.map(|t| match last_event {
-                Some(ev) => now.saturating_duration_since(ev),
-                None => now.saturating_duration_since(t),
-            });
-            let (state, detail) = match (started, silent_for) {
-                (None, _) => ("🟢", "idle".to_string()),
-                (Some(_), Some(silent)) if silent >= stuck_after => {
-                    ("🔴", format!("STUCK {} silent", humanize_dur(silent)))
-                }
-                (Some(t), _) => (
-                    "🔵",
-                    format!("working {}", humanize_dur(now.saturating_duration_since(t))),
-                ),
-            };
-            match state {
-                "🔵" => n_work += 1,
-                "🔴" => n_stuck += 1,
-                _ => n_idle += 1,
-            }
-            let role = if s.role.is_empty() { "—" } else { &s.role };
-            // The canonical pane / chat-session name (`ccteam-chat-<slug>-<sid>`),
-            // the same name the adapter spawns and `reconcile_chat_sessions`
-            // tracks — so a `/status` line can be matched against `tmux ls`.
-            let session_name = chat_session_name(&s.project, &s.id);
-            // The REAL vendor `--resume` id (the Anthropic session UUID). For a
-            // stream-json session the handle's `vendor_uuid` IS that id (it is
-            // also the handle `identity`), persisted across daemon restarts. A
-            // tmux/codex session carries no stream-json uuid → `resume —`
-            // (deterministic; never fabricated). The owner wants the actual
-            // resume id shown next to the sid.
-            let resume = thread_vendor_uuid(&s.thread)
-                .map(|u| format!("resume {u}"))
-                .unwrap_or_else(|| "resume —".to_string());
-            // model · effort · ctx X% from the real thread_status (same source
-            // `/sessions` uses). A statusless adapter / failure degrades each
-            // field to a deterministic placeholder — never fabricated.
-            let status = s.adapter.thread_status(&s.thread).await.ok();
-            let model = status
-                .as_ref()
-                .and_then(|st| st.model.as_deref())
-                .filter(|m| !m.is_empty())
-                .unwrap_or("—");
-            let effort = status
-                .as_ref()
-                .and_then(|st| st.effort.as_deref())
-                .filter(|e| !e.is_empty())
-                .unwrap_or("—");
-            let ctx = match status.as_ref().and_then(|st| st.context.as_ref()) {
-                Some(c) if c.window_tokens > 0 => format!("ctx {:.0}%", c.pct()),
-                // No context reported (or unknown window) ⇒ deterministic `ctx —`,
-                // consistent with the statusline; don't fabricate a percentage.
-                _ => "ctx —".to_string(),
-            };
-            let mut line = format!(
-                "{state} {} {session_name} · {resume} · {} · {role} · {detail} · {model} · \
-                 {effort} · {ctx}",
-                s.id, s.project
-            );
-            // Activity counts only while working (the in-flight fold; stale-then-
-            // cleared on TurnCompleted). Idle/stuck lines omit it.
-            if state == "🔵" {
-                if let Some(act) = s.latest_activity.lock().ok().and_then(|g| g.clone()) {
-                    if !act.is_empty() {
-                        line.push_str(" · ");
-                        line.push_str(&act);
-                    }
-                }
-            }
-            rows.push(line);
-        }
-        // ① + ③ dashboard header (session counts · projects · account usage),
-        // then the per-session fleet — distinct from the bare /sessions list.
-        let mut header = format!(
-            "📊 {} 会话 · 🔵{n_work} 🟢{n_idle} 🔴{n_stuck} · {} 项目",
-            rows.len(),
-            projects.len()
+            (Some(t), _) => (
+                "🔵",
+                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+            ),
+        };
+
+        let role = if s.role.is_empty() { "—" } else { &s.role };
+        let mut out = format!(
+            "📍 当前会话 {} · {} · {role} · {state} {detail}",
+            s.id, s.project
         );
+
+        // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
+        // their own line for the deep view). Statusless/failed → `—` placeholder.
+        let model = status
+            .as_ref()
+            .and_then(|st| st.model.as_deref())
+            .filter(|m| !m.is_empty())
+            .unwrap_or("—");
+        let effort = status
+            .as_ref()
+            .and_then(|st| st.effort.as_deref())
+            .filter(|e| !e.is_empty())
+            .unwrap_or("—");
+        let ctx = match status.as_ref().and_then(|st| st.context.as_ref()) {
+            Some(c) if c.window_tokens > 0 => format!("ctx {:.0}%", c.pct()),
+            _ => "ctx —".to_string(),
+        };
+        // The REAL `--resume` id (Anthropic session uuid), shown in full so it
+        // can be matched against `tmux ls` / `claude --resume`; `—` for a
+        // tmux/codex session that carries no stream-json uuid (never fabricated).
+        let resume = thread_vendor_uuid(&s.thread)
+            .map(|u| format!("resume {u}"))
+            .unwrap_or_else(|| "resume —".to_string());
+        out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
+
+        // Running subagents / workflows — straight from claude's task lifecycle
+        // (NOT a fold). Oldest first (longest-running on top). Only present while
+        // working; an idle session has none.
+        if !running.is_empty() {
+            out.push_str(&format!("\n   🤖 在跑 subagent ({}):", running.len()));
+            let mut tasks: Vec<&RunningTask> = running.iter().collect();
+            tasks.sort_by_key(|t| t.started);
+            for t in tasks {
+                let kind = if t.kind.is_empty() {
+                    "subagent"
+                } else {
+                    t.kind.as_str()
+                };
+                let elapsed = humanize_dur(t.started.elapsed());
+                let desc = t.description.trim();
+                if desc.is_empty() {
+                    out.push_str(&format!("\n      · {kind} · {elapsed}"));
+                } else {
+                    let shown: String = if desc.chars().count() > 40 {
+                        format!("{}…", desc.chars().take(39).collect::<String>())
+                    } else {
+                        desc.to_string()
+                    };
+                    out.push_str(&format!("\n      · {kind}「{shown}」· {elapsed}"));
+                }
+            }
+        }
+
+        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
+        if let Some(g) = status.as_ref().and_then(|st| st.goal.as_ref()) {
+            let cond = g.condition.trim();
+            if !cond.is_empty() {
+                let marker = if g.met { "✅" } else { "🎯" };
+                let shown: String = if cond.chars().count() > 60 {
+                    format!("{}…", cond.chars().take(59).collect::<String>())
+                } else {
+                    cond.to_string()
+                };
+                out.push_str(&format!("\n   {marker} {shown}"));
+            }
+        }
+
+        // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
         if let Some(u) = &account {
             let usage = format_account_usage(u);
             if !usage.is_empty() {
-                header.push('\n');
-                header.push_str(&usage);
+                out.push_str("\n   ");
+                out.push_str(&usage);
             }
         }
-        format!("{header}\n\n{}", rows.join("\n"))
+
+        // Footer: the rest of the fleet lives in /sessions.
+        let other = visible.len().saturating_sub(1);
+        if other > 0 {
+            out.push_str(&format!("\n   ↓ 其他 {other} 个会话 → /sessions"));
+        }
+        out
     }
 
     fn render_projects(&self) -> String {
@@ -6454,22 +6492,16 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(idle.len(), 1, "one session → one line: {idle:?}");
-        let line = &idle[0];
-        // state · sid · session-name · resume-id · project · role · idle · …
-        // The fake adapter's handle carries no `vendor_uuid` → `resume —`.
+        assert_eq!(idle.len(), 1, "one message: {idle:?}");
+        // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
+        // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            line.contains("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle · "),
-            "got: {line}"
-        );
-        // v0.8.20 /status v2 ① — the dashboard header: 1 session, all idle, 1 project.
-        assert!(
-            idle[0].starts_with("📊 1 会话 · 🔵0 🟢1 🔴0 · 1 项目"),
-            "dashboard header: {idle:?}"
+            idle[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
+            "current-session header: {idle:?}"
         );
         assert!(
-            line.contains("claude-opus-4-8 · max · ctx 41%"),
-            "got: {line}"
+            idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
+            "model·effort·ctx·resume line: {idle:?}"
         );
 
         // (2) A turn in flight with a RECENT event → 🔵 working.
@@ -6484,19 +6516,14 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        let line = &working[0];
         assert!(
-            line.contains("🔵 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · working "),
-            "got: {line}"
+            working[0].contains("📍 当前会话 s1 · alpha · reviewer · 🔵 working "),
+            "working state: {working:?}"
         );
-        // ① the header count reflects the working state.
         assert!(
-            working[0].starts_with("📊 1 会话 · 🔵1 🟢0 🔴0 · 1 项目"),
-            "dashboard header: {working:?}"
+            working[0].contains("ctx 41%"),
+            "ctx still shown: {working:?}"
         );
-        // The activity counts show ONLY while working.
-        assert!(line.ends_with("· read×16·bash×8"), "got: {line}");
-        assert!(line.contains("ctx 41%"), "got: {line}");
 
         // (3) In flight but the last event is stale past the idle window →
         // 🔴 STUCK. Use the SAME threshold the code reads so the test is
@@ -6515,17 +6542,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        let line = &stuck[0];
         assert!(
-            line.contains("🔴 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · STUCK "),
-            "got: {line}"
+            stuck[0].contains("📍 当前会话 s1 · alpha · reviewer · 🔴 STUCK "),
+            "stuck state: {stuck:?}"
         );
-        assert!(line.contains("silent · "), "got: {line}");
-        // No activity tail on a stuck (non-working) line.
-        assert!(
-            !line.contains("read×16"),
-            "stuck line omits activity: {line}"
-        );
+        assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
     }
 
     /// v0.8.19 `/status` — a roleless session shows `—` for the role, and a
@@ -6545,10 +6566,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains(
-                "🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · — · idle · — · — · ctx —"
-            ),
-            "roleless + statusless + no-uuid → placeholders, not fabricated values: {out:?}"
+            out[0].contains("📍 当前会话 s1 · alpha · — · 🟢 idle"),
+            "roleless → role shows —: {out:?}"
+        );
+        assert!(
+            out[0].contains("— · — · ctx — · resume —"),
+            "statusless + no-uuid → placeholders, never fabricated: {out:?}"
         );
     }
 
@@ -6616,7 +6639,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle"),
+            owner[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
             "got: {owner:?}"
         );
     }
@@ -6646,13 +6669,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains(&format!("· resume {uuid} ·")),
-            "the real --resume uuid must show next to the sid: {out:?}"
+            out[0].contains(&format!("resume {uuid}")),
+            "the real --resume uuid must show in the deep view: {out:?}"
         );
         assert!(
-            out[0].contains(&format!(
-                "🟢 s1 ccteam-chat-alpha-s1 · resume {uuid} · alpha · reviewer · idle"
-            )),
+            out[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
             "got: {out:?}"
         );
     }

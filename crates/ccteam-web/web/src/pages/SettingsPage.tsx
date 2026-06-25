@@ -75,6 +75,34 @@ import {
 /** Poll interval for the async Telegram `chat_id` capture. */
 const CHAT_ID_POLL_MS = 1500;
 
+/**
+ * Legacy clipboard copy via a temporary off-screen <textarea> +
+ * `document.execCommand("copy")`. Used as a fallback when `navigator.clipboard`
+ * is unavailable — e.g. the daemon served over plain http:// on a remote IP
+ * (non-secure context). Returns `true` on success.
+ */
+function legacyCopy(text: string): boolean {
+  if (typeof document === "undefined") return false;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  // Keep it off-screen and unfocusable visually, but still selectable.
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-9999px";
+  ta.style.left = "-9999px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  try {
+    ta.select();
+    ta.setSelectionRange(0, text.length); // iOS / mobile Safari
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    document.body.removeChild(ta);
+  }
+}
+
 export default function SettingsPage() {
   // v0.8.18 档1 — this page is admin-only (IM credentials + user management are
   // GLOBAL daemon config); a tenant gets a pointer to the avatar menu instead.
@@ -925,11 +953,22 @@ function UserManagementSection() {
   }
 
   function copyLink(link: string) {
+    const ok = () => toastBus.handler?.info("链接已复制 / Link copied");
+    const fail = () => toastBus.handler?.error("复制失败,请手动复制 / Copy failed, please copy manually");
+
+    // The daemon is often served over plain http:// on a remote IP (not https /
+    // not localhost), where `navigator.clipboard` is undefined. Try the async
+    // Clipboard API first, then fall back to a temporary off-screen <textarea>
+    // + document.execCommand("copy") so the button works in non-secure contexts.
     if (typeof navigator !== "undefined" && navigator.clipboard) {
-      navigator.clipboard.writeText(link).then(
-        () => toastBus.handler?.info("链接已复制 / Link copied"),
-        () => {},
-      );
+      navigator.clipboard.writeText(link).then(ok, () => {
+        if (!legacyCopy(link)) fail();
+        else ok();
+      });
+    } else if (legacyCopy(link)) {
+      ok();
+    } else {
+      fail();
     }
   }
 

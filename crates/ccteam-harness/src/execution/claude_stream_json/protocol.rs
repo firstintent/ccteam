@@ -111,6 +111,30 @@ pub struct SystemMsg {
     pub slash_commands: Vec<String>,
     #[serde(default)]
     pub tools: Vec<String>,
+    // v0.8.20 /status — subagent/workflow task lifecycle. claude reports a
+    // running task via `task_started`, mutates it via `task_updated{patch}`, and
+    // signals completion via `task_notification{status}`. The status tap reflects
+    // these into the session's running-task list. Only the fields the tracker
+    // reads are typed; all default-absent so non-task system lines (init /
+    // commands_changed) still parse unchanged.
+    /// `task_*.task_id` — the stable id (add on `task_started`, remove on terminal).
+    #[serde(default)]
+    pub task_id: String,
+    /// `task_started.subagent_type` (e.g. `general-purpose`, `code-reviewer`).
+    #[serde(default)]
+    pub subagent_type: String,
+    /// `task_started.description` — the task's short label.
+    #[serde(default)]
+    pub description: String,
+    /// `task_started.task_type` (e.g. `local_agent`).
+    #[serde(default)]
+    pub task_type: String,
+    /// `task_notification.status` (terminal, e.g. `completed`/`failed`).
+    #[serde(default)]
+    pub status: String,
+    /// `task_updated.patch` (`{status, end_time}`) — read `patch.status` for removal.
+    #[serde(default)]
+    pub patch: Option<Value>,
 }
 
 impl SystemMsg {
@@ -159,6 +183,7 @@ impl SystemMsg {
             models,
             slash_commands,
             tools: Vec::new(),
+            ..Default::default()
         }
     }
 }

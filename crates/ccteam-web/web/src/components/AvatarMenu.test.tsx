@@ -15,6 +15,12 @@ vi.hoisted(() => {
   if (typeof g.localStorage === "undefined") {
     g.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
   }
+  // AvatarMenu now calls useMe() → getMe() → fetch("/api/v1/me"). Stub fetch so
+  // the SSR smoke test never hits the network (the synchronous renderToString
+  // renders with me=null before this would resolve anyway).
+  if (typeof g.fetch === "undefined") {
+    g.fetch = () => Promise.reject(new Error("no network in test"));
+  }
 });
 
 import { renderToString } from "react-dom/server";
@@ -22,10 +28,11 @@ import AvatarMenu, { AvatarPopover } from "./AvatarMenu";
 
 const noop = () => {};
 
-function popover(lang: "zh" | "en", avatar = "#f59e0b") {
+function popover(lang: "zh" | "en", avatar = "#f59e0b", handle: string | null = "alice") {
   return renderToString(
     <AvatarPopover
       lang={lang}
+      handle={handle}
       displayName="rob"
       avatar={avatar}
       theme="dark"
@@ -73,6 +80,20 @@ describe("AvatarPopover (pure)", () => {
 
   it("shows the single light/dark theme toggle", () => {
     expect(popover("zh")).toContain('data-testid="theme-toggle"');
+  });
+
+  it("surfaces the signed-in identity handle when present", () => {
+    const html = popover("zh", "#f59e0b", "alice");
+    expect(html).toContain('data-testid="avatar-handle"');
+    // React SSR splits the literal "@" from the {handle} expression with a
+    // comment marker, so assert on the handle value (not a contiguous "@alice").
+    expect(html).toContain("alice");
+    expect(html).toContain("当前登录:alice");
+  });
+
+  it("omits the handle row when identity has not loaded", () => {
+    const html = popover("zh", "#f59e0b", null);
+    expect(html).not.toContain('data-testid="avatar-handle"');
   });
 });
 

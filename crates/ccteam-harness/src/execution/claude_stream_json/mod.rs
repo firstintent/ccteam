@@ -94,6 +94,12 @@ struct LiveSession {
     /// ([`spawn_status_tap`]) overwrites it from each `assistant`/`result`
     /// message's `usage` as turns run (interior-mutable, shared with the tap).
     status: Arc<StdMutex<ThreadStatus>>,
+    /// v0.8.20 `/status` — the session's currently-running subagent/workflow
+    /// tasks, reflected from claude's `system:task_*` lifecycle by the same
+    /// [`spawn_status_tap`] (`task_started` adds, a terminal status removes; the
+    /// per-turn `result` clears as a safety net). Read by
+    /// [`HarnessAdapter::running_tasks`]. Interior-mutable, shared with the tap.
+    running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -192,6 +198,7 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
 fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
     status: Arc<StdMutex<ThreadStatus>>,
+    running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
     project_dir: PathBuf,
     sid: String,
 ) {
@@ -260,6 +267,12 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
+                        // The turn ended — no subagent/workflow task can still be
+                        // running (tasks live within a turn). Clear the list as a
+                        // safety net in case a terminal task event was missed.
+                        if let Ok(mut t) = running_tasks.lock() {
+                            t.clear();
+                        }
                         // Context is read STRICTLY from claude's OWN accounting
                         // (`get_context_usage` → real totalTokens + maxTokens). No
                         // heuristic estimate: if the vendor build doesn't answer, the
@@ -299,6 +312,10 @@ fn spawn_status_tap(
                             write_status_file(&project_dir, &sid, &snap);
                         }
                     }
+                    // v0.8.20 `/status` — reflect claude's subagent/workflow task
+                    // lifecycle into the running-task list (the authoritative
+                    // running-subagent source; ccteam mirrors, never folds/counts).
+                    Ok(Outbound::System(sys)) => reflect_task_event(&running_tasks, &sys),
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -306,6 +323,69 @@ fn spawn_status_tap(
             }
         }
     });
+}
+
+/// True for a task `status` that means the task is no longer running, so it
+/// must leave the running-subagent list. Anything else (`running`,
+/// `in_progress`, …) keeps it.
+fn task_status_is_terminal(s: &str) -> bool {
+    matches!(
+        s,
+        "completed" | "failed" | "cancelled" | "canceled" | "error" | "aborted" | "timed_out"
+    )
+}
+
+/// Reflect one claude `system:task_*` line into the session's running-task list
+/// — the AUTHORITATIVE running-subagent/workflow source for `/status`. ccteam
+/// does NOT count or fold; it mirrors claude's own lifecycle:
+/// - `task_started` → add a [`crate::RunningTask`] (idempotent on `task_id`),
+/// - `task_updated` whose `patch.status` is terminal → remove,
+/// - `task_notification` whose `status` is terminal → remove (redundant safety).
+///
+/// A plain `Agent` subagent and a workflow task both flow through these events
+/// (distinguished by `task_type`). Non-task system subtypes (`init`,
+/// `commands_changed`) are ignored.
+fn reflect_task_event(
+    running_tasks: &StdMutex<Vec<crate::RunningTask>>,
+    sys: &protocol::SystemMsg,
+) {
+    match sys.subtype.as_str() {
+        "task_started" if !sys.task_id.is_empty() => {
+            if let Ok(mut tasks) = running_tasks.lock() {
+                // Idempotent: a duplicate `task_started` must not double-insert.
+                if tasks.iter().any(|t| t.task_id == sys.task_id) {
+                    return;
+                }
+                tasks.push(crate::RunningTask {
+                    task_id: sys.task_id.clone(),
+                    kind: sys.subagent_type.clone(),
+                    description: sys.description.clone(),
+                    task_type: sys.task_type.clone(),
+                    started: Instant::now(),
+                });
+            }
+        }
+        "task_updated" if !sys.task_id.is_empty() => {
+            let terminal = sys
+                .patch
+                .as_ref()
+                .and_then(|p| p.get("status"))
+                .and_then(|s| s.as_str())
+                .map(task_status_is_terminal)
+                .unwrap_or(false);
+            if terminal {
+                if let Ok(mut tasks) = running_tasks.lock() {
+                    tasks.retain(|t| t.task_id != sys.task_id);
+                }
+            }
+        }
+        "task_notification" if !sys.task_id.is_empty() && task_status_is_terminal(&sys.status) => {
+            if let Ok(mut tasks) = running_tasks.lock() {
+                tasks.retain(|t| t.task_id != sys.task_id);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Query claude's REAL context accounting via the `get_context_usage`
@@ -865,13 +945,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // Goal is read from the transcript on `thread_status`, not the tap.
             goal: None,
         }));
+        // v0.8.20 `/status` — the live running-subagent/workflow list, kept
+        // current by the SAME status tap from claude's `system:task_*` events.
+        let running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>> =
+            Arc::new(StdMutex::new(Vec::new()));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
-        // show model + context% as the session burns context.
+        // show model + context% as the session burns context; ALSO reflect the
+        // `system:task_*` lifecycle into `running_tasks` for `/status`.
         spawn_status_tap(
             Arc::clone(&transport),
             Arc::clone(&status),
+            Arc::clone(&running_tasks),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
         );
@@ -926,6 +1012,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             commands: init.slash_commands.clone(),
             models: init.models.clone(),
             status,
+            running_tasks,
         };
         self.live
             .lock()
@@ -1348,6 +1435,20 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         get_account_usage(&live.transport).await
     }
 
+    async fn running_tasks(&self, h: &ThreadHandle) -> Vec<crate::RunningTask> {
+        // The session's currently-running subagent/workflow tasks, reflected
+        // from claude's `system:task_*` lifecycle by the status tap. A snapshot
+        // clone (cheap; the list is a handful of entries at most).
+        match self.lookup(&h.identity) {
+            Some(live) => live
+                .running_tasks
+                .lock()
+                .map(|t| t.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
     /// Interrupt the in-flight turn via the bidirectional `interrupt`
     /// control_request. Because the transport is full-duplex NDJSON, this line
     /// is written to claude's stdin and answered OUT-OF-BAND — it reaches
@@ -1380,10 +1481,74 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 
 #[cfg(test)]
 mod effort_tests {
+    use super::protocol::SystemMsg;
     use super::{
         claude_model_options, normalize_effort, parse_latest_goal_status, preserve_1m_tag,
-        set_effort_level, split_model_effort, ClaudeModelOption, EFFORT_LEVELS,
+        reflect_task_event, set_effort_level, split_model_effort, ClaudeModelOption, EFFORT_LEVELS,
     };
+    use std::sync::Mutex;
+
+    /// Build a `system:task_*` line with the given subtype + task id.
+    fn task_sys(subtype: &str, task_id: &str) -> SystemMsg {
+        SystemMsg {
+            subtype: subtype.to_string(),
+            task_id: task_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// `/status` running-subagent tracking REFLECTS claude's own task lifecycle
+    /// (never folds): `task_started` adds, a terminal `task_updated`/
+    /// `task_notification` removes, duplicates are idempotent, non-task system
+    /// lines are ignored.
+    #[test]
+    fn reflect_task_event_mirrors_claude_task_lifecycle() {
+        let tasks = Mutex::new(Vec::new());
+        // task_started adds, carrying kind/description from the event.
+        let mut started = task_sys("task_started", "t1");
+        started.subagent_type = "code-reviewer".into();
+        started.description = "review auth".into();
+        started.task_type = "local_agent".into();
+        reflect_task_event(&tasks, &started);
+        // A duplicate task_started for the same id must NOT double-insert.
+        reflect_task_event(&tasks, &task_sys("task_started", "t1"));
+        {
+            let g = tasks.lock().unwrap();
+            assert_eq!(g.len(), 1);
+            assert_eq!(g[0].kind, "code-reviewer");
+            assert_eq!(g[0].description, "review auth");
+            assert_eq!(g[0].task_type, "local_agent");
+        }
+        // A second task.
+        reflect_task_event(&tasks, &task_sys("task_started", "t2"));
+        assert_eq!(tasks.lock().unwrap().len(), 2);
+        // A NON-terminal patch keeps the task running.
+        let mut running = task_sys("task_updated", "t1");
+        running.patch = Some(serde_json::json!({"status": "in_progress"}));
+        reflect_task_event(&tasks, &running);
+        assert_eq!(
+            tasks.lock().unwrap().len(),
+            2,
+            "non-terminal patch keeps it"
+        );
+        // A terminal patch removes t1; t2 remains.
+        let mut done = task_sys("task_updated", "t1");
+        done.patch = Some(serde_json::json!({"status": "completed", "end_time": 1}));
+        reflect_task_event(&tasks, &done);
+        {
+            let g = tasks.lock().unwrap();
+            assert_eq!(g.len(), 1, "completed patch removes t1");
+            assert_eq!(g[0].task_id, "t2");
+        }
+        // task_notification{status:completed} removes t2.
+        let mut note = task_sys("task_notification", "t2");
+        note.status = "completed".into();
+        reflect_task_event(&tasks, &note);
+        assert!(tasks.lock().unwrap().is_empty());
+        // A non-task system line (init) is ignored (no panic, no insert).
+        reflect_task_event(&tasks, &task_sys("init", ""));
+        assert!(tasks.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn parse_latest_goal_status_takes_the_last_record_and_honors_clear() {
