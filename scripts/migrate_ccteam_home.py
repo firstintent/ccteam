@@ -105,6 +105,35 @@ def harden_secrets():
             os.chmod(p, 0o600)
 
 
+def relabel_session_owners():
+    """v0.8.20 W8 — the owner namespace was renamed web: -> user: and the new
+    visibility pool matches `owner.channel == "user"`. Session owners persisted
+    by the OLD daemon still say `web:` -> they would be ACL-hidden after upgrade
+    (e.g. web-created sessions vanish from the telegram view). Relabel the
+    session OWNERS in the moved state/im/gateway-state.json (channel web->user;
+    keep chat_id). Leave current_session / reply_to / other frontend chats alone
+    -- those stay on their real delivery channel ("web")."""
+    gs = HOME / "state" / "im" / "gateway-state.json"
+    if not gs.exists():
+        return
+    try:
+        d = json.loads(gs.read_text())
+    except Exception:
+        return
+    sess = d.get("sessions")
+    items = list(sess.values()) if isinstance(sess, dict) else (sess or [])
+    n = 0
+    for s in items:
+        ow = s.get("owner") if isinstance(s, dict) else None
+        if isinstance(ow, dict) and ow.get("channel") == "web":
+            ow["channel"] = "user"
+            n += 1
+    if n:
+        log(f"relabel {n} session owner(s) web: -> user: in state/im/gateway-state.json")
+        if not DRY:
+            gs.write_text(json.dumps(d, indent=2))
+
+
 def main():
     if not HOME.exists():
         log(f"no ccteam home at {HOME}; nothing to do")
@@ -113,6 +142,7 @@ def main():
     for old_rel, new_rel in MOVES:
         move(old_rel, new_rel)
     split_tenants()
+    relabel_session_owners()
     harden_secrets()
     for name in DELETE:
         p = HOME / name
