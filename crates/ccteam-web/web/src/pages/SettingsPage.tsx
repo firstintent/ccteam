@@ -49,7 +49,13 @@ import {
   type ImConfigStatus,
 } from "../lib/configApi";
 import { toastBus } from "../lib/toastBus";
-import { createUser, deleteUser, listUsers, type TenantView } from "../lib/usersApi";
+import {
+  createUser,
+  deleteUser,
+  getUserLink,
+  listUsers,
+  type TenantView,
+} from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
 import {
   Badge,
@@ -788,6 +794,21 @@ function UserManagementSection() {
     }
   }
 
+  // v0.8.20 F3: re-reveal a tenant's personal link on demand (admin only) and
+  // copy it — so the owner can re-send a link without re-creating the user.
+  function revealAndCopy(id: string) {
+    getUserLink(id)
+      .then((res) => {
+        const origin =
+          typeof window !== "undefined" && window.location ? window.location.origin : "";
+        copyLink(`${origin}${res.personal_link}`);
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+        toastBus.handler?.error(err instanceof Error ? err.message : "reveal failed");
+      });
+  }
+
   return (
     <section data-testid="settings-users" className="flex flex-col gap-4">
       <div className="flex flex-col gap-1">
@@ -914,13 +935,22 @@ function UserManagementSection() {
                             </Button>
                           </span>
                         ) : (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setConfirmDelete(u.id)}
-                          >
-                            删除
-                          </Button>
+                          <span className="inline-flex items-center gap-1.5">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => revealAndCopy(u.id)}
+                            >
+                              复制链接
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setConfirmDelete(u.id)}
+                            >
+                              删除
+                            </Button>
+                          </span>
                         )}
                       </td>
                     </tr>

@@ -139,6 +139,57 @@ pub(crate) async fn handle_list_users(
     Json(views).into_response()
 }
 
+/// `GET /api/v1/users/{id}/link` response — a tenant's personal entry link,
+/// re-derivable by the admin at any time.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UserLinkResponse {
+    pub id: String,
+    pub handle: String,
+    /// Personal entry link (`/?token=ccteam:<hex>`) the tenant opens to sign in.
+    pub personal_link: String,
+}
+
+/// `GET /api/v1/users/{id}/link` — re-reveal a tenant's personal login link
+/// (admin only). v0.8.20 F3 relaxes 档1's "list never returns the token" FOR
+/// THE ADMIN: the owner can re-copy any tenant's link (e.g. to re-send it),
+/// not only at create time. Tenants still never see others' tokens — this is a
+/// SEPARATE admin-gated route, so the list (`GET /api/v1/users`) keeps stripping
+/// the token. 404 if the tenant is unknown.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{id}/link",
+    tag = "users",
+    params(("id" = String, Path, description = "Tenant id")),
+    responses(
+        (status = 200, description = "The tenant's personal login link", body = UserLinkResponse),
+        (status = 403, description = "Not the admin/owner"),
+        (status = 404, description = "Unknown tenant"),
+    ),
+)]
+pub(crate) async fn handle_user_link(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let reg = TenantRegistry::load(&app.paths.tenants_json());
+    match reg.by_id(&id) {
+        Some(t) => Json(UserLinkResponse {
+            id: t.id.clone(),
+            handle: t.handle.clone(),
+            personal_link: format!("/?token={TOKEN_PREFIX}{}", t.web_token),
+        })
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {id}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// `DELETE /api/v1/users/{id}` — remove a tenant (admin only). 404 if unknown.
 #[utoipa::path(
     delete,

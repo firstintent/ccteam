@@ -121,6 +121,7 @@
    - **内部 SoT**:CLAUDE.md §一 baseline + `docs/tech-design.md` + workspace `Cargo.toml` version bump
    - **用户面**:root `README.md`(英文,不含版本进展)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞
    - **版本归档**:`docs/versions/v0-X-Y/README.md` + handoff doc 落地
+8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
 
 ### 多 session 并行编辑同一仓库
 

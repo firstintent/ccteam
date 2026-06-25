@@ -82,6 +82,7 @@ describe("NewSessionModal project dropdown", () => {
         projects={["demo", "demo2"]}
         fallbackRoles={["cto"]}
         defaultProject="demo2"
+        isAdmin={true}
         onCancel={() => {}}
         onCreate={async () => true}
       />,
@@ -96,12 +97,13 @@ describe("NewSessionModal project dropdown", () => {
     expect(html).not.toContain("（暂无已有项目）");
   });
 
-  it("renders runtime choices instead of contradictory vendor/protocol labels", () => {
+  it("shows ALL runtimes + the role picker to the admin", () => {
     const html = renderToString(
       <NewSessionModal
         projects={["demo"]}
         fallbackRoles={["cto"]}
         defaultProject="demo"
+        isAdmin={true}
         onCancel={() => {}}
         onCreate={async () => true}
       />,
@@ -111,8 +113,35 @@ describe("NewSessionModal project dropdown", () => {
     expect(html).toContain("Claude · stream-json");
     expect(html).toContain("Claude · terminal");
     expect(html).toContain("Codex · app-server");
+    expect(html).toContain("Codex · terminal");
+    // The admin gets the role picker (the `<label>Role</label>` renders).
+    expect(html).toContain(">Role<");
     expect(html).toContain("permission=");
     expect(html).not.toContain("Claude Code · tmux");
     expect(html).not.toContain(" mode=");
+  });
+
+  // v0.8.20 F4 — beta-gating (UI only): a tenant sees only the production-stable
+  // claude/codex stream-json runtimes and creates roleless sessions.
+  it("hides terminal runtimes + the role picker from a tenant", () => {
+    const html = renderToString(
+      <NewSessionModal
+        projects={["demo"]}
+        fallbackRoles={["cto"]}
+        defaultProject="demo"
+        isAdmin={false}
+        onCancel={() => {}}
+        onCreate={async () => true}
+      />,
+    );
+
+    // Production-stable runtimes (claude + codex, both stream-json).
+    expect(html).toContain("Claude · stream-json");
+    expect(html).toContain("Codex · app-server");
+    // Terminal/rmux runtimes are admin-only.
+    expect(html).not.toContain("Claude · terminal");
+    expect(html).not.toContain("Codex · terminal");
+    // No role picker → the tenant always creates a roleless session.
+    expect(html).not.toContain(">Role<");
   });
 });

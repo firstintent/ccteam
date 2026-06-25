@@ -42,6 +42,21 @@ export function deleteUser(id: string): Promise<{ removed: boolean }> {
   );
 }
 
+/** `GET /api/v1/users/{id}/link` response — a tenant's personal login link. */
+export interface UserLinkResponse {
+  id: string;
+  handle: string;
+  /** Relative `/?token=ccteam:<hex>` the tenant opens to sign in. */
+  personal_link: string;
+}
+
+/** `GET /api/v1/users/{id}/link` — re-reveal a tenant's personal login link
+ *  (admin only). v0.8.20 F3: unlike the list (which never carries the token),
+ *  this lets the admin re-copy any tenant's link at any time. */
+export function getUserLink(id: string): Promise<UserLinkResponse> {
+  return getJson<UserLinkResponse>(`/api/v1/users/${encodeURIComponent(id)}/link`);
+}
+
 async function getJson<T>(url: string): Promise<T> {
   let res: Response;
   try {

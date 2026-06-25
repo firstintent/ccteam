@@ -88,6 +88,35 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
         .unwrap();
     assert_eq!(r.status(), 403, "tenant can't create users");
 
+    // v0.8.20 F3: the admin can RE-REVEAL a tenant's personal login link (a
+    // separate admin-gated route, so the list still strips the token); a tenant
+    // cannot reach it.
+    let link: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/users/{}/link", tenant.id))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        link["personal_link"],
+        serde_json::json!(format!("/?token=ccteam:{tenant_tok}")),
+        "admin re-reveals the tenant's personal link",
+    );
+    let r = c
+        .get(format!("http://{addr}/api/v1/users/{}/link", tenant.id))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "a tenant can't reveal links via the admin route",
+    );
+
     // `/api/v1/me` reflects the caller's identity (the SPA branches on it).
     let me_admin: serde_json::Value = c
         .get(format!("http://{addr}/api/v1/me"))
@@ -183,4 +212,79 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "admin sees its own project detail");
+}
+
+/// v0.8.20 ownership-leak fix: the session cookie (the CURRENT login) must win
+/// over a STALE `Authorization: Bearer` the SPA fetch shim still injects from a
+/// prior admin login. Before the fix, `auth_layer` checked the header FIRST, so
+/// a cached admin Bearer outranked the fresh tenant cookie → the tenant's new
+/// projects were stamped `web:web-api` (admin pool) instead of `web:<tenant>`
+/// and vanished from the tenant's own list. Now: shim → cookie → header.
+#[tokio::test]
+async fn session_cookie_beats_stale_bearer_header() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.tenants_json()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // The leak scenario: a fresh tenant cookie + a STALE admin Bearer. The
+    // cookie (the current login) must win → identity resolves to the tenant.
+    let me: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/me"))
+        .header("Cookie", format!("ccteam_token={tenant_tok}"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        me["is_admin"],
+        serde_json::json!(false),
+        "the fresh tenant cookie must beat a stale admin Bearer",
+    );
+    assert_eq!(me["handle"], serde_json::json!("alice"));
+
+    // `/auth/token` (used by the SPA to re-scope its Bearer) returns the COOKIE
+    // identity's token, not the stale header's → the SPA heals to the tenant.
+    let tok: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Cookie", format!("ccteam_token={tenant_tok}"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tok["wire_token"],
+        serde_json::json!(format!("ccteam:{tenant_tok}")),
+        "auth/token reflects the cookie identity, not the stale Bearer",
+    );
+
+    // Fallback intact: a Bearer with NO cookie still resolves (API / iOS-PWA).
+    let me_bearer: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/me"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        me_bearer["is_admin"],
+        serde_json::json!(true),
+        "Bearer remains the fallback when there is no cookie",
+    );
 }

@@ -323,13 +323,17 @@ fn query_token(query: &str) -> Option<&str> {
 
 /// The middleware itself, plumbed via `from_fn_with_state`.
 ///
-/// Order of checks:
+/// Order of checks (v0.8.20 — cookie BEFORE header, the ownership-leak fix):
 ///
-/// 1. If `auth.enabled = false` → pass through.
-/// 2. Bearer header valid → pass through.
-/// 3. Query string `?token=` present + valid → set HttpOnly cookie +
-///    302 redirect to URI minus the `token` parameter.
-/// 4. Cookie value valid → pass through.
+/// 1. If `auth.enabled = false` → pass through (loopback = owner = admin).
+/// 2. Query string `?token=` present + valid → set HttpOnly cookie + 302
+///    redirect to URI minus the `token` parameter (an explicit login link
+///    always wins — it (re)establishes the cookie).
+/// 3. Cookie value valid → pass through (the CURRENT login; checked before the
+///    Authorization header so a stale `Bearer` the SPA fetch shim still injects
+///    can't shadow a freshly-set tenant cookie).
+/// 4. Bearer header valid → pass through (fallback for cookieless clients: API
+///    callers, iOS-PWA where the cookie is dropped across the standalone switch).
 /// 5. Else → 401 plain-text "auth required".
 pub async fn auth_layer(
     State(app): State<AppState>,
@@ -350,24 +354,10 @@ pub async fn auth_layer(
     // v0.8.18 档1 — the bootstrap token → admin; per-user tokens → their tenant.
     let tenants = app.paths.tenants_json();
 
-    // 1. Authorization header.
-    if let Some(h) = req.headers().get(header::AUTHORIZATION) {
-        if let Some(presented) = parse_bearer(h) {
-            if let Some(bare) = bare_hex(presented) {
-                if let Some(id) = resolve_identity(bare, expected, &tenants) {
-                    // Own the token before the &mut borrow (it borrows req.headers).
-                    let presented = presented.to_string();
-                    req.extensions_mut().insert(id);
-                    req.extensions_mut().insert(PresentedToken(presented));
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    // 2. URL shim — `?token=ccteam:<hex>` query → cookie + redirect. The cookie
-    //    stores the BARE hex the user presented (admin OR per-user), so the
-    //    carry-over below resolves to the SAME identity.
+    // 1. URL shim — an explicit `?token=ccteam:<hex>` login link ALWAYS wins: it
+    //    (re)establishes the session cookie so a fresh login replaces a stale
+    //    one. The cookie stores the BARE hex presented (admin OR per-user), so
+    //    the carry-over below resolves to the SAME identity.
     if let Some(q) = req.uri().query() {
         if let Some(presented) = query_token(q) {
             if let Some(bare) = bare_hex(presented) {
@@ -385,13 +375,35 @@ pub async fn auth_layer(
         }
     }
 
-    // 3. Cookie carry-over for subsequent GETs / SSE.
+    // 2. Session cookie — the CURRENT login. Checked BEFORE the Authorization
+    //    header so a freshly-set tenant cookie is NOT shadowed by a stale admin
+    //    `Bearer` the SPA fetch shim still injects from a prior login. This is
+    //    the v0.8.20 ownership-leak fix: header-first let a cached admin token
+    //    outrank the fresh tenant cookie → a tenant's new project landed under
+    //    the admin pool (`web:web-api`) instead of `web:<tenant>`.
     if let Some(cookie_val) = cookie_token(&jar) {
         if let Some(id) = resolve_identity(cookie_val, expected, &tenants) {
             let wire = format!("{TOKEN_PREFIX}{cookie_val}");
             req.extensions_mut().insert(id);
             req.extensions_mut().insert(PresentedToken(wire));
             return next.run(req).await;
+        }
+    }
+
+    // 3. Authorization header — fallback for cookieless clients: API callers
+    //    (curl) and iOS-PWA where the standalone switch drops the cookie and the
+    //    token survives only in localStorage (injected as Bearer by the SPA).
+    if let Some(h) = req.headers().get(header::AUTHORIZATION) {
+        if let Some(presented) = parse_bearer(h) {
+            if let Some(bare) = bare_hex(presented) {
+                if let Some(id) = resolve_identity(bare, expected, &tenants) {
+                    // Own the token before the &mut borrow (it borrows req.headers).
+                    let presented = presented.to_string();
+                    req.extensions_mut().insert(id);
+                    req.extensions_mut().insert(PresentedToken(presented));
+                    return next.run(req).await;
+                }
+            }
         }
     }
 

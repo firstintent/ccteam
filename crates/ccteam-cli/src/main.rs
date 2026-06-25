@@ -3724,6 +3724,23 @@ fn run_status() -> Result<()> {
             token_path.display()
         );
     }
+
+    // ⑤ v0.8.20 F3 — per-user (tenant) login links. `ccteam status` runs on the
+    //    box = the admin/operator context, so it surfaces every tenant's personal
+    //    `?token=ccteam:<hex>` link (the value the admin hands out / re-sends).
+    //    Tenants never see each other's; this local admin view is the CLI peer of
+    //    the web user-management "copy link" action (GET /api/v1/users/{id}/link).
+    let tenants = ccteam_core::tenants::TenantRegistry::load(&paths.tenants_json());
+    if !tenants.list().is_empty() {
+        println!();
+        println!("  web tenants ({}):", tenants.list().len());
+        let host = first_lan_ipv4()
+            .map(|ip| format!("http://{ip}:7331"))
+            .unwrap_or_else(|| "http://localhost:7331".to_string());
+        for t in tenants.list() {
+            println!("    {:<14}  {host}/?token=ccteam:{}", t.handle, t.web_token);
+        }
+    }
     Ok(())
 }
 

@@ -22,7 +22,8 @@
 // chat|terminal toggle + TerminalView, stopSession, and HITL approval resolve.
 //
 // Red lines: reads structured turn/SSE frames (never scrapes a pane); the
-// new-session default role stays `cto` (chatDefaults.DEFAULT_ROLE, FIX-2).
+// new-session form defaults to ROLELESS (v0.8.20 F4 — a bare-claude session),
+// and the role picker + terminal runtimes are admin-only (UI-level beta-gate).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
@@ -44,7 +45,7 @@ import {
   type SessionView as SessionSummary,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
-import { DEFAULT_ROLE, ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
+import { ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import { mergeProjectSlugs } from "./projectList";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
@@ -501,6 +502,7 @@ export default function ChatConsole() {
           projects={projects}
           fallbackRoles={roleOptions}
           defaultProject={modalProject ?? activeView?.project ?? projects[0] ?? ""}
+          isAdmin={isAdmin}
           onCancel={() => {
             setModalOpen(false);
             setModalProject(null);
@@ -526,11 +528,14 @@ export default function ChatConsole() {
 //     as the fallback/seed (FIX-2). A brand-new project has no roles yet, so
 //     that branch uses the static fallback and does NOT fetch (would 404).
 //
-//   - F2-web: the role dropdown now offers an explicit "(无角色 / 裸 claude)"
-//     choice (the ROLELESS sentinel). Picking it sends an empty role (a
-//     bare-claude session that self-reads the project CLAUDE.md);
-//     `resolveRole` (chatDefaults) maps the sentinel → "" while an
-//     un-touched modal still falls back to DEFAULT_ROLE (cto), never roleless.
+//   - F2-web: the role dropdown offers an explicit "(无角色 / 裸 claude)" choice
+//     (the ROLELESS sentinel). Picking it sends an empty role (a bare-claude
+//     session that self-reads the project CLAUDE.md); `resolveRole`
+//     (chatDefaults) maps the sentinel → "".
+//   - v0.8.20 F4: the modal now DEFAULTS to ROLELESS (no role unless one is
+//     deliberately picked), and the role picker itself is admin-only — a tenant
+//     always creates a roleless session. The terminal/rmux runtimes are
+//     likewise admin-only; tenants see only claude/codex on stream-json.
 
 /** Sentinel project value selecting the "create a new project" branch. */
 const NEW_PROJECT = "__new";
@@ -603,6 +608,7 @@ export function NewSessionModal({
   projects,
   fallbackRoles,
   defaultProject,
+  isAdmin,
   onCancel,
   onCreate,
 }: {
@@ -611,6 +617,11 @@ export function NewSessionModal({
    *  fallback when a project's real roles can't be / aren't fetched. */
   fallbackRoles: string[];
   defaultProject: string;
+  /** v0.8.20 F4 — beta-gating (UI ONLY): the admin sees every runtime + the
+   *  role picker; a tenant sees only the production-stable claude/codex
+   *  stream-json runtimes and creates roleless sessions. Not a security
+   *  boundary — the backend create route is unchanged. */
+  isAdmin: boolean;
   onCancel: () => void;
   onCreate: (
     slug: string,
@@ -632,6 +643,15 @@ export function NewSessionModal({
   const runtime = RUNTIME_OPTIONS.find((item) => item.id === runtimeId) ?? RUNTIME_OPTIONS[0];
   const vendor = runtime.vendor;
   const protocol = runtime.protocol;
+
+  // v0.8.20 F4 — beta-gating (UI-level only): production-stable runtimes
+  // (claude/codex on stream-json) for everyone; the terminal/rmux protocol is
+  // an advanced surface shown ONLY to the admin. The default `runtimeId`
+  // (claude-stream-json) is in both sets, so a tenant never lands on a hidden
+  // option. NOT a security boundary — the backend create route is unchanged.
+  const runtimeOptions = isAdmin
+    ? RUNTIME_OPTIONS
+    : RUNTIME_OPTIONS.filter((option) => option.protocol === "stream-json");
 
   const isNew = project === NEW_PROJECT;
 
@@ -707,18 +727,15 @@ export function NewSessionModal({
   // The role <select>'s controlled value, DERIVED (not effect-synced) so the
   // option set changing (project switch / fetch resolve) can't desync state:
   // honor the user's explicit pick while it's still on offer, otherwise fall
-  // back to a sensible default. `role===""` means "no explicit pick yet".
+  // back to the default. `role===""` means "no explicit pick yet".
   //
-  // F2-web: with ROLELESS now leading every option set, the no-pick fallback
-  // must NOT be `roleChoices[0]` (that would silently default to roleless and
-  // break FIX-2). Prefer DEFAULT_ROLE (`cto`) when it's on offer, else the
-  // first concrete (non-roleless) option, else roleless as the last resort.
-  const selectedRole = role && roleChoices.some((c) => c.value === role)
-    ? role
-    : roleChoices.find((c) => c.value === DEFAULT_ROLE)?.value ??
-      roleChoices.find((c) => c.value !== ROLELESS)?.value ??
-      roleChoices[0]?.value ??
-      "";
+  // v0.8.20 F4: the new-session form now defaults to ROLELESS (a bare-claude
+  // session) for everyone — the owner's call that web sessions start with no
+  // role unless one is deliberately chosen. The admin can still pick a concrete
+  // role from the picker below; a tenant has no picker, so it stays roleless.
+  // (ROLELESS always leads `roleChoices`, so it is always on offer.)
+  const selectedRole =
+    role && roleChoices.some((c) => c.value === role) ? role : ROLELESS;
 
   // The wire role: ROLELESS → "" (roleless passthrough), a concrete pick →
   // that role, blank → DEFAULT_ROLE. See chatDefaults.resolveRole (pure +
@@ -824,7 +841,7 @@ export function NewSessionModal({
 
           <label className="block text-xs text-text-dim">运行时</label>
           <div className="grid grid-cols-2 gap-1 rounded-md bg-surface-800 p-0.5">
-            {RUNTIME_OPTIONS.map((option) => (
+            {runtimeOptions.map((option) => (
               <button
                 key={option.id}
                 type="button"
@@ -843,21 +860,27 @@ export function NewSessionModal({
             {runtime.label} → vendor={vendor} · protocol={protocol}
           </p>
 
-          <div className="flex items-center justify-between">
-            <label className="block text-xs text-text-dim">Role</label>
-            {roleLoading ? (
-              <span className="text-[10px] text-text-dim">加载角色中…</span>
-            ) : null}
-          </div>
-          <Combobox
-            value={selectedRole}
-            onChange={setRole}
-            options={roleChoices}
-            disabled={pending || roleLoading}
-            searchable={roleChoices.length > 8}
-            searchPlaceholder="搜索角色…"
-            ariaLabel="Role"
-          />
+          {/* v0.8.20 F4 — role picker is an admin-only (beta) surface; a tenant
+              always creates a roleless session (selectedRole stays ROLELESS). */}
+          {isAdmin ? (
+            <>
+              <div className="flex items-center justify-between">
+                <label className="block text-xs text-text-dim">Role</label>
+                {roleLoading ? (
+                  <span className="text-[10px] text-text-dim">加载角色中…</span>
+                ) : null}
+              </div>
+              <Combobox
+                value={selectedRole}
+                onChange={setRole}
+                options={roleChoices}
+                disabled={pending || roleLoading}
+                searchable={roleChoices.length > 8}
+                searchPlaceholder="搜索角色…"
+                ariaLabel="Role"
+              />
+            </>
+          ) : null}
 
           <label className="flex items-center gap-2 text-xs text-text-secondary">
             <input
