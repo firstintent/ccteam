@@ -65,6 +65,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("DELETE", "/api/v1/users/{id}"),
         // v0.8.20 F3 — admin re-reveals a tenant's personal login link.
         ("GET", "/api/v1/users/{id}/link"),
+        // v0.8.20 F2 — per-user IM bot config (self-serve + admin).
+        ("PUT", "/api/v1/me/im"),
+        ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
         // v0.8.18 档1 — caller identity (SPA branches admin-only surfaces).

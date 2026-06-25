@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use ccteam_core::tenants::{Tenant, TenantRegistry};
+use ccteam_core::tenants::{Tenant, TenantLark, TenantRegistry, TenantTelegram};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::ToSchema;
@@ -229,6 +229,159 @@ pub(crate) async fn handle_delete_user(
             .into_response();
     }
     Json(json!({"removed": true})).into_response()
+}
+
+/// `PUT /api/v1/me/im` (+ admin `/users/{id}/im`) body — v0.8.20 F2. REPLACE
+/// semantics: the body is the tenant's FULL desired per-user IM config; a
+/// platform left absent/null is cleared. The Telegram token is `getMe`-validated
+/// (against the SAME base as the global config route) before anything is written.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PutTenantImForm {
+    /// The tenant's own Telegram bot token. Absent / empty → no Telegram bot.
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
+    /// The tenant's own Lark/Feishu app. Absent / null → no Lark bot.
+    #[serde(default)]
+    pub lark: Option<LarkImForm>,
+}
+
+/// Lark app credentials in a [`PutTenantImForm`].
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LarkImForm {
+    pub app_id: String,
+    pub app_secret: String,
+    #[serde(default = "default_true_im")]
+    pub use_feishu: bool,
+}
+
+fn default_true_im() -> bool {
+    true
+}
+
+/// Validate + REPLACE a tenant's per-user IM creds, then persist. Shared by the
+/// self-serve (`/me/im`) and admin (`/users/{id}/im`) handlers.
+async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm) -> Response {
+    // Validate Telegram against `getMe` BEFORE touching disk (reuse the same
+    // onboarding validator + base the global config route uses).
+    let telegram = match form
+        .telegram_bot_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(tok) => match ccteam_im::onboarding::telegram_validate_token_with_base(
+            tok,
+            &super::im_config::telegram_api_base(),
+        )
+        .await
+        {
+            Ok(_username) => Some(TenantTelegram {
+                bot_token: tok.to_string(),
+                allowed_chat_ids: Vec::new(),
+            }),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("Telegram token rejected: {err}")})),
+                )
+                    .into_response()
+            }
+        },
+        None => None,
+    };
+    let lark = form.lark.map(|l| TenantLark {
+        app_id: l.app_id,
+        app_secret: l.app_secret,
+        allowed_user_ids: Vec::new(),
+        use_feishu: l.use_feishu,
+    });
+    let has_telegram = telegram.is_some();
+    let has_lark = lark.is_some();
+
+    let path = app.paths.tenants_json();
+    let mut reg = TenantRegistry::load(&path);
+    if reg.by_id(tenant_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {tenant_id}")})),
+        )
+            .into_response();
+    }
+    reg.set_telegram(tenant_id, telegram);
+    reg.set_lark(tenant_id, lark);
+    if let Err(err) = reg.save(&path) {
+        tracing::error!(%err, "PUT tenant im: registry save failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{err}")})),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "telegram": has_telegram,
+        "lark": has_lark,
+        "restart_required": true,
+        "note": "saved; takes effect once the daemon (re)starts this tenant's bot listener",
+    }))
+    .into_response()
+}
+
+/// `PUT /api/v1/me/im` — the caller sets its OWN per-user IM bot (self-serve).
+/// Tenants only: the admin/owner's bot is the global one (`/api/v1/config/im`),
+/// so an admin caller is 400'd here.
+#[utoipa::path(
+    put,
+    path = "/api/v1/me/im",
+    tag = "users",
+    request_body(content = PutTenantImForm, description = "The caller's full per-user IM config (replace)"),
+    responses(
+        (status = 200, description = "Validated + persisted; `{ok, telegram, lark, restart_required, note}`", body = serde_json::Value),
+        (status = 400, description = "Admin caller (uses /config/im) / Telegram token rejected"),
+        (status = 404, description = "Caller is not a registered tenant"),
+        (status = 500, description = "Registry write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_me_im(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(form): Json<PutTenantImForm>,
+) -> Response {
+    if identity.is_admin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the owner's bot is the global bot — set it via /api/v1/config/im"})),
+        )
+            .into_response();
+    }
+    apply_tenant_im(&app, &identity.id, form).await
+}
+
+/// `PUT /api/v1/users/{id}/im` — the admin sets a tenant's per-user IM bot.
+#[utoipa::path(
+    put,
+    path = "/api/v1/users/{id}/im",
+    tag = "users",
+    params(("id" = String, Path, description = "Tenant id")),
+    request_body(content = PutTenantImForm, description = "The tenant's full per-user IM config (replace)"),
+    responses(
+        (status = 200, description = "Validated + persisted", body = serde_json::Value),
+        (status = 400, description = "Telegram token rejected"),
+        (status = 403, description = "Not the admin/owner"),
+        (status = 404, description = "Unknown tenant"),
+        (status = 500, description = "Registry write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_user_im(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(id): Path<String>,
+    Json(form): Json<PutTenantImForm>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    apply_tenant_im(&app, &id, form).await
 }
 
 #[cfg(test)]

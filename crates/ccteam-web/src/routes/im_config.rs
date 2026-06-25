@@ -84,8 +84,9 @@ const TELEGRAM_API_BASE_ENV: &str = "CCTEAM_TELEGRAM_API_BASE";
 const LARK_API_BASE_ENV: &str = "CCTEAM_LARK_API_BASE";
 
 /// Resolve the Telegram API base: the [`TELEGRAM_API_BASE_ENV`] override if
-/// set + non-empty, else the production constant.
-fn telegram_api_base() -> String {
+/// set + non-empty, else the production constant. `pub(crate)` so the per-tenant
+/// IM route (`users::handle_put_me_im`) validates against the same base.
+pub(crate) fn telegram_api_base() -> String {
     std::env::var(TELEGRAM_API_BASE_ENV)
         .ok()
         .filter(|s| !s.is_empty())

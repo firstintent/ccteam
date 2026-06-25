@@ -288,3 +288,90 @@ async fn session_cookie_beats_stale_bearer_header() {
         "Bearer remains the fallback when there is no cookie",
     );
 }
+
+/// v0.8.20 F2: per-user IM bot config — PUT /api/v1/me/im (self-serve) + admin
+/// /api/v1/users/{id}/im. Covers storage + ACL + replace semantics. The
+/// Telegram `getMe` path reuses the global onboarding validator (covered by
+/// im_config_test), so these cases use Lark / empty bodies — no network call.
+#[tokio::test]
+async fn per_tenant_im_config_self_serve_and_admin() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    let bob = reg.add("bob");
+    reg.save(&paths.tenants_json()).unwrap();
+    let alice_tok = alice.web_token.clone();
+    let tenants_path = paths.tenants_json();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // 1. Self-serve: alice sets her OWN Lark app via /me/im → lands on alice.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(&serde_json::json!({"lark": {"app_id": "cli_a", "app_secret": "sek"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "alice configures her own IM bot");
+    let a = TenantRegistry::load(&tenants_path);
+    let a = a.by_id(&alice.id).unwrap().clone();
+    assert_eq!(a.lark.as_ref().unwrap().app_id, "cli_a");
+    assert!(a.telegram.is_none(), "no telegram in body → none");
+
+    // 2. A tenant can NOT set another tenant's bot via the admin route.
+    let r = c
+        .put(format!("http://{addr}/api/v1/users/{}/im", bob.id))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(&serde_json::json!({"lark": {"app_id": "x", "app_secret": "y"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "tenant can't set another tenant's IM");
+
+    // 3. The admin CAN set a tenant's bot (and use_feishu=false is honored).
+    let r = c
+        .put(format!("http://{addr}/api/v1/users/{}/im", bob.id))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"lark": {"app_id": "cli_bob", "app_secret": "s", "use_feishu": false}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "admin sets bob's IM bot");
+    let b = TenantRegistry::load(&tenants_path);
+    let b = b.by_id(&bob.id).unwrap().clone();
+    assert_eq!(b.lark.as_ref().unwrap().app_id, "cli_bob");
+    assert!(
+        !b.lark.as_ref().unwrap().use_feishu,
+        "use_feishu=false honored"
+    );
+
+    // 4. The owner has no per-user bot — /me/im is 400 (uses /config/im).
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "owner uses global /config/im, not /me/im");
+
+    // 5. Replace semantics: alice re-PUTs an empty body → her Lark is cleared.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cleared = TenantRegistry::load(&tenants_path);
+    assert!(
+        cleared.by_id(&alice.id).unwrap().lark.is_none(),
+        "an empty PUT clears (replace semantics)",
+    );
+}

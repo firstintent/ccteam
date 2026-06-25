@@ -152,6 +152,9 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::users::handle_delete_user))
         // v0.8.20 F3 — admin re-reveals a tenant's personal login link.
         .routes(routes!(super::users::handle_user_link))
+        // v0.8.20 F2 — per-user IM bot config (self-serve `/me/im` + admin).
+        .routes(routes!(super::users::handle_put_me_im))
+        .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
         .routes(routes!(super::api_v1::handle_me))

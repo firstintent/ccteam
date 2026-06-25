@@ -54,6 +54,8 @@ import {
   deleteUser,
   getUserLink,
   listUsers,
+  putMyIm,
+  type PutMyImForm,
   type TenantView,
 } from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
@@ -117,19 +119,17 @@ export default function SettingsPage() {
       </div>
     );
   }
-  // A per-user tenant has no global settings here — personal settings live in
-  // the top-right avatar menu.
+  // v0.8.20 F2 — a per-user tenant's Settings page is its self-serve "我的 IM
+  // bot" (admin-only IM credentials / user management are not shown). Personal
+  // display settings stay in the top-right avatar menu.
   if (!me.is_admin) {
     return (
       <div
         data-testid="settings-tenant"
-        className="p-6 max-w-xl mx-auto flex flex-col gap-2 text-[11px] font-mono text-text-secondary leading-relaxed"
+        className="p-4 sm:p-6 max-w-3xl mx-auto flex flex-col gap-6"
       >
-        <h1 className="text-sm font-medium text-text-primary">设置 · Settings</h1>
-        <p>
-          这一页是<b className="text-text-primary">管理员设置</b>(IM 凭据 / 用户管理),仅 owner 可见。
-        </p>
-        <p className="text-text-dim">
+        <MyImSection />
+        <p className="text-[11px] font-mono text-text-dim leading-relaxed">
           你的个人设置(显示名 / 头像 / 界面语言 / 登出)在
           <b className="text-text-secondary">右上角头像菜单</b>里。
         </p>
@@ -719,6 +719,145 @@ export function LarkSection({
 // the management table. There is deliberately NO `ccteam user` CLI — runtime
 // user writes live here on the web.
 // --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// v0.8.20 F2 — a tenant's OWN IM bot (self-serve). The owner's bot is the
+// global one (admin Settings); a per-user tenant runs its own bot so its
+// Telegram/Lark drives ONLY its sessions, not a shared admin bot.
+// --------------------------------------------------------------------------
+
+function MyImSection() {
+  const [telegram, setTelegram] = useState("");
+  const [larkOpen, setLarkOpen] = useState(false);
+  const [larkAppId, setLarkAppId] = useState("");
+  const [larkSecret, setLarkSecret] = useState("");
+  const [useFeishu, setUseFeishu] = useState(true);
+  const [pending, setPending] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  async function onSave(e: React.FormEvent) {
+    e.preventDefault();
+    if (pending) return;
+    setPending(true);
+    setSaved(false);
+    const form: PutMyImForm = {};
+    const tok = telegram.trim();
+    if (tok) form.telegram_bot_token = tok;
+    if (larkOpen && larkAppId.trim() && larkSecret.trim()) {
+      form.lark = {
+        app_id: larkAppId.trim(),
+        app_secret: larkSecret.trim(),
+        use_feishu: useFeishu,
+      };
+    }
+    try {
+      await putMyIm(form);
+      setSaved(true);
+      setTelegram("");
+      setLarkAppId("");
+      setLarkSecret("");
+      toastBus.handler?.info("已保存 / Saved");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <section data-testid="settings-my-im" className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center gap-2">
+          <MessageSquare className="size-4 text-text-secondary" />
+          <h2 className="text-sm font-semibold text-text-primary">我的 IM bot · My bot</h2>
+          <Badge variant="accent">自助</Badge>
+        </div>
+        <p className="text-[11px] text-text-muted leading-relaxed">
+          配置你自己的 Telegram / Lark 机器人 —— 它只驱动你自己的 session(不再共用管理员的全局 bot)。
+          保存会<b className="text-text-secondary">替换</b>当前配置;留空即清除。下次该 bot 监听重启后生效。
+        </p>
+      </div>
+
+      <Card className="p-4">
+        <form onSubmit={onSave} className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="my-im-telegram">Telegram bot token</Label>
+            <Input
+              id="my-im-telegram"
+              type="password"
+              autoComplete="off"
+              value={telegram}
+              onChange={(e) => setTelegram(e.target.value)}
+              disabled={pending}
+              spellCheck={false}
+              placeholder="123456:ABC-DEF…"
+              className="font-mono"
+            />
+            <p className="text-[10px] text-text-dim">
+              从 @BotFather 拿一个新 bot 的 token(每个 bot 的 token 唯一,保存前会校验)。
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setLarkOpen((v) => !v)}
+            className="self-start text-[11px] text-text-dim hover:text-text-secondary"
+          >
+            {larkOpen ? "▾" : "▸"} Lark / 飞书(可选)
+          </button>
+          {larkOpen ? (
+            <div className="flex flex-col gap-2 rounded-md border border-surface-800 p-3">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="my-im-lark-id">Lark App ID</Label>
+                <Input
+                  id="my-im-lark-id"
+                  value={larkAppId}
+                  onChange={(e) => setLarkAppId(e.target.value)}
+                  disabled={pending}
+                  spellCheck={false}
+                  placeholder="cli_…"
+                  className="font-mono"
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="my-im-lark-secret">Lark App Secret</Label>
+                <Input
+                  id="my-im-lark-secret"
+                  type="password"
+                  value={larkSecret}
+                  onChange={(e) => setLarkSecret(e.target.value)}
+                  disabled={pending}
+                  spellCheck={false}
+                  className="font-mono"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-[11px] text-text-secondary">
+                <input
+                  type="checkbox"
+                  checked={useFeishu}
+                  onChange={(e) => setUseFeishu(e.target.checked)}
+                  disabled={pending}
+                  className="accent-brand-500"
+                />
+                飞书(CN);取消勾选 = Lark intl
+              </label>
+            </div>
+          ) : null}
+
+          <div className="flex items-center gap-2">
+            <Button type="submit" disabled={pending}>
+              {pending ? "保存中…" : "保存"}
+            </Button>
+            {saved ? (
+              <span className="text-[11px] font-mono text-status-running">已保存 ✓</span>
+            ) : null}
+          </div>
+        </form>
+      </Card>
+    </section>
+  );
+}
 
 function UserManagementSection() {
   const [users, setUsers] = useState<TenantView[] | null>(null);

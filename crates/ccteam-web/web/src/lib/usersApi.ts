@@ -57,6 +57,21 @@ export function getUserLink(id: string): Promise<UserLinkResponse> {
   return getJson<UserLinkResponse>(`/api/v1/users/${encodeURIComponent(id)}/link`);
 }
 
+/** `PUT /api/v1/me/im` body — v0.8.20 F2. REPLACE semantics: the full desired
+ *  per-user IM config; a platform omitted/empty is cleared. */
+export interface PutMyImForm {
+  /** The tenant's own Telegram bot token. Omit/empty → no Telegram bot. */
+  telegram_bot_token?: string;
+  /** The tenant's own Lark/Feishu app. Omit → no Lark bot. */
+  lark?: { app_id: string; app_secret: string; use_feishu?: boolean };
+}
+
+/** `PUT /api/v1/me/im` — the caller sets its OWN per-user IM bot (self-serve).
+ *  The Telegram token is `getMe`-validated server-side before it is stored. */
+export function putMyIm(form: PutMyImForm): Promise<{ ok: boolean }> {
+  return sendJson<{ ok: boolean }>("/api/v1/me/im", "PUT", form);
+}
+
 async function getJson<T>(url: string): Promise<T> {
   let res: Response;
   try {
@@ -72,7 +87,7 @@ async function getJson<T>(url: string): Promise<T> {
 
 async function sendJson<T>(
   url: string,
-  method: "POST" | "DELETE",
+  method: "POST" | "PUT" | "DELETE",
   body?: unknown,
 ): Promise<T> {
   let res: Response;

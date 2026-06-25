@@ -429,6 +429,7 @@ export default function ChatConsole() {
                 label={navLabel("marketplace", lang)}
                 onNavigate={() => setSidebarOpen(false)}
               />
+              {/* v0.8.18 档1 — Status / 主机 are operator/admin surfaces. */}
               {isAdmin && (
                 <>
                   <SidebarNavLink
@@ -443,14 +444,17 @@ export default function ChatConsole() {
                     label={navLabel("hosts", lang)}
                     onNavigate={() => setSidebarOpen(false)}
                   />
-                  <SidebarNavLink
-                    to="/settings"
-                    icon={<Settings className="h-4 w-4" />}
-                    label={navLabel("settings", lang)}
-                    onNavigate={() => setSidebarOpen(false)}
-                  />
                 </>
               )}
+              {/* v0.8.20 F2 — Settings is visible to tenants too (their
+                  self-serve "我的 IM bot"); the page itself shows admin-only
+                  sections only to the admin. */}
+              <SidebarNavLink
+                to="/settings"
+                icon={<Settings className="h-4 w-4" />}
+                label={navLabel("settings", lang)}
+                onNavigate={() => setSidebarOpen(false)}
+              />
             </div>
           </nav>
         </aside>
