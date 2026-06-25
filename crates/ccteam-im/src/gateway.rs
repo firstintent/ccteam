@@ -3123,8 +3123,8 @@ impl Gateway {
 
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let mut out = format!(
-            "📍 当前会话 {} · {} · {role} · {state} {detail}",
-            s.id, s.project
+            "📍 当前会话 {} · {} · {:?} · {role} · {state} {detail}",
+            s.id, s.project, s.vendor
         );
 
         // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
@@ -6496,7 +6496,7 @@ mod tests {
         // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
         // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
+            idle[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
             "current-session header: {idle:?}"
         );
         assert!(
@@ -6517,7 +6517,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · reviewer · 🔵 working "),
+            working[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🔵 working "),
             "working state: {working:?}"
         );
         assert!(
@@ -6543,7 +6543,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · reviewer · 🔴 STUCK "),
+            stuck[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🔴 STUCK "),
             "stuck state: {stuck:?}"
         );
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
@@ -6566,8 +6566,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · — · 🟢 idle"),
-            "roleless → role shows —: {out:?}"
+            out[0].contains("📍 当前会话 s1 · alpha · Claude · — · 🟢 idle"),
+            "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
             out[0].contains("— · — · ctx — · resume —"),
@@ -6639,7 +6639,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
+            owner[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
             "got: {owner:?}"
         );
     }
@@ -6673,7 +6673,7 @@ mod tests {
             "the real --resume uuid must show in the deep view: {out:?}"
         );
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · reviewer · 🟢 idle"),
+            out[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
             "got: {out:?}"
         );
     }

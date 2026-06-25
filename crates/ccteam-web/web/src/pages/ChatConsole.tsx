@@ -49,10 +49,17 @@ import { ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
 import { mergeProjectSlugs } from "./projectList";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
-import { navLabel } from "../lib/i18n";
+import { navLabel, tr } from "../lib/i18n";
 
 /** A switcher entry — one live gateway session, grouped under its project. */
 type RailSession = SessionSummary;
+
+/** Frontend-only soft cap on how many active sessions one user may hold at
+ *  once. "Active" = the sessions in this caller's own cross-project list
+ *  (`railSessions`), which the backend already ACL-scopes to the caller — so
+ *  counting that list is counting the user's own live sessions. This is a UX
+ *  guard (block the create + toast), NOT a security/backend limit. */
+const MAX_ACTIVE_SESSIONS = 10;
 
 /** The three bottom-nav global views — each is a full route the shell hosts
  *  in its main area (sidebar persists, Chat|终端 tabs hide). `null` = a
@@ -207,6 +214,21 @@ export default function ChatConsole() {
       protocol: "stream-json" | "terminal",
       newProjectPath?: string,
     ): Promise<boolean> => {
+      // Frontend-only cap: block a new session once the caller already holds
+      // MAX_ACTIVE_SESSIONS. `railSessions` is the caller's own (ACL-scoped)
+      // cross-project session list, so its length == the user's active count.
+      // Block BEFORE any create/spawn API call and surface a bilingual toast;
+      // return false so the modal stays open (input preserved).
+      if (railSessions.length >= MAX_ACTIVE_SESSIONS) {
+        toastBus.handler?.error(
+          tr(
+            lang,
+            "最多 10 个活跃 session,请先结束其他 session",
+            "Max 10 active sessions — please end others first",
+          ),
+        );
+        return false;
+      }
       try {
         // B2: create the project first when a path was supplied.
         let targetSlug = slug;
@@ -238,7 +260,7 @@ export default function ChatConsole() {
         return false;
       }
     },
-    [refreshSessions, navigate],
+    [refreshSessions, navigate, railSessions, lang],
   );
 
   // The project list = ALL registered projects (config.yaml SoT) ∪ the
@@ -253,6 +275,10 @@ export default function ChatConsole() {
     railSessions.forEach((s) => s.role && seen.add(s.role));
     return Array.from(seen);
   }, [railSessions]);
+  // Frontend-only cap (see MAX_ACTIVE_SESSIONS) — disable the header "＋ 新建"
+  // entry at the limit so the affordance reflects the block; the create
+  // funnel (`createSession`) still hard-guards + toasts as the source of truth.
+  const atSessionCap = railSessions.length >= MAX_ACTIVE_SESSIONS;
 
   const switchTo = useCallback(
     (s: RailSession) => {
@@ -312,6 +338,7 @@ export default function ChatConsole() {
             <div className="flex items-center gap-1">
               <button
                 type="button"
+                disabled={atSessionCap}
                 onClick={() => {
                   // bug5 — refetch so a project created out-of-band (CLI
                   // `ccteam init`) is in the list when the modal opens.
@@ -319,8 +346,16 @@ export default function ChatConsole() {
                   setModalProject(null);
                   setModalOpen(true);
                 }}
-                className="h-6 px-2 rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs flex items-center gap-1"
-                title="新建 session"
+                className="h-6 px-2 rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-brand-500/90"
+                title={
+                  atSessionCap
+                    ? tr(
+                        lang,
+                        "最多 10 个活跃 session,请先结束其他 session",
+                        "Max 10 active sessions — please end others first",
+                      )
+                    : "新建 session"
+                }
               >
                 <Plus className="h-3.5 w-3.5" /> 新建
               </button>
