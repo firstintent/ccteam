@@ -276,6 +276,12 @@ where
     // each rebuilt channel on reload.
     let shared_channels: Arc<RwLock<ChannelMap>> = Arc::new(RwLock::new(channels));
     let last_creds: Arc<StdMutex<Credentials>> = Arc::new(StdMutex::new(creds.clone()));
+    // v0.8.20 F2 — track the last tenants.json bytes so a reload rebuilds only
+    // the CHANGED scope: a tenant-only change must not blip the owner's live
+    // global bot, and a creds-only change must not blip the tenant bots.
+    let last_tenants: Arc<StdMutex<String>> = Arc::new(StdMutex::new(
+        std::fs::read_to_string(tenants_json_path(&args)).unwrap_or_default(),
+    ));
     // V0.8.6 W5b — use the caller-provided gateway handle when `ccteam start`
     // built one (so the web `AppState` and this daemon drive the SAME session
     // map); else build + own one (standalone `ccteam-im run`). The post-build
@@ -413,6 +419,7 @@ where
                     &inbound_tx_for_reload,
                     &args,
                     &last_creds,
+                    &last_tenants,
                     &menu_specs,
                 )
                 .await;
@@ -472,9 +479,10 @@ async fn reload_im_channels(
     inbound_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     args: &DaemonArgs,
     last_creds: &Arc<StdMutex<Credentials>>,
+    last_tenants: &Arc<StdMutex<String>>,
     menu_specs: &[crate::transport::CommandSpec],
 ) {
-    // Re-read credentials.
+    // Re-read credentials (global/admin bot) + tenants.json (per-tenant bots).
     let new_creds = match credentials::load(args.credentials.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -482,24 +490,30 @@ async fn reload_im_channels(
             return;
         }
     };
+    let new_tenants_raw = std::fs::read_to_string(tenants_json_path(args)).unwrap_or_default();
+    let creds_changed = *last_creds.lock().unwrap() != new_creds;
+    let tenants_changed = *last_tenants.lock().unwrap() != new_tenants_raw;
     // No-op when nothing changed (e.g. a pref-only `ccteam config`).
-    {
-        let prev = last_creds.lock().unwrap();
-        if *prev == new_creds {
-            tracing::debug!("imd: reload — credentials unchanged, no-op");
-            return;
-        }
+    if !creds_changed && !tenants_changed {
+        tracing::debug!("imd: reload — credentials + tenants unchanged, no-op");
+        return;
     }
-    // Rebuild credential-driven channels ONLY, using the SAME table the startup
-    // path walks and the current bot registrations (loaded the same way startup
-    // loads `initial`). `list_bots` failing leaves the bot set empty — channels
-    // still rebuild from the new creds (telegram unions registered bots into its
-    // allowlist; an empty set just means no extra chats, same as a fresh start).
+    // Rebuild ONLY the CHANGED scope, so a tenant-only change never blips the
+    // owner's live global bot (and a creds-only change never blips the tenant
+    // bots). Globals use the SAME table the startup path walks + current bot
+    // registrations; per-tenant bots come from tenants.json.
     let bots = list_bots().unwrap_or_default();
     let mut rebuilt: ChannelMap = HashMap::new();
-    for (name, builder) in CHANNEL_BUILDERS {
-        if let Some(ch) = builder(&new_creds, &bots) {
-            rebuilt.insert((*name).to_string(), ch);
+    if creds_changed {
+        for (name, builder) in CHANNEL_BUILDERS {
+            if let Some(ch) = builder(&new_creds, &bots) {
+                rebuilt.insert((*name).to_string(), ch);
+            }
+        }
+    }
+    if tenants_changed {
+        for (name, ch) in build_tenant_channels(&daemon_tenants(args)) {
+            rebuilt.insert(name, ch);
         }
     }
     // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
@@ -514,14 +528,22 @@ async fn reload_im_channels(
             tracing::warn!(channel = %name, error = %e, "imd: reload register_commands failed");
         }
     }
-    // Remove credential-driven channels whose creds vanished (present before,
-    // gone now) and publish the rebuilt set into the shared map.
+    // Remove managed channels that vanished — but only within the CHANGED scope
+    // (a creds-driven global iff creds changed; a per-tenant bot iff tenants
+    // changed), so the unchanged dimension's listeners are never touched.
     {
         let creds_driven: HashSet<&str> = CHANNEL_BUILDERS.iter().map(|(n, _)| *n).collect();
         let mut map = shared.write().unwrap();
         let vanished: Vec<String> = map
             .keys()
-            .filter(|k| creds_driven.contains(k.as_str()) && !rebuilt.contains_key(*k))
+            .filter(|k| {
+                if rebuilt.contains_key(*k) {
+                    return false;
+                }
+                let is_global = creds_driven.contains(k.as_str());
+                let is_tenant = crate::transport::is_tenant_bot_channel(k);
+                (creds_changed && is_global) || (tenants_changed && is_tenant)
+            })
             .cloned()
             .collect();
         for k in vanished {
@@ -534,8 +556,17 @@ async fn reload_im_channels(
             map.insert(name, ch);
         }
     }
-    *last_creds.lock().unwrap() = new_creds;
-    tracing::info!("imd: IM channels reloaded from credentials.json (sessions untouched)");
+    if creds_changed {
+        *last_creds.lock().unwrap() = new_creds;
+    }
+    if tenants_changed {
+        *last_tenants.lock().unwrap() = new_tenants_raw;
+    }
+    tracing::info!(
+        creds_changed,
+        tenants_changed,
+        "imd: IM channels reloaded (changed scope only; sessions untouched)"
+    );
 }
 
 /// V0.6.1 F132 — channel-listener mpsc buffer. 64 is enough headroom
@@ -586,6 +617,13 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
             out.insert((*name).to_string(), ch);
             tracing::info!(channel = %name, "imd: provider channel built from credentials");
         }
+    }
+    // v0.8.20 F2 — one listener per tenant bot (tenants.json), additive to the
+    // global/admin bot above. Keyed "<platform>@<tenant_id>" so reply routing
+    // and the inbound→tenant binding work without colliding on the platform.
+    for (name, ch) in build_tenant_channels(&daemon_tenants(args)) {
+        tracing::info!(channel = %name, "imd: per-tenant bot channel built");
+        out.insert(name, ch);
     }
     if let Some(extra) = args.extra_channels.clone() {
         out.extend(extra); // web-chat WS merge still last, unchanged
@@ -679,6 +717,69 @@ fn build_lark_channel(
             lark.use_feishu,
         ),
     ))
+}
+
+/// v0.8.20 F2 — the per-user tenant registry path (`~/.ccteam/tenants.json`).
+/// When the creds path is overridden (tests / non-default home), derive the
+/// sibling `tenants.json` from its `.ccteam` grandparent so a test home is
+/// honored; otherwise the canonical env-aware path.
+fn tenants_json_path(args: &DaemonArgs) -> PathBuf {
+    if let Some(creds) = &args.credentials {
+        if let Some(ccteam_dir) = creds.parent().and_then(|p| p.parent()) {
+            return ccteam_dir.join("tenants.json");
+        }
+    }
+    ccteam_core::CcteamPaths::from_env()
+        .map(|p| p.tenants_json())
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".ccteam")
+                .join("tenants.json")
+        })
+}
+
+/// v0.8.20 F2 — load the tenant registry for the daemon (best-effort: a missing
+/// / unreadable file is an empty registry, so the daemon always starts).
+fn daemon_tenants(args: &DaemonArgs) -> ccteam_core::tenants::TenantRegistry {
+    ccteam_core::tenants::TenantRegistry::load(&tenants_json_path(args))
+}
+
+/// v0.8.20 F2 — one IM [`Channel`] per tenant bot (from `tenants.json`). Each is
+/// keyed `"<platform>@<tenant_id>"` so its inbound stamps that name (→ routes to
+/// the tenant + replies return through THIS bot, not a colliding shared
+/// `"telegram"`). The global/admin bot keeps its bare platform name. Only
+/// tenants WITH IM creds get a channel.
+fn build_tenant_channels(
+    reg: &ccteam_core::tenants::TenantRegistry,
+) -> Vec<(String, Arc<dyn Channel + Send + Sync>)> {
+    let mut out: Vec<(String, Arc<dyn Channel + Send + Sync>)> = Vec::new();
+    for t in reg.list() {
+        #[cfg(feature = "telegram")]
+        {
+            if let Some(tg) = &t.telegram {
+                let name = format!("telegram@{}", t.id);
+                let ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_chat_ids.clone())
+                    .with_name(name.clone());
+                out.push((name, Arc::new(ch)));
+            }
+        }
+        #[cfg(feature = "lark")]
+        {
+            if let Some(lk) = &t.lark {
+                let name = format!("lark@{}", t.id);
+                let ch = crate::transport::providers::lark::LarkChannel::new(
+                    lk.app_id.clone(),
+                    lk.app_secret.clone(),
+                    lk.allowed_user_ids.clone(),
+                    lk.use_feishu,
+                )
+                .with_name(name.clone());
+                out.push((name, Arc::new(ch)));
+            }
+        }
+    }
+    out
 }
 
 fn build_gateway(
@@ -908,10 +1009,15 @@ fn spawn_inbound_consumer(
             // rejection is waived. Without this, every D3/D6 button AND every
             // captionless inbound file is silently dropped here (on Telegram
             // *and* web chat — both feed this consumer).
-            let outcome = sec
-                .lock()
-                .await
-                .evaluate(&msg.channel, &msg.sender, &msg.content);
+            // v0.8.20 F2 — a per-tenant bot's channel is "<platform>@<tenant>";
+            // the ACL is keyed by PLATFORM (fail-closed on unknown), so strip the
+            // tenant suffix before the gate (reply routing still uses the full
+            // channel name elsewhere).
+            let outcome = sec.lock().await.evaluate(
+                crate::transport::platform_of(&msg.channel),
+                &msg.sender,
+                &msg.content,
+            );
             let has_nontext_payload = msg.selection.is_some() || !msg.attachments.is_empty();
             let Some(clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload) else {
                 tracing::warn!(
@@ -1404,6 +1510,33 @@ pub fn _link_check(_c: &Credentials) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.8.20 F2 — one channel per tenant bot, keyed `"<platform>@<tenant_id>"`
+    /// (the unique routing key); a tenant with no IM creds yields no channel.
+    #[cfg(feature = "telegram")]
+    #[test]
+    fn build_tenant_channels_keys_one_per_tenant_bot() {
+        let mut reg = ccteam_core::tenants::TenantRegistry::default();
+        let a = reg.add("alice");
+        reg.set_telegram(
+            &a.id,
+            Some(ccteam_core::tenants::TenantTelegram {
+                bot_token: "123:abc".into(),
+                allowed_chat_ids: vec![],
+            }),
+        );
+        let _bob = reg.add("bob"); // no IM creds → no channel
+        let chans = build_tenant_channels(&reg);
+        let names: Vec<String> = chans.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(
+            names,
+            vec![format!("telegram@{}", a.id)],
+            "one channel for alice's telegram bot, none for bob",
+        );
+        // The Channel reports the SAME unique name → inbound stamps it + replies
+        // route back through this bot (not a colliding shared `"telegram"`).
+        assert_eq!(chans[0].1.name(), format!("telegram@{}", a.id).as_str());
+    }
     use tempfile::TempDir;
 
     /// (v0.8.5 B1 / B1b) The security gate must let a non-text message through

@@ -86,6 +86,21 @@ pub struct ChannelMessage {
     pub selection: Option<ChoiceReply>,
 }
 
+/// v0.8.20 F2 — a per-tenant IM bot's channel name is `"<platform>@<tenant_id>"`
+/// (the `@` keeps the channel-map key unique per bot, so outbound replies route
+/// to the RIGHT bot). The platform prefix (before `@`) is what platform-keyed
+/// logic — the inbound ACL, `setMyCommands` — must use; the full name is the
+/// routing key. The global/admin bot keeps a bare platform name (`"telegram"`).
+pub fn platform_of(channel: &str) -> &str {
+    channel.split('@').next().unwrap_or(channel)
+}
+
+/// Whether a channel name belongs to a per-tenant bot (`"<platform>@<tenant>"`)
+/// rather than the global/admin bot (`"telegram"`/`"lark"`/…) or web (`"web"`).
+pub fn is_tenant_bot_channel(channel: &str) -> bool {
+    channel.contains('@')
+}
+
 /// How an [`OutboundFile`] should be sent (V0.8.4 P2b).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -353,6 +368,20 @@ pub(crate) fn sanitize_attachment_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.8.20 F2 — the platform prefix is what platform-keyed logic (ACL,
+    /// menus) uses; the `@`-suffixed full name is the per-bot routing key.
+    #[test]
+    fn platform_of_and_tenant_bot_channel() {
+        assert_eq!(platform_of("telegram"), "telegram");
+        assert_eq!(platform_of("telegram@uabc"), "telegram");
+        assert_eq!(platform_of("lark@u123"), "lark");
+        assert_eq!(platform_of("web"), "web");
+        assert!(!is_tenant_bot_channel("telegram"));
+        assert!(!is_tenant_bot_channel("web"));
+        assert!(is_tenant_bot_channel("telegram@uabc"));
+        assert!(is_tenant_bot_channel("lark@u123"));
+    }
 
     #[test]
     fn sanitize_attachment_name_blocks_traversal_and_control() {

@@ -396,6 +396,13 @@ impl LarkChannel {
         }
     }
 
+    /// v0.8.20 F2 — override the channel-map key (`"lark@<tenant_id>"`) for a
+    /// per-tenant bot (see [`super::telegram::TelegramChannel::with_name`]).
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
     fn api_base(&self) -> &'static str {
         if self.use_feishu {
             FEISHU_BASE_URL
@@ -661,6 +668,10 @@ impl LarkChannel {
                     let pending = decoded.pending.clone();
                     let raw_message_id = decoded.message_id.clone();
                     let mut channel_msg = decoded.into_channel_message();
+                    // v0.8.20 F2 — stamp THIS bot's channel key so a per-tenant
+                    // lark bot's inbound routes to its tenant + replies come back
+                    // through it (not a colliding shared "lark").
+                    channel_msg.channel = self.name.clone();
                     if let Some(p) = pending {
                         match self.stage_lark_attachment(&channel_msg.id, &raw_message_id, &p).await {
                             Ok(Some(att)) => channel_msg.attachments.push(att),
@@ -1029,7 +1040,9 @@ impl LarkChannel {
             );
             return None;
         }
-        Some(decoded.into_channel_message())
+        let mut cm = decoded.into_channel_message();
+        cm.channel = self.name.clone();
+        Some(cm)
     }
 
     /// Decode a WS frame's event-JSON bytes into a [`DecodedMessage`]

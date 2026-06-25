@@ -2893,13 +2893,33 @@ impl Gateway {
     /// clause), and the same-current-project leak (the v0.8.13 cross-frontend-
     /// by-project sharing) is removed. Reply routing is unaffected (per-turn
     /// submitter via `reply_to`). HONEST SCOPE: soft (UX) isolation under one OS
-    /// uid, NOT a security boundary. 档1 makes the web pool per-user too — then
-    /// the `owner.channel == "web"` clause narrows to the owning user.
+    /// uid, NOT a security boundary.
+    ///
+    /// v0.8.20 F2 — a PER-TENANT IM bot (channel `"<platform>@<tenant>"`) is
+    /// scoped to its OWN sessions only: it does NOT inherit the shared web pool
+    /// (that would let every tenant's bot drive every web session). The shared
+    /// pool stays the admin/global bot's operational view. Per-tenant web↔IM
+    /// convergence (a tenant bot also seeing its OWN web sessions) is deferred —
+    /// the gateway owns web sessions under the synthetic `web:web-api` pool, not
+    /// per tenant; see `docs/versions/v0-8-20`.
     fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
-        // Own sessions, plus the shared web-console operator pool (see doc): the
-        // single-user "create on web, drive from phone" flow. IM-created
-        // sessions (owner.channel == telegram/lark) stay private to their chat.
-        session.owner == *chat || session.owner.channel == "web"
+        Self::chat_owner_visible(chat, &session.owner)
+    }
+
+    /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
+    /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
+    /// iff (a) it owns it, or (b) — for the admin/global bot + the web querier
+    /// ONLY — the session is in the shared web pool (`owner.channel == "web"`).
+    /// A per-tenant IM bot (channel `"<platform>@<tenant>"`) sees ONLY what it
+    /// owns: it gets neither the shared web pool nor other tenants' IM sessions.
+    fn chat_owner_visible(chat: &ChatKey, owner: &ChatKey) -> bool {
+        if *owner == *chat {
+            return true;
+        }
+        if crate::transport::is_tenant_bot_channel(&chat.channel) {
+            return false;
+        }
+        owner.channel == "web"
     }
 
     /// Point the chat's active session at an existing session owned by this
@@ -6513,7 +6533,37 @@ mod tests {
     /// DIFFERENT chat, even in the same project. This REVERSES the v0.8.13
     /// cross-frontend-by-project sharing so two IM chats (distinct `chat_id`s)
     /// on one machine never cross. The OWNER keeps full visibility + addressing.
-    /// (Same-user web↔IM cross-frontend reach returns via 档1.)
+    /// (Same-user web↔IM cross-frontend reach returns via 档1.) — the async
+    /// integration check for this is `gateway_sessions_are_own_only_across_chats`
+    /// below; the test directly here is the pure unit check of the same rule.
+    ///
+    /// v0.8.20 F2 — a per-tenant IM bot (`telegram@<tid>`) sees ONLY its own
+    /// sessions: not the shared web pool, not another tenant's IM sessions. The
+    /// admin/global bot (`telegram`) keeps the shared-web-pool operator view.
+    #[test]
+    fn chat_owner_visible_tenant_bot_is_own_only() {
+        let web = ChatKey::new("web", "web-api", "web-api");
+        let admin_tg = ChatKey::new("telegram", "339", "rob");
+        let tenant_a = ChatKey::new("telegram@uaaa", "111", "alice");
+        let tenant_b = ChatKey::new("telegram@ubbb", "222", "bob");
+
+        // The admin/global bot: own + the shared web pool (unchanged).
+        assert!(Gateway::chat_owner_visible(&admin_tg, &admin_tg));
+        assert!(Gateway::chat_owner_visible(&admin_tg, &web));
+        // A per-tenant bot: ONLY its own.
+        assert!(Gateway::chat_owner_visible(&tenant_a, &tenant_a));
+        assert!(
+            !Gateway::chat_owner_visible(&tenant_a, &web),
+            "a tenant bot must NOT see the shared web pool"
+        );
+        assert!(
+            !Gateway::chat_owner_visible(&tenant_a, &tenant_b),
+            "a tenant bot must NOT see another tenant's IM session"
+        );
+        // A plain web querier still sees the web pool.
+        assert!(Gateway::chat_owner_visible(&web, &web));
+    }
+
     #[tokio::test]
     async fn gateway_sessions_are_own_only_across_chats() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));

@@ -317,12 +317,25 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
         )
             .into_response();
     }
+    // v0.8.20 F2 — hot-reload: nudge the daemon to (re)start this tenant's bot
+    // listener now (the reload reads tenants.json + diffs the per-tenant bots, so
+    // it picks up exactly this change). Best-effort: `false` when the web runs
+    // standalone (no daemon gateway handle) — then the bot starts on the next
+    // daemon reload/restart.
+    let reloaded = match app.gateway.as_ref() {
+        Some(gw) => gw.lock().await.request_im_reload(),
+        None => false,
+    };
     Json(json!({
         "ok": true,
         "telegram": has_telegram,
         "lark": has_lark,
-        "restart_required": true,
-        "note": "saved; takes effect once the daemon (re)starts this tenant's bot listener",
+        "reloaded": reloaded,
+        "note": if reloaded {
+            "saved; your bot listener is (re)starting now"
+        } else {
+            "saved; takes effect on the next daemon reload/restart"
+        },
     }))
     .into_response()
 }

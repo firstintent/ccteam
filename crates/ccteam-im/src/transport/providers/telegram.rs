@@ -61,6 +61,14 @@ impl TelegramChannel {
         }
     }
 
+    /// v0.8.20 F2 — override the channel-map key (`"telegram@<tenant_id>"`) for a
+    /// per-tenant bot, so its inbound stamps that name and outbound replies route
+    /// back through THIS bot (not a colliding shared `"telegram"`).
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
     }
@@ -180,7 +188,7 @@ impl TelegramChannel {
             sender,
             reply_target: chat_id,
             content: String::new(),
-            channel: "telegram".into(),
+            channel: self.name.clone(),
             timestamp: (now_unix_ms() / 1000) as u64,
             thread_ts: None,
             attachments: Vec::new(),
@@ -627,7 +635,7 @@ impl Channel for TelegramChannel {
                         sender,
                         reply_target: chat_id.clone(),
                         content,
-                        channel: "telegram".into(),
+                        channel: self.name.clone(),
                         timestamp: m.date.max(0) as u64,
                         thread_ts: None,
                         attachments,
