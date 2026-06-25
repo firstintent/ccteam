@@ -43,7 +43,7 @@ ccteam is a **self-hosted control plane for coding agents.** One resident daemon
 
 ## The model: chat ⇄ project ⇄ session ⇄ role
 
-- A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat — another person, even sharing the same machine and daemon — sees only its own sessions (soft per-chat isolation under one OS account).
+- A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat — another person, even sharing the same machine and daemon — sees only its own sessions (soft per-chat isolation under one OS account). Several people can share one daemon: the owner mints a **per-user web login link**, and each user can run their **own** IM bot (its own Telegram / Lark token, set self-serve in the web console) that drives only their sessions.
 - A **project** is a local directory you ran `ccteam init` on.
 - A **session** is an independent, resident agent handle (`s<N>`) with its own context (`/compact` and `/clear` are per-session) — exactly like a native Claude Code session. `/new` spawns, `/sessions` lists (handle, project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Two sessions of the same role never cross-talk.
 - A **role** is who a session *is* — a plain Markdown persona at `.claude/agents/<role>.md`, or no role at all (a bare `claude` driven by your project's `CLAUDE.md`). `ccteam init` seeds a `cto` manager that recommends the right work-role; swap any session's role live with `/role`.

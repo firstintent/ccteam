@@ -1,7 +1,18 @@
 # v0.8.20 — 多租户深化:CLI 项目归属 + per-tenant IM bot + 登录链接可见
 
-> **Status: PLANNING / PRD**(doc-first,owner 2026-06-25)。4 个开放决策 owner 已拍板(见「决策」);**下个新 session 进入开发**。
+> **Status: LANDED**(dev,doc-first → 4 wave 实现,owner 2026-06-25)。**tag HELD**;daemon 需**重部署** + SPA 需**重 build** + 用户 `/mcp` 重连才上线。
 > 建立在**档1**(per-user web,v0.8.18)之上:`~/.ccteam/tenants.json` 租户注册表 + 单 token→`Identity{admin|tenant}` + 项目归属 ACL(`ProjectState.owner`,web 建项目盖 `web:<tenant>`,session 继承 project 归属)。
+
+## 落地概览(4 wave,全绿)
+
+| Wave | 内容 | 关键文件 |
+|---|---|---|
+| **W1** | `ccteam init --owner`(裸值→`web:`、`:` 原样、re-init 覆盖**无需 `--force`**、轻校验 WARN) | `ccteam-cli/src/{main,commands}.rs` |
+| **W2** | 归属 bug 修(auth `URL→cookie→Bearer`,cookie 优先 Bearer 回退)+ **F3** 登录链接(`GET /users/{id}/link` + `ccteam status` + Settings 复制)+ **F4** 建-session 默认无角色 + 按身份分级运行时/角色 + **beta-gating 规范**(→ CLAUDE.md §五.8) | `ccteam-web/src/{auth,routes/users,routes/openapi}.rs` · SPA `ChatConsole/SettingsPage/usersApi` |
+| **W3** | Tenant IM 凭据模型(`TenantTelegram`/`TenantLark`,0600)+ 自助 REST `PUT /me/im`(getMe 校验,replace 语义)+ admin `PUT /users/{id}/im` + Settings「我的 IM bot」 | `ccteam-core/src/tenants.rs` · `ccteam-web/src/routes/users.rs` · SPA `SettingsPage` |
+| **W4** | **per-tenant IM bot 监听/路由/热重载**(核心):channel `"<platform>@<tenant>"`、`build_tenant_channels` fan-out、`chat_can_access` 租户隔离、`platform_of` ACL、changed-scope 热重载 + web PUT 触发 | `ccteam-im/src/{daemon,gateway,transport/*}.rs` |
+
+> **DEFERRED(owner review):** ① web↔IM **收敛**(租户 bot 看自己的 web session)—— gateway 把 web session 统一记 `web:web-api`(非 per-tenant),收敛需更大改,本版做**隔离**(租户 bot 只见自己 IM session)。② **全局 bot「废迁」是 reframe 非 literal**:不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。
 
 ---
 
@@ -105,3 +116,37 @@ admin 随时看**所有租户的登录链接**(`?token=ccteam:<hex>`),两处:
 - IM 凭据面:租户设自己的 bot 是**自助**;全局/admin 运维面仍 admin-gated(`deny_non_admin`)。登录链接对 **admin** 可见、租户间互不可见。
 
 > **注:claude 上下文压缩(autoCompactWindow)不在本版** —— owner 2026-06-25 决定它**不做 ccteam 功能**,用户直接在本机 `~/.claude/settings.json` 写 `{"autoCompactWindow": N}`(ccteam spawn 用 `--setting-sources=user,project,local`,会读用户设置 → 生效)。
+
+---
+
+## Handoff(实现已落地)
+
+**Decided(实现时定的工程决策):**
+- **per-tenant channel key = `"<platform>@<tenant_id>"`**(`@` 分隔):唯一 channel-map key 让出站回信(`channels.get(reply_to.channel)`)落到**正确的 bot**,不串。这是 W4 能小改的关键 —— gateway 早已把 `reply_to`(每 turn 回信目标)与 `owner`(ACL key)**分开**,所以 channel 名随 `ChatKey` 自然流过,无需重写 361KB gateway。
+- **ACL 按 platform**:`ThreeLayerSec` 对未知 platform fail-closed,故入站门用 `platform_of()` 剥掉 `@<tenant>` 后缀(`telegram@x`→`telegram`);回信仍用全名。
+- **`chat_can_access` 隔离**:抽出纯函数 `chat_owner_visible(chat, owner)` 单测。租户 bot **只见自己**(不见共享 web 池、不见别租户 IM session);admin/全局 bot 保留「own + web 池」运维视图。
+- **热重载按 changed-scope**:`reload_im_channels` 只重建变了的那一维(creds vs tenants),租户改动**不 blip owner 的活 bot**。web `PUT /me/im` 经 `AppState.gateway` 句柄 `request_im_reload()` 触发 → 租户 bot 即时起。
+- **归属 bug 根因 = auth 优先级**(非建项目逻辑):改 `URL-shim → cookie → Bearer`(cookie=当前登录、Bearer=无 cookie 客户端回退)。
+- **F4 默认无角色 + 纯 UI 门**:`useMe().isAdmin` 控制运行时/角色可见性,后端创建路由不变。
+
+**Rejected / Deferred(需 owner 拍板是否后续做):**
+- **web↔IM 收敛**:租户 bot 看自己的 **web-created** session —— 当前 gateway 把所有 web session 记 `web:web-api`(共享池,per-tenant 归属在 web REST/project 层,不在 gateway session.owner)。收敛要么让 gateway 按租户记 web session owner(动 v0.8.18 project-ownership 模型,风险大),要么 gateway 查 web-session→tenant。**本版做隔离不做收敛**。`Tenant.linked_chat` 字段留着、未接 per-tenant bot 身份。
+- **全局 bot literal「废迁」**:owner 说「废+迁」「admin 也是一个有自己 bot 的租户」。实现为 **reframe**:全局 `credentials.json` bot 不再是共享 bot(租户各有自己的),它只服务 admin;**未**把 admin 塞进 tenants.json 当租户(避免迁移代码,守 pre-v1.0 不迁移规则)。功能上「租户不再用全局 bot」已达成。**若 owner 要 admin 也在注册表当租户,是后续小改。**
+
+**Risks:**
+- **soft-partition 诚实**:per-tenant bot = IM 路由+可见性隔离,**非** OS 安全边界(同 uid 仍可读他人 token/`/proc`)。真隔离 = per-user OS user/sandbox(deferred)。
+- **同 token 不能两 bot**:每租户 bot token 必须 distinct(两 bot 同 token → `getUpdates` 409)。明文存 `tenants.json`(0600)。
+- **bot 加载需 session 重启**无关(IM bot 是 daemon listener,非 claude session);但 daemon **重部署**后所有租户 bot 才按新代码起。
+
+**Files(主要):**
+- 核:`ccteam-core/src/tenants.rs`(IM creds + 0600 + setters)。
+- 传输/网关:`ccteam-im/src/transport/{mod,providers/telegram,providers/lark}.rs`(`platform_of`/`is_tenant_bot_channel`/`with_name`/`self.name` stamp)、`ccteam-im/src/daemon.rs`(`build_tenant_channels`/路径/`build_channels`/`reload_im_channels`/ACL `platform_of`)、`ccteam-im/src/gateway.rs`(`chat_owner_visible`)。
+- web:`ccteam-web/src/auth.rs`(优先级)、`routes/users.rs`(`/users/{id}/link`、`/me/im`、`/users/{id}/im`、热重载触发)、`routes/openapi.rs` + `tests/openapi_test.rs`(路由冻结表)。
+- SPA:`ChatConsole.tsx`(F4 + Settings nav)、`SettingsPage.tsx`(MyImSection)、`lib/usersApi.ts`、`pages/chatDefaults` 不变(`resolveRole` 复用)。
+- 规范:`CLAUDE.md §五.8`(beta-gating)。
+
+**Remaining(本版后,按需):**
+- web↔IM 收敛(见上)。
+- admin 也进 tenants.json 当租户(若 owner 要 literal「admin=有 bot 的租户」)。
+- lark 自助流的端到端真机验证(本版 lark 走 with_name + override,与 telegram 对称,但真机未跑)。
+- `GET /me/im`(masked 回当前配置)让自助表单显示现状(当前 replace 语义 + 无 read → 表单从空起,留 UX 余地)。

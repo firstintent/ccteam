@@ -91,6 +91,7 @@ ccteam init
 ccteam init --in /path/to/repo          # 在别处初始化(slug 默认取目录名)
 ccteam init --slug demo-app             # 覆盖自动推断的 slug
 ccteam init --force                     # 覆盖 ccteam 生成物(在源码目录自举时也用它)
+ccteam init --owner web:u8e29d424       # 多用户:把项目归属给某 web 租户(裸值补 web:;含 : 原样;re-init 覆盖无需 --force)
 ccteam project ls                       # 列已知项目
 ```
 
@@ -182,6 +183,14 @@ Telegram 之外可同时接入飞书/Lark(同一个 `credentials.json`,与 teleg
 - **怎么拿自己的 open_id**:先留个占位(或留空)启动 daemon,给 bot 发一条消息,在 daemon 日志里找这行 —— `Lark WS: ignoring ou_xxxx (not in allowed_users)`,`ou_xxxx` 就是你的 open_id;填回 `allowed_user_ids` 再重启。
 
 改完凭证同样要 `ccteam stop && ccteam start` 才生效。飞书/Lark 支持文本 + 富文本(post)+ 图片/文件(image/file/audio/media)收发 —— 收到的图/文件自动落盘供 agent `Read`,`chat_send_file` 也能把图/文件发回(与 Telegram 对等)。
+
+### 多用户:per-user web 登录 + 每人自己的 IM bot
+
+一台机器、一个 daemon 给多个人用(同一 OS 账号下是**软隔离**、UX 非安全边界):
+
+- **owner(admin)** 在 web Settings → 用户管理建用户,得到一次性个人链接 `?token=ccteam:<hex>`,发给对方;对方打开即以自己身份登录,只见自己的项目/会话。`ccteam status` 在本机随时列出**所有租户的登录链接**(admin/operator 视角;租户之间互不可见)。
+- **每个用户自己的 IM bot**:租户登录 web → Settings →「我的 IM bot」填**自己的** Telegram bot token(或 Lark app),保存即 `getMe` 校验 + 该 bot 监听**即时**起(不重启 daemon)。这个 bot **只**驱动该用户自己的会话,跟别人、跟全局 bot 互不相干。**每个 bot 的 token 必须各不相同**(同 token 两处用会 `getUpdates` 409 冲突)。全局 `~/.ccteam/im/credentials.json` 的 bot 不再共享 —— 它现在是 owner(admin)自己的 bot。
+- **`ccteam init --owner`**:CLI 起手就把项目归给某租户(见 §2)。
 
 ---
 
