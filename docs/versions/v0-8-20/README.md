@@ -12,7 +12,8 @@
 | **W3** | Tenant IM 凭据模型(`TenantTelegram`/`TenantLark`,0600)+ 自助 REST `PUT /me/im`(getMe 校验,replace 语义)+ admin `PUT /users/{id}/im` + Settings「我的 IM bot」 | `ccteam-core/src/tenants.rs` · `ccteam-web/src/routes/users.rs` · SPA `SettingsPage` |
 | **W4** | **per-tenant IM bot 监听/路由/热重载**(核心):channel `"<platform>@<tenant>"`、`build_tenant_channels` fan-out、`chat_can_access` 租户隔离、`platform_of` ACL、changed-scope 热重载 + web PUT 触发 | `ccteam-im/src/{daemon,gateway,transport/*}.rs` |
 
-> **DEFERRED(owner review):** ① web↔IM **收敛**(租户 bot 看自己的 web session)—— gateway 把 web session 统一记 `web:web-api`(非 per-tenant),收敛需更大改,本版做**隔离**(租户 bot 只见自己 IM session)。② **全局 bot「废迁」是 reframe 非 literal**:不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。
+> **W6 — web↔IM 收敛已落地**(owner 拍板「现在收敛、更优雅」):抽 `canonical_owner(frontend)→identity` 把「**谁拥有**」(`owner`)和「**回哪去**」(`reply_to`)彻底分开 —— 租户的 web 和它**自己的** IM bot 共用一个 `web:<tenant>` owner,两个前端互看自己的**全部**会话(web 建 / IM bot 建都互通);回信仍按来源前端(`reply_to`)走、web SSE 按 `sid` 投递**不受影响**。全局/admin bot 路径不变。<br>
+> **仍 DEFERRED(owner 拍板「不改」):** 全局 bot「废迁」是 **reframe 非 literal** —— 不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。
 
 ---
 
@@ -130,7 +131,7 @@ admin 随时看**所有租户的登录链接**(`?token=ccteam:<hex>`),两处:
 - **F4 默认无角色 + 纯 UI 门**:`useMe().isAdmin` 控制运行时/角色可见性,后端创建路由不变。
 
 **Rejected / Deferred(需 owner 拍板是否后续做):**
-- **web↔IM 收敛**:租户 bot 看自己的 **web-created** session —— 当前 gateway 把所有 web session 记 `web:web-api`(共享池,per-tenant 归属在 web REST/project 层,不在 gateway session.owner)。收敛要么让 gateway 按租户记 web session owner(动 v0.8.18 project-ownership 模型,风险大),要么 gateway 查 web-session→tenant。**本版做隔离不做收敛**。`Tenant.linked_chat` 字段留着、未接 per-tenant bot 身份。
+- **web↔IM 收敛(W6 已落地 —— owner 拍板「现在收敛、更优雅」,原 deferred 已做)**:抽纯函数 `canonical_owner(chat)→identity` 把 per-tenant bot(`telegram@<tid>`)与租户 web 统一成 `web:<tid>` owner。gateway 创建会话/项目时盖 canonical identity(`start_session` 的 `GatewaySession.owner = canonical_owner(frontend)`、web `create_session_api_proto` 收 `owner_id`(REST 传 `Identity::web_owner_chat_id()`)、IM `/newproject` 用 `canonical_owner(chat).identity()`),`chat_owner_visible` 按 canonical 比对。**优雅点 = owner(ACL)与 reply_to(投递)彻底分开** —— `reply_to` 仍是来源前端,回信路由不变(web SSE 按 `sid` / IM 按 channel+chat_id;`pump_target` 用 `reply_to` 非 `owner`)。验证:`chat_owner_visible_converges_tenant_web_and_im`(单元)+ `gateway_web_and_tenant_bot_converge`(端到端:web↔bot 双向 + 别租户隔离)。`Tenant.linked_chat` 仍留作显式复联记录。
 - **全局 bot literal「废迁」**:owner 说「废+迁」「admin 也是一个有自己 bot 的租户」。实现为 **reframe**:全局 `credentials.json` bot 不再是共享 bot(租户各有自己的),它只服务 admin;**未**把 admin 塞进 tenants.json 当租户(避免迁移代码,守 pre-v1.0 不迁移规则)。功能上「租户不再用全局 bot」已达成。**若 owner 要 admin 也在注册表当租户,是后续小改。**
 
 **Risks:**
@@ -146,7 +147,6 @@ admin 随时看**所有租户的登录链接**(`?token=ccteam:<hex>`),两处:
 - 规范:`CLAUDE.md §五.8`(beta-gating)。
 
 **Remaining(本版后,按需):**
-- web↔IM 收敛(见上)。
 - admin 也进 tenants.json 当租户(若 owner 要 literal「admin=有 bot 的租户」)。
 - lark 自助流的端到端真机验证(本版 lark 走 with_name + override,与 telegram 对称,但真机未跑)。
 - `GET /me/im`(masked 回当前配置)让自助表单显示现状(当前 replace 语义 + 无 read → 表单从空起,留 UX 余地)。

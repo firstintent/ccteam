@@ -160,6 +160,18 @@ impl Identity {
         }
     }
 
+    /// v0.8.20 — the bare chat_id of this identity's web owner (the part after
+    /// `web:`): `"web-api"` for the admin, else the tenant id. Threaded into the
+    /// gateway's web session creation so a web session is OWNED by `web:<id>`
+    /// (web↔IM convergence — the tenant's own IM bot then sees it too).
+    pub fn web_owner_chat_id(&self) -> String {
+        if self.is_admin {
+            "web-api".to_string()
+        } else {
+            self.id.clone()
+        }
+    }
+
     /// Whether this identity may see a resource owned by `owner` (a project's
     /// `ProjectState.owner` or a session owner). The admin/owner sees
     /// everything; a per-user tenant sees only what it owns (`web:<id>`).
