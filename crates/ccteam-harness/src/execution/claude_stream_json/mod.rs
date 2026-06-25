@@ -36,7 +36,7 @@ pub mod transport;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -197,6 +197,11 @@ fn spawn_status_tap(
 ) {
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
+        // v0.8.20 — throttle the mid-turn context refresh so `/sessions` tracks
+        // a long working turn's GROWING context (authoritative `get_context_usage`
+        // on `assistant` steps), without one control_request per streamed step.
+        let mut last_ctx: Option<Instant> = None;
+        const CTX_REFRESH_MIN: Duration = Duration::from_secs(2);
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -204,16 +209,47 @@ fn spawn_status_tap(
                     Ok(Outbound::Assistant(env)) => {
                         // Keep the live model id current from the API `model` field,
                         // carrying over a user-set `[1m]` tag (the API omits it).
-                        // Context is NOT computed here — it comes ONLY from claude's
-                        // own get_context_usage on TurnResult (never a heuristic).
                         let api_model = env
                             .message
                             .get("model")
                             .and_then(|v| v.as_str())
                             .filter(|m| !m.is_empty());
-                        if let Some(m) = api_model {
+                        // v0.8.20 — ALSO refresh the live context window mid-turn
+                        // (throttled) so `/sessions` reflects a long working turn's
+                        // GROWING context, not only the value frozen at the last
+                        // TurnResult. STILL authoritative — claude's own
+                        // `get_context_usage` (totalTokens/maxTokens), never a
+                        // heuristic. A transient miss leaves the last value (no
+                        // blink): unlike TurnResult, a mid-turn None does NOT clear.
+                        let now = Instant::now();
+                        let fresh_ctx = if last_ctx
+                            .is_none_or(|t| now.duration_since(t) >= CTX_REFRESH_MIN)
+                        {
+                            last_ctx = Some(now);
+                            get_context_usage(&transport).await
+                        } else {
+                            None
+                        };
+                        if api_model.is_some() || fresh_ctx.is_some() {
                             let snapshot = if let Ok(mut s) = status.lock() {
-                                s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                                if let Some(m) = api_model {
+                                    s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                                }
+                                if let Some((used, window)) = fresh_ctx {
+                                    s.context = Some(crate::ContextUsage {
+                                        used_tokens: used,
+                                        window_tokens: window,
+                                    });
+                                    // Tag the 1M model id when the real window is
+                                    // 1M (same rule the TurnResult path applies).
+                                    if window >= 1_000_000 {
+                                        if let Some(m) = s.model.as_mut() {
+                                            if !m.to_ascii_lowercase().ends_with("[1m]") {
+                                                m.push_str("[1m]");
+                                            }
+                                        }
+                                    }
+                                }
                                 Some(s.clone())
                             } else {
                                 None

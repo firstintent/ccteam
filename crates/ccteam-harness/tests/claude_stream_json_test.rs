@@ -127,6 +127,13 @@ while True:
         emit({"type":"result","subtype":"error_during_execution","is_error":True,
               "session_id":sid})
         continue
+    if os.environ.get("FAKE_SJ_NO_RESULT") == "1":
+        # Emit an assistant step but NO result — the turn stays "working...".
+        # Loop back to readline so we still answer control_requests
+        # (get_context_usage) for the mid-turn status refresh.
+        emit({"type":"assistant","session_id":sid,
+              "message":{"role":"assistant","content":[{"type":"text","text":"working..."}]}})
+        continue
     if ask_tool:
         rid = "req-%d" % n
         emit({"type":"control_request","request_id":rid,
@@ -170,6 +177,7 @@ fn setup(tmp: &Path) -> PathBuf {
     std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "5000");
     std::env::set_var("FAKE_SJ_ARGV_LOG", tmp.join("argv.log"));
     std::env::remove_var("FAKE_SJ_DIE_AFTER_INIT");
+    std::env::remove_var("FAKE_SJ_NO_RESULT");
     fake
 }
 
@@ -526,6 +534,66 @@ async fn thread_status_reports_model_and_context_after_turn() {
     );
 
     adapter.close_thread(&handle).await.unwrap();
+}
+
+/// v0.8.20 (owner bug #2) — during a LONG working turn the context window keeps
+/// growing as tools run; `/sessions` must track it, not freeze at the previous
+/// TurnResult. The status tap now re-queries `get_context_usage` (authoritative)
+/// on each assistant step (throttled). Here the fake emits an assistant step but
+/// NEVER a result, so context can ONLY land via the mid-turn path.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn thread_status_refreshes_context_mid_turn_before_result() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_NO_RESULT", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // No turn yet → no context.
+    assert!(adapter
+        .thread_status(&handle)
+        .await
+        .unwrap()
+        .context
+        .is_none());
+
+    // Submit a turn that streams an assistant step but never a result. submit_turn
+    // returns the TurnId once submitted (the turn then streams async via the read
+    // loop + status tap); context must populate from the mid-turn refresh WITHOUT
+    // any TurnResult ever arriving.
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("hi".into()))
+        .await
+        .expect("submit_turn");
+    let mut got = None;
+    for _ in 0..160 {
+        if let Some(c) = adapter.thread_status(&handle).await.unwrap().context {
+            got = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let c = got.expect("context populated mid-turn (no result was emitted)");
+    assert_eq!(
+        c.used_tokens, 12_345,
+        "totalTokens from get_context_usage mid-turn"
+    );
+    assert_eq!(
+        c.window_tokens, 1_000_000,
+        "maxTokens from get_context_usage mid-turn"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    std::env::remove_var("FAKE_SJ_NO_RESULT");
 }
 
 /// Task 1 (durability) — stream-json status is in-memory only, so without
