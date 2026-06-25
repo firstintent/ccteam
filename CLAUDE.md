@@ -5,9 +5,9 @@
 
 ---
 
-## 〇、当前架构红线
+## 〇、当前架构总览
 
-本仓已落地 **「IM 通用模式 + session 独立一等实体 + 插件市场 + 协议轴」**。Claude 两条 spawn 路径:**`ClaudeStreamJsonAdapter`(`stream-json`,默认主路 —— 长驻子进程 + 双向 NDJSON,无 PTY/pane/hook)** 与 `ClaudeTuiAdapter`(`terminal`,tmux + 逐字节镜像);session facet `protocol`=`stream-json`(默认)| `terminal`(+ slash bridge / HITL / 故障矩阵)。架构 SoT = `docs/tech-design.md` + 本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议→代码位置」指针表)。**下文若仍见 orchestrator / 多模式(模式 1/2/3)/ flex / session=role / agent-team init,以本节为准 —— 已退役:**
+本仓已落地 **「IM 通用模式 + session 独立一等实体 + 插件市场 + 协议轴」**。Claude 两条 spawn 路径:**`ClaudeStreamJsonAdapter`(`stream-json`,默认主路 —— 长驻子进程 + 双向 NDJSON,无 PTY/pane/hook)** 与 `ClaudeTuiAdapter`(`terminal`,tmux + 逐字节镜像);session facet `protocol`=`stream-json`(默认)| `terminal`(+ slash bridge / HITL / 故障矩阵)。架构 SoT = `docs/tech-design.md` + 本文(**协议细节一律以代码为准**,见 tech-design 末尾「协议→代码位置」指针表)。本节 = **架构总览**(**不可触碰的红线清单见 §三**,勿与本节混)。**下文若仍见 orchestrator / 多模式(模式 1/2/3)/ flex / session=role / agent-team init,以本节为准 —— 已退役:**
 
 - **核心模型 `chat ⇄ project ⇄ session`,role 是 session 的属性**:一个 chat = 你的终端(IM chat 或 web)→ 切 project → spawn/resume **session**。**session 是独立一等实体**,有持久 `sid`(`s<N>`,单调、扛 daemon 重启、不复用);**role 降为 session 的一个属性**(spawn 时绑 `--agent <role>` persona)。**同一 role 可并存多个 session**(去掉了 `(project,role)` dedup)。session 启动:**默认 `stream-json`**(长驻子进程,无 hook/pane);`terminal` 协议才走 `claude [--agent <role>] --name|--resume`(tmux send-keys + hooks,`Stop`→`chat_turn_completed`)。role 库 = 项目级 `.claude/agents/<role>.md`;`ccteam init` 种默认 `cto` role(chat-first 管家:懂 ccteam、**推荐** work-role,本版只推荐,用户自己 `/role` 切)。
 - **turns / marker 全按 sid**:turns = `.ccteam/chat/<sid>/turns.jsonl`、transcript cursor / active-session marker 全按 sid;gateway `spawn_event_pump` 的 ANSWER 分支按 sid `append_turn`(live daemon 唯一 turns writer)。**terminal 协议**额外:pane = `ccteam-chat-<slug>-<sid>` + `CCTEAM_CHAT_SID` pane env(daemon HTTP 加 `X-Ccteam-Sid` → hook/in-pane forwarder 报 sid);**stream-json 默认路无 pane/hook**,sid 在 adapter 内。
