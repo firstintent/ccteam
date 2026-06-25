@@ -64,39 +64,36 @@ Build your team by dropping `.md` files into `.claude/agents/` — or one-click-
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
 
-# 1. Install the ccteam binary (one line, no Rust toolchain needed):
+# 1. Install ccteam (prebuilt binary, no Rust toolchain → ~/.local/bin/ccteam):
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-#    Installs to ~/.local/bin/ccteam. If that isn't on your PATH, follow the
-#    printed export hint and restart your shell.
-#    System-wide:        CCTEAM_INSTALL_DIR=/usr/local/bin curl ... | sh
-#    Build from source:  cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-```
 
-```bash
-# 2. Turn a directory into a ccteam project (operates on the current directory):
-cd ~/code/myproject && ccteam init      # or, from anywhere:  ccteam init --in ~/code/myproject
-
-# 3. One-time setup — registers the ccteam MCP server for Claude and Codex,
-#    sets your IM token and preferences (interactive menu, or `config <key> <value>`):
+# 2. Initialize a project, then one-time setup (MCP for Claude + Codex, IM token, prefs):
+cd ~/code/myproject && ccteam init
 ccteam config
 
-# 4. Start the gateway (IM gateway + web console + resource API + MCP socket).
-#    It runs in the FOREGROUND — for an always-on daemon, run it detached
-#    (or install it as a systemd / launchd service):
-nohup ccteam start > ~/ccteam.log 2>&1 &
-#    Foreground instead? just `ccteam start` (Ctrl+C to stop). Stop anytime: `ccteam stop`
+# 3. Start the daemon — IM gateway + web console + resource API + MCP, one process:
+ccteam start                              # foreground; detached: nohup ccteam start >~/ccteam.log 2>&1 &
+```
+
+Then drive it from **either** surface — the web console or IM:
+
+```text
+# Web console — open in your browser:
+http://localhost:7331
+#   Token auth: paste the token shown when the daemon starts
+#   (also stored at ~/.ccteam/secrets/web-token).
 ```
 
 ```text
-# 5. Drive it from IM (Telegram):
-/pair <code>            # link your chat to the daemon (code from `ccteam config`)
-/cd myproject           # switch to a project → a `cto` session spins up; start chatting
-/role backend-dev       # become a work-role to do the job
-/new   /use   @handle   # open / switch / address multiple sessions
-@ccteam status          # group control: status / pause / cost / stop
+# IM (Telegram):
+/pair <code>            # link your chat (code from `ccteam config`)
+/cd myproject           # switch project → a `cto` session spins up; start chatting
+/role backend-dev       # switch to a work-role
+/new   /use   @handle   # open / switch / address sessions
+@ccteam status          # group control: status / cost / stop
 ```
 
-Manage it from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
+Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`. Build from source instead: `cargo install --git https://github.com/firstintent/ccteam ccteam-cli`.
 
 **Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
 

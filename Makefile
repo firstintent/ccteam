@@ -1,116 +1,64 @@
-# ccteam Makefile — manual-verification convenience.
+# ccteam Makefile — thin convenience wrappers around cargo / npm / the CLI.
 #
-# Targets are deliberately thin wrappers around `cargo` / shell. The point
-# is to make repeated "rebuild → reinstall → wipe state → run a project →
-# observe → wipe" loops cheap. Anything that touches user state is in a
-# named target, never on a default code path.
-#
-# Quick start:
-#   make help            # list everything
+#   make gate            # full pre-push gate: fmt + clippy + tests + SPA
 #   make install         # build release + symlink to $(BIN_DIR)/ccteam
-#   make doctor          # health-check (binary must be installed)
-#   make wipe            # safe reset: kills tmux sessions, removes our 8
-#                        # agent symlinks, clears runtime state dirs.
-#                        # Keeps ~/.ccteam/phases & ~/.ccteam/memory.
-#   make uninstall       # remove the symlink (does not touch state).
+#   make start           # run the daemon (IM gateway + web UI + MCP)
+#   make wipe            # reset runtime state (keeps secrets + config)
 #
-# Override the install location with `make BIN_DIR=/usr/local/bin install`.
+# Override locations:  make BIN_DIR=/usr/local/bin install
+#                       make CCTEAM_HOME=~/.ccteam2 wipe
 
 # --- Configuration -----------------------------------------------------------
 
-BIN_DIR        ?= $(HOME)/.local/bin
-BIN_NAME       := ccteam
-BIN_LINK       := $(BIN_DIR)/$(BIN_NAME)
-RELEASE_BIN    := $(CURDIR)/target/release/$(BIN_NAME)
+BIN_DIR      ?= $(HOME)/.local/bin
+BIN_NAME     := ccteam
+BIN_LINK     := $(BIN_DIR)/$(BIN_NAME)
+RELEASE_BIN  := $(CURDIR)/target/release/$(BIN_NAME)
+CCTEAM_HOME  ?= $(HOME)/.ccteam
+WEB_DIR      := $(CURDIR)/crates/ccteam-web/web
+WEB_PORT     ?= 7331
 
-CCTEAM_HOME    ?= $(HOME)/.ccteam
-PROJECTS_ROOT  ?= $(HOME)/projects
-CLAUDE_AGENTS  := $(HOME)/.claude/agents
-
-# The eight plugin-agent files `bootstrap_project` symlinks into
-# ~/.claude/agents/. Kept in sync with crates/ccteam-core/src/tool_surface.rs
-# RECOMMENDED_AGENTS. `make agents-clean` only touches these names so user-
-# authored agents in the same dir survive.
-PLUGIN_AGENTS  := \
-    code-reviewer.md \
-    silent-failure-hunter.md \
-    pr-test-analyzer.md \
-    type-design-analyzer.md \
-    comment-analyzer.md \
-    code-architect.md \
-    code-explorer.md \
-    code-simplifier.md
-
-# Runtime dirs under $(CCTEAM_HOME) that `make state-clean` resets. Phases
-# and memory are intentionally preserved (phases are part of install, memory
-# is the cross-project RAG store).
-RUNTIME_DIRS   := state progress inbox queue control log
-
-# Connection config for notes sync lives in .env (gitignored — keeps the real
-# host/IP out of version control). Copy .env.example → .env and fill in. The
-# include comes before the defaults below, so .env values win; the defaults
-# are inert placeholders that make the targets fail loudly if .env is missing.
--include $(CURDIR)/.env
-
-# notes/ is gitignored scratch (architecture diagrams, prototypes, ad-hoc
-# analysis). These targets mirror it to/from the remote box, full overwrite
-# (destination is removed first, so it's a true mirror, not a merge).
-NOTES_DIR      := $(CURDIR)/notes
-NOTES_HOST     ?= __UNSET__
-NOTES_KEY      ?= $(HOME)/.ssh/id_ed25519
-NOTES_REMOTE   ?= __UNSET__
-NOTES_SSH_OPTS := -i $(NOTES_KEY) -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15
+# Runtime dirs reset by `make wipe` (W7 layout: ~/.ccteam/{hooks,run,state,
+# secrets,cache}). Kept: secrets/ (web-token, IM creds, per-user files),
+# config.yaml, hooks/ — so creds + prefs survive a reset.
+WIPE_DIRS    := state run cache
 
 .DEFAULT_GOAL := help
-.PHONY: help build release clean check fmt clippy test \
+.PHONY: help build release clean fmt fmt-check clippy check test test-web \
+        web web-deps web-check gate \
         install uninstall reinstall \
-        setup start attach \
-        doctor tool-surface \
-        tmux-clean agents-clean state-clean wipe nuke \
-        notes-push notes-pull notes-env-check
+        config init start stop status doctor \
+        wipe nuke
 
 # --- Help --------------------------------------------------------------------
 
 help:
-	@printf '\033[1mccteam Makefile\033[0m — manual-verification helpers\n\n'
+	@printf '\033[1mccteam Makefile\033[0m\n\n'
 	@printf '\033[1mBuild & test\033[0m\n'
-	@printf '  make build         cargo build (debug)\n'
-	@printf '  make release       cargo build --release\n'
-	@printf '  make test          cargo test (full suite)\n'
-	@printf '  make check         cargo check + fmt --check + clippy\n'
-	@printf '  make fmt           cargo fmt\n'
-	@printf '  make clippy        cargo clippy -- -D warnings\n'
-	@printf '  make clean         cargo clean\n\n'
+	@printf '  make build        cargo build (debug)\n'
+	@printf '  make release      cargo build --release\n'
+	@printf '  make fmt          cargo fmt --all\n'
+	@printf '  make clippy       cargo clippy --workspace --all-targets -D warnings\n'
+	@printf '  make test         cargo test (workspace, excl ccteam-web)\n'
+	@printf '  make test-web     cargo test -p ccteam-web\n'
+	@printf '  make web          build the SPA (tsc + vite)\n'
+	@printf '  make web-check    SPA eslint + vitest\n'
+	@printf '  \033[1mmake gate\033[0m         full pre-push gate (fmt+clippy+test+test-web+web-check)\n'
+	@printf '  make clean        cargo clean + rm SPA dist\n\n'
 	@printf '\033[1mInstall\033[0m\n'
-	@printf '  make install       symlink %s → %s\n' '$(RELEASE_BIN)' '$(BIN_LINK)'
-	@printf '  make uninstall     remove %s (state untouched)\n' '$(BIN_LINK)'
-	@printf '  make reinstall     uninstall + install\n\n'
-	@printf '\033[1mFirst-time setup & run (end-to-end)\033[0m\n'
-	@printf '  make setup HANDLE=<h>   one-shot: init + 4 doctor installs + tool-surface\n'
-	@printf '  make start              ccteam start --foreground (Terminal A)\n'
-	@printf '  make attach HANDLE=<h>  tmux attach -t ccteam-meta-<h> (Terminal B)\n\n'
-	@printf '\033[1mHealth check\033[0m\n'
-	@printf '  make doctor        ccteam doctor --tool-surface\n'
-	@printf '  make tool-surface  alias for doctor\n\n'
-	@printf '\033[1mnotes/ sync (scratch ⇄ remote box)\033[0m\n'
-	@printf '  make notes-push    local notes/ → remote box (full overwrite)\n'
-	@printf '  make notes-pull    remote box → local notes/ (full overwrite)\n'
-	@printf '                     (host/path from .env — see .env.example)\n\n'
-	@printf '\033[1mState reset (destructive — read help text)\033[0m\n'
-	@printf '  make tmux-clean    kill all ccteam-* tmux sessions\n'
-	@printf '  make agents-clean  remove the 8 plugin agent symlinks we installed\n'
-	@printf '                     (user-authored agents in %s preserved)\n' '$(CLAUDE_AGENTS)'
-	@printf '  make state-clean   wipe runtime dirs under %s\n' '$(CCTEAM_HOME)'
-	@printf '                     (kept: phases, memory)\n'
-	@printf '  make wipe          tmux-clean + agents-clean + state-clean\n'
-	@printf '  make nuke          rm -rf %s + rm -rf %s' '$(CCTEAM_HOME)' '$(PROJECTS_ROOT)'
-	@printf ' (requires CONFIRM=1)\n\n'
-	@printf '\033[1mOverrides\033[0m\n'
-	@printf '  BIN_DIR        install location (default $(BIN_DIR))\n'
-	@printf '  CCTEAM_HOME    ccteam state root (default $(CCTEAM_HOME))\n'
-	@printf '  PROJECTS_ROOT  projects root      (default $(PROJECTS_ROOT))\n'
-	@printf '  NOTES_HOST     notes sync remote  (set in .env — see .env.example)\n'
-	@printf '  NOTES_REMOTE   remote notes path  (set in .env)\n'
+	@printf '  make install      symlink %s -> %s\n' '$(RELEASE_BIN)' '$(BIN_LINK)'
+	@printf '  make uninstall    remove the symlink (state untouched)\n'
+	@printf '  make reinstall    uninstall + install\n\n'
+	@printf '\033[1mRun (daemon = IM gateway + web UI + MCP, one process)\033[0m\n'
+	@printf '  make config       ccteam config   (register MCP + IM creds + prefs)\n'
+	@printf '  make init         ccteam init     (initialize the current dir as a project)\n'
+	@printf '  make start        ccteam start    (web UI at http://localhost:%s)\n' '$(WEB_PORT)'
+	@printf '  make status       ccteam status   (daemon health + sessions)\n'
+	@printf '  make doctor       ccteam doctor --verify-mcp\n'
+	@printf '  make stop         ccteam stop     (stop the daemon; sessions resume on next start)\n\n'
+	@printf '\033[1mState reset (destructive)\033[0m\n'
+	@printf '  make wipe         rm %s/{%s} (keeps secrets/, config.yaml, hooks/)\n' '$(CCTEAM_HOME)' 'state,run,cache'
+	@printf '  make nuke         rm -rf %s   (requires CONFIRM=1)\n' '$(CCTEAM_HOME)'
 
 # --- Build & test ------------------------------------------------------------
 
@@ -122,9 +70,7 @@ release:
 
 clean:
 	cargo clean
-
-check: fmt-check clippy
-	cargo check --workspace --all-targets
+	@rm -rf $(WEB_DIR)/dist
 
 fmt:
 	cargo fmt --all
@@ -135,21 +81,39 @@ fmt-check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
+check: fmt-check clippy
+	cargo check --workspace --all-targets
+
+# Rust core gate — ccteam-web runs separately (its WS/PTY tests need a real
+# terminal). `--no-fail-fast` so one env-flaky test doesn't mask the count.
 test:
-	cargo test --workspace
+	cargo test --workspace --exclude ccteam-web --no-fail-fast
+
+test-web:
+	cargo test -p ccteam-web
+
+web-deps:
+	cd $(WEB_DIR) && npm ci
+
+web:
+	cd $(WEB_DIR) && npm run build
+
+web-check:
+	cd $(WEB_DIR) && npm run lint && npm run test:unit
+
+# The full pre-push gate. Mirrors CI + the ship discipline.
+gate: fmt-check clippy test test-web web-check
+	@printf '\n\033[32mgate green.\033[0m\n'
 
 # --- Install / uninstall -----------------------------------------------------
 #
-# We install via symlink, not copy: rebuild → newer binary auto-picked up,
-# no need to `make install` after every `cargo build --release`. Use a
-# copy if you prefer pinned-binary semantics:
-#   install -m 0755 $(RELEASE_BIN) $(BIN_LINK)
+# Symlink (not copy): a fresh `cargo build --release` is picked up without a
+# re-install. For pinned-binary semantics use `install -m0755 $(RELEASE_BIN)`.
 
 install: release
 	@mkdir -p $(BIN_DIR)
 	@ln -sf $(RELEASE_BIN) $(BIN_LINK)
-	@printf 'installed: %s → %s\n' '$(BIN_LINK)' '$(RELEASE_BIN)'
-	@printf 'verify with: ccteam --version\n'
+	@printf 'installed: %s -> %s\n' '$(BIN_LINK)' '$(RELEASE_BIN)'
 	@case ":$$PATH:" in \
 	    *:$(BIN_DIR):*) ;; \
 	    *) printf '\033[33mwarning:\033[0m %s is not on PATH; add it to your shell rc.\n' '$(BIN_DIR)' ;; \
@@ -157,138 +121,58 @@ install: release
 
 uninstall:
 	@if [ -L $(BIN_LINK) ] || [ -f $(BIN_LINK) ]; then \
-	    rm -f $(BIN_LINK); \
-	    printf 'removed: %s\n' '$(BIN_LINK)'; \
+	    rm -f $(BIN_LINK) && printf 'removed: %s\n' '$(BIN_LINK)'; \
 	else \
 	    printf 'not installed: %s\n' '$(BIN_LINK)'; \
 	fi
 
 reinstall: uninstall install
 
-# --- First-time setup & run --------------------------------------------------
+# --- Run ---------------------------------------------------------------------
 #
-# `make setup HANDLE=cto` bundles the six idempotent first-time steps so users
-# don't have to memorize / paste-and-edit the doctor command list. `make start`
-# and `make attach` wrap the canonical Quick start two-terminal flow.
+# `ccteam start` runs ONE process: the IM gateway + the embedded web UI
+# (default bind 0.0.0.0:$(WEB_PORT)) + the MCP socket. Foreground is the only
+# mode. Sessions are spawned on demand and resume by sid across restarts.
 
-HANDLE ?=
+config:
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
+	$(BIN_NAME) config
 
-setup:
-	@if [ -z "$(HANDLE)" ]; then \
-	    printf '\033[31merror:\033[0m HANDLE is required. Example: make setup HANDLE=cto\n' >&2; \
-	    exit 1; \
-	fi
-	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install` first\n' '$(BIN_NAME)' >&2; exit 1; }
+init:
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
 	$(BIN_NAME) init
-	$(BIN_NAME) doctor --install-skill
-	$(BIN_NAME) doctor --install-mcp
-	$(BIN_NAME) doctor --install-memory-bridge
-	$(BIN_NAME) doctor --install-meta-agent $(HANDLE)
-	$(BIN_NAME) doctor --tool-surface
-	@printf '\n\033[32mready.\033[0m\n'
-	@printf 'next:\n'
-	@printf '  Terminal A: make start                 (or: ccteam start --foreground)\n'
-	@printf '  Terminal B: make attach HANDLE=%s     (or: tmux attach -t ccteam-meta-%s)\n' '$(HANDLE)' '$(HANDLE)'
 
 start:
 	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
-	$(BIN_NAME) start --foreground
+	@printf 'web UI: http://localhost:%s  (token printed below if auth is on)\n' '$(WEB_PORT)'
+	$(BIN_NAME) start
 
-attach:
-	@if [ -z "$(HANDLE)" ]; then \
-	    printf '\033[31merror:\033[0m HANDLE is required. Example: make attach HANDLE=cto\n' >&2; \
-	    exit 1; \
-	fi
-	@command -v tmux >/dev/null || { printf '\033[31merror:\033[0m tmux not installed\n' >&2; exit 1; }
-	tmux attach -t ccteam-meta-$(HANDLE)
-
-# --- Health check ------------------------------------------------------------
+status:
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
+	$(BIN_NAME) status
 
 doctor:
 	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
-	$(BIN_NAME) doctor --tool-surface
+	$(BIN_NAME) doctor --verify-mcp
 
-tool-surface: doctor
+stop:
+	@command -v $(BIN_NAME) >/dev/null || { printf '\033[31merror:\033[0m %s not on PATH; run `make install`\n' '$(BIN_NAME)' >&2; exit 1; }
+	$(BIN_NAME) stop
 
 # --- State reset (destructive) -----------------------------------------------
 
-tmux-clean:
-	@if ! command -v tmux >/dev/null; then \
-	    printf 'tmux not installed; nothing to clean\n'; exit 0; \
-	fi; \
-	sessions=$$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^ccteam-' || true); \
-	if [ -z "$$sessions" ]; then \
-	    printf 'no ccteam-* tmux sessions\n'; \
-	else \
-	    for s in $$sessions; do \
-	        tmux kill-session -t "$$s" && printf 'killed: %s\n' "$$s"; \
-	    done; \
-	fi
-
-agents-clean:
-	@for f in $(PLUGIN_AGENTS); do \
-	    target="$(CLAUDE_AGENTS)/$$f"; \
-	    if [ -L "$$target" ]; then \
-	        rm -f "$$target" && printf 'unlinked: %s\n' "$$target"; \
-	    elif [ -f "$$target" ]; then \
-	        printf '\033[33mskip\033[0m (regular file, user-authored?): %s\n' "$$target"; \
-	    fi; \
-	done
-
-state-clean:
-	@if [ ! -d "$(CCTEAM_HOME)" ]; then \
-	    printf 'no $(CCTEAM_HOME); nothing to clean\n'; exit 0; \
-	fi; \
-	for d in $(RUNTIME_DIRS); do \
+wipe:
+	@if [ ! -d "$(CCTEAM_HOME)" ]; then printf 'no %s; nothing to wipe\n' '$(CCTEAM_HOME)'; exit 0; fi
+	@for d in $(WIPE_DIRS); do \
 	    full="$(CCTEAM_HOME)/$$d"; \
-	    if [ -d "$$full" ]; then \
-	        rm -rf "$$full" && printf 'wiped: %s\n' "$$full"; \
-	    fi; \
-	done; \
-	printf 'kept: %s/phases  %s/memory\n' '$(CCTEAM_HOME)' '$(CCTEAM_HOME)'
-
-wipe: tmux-clean agents-clean state-clean
-	@printf '\nwipe complete. binary still installed; run `make doctor` to verify.\n'
+	    if [ -d "$$full" ]; then rm -rf "$$full" && printf 'wiped: %s\n' "$$full"; fi; \
+	done
+	@printf 'kept: %s/{secrets,hooks}  %s/config.yaml\n' '$(CCTEAM_HOME)' '$(CCTEAM_HOME)'
 
 nuke:
 	@if [ "$(CONFIRM)" != "1" ]; then \
-	    printf '\033[31mrefusing to nuke without CONFIRM=1\033[0m\n'; \
-	    printf 'this would `rm -rf %s` and `rm -rf %s`.\n' '$(CCTEAM_HOME)' '$(PROJECTS_ROOT)'; \
+	    printf '\033[31mrefusing to nuke without CONFIRM=1\033[0m — would `rm -rf %s`.\n' '$(CCTEAM_HOME)'; \
 	    printf 'rerun:  make nuke CONFIRM=1\n'; \
 	    exit 1; \
 	fi
-	$(MAKE) tmux-clean
-	$(MAKE) agents-clean
-	@if [ -d "$(CCTEAM_HOME)" ]; then \
-	    rm -rf "$(CCTEAM_HOME)" && printf 'rmrf: %s\n' '$(CCTEAM_HOME)'; \
-	fi
-	@if [ -d "$(PROJECTS_ROOT)" ]; then \
-	    rm -rf "$(PROJECTS_ROOT)" && printf 'rmrf: %s\n' '$(PROJECTS_ROOT)'; \
-	fi
-	@printf '\nnuke complete. binary still installed; run `make doctor` to verify.\n'
-
-# --- notes/ sync (scratch ⇄ remote dev box) ----------------------------------
-#
-# Full-overwrite mirror, not a merge: the destination notes/ is removed before
-# copy, so deletions propagate. notes/ is gitignored, so this never touches
-# tracked state. Override NOTES_HOST / NOTES_REMOTE / NOTES_KEY as needed.
-
-notes-env-check:
-	@if [ "$(NOTES_HOST)" = "__UNSET__" ] || [ "$(NOTES_REMOTE)" = "__UNSET__" ]; then \
-	    printf '\033[31merror:\033[0m NOTES_HOST / NOTES_REMOTE not set.\n' >&2; \
-	    printf 'create your .env first:  cp .env.example .env   then edit it.\n' >&2; \
-	    exit 1; \
-	fi
-
-notes-push: notes-env-check
-	@printf 'push: %s → %s:%s (overwrite)\n' '$(NOTES_DIR)' '$(NOTES_HOST)' '$(NOTES_REMOTE)'
-	@if [ ! -d "$(NOTES_DIR)" ]; then printf '\033[31merror:\033[0m no local %s\n' '$(NOTES_DIR)' >&2; exit 1; fi
-	ssh $(NOTES_SSH_OPTS) $(NOTES_HOST) 'rm -rf $(NOTES_REMOTE) && mkdir -p $(dir $(NOTES_REMOTE))'
-	scp $(NOTES_SSH_OPTS) -r $(NOTES_DIR) $(NOTES_HOST):$(dir $(NOTES_REMOTE))
-	@printf '\033[32mdone.\033[0m remote notes/ now mirrors local.\n'
-
-notes-pull: notes-env-check
-	@printf 'pull: %s:%s → %s (overwrite)\n' '$(NOTES_HOST)' '$(NOTES_REMOTE)' '$(NOTES_DIR)'
-	rm -rf $(NOTES_DIR)
-	scp $(NOTES_SSH_OPTS) -r $(NOTES_HOST):$(NOTES_REMOTE) $(NOTES_DIR)
-	@printf '\033[32mdone.\033[0m local notes/ now mirrors remote.\n'
+	@if [ -d "$(CCTEAM_HOME)" ]; then rm -rf "$(CCTEAM_HOME)" && printf 'rmrf: %s\n' '$(CCTEAM_HOME)'; fi
