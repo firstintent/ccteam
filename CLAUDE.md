@@ -38,7 +38,7 @@
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 
 - **配置**:role 行为 = 项目级 `.claude/agents/<role>.md`(`ccteam init` 种默认 `cto`)。**项目知识层(`CLAUDE.md`/`AGENTS.md`)归 vendor + 项目自己,ccteam 不改写已有内容**(v0.8.9 owner 决策:仅对**真空项目** scaffold 占位 `AGENTS.md` + `CLAUDE.md`=`@AGENTS.md`,绝不覆盖;详见 §三红线)。**多-agent 编排已推迟**:`ccteam init` 仍 scaffold 一份 `workflow.yaml` 占位,但其声明的 agent 拓扑(trigger/并发/vendor)**当前不被驱动**(daemon 不 tick、不 orchestrate;`ccteam-flow` 未接);编排方式仍在探索 —— 倾向 **prompt 层 skill over `session_*` 工具**,非 Rust 特性。
-- **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session(按持久 sid):Claude 走 `claude [--agent <role>]` tmux 长 session(send-keys + transcript + hook;空 role = roleless 裸 claude),Codex best-effort;两 vendor 归一成中立 `CanonicalEvent`。
+- **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session(按持久 sid):Claude **默认 `stream-json`**(长驻子进程 + 双向 NDJSON,无 pane/hook),`terminal` 协议才走 tmux 长 session(send-keys + transcript + hook);空 role = roleless 裸 claude,Codex best-effort;两 vendor 归一成中立 `CanonicalEvent`。
 - **状态 SoT**:`progress.jsonl` 业务事件(`harness/progress_bridge` 单一权威);chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(按 sid;不依赖 Anthropic 内部 `~/.claude/projects/`)。
 - **接口**:15 个 MCP 工具 `mcp__ccteam__{admin_,chat_,advise_,session_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ 标准资源 API `/api/v1`(含 `marketplace` + `status` + `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/pair /cd /use /new /role @handle @ccteam`)+ 统一 chat-shell web(per-session `/chat/s/:sid` Chat|终端 + 底部导航 插件市场/Status/Settings)。
 - **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ `ccteam config` 注册 MCP server(给 Claude `~/.claude.json` + Codex `~/.codex/config.toml` 都写)。**ccteam 是纯 CLI、不是 vendor 插件**,无 `/plugin` 步;`cargo install --git …` 是 fallback。
@@ -89,8 +89,6 @@
 **vendor 红线**(V0.6 F107 / F112):
 - ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override)。
 - `vendor: AgentVendor::{Claude, Codex, …}` 是 trait 一等公民(可扩展),无 default —— 必须 explicit(session spawn;`workflow.yaml` 的 vendor 同理,但编排已推迟,见 §一)。
-
-**skill 自洽红线**:**本版 0 个 ccteam 自带 skill**(repo 根 `skills/` 目录已删,原 skill 功能落 MCP 工具 + cto role + work-role + `config` CLI)。规则保留供日后若引入 bundled skill 时遵守:`skills/*/SKILL.md` + body 随安装装到用户机器,**必须**自洽 ── 禁版本号(`V0.X.Y`)/ 禁 `docs/versions/v0-X-Y/` 引用 / 禁 Wave-N / 禁 F-tag / 禁 ship-status creep(shipped / "ship gate" 等)/ 禁 PR # / 禁 commit ref。允许:sibling skill 引用、MCP tool 名、CLI 命令、稳定 user-facing docs(`docs/usage.md`)。Ship gate:`grep -rnE "V\d+\.\d+|docs/versions|Wave [0-9]|F[0-9]+[a-z]?\b|ship gate|shipped" skills/*/SKILL.md` 必须 0 命中(无 `skills/` 目录 → 天然 0)。
 
 ## 四、扩展机制速查
 
