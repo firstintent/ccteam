@@ -631,18 +631,22 @@ mod tests {
 
     #[test]
     fn cto_role_template_has_fresh_user_guidance() {
+        // Whitespace-normalized so the assertions check for the GUIDANCE, not the
+        // prose line-wrapping (a needle must not silently fail when a sentence
+        // happens to wrap across two lines).
+        let body = CTO_ROLE_MD.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
-            "新用户问",
+            "New user asking",
             "ccteam config",
             "ccteam start",
             "/pair <code>",
-            "/cd <项目>",
-            "roleless = 裸 Claude",
-            "cto` = 默认管家",
-            "work-role = `.claude/agents/<role>.md`",
+            "/cd <project>",
+            "roleless = bare Claude",
+            "`cto` = the default steward",
+            "work-role = a specialist in `.claude/agents/<role>.md`",
         ] {
             assert!(
-                CTO_ROLE_MD.contains(needle),
+                body.contains(needle),
                 "cto_role.md missing fresh-user guidance {needle:?}"
             );
         }
@@ -651,11 +655,11 @@ mod tests {
     #[test]
     fn cto_role_template_describes_session_spawn_as_fresh_sid() {
         assert!(
-            CTO_ROLE_MD.contains("每次调用都铸一个新 sid"),
+            CTO_ROLE_MD.contains("mints a NEW sid"),
             "cto_role.md must say session_spawn mints a fresh sid"
         );
         assert!(
-            !CTO_ROLE_MD.contains("同 (项目, role) 幂等"),
+            !CTO_ROLE_MD.contains("(project, role) dedup") && !CTO_ROLE_MD.contains("idempotent"),
             "cto_role.md must not describe removed (project, role) dedup"
         );
     }

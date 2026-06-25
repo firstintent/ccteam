@@ -110,7 +110,7 @@
 ## 五、PR / 实现纪律
 
 1. **每个改动映射**(commit/PR 描述均可):`requirements.md` 某条痛点 + `tech-design.md` 某节;改协议**以代码为 SoT**(同步 tech-design 末尾「协议→代码」指针表)
-2. **commit 用英语**;文档与 agent prompt 用中文
+2. **commit 用英语;agent prompt 用英语**(**产品化、简洁,非冗长** —— ccteam 自写的如 `cto_role.md`;hub vendored prompt 随上游);项目文档(CLAUDE.md / `docs/`)用中文
 3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 新旧状态数据不兼容时**不写迁移步骤/兼容分支**,直接「清旧数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重 `ccteam init`」;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
 4. **不写 backwards-compat shim**
 5. **优先编辑现有文件,不轻易新建**
