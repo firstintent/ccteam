@@ -26,7 +26,7 @@
 // approval routes through the gateway's pending machinery (NOT a turn).
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown, MessageSquare, Square, Terminal } from "lucide-react";
+import { ArrowDown, LogOut, MessageSquare, Terminal } from "lucide-react";
 import { Composer } from "../components/Composer";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
@@ -216,13 +216,13 @@ export default function SessionView({
   const stopActive = useCallback(() => {
     apiStopSession(sid)
       .then(() => {
-        pushRow({ kind: "system", content: "会话已停止" });
+        pushRow({ kind: "system", content: "会话已退出" });
         onSessionChanged?.();
       })
       .catch((e) => {
         pushRow({
           kind: "system",
-          content: `停止失败: ${e instanceof Error ? e.message : "unknown"}`,
+          content: `退出失败: ${e instanceof Error ? e.message : "unknown"}`,
         });
       });
   }, [sid, pushRow, onSessionChanged]);
@@ -230,7 +230,7 @@ export default function SessionView({
   // ---- interrupt the running turn (keep the session) ---------------------
   // The composer's busy-state Stop button stops only the in-flight turn — the
   // session survives (context kept), so you can then /model switch or send a
-  // follow-up. Distinct from the sub-bar's "停止" which DESTROYS the session.
+  // follow-up. Distinct from the sub-bar's "退出" which DESTROYS the session.
   const interruptActive = useCallback(() => {
     apiInterruptSession(sid)
       .then(() => {
@@ -326,10 +326,10 @@ export default function SessionView({
         <button
           type="button"
           onClick={stopActive}
-          title="停止会话"
+          title="退出会话（销毁该 session）"
           className="h-7 px-2 rounded text-xs flex items-center gap-1 text-text-dim hover:text-status-error hover:bg-surface-800"
         >
-          <Square className="h-3.5 w-3.5" /> 停止
+          <LogOut className="h-3.5 w-3.5" /> 退出
         </button>
         <div className="flex items-center gap-1 rounded-md bg-surface-800 p-0.5">
           <button
@@ -374,17 +374,11 @@ export default function SessionView({
         <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
       ) : (
         <>
-          {isStreamJson ? (
-            <div className="shrink-0 px-4 py-1.5 text-[11px] text-text-dim border-b border-surface-700/30">
-              stream-json session 无终端（薄/默认路径）；需要终端镜像 / attach /
-              截图请新建 terminal session。
-            </div>
-          ) : null}
           <div className="relative flex-1 min-h-0">
           <div
             ref={scrollRef}
             onScroll={onTranscriptScroll}
-            className="h-full overflow-y-auto p-4 space-y-3"
+            className="h-full overflow-y-auto overflow-x-hidden p-4 space-y-3"
           >
             {rows.map((row) => {
               if (row.kind === "approval") {

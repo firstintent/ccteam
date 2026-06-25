@@ -281,9 +281,6 @@ export default function ChatConsole() {
         <span className="text-sm font-semibold">
           ccteam <span className="text-brand-400">chat</span>
         </span>
-        <span className="hidden sm:inline text-[11px] font-mono text-text-dim px-1.5 py-0.5 rounded bg-surface-800">
-          per-session · /api/v1
-        </span>
         <span className="flex-1" />
         {/* Cost pill — today's daily-spend / 24h-budget rollup; click → /status. */}
         <CostPill />
@@ -419,9 +416,6 @@ export default function ChatConsole() {
               list above IS the chat navigation (click a session = its chat),
               so there's NO "Chat" item — only the 3 global views. */}
           <nav className="border-t border-surface-700/40 p-2">
-            <p className="px-2 pb-2 pt-1 text-[11px] leading-snug text-text-dim/80">
-              ↑ 点上面的会话 = 进入它的聊天（每个 session 一个独立对话）。下面是全局页：
-            </p>
             <div className="space-y-0.5">
               <SidebarNavLink
                 to="/marketplace"
