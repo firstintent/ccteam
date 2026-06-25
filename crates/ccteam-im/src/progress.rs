@@ -345,6 +345,25 @@ impl ProgressFold {
             .join(" · ")
     }
 
+    /// Compact per-tool counts for the IM `/status` fleet line, e.g.
+    /// `read×16·bash×8` — labels + counts only (no emoji, no spaces), joined
+    /// by `·`. `None` when nothing tool-like has happened yet (the working
+    /// line then shows only state + model + ctx). Shares the SAME per-category
+    /// buckets the live IM status message folds, so `/status` can never drift
+    /// from the progress text.
+    pub fn compact_counts(&self) -> Option<String> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        Some(
+            self.buckets
+                .iter()
+                .map(|b| format!("{}×{}", b.label, b.count))
+                .collect::<Vec<_>>()
+                .join("·"),
+        )
+    }
+
     fn head(&self) -> &'static str {
         if self.drafting {
             "✍️ drafting…"
@@ -418,6 +437,18 @@ mod tests {
         assert!(r.contains("📖 read ×2"), "got: {r}");
         assert!(r.contains("🔧 bash ×1"), "got: {r}");
         assert!(r.starts_with("⏳ working…"), "got: {r}");
+    }
+
+    #[test]
+    fn compact_counts_is_label_times_count_no_emoji() {
+        let mut f = ProgressFold::new();
+        // Empty fold → no compact summary.
+        assert_eq!(f.compact_counts(), None);
+        f.apply(&started_tool("t1", "Read", json!({"file_path": "/a"})));
+        f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"})));
+        f.apply(&started_tool("t3", "Bash", json!({"command": "ls"})));
+        // `/status`-shaped: labels + counts only, joined by `·`, no emoji/space.
+        assert_eq!(f.compact_counts().as_deref(), Some("read×2·bash×1"));
     }
 
     #[test]

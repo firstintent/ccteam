@@ -122,6 +122,28 @@ struct GatewaySession {
     /// once per turn (TAKE → None). Best-effort: a lost clear just leaves a
     /// stale 👀, never affects delivery.
     pending_reaction: Arc<std::sync::Mutex<Option<String>>>,
+    /// v0.8.19 — `/status` fleet-health tracking. When a real **Turn** is
+    /// submitted (the Turn branch of `submit_resolved`, NOT a directive) this
+    /// is set to `Some(Instant::now())`; the event pump clears it to `None` on
+    /// `ThreadEvent::TurnCompleted`. `/status` reads it to know whether a turn
+    /// is in flight (→ 🔵 working, showing `now - start`) or the session is
+    /// idle (`None` → 🟢). Shared (`Arc<Mutex>`) so the detached pump clears
+    /// the same cell the submit path set. PULL-only signal — nothing acts on it
+    /// except the `/status` render.
+    turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// v0.8.19 — timestamp of the most recent pump event for this session
+    /// (set next to the `activity_events` tick, on EVERY event). `/status`
+    /// derives the 🔴 stuck state the same way the turn-timeout watchdog does:
+    /// a turn is in flight (`turn_started_at == Some`) yet the last event is
+    /// older than the idle window (`gateway_turn_timeout_duration`) ⇒ silent ⇒
+    /// STUCK. Shared so the pump and `/status` read the same cell.
+    last_event_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// v0.8.19 — the latest compact activity summary (`read×16·bash×8` form,
+    /// NOT the full progress text) for the in-flight turn, computed by the
+    /// SAME [`crate::progress::ProgressFold`] the IM status message uses (so the
+    /// two never drift). Updated by the pump whenever the fold changes; cleared
+    /// to `None` on `TurnCompleted`. `/status` appends it on the 🔵 working line.
+    latest_activity: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +674,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         name: "/sessions",
         arg_hint: None,
         help: "list sessions + status",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/status",
+        arg_hint: None,
+        help: "fleet health — per-session idle/working/stuck + model·ctx",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -1500,6 +1528,7 @@ impl Gateway {
                     .map(Some)
             }
             "/sessions" => Ok(Some(self.render_sessions(chat).await)),
+            "/status" => Ok(Some(self.render_status(chat).await)),
             "/projects" => Ok(Some(self.render_projects())),
             "/help" => Ok(Some(render_help())),
             _ => Ok(None),
@@ -1807,6 +1836,9 @@ impl Gateway {
                 activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                latest_activity: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         let model_warning =
@@ -1948,6 +1980,9 @@ impl Gateway {
                 activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                latest_activity: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         self.current_session
@@ -2068,6 +2103,14 @@ impl Gateway {
                         // TRUE silence (no event for the whole idle window) is a
                         // stall. Counts every event, before any branch/filter.
                         session.activity_events.fetch_add(1, Ordering::SeqCst);
+                        // v0.8.19 `/status` — record the wall-clock of this event
+                        // right beside the liveness counter. `/status` derives the
+                        // 🔴 stuck state from it the SAME way the watchdog does (a
+                        // turn in flight whose last event is older than the idle
+                        // window = silent = STUCK).
+                        if let Ok(mut last) = session.last_event_at.lock() {
+                            *last = Some(Instant::now());
+                        }
                         // 👀 ack clear: the FIRST event of a turn is the moment
                         // the silent gap ends (💭 thinking / first progress), so
                         // remove the ack reaction added at dispatch. TAKE the
@@ -2102,6 +2145,20 @@ impl Gateway {
                                 sid: Some(session_id.clone()),
                             }) {
                                 break;
+                            }
+                        }
+                        // v0.8.19 `/status` — a completed turn ends the in-flight
+                        // window: clear `turn_started_at` (→ 🟢 idle) and the
+                        // activity summary. Protocol-INDEPENDENT (both tmux and
+                        // stream-json adapters emit `TurnCompleted`), unlike the
+                        // stream-json-only progress mirror just below. Mirrors the
+                        // submit path's set, on the same shared cell.
+                        if matches!(&evt, ThreadEvent::TurnCompleted { .. }) {
+                            if let Ok(mut started) = session.turn_started_at.lock() {
+                                *started = None;
+                            }
+                            if let Ok(mut act) = session.latest_activity.lock() {
+                                *act = None;
                             }
                         }
                         // v0.8.11 E4 — for a stream-json session (no hooks), the
@@ -2249,6 +2306,13 @@ impl Gateway {
                             // before — IM behavior is byte-identical.
                             if fold.apply(&evt) {
                                 dirty = true;
+                                // v0.8.19 `/status` — publish the compact
+                                // `read×N·bash×M` counts (NOT the full progress
+                                // text) for the working line. Same fold, so the
+                                // IM status and `/status` can never disagree.
+                                if let Ok(mut act) = session.latest_activity.lock() {
+                                    *act = fold.compact_counts();
+                                }
                                 let ready =
                                     last_emit.map(|t| t.elapsed() >= throttle).unwrap_or(true);
                                 if ready
@@ -2355,6 +2419,9 @@ impl Gateway {
                     activity_events: Arc::new(AtomicU64::new(0)),
                     reply_to: Arc::new(std::sync::Mutex::new(saved_session.owner)),
                     pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                    turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                    last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                    latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 },
             );
         }
@@ -2518,6 +2585,14 @@ impl Gateway {
         // Replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
+        }
+        // v0.8.19 `/status` — a real Turn is now in flight: stamp its start (the
+        // pump clears it on `TurnCompleted`). Done for EVERY turn (web included,
+        // unlike the IM-only 👀 ack below) so `/status` shows 🔵 working with the
+        // elapsed time. Directives never reach here (they early-returned above),
+        // so a `/model` switch is correctly NOT counted as a working turn.
+        if let Ok(mut started) = session.turn_started_at.lock() {
+            *started = Some(Instant::now());
         }
         // 👀 ack: add the transient "received, processing" reaction on the
         // inbound IM message the moment this turn is dispatched, filling the
@@ -2901,6 +2976,118 @@ impl Gateway {
                 Some(sfx) => rows.push(format!("{base} — {sfx}")),
                 None => rows.push(base),
             }
+        }
+        rows.join("\n")
+    }
+
+    /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
+    /// accessible session: state (🟢 idle / 🔵 working / 🔴 stuck) · sid ·
+    /// session-name (`ccteam-chat-<slug>-<sid>`) · the real vendor `--resume`
+    /// id (`resume <uuid>`, or `resume —` when none) · project · role ·
+    /// state-detail · model · effort · ctx, plus the live activity counts
+    /// (`read×N·bash×M`) while working. Same ACL + iteration as
+    /// [`render_sessions`]; pure rendering (no side effects, no push, no
+    /// mutation) — it only renders when the user types `/status`.
+    ///
+    /// State derivation (mirrors the turn-timeout watchdog's own "silent for a
+    /// full idle window = stalled" definition, so 🔴 here means exactly what the
+    /// watchdog would flag):
+    /// - `turn_started_at == None` ⇒ 🟢 **idle**.
+    /// - in flight, last event recent (< idle window) ⇒ 🔵 **working** (show
+    ///   `now - start`).
+    /// - in flight, last event stale (≥ idle window) ⇒ 🔴 **STUCK** (show the
+    ///   silent duration).
+    ///
+    /// When the watchdog window is disabled (`CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS
+    /// == 0`), fall back to a fixed 300s stuck threshold so 🔴 still works.
+    async fn render_status(&self, chat: &ChatKey) -> String {
+        let visible: Vec<&GatewaySession> = self
+            .sessions
+            .values()
+            .filter(|s| Self::chat_can_access(chat, s))
+            .collect();
+        if visible.is_empty() {
+            return "no sessions — start one with /new".to_string();
+        }
+        // Idle/stuck threshold: the watchdog's idle window, or a fixed 300s when
+        // the watchdog is disabled (so the 🔴 state is still derivable).
+        let mut stuck_after = gateway_turn_timeout_duration();
+        if stuck_after.is_zero() {
+            stuck_after = std::time::Duration::from_secs(300);
+        }
+        let now = Instant::now();
+        let mut rows: Vec<String> = Vec::with_capacity(visible.len());
+        for s in visible {
+            let started = s.turn_started_at.lock().ok().and_then(|g| *g);
+            let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
+            // Has the last event gone silent past the idle window? Treat a
+            // missing last-event timestamp on an in-flight turn as silent so a
+            // turn that produced NO event at all eventually reads 🔴 (matching
+            // the watchdog, which trips on total silence).
+            let silent_for = started.map(|t| match last_event {
+                Some(ev) => now.saturating_duration_since(ev),
+                None => now.saturating_duration_since(t),
+            });
+            let (state, detail) = match (started, silent_for) {
+                (None, _) => ("🟢", "idle".to_string()),
+                (Some(_), Some(silent)) if silent >= stuck_after => {
+                    ("🔴", format!("STUCK {} silent", humanize_dur(silent)))
+                }
+                (Some(t), _) => (
+                    "🔵",
+                    format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+                ),
+            };
+            let role = if s.role.is_empty() { "—" } else { &s.role };
+            // The canonical pane / chat-session name (`ccteam-chat-<slug>-<sid>`),
+            // the same name the adapter spawns and `reconcile_chat_sessions`
+            // tracks — so a `/status` line can be matched against `tmux ls`.
+            let session_name = chat_session_name(&s.project, &s.id);
+            // The REAL vendor `--resume` id (the Anthropic session UUID). For a
+            // stream-json session the handle's `vendor_uuid` IS that id (it is
+            // also the handle `identity`), persisted across daemon restarts. A
+            // tmux/codex session carries no stream-json uuid → `resume —`
+            // (deterministic; never fabricated). The owner wants the actual
+            // resume id shown next to the sid.
+            let resume = thread_vendor_uuid(&s.thread)
+                .map(|u| format!("resume {u}"))
+                .unwrap_or_else(|| "resume —".to_string());
+            // model · effort · ctx X% from the real thread_status (same source
+            // `/sessions` uses). A statusless adapter / failure degrades each
+            // field to a deterministic placeholder — never fabricated.
+            let status = s.adapter.thread_status(&s.thread).await.ok();
+            let model = status
+                .as_ref()
+                .and_then(|st| st.model.as_deref())
+                .filter(|m| !m.is_empty())
+                .unwrap_or("—");
+            let effort = status
+                .as_ref()
+                .and_then(|st| st.effort.as_deref())
+                .filter(|e| !e.is_empty())
+                .unwrap_or("—");
+            let ctx = match status.as_ref().and_then(|st| st.context.as_ref()) {
+                Some(c) if c.window_tokens > 0 => format!("ctx {:.0}%", c.pct()),
+                // No context reported (or unknown window) ⇒ deterministic `ctx —`,
+                // consistent with the statusline; don't fabricate a percentage.
+                _ => "ctx —".to_string(),
+            };
+            let mut line = format!(
+                "{state} {} {session_name} · {resume} · {} · {role} · {detail} · {model} · \
+                 {effort} · {ctx}",
+                s.id, s.project
+            );
+            // Activity counts only while working (the in-flight fold; stale-then-
+            // cleared on TurnCompleted). Idle/stuck lines omit it.
+            if state == "🔵" {
+                if let Some(act) = s.latest_activity.lock().ok().and_then(|g| g.clone()) {
+                    if !act.is_empty() {
+                        line.push_str(" · ");
+                        line.push_str(&act);
+                    }
+                }
+            }
+            rows.push(line);
         }
         rows.join("\n")
     }
@@ -3845,6 +4032,47 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MS);
     std::time::Duration::from_millis(ms)
+}
+
+/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
+/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
+/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
+/// `0s`.
+fn humanize_dur(d: std::time::Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        if m > 0 {
+            format!("{h}h{m}m")
+        } else {
+            format!("{h}h")
+        }
+    } else if m > 0 {
+        if s > 0 {
+            format!("{m}m{s}s")
+        } else {
+            format!("{m}m")
+        }
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
+/// [`ThreadHandle`], or `None` for a tmux / Codex handle (which has no
+/// stream-json uuid). Read from `raw_extras["vendor_uuid"]` — the field both
+/// the spawn and resume paths populate, persisted across daemon restarts — so
+/// `/status` shows the actual id that `--resume` would use. Filters out an
+/// empty string so a blank uuid degrades to `None` (→ `resume —`).
+fn thread_vendor_uuid(thread: &ThreadHandle) -> Option<String> {
+    thread
+        .raw_extras
+        .get("vendor_uuid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// True when a restored Claude `ThreadHandle` carries enough context
@@ -6037,6 +6265,247 @@ mod tests {
             baseline,
             vec!["s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
+    }
+
+    /// v0.8.19 `/status` — fleet-health states derive deterministically from
+    /// the per-session `turn_started_at` / `last_event_at` cells:
+    /// - no turn in flight (`turn_started_at == None`) ⇒ 🟢 idle.
+    /// - in flight + a recent event ⇒ 🔵 working (with elapsed).
+    /// - in flight + last event stale past the idle window ⇒ 🔴 STUCK (matching
+    ///   the watchdog's "silent for a full window" definition).
+    /// Also asserts model · effort · ctx come from the real `thread_status`,
+    /// and `ctx —` when no context is reported.
+    #[tokio::test]
+    async fn gateway_status_renders_idle_working_stuck() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        // A model + effort + context so the model·effort·ctx tail is exercised.
+        fake.set_status(ThreadStatus {
+            model: Some("claude-opus-4-8".into()),
+            context: Some(ContextUsage {
+                used_tokens: 410_000,
+                window_tokens: 1_000_000,
+            }),
+            effort: Some("max".into()),
+            goal: None,
+        })
+        .await;
+
+        // (1) No turn in flight → 🟢 idle (seeded None at construction).
+        let idle = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(idle.len(), 1, "one session → one line: {idle:?}");
+        let line = &idle[0];
+        // state · sid · session-name · resume-id · project · role · idle · …
+        // The fake adapter's handle carries no `vendor_uuid` → `resume —`.
+        assert!(
+            line.starts_with("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle · "),
+            "got: {line}"
+        );
+        assert!(
+            line.contains("claude-opus-4-8 · max · ctx 41%"),
+            "got: {line}"
+        );
+
+        // (2) A turn in flight with a RECENT event → 🔵 working.
+        let now = Instant::now();
+        {
+            let s = gateway.sessions.get("s1").expect("session s1");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() = Some(now);
+            *s.latest_activity.lock().unwrap() = Some("read×16·bash×8".to_string());
+        }
+        let working = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        let line = &working[0];
+        assert!(
+            line.starts_with("🔵 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · working "),
+            "got: {line}"
+        );
+        // The activity counts show ONLY while working.
+        assert!(line.ends_with("· read×16·bash×8"), "got: {line}");
+        assert!(line.contains("ctx 41%"), "got: {line}");
+
+        // (3) In flight but the last event is stale past the idle window →
+        // 🔴 STUCK. Use the SAME threshold the code reads so the test is
+        // deterministic against any env-configured window.
+        let mut window = gateway_turn_timeout_duration();
+        if window.is_zero() {
+            window = std::time::Duration::from_secs(300);
+        }
+        {
+            let s = gateway.sessions.get("s1").expect("session s1");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() =
+                Some(now - (window + std::time::Duration::from_secs(60)));
+        }
+        let stuck = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        let line = &stuck[0];
+        assert!(
+            line.starts_with("🔴 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · STUCK "),
+            "got: {line}"
+        );
+        assert!(line.contains("silent · "), "got: {line}");
+        // No activity tail on a stuck (non-working) line.
+        assert!(
+            !line.contains("read×16"),
+            "stuck line omits activity: {line}"
+        );
+    }
+
+    /// v0.8.19 `/status` — a roleless session shows `—` for the role, and a
+    /// session whose adapter reports no context shows `ctx —` (deterministic,
+    /// never fabricated). Default (all-None) status → model `—`, effort `—`.
+    #[tokio::test]
+    async fn gateway_status_roleless_and_no_context() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // Roleless: `/new claude` with no role token.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            vec!["🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · — · idle · — · — · ctx —"],
+            "roleless + statusless + no-uuid → placeholders, not fabricated values"
+        );
+    }
+
+    /// v0.8.19 `/status` — empty fleet renders a friendly line, never an error.
+    #[tokio::test]
+    async fn gateway_status_empty_is_friendly() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(out, vec!["no sessions — start one with /new"]);
+    }
+
+    /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's
+    /// sessions (mirrors `/sessions` own-only). The owner sees its own.
+    #[tokio::test]
+    async fn gateway_status_acl_is_own_only() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // tg-1 owns s1.
+        gateway
+            .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
+            .await
+            .unwrap();
+        // A DIFFERENT telegram chat sees nothing (own-only isolation).
+        let foreign = gateway
+            .handle_text("telegram", "tg-2", "bob", "/status")
+            .await
+            .unwrap();
+        assert_eq!(foreign, vec!["no sessions — start one with /new"]);
+        // The web console (shared pool) DOES NOT see an IM-created session.
+        let web = gateway
+            .handle_text("web", "web-chat", "web-user", "/status")
+            .await
+            .unwrap();
+        assert_eq!(web, vec!["no sessions — start one with /new"]);
+        // The owner sees its own session.
+        let owner = gateway
+            .handle_text("telegram", "tg-1", "rob", "/status")
+            .await
+            .unwrap();
+        assert_eq!(owner.len(), 1);
+        assert!(
+            owner[0].starts_with("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle"),
+            "got: {owner:?}"
+        );
+    }
+
+    /// v0.8.19 `/status` — when the session's handle carries a stream-json
+    /// `vendor_uuid` (the real Anthropic `--resume` id), `/status` surfaces it
+    /// verbatim next to the sid as `resume <uuid>` (not the `resume —`
+    /// fallback). Mirrors how the live daemon's persisted handle holds the id
+    /// across restarts.
+    #[tokio::test]
+    async fn gateway_status_shows_real_vendor_resume_uuid() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        // Inject a vendor_uuid into the handle the way a stream-json spawn would
+        // (the FakeAdapter returns an empty `raw_extras`).
+        let uuid = "43e8b6b9-f233-4612-91e5-fc94e935c448";
+        {
+            let s = gateway.sessions.get_mut("s1").expect("session s1");
+            s.thread.raw_extras = serde_json::json!({ "vendor_uuid": uuid });
+        }
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains(&format!("· resume {uuid} ·")),
+            "the real --resume uuid must show next to the sid: {out:?}"
+        );
+        assert!(
+            out[0].starts_with(&format!(
+                "🟢 s1 ccteam-chat-alpha-s1 · resume {uuid} · alpha · reviewer · idle"
+            )),
+            "got: {out:?}"
+        );
+    }
+
+    /// v0.8.19 `/status` — registered in the command set + dispatches via
+    /// `handle_text` (it routes as a gateway command, never as turn text).
+    #[tokio::test]
+    async fn gateway_status_is_registered_and_dispatches() {
+        assert!(
+            GATEWAY_COMMANDS.iter().any(|c| c.name == "/status"),
+            "/status must be registered in GATEWAY_COMMANDS"
+        );
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        // Dispatched as a command (the friendly empty-fleet reply), and the fake
+        // adapter never received a turn submission.
+        assert_eq!(out, vec!["no sessions — start one with /new"]);
+        assert!(
+            fake.submissions.lock().await.is_empty(),
+            "/status must not submit a turn"
+        );
+    }
+
+    /// v0.8.19 `/status` — the duration humanizer used on the working / stuck
+    /// lines: compact `45s` / `1m12s` / `6m` / `2h3m`, seconds dropped at ≥ 1h.
+    #[test]
+    fn humanize_dur_is_compact() {
+        use std::time::Duration;
+        assert_eq!(humanize_dur(Duration::from_secs(0)), "0s");
+        assert_eq!(humanize_dur(Duration::from_secs(45)), "45s");
+        assert_eq!(humanize_dur(Duration::from_secs(72)), "1m12s");
+        assert_eq!(humanize_dur(Duration::from_secs(360)), "6m");
+        assert_eq!(humanize_dur(Duration::from_secs(7380)), "2h3m");
+        assert_eq!(humanize_dur(Duration::from_secs(7200)), "2h");
+        // Sub-second rounds down to 0s (never panics / never blank).
+        assert_eq!(humanize_dur(Duration::from_millis(400)), "0s");
     }
 
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — own-only isolation: a
