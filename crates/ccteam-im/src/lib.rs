@@ -8,7 +8,7 @@
 //! Public API (called from `ccteam-creator` skill / CLI):
 //!
 //! - [`register_bot`] / [`unregister_bot`] — manage the on-disk registry
-//!   under `~/.ccteam/imd/registry/<slug>/<role>.json`.
+//!   under `~/.ccteam/state/im/registry/<slug>/<role>.json`.
 //! - [`run_daemon`] — the main event loop (clap-driven from `main.rs`).
 //!
 //! Architectural red lines (see `docs/versions/v0-6-0/wave-2-decisions.md`):
@@ -63,7 +63,7 @@ use ccteam_harness::AgentVendor;
 use serde::{Deserialize, Serialize};
 
 /// One registered bot — the on-disk payload at
-/// `~/.ccteam/imd/registry/<slug>/<role>.json`.
+/// `~/.ccteam/state/im/registry/<slug>/<role>.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BotRegistration {
     /// `workflow.yaml`'s `name` field — the per-project slug.
@@ -134,28 +134,31 @@ pub fn default_ccteam_root_public() -> PathBuf {
 }
 
 /// Canonical on-disk path of the gateway route-table snapshot
-/// (`<ccteam_root>/imd/gateway-state.json`). The daemon persists its tracked
+/// (`<ccteam_root>/state/im/gateway-state.json`). The daemon persists its tracked
 /// sessions here; the read-only `ccteam sessions` CLI view loads them back via
 /// [`gateway::tracked_chat_session_names`]. Both sides resolve the path through
 /// this one helper so they never drift.
 pub fn gateway_state_path_in(ccteam_root: &Path) -> PathBuf {
-    ccteam_root.join("imd").join("gateway-state.json")
+    ccteam_root
+        .join("state")
+        .join("im")
+        .join("gateway-state.json")
 }
 
 /// Resolve the gateway route-table snapshot for the current user
-/// (`~/.ccteam/imd/gateway-state.json`).
+/// (`~/.ccteam/state/im/gateway-state.json`).
 pub fn default_gateway_state_path() -> PathBuf {
     gateway_state_path_in(&default_ccteam_root())
 }
 
-/// `<ccteam_root>/imd/registry/` — base registry dir given an explicit
+/// `<ccteam_root>/state/im/registry/` — base registry dir given an explicit
 /// root (V0.6.5 F146).
 pub fn registry_root_in(ccteam_root: &Path) -> PathBuf {
-    ccteam_root.join("imd").join("registry")
+    ccteam_root.join("state").join("im").join("registry")
 }
 
 /// Resolve the registry directory for the current user
-/// (`~/.ccteam/imd/registry/`).
+/// (`~/.ccteam/state/im/registry/`).
 pub fn registry_root() -> PathBuf {
     registry_root_in(&default_ccteam_root())
 }
@@ -175,7 +178,7 @@ pub fn registration_path(slug: &str, role: &str) -> PathBuf {
 
 /// V0.6.5 F146 — per-bot heartbeat sidecar under the registry, so a
 /// separate MCP tool process can read `running` status off disk. Sibling
-/// of the registration JSON: `<ccteam_root>/imd/registry/<slug>/<role>.heartbeat`.
+/// of the registration JSON: `<ccteam_root>/state/im/registry/<slug>/<role>.heartbeat`.
 pub fn bot_heartbeat_path_in(ccteam_root: &Path, slug: &str, role: &str) -> PathBuf {
     registry_root_in(ccteam_root)
         .join(slug)
@@ -590,6 +593,6 @@ mod tests {
     #[test]
     fn registration_path_layout() {
         let p = registration_path("dev-foo", "lead");
-        assert!(p.ends_with(".ccteam/imd/registry/dev-foo/lead.json"));
+        assert!(p.ends_with(".ccteam/state/im/registry/dev-foo/lead.json"));
     }
 }

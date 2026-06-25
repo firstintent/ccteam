@@ -79,5 +79,5 @@ fn default_token_path_resolves_under_root() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let token_path = default_token_path(&paths);
-    assert_eq!(token_path, paths.root.join("web-token"));
+    assert_eq!(token_path, paths.root.join("secrets").join("web-token"));
 }

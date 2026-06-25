@@ -13,7 +13,7 @@
 //! Driven through the real `ccteam status` binary with `CCTEAM_HOME`
 //! pointing at an ephemeral tempdir (project registered via on-disk
 //! `config.yaml` + `state.json`; sessions seeded via a hand-written
-//! `imd/gateway-state.json`; token seeded via `web-token`). This pins
+//! `state/im/gateway-state.json`; token seeded via `web-token`). This pins
 //! the operator-facing text for host probe / CI greps.
 
 use ccteam_core::state::ProjectState;
@@ -38,7 +38,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
     let projects_root = tmp.path().join("projects");
     let project_dir = projects_root.join(slug);
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
-    std::fs::create_dir_all(root.join("imd")).unwrap();
+    std::fs::create_dir_all(root.join("state").join("im")).unwrap();
 
     // config.yaml — register the project so `collect_projects` finds it.
     let cfg = serde_yaml::Value::Mapping({
@@ -71,7 +71,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
     )
     .unwrap();
 
-    // imd/gateway-state.json — one claude + one codex session for the project.
+    // state/im/gateway-state.json — one claude + one codex session for the project.
     // Mirrors the `SavedGatewayState` serde shape (AgentVendor / ExecutionMode
     // both `rename_all = "lowercase"`).
     let owner = json!({ "channel": "telegram", "chat_id": "c1", "user_id": "u1" });
@@ -115,14 +115,15 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
         ]
     });
     std::fs::write(
-        root.join("imd").join("gateway-state.json"),
+        root.join("state").join("im").join("gateway-state.json"),
         serde_json::to_string_pretty(&gw).unwrap(),
     )
     .unwrap();
 
     // web-token — bare hex, 0600 (load_existing tolerates the mode warning).
     let token_hex = "deadbeefcafe0123456789abcdef0123456789abcdef0123456789abcdef0123";
-    let token_path = root.join("web-token");
+    let token_path = root.join("secrets").join("web-token");
+    std::fs::create_dir_all(token_path.parent().unwrap()).unwrap();
     std::fs::write(&token_path, token_hex).unwrap();
     #[cfg(unix)]
     {

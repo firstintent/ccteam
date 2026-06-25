@@ -46,6 +46,53 @@ impl CcteamPaths {
         })
     }
 
+    // v0.8.20 — `~/.ccteam/` is grouped by concern: `config.yaml` (user config,
+    // top-level) · `hooks/` (the hook.sh dispatcher) · `secrets/` (0700: every
+    // token) · `cache/` (deletable) · `run/` (live sockets) · `state/` (everything
+    // the daemon writes). The override is `CCTEAM_HOME` (or `--home`), so a second
+    // instance can live under `~/.ccteam2`.
+
+    /// `~/.ccteam/state/` — everything the running daemon writes (pidfile,
+    /// per-project progress, IM daemon state, statusline, pty FIFOs).
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
+    /// `~/.ccteam/secrets/` (mode 0700) — every credential/token: the admin web
+    /// token, the global bot creds, and per-user (`users/<id>.json`).
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.root.join("secrets")
+    }
+
+    /// `~/.ccteam/secrets/users/` — one `<id>.json` per web tenant (its web token
+    /// + IM creds + profile). Replaces the single `tenants.json`.
+    pub fn users_dir(&self) -> PathBuf {
+        self.secrets_dir().join("users")
+    }
+
+    /// `~/.ccteam/secrets/web-token` — the admin/bootstrap web token.
+    pub fn web_token_path(&self) -> PathBuf {
+        self.secrets_dir().join("web-token")
+    }
+
+    /// `~/.ccteam/secrets/im-credentials.json` — the global/admin bot creds
+    /// (telegram/lark). Per-tenant bots live in `users/<id>.json`.
+    pub fn im_credentials_path(&self) -> PathBuf {
+        self.secrets_dir().join("im-credentials.json")
+    }
+
+    /// `~/.ccteam/cache/` — ephemeral, safe to delete.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
+    /// `~/.ccteam/state/im/` — the IM daemon's state (gateway-state.json, bot
+    /// registry, outbound ledger). Was the top-level `imd/` — the `im/` vs `imd/`
+    /// name clash is gone (global creds are now `secrets/im-credentials.json`).
+    pub fn im_state_dir(&self) -> PathBuf {
+        self.state_dir().join("im")
+    }
+
     pub fn progress_jsonl(&self, slug: &str) -> PathBuf {
         self.progress_dir().join(format!("{slug}.jsonl"))
     }
@@ -55,7 +102,7 @@ impl CcteamPaths {
     /// can attach a recursive `notify` watcher without re-deriving
     /// the path.
     pub fn progress_dir(&self) -> PathBuf {
-        self.root.join("progress")
+        self.state_dir().join("progress")
     }
 
     /// `~/.ccteam/hub-cache/` — v0.8.9 Phase 2 local cache of the
@@ -66,16 +113,11 @@ impl CcteamPaths {
     /// `CCTEAM_HOME` via [`CcteamPaths::from_env`] like every other
     /// `~/.ccteam/` subdir.
     pub fn hub_cache_dir(&self) -> PathBuf {
-        self.root.join("hub-cache")
+        self.cache_dir().join("hub")
     }
 
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join("inbox")
-    }
-
-    /// v0.8.18 档1 — the per-user web tenant registry (`~/.ccteam/tenants.json`).
-    pub fn tenants_json(&self) -> PathBuf {
-        self.root.join("tenants.json")
     }
 
     pub fn control_dir(&self) -> PathBuf {
@@ -174,7 +216,7 @@ impl CcteamPaths {
     /// orchestrator never reads it; `progress.jsonl` remains the
     /// single source of truth.
     pub fn pty_dir(&self) -> PathBuf {
-        self.root.join("pty")
+        self.state_dir().join("pty")
     }
 
     /// `~/.ccteam/harness/` — V0.3.1 F46 dual-write target for the
@@ -188,7 +230,7 @@ impl CcteamPaths {
     /// machine never reads them — `progress.jsonl` remains the single
     /// source of truth.
     pub fn harness_dir(&self) -> PathBuf {
-        self.root.join("harness")
+        self.state_dir().join("harness")
     }
 
     /// `~/.ccteam/teams-progress.jsonl` — V0.5.0 F95 global progress
@@ -245,13 +287,14 @@ pub struct ProjectSessionContext {
 /// — this lists directories only. `imd/` is created lazily by bot
 /// registration, not by `init`, so it is not part of the init-time set.
 ///
-/// Kept minimal on purpose: only directories the current architecture
-/// actually writes — `hooks/` (hook.sh dispatcher), `progress/`
-/// (per-project jsonl streams), `run/` (daemon socket / runtime files),
-/// `state/` (daemon pidfile), and `hub-cache/` (v0.8.9 Phase 2 ccteam-hub
-/// catalog cache — the marketplace's offline `index.json`).
+/// v0.8.20 — the home is grouped by concern (top-level dirs): `hooks/` (the
+/// hook.sh dispatcher), `run/` (live sockets), `state/` (everything the daemon
+/// writes — `progress/`, `im/`, `harness/`, `pty/`, the pidfile), `secrets/`
+/// (0700 — `web-token`, `im-credentials.json`, `users/<id>.json`), and `cache/`
+/// (deletable — `hub/`). Subdirectories are created lazily by their writers
+/// (`create_dir_all`); this is the top-level manifest the doctor tolerates.
 pub fn canonical_home_dirs() -> &'static [&'static str] {
-    &["hooks", "progress", "run", "state", "hub-cache"]
+    &["hooks", "run", "state", "secrets", "cache"]
 }
 
 /// Idempotently materialize the global `~/.ccteam/` home so any
@@ -279,6 +322,17 @@ pub fn ensure_ccteam_home(paths: &CcteamPaths) -> Result<()> {
     for sub in canonical_home_dirs() {
         let dir = paths.root.join(sub);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    // v0.8.20 — `secrets/` holds every token → 0700 (POSIX). The token/cred
+    // writers set 0600 on the files; this hardens the directory itself.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(paths.secrets_dir()) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o700);
+            let _ = std::fs::set_permissions(paths.secrets_dir(), perm);
+        }
     }
     crate::hooks_dispatcher::install_hooks(paths)
         .context("install ~/.ccteam/hooks/hook.sh dispatcher")?;

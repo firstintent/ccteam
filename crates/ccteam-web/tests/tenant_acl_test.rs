@@ -43,7 +43,7 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     // A registered tenant — so its token resolves to a tenant identity.
     let mut reg = TenantRegistry::default();
     let tenant = reg.add("alice");
-    reg.save(&paths.tenants_json()).unwrap();
+    reg.save(&paths.users_dir()).unwrap();
     let tenant_tok = tenant.web_token.clone();
 
     // An admin-owned project on disk (owner = the shared web-api pool). Written
@@ -228,7 +228,7 @@ async fn session_cookie_beats_stale_bearer_header() {
 
     let mut reg = TenantRegistry::default();
     let tenant = reg.add("alice");
-    reg.save(&paths.tenants_json()).unwrap();
+    reg.save(&paths.users_dir()).unwrap();
     let tenant_tok = tenant.web_token.clone();
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
@@ -301,9 +301,9 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     let mut reg = TenantRegistry::default();
     let alice = reg.add("alice");
     let bob = reg.add("bob");
-    reg.save(&paths.tenants_json()).unwrap();
+    reg.save(&paths.users_dir()).unwrap();
     let alice_tok = alice.web_token.clone();
-    let tenants_path = paths.tenants_json();
+    let tenants_path = paths.users_dir();
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;

@@ -95,7 +95,7 @@ pub(crate) async fn handle_create_user(
         )
             .into_response();
     }
-    let path = app.paths.tenants_json();
+    let path = app.paths.users_dir();
     let mut reg = TenantRegistry::load(&path);
     let tenant = reg.add(&form.handle);
     if let Err(err) = reg.save(&path) {
@@ -134,7 +134,7 @@ pub(crate) async fn handle_list_users(
     if let Some(deny) = deny_non_admin(&identity) {
         return deny;
     }
-    let reg = TenantRegistry::load(&app.paths.tenants_json());
+    let reg = TenantRegistry::load(&app.paths.users_dir());
     let views: Vec<TenantView> = reg.list().iter().map(TenantView::from).collect();
     Json(views).into_response()
 }
@@ -174,7 +174,7 @@ pub(crate) async fn handle_user_link(
     if let Some(deny) = deny_non_admin(&identity) {
         return deny;
     }
-    let reg = TenantRegistry::load(&app.paths.tenants_json());
+    let reg = TenantRegistry::load(&app.paths.users_dir());
     match reg.by_id(&id) {
         Some(t) => Json(UserLinkResponse {
             id: t.id.clone(),
@@ -211,7 +211,7 @@ pub(crate) async fn handle_delete_user(
     if let Some(deny) = deny_non_admin(&identity) {
         return deny;
     }
-    let path = app.paths.tenants_json();
+    let path = app.paths.users_dir();
     let mut reg = TenantRegistry::load(&path);
     if !reg.remove(&id) {
         return (
@@ -298,7 +298,7 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
     let has_telegram = telegram.is_some();
     let has_lark = lark.is_some();
 
-    let path = app.paths.tenants_json();
+    let path = app.paths.users_dir();
     let mut reg = TenantRegistry::load(&path);
     if reg.by_id(tenant_id).is_none() {
         return (

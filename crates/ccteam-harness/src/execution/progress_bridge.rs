@@ -42,7 +42,11 @@ pub fn hooks_script_from_env() -> Option<PathBuf> {
 }
 
 pub fn progress_jsonl_from_env(slug: &str) -> Option<PathBuf> {
-    ccteam_root_from_env().map(|root| root.join("progress").join(format!("{slug}.jsonl")))
+    ccteam_root_from_env().map(|root| {
+        root.join("state")
+            .join("progress")
+            .join(format!("{slug}.jsonl"))
+    })
 }
 
 pub fn append_event(path: &Path, event: &Value) -> Result<()> {

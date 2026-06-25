@@ -11,9 +11,27 @@
 | **W2** | 归属 bug 修(auth `URL→cookie→Bearer`,cookie 优先 Bearer 回退)+ **F3** 登录链接(`GET /users/{id}/link` + `ccteam status` + Settings 复制)+ **F4** 建-session 默认无角色 + 按身份分级运行时/角色 + **beta-gating 规范**(→ CLAUDE.md §五.8) | `ccteam-web/src/{auth,routes/users,routes/openapi}.rs` · SPA `ChatConsole/SettingsPage/usersApi` |
 | **W3** | Tenant IM 凭据模型(`TenantTelegram`/`TenantLark`,0600)+ 自助 REST `PUT /me/im`(getMe 校验,replace 语义)+ admin `PUT /users/{id}/im` + Settings「我的 IM bot」 | `ccteam-core/src/tenants.rs` · `ccteam-web/src/routes/users.rs` · SPA `SettingsPage` |
 | **W4** | **per-tenant IM bot 监听/路由/热重载**(核心):channel `"<platform>@<tenant>"`、`build_tenant_channels` fan-out、`chat_can_access` 租户隔离、`platform_of` ACL、changed-scope 热重载 + web PUT 触发 | `ccteam-im/src/{daemon,gateway,transport/*}.rs` |
+| **W7** | **`~/.ccteam/` 布局整理**(owner 追加):按职责分组 `secrets/`(0700:web-token · im-credentials.json · `users/<id>.json` 每租户一个)· `cache/hub` · `state/`(progress · im(原 imd)· harness · pty · pid);`tenants.json` 拆成 **per-user 文件**;`--home <dir>`(多实例 `~/.ccteam2`);Python 迁移脚本(Rust **零兼容逻辑**)。死目录 phases/templates/inbox/control/teams-progress.jsonl 不再创建 | `ccteam-core/src/{paths,tenants}.rs` · `ccteam-cli/src/main.rs` · `scripts/migrate_ccteam_home.py` |
 
 > **W6 — web↔IM 收敛已落地**(owner 拍板「现在收敛、更优雅」):抽 `canonical_owner(frontend)→identity` 把「**谁拥有**」(`owner`)和「**回哪去**」(`reply_to`)彻底分开 —— 租户的 web 和它**自己的** IM bot 共用一个 `web:<tenant>` owner,两个前端互看自己的**全部**会话(web 建 / IM bot 建都互通);回信仍按来源前端(`reply_to`)走、web SSE 按 `sid` 投递**不受影响**。全局/admin bot 路径不变。<br>
 > **仍 DEFERRED(owner 拍板「不改」):** 全局 bot「废迁」是 **reframe 非 literal** —— 不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。
+
+### W7 — `~/.ccteam/` 新布局(owner 追加「整理得更优雅」)
+
+```
+~/.ccteam/                       (或 ~/.ccteam2 —— CCTEAM_HOME / --home)
+├ config.yaml          用户配置(项目 / 偏好),顶层
+├ hooks/               hook.sh 派发器
+├ secrets/  (0700)     web-token · im-credentials.json · users/<id>.json(每租户一个 0600 文件)
+├ cache/hub/           市场目录缓存(可删)
+├ run/                 live sockets(mcp.sock)
+└ state/               daemon 写的一切:progress/ · im/(原 imd)· harness/ · pty/ · pidfile
+```
+
+- **赢**:密钥一处 0700;`im/` vs `imd/` 撞名消除;缓存可删;daemon 态归一;config 仍顶层。死目录 `phases/templates/inbox/control/teams-progress.jsonl` 不再创建(doctor home-drift 用新 `canonical_home_dirs() = [hooks,run,state,secrets,cache]`)。
+- **多实例**:`CCTEAM_HOME=~/.ccteam2 ccteam start` 或 `ccteam --home ~/.ccteam2 …` 跑完全独立的实例。
+- **per-user 文件**:`TenantRegistry` 从单 `tenants.json` 改为 `secrets/users/<id>.json` 目录(`load(dir)` 读全部、`save(dir)` 每文件 0600 + 删已移除者)。每文件 = 身份 + web_token + IM creds。
+- **迁移(Rust 零兼容逻辑)**:`python3 scripts/migrate_ccteam_home.py [--dry-run] [HOME]` 一次性把旧布局搬到新的(含 `tenants.json` → 拆成 `users/<id>.json`、删死目录),幂等可重跑;先 `ccteam stop`。
 
 ---
 

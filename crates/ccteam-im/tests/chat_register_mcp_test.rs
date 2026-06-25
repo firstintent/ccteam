@@ -40,11 +40,11 @@ fn register_bot_checked_writes_registration_at_documented_path() {
         RegisterOutcome::Registered(p) => p,
         RegisterOutcome::AlreadyRegistered(_) => panic!("first register should not be a dup"),
     };
-    // Layout: <root>/imd/registry/<slug>/<role>.json
+    // Layout: <root>/state/im/registry/<slug>/<role>.json
     let expected = registration_path_in(&r, "demo", "helper");
     assert_eq!(path, expected);
     assert!(
-        expected.ends_with("imd/registry/demo/helper.json"),
+        expected.ends_with("state/im/registry/demo/helper.json"),
         "unexpected on-disk layout: {}",
         expected.display()
     );

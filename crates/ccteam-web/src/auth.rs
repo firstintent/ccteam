@@ -364,7 +364,7 @@ pub async fn auth_layer(
         return (StatusCode::INTERNAL_SERVER_ERROR, "auth misconfigured").into_response();
     };
     // v0.8.18 档1 — the bootstrap token → admin; per-user tokens → their tenant.
-    let tenants = app.paths.tenants_json();
+    let tenants = app.paths.users_dir();
 
     // 1. URL shim — an explicit `?token=ccteam:<hex>` login link ALWAYS wins: it
     //    (re)establishes the session cookie so a fresh login replaces a stale
@@ -522,7 +522,7 @@ mod tests {
     fn resolve_identity_admin_tenant_and_unknown() {
         use ccteam_core::tenants::TenantRegistry;
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("tenants.json");
+        let path = tmp.path().join("users");
         let mut reg = TenantRegistry::default();
         let alice = reg.add("alice");
         reg.save(&path).unwrap();

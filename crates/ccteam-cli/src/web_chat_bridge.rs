@@ -606,7 +606,7 @@ mod tests {
     }
 
     fn write_queued_web_outbound(ccteam_home: &Path, content: &str) {
-        let path = ccteam_home.join("imd").join("outbound.jsonl");
+        let path = ccteam_home.join("state").join("im").join("outbound.jsonl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let row = serde_json::json!({
             "ts_ms": 1_u64,

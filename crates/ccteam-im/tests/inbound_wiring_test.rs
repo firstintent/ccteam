@@ -2455,7 +2455,8 @@ fn read_durable_outbound_rows() -> Vec<serde_json::Value> {
     let path = dirs::home_dir()
         .unwrap()
         .join(".ccteam")
-        .join("imd")
+        .join("state")
+        .join("im")
         .join("outbound.jsonl");
     let raw = std::fs::read_to_string(path).unwrap();
     raw.lines()
@@ -2467,7 +2468,8 @@ fn write_durable_outbound_row(id: &str, channel: &str, state: &str, content: &st
     let path = dirs::home_dir()
         .unwrap()
         .join(".ccteam")
-        .join("imd")
+        .join("state")
+        .join("im")
         .join("outbound.jsonl");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let row = serde_json::json!({

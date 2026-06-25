@@ -32,9 +32,9 @@ use rand::RngCore;
 /// LAN-attacker threat model in PRD §9.1.
 pub const TOKEN_BYTES: usize = 32;
 
-/// Default token-file path under the ccteam root.
+/// Default token-file path (`~/.ccteam/secrets/web-token`, v0.8.20 layout).
 pub fn default_token_path(paths: &CcteamPaths) -> PathBuf {
-    paths.root.join("web-token")
+    paths.web_token_path()
 }
 
 /// Hex-encode a byte slice with lowercase digits. Inlined to avoid

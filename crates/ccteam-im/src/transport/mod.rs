@@ -348,7 +348,8 @@ pub trait Channel: Send + Sync {
 /// routing to a project/role happens later in the gateway).
 pub(crate) fn inbound_staging_dir() -> std::path::PathBuf {
     crate::default_ccteam_root_public()
-        .join("imd")
+        .join("state")
+        .join("im")
         .join("attachments")
         .join("inbound")
 }

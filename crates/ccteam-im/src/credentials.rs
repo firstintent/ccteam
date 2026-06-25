@@ -108,13 +108,20 @@ fn default_use_feishu() -> bool {
     true
 }
 
-/// Default credentials file path.
+/// Default credentials file path (`~/.ccteam/secrets/im-credentials.json`,
+/// v0.8.20 layout). Resolved via [`ccteam_core::CcteamPaths::from_env`] so it
+/// honours `CCTEAM_HOME` (multi-instance `~/.ccteam2`), falling back to the
+/// hard path only if home resolution fails.
 pub fn default_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".ccteam")
-        .join("im")
-        .join("credentials.json")
+    ccteam_core::CcteamPaths::from_env()
+        .map(|p| p.im_credentials_path())
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".ccteam")
+                .join("secrets")
+                .join("im-credentials.json")
+        })
 }
 
 /// Load credentials from the given path (or [`default_path`] when

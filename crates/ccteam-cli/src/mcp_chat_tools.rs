@@ -18,7 +18,7 @@
 //!
 //! - The 3 lifecycle / list tools wrap `ccteam_im::{register_bot_checked_in,
 //!   unregister_bot_in, list_bots_in}` (file-system control plane:
-//!   registry JSON under `<ccteam_root>/imd/registry/<slug>/<role>.json`).
+//!   registry JSON under `<ccteam_root>/state/im/registry/<slug>/<role>.json`).
 //! - `running` status comes from a sidecar heartbeat file the daemon's
 //!   per-bot supervisor touches every 5s; an MCP process (separate
 //!   from the daemon) reads mtime to infer "alive within 30s".
@@ -47,7 +47,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "ccteam__chat_register_bot",
-            "description": "Register a chat-mode bot. Writes `<ccteam_root>/imd/registry/<workflow_slug>/<role>.json` (non-clobbering — returns `ok:false, error:\"already_registered\"` if the file already exists; unregister first to re-bind). The daemon's registry watcher picks the new file up and spawns the tmux session. When `chat_handle` is omitted, the dispatcher auto-mints an unused scientist nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES` (e.g. `curie`, `galileo`) so IM users get a friendly `@curie` handle instead of `@helper`. Pass `chat_handle` to pin a specific handle.",
+            "description": "Register a chat-mode bot. Writes `<ccteam_root>/state/im/registry/<workflow_slug>/<role>.json` (non-clobbering — returns `ok:false, error:\"already_registered\"` if the file already exists; unregister first to re-bind). The daemon's registry watcher picks the new file up and spawns the tmux session. When `chat_handle` is omitted, the dispatcher auto-mints an unused scientist nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES` (e.g. `curie`, `galileo`) so IM users get a friendly `@curie` handle instead of `@helper`. Pass `chat_handle` to pin a specific handle.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -73,7 +73,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__chat_unregister_bot",
-            "description": "V0.6.5 F146 — unregister a chat bot: deletes `<ccteam_root>/imd/registry/<workflow_slug>/<role>.json` + the sidecar heartbeat. Idempotent: returns `ok:true, removed:false` when no registration exists. Daemon's registry watcher closes the corresponding tmux session.",
+            "description": "V0.6.5 F146 — unregister a chat bot: deletes `<ccteam_root>/state/im/registry/<workflow_slug>/<role>.json` + the sidecar heartbeat. Idempotent: returns `ok:true, removed:false` when no registration exists. Daemon's registry watcher closes the corresponding tmux session.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {

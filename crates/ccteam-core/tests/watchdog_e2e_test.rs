@@ -117,7 +117,7 @@ fn watchdog_does_not_mutate_state_or_progress_jsonl() {
     let tmp = TempDir::new().unwrap();
     let p = paths(&tmp);
     let _daemon = fake_daemon(&p);
-    std::fs::create_dir_all(p.root.join("progress")).unwrap();
+    std::fs::create_dir_all(p.root.join("state").join("progress")).unwrap();
 
     let slug = "dev-watch";
     write_state(&p, slug, |s| {
@@ -135,7 +135,7 @@ fn watchdog_does_not_mutate_state_or_progress_jsonl() {
     });
     let state_path = p.project_state(slug);
     let mtime_before = std::fs::metadata(&state_path).unwrap().modified().unwrap();
-    let progress_dir = p.root.join("progress");
+    let progress_dir = p.root.join("state").join("progress");
     let count_before = std::fs::read_dir(&progress_dir).unwrap().count();
 
     let cfg = WatchdogConfig {

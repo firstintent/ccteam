@@ -47,6 +47,11 @@ const VERSION: &str = concat!(
     about = "Autonomous AI development orchestrator built on Claude Code"
 )]
 struct Cli {
+    /// v0.8.20 — override the ccteam home dir (default `~/.ccteam`). Lets a
+    /// second, fully isolated instance live under e.g. `~/.ccteam2`. Equivalent
+    /// to setting `CCTEAM_HOME`; this flag wins when both are given.
+    #[arg(long, value_name = "DIR", global = true)]
+    home: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -563,7 +568,7 @@ enum SessionCommand {
         role: String,
     },
     /// List registered chat-mode bots (reads the F146 registry at
-    /// `~/.ccteam/imd/registry/<slug>/<role>.json`). Confirms what
+    /// `~/.ccteam/state/im/registry/<slug>/<role>.json`). Confirms what
     /// `register` wrote — role → @handle → platform/chat_id, plus
     /// live `running` status from the per-bot heartbeat sidecar.
     /// Distinct from `session ls`, which lists *live* gateway sessions;
@@ -929,6 +934,13 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // v0.8.20 — `--home <dir>` overrides CCTEAM_HOME for this invocation (a
+    // second, fully isolated instance, e.g. `~/.ccteam2`). Set before the F173
+    // pin below so every path resolution + child spawn sees it.
+    if let Some(home) = &cli.home {
+        std::env::set_var("CCTEAM_HOME", home);
+    }
 
     // F173 — pin `CCTEAM_HOME` early so child spawn paths
     // (CodexExecAdapter ledger hook, etc.) see the same root the CLI
@@ -3730,7 +3742,7 @@ fn run_status() -> Result<()> {
     //    `?token=ccteam:<hex>` link (the value the admin hands out / re-sends).
     //    Tenants never see each other's; this local admin view is the CLI peer of
     //    the web user-management "copy link" action (GET /api/v1/users/{id}/link).
-    let tenants = ccteam_core::tenants::TenantRegistry::load(&paths.tenants_json());
+    let tenants = ccteam_core::tenants::TenantRegistry::load(&paths.users_dir());
     if !tenants.list().is_empty() {
         println!();
         println!("  web tenants ({}):", tenants.list().len());

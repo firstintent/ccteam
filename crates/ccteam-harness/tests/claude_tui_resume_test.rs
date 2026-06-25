@@ -58,7 +58,10 @@ struct TestCcteamPaths {
 
 impl TestCcteamPaths {
     fn progress_jsonl(&self, slug: &str) -> PathBuf {
-        self.root.join("progress").join(format!("{slug}.jsonl"))
+        self.root
+            .join("state")
+            .join("progress")
+            .join(format!("{slug}.jsonl"))
     }
 }
 

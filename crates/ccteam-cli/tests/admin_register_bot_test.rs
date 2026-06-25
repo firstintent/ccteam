@@ -5,7 +5,7 @@
 //!
 //! Mirrors the MCP `chat_register_bot` / `chat_unregister_bot` path —
 //! same on-disk JSON shape under
-//! `<CCTEAM_HOME>/imd/registry/<slug>/<role>.json`. The CLI is the
+//! `<CCTEAM_HOME>/state/im/registry/<slug>/<role>.json`. The CLI is the
 //! scripted / no-daemon fallback for environments where MCP isn't
 //! registered yet.
 
@@ -77,7 +77,7 @@ fn admin_register_bot_writes_registry_json_then_unregister_removes_it() {
     assert_eq!(body["workflow_slug"], "demo");
     assert_eq!(body["role"], "helper");
 
-    let registry_file = home.join("imd/registry/demo/helper.json");
+    let registry_file = home.join("state/im/registry/demo/helper.json");
     assert!(
         registry_file.exists(),
         "registry JSON must exist at {}",
@@ -157,7 +157,7 @@ fn admin_register_bot_respects_explicit_chat_handle() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["chat_handle"], "captain");
 
-    let registry_file = home.join("imd/registry/demo2/lead.json");
+    let registry_file = home.join("state/im/registry/demo2/lead.json");
     let on_disk: Value =
         serde_json::from_str(&std::fs::read_to_string(&registry_file).unwrap()).unwrap();
     assert_eq!(on_disk["chat_handle"], "captain");

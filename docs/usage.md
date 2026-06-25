@@ -66,7 +66,11 @@ agent 侧的 `mcp__ccteam__*` 工具由 `ccteam config`(见 §3)注册 —— �
 
 > **从旧版本升级(须知)**:本版的独立 session 模型与旧的 per-role 会话状态**不兼容**。升级前请**清掉旧状态**再重新初始化 —— `ccteam stop` → 删 `~/.ccteam` 以及各项目里的 `.ccteam/` → 各项目重跑 `ccteam init` → `ccteam config` → `ccteam start`。旧的 per-role 历史会丢(pre-v1.0 阶段可接受,无兼容迁移)。**不碰你的业务代码 / `CLAUDE.md` / `.env` / `.git`**。
 >
-> 另外两处变化:① **role/skill/workflow 的内容现在住 ccteam 插件市场(ccteam-hub),不再随 ccteam 内置** —— 旧的内置 role catalog 已移除,`ccteam role search/add` 改从市场(经 HTTPS + `~/.ccteam/hub-cache/`)拉取(见 §7)。② **`ccteam init` 不再有 `--mode` 选项**(旧的 agent-team 模式已退役),始终就地初始化 artifact 型项目。
+> 另外两处变化:① **role/skill/workflow 的内容现在住 ccteam 插件市场(ccteam-hub),不再随 ccteam 内置** —— 旧的内置 role catalog 已移除,`ccteam role search/add` 改从市场(经 HTTPS + `~/.ccteam/cache/hub/`)拉取(见 §7)。② **`ccteam init` 不再有 `--mode` 选项**(旧的 agent-team 模式已退役),始终就地初始化 artifact 型项目。
+>
+> ③ **`~/.ccteam/` 布局已整理**(按职责分组:`config.yaml` · `hooks/` · `secrets/`(0700:`web-token` · `im-credentials.json` · `users/<id>.json` 每租户一个)· `cache/` · `run/` · `state/`)。**Rust 干净切、无兼容逻辑**;若你有旧布局(`im/` · `imd/` · `tenants.json` · `web-token` 顶层 …),先 `ccteam stop`,再跑一次性 Python 迁移:`python3 scripts/migrate_ccteam_home.py`(加 `--dry-run` 先预览;接受一个可选的 HOME 参数,默认 `~/.ccteam`)—— 它把旧文件搬到新位置(含 `tenants.json` → 拆成 `secrets/users/<id>.json`)、删死目录,幂等可重跑;`config`/租户/IM creds 都保留。
+>
+> ④ **多实例**:`ccteam --home ~/.ccteam2 start`(或 `CCTEAM_HOME=~/.ccteam2 ccteam start`)跑一个完全独立的 ccteam 实例(独立配置/租户/会话/socket)。
 
 ---
 

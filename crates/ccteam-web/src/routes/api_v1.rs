@@ -212,7 +212,7 @@ pub(crate) async fn handle_me(
     let handle = if identity.is_admin {
         "owner".to_string()
     } else {
-        ccteam_core::tenants::TenantRegistry::load(&app.paths.tenants_json())
+        ccteam_core::tenants::TenantRegistry::load(&app.paths.users_dir())
             .by_id(&identity.id)
             .map(|t| t.handle.clone())
             .unwrap_or_else(|| identity.id.clone())

@@ -279,9 +279,7 @@ where
     // v0.8.20 F2 — track the last tenants.json bytes so a reload rebuilds only
     // the CHANGED scope: a tenant-only change must not blip the owner's live
     // global bot, and a creds-only change must not blip the tenant bots.
-    let last_tenants: Arc<StdMutex<String>> = Arc::new(StdMutex::new(
-        std::fs::read_to_string(tenants_json_path(&args)).unwrap_or_default(),
-    ));
+    let last_tenants: Arc<StdMutex<String>> = Arc::new(StdMutex::new(tenants_fingerprint(&args)));
     // V0.8.6 W5b — use the caller-provided gateway handle when `ccteam start`
     // built one (so the web `AppState` and this daemon drive the SAME session
     // map); else build + own one (standalone `ccteam-im run`). The post-build
@@ -490,7 +488,7 @@ async fn reload_im_channels(
             return;
         }
     };
-    let new_tenants_raw = std::fs::read_to_string(tenants_json_path(args)).unwrap_or_default();
+    let new_tenants_raw = tenants_fingerprint(args);
     let creds_changed = *last_creds.lock().unwrap() != new_creds;
     let tenants_changed = *last_tenants.lock().unwrap() != new_tenants_raw;
     // No-op when nothing changed (e.g. a pref-only `ccteam config`).
@@ -719,30 +717,39 @@ fn build_lark_channel(
     ))
 }
 
-/// v0.8.20 F2 — the per-user tenant registry path (`~/.ccteam/tenants.json`).
-/// When the creds path is overridden (tests / non-default home), derive the
-/// sibling `tenants.json` from its `.ccteam` grandparent so a test home is
-/// honored; otherwise the canonical env-aware path.
-fn tenants_json_path(args: &DaemonArgs) -> PathBuf {
+/// v0.8.20 — the per-user tenant registry DIR (`~/.ccteam/secrets/users/`, one
+/// `<id>.json` per tenant). When the creds path is overridden (tests / non-
+/// default home), derive the sibling `users/` from its `secrets/` parent so a
+/// test home is honored; otherwise the canonical env-aware path.
+fn users_dir_for(args: &DaemonArgs) -> PathBuf {
     if let Some(creds) = &args.credentials {
-        if let Some(ccteam_dir) = creds.parent().and_then(|p| p.parent()) {
-            return ccteam_dir.join("tenants.json");
+        // creds = .../secrets/im-credentials.json → .../secrets/users
+        if let Some(secrets) = creds.parent() {
+            return secrets.join("users");
         }
     }
     ccteam_core::CcteamPaths::from_env()
-        .map(|p| p.tenants_json())
+        .map(|p| p.users_dir())
         .unwrap_or_else(|_| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/"))
                 .join(".ccteam")
-                .join("tenants.json")
+                .join("secrets")
+                .join("users")
         })
 }
 
-/// v0.8.20 F2 — load the tenant registry for the daemon (best-effort: a missing
-/// / unreadable file is an empty registry, so the daemon always starts).
+/// v0.8.20 — load the tenant registry for the daemon (best-effort: a missing
+/// dir is an empty registry, so the daemon always starts).
 fn daemon_tenants(args: &DaemonArgs) -> ccteam_core::tenants::TenantRegistry {
-    ccteam_core::tenants::TenantRegistry::load(&tenants_json_path(args))
+    ccteam_core::tenants::TenantRegistry::load(&users_dir_for(args))
+}
+
+/// v0.8.20 — a cheap fingerprint of the per-user tenant files so a reload can
+/// no-op when tenants are unchanged (replaces the single-file byte compare now
+/// that tenants live in a directory of `<id>.json` files).
+fn tenants_fingerprint(args: &DaemonArgs) -> String {
+    serde_json::to_string(&daemon_tenants(args).tenants).unwrap_or_default()
 }
 
 /// v0.8.20 F2 — one IM [`Channel`] per tenant bot (from `tenants.json`). Each is
@@ -1263,7 +1270,8 @@ enum DurableOutboundState {
 
 fn durable_outbox_path() -> PathBuf {
     crate::default_ccteam_root_public()
-        .join("imd")
+        .join("state")
+        .join("im")
         .join("outbound.jsonl")
 }
 

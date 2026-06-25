@@ -8,7 +8,8 @@
 //! be **linked to an IM chat** (`"channel:chat_id"`) so the same person's web
 //! and Telegram/Lark share ONE identity.
 //!
-//! Stored at `~/.ccteam/tenants.json` (admin-managed via `POST /api/v1/users`).
+//! Stored as per-user files `~/.ccteam/secrets/users/<id>.json` (v0.8.20 — one
+//! 0600 file per tenant; admin-managed via `POST /api/v1/users`).
 //! Created on the WEB (the CLI deliberately has no `ccteam user` command — the
 //! runtime write surface lives on web/IM/REST; the CLI stays bootstrap-only).
 //!
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::session_secret;
 
 /// v0.8.20 F2 — a tenant's OWN Telegram bot (the per-user IM bot). Stored
-/// plaintext in `tenants.json` (mode 0600, owner decision ②); the daemon runs
+/// plaintext in the tenant's `secrets/users/<id>.json` (0600, owner decision ②); the daemon runs
 /// one `getUpdates` listener per tenant bot and routes its inbound to this
 /// tenant's identity. Mirrors the global `ccteam_im::TelegramCreds` shape but
 /// lives in core (where `Tenant` lives) — im maps it to its channel at spawn.
@@ -84,7 +85,7 @@ pub struct Tenant {
     pub created_at: DateTime<Utc>,
 }
 
-/// The tenant registry, persisted as `~/.ccteam/tenants.json`.
+/// The tenant registry — persisted as per-user `~/.ccteam/secrets/users/<id>.json` files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TenantRegistry {
     #[serde(default)]
@@ -92,39 +93,76 @@ pub struct TenantRegistry {
 }
 
 impl TenantRegistry {
-    /// Load from `path`. A missing / unreadable / unparseable file is an empty
-    /// registry (best-effort — never an error, so the web layer always starts).
-    pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// v0.8.20 — load every tenant from `dir/<id>.json` (the per-user files under
+    /// `~/.ccteam/secrets/users/`). A missing dir / unreadable / unparseable file
+    /// is skipped (best-effort — never an error, so the web layer always starts);
+    /// tenants are ordered by `created_at` for a stable list.
+    pub fn load(dir: &Path) -> Self {
+        let mut tenants = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Some(t) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Tenant>(&b).ok())
+                {
+                    tenants.push(t);
+                }
+            }
+        }
+        tenants.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Self { tenants }
     }
 
-    /// Atomically persist to `path` (serialize → write `<path>.tmp` → rename).
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self).context("serialize TenantRegistry")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp_os);
-        std::fs::write(&tmp, json.as_bytes())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        // v0.8.20 F2 — tenants.json now holds per-tenant bot tokens (secrets),
-        // so enforce mode 0600 on the tmp BEFORE the rename (no world-readable
-        // window). Matches the global credentials.json hygiene.
+    /// v0.8.20 — persist to `dir/<id>.json` (one 0600 file per tenant; the dir is
+    /// 0700). Writes every current tenant atomically (tmp + rename) and DELETES
+    /// any stale `<id>.json` whose tenant was removed, so `load → remove → save`
+    /// drops the file. Each file holds the tenant's web token + IM bot creds.
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&tmp)?.permissions();
-            perm.set_mode(0o600);
-            std::fs::set_permissions(&tmp, perm)?;
+            let mut perm = std::fs::metadata(dir)?.permissions();
+            perm.set_mode(0o700);
+            let _ = std::fs::set_permissions(dir, perm);
         }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+        // Delete files for tenants no longer present (handles removal).
+        let keep: std::collections::HashSet<&str> =
+            self.tenants.iter().map(|t| t.id.as_str()).collect();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !keep.contains(stem) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        // Write each tenant atomically + 0600 (it holds secret tokens).
+        for t in &self.tenants {
+            let path = dir.join(format!("{}.json", t.id));
+            let json = serde_json::to_string_pretty(t).context("serialize Tenant")?;
+            let tmp = dir.join(format!("{}.json.tmp", t.id));
+            std::fs::write(&tmp, json.as_bytes())
+                .with_context(|| format!("write {}", tmp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perm = std::fs::metadata(&tmp)?.permissions();
+                perm.set_mode(0o600);
+                std::fs::set_permissions(&tmp, perm)?;
+            }
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+        }
         Ok(())
     }
 
@@ -296,18 +334,23 @@ mod tests {
     #[test]
     fn save_load_round_trips() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("tenants.json");
+        let dir = tmp.path().join("users");
         let mut reg = TenantRegistry::default();
         let a = reg.add("alice");
         reg.link_chat(&a.id, "telegram:111");
-        reg.save(&path).unwrap();
+        reg.save(&dir).unwrap();
 
-        let back = TenantRegistry::load(&path);
+        let back = TenantRegistry::load(&dir);
         assert_eq!(back.tenants, reg.tenants);
-        // Missing file → empty registry, not an error.
-        assert!(TenantRegistry::load(&tmp.path().join("absent.json"))
+        // Missing dir → empty registry, not an error.
+        assert!(TenantRegistry::load(&tmp.path().join("absent"))
             .tenants
             .is_empty());
+        // load → remove → save drops the per-user file.
+        let mut reg2 = TenantRegistry::load(&dir);
+        assert!(reg2.remove(&a.id));
+        reg2.save(&dir).unwrap();
+        assert!(TenantRegistry::load(&dir).tenants.is_empty());
     }
 
     #[test]
@@ -353,7 +396,7 @@ mod tests {
     fn save_enforces_0600_for_secret_tokens() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("tenants.json");
+        let dir = tmp.path().join("users");
         let mut reg = TenantRegistry::default();
         let a = reg.add("alice");
         reg.set_telegram(
@@ -363,11 +406,18 @@ mod tests {
                 allowed_chat_ids: vec![],
             }),
         );
-        reg.save(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "tenants.json holds bot tokens → must be 0600");
+        reg.save(&dir).unwrap();
+        // The per-user file is 0600 (it holds bot tokens); the dir is 0700.
+        let file = dir.join(format!("{}.json", a.id));
+        let fmode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fmode, 0o600,
+            "per-user file holds bot tokens → must be 0600"
+        );
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "users/ dir → 0700");
         // Per-tenant IM creds survive a round-trip.
-        let back = TenantRegistry::load(&path);
+        let back = TenantRegistry::load(&dir);
         assert_eq!(
             back.by_id(&a.id)
                 .unwrap()

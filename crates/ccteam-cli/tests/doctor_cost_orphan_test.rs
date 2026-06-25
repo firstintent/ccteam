@@ -32,7 +32,7 @@ fn ephemeral_home_with_one_project(slug: &str) -> (tempfile::TempDir, PathBuf, P
     let projects_root = tmp.path().join("projects");
     let project_dir = projects_root.join(slug);
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
-    std::fs::create_dir_all(root.join("progress")).unwrap();
+    std::fs::create_dir_all(root.join("state").join("progress")).unwrap();
 
     // config.yaml — register the project so `collect_projects` finds it.
     let cfg = serde_yaml::Value::Mapping({
@@ -83,7 +83,10 @@ fn append_agent_done(root: &Path, slug: &str, vendor: &str, ts_offset_secs: i64)
         "slug": slug,
         "ts": ts.to_rfc3339(),
     });
-    let path = root.join("progress").join(format!("{slug}.jsonl"));
+    let path = root
+        .join("state")
+        .join("progress")
+        .join(format!("{slug}.jsonl"));
     let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
     existing.push_str(&serde_json::to_string(&row).unwrap());
     existing.push('\n');

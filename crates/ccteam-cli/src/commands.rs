@@ -368,13 +368,13 @@ fn install_project_at(
     if let Some(owner) = &requested_owner {
         if let Some(tenant_id) = owner.strip_prefix("web:") {
             if tenant_id != "web-api"
-                && ccteam_core::tenants::TenantRegistry::load(&paths.tenants_json())
+                && ccteam_core::tenants::TenantRegistry::load(&paths.users_dir())
                     .by_id(tenant_id)
                     .is_none()
             {
                 eprintln!(
                     "warning: --owner {owner} references no known tenant in {}; writing it anyway",
-                    paths.tenants_json().display(),
+                    paths.users_dir().display(),
                 );
             }
         }
@@ -1875,10 +1875,12 @@ fn render_daemon_health_line(paths: &CcteamPaths) -> String {
 /// Purely informational — never fails the doctor exit code, and tolerates
 /// a missing/unreadable root (fresh install) by reporting nothing.
 fn render_home_drift_line(paths: &CcteamPaths) -> String {
-    // Directories that are legitimate under the current architecture but
-    // are intentionally *not* in the init-time canonical set (they are
-    // created lazily by the daemon / bot registration / team seeding).
-    const RUNTIME_LAZY_DIRS: &[&str] = &["pty", "harness", "imd", "teams"];
+    // v0.8.20 — every runtime dir now lives UNDER a canonical top-level dir
+    // (`state/{progress,im,harness,pty}`, `secrets/users`, `cache/hub`), so there
+    // are no lazily-created TOP-LEVEL dirs left to tolerate. Old flat dirs
+    // (`im/`, `imd/`, `progress/`, `hub-cache/`, `harness/`, `pty/`) now read as
+    // drift until `scripts/migrate_ccteam_home.py` relocates them.
+    const RUNTIME_LAZY_DIRS: &[&str] = &[];
 
     let Ok(entries) = std::fs::read_dir(&paths.root) else {
         return String::new();
@@ -3943,7 +3945,7 @@ pub fn run_config_install_mcp() -> Result<String> {
 
 /// `config` action (b) — validate a Telegram bot token, long-poll for the
 /// owner's first message to capture the `chat_id`, and persist the
-/// resulting credentials to `~/.ccteam/im/credentials.json` (mode 0600).
+/// resulting credentials to `~/.ccteam/secrets/im-credentials.json` (mode 0600).
 /// Wraps [`ccteam_im::onboarding::telegram_setup`]; the async call is
 /// driven on a one-shot current-thread tokio runtime so the sync CLI /
 /// menu path stays runtime-agnostic.
@@ -4001,7 +4003,7 @@ pub fn run_config_set_im_token(token: &str) -> Result<String> {
 
 /// `config` action — validate Lark/Feishu app credentials (by fetching a
 /// `tenant_access_token`) and persist them to
-/// `~/.ccteam/im/credentials.json` (mode 0600). Mirrors
+/// `~/.ccteam/secrets/im-credentials.json` (mode 0600). Mirrors
 /// [`run_config_set_im_token`] but for the WS-long-connection Lark
 /// provider: there is no `chat_id` to poll — the provider keys its
 /// allowlist on operator-supplied `open_id`s.
@@ -4032,7 +4034,7 @@ pub fn run_config_set_lark_creds(
 
 /// Test seam for [`run_config_set_lark_creds`]: lets callers override the
 /// Lark API base (point a deterministic mock server at it) and the
-/// credentials-file path (sandbox `~/.ccteam/im/credentials.json` into a
+/// credentials-file path (sandbox `~/.ccteam/secrets/im-credentials.json` into a
 /// tempdir). Production callers go through [`run_config_set_lark_creds`],
 /// which passes the real region base + the default creds path. Mirrors the
 /// `_with_base` convention in `ccteam_im::onboarding`.
@@ -4607,7 +4609,7 @@ pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> 
 }
 
 /// `ccteam admin list-bots [--slug <slug>] [--json]`. Reads the F146
-/// registry (`~/.ccteam/imd/registry/<slug>/<role>.json`) and reports
+/// registry (`~/.ccteam/state/im/registry/<slug>/<role>.json`) and reports
 /// each registered chat-mode bot with its effective `@handle`,
 /// platform/chat_id, and live `running` status (from the per-bot
 /// heartbeat sidecar). Pairs with `register-bot` / `unregister-bot` so
@@ -4901,7 +4903,7 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // 6. Optional `--purge`: project-local ccteam-managed paths.
     if opts.purge {
         purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
-        // V0.6.5 F151 — also clean `~/.ccteam/imd/registry/<slug>/`. The
+        // V0.6.5 F151 — also clean `~/.ccteam/state/im/registry/<slug>/`. The
         // F146 registry is the daemon's bot lifecycle SoT, so without
         // this cleanup `list_bots()` still surfaces stale BotRegistration
         // entries after the workflow.yaml is gone → daemon can spawn an
@@ -5018,7 +5020,7 @@ pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
     Ok(out)
 }
 
-/// V0.6.5 F151 — purge `~/.ccteam/imd/registry/<slug>/`.
+/// V0.6.5 F151 — purge `~/.ccteam/state/im/registry/<slug>/`.
 ///
 /// **Strategy:** for each registered role under the slug, call
 /// [`ccteam_im::unregister_bot_in`] first — this is the in-process
@@ -5068,7 +5070,7 @@ fn purge_imd_registry_for_slug(
             "JSON files"
         };
         report.steps.push(format!(
-            "would purge imd/registry/{slug}/ ({json_count} {noun})"
+            "would purge state/im/registry/{slug}/ ({json_count} {noun})"
         ));
         return Ok(());
     }
@@ -5103,7 +5105,7 @@ fn purge_imd_registry_for_slug(
         std::fs::remove_dir_all(&slug_dir)
             .with_context(|| format!("rm -rf {}", slug_dir.display()))?;
         report.steps.push(format!(
-            "purged imd/registry/{slug}/ ({role_count} role{} cleared)",
+            "purged state/im/registry/{slug}/ ({role_count} role{} cleared)",
             if role_count == 1 { "" } else { "s" }
         ));
     }
@@ -6409,14 +6411,13 @@ mod tests {
         ensure_isolation();
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
-        // Canonical (init-time) + runtime-lazy dirs — must NOT be flagged.
-        for d in [
-            "hooks", "progress", "run", "state", "pty", "harness", "imd", "teams",
-        ] {
+        // v0.8.20 canonical top-level dirs — must NOT be flagged.
+        for d in ["hooks", "run", "state", "secrets", "cache"] {
             std::fs::create_dir_all(paths.root.join(d)).unwrap();
         }
-        // Orchestrator-era leftovers — must be flagged.
-        for d in ["phases", "control", "queue"] {
+        // Old flat dirs (now relocated under state/, secrets/, cache/) +
+        // orchestrator-era leftovers — must be flagged as drift.
+        for d in ["progress", "imd", "harness", "pty", "phases", "control"] {
             std::fs::create_dir_all(paths.root.join(d)).unwrap();
         }
         let body = run_doctor(&paths, DoctorOptions::default()).unwrap();
@@ -6424,21 +6425,21 @@ mod tests {
             body.contains("home drift"),
             "expected a home-drift line; got: {body}",
         );
-        for leftover in ["phases", "control", "queue"] {
+        for leftover in ["progress", "imd", "phases", "control"] {
             assert!(
                 body.contains(leftover),
                 "drift line must name `{leftover}`; got: {body}",
             );
         }
-        // Legitimate dirs must not be reported on the drift line.
+        // Canonical dirs must not be reported on the drift line.
         let drift_line = body
             .lines()
             .find(|l| l.contains("home drift"))
             .unwrap_or("");
-        for ok in ["hooks", "pty", "harness", "imd", "teams"] {
+        for ok in ["hooks", "run", "state", "secrets", "cache"] {
             assert!(
                 !drift_line.contains(ok),
-                "`{ok}` is legitimate and must not appear in the drift line; got: {drift_line}",
+                "`{ok}` is canonical and must not appear in the drift line; got: {drift_line}",
             );
         }
     }

@@ -11,7 +11,7 @@
 //!   t03b/c    surgical settings.local.json hook strip / empty-file delete
 //!   t04–t06   refusal gate (tmux / claude bg / open spawn) + --force
 //!   t07–t08   daemon unroster trigger ack / timeout
-//!   t09–t11   imd/registry/<slug>/ purge semantics
+//!   t09–t11   state/im/registry/<slug>/ purge semantics
 //!   t12–t13   `ccteam project rm` group routing + dry-run
 //!   t14–t15   `ccteam project stop` (no-session ok / kills matching
 //!             `ccteam-chat-<slug>-*` panes, dash-aware slug match)
@@ -746,13 +746,13 @@ fn t16_project_rm_nonpurge_keeps_project_files() {
 
 /// t17 — `ccteam project rm --purge` deletes ccteam's footprint via the
 /// GROUP path (cto.md + .ccteam/ + settings.local.json hook section +
-/// config entry + ~/.ccteam/{progress,imd/registry}/<slug>) and PROVABLY
+/// config entry + ~/.ccteam/{progress,state/im/registry}/<slug>) and PROVABLY
 /// keeps a user role, CLAUDE.md, .env, and the user's settings.json.
 #[test]
 fn t17_project_rm_purge_via_group() {
     let fx = Fixture::new("dex-grp-purge");
     fx.seed_closed_progress();
-    // imd/registry/<slug>/ — must be purged.
+    // state/im/registry/<slug>/ — must be purged.
     let (reg, hb) = seed_imd_registry(&fx, "helper");
     let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
     // ccteam footprint.
@@ -817,12 +817,12 @@ fn t17_project_rm_purge_via_group() {
     );
     assert!(
         !reg.exists(),
-        "imd/registry/<slug>/helper.json must be purged"
+        "state/im/registry/<slug>/helper.json must be purged"
     );
-    assert!(!hb.exists(), "imd/registry heartbeat must be purged");
+    assert!(!hb.exists(), "state/im/registry heartbeat must be purged");
     assert!(
         !slug_dir.exists(),
-        "imd/registry/<slug>/ dir must be purged"
+        "state/im/registry/<slug>/ dir must be purged"
     );
     assert!(
         !fx.paths().progress_jsonl(&fx.slug).exists(),
@@ -1107,11 +1107,11 @@ fn t06_force_overrides_refusal() {
 // ─────────────────────────── V0.6.5 F151 ────────────────────────────
 //
 // `ccteam remove <slug> --purge` must also clean
-// `~/.ccteam/imd/registry/<slug>/` (registration JSON + heartbeat
+// `~/.ccteam/state/im/registry/<slug>/` (registration JSON + heartbeat
 // sidecars). Without `--purge` the registry stays put so a re-init
 // of the same slug can resume the existing chat bots.
 
-/// Seed an imd/registry/<slug>/<role>.json + matching heartbeat
+/// Seed an state/im/registry/<slug>/<role>.json + matching heartbeat
 /// sidecar — mirrors the on-disk shape F146's `register_bot_checked_in`
 /// produces.
 fn seed_imd_registry(fx: &Fixture, role: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -1149,7 +1149,10 @@ fn t09_purge_cleans_imd_registry_dir() {
     let (reg_a, hb_a) = seed_imd_registry(&fx, "helper");
     let (reg_b, hb_b) = seed_imd_registry(&fx, "critic");
     let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
-    assert!(slug_dir.is_dir(), "fixture: imd/registry/<slug>/ seeded");
+    assert!(
+        slug_dir.is_dir(),
+        "fixture: state/im/registry/<slug>/ seeded"
+    );
 
     let out = fx
         .cmd()
@@ -1166,29 +1169,29 @@ fn t09_purge_cleans_imd_registry_dir() {
     // Every role file + heartbeat gone.
     assert!(
         !reg_a.exists(),
-        "imd/registry/<slug>/helper.json should be purged"
+        "state/im/registry/<slug>/helper.json should be purged"
     );
     assert!(
         !reg_b.exists(),
-        "imd/registry/<slug>/critic.json should be purged"
+        "state/im/registry/<slug>/critic.json should be purged"
     );
     assert!(
         !hb_a.exists(),
-        "imd/registry/<slug>/helper.heartbeat should be purged"
+        "state/im/registry/<slug>/helper.heartbeat should be purged"
     );
     assert!(
         !hb_b.exists(),
-        "imd/registry/<slug>/critic.heartbeat should be purged"
+        "state/im/registry/<slug>/critic.heartbeat should be purged"
     );
     // The slug dir itself gone.
     assert!(
         !slug_dir.exists(),
-        "imd/registry/<slug>/ dir should be purged; still at {}",
+        "state/im/registry/<slug>/ dir should be purged; still at {}",
         slug_dir.display()
     );
     // Progress log mentions the purge so the user can see what happened.
     assert!(
-        stdout.contains("imd/registry/dex-bot/"),
+        stdout.contains("state/im/registry/dex-bot/"),
         "purge step must be reported; got: {stdout}",
     );
 }
@@ -1212,24 +1215,24 @@ fn t10_remove_without_purge_keeps_imd_registry() {
         "remove (no --purge) should succeed; stderr: {stderr}; stdout: {stdout}",
     );
 
-    // Without --purge the imd/registry/<slug>/ tree must survive so a
+    // Without --purge the state/im/registry/<slug>/ tree must survive so a
     // re-`ccteam init` of the same slug picks up where it left off.
     assert!(
         reg_path.exists(),
-        "imd/registry/<slug>/helper.json must survive without --purge",
+        "state/im/registry/<slug>/helper.json must survive without --purge",
     );
     assert!(
         hb_path.exists(),
-        "imd/registry/<slug>/helper.heartbeat must survive without --purge",
+        "state/im/registry/<slug>/helper.heartbeat must survive without --purge",
     );
     assert!(
         slug_dir.is_dir(),
-        "imd/registry/<slug>/ must survive without --purge",
+        "state/im/registry/<slug>/ must survive without --purge",
     );
-    // Step list must NOT mention the imd/registry purge step.
+    // Step list must NOT mention the state/im/registry purge step.
     assert!(
-        !stdout.contains("imd/registry/"),
-        "non-purge run must not touch imd/registry/; got: {stdout}",
+        !stdout.contains("state/im/registry/"),
+        "non-purge run must not touch state/im/registry/; got: {stdout}",
     );
 }
 
@@ -1262,7 +1265,7 @@ fn t11_purge_dry_run_reports_imd_registry_count() {
     );
     // PRD §F151 acceptance #1 — output names the dir + JSON count.
     assert!(
-        stdout.contains("would purge imd/registry/dex-bot/") && stdout.contains("1 JSON file"),
-        "dry-run must preview imd/registry/<slug>/ with count; got: {stdout}",
+        stdout.contains("would purge state/im/registry/dex-bot/") && stdout.contains("1 JSON file"),
+        "dry-run must preview state/im/registry/<slug>/ with count; got: {stdout}",
     );
 }
