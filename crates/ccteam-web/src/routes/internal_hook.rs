@@ -219,7 +219,14 @@ async fn dispatch(
                 decision = false,
                 "latency hook.recv"
             );
-            Json(json!({})).into_response()
+            // 204 No Content — an EMPTY body, not `{}`. `hook.sh`'s curl
+            // silences stderr but NOT stdout, so any response body prints to
+            // the hook's stdout; for a SessionStart / UserPromptSubmit hook
+            // that stdout lands in the model's context. An empty 204 keeps a
+            // non-decision hook's stdout provably ZERO. (The `Ok(Some)` HITL
+            // arm above still returns its decision JSON — that body MUST reach
+            // claude, so we do NOT silence the curl itself.)
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
             tracing::warn!(

@@ -81,9 +81,11 @@ async fn post_progress_append_returns_empty_object_and_writes_jsonl() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({}));
+    // 204 No Content — a non-decision hook returns an EMPTY body (provably-zero
+    // hook stdout, so a SessionStart/UserPromptSubmit hook injects nothing into
+    // the model's context); only the intercept-ask/permission decision hooks
+    // return a body. The side effect below still records the event.
+    assert_eq!(resp.status(), 204);
 
     // Side effect: a Stop event line lives in the progress jsonl.
     let line = std::fs::read_to_string(&progress).expect("progress jsonl written");
@@ -158,7 +160,7 @@ async fn chat_progress_session_start_uses_role_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204); // non-decision hook → empty body
 
     // Progress line should carry `role=alice` even though the daemon
     // process itself has no `CCTEAM_CHAT_ROLE` in env.
@@ -213,7 +215,7 @@ async fn chat_progress_user_prompt_refreshes_marker() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204); // non-decision hook → empty body
 
     let marker_body =
         std::fs::read_to_string(&marker).expect("active-session-id marker written on user-prompt");
@@ -251,7 +253,7 @@ async fn chat_progress_payload_role_overrides_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204); // non-decision hook → empty body
 
     let line = std::fs::read_to_string(&progress).expect("progress jsonl written");
     assert!(
