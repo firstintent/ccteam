@@ -1,20 +1,21 @@
 # v0.8.20 — 多租户深化:CLI 项目归属 + per-tenant IM bot + 登录链接可见
 
 > **Status: LANDED**(dev,doc-first → 4 wave 实现,owner 2026-06-25)。**tag HELD**;daemon 需**重部署** + SPA 需**重 build** + 用户 `/mcp` 重连才上线。
-> 建立在**档1**(per-user web,v0.8.18)之上:`~/.ccteam/tenants.json` 租户注册表 + 单 token→`Identity{admin|tenant}` + 项目归属 ACL(`ProjectState.owner`,web 建项目盖 `web:<tenant>`,session 继承 project 归属)。
+> 建立在**档1**(per-user web,v0.8.18)之上:`~/.ccteam/tenants.json` 租户注册表 + 单 token→`Identity{admin|tenant}` + 项目归属 ACL(`ProjectState.owner`,web 建项目盖 `user:<tenant>`,session 继承 project 归属)。
 
 ## 落地概览(4 wave,全绿)
 
 | Wave | 内容 | 关键文件 |
 |---|---|---|
-| **W1** | `ccteam init --owner`(裸值→`web:`、`:` 原样、re-init 覆盖**无需 `--force`**、轻校验 WARN) | `ccteam-cli/src/{main,commands}.rs` |
+| **W1** | `ccteam init --owner`(裸值→`user:`、`:` 原样、re-init 覆盖**无需 `--force`**、轻校验 WARN) | `ccteam-cli/src/{main,commands}.rs` |
 | **W2** | 归属 bug 修(auth `URL→cookie→Bearer`,cookie 优先 Bearer 回退)+ **F3** 登录链接(`GET /users/{id}/link` + `ccteam status` + Settings 复制)+ **F4** 建-session 默认无角色 + 按身份分级运行时/角色 + **beta-gating 规范**(→ CLAUDE.md §五.8) | `ccteam-web/src/{auth,routes/users,routes/openapi}.rs` · SPA `ChatConsole/SettingsPage/usersApi` |
 | **W3** | Tenant IM 凭据模型(`TenantTelegram`/`TenantLark`,0600)+ 自助 REST `PUT /me/im`(getMe 校验,replace 语义)+ admin `PUT /users/{id}/im` + Settings「我的 IM bot」 | `ccteam-core/src/tenants.rs` · `ccteam-web/src/routes/users.rs` · SPA `SettingsPage` |
 | **W4** | **per-tenant IM bot 监听/路由/热重载**(核心):channel `"<platform>@<tenant>"`、`build_tenant_channels` fan-out、`chat_can_access` 租户隔离、`platform_of` ACL、changed-scope 热重载 + web PUT 触发 | `ccteam-im/src/{daemon,gateway,transport/*}.rs` |
 | **W7** | **`~/.ccteam/` 布局整理**(owner 追加):按职责分组 `secrets/`(0700:web-token · im-credentials.json · `users/<id>.json` 每租户一个)· `cache/hub` · `state/`(progress · im(原 imd)· harness · pty · pid);`tenants.json` 拆成 **per-user 文件**;`--home <dir>`(多实例 `~/.ccteam2`);Python 迁移脚本(Rust **零兼容逻辑**)。死目录 phases/templates/inbox/control/teams-progress.jsonl 不再创建 | `ccteam-core/src/{paths,tenants}.rs` · `ccteam-cli/src/main.rs` · `scripts/migrate_ccteam_home.py` |
 
-> **W6 — web↔IM 收敛已落地**(owner 拍板「现在收敛、更优雅」):抽 `canonical_owner(frontend)→identity` 把「**谁拥有**」(`owner`)和「**回哪去**」(`reply_to`)彻底分开 —— 租户的 web 和它**自己的** IM bot 共用一个 `web:<tenant>` owner,两个前端互看自己的**全部**会话(web 建 / IM bot 建都互通);回信仍按来源前端(`reply_to`)走、web SSE 按 `sid` 投递**不受影响**。全局/admin bot 路径不变。<br>
-> **仍 DEFERRED(owner 拍板「不改」):** 全局 bot「废迁」是 **reframe 非 literal** —— 不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。
+> **W6 — web↔IM 收敛已落地**(owner 拍板「现在收敛、更优雅」):抽 `canonical_owner(frontend)→identity` 把「**谁拥有**」(`owner`)和「**回哪去**」(`reply_to`)彻底分开 —— 租户的 web 和它**自己的** IM bot 共用一个 `user:<tenant>` owner,两个前端互看自己的**全部**会话(web 建 / IM bot 建都互通);回信仍按来源前端(`reply_to`)走、web SSE 按 `sid` 投递**不受影响**。全局/admin bot 路径不变。<br>
+> **仍 DEFERRED(owner 拍板「不改」):** 全局 bot「废迁」是 **reframe 非 literal** —— 不写迁移代码(pre-v1.0 规则),全局 `credentials.json` bot **不再共享**(租户各自有 bot),它只服务 admin。详见末尾 Handoff。<br>
+> **W8 — owner 命名空间 `web:` → `user:`**(post-ship follow-up,owner msg 1458「owner=web 有误导,改吧」):owner 身份 tag 从 `web:<tenant>`/`web:web-api` 改 `user:<tenant>`/`user:web-api`。`canonical_owner` 产出**合成 `user:` channel(纯身份轴、非投递 channel)**,web SSE / IM 投递仍走 `reply_to`(真实前端 channel `web` / `telegram@<tid>`)**不变** —— 零投递回归。配套:`session_by_handle`/`adopt_session_in_project` 改比 `canonical_owner(chat)`(顺手修了 W6 遗留的「租户 bot 自己 @handle / `/cd` 匹配不到」latent bug);`Identity::web_owner`→`owner_tag`、`web_owner_chat_id`→`web_chat_id`。**breaking**:旧 `web:<tenant>` 项目归属 tag → 租户用 `ccteam init --owner user:<t>` 重盖(admin 因 `is_admin` 兜底不受影响,会话 owner 在内存、重启即新 `user:`)。验证:`chat_owner_visible_converges_*` + `create_session_empty_role_is_ok` + `tenant_acl_test` 全绿。
 
 ### W7 — `~/.ccteam/` 新布局(owner 追加「整理得更优雅」)
 
@@ -54,10 +55,10 @@
 ## Feature 1 — `ccteam init --owner <value>`(支持覆盖)
 
 CLI 起手把项目指给某租户。
-- `ccteam init --owner <web:<tenant> | channel:<chat_id>>` → 写 `ProjectState.owner`。
-- **归一化**:值含 `:` 原样;裸值(租户 id)前缀补 `web:`。空 → 未指定。
+- `ccteam init --owner <user:<tenant> | channel:<chat_id>>` → 写 `ProjectState.owner`。
+- **归一化**:值含 `:` 原样;裸值(租户 id)前缀补 `user:`。空 → 未指定。
 - **覆盖语义**:带 `--owner` → 覆盖已有 owner(re-init 也覆盖,**不需 `--force`**);不带 → 保留现有(新建=None,re-init=原值不清零)。
-- 轻校验(不阻断):`web:<tenant>` 非已知租户 → stderr WARN,仍写。
+- 轻校验(不阻断):`user:<tenant>` 非已知租户 → stderr WARN,仍写。
 - 回执显示 `owner: <value>`。
 - 落点:`main.rs` `Init` 变体 + `commands.rs` `InitOptions` → 透传 `owner: Option<String>` 进 `bootstrap_project_at_dir`/`bootstrap_project`(projects.rs;grep 全 caller 传 `None`)→ set/override。规模小。
 
@@ -99,25 +100,25 @@ admin 随时看**所有租户的登录链接**(`?token=ccteam:<hex>`),两处:
 
 ## Bug 修复 — web 新租户建项目误归 admin(deployed,本版修)
 
-**症状(owner msg 1438):** 新用户 web 建项目后归到 admin(应 `web:<tenant>`)。
+**症状(owner msg 1438):** 新用户 web 建项目后归到 admin(应 `user:<tenant>`)。
 
 **根因分析(本 session 排查,deployed `5314c36`):**
-- 建项目路由 `routes/projects.rs:138` `owner = identity.web_owner()` —— **正确**(`web_owner()`:admin→`web:web-api`、tenant→`web:<id>`,`auth.rs:155`)。
+- 建项目路由 `routes/projects.rs:138` `owner = identity.owner_tag()` —— **正确**(`owner_tag()`:admin→`user:web-api`、tenant→`user:<id>`,`auth.rs:155`)。
 - `auth_layer`(`auth.rs:334`)身份优先级:**① Authorization header (Bearer) > ② URL-shim `?token` cookie > ③ cookie**(auth 已启用;loopback 短路仅 `!auth.enabled` 时,本机 auth 开着不触发)。
 - SPA **同时**带 same-origin cookie **和** `Authorization: Bearer <token>`(fetchInterceptor monkey-patch,`configApi.ts:14`)→ **header 赢**。
 - ⇒ **最可能根因**:SPA 的 Bearer 没随当前登录(租户)重取,带的是**缓存/残留的 admin token**(上次 admin 登录),header 盖过新设的租户 cookie → 建项目 identity 解析成 **admin**。
 
-**下个 session 要做:** ① 服务端建项目处 **log 解析出的 Identity** 实证;② 修 SPA token:Bearer 跟当前 cookie 同源(每次登录重取 `/api/v1/auth/token`、别跨登录缓存),或**去掉 Bearer monkey-patch 只靠 cookie**(same-origin 本带 cookie);③ 或服务端 web 路径把优先级改 **cookie > header**。测试:租户 token 建项目 → `owner==web:<tenant>` 非 admin。
+**下个 session 要做:** ① 服务端建项目处 **log 解析出的 Identity** 实证;② 修 SPA token:Bearer 跟当前 cookie 同源(每次登录重取 `/api/v1/auth/token`、别跨登录缓存),或**去掉 Bearer monkey-patch 只靠 cookie**(same-origin 本带 cookie);③ 或服务端 web 路径把优先级改 **cookie > header**。测试:租户 token 建项目 → `owner==user:<tenant>` 非 admin。
 
 ---
 
 ## 验收(草案)
 
-- **F1**:`init --owner web:u1`→`state.owner=="web:u1"`;裸 `u1`→`web:u1`;re-init 带新 owner 覆盖(无 `--force`)、不带保留。
+- **F1**:`init --owner user:u1`→`state.owner=="user:u1"`;裸 `u1`→`user:u1`;re-init 带新 owner 覆盖(无 `--force`)、不带保留。
 - **F2**:两租户各配自己 telegram/lark bot → 各自 `/pair` + 发消息 → 各只见/驱动自己会话;增一租户 bot → daemon 不重启热起监听;全局 bot 退役后 owner 经自己租户 bot 正常驱动。
 - **F3**:`ccteam status` + admin 用户管理列出每租户登录链接;租户自助接口只回自己的、看不到别人。
 - **F4**:tenant 建 session 面只见 claude/codex(固定 stream-json、默认无角色);admin 见全部(含 terminal/rmux + 角色)。beta-gating:admin 见 beta、tenant 不见(**纯 UI**,后端不变)。
-- **Bug**:租户 web 建项目 → `owner==web:<tenant>`(非 admin)。
+- **Bug**:租户 web 建项目 → `owner==user:<tenant>`(非 admin)。
 - baseline:cargo / ccteam-web / vitest 不退步;clippy 0;fmt clean。
 
 ## Dev-plan(波次,草案)
@@ -149,7 +150,7 @@ admin 随时看**所有租户的登录链接**(`?token=ccteam:<hex>`),两处:
 - **F4 默认无角色 + 纯 UI 门**:`useMe().isAdmin` 控制运行时/角色可见性,后端创建路由不变。
 
 **Rejected / Deferred(需 owner 拍板是否后续做):**
-- **web↔IM 收敛(W6 已落地 —— owner 拍板「现在收敛、更优雅」,原 deferred 已做)**:抽纯函数 `canonical_owner(chat)→identity` 把 per-tenant bot(`telegram@<tid>`)与租户 web 统一成 `web:<tid>` owner。gateway 创建会话/项目时盖 canonical identity(`start_session` 的 `GatewaySession.owner = canonical_owner(frontend)`、web `create_session_api_proto` 收 `owner_id`(REST 传 `Identity::web_owner_chat_id()`)、IM `/newproject` 用 `canonical_owner(chat).identity()`),`chat_owner_visible` 按 canonical 比对。**优雅点 = owner(ACL)与 reply_to(投递)彻底分开** —— `reply_to` 仍是来源前端,回信路由不变(web SSE 按 `sid` / IM 按 channel+chat_id;`pump_target` 用 `reply_to` 非 `owner`)。验证:`chat_owner_visible_converges_tenant_web_and_im`(单元)+ `gateway_web_and_tenant_bot_converge`(端到端:web↔bot 双向 + 别租户隔离)。`Tenant.linked_chat` 仍留作显式复联记录。
+- **web↔IM 收敛(W6 已落地 —— owner 拍板「现在收敛、更优雅」,原 deferred 已做)**:抽纯函数 `canonical_owner(chat)→identity` 把 per-tenant bot(`telegram@<tid>`)与租户 web 统一成 `user:<tid>` owner。gateway 创建会话/项目时盖 canonical identity(`start_session` 的 `GatewaySession.owner = canonical_owner(frontend)`、web `create_session_api_proto` 收 `owner_id`(REST 传 `Identity::web_chat_id()`)、IM `/newproject` 用 `canonical_owner(chat).identity()`),`chat_owner_visible` 按 canonical 比对。**优雅点 = owner(ACL)与 reply_to(投递)彻底分开** —— `reply_to` 仍是来源前端,回信路由不变(web SSE 按 `sid` / IM 按 channel+chat_id;`pump_target` 用 `reply_to` 非 `owner`)。验证:`chat_owner_visible_converges_tenant_web_and_im`(单元)+ `gateway_web_and_tenant_bot_converge`(端到端:web↔bot 双向 + 别租户隔离)。`Tenant.linked_chat` 仍留作显式复联记录。
 - **全局 bot literal「废迁」**:owner 说「废+迁」「admin 也是一个有自己 bot 的租户」。实现为 **reframe**:全局 `credentials.json` bot 不再是共享 bot(租户各有自己的),它只服务 admin;**未**把 admin 塞进 tenants.json 当租户(避免迁移代码,守 pre-v1.0 不迁移规则)。功能上「租户不再用全局 bot」已达成。**若 owner 要 admin 也在注册表当租户,是后续小改。**
 
 **Risks:**

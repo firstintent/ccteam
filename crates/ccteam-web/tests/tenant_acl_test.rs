@@ -51,7 +51,7 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     let admin_state = paths.project_state("adminproj");
     std::fs::create_dir_all(admin_state.parent().unwrap()).unwrap();
     let mut st = ccteam_core::ProjectState::initial_for_team("adminproj".into(), "dev".into());
-    st.owner = Some("web:web-api".into());
+    st.owner = Some("user:web-api".into());
     st.save(&admin_state).unwrap();
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
@@ -218,7 +218,7 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
 /// over a STALE `Authorization: Bearer` the SPA fetch shim still injects from a
 /// prior admin login. Before the fix, `auth_layer` checked the header FIRST, so
 /// a cached admin Bearer outranked the fresh tenant cookie → the tenant's new
-/// projects were stamped `web:web-api` (admin pool) instead of `web:<tenant>`
+/// projects were stamped `user:web-api` (admin pool) instead of `user:<tenant>`
 /// and vanished from the tenant's own list. Now: shim → cookie → header.
 #[tokio::test]
 async fn session_cookie_beats_stale_bearer_header() {

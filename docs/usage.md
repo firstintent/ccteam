@@ -95,7 +95,7 @@ ccteam init
 ccteam init --in /path/to/repo          # 在别处初始化(slug 默认取目录名)
 ccteam init --slug demo-app             # 覆盖自动推断的 slug
 ccteam init --force                     # 覆盖 ccteam 生成物(在源码目录自举时也用它)
-ccteam init --owner web:u8e29d424       # 多用户:把项目归属给某 web 租户(裸值补 web:;含 : 原样;re-init 覆盖无需 --force)
+ccteam init --owner user:u8e29d424      # 多用户:把项目归属给某用户租户(裸值补 user:;含 : 原样;re-init 覆盖无需 --force)
 ccteam project ls                       # 列已知项目
 ```
 

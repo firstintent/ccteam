@@ -795,7 +795,7 @@ mod tests {
         send_text(&mut s1, "new", "/new claude reviewer").await;
         recv_reply_contains(&mut s1, "created session s1").await;
 
-        // chat-2 (a different web chat) SEES it via the shared web pool and can
+        // chat-2 (a different web chat) SEES it via the shared user pool and can
         // /use it.
         let mut s2 = connect_chat_as(stack.addr, "chat-2", "bob").await;
         send_text(&mut s2, "sessions", "/sessions").await;

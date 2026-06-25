@@ -113,8 +113,8 @@ enum Command {
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
         /// v0.8.20 F1: set the project owner identity (`ProjectState.owner`,
-        /// `"channel:chat_id"` — e.g. `web:<tenant>`). A bare value (no `:`)
-        /// is scoped to the web namespace (`alice` → `web:alice`). Present
+        /// `"channel:chat_id"` — e.g. `user:<tenant>`). A bare value (no `:`)
+        /// is scoped to the per-user identity namespace (`alice` → `user:alice`). Present
         /// overrides an existing owner on re-init (no `--force` needed);
         /// absent preserves it.
         #[arg(long, value_name = "OWNER")]

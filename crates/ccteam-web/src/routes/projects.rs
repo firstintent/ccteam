@@ -133,9 +133,9 @@ pub(crate) async fn handle_create_project(
     let abs_for_blocking = abs.clone();
     let team_for_blocking = team.clone();
     // v0.8.18 档1 — bind the new project to its creating web user
-    // (`web:<id>`; admin → the shared `web-api` pool). Project is the unit of
+    // (`user:<id>`; admin → the shared `web-api` pool). Project is the unit of
     // ownership; its sessions inherit it.
-    let owner_for_blocking = identity.web_owner();
+    let owner_for_blocking = identity.owner_tag();
     let scaffold = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         ccteam_core::bootstrap_project_at_dir(
             &paths,

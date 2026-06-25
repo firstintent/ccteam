@@ -150,21 +150,23 @@ impl Identity {
 
     /// This identity's owner tag for resources it creates on the web
     /// (a project's `ProjectState.owner` / a session owner, `"channel:chat_id"`).
-    /// The admin uses the shared `web-api` pool; a per-user tenant owns
-    /// `web:<id>`. Mirrors the gateway's `web_owner_chat`.
-    pub fn web_owner(&self) -> String {
+    /// The `user:` namespace is the SYNTHETIC identity channel (NOT a delivery
+    /// channel — see the gateway's `canonical_owner`): the admin uses the shared
+    /// `user:web-api` pool; a per-user tenant owns `user:<id>`.
+    pub fn owner_tag(&self) -> String {
         if self.is_admin {
-            "web:web-api".to_string()
+            "user:web-api".to_string()
         } else {
-            format!("web:{}", self.id)
+            format!("user:{}", self.id)
         }
     }
 
-    /// v0.8.20 — the bare chat_id of this identity's web owner (the part after
-    /// `web:`): `"web-api"` for the admin, else the tenant id. Threaded into the
-    /// gateway's web session creation so a web session is OWNED by `web:<id>`
-    /// (web↔IM convergence — the tenant's own IM bot then sees it too).
-    pub fn web_owner_chat_id(&self) -> String {
+    /// v0.8.20 — the bare chat_id of this identity's WEB FRONTEND (the delivery
+    /// channel `"web"`): `"web-api"` for the admin, else the tenant id. Threaded
+    /// into the gateway's web session creation as the `reply_to` seed; the gateway
+    /// then derives the OWNER as `user:<id>` via `canonical_owner` (web↔IM
+    /// convergence — the tenant's own IM bot then sees it too).
+    pub fn web_chat_id(&self) -> String {
         if self.is_admin {
             "web-api".to_string()
         } else {
@@ -174,9 +176,9 @@ impl Identity {
 
     /// Whether this identity may see a resource owned by `owner` (a project's
     /// `ProjectState.owner` or a session owner). The admin/owner sees
-    /// everything; a per-user tenant sees only what it owns (`web:<id>`).
+    /// everything; a per-user tenant sees only what it owns (`user:<id>`).
     pub fn can_see_owner(&self, owner: Option<&str>) -> bool {
-        self.is_admin || owner == Some(self.web_owner().as_str())
+        self.is_admin || owner == Some(self.owner_tag().as_str())
     }
 }
 
@@ -392,7 +394,7 @@ pub async fn auth_layer(
     //    `Bearer` the SPA fetch shim still injects from a prior login. This is
     //    the v0.8.20 ownership-leak fix: header-first let a cached admin token
     //    outrank the fresh tenant cookie → a tenant's new project landed under
-    //    the admin pool (`web:web-api`) instead of `web:<tenant>`.
+    //    the admin pool (`user:web-api`) instead of `user:<tenant>`.
     if let Some(cookie_val) = cookie_token(&jar) {
         if let Some(id) = resolve_identity(cookie_val, expected, &tenants) {
             let wire = format!("{TOKEN_PREFIX}{cookie_val}");
@@ -505,15 +507,15 @@ mod tests {
     #[test]
     fn can_see_owner_admin_sees_all_tenant_sees_own() {
         let admin = Identity::admin();
-        assert_eq!(admin.web_owner(), "web:web-api");
+        assert_eq!(admin.owner_tag(), "user:web-api");
         assert!(admin.can_see_owner(None));
-        assert!(admin.can_see_owner(Some("web:u1")));
+        assert!(admin.can_see_owner(Some("user:u1")));
         assert!(admin.can_see_owner(Some("telegram:123")));
 
         let t = Identity::tenant("u1".to_string());
-        assert_eq!(t.web_owner(), "web:u1");
-        assert!(t.can_see_owner(Some("web:u1")), "owns it");
-        assert!(!t.can_see_owner(Some("web:u2")), "another tenant's");
+        assert_eq!(t.owner_tag(), "user:u1");
+        assert!(t.can_see_owner(Some("user:u1")), "owns it");
+        assert!(!t.can_see_owner(Some("user:u2")), "another tenant's");
         assert!(!t.can_see_owner(None), "legacy/admin-pool project");
         assert!(!t.can_see_owner(Some("telegram:1")), "IM-owned");
     }

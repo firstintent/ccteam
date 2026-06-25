@@ -1525,7 +1525,7 @@ impl Gateway {
                     .filter(|p| !p.is_empty())
                     .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
                 // v0.8.20 convergence — own the project by the CANONICAL identity
-                // (`web:<tenant>` for a tenant bot), so the tenant's web console
+                // (`user:<tenant>` for a tenant bot), so the tenant's web console
                 // sees the IM-bot-created project too (web ACL is project-owned).
                 let owner_id = canonical_owner(chat).identity();
                 self.create_project(slug, path, Some(&owner_id)).map(Some)
@@ -1825,7 +1825,7 @@ impl Gateway {
             GatewaySession {
                 id: id.clone(),
                 // v0.8.20 web↔IM convergence — the OWNER is the canonical identity
-                // (`web:<tenant>` for a per-tenant bot; the chat itself otherwise),
+                // (`user:<tenant>` for a per-tenant bot; the chat itself otherwise),
                 // so a tenant's web console + their own IM bot share ONE owner and
                 // see the SAME sessions. `reply_to` below stays the actual frontend
                 // chat (delivery target), so reply routing is unchanged.
@@ -2887,9 +2887,9 @@ impl Gateway {
     /// Session access scope — visibility (`/sessions`) AND addressing
     /// (`/use` / `/stop` / `/screen`).
     ///
-    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared web pool**: a
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared user pool**: a
     /// chat reaches the sessions it OWNS, PLUS every session created by the web
-    /// console (`owner.channel == "web"`). The web console is ONE shared
+    /// console (`owner.channel == "user"`). The web console is ONE shared
     /// operator identity (`web-api`) until 档1 gives per-user web tokens, so its
     /// sessions must stay reachable from IM — the common single-user flow is
     /// "create it on web, drive it from your phone". IM-created sessions stay
@@ -2904,11 +2904,11 @@ impl Gateway {
     /// uid, NOT a security boundary.
     ///
     /// v0.8.20 — a PER-TENANT IM bot (channel `"<platform>@<tenant>"`) and that
-    /// tenant's web console are ONE identity (`web:<tenant>`, via
+    /// tenant's web console are ONE identity (`user:<tenant>`, via
     /// `canonical_owner`): the bot sees + drives the tenant's WEB-created sessions
     /// AND its own, and the tenant's web sees the bot's — CONVERGED. It still
     /// inherits NO shared pool (other tenants + the admin pool stay hidden); the
-    /// shared web pool stays the admin/global bot's operator view.
+    /// shared user pool stays the admin/global bot's operator view.
     fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
         Self::chat_owner_visible(chat, &session.owner)
     }
@@ -2916,23 +2916,25 @@ impl Gateway {
     /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
     /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
     /// iff (a) it owns it, or (b) — for the admin/global bot + the web querier
-    /// ONLY — the session is in the shared web pool (`owner.channel == "web"`).
-    /// A per-tenant IM bot (channel `"<platform>@<tenant>"`) sees ONLY what it
-    /// owns: it gets neither the shared web pool nor other tenants' IM sessions.
+    /// ONLY — the session is in the shared user pool (`owner.channel == "user"`,
+    /// i.e. any web/tenant-created session). A per-tenant IM bot (channel
+    /// `"<platform>@<tenant>"`) sees ONLY what it owns: it gets neither the shared
+    /// pool nor other tenants' IM sessions.
     fn chat_owner_visible(chat: &ChatKey, owner: &ChatKey) -> bool {
         // Own = the session is owned by the chat's CANONICAL identity. v0.8.20
         // web↔IM convergence: a per-tenant bot's canonical identity is its
-        // tenant `web:<tid>`, so it sees BOTH its IM sessions AND that tenant's
+        // tenant `user:<tid>`, so it sees BOTH its IM sessions AND that tenant's
         // web-created sessions (and the tenant's web console sees the bot's).
         if *owner == canonical_owner(chat) {
             return true;
         }
-        // A per-tenant bot gets NO shared web pool — only its own (above).
+        // A per-tenant bot gets NO shared pool — only its own (above).
         if crate::transport::is_tenant_bot_channel(&chat.channel) {
             return false;
         }
-        // The admin/global bot + the web querier: own + shared web pool.
-        owner.channel == "web"
+        // The admin/global bot + the web querier: own + the shared user pool
+        // (every web/tenant-owned session, the `user:` identity namespace).
+        owner.channel == "user"
     }
 
     /// Point the chat's active session at an existing session owned by this
@@ -2940,10 +2942,16 @@ impl Gateway {
     /// id. When none exists, clear the active session so the next message spawns
     /// one on demand in `project`. Backs `/cd` so the project switch is real.
     fn adopt_session_in_project(&mut self, chat: &ChatKey, project: &str) -> Option<String> {
+        // Own = owned by the chat's CANONICAL identity (`user:<id>` for web /
+        // tenant bots, the chat itself for the admin/global IM bot). Owner is the
+        // synthetic `user:` channel, never the querier's delivery channel, so we
+        // must canonicalize before comparing — a plain `s.owner == *chat` would
+        // miss a web chat's own (`user:`-owned) sessions. See `canonical_owner`.
+        let canon = canonical_owner(chat);
         let adopted = self
             .sessions
             .values()
-            .filter(|s| s.owner == *chat && s.project == project)
+            .filter(|s| s.owner == canon && s.project == project)
             .min_by_key(|s| session_index(&s.id))
             .map(|s| s.id.clone());
         match &adopted {
@@ -2961,9 +2969,13 @@ impl Gateway {
     }
 
     fn session_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<String> {
+        // Own-scoped @handle resolution: match the chat's CANONICAL identity
+        // (`user:<id>` for web / tenant bots), not the raw querier chat — owner
+        // lives in the synthetic `user:` channel. See `canonical_owner`.
+        let canon = canonical_owner(chat);
         self.sessions
             .values()
-            .find(|s| s.owner == *chat && s.handle == handle)
+            .find(|s| s.owner == canon && s.handle == handle)
             .map(|s| s.id.clone())
     }
 
@@ -3383,11 +3395,12 @@ impl Gateway {
         owner_id: String,
     ) -> Result<CreateSessionOutcome> {
         // v0.8.20 web↔IM convergence — a web session is OWNED by the caller's
-        // identity (`web:<tenant>`, or `web:web-api` for the admin/owner), so the
-        // same tenant's own IM bot sees it too (and the tenant's web sees their
-        // bot's sessions). Delivery is still a web SSE subscriber (channel "web",
-        // filtered by `sid` — the chat_id is irrelevant to web delivery), so the
-        // reply routing is unchanged.
+        // identity (`user:<tenant>`, or `user:web-api` for the admin/owner): we
+        // pass the web frontend chat (channel "web") here as `reply_to`, and
+        // `start_session` derives the owner via `canonical_owner` (→ `user:<id>`),
+        // so the same tenant's own IM bot sees it too. Delivery stays a web SSE
+        // subscriber (channel "web", filtered by `sid` — the chat_id is
+        // irrelevant to web delivery), so the reply routing is unchanged.
         let owner = ChatKey::new("web", &owner_id, &owner_id);
         // v0.8.8 F2 — handle 默认 = role;空 role(roleless)→ 空 handle,由
         // `start_session` 统一回退到 sid(避免空 handle 撞 @handle 路由)。
@@ -3589,14 +3602,24 @@ fn web_api_chat() -> ChatKey {
 
 /// v0.8.20 — the canonical OWNER identity of a frontend chat (web↔IM
 /// convergence). A per-tenant IM bot (`"<platform>@<tenant>"`) and that tenant's
-/// web console are ONE identity (`web:<tenant>`), so both frontends OWN + SEE the
-/// same sessions. Everything else (the admin/global bot, the web admin pool)
-/// owns by the chat itself. Reply routing is unaffected — it uses the per-turn
-/// `reply_to` (the actual frontend chat), NOT the owner (see `pump_target`).
+/// web console are ONE identity (`user:<tenant>`), so both frontends OWN + SEE
+/// the same sessions. Everything else (the admin/global bot) owns by the chat
+/// itself. The `user:` namespace is a SYNTHETIC identity channel — it is NEVER a
+/// delivery channel; reply routing uses the per-turn `reply_to` (the actual
+/// frontend chat, e.g. the web console's channel `"web"`), NOT the owner (see
+/// `pump_target`). So the owner tag stays clear (`user:<id>`) while web SSE / IM
+/// delivery is untouched.
 fn canonical_owner(chat: &ChatKey) -> ChatKey {
-    match crate::transport::tenant_of_bot_channel(&chat.channel) {
-        Some(tid) => ChatKey::new("web", tid, tid),
-        None => chat.clone(),
+    if let Some(tid) = crate::transport::tenant_of_bot_channel(&chat.channel) {
+        // A per-tenant IM bot → its tenant identity.
+        ChatKey::new("user", tid, tid)
+    } else if chat.channel == "web" {
+        // The web console (admin `web-api` or a tenant) → the user identity. The
+        // frontend chat itself (channel "web") remains the delivery `reply_to`.
+        ChatKey::new("user", &chat.chat_id, &chat.chat_id)
+    } else {
+        // The admin/global IM bot, etc. — owns by the chat itself.
+        chat.clone()
     }
 }
 
@@ -6571,21 +6594,23 @@ mod tests {
     /// below; the test directly here is the pure unit check of the same rule.
     ///
     /// v0.8.20 web↔IM convergence — a per-tenant IM bot (`telegram@<tid>`) and
-    /// that tenant's web console are ONE identity (`web:<tid>`): the bot sees the
+    /// that tenant's web console are ONE identity (`user:<tid>`): the bot sees the
     /// tenant's WEB-created sessions (and the tenant's web sees the bot's). It
     /// still sees NOTHING of other tenants or the admin pool. The admin/global
     /// bot keeps the operator "own + all web" view.
     #[test]
     fn chat_owner_visible_converges_tenant_web_and_im() {
-        let web_a = ChatKey::new("web", "uaaa", "uaaa"); // tenant uaaa's web identity
-        let web_b = ChatKey::new("web", "ubbb", "ubbb");
-        let web_admin = ChatKey::new("web", "web-api", "web-api");
+        // A web-created session's OWNER is the canonical user identity
+        // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
+        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")); // user:uaaa
+        let web_b = canonical_owner(&ChatKey::new("web", "ubbb", "ubbb")); // user:ubbb
+        let web_admin = canonical_owner(&ChatKey::new("web", "web-api", "web-api")); // user:web-api
         let admin_tg = ChatKey::new("telegram", "339", "rob");
         let bot_a = ChatKey::new("telegram@uaaa", "111", "alice"); // uaaa's IM bot
         let bot_b = ChatKey::new("telegram@ubbb", "222", "bob");
 
-        // CONVERGENCE: uaaa's bot canonicalizes to web:uaaa → it sees uaaa's
-        // web-created sessions (owner web:uaaa).
+        // CONVERGENCE: uaaa's bot canonicalizes to user:uaaa → it sees uaaa's
+        // web-created sessions (owner user:uaaa).
         assert!(
             Gateway::chat_owner_visible(&bot_a, &web_a),
             "a tenant bot sees its tenant's web-created sessions (convergence)"
@@ -6609,7 +6634,7 @@ mod tests {
         );
 
         // The admin/global bot keeps the operator view: own + the shared web
-        // pool (every owner.channel == "web", incl tenants' — oversight).
+        // pool (every owner.channel == "user", incl tenants' — oversight).
         assert!(Gateway::chat_owner_visible(&admin_tg, &admin_tg));
         assert!(Gateway::chat_owner_visible(&admin_tg, &web_admin));
         assert!(
@@ -6659,7 +6684,7 @@ mod tests {
     }
 
     /// v0.8.18 柱2 档0 (regression fix) — the web console is a SHARED operator
-    /// pool: a session created from the web console (`owner.channel == "web"`)
+    /// pool: a session created from the web console (`owner.channel == "user"`)
     /// is visible AND addressable from an IM chat. This is the common
     /// single-user flow (create it on web, drive it from your phone) and the
     /// exact case the first cut of own-only broke. IM-created sessions instead
@@ -6674,7 +6699,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A telegram chat SEES it (shared web pool) and can /use it.
+        // A telegram chat SEES it (shared user pool) and can /use it.
         let seen = gateway
             .handle_text("telegram", "339498819", "rob", "/sessions")
             .await
@@ -6688,7 +6713,7 @@ mod tests {
     }
 
     /// v0.8.20 web↔IM convergence — a tenant's web console and their OWN IM bot
-    /// (`telegram@<tid>`) are ONE identity (`web:<tid>`): the bot sees the
+    /// (`telegram@<tid>`) are ONE identity (`user:<tid>`): the bot sees the
     /// tenant's web-created sessions AND its own; a DIFFERENT tenant's bot sees
     /// neither. (The admin/global bot keeps the shared-pool operator view, tested
     /// in `gateway_web_owned_session_visible_from_im`.)
@@ -6697,7 +6722,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
 
-        // Tenant uaaa creates a session on the WEB → owned web:uaaa.
+        // Tenant uaaa creates a session on the WEB → owned user:uaaa.
         gateway
             .handle_text("web", "uaaa", "uaaa", "/new claude reviewer")
             .await
@@ -6712,7 +6737,7 @@ mod tests {
             "uaaa's bot sees its tenant's web session: {seen:?}"
         );
 
-        // uaaa's bot creates a SECOND session → also web:uaaa.
+        // uaaa's bot creates a SECOND session → also user:uaaa.
         gateway
             .handle_text("telegram@uaaa", "111", "alice", "/new claude api")
             .await

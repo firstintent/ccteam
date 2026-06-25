@@ -313,9 +313,9 @@ pub(crate) async fn handle_create_session(
                 permission_mode,
                 protocol,
                 // v0.8.20 web↔IM convergence — own the session by the caller's
-                // identity (`web:<tenant>` / `web:web-api`) so the tenant's own
+                // identity (`user:<tenant>` / `user:web-api`) so the tenant's own
                 // IM bot sees it too.
-                identity.web_owner_chat_id(),
+                identity.web_chat_id(),
             )
             .await
     };

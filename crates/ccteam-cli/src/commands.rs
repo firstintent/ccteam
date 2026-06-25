@@ -56,9 +56,9 @@ pub struct InitOptions {
     /// `interactive` but skips actual stdin.
     pub yes: bool,
     /// v0.8.20 F1: set the project owner identity (`ProjectState.owner`,
-    /// `"channel:chat_id"` — e.g. `web:<tenant>` / `telegram:<chat_id>`). A
-    /// bare value (no `:`) is scoped to the web namespace (`alice` →
-    /// `web:alice`). Present ⇒ override an existing owner on re-init (without
+    /// `"channel:chat_id"` — e.g. `user:<tenant>` / `telegram:<chat_id>`). A
+    /// bare value (no `:`) is scoped to the per-user identity namespace (`alice` →
+    /// `user:alice`). Present ⇒ override an existing owner on re-init (without
     /// `--force`); absent ⇒ preserve. `None` = unspecified.
     pub owner: Option<String>,
 }
@@ -360,13 +360,13 @@ fn install_project_at(
     let fresh = !state_path.exists();
 
     // v0.8.20 F1: `--owner` stamps `ProjectState.owner` at init. Normalize the
-    // raw value (bare → `web:`; `:`-bearing → verbatim) once, then apply it in
+    // raw value (bare → `user:`; `:`-bearing → verbatim) once, then apply it in
     // whichever branch we take. Light, non-blocking validation: an unknown
-    // `web:<tenant>` warns on stderr but is still written (the tenant may be
+    // `user:<tenant>` warns on stderr but is still written (the tenant may be
     // created later). Override-on-reinit needs no `--force`.
     let requested_owner = opts.owner.as_deref().and_then(normalize_owner);
     if let Some(owner) = &requested_owner {
-        if let Some(tenant_id) = owner.strip_prefix("web:") {
+        if let Some(tenant_id) = owner.strip_prefix("user:") {
             if tenant_id != "web-api"
                 && ccteam_core::tenants::TenantRegistry::load(&paths.users_dir())
                     .by_id(tenant_id)
@@ -463,8 +463,8 @@ fn install_project_at(
 
 /// v0.8.20 F1 (`ccteam init --owner`): normalize a raw `--owner` value into the
 /// `ProjectState.owner` convention. A value already containing `:` is taken
-/// verbatim (`web:u123`, `telegram:456`); a bare value is scoped to the web
-/// tenant namespace (`alice` → `web:alice`). Whitespace-only ⇒ `None`.
+/// verbatim (`user:u123`, `telegram:456`); a bare value is scoped to the
+/// per-user identity namespace (`alice` → `user:alice`). Whitespace-only ⇒ `None`.
 fn normalize_owner(raw: &str) -> Option<String> {
     let v = raw.trim();
     if v.is_empty() {
@@ -472,7 +472,7 @@ fn normalize_owner(raw: &str) -> Option<String> {
     } else if v.contains(':') {
         Some(v.to_string())
     } else {
-        Some(format!("web:{v}"))
+        Some(format!("user:{v}"))
     }
 }
 
@@ -5687,23 +5687,26 @@ mod tests {
         }
     }
 
-    /// v0.8.20 F1: bare values are scoped to the web namespace; `:`-bearing
+    /// v0.8.20 F1: bare values are scoped to the per-user identity namespace; `:`-bearing
     /// values pass through verbatim; whitespace-only collapses to `None`.
     #[test]
     fn normalize_owner_scopes_bare_and_keeps_qualified() {
-        assert_eq!(normalize_owner("alice").as_deref(), Some("web:alice"));
-        assert_eq!(normalize_owner("web:u1").as_deref(), Some("web:u1"));
+        assert_eq!(normalize_owner("alice").as_deref(), Some("user:alice"));
+        assert_eq!(normalize_owner("user:u1").as_deref(), Some("user:u1"));
         assert_eq!(
             normalize_owner("telegram:123").as_deref(),
             Some("telegram:123")
         );
-        assert_eq!(normalize_owner("  spaced  ").as_deref(), Some("web:spaced"));
+        assert_eq!(
+            normalize_owner("  spaced  ").as_deref(),
+            Some("user:spaced")
+        );
         assert_eq!(normalize_owner("   "), None);
         assert_eq!(normalize_owner(""), None);
     }
 
     /// v0.8.20 F1 acceptance: `--owner` stamps `ProjectState.owner`, normalizes
-    /// bare → `web:`, and overrides an existing owner on re-init WITHOUT
+    /// bare → `user:`, and overrides an existing owner on re-init WITHOUT
     /// `--force`; a re-init without `--owner` preserves the existing owner.
     #[test]
     fn run_init_owner_sets_normalizes_and_overrides() {
@@ -5712,18 +5715,18 @@ mod tests {
         let dir = tmp.path().join("owned-demo");
         let state_path = dir.join(".ccteam").join("state.json");
 
-        // 1. `--owner web:u1` → verbatim (already qualified).
+        // 1. `--owner user:u1` → verbatim (already qualified).
         run_init(
             &paths,
             InitOptions {
                 install_in: Some(dir.clone()),
-                owner: Some("web:u1".into()),
+                owner: Some("user:u1".into()),
                 ..InitOptions::default()
             },
         )
         .unwrap();
         let st = ccteam_core::ProjectState::load(&state_path).unwrap();
-        assert_eq!(st.owner.as_deref(), Some("web:u1"));
+        assert_eq!(st.owner.as_deref(), Some("user:u1"));
 
         // 2. re-init WITHOUT `--owner` preserves the existing owner (no force).
         run_init(
@@ -5737,12 +5740,12 @@ mod tests {
         let st = ccteam_core::ProjectState::load(&state_path).unwrap();
         assert_eq!(
             st.owner.as_deref(),
-            Some("web:u1"),
+            Some("user:u1"),
             "re-init without --owner must preserve the existing owner"
         );
 
         // 3. re-init WITH a new bare `--owner` overrides (no `--force`) and is
-        //    scoped to the web namespace.
+        //    scoped to the per-user identity namespace.
         run_init(
             &paths,
             InitOptions {
@@ -5755,8 +5758,8 @@ mod tests {
         let st = ccteam_core::ProjectState::load(&state_path).unwrap();
         assert_eq!(
             st.owner.as_deref(),
-            Some("web:u2"),
-            "bare --owner is scoped to web: and overrides without --force"
+            Some("user:u2"),
+            "bare --owner is scoped to user: and overrides without --force"
         );
     }
 

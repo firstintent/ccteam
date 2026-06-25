@@ -151,7 +151,7 @@ fn build_projects(
     let mut rows = Vec::with_capacity(summaries.len());
     for s in summaries {
         // v0.8.18 档1 — per-user project isolation: the admin sees every
-        // project; a tenant sees only the ones it owns (`web:<id>`).
+        // project; a tenant sees only the ones it owns (`user:<id>`).
         if !identity.can_see_owner(s.state.owner.as_deref()) {
             continue;
         }
@@ -227,7 +227,7 @@ pub(crate) async fn handle_me(
 /// v0.8.18 档1 — whether `identity` may see project `slug`. Project is the unit
 /// of ownership; a session's visibility derives from its project's. Reads the
 /// project's `state.json` owner: the admin sees every project, a tenant only
-/// one it owns (`web:<id>`). A missing/unreadable project is not visible to a
+/// one it owns (`user:<id>`). A missing/unreadable project is not visible to a
 /// tenant. The single source the session endpoints consult to scope by project.
 pub(crate) fn can_see_project(
     app: &AppState,

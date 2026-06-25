@@ -103,7 +103,7 @@ pub fn is_tenant_bot_channel(channel: &str) -> bool {
 
 /// v0.8.20 — the tenant id of a per-tenant bot channel (`"<platform>@<tenant>"`),
 /// or `None` for the global/admin bot + web. Used to converge a tenant's IM bot
-/// onto its web identity `web:<tenant>` (web↔IM convergence).
+/// onto its web identity `user:<tenant>` (web↔IM convergence).
 pub fn tenant_of_bot_channel(channel: &str) -> Option<&str> {
     channel.split_once('@').map(|(_platform, tid)| tid)
 }
