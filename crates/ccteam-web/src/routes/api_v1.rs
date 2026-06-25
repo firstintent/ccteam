@@ -175,6 +175,9 @@ fn build_projects(
         .unwrap_or(0.0);
         rows.push(DashboardRow {
             slug: s.state.slug.clone(),
+            // The real working-tree dir (config-registry resolved) so the SPA can
+            // show it next to the slug — disambiguates an auto-appended slug.
+            path: app.paths.project_dir(&s.state.slug).display().to_string(),
             team: s.state.team.clone(),
             kind: team_kind_label(s.state.team_kind).to_string(),
             last_event_label,

@@ -3127,6 +3127,13 @@ impl Gateway {
             s.id, s.project, s.vendor
         );
 
+        // Project working-tree PATH — disambiguates an auto-appended slug
+        // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
+        // project map (slug → dir); omitted if the project isn't mapped.
+        if let Some(dir) = self.projects.get(&s.project) {
+            out.push_str(&format!("\n   📁 {}", dir.display()));
+        }
+
         // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
         // their own line for the deep view). Statusless/failed → `—` placeholder.
         let model = status

@@ -27,6 +27,9 @@ use utoipa::ToSchema;
 #[derive(Serialize, ToSchema)]
 pub struct DashboardRow {
     pub slug: String,
+    /// The project's real working-tree path. The SPA shows it to disambiguate
+    /// an auto-appended slug (demo2 vs demo): the dir is unambiguous.
+    pub path: String,
     pub team: String,
     pub kind: String,
     pub last_event_label: String,

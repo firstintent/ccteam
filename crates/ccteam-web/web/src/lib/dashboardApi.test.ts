@@ -26,6 +26,7 @@ describe("fetchDashboard", () => {
     const rows: DashboardRow[] = [
       {
         slug: "dev-foo",
+        path: "/home/u/dev-foo",
         team: "dev",
         kind: "workflow",
         last_event_label: "5s ago",

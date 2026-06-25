@@ -137,6 +137,12 @@ export default function ChatConsole() {
   // sessions → a freshly `ccteam init`-ed project was invisible and you
   // could never create its first session (chicken-and-egg).
   const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
+  // slug → real working-tree path (from GET /api/v1/projects). Lets the
+  // sidebar + new-session picker show each project's directory so a
+  // collision-suffixed slug (demo / demo2 / demo3) is identifiable. A
+  // sessions-only project (live but not registered) simply has no entry —
+  // the path line is then omitted for it.
+  const [projectPaths, setProjectPaths] = useState<Record<string, string>>({});
   const [railError, setRailError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   // When the new-session modal is opened from a specific project's "还没有
@@ -165,6 +171,10 @@ export default function ChatConsole() {
       // Keep the registered-project list (config.yaml SoT) so a project with
       // no session yet still shows up — don't discard it after the fan-out.
       setRegisteredProjects(projects.map((p) => p.slug));
+      // Side-table of each registered project's real working-tree path, keyed
+      // by slug — the sidebar group header + the picker's `hint` line read it
+      // to disambiguate demo / demo2 / demo3.
+      setProjectPaths(Object.fromEntries(projects.map((p) => [p.slug, p.path])));
       const lists = await Promise.all(
         projects.map((p) => listSessions(p.slug).catch(() => [] as SessionSummary[])),
       );
@@ -373,9 +383,20 @@ export default function ChatConsole() {
           <div className="flex-1 overflow-y-auto p-2 space-y-2">
             {projects.map((project) => {
               const items = railSessions.filter((s) => s.project === project);
+              const projectPath = projectPaths[project];
               return (
                 <div key={project}>
-                  <div className="px-1.5 py-1 text-[11px] font-mono text-text-dim">{project}</div>
+                  <div
+                    className="px-1.5 py-1"
+                    title={projectPath ? `${project} — ${projectPath}` : project}
+                  >
+                    <div className="text-[11px] font-mono text-text-dim truncate">{project}</div>
+                    {projectPath ? (
+                      <div className="text-[10px] font-mono text-text-secondary truncate">
+                        {projectPath}
+                      </div>
+                    ) : null}
+                  </div>
                   <div className="space-y-0.5">
                     {items.map((s) => {
                       const active = s.sid === sid;
@@ -533,6 +554,7 @@ export default function ChatConsole() {
       {modalOpen ? (
         <NewSessionModal
           projects={projects}
+          projectPaths={projectPaths}
           fallbackRoles={roleOptions}
           defaultProject={modalProject ?? activeView?.project ?? projects[0] ?? ""}
           isAdmin={isAdmin}
@@ -639,6 +661,7 @@ type RuntimeId = (typeof RUNTIME_OPTIONS)[number]["id"];
 
 export function NewSessionModal({
   projects,
+  projectPaths,
   fallbackRoles,
   defaultProject,
   isAdmin,
@@ -646,6 +669,11 @@ export function NewSessionModal({
   onCreate,
 }: {
   projects: string[];
+  /** slug → real working-tree path. Optional (tests pass only `projects`);
+   *  when present, each existing project's option shows its directory as the
+   *  Combobox `hint` line so demo / demo2 / demo3 are distinguishable at pick
+   *  time. */
+  projectPaths?: Record<string, string>;
   /** Static role hints (ROLE_SUGGESTIONS ∪ live session roles) — the seed/
    *  fallback when a project's real roles can't be / aren't fetched. */
   fallbackRoles: string[];
@@ -735,11 +763,17 @@ export function NewSessionModal({
   // "＋ new project…" sentinel. The "(no existing projects)" empty marker is
   // only offered when the list is truly empty (and not already creating one).
   const projectOptions: ComboboxOption[] = useMemo(() => {
-    const opts: ComboboxOption[] = projects.map((p) => ({ value: p, label: p }));
+    const opts: ComboboxOption[] = projects.map((p) => ({
+      value: p,
+      label: p,
+      // Show the real working-tree path under the slug so a collision-suffixed
+      // slug (demo / demo2 / demo3) is disambiguated at selection time.
+      hint: projectPaths?.[p],
+    }));
     if (projects.length === 0 && !isNew) opts.push({ value: "", label: "（暂无已有项目）" });
     opts.push({ value: NEW_PROJECT, label: "＋ 新建项目…" });
     return opts;
-  }, [projects, isNew]);
+  }, [projects, projectPaths, isNew]);
 
   const roleChoices: { value: string; label: string }[] = useMemo(() => {
     const roleless = { value: ROLELESS, label: "(无角色 / 裸 claude)" };

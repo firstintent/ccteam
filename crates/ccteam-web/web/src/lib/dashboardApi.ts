@@ -20,6 +20,10 @@
  *  struct's `Serialize` shape. See `docs/interfaces.md` §16.1. */
 export interface DashboardRow {
   slug: string;
+  /** The project's real working-tree directory (e.g. `/home/u/sdd/sdddemo2`).
+   *  Disambiguates collision-suffixed slugs (demo / demo2 / demo3) in the UI —
+   *  the sidebar list + new-session project picker show it under the slug. */
+  path: string;
   team: string;
   kind: string;
   last_event_label: string;
