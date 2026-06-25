@@ -333,6 +333,64 @@ async fn get_context_usage(transport: &StreamJsonTransport) -> Option<(u64, u64)
     Some((used, window))
 }
 
+/// `get_usage` control_request → ACCOUNT-level usage / rate-limits
+/// ([`crate::AccountUsage`]). The vendor response carries `subscription_type`
+/// and `rate_limits.{five_hour,seven_day}.{utilization,resets_at}` + a `limits[]`
+/// array (group·severity) + `extra_usage` (credits). `None` on timeout / error /
+/// a CLI without the subtype (probed: `get_usage` is the real subtype;
+/// `rate_limits`/`usage` error). Short timeout — must never stall the dashboard.
+async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::AccountUsage> {
+    let body = transport
+        .request_control("get_usage", json!({}), Duration::from_secs(3))
+        .await
+        .ok()?;
+    if body.subtype != "success" {
+        return None;
+    }
+    let resp = body.response.as_ref()?;
+    let rl = resp.get("rate_limits");
+    let five = rl.and_then(|r| r.get("five_hour"));
+    let seven = rl.and_then(|r| r.get("seven_day"));
+    let extra = rl.and_then(|r| r.get("extra_usage"));
+    // Weekly severity (e.g. "warning") is in the `limits[]` entry grouped "weekly".
+    let weekly_severity = rl
+        .and_then(|r| r.get("limits"))
+        .and_then(|l| l.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|x| x.get("group").and_then(|g| g.as_str()) == Some("weekly"))
+        })
+        .and_then(|x| x.get("severity").and_then(|s| s.as_str()))
+        .map(str::to_string);
+    let pct = |o: Option<&serde_json::Value>| {
+        o.and_then(|x| x.get("utilization"))
+            .and_then(|v| v.as_f64())
+            .map(|f| f.round() as u8)
+    };
+    let resets = |o: Option<&serde_json::Value>| {
+        o.and_then(|x| x.get("resets_at"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let usage = crate::AccountUsage {
+        subscription: resp
+            .get("subscription_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        five_hour_pct: pct(five),
+        five_hour_resets_at: resets(five),
+        weekly_pct: pct(seven),
+        weekly_resets_at: resets(seven),
+        weekly_severity,
+        credits_pct: pct(extra),
+    };
+    if usage == crate::AccountUsage::default() {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
 /// The reasoning-effort levels claude accepts (Opus 4.6+), low→high. Mirrors
 /// the vendor `EFFORT_LEVELS` (`/effort`); used to validate a `/model <id>
 /// <effort>` / `/effort <level>` argument before it touches settings.
@@ -1280,6 +1338,14 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             status.goal = read_latest_goal_status(Path::new(cwd), &h.identity);
         }
         Ok(status)
+    }
+
+    async fn account_usage(&self, h: &ThreadHandle) -> Option<crate::AccountUsage> {
+        // Account-level usage (5h / weekly / credits) — query `get_usage` on this
+        // live session's transport. It is account-scoped, so the gateway calls it
+        // on any ONE live claude session to build the `/status` header.
+        let live = self.lookup(&h.identity)?;
+        get_account_usage(&live.transport).await
     }
 
     /// Interrupt the in-flight turn via the bidirectional `interrupt`

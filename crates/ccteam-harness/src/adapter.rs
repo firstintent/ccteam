@@ -573,6 +573,28 @@ pub struct ThreadStatus {
     pub goal: Option<GoalStatus>,
 }
 
+/// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
+/// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
+/// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
+/// credits), NOT a per-session property — the gateway queries it once on any
+/// live session. Percentages are 0-100; `*_resets_at` is the vendor's ISO-8601
+/// string (the caller renders it). All-`None` = "no account-usage channel".
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AccountUsage {
+    /// Subscription tier (e.g. `"max"`, `"pro"`).
+    pub subscription: Option<String>,
+    /// 5-hour rolling window utilization (%), and when it resets.
+    pub five_hour_pct: Option<u8>,
+    pub five_hour_resets_at: Option<String>,
+    /// 7-day (weekly) window utilization (%), when it resets, and its severity
+    /// (`"normal"` / `"warning"` / … from the vendor `limits[]`).
+    pub weekly_pct: Option<u8>,
+    pub weekly_resets_at: Option<String>,
+    pub weekly_severity: Option<String>,
+    /// Pay-as-you-go extra-credit utilization (%), when enabled.
+    pub credits_pct: Option<u8>,
+}
+
 /// A long-running session goal (`/goal`). `condition` is the objective text;
 /// `met` flips true when the agent reports it achieved. For Claude stream-json
 /// this is sourced from the session transcript's `goal_status` attachment —
@@ -805,6 +827,16 @@ pub trait HarnessAdapter: Send + Sync {
     /// silently blank for a new vendor. bg / statusless adapters answer
     /// `Ok(ThreadStatus::default())`.
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError>;
+
+    /// Report ACCOUNT-level usage / rate-limits (5-hour + weekly windows + extra
+    /// credits) for the IM `/status` operator dashboard. Unlike `thread_status`
+    /// this is OPTIONAL (a default `None`): only adapters with a usage channel
+    /// implement it (Claude stream-json via the `get_usage` control_request).
+    /// It is account-, not session-, scoped — the gateway queries it once on any
+    /// one live session.
+    async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
+        None
+    }
 
     /// Interrupt the session's CURRENTLY-RUNNING turn **without destroying
     /// the session** — the context survives, so the user can immediately

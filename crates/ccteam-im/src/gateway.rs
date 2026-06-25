@@ -16,10 +16,10 @@ use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
-    chat_session_name, parse_chat_session_name, AgentSpecBrief, AgentVendor, ChoicePrompt,
-    ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, HarnessError, PermissionMode,
-    ProcessBackend, SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
-    TurnInput,
+    chat_session_name, parse_chat_session_name, AccountUsage, AgentSpecBrief, AgentVendor,
+    ChoicePrompt, ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, HarnessError,
+    PermissionMode, ProcessBackend, SessionProtocol, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -3061,8 +3061,24 @@ impl Gateway {
             stuck_after = std::time::Duration::from_secs(300);
         }
         let now = Instant::now();
+        // v0.8.20 /status v2 ③ — ACCOUNT-level usage (5h / weekly / credits) for
+        // the dashboard header: query `get_usage` on the first session whose
+        // adapter answers (account-scoped — any one live claude session answers
+        // for all; non-claude/non-live return None via the default). Best-effort.
+        let mut account: Option<AccountUsage> = None;
+        for s in &visible {
+            if let Some(u) = s.adapter.account_usage(&s.thread).await {
+                account = Some(u);
+                break;
+            }
+        }
         let mut rows: Vec<String> = Vec::with_capacity(visible.len());
+        // ① aggregate tally — the operator summary that makes /status a dashboard
+        // (vs the bare /sessions list).
+        let (mut n_work, mut n_idle, mut n_stuck) = (0u32, 0u32, 0u32);
+        let mut projects: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for s in visible {
+            projects.insert(s.project.as_str());
             let started = s.turn_started_at.lock().ok().and_then(|g| *g);
             let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
             // Has the last event gone silent past the idle window? Treat a
@@ -3083,6 +3099,11 @@ impl Gateway {
                     format!("working {}", humanize_dur(now.saturating_duration_since(t))),
                 ),
             };
+            match state {
+                "🔵" => n_work += 1,
+                "🔴" => n_stuck += 1,
+                _ => n_idle += 1,
+            }
             let role = if s.role.is_empty() { "—" } else { &s.role };
             // The canonical pane / chat-session name (`ccteam-chat-<slug>-<sid>`),
             // the same name the adapter spawns and `reconcile_chat_sessions`
@@ -3134,7 +3155,21 @@ impl Gateway {
             }
             rows.push(line);
         }
-        rows.join("\n")
+        // ① + ③ dashboard header (session counts · projects · account usage),
+        // then the per-session fleet — distinct from the bare /sessions list.
+        let mut header = format!(
+            "📊 {} 会话 · 🔵{n_work} 🟢{n_idle} 🔴{n_stuck} · {} 项目",
+            rows.len(),
+            projects.len()
+        );
+        if let Some(u) = &account {
+            let usage = format_account_usage(u);
+            if !usage.is_empty() {
+                header.push('\n');
+                header.push_str(&usage);
+            }
+        }
+        format!("{header}\n\n{}", rows.join("\n"))
     }
 
     fn render_projects(&self) -> String {
@@ -4113,6 +4148,49 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
 /// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
 /// `0s`.
+/// Render [`AccountUsage`] as the `/status` dashboard usage line:
+/// `⚡ 用量: 5h 17% (→19:00) · 周 78%⚠ (→06/29) · 额度 46% · max`. Each field is
+/// omitted when the vendor didn't report it; an empty result = nothing to show.
+fn format_account_usage(u: &AccountUsage) -> String {
+    // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
+    // MM/DD for the weekly. Empty when unparseable.
+    fn reset_hm(iso: &Option<String>) -> String {
+        iso.as_deref()
+            .and_then(|s| s.split('T').nth(1))
+            .map(|t| format!(" (→{})", &t[..t.len().min(5)]))
+            .unwrap_or_default()
+    }
+    fn reset_md(iso: &Option<String>) -> String {
+        iso.as_deref()
+            .and_then(|s| s.split('T').next())
+            .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
+            .map(|md| format!(" (→{})", md.replace('-', "/")))
+            .unwrap_or_default()
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = u.five_hour_pct {
+        parts.push(format!("5h {p}%{}", reset_hm(&u.five_hour_resets_at)));
+    }
+    if let Some(p) = u.weekly_pct {
+        let warn = if u.weekly_severity.as_deref() == Some("warning") {
+            "⚠"
+        } else {
+            ""
+        };
+        parts.push(format!("周 {p}%{warn}{}", reset_md(&u.weekly_resets_at)));
+    }
+    if let Some(p) = u.credits_pct {
+        parts.push(format!("额度 {p}%"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    if let Some(sub) = u.subscription.as_deref() {
+        parts.push(sub.to_string());
+    }
+    format!("⚡ 用量: {}", parts.join(" · "))
+}
+
 fn humanize_dur(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -6381,8 +6459,13 @@ mod tests {
         // state · sid · session-name · resume-id · project · role · idle · …
         // The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            line.starts_with("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle · "),
+            line.contains("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle · "),
             "got: {line}"
+        );
+        // v0.8.20 /status v2 ① — the dashboard header: 1 session, all idle, 1 project.
+        assert!(
+            idle[0].starts_with("📊 1 会话 · 🔵0 🟢1 🔴0 · 1 项目"),
+            "dashboard header: {idle:?}"
         );
         assert!(
             line.contains("claude-opus-4-8 · max · ctx 41%"),
@@ -6403,8 +6486,13 @@ mod tests {
             .unwrap();
         let line = &working[0];
         assert!(
-            line.starts_with("🔵 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · working "),
+            line.contains("🔵 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · working "),
             "got: {line}"
+        );
+        // ① the header count reflects the working state.
+        assert!(
+            working[0].starts_with("📊 1 会话 · 🔵1 🟢0 🔴0 · 1 项目"),
+            "dashboard header: {working:?}"
         );
         // The activity counts show ONLY while working.
         assert!(line.ends_with("· read×16·bash×8"), "got: {line}");
@@ -6429,7 +6517,7 @@ mod tests {
             .unwrap();
         let line = &stuck[0];
         assert!(
-            line.starts_with("🔴 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · STUCK "),
+            line.contains("🔴 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · STUCK "),
             "got: {line}"
         );
         assert!(line.contains("silent · "), "got: {line}");
@@ -6456,10 +6544,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(
-            out,
-            vec!["🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · — · idle · — · — · ctx —"],
-            "roleless + statusless + no-uuid → placeholders, not fabricated values"
+        assert!(
+            out[0].contains(
+                "🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · — · idle · — · — · ctx —"
+            ),
+            "roleless + statusless + no-uuid → placeholders, not fabricated values: {out:?}"
         );
     }
 
@@ -6473,6 +6562,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, vec!["no sessions — start one with /new"]);
+    }
+
+    /// v0.8.20 /status v2 ③ — the account-usage line renders 5h / weekly /
+    /// credits with reset hints, a ⚠ on a `warning` weekly, and the
+    /// subscription tail; an all-None usage renders the empty string.
+    #[test]
+    fn format_account_usage_renders_windows_resets_and_warning() {
+        let u = AccountUsage {
+            subscription: Some("max".into()),
+            five_hour_pct: Some(17),
+            five_hour_resets_at: Some("2026-06-25T19:00:00.4+00:00".into()),
+            weekly_pct: Some(78),
+            weekly_resets_at: Some("2026-06-29T18:59:59+00:00".into()),
+            weekly_severity: Some("warning".into()),
+            credits_pct: Some(46),
+        };
+        let s = format_account_usage(&u);
+        assert!(s.contains("5h 17% (→19:00)"), "{s}");
+        assert!(s.contains("周 78%⚠ (→06/29)"), "{s}");
+        assert!(s.contains("额度 46%"), "{s}");
+        assert!(s.ends_with("· max"), "{s}");
+        assert_eq!(format_account_usage(&AccountUsage::default()), "");
     }
 
     /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's
@@ -6505,7 +6616,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].starts_with("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle"),
+            owner[0].contains("🟢 s1 ccteam-chat-alpha-s1 · resume — · alpha · reviewer · idle"),
             "got: {owner:?}"
         );
     }
@@ -6539,7 +6650,7 @@ mod tests {
             "the real --resume uuid must show next to the sid: {out:?}"
         );
         assert!(
-            out[0].starts_with(&format!(
+            out[0].contains(&format!(
                 "🟢 s1 ccteam-chat-alpha-s1 · resume {uuid} · alpha · reviewer · idle"
             )),
             "got: {out:?}"
