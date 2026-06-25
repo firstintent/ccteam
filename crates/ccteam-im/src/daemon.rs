@@ -988,6 +988,15 @@ fn spawn_gateway_event_consumer(
         // epoch). Bounded: entries are inserted on the first progress of a
         // turn and removed when the turn finalizes (`done`).
         let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
+        // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
+        // the value is the provider's reaction handle (`Some(reaction_id)` for
+        // Lark, `None` for Telegram which clears by message_id alone). An add
+        // records the handle; the matching remove pops it. Bounded by the
+        // in-flight turn count (each turn adds one entry, removes it on its
+        // first event), and any orphan is harmless (a stale handle never
+        // dereferences). ALL reaction calls are fire-and-forget — a failure is
+        // logged + swallowed, NEVER propagated, so it can't affect delivery.
+        let mut reaction_handles: HashMap<String, Option<String>> = HashMap::new();
         while let Some(evt) = rx.recv().await {
             // Clone the channel out under the read lock, then DROP the guard
             // before any `.await` (never hold a std RwLock guard across await).
@@ -1029,6 +1038,41 @@ fn spawn_gateway_event_consumer(
                 // so this is a strict no-op (no send / no edit): IM delivery
                 // stays byte-identical to before the Activity event existed.
                 GatewayEventKind::Activity { .. } => {}
+                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
+                // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
+                // Activity arm's discipline: ALL fire-and-forget — log + swallow,
+                // never propagate, so a reaction can't break/delay the turn.
+                GatewayEventKind::Reaction { message_id, on } => {
+                    let key = format!("{}:{}", evt.channel, message_id);
+                    if on {
+                        match channel.add_reaction(&evt.chat_id, &message_id).await {
+                            Ok(handle) => {
+                                reaction_handles.insert(key, handle);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    channel = %evt.channel,
+                                    message_id = %message_id,
+                                    error = %err,
+                                    "ccteam-im: add_reaction failed (ack skipped)"
+                                );
+                            }
+                        }
+                    } else {
+                        let handle = reaction_handles.remove(&key).flatten();
+                        if let Err(err) = channel
+                            .remove_reaction(&evt.chat_id, &message_id, handle.as_deref())
+                            .await
+                        {
+                            tracing::warn!(
+                                channel = %evt.channel,
+                                message_id = %message_id,
+                                error = %err,
+                                "ccteam-im: remove_reaction failed (ack lingers)"
+                            );
+                        }
+                    }
+                }
             }
         }
         tracing::debug!("imd: gateway event consumer exited");
@@ -1401,6 +1445,123 @@ mod tests {
         assert_eq!(
             sec_gate_payload(SecOutcome::BadSignature("x".into()), true),
             None
+        );
+    }
+
+    /// v0.8.19 — the daemon egress 👀-reaction handle-map round-trips. A
+    /// `Reaction{on:true}` calls `add_reaction` and STORES the returned handle
+    /// (here the stateful Lark `reaction_id` shape); the matching
+    /// `Reaction{on:false}` POPS it and passes it to `remove_reaction`. Drives
+    /// the real `spawn_gateway_event_consumer` end-to-end through a recording
+    /// `MockChannel`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_egress_reaction_handle_round_trips() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let mock = MockChannel::new()
+            .with_name("telegram")
+            .with_reaction_handle("rid-123");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer(rx, channels);
+
+        let reaction_event = |on: bool| GatewayEvent {
+            id: format!("gateway-reaction-{on}"),
+            channel: "telegram".to_string(),
+            chat_id: "chat-7".to_string(),
+            thread_ts: None,
+            content: String::new(),
+            kind: GatewayEventKind::Reaction {
+                message_id: "tg-555".to_string(),
+                on,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some("s1".to_string()),
+        };
+        tx.send(reaction_event(true)).unwrap();
+        tx.send(reaction_event(false)).unwrap();
+
+        // Poll the recording mock until both calls land (the consumer is async).
+        let mut calls = Vec::new();
+        for _ in 0..200 {
+            calls = mock.reactions().await;
+            if calls.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(calls.len(), 2, "add + remove must both fire, got {calls:?}");
+        // add: op=add, on the inbound (chat, message_id), no handle passed in.
+        assert_eq!(calls[0].0, "add");
+        assert_eq!(calls[0].1, "chat-7");
+        assert_eq!(calls[0].2, "tg-555");
+        assert_eq!(calls[0].3, None);
+        // remove: the SAME (chat, message_id), with the stored handle replayed.
+        assert_eq!(calls[1].0, "remove");
+        assert_eq!(calls[1].1, "chat-7");
+        assert_eq!(calls[1].2, "tg-555");
+        assert_eq!(
+            calls[1].3.as_deref(),
+            Some("rid-123"),
+            "the add handle must be replayed to remove"
+        );
+    }
+
+    /// v0.8.19 — the stateless (Telegram) shape: `add_reaction` returns `None`,
+    /// so the egress stores `None` and `remove_reaction` is called with `None`
+    /// (Telegram clears by message_id alone). The handle map still round-trips
+    /// (the key is present), just with a `None` value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_egress_reaction_stateless_handle_is_none() {
+        use crate::transport::providers::mock::MockChannel;
+
+        // No `with_reaction_handle` → add_reaction returns None (Telegram shape).
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer(rx, channels);
+
+        let ev = |on: bool| GatewayEvent {
+            id: format!("r-{on}"),
+            channel: "telegram".to_string(),
+            chat_id: "chat-7".to_string(),
+            thread_ts: None,
+            content: String::new(),
+            kind: GatewayEventKind::Reaction {
+                message_id: "tg-9".to_string(),
+                on,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: None,
+        };
+        tx.send(ev(true)).unwrap();
+        tx.send(ev(false)).unwrap();
+
+        let mut calls = Vec::new();
+        for _ in 0..200 {
+            calls = mock.reactions().await;
+            if calls.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "remove");
+        assert_eq!(
+            calls[1].3, None,
+            "stateless channel clears with a None handle"
         );
     }
 

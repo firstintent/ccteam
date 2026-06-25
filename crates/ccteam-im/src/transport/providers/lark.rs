@@ -420,6 +420,21 @@ impl LarkChannel {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
     }
 
+    /// `POST` URL to add a reaction to a message
+    /// (`im/v1/messages/{message_id}/reactions`).
+    fn add_reaction_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    /// `DELETE` URL to remove a reaction by its `reaction_id`
+    /// (`im/v1/messages/{message_id}/reactions/{reaction_id}`).
+    fn delete_reaction_url(&self, message_id: &str, reaction_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/reactions/{reaction_id}",
+            self.api_base()
+        )
+    }
+
     /// `POST /callback/ws/endpoint` -> (wss_url, client_config).
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
@@ -1118,7 +1133,76 @@ impl Channel for LarkChannel {
         // bookkeeping.
         Ok(Some(message_id.to_string()))
     }
+
+    /// Add the 👀-equivalent ack reaction. Feishu has no plain "EYES" in its
+    /// fixed set, so we use **`OnIt`** — the semantic "on it / seen, working"
+    /// reaction (the closest match to the 👀 "received, processing" intent).
+    /// STATEFUL: Feishu returns a `reaction_id` we must keep to delete it
+    /// later, so we hand it back as the opaque handle. Reuses the same
+    /// `tenant_access_token` + one-shot 401-retry as `send`. Any API/parse
+    /// failure surfaces here; the daemon egress swallows it (fire-and-forget).
+    async fn add_reaction(
+        &self,
+        _chat_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Feishu addresses the message by id in the URL path; the chat id is
+        // not needed (mirrors `edit_message`).
+        let url = self.add_reaction_url(message_id);
+        let body = reaction_create_body(LARK_ACK_EMOJI_TYPE);
+        let resp = self
+            .send_json_with_token_retry(reqwest::Method::POST, &url, &body)
+            .await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark add_reaction {message_id} failed: {err}");
+        }
+        // The reaction_id is the handle remove_reaction needs; a missing one is
+        // logged but not fatal (the reaction WAS created — we just can't delete
+        // it, so it lingers; better than failing the ack).
+        let reaction_id = parse_reaction_id(resp).await;
+        if reaction_id.is_none() {
+            tracing::warn!(
+                message_id = %message_id,
+                "Lark add_reaction: no reaction_id in response (reaction may linger)"
+            );
+        }
+        Ok(reaction_id)
+    }
+
+    /// Remove the ack reaction by its `reaction_id` (the `handle`
+    /// [`Self::add_reaction`] returned). A `None` handle is a no-op (Feishu
+    /// can only delete a reaction by its id). Reuses the tenant-token auth.
+    async fn remove_reaction(
+        &self,
+        _chat_id: &str,
+        message_id: &str,
+        handle: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(reaction_id) = handle else {
+            // No reaction_id (add failed / response had none) — nothing to do.
+            return Ok(());
+        };
+        let url = self.delete_reaction_url(message_id, reaction_id);
+        // DELETE carries no body; reuse the token-retry helper with an empty
+        // JSON object (the API ignores it).
+        let resp = self
+            .send_json_with_token_retry(reqwest::Method::DELETE, &url, &serde_json::json!({}))
+            .await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Lark remove_reaction {message_id}/{reaction_id} failed: {err}");
+        }
+        Ok(())
+    }
 }
+
+/// Feishu emoji_type for the 👀 "received, processing" ack. Feishu's fixed
+/// emoji set has no plain `EYES`; `OnIt` is the semantic "on it / seen,
+/// working" reaction — the closest match to the 👀 ack intent. (See the
+/// Feishu emoji introduction doc; `GLANCE`/`LOOKDOWN` are the only other
+/// looking-adjacent codes, but `OnIt` carries the "received, working" meaning.)
+const LARK_ACK_EMOJI_TYPE: &str = "OnIt";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WS helper functions (pure — unit-tested in lark_tests.rs)
@@ -1131,6 +1215,24 @@ impl Channel for LarkChannel {
 async fn parse_sent_message_id(resp: reqwest::Response) -> Option<String> {
     let v: serde_json::Value = resp.json().await.unwrap_or_default();
     v.pointer("/data/message_id")
+        .and_then(|m| m.as_str())
+        .map(String::from)
+}
+
+/// Build the `im/v1/messages/{id}/reactions` create body (pure + isolated so
+/// the `reaction_type.emoji_type` shape is unit-testable without a live API).
+/// Feishu wants `{"reaction_type":{"emoji_type":"<TYPE>"}}`.
+fn reaction_create_body(emoji_type: &str) -> serde_json::Value {
+    serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } })
+}
+
+/// Parse the `data.reaction_id` from a successful reaction-create response.
+/// Returns `Ok(None)`-shaped `None` (NOT an error) when absent — the reaction
+/// was already created; we just can't address it for deletion. Success shape:
+/// `{"code":0,"data":{"reaction_id":"ZCaCIjUBVU...", ...}}`.
+async fn parse_reaction_id(resp: reqwest::Response) -> Option<String> {
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    v.pointer("/data/reaction_id")
         .and_then(|m| m.as_str())
         .map(String::from)
 }

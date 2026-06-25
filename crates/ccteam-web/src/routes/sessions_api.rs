@@ -700,7 +700,10 @@ pub(crate) async fn handle_session_events(
                 let target_sid = target_sid.clone();
                 async move {
                     match item {
-                        Ok(ev) if event_matches_sid(&ev, &target_sid) => {
+                        // v0.8.19 — the 👀 ack `Reaction` is IM-only (web has its
+                        // own UI). Drop it here so the SSE contract is unchanged,
+                        // even though it carries this session's `sid`.
+                        Ok(ev) if event_matches_sid(&ev, &target_sid) && !is_im_only_event(&ev) => {
                             Some(Ok(session_event(&ev)))
                         }
                         Ok(_) => None,
@@ -812,6 +815,15 @@ fn event_matches_sid(ev: &GatewayEvent, target: &str) -> bool {
     ev.sid.as_deref() == Some(target)
 }
 
+/// True for [`GatewayEvent`]s the web SSE must never emit because they have no
+/// web representation (v0.8.19): the 👀 ack `Reaction` is an IM-only affordance
+/// (Telegram/Lark message reaction). The web chat has its own UI, so these are
+/// dropped at the stream filter, keeping the SSE contract unchanged.
+fn is_im_only_event(ev: &GatewayEvent) -> bool {
+    use ccteam_im::gateway::GatewayEventKind;
+    matches!(ev.kind, GatewayEventKind::Reaction { .. })
+}
+
 /// Build the `event: progress` SSE frame for one [`GatewayEvent`]. The
 /// payload is a single-line JSON object carrying the event `id`, its `sid`,
 /// a `kind` label (`"answer"` / `"progress"`, with `done` for a finalizing
@@ -845,6 +857,10 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         GatewayEventKind::Progress { done, .. } => ("progress", *done),
         // v0.8.19 — structured per-step activity (web-only; IM drops it).
         GatewayEventKind::Activity { .. } => ("activity", false),
+        // v0.8.19 — the 👀 ack `Reaction` is IM-only and is filtered out by
+        // `is_im_only_event` before this serializer ever runs; the arm exists
+        // only to keep the match exhaustive (a no-op label, never emitted).
+        GatewayEventKind::Reaction { .. } => ("reaction", false),
     };
     let mut payload = json!({
         "id": ev.id,
@@ -1098,6 +1114,33 @@ mod tests {
         assert!(event_matches_sid(&gw_event(Some("s1")), "s1"));
         assert!(!event_matches_sid(&gw_event(Some("s2")), "s1"));
         assert!(!event_matches_sid(&gw_event(None), "s1"));
+    }
+
+    /// v0.8.19 — the 👀 ack `Reaction` is IM-only: even when it carries a
+    /// matching `sid`, the SSE stream drops it via `is_im_only_event` so the
+    /// web SSE contract is unchanged (web has its own UI). Answer/Progress/
+    /// Activity are NOT IM-only and still flow.
+    #[test]
+    fn reaction_event_is_im_only_and_dropped_from_sse() {
+        use ccteam_im::gateway::GatewayEventKind;
+        let mut reaction = gw_event(Some("s1"));
+        reaction.kind = GatewayEventKind::Reaction {
+            message_id: "tg-555".into(),
+            on: true,
+        };
+        assert!(
+            is_im_only_event(&reaction),
+            "a Reaction event must be IM-only (dropped from web SSE)"
+        );
+        // The SSE filter combines sid-match AND not-im-only: a reaction with a
+        // matching sid is still dropped.
+        assert!(event_matches_sid(&reaction, "s1"));
+        assert!(
+            event_matches_sid(&reaction, "s1") && is_im_only_event(&reaction),
+            "matches sid but is im-only → the filter drops it"
+        );
+        // A normal Answer is NOT im-only (still emitted).
+        assert!(!is_im_only_event(&gw_event(Some("s1"))));
     }
 
     #[test]

@@ -87,6 +87,43 @@ fn lark_new_stores_fields_and_allowlist() {
     assert!(ch.use_feishu);
 }
 
+// ── reaction (👀 ack) ──────────────────────────────────────────
+
+#[test]
+fn reaction_create_body_carries_emoji_type() {
+    // Feishu wants {"reaction_type":{"emoji_type":"<TYPE>"}}.
+    let body = reaction_create_body(LARK_ACK_EMOJI_TYPE);
+    assert_eq!(body["reaction_type"]["emoji_type"], "OnIt");
+}
+
+#[test]
+fn lark_ack_emoji_type_is_on_it() {
+    // The 👀-equivalent: Feishu has no plain EYES, so OnIt ("on it / seen,
+    // working") is the chosen ack emoji_type.
+    assert_eq!(LARK_ACK_EMOJI_TYPE, "OnIt");
+}
+
+#[test]
+fn reaction_urls_are_message_keyed() {
+    let ch = make_channel();
+    assert_eq!(
+        ch.add_reaction_url("om_abc"),
+        "https://open.feishu.cn/open-apis/im/v1/messages/om_abc/reactions"
+    );
+    assert_eq!(
+        ch.delete_reaction_url("om_abc", "ZCaCIjUB"),
+        "https://open.feishu.cn/open-apis/im/v1/messages/om_abc/reactions/ZCaCIjUB"
+    );
+}
+
+#[tokio::test]
+async fn remove_reaction_none_handle_is_noop() {
+    // No reaction_id ⇒ nothing to delete; must NOT error (and never hits the
+    // network, so it's safe in the sandbox).
+    let ch = make_channel();
+    assert!(ch.remove_reaction("oc_chat", "om_abc", None).await.is_ok());
+}
+
 // ── is_user_allowed ────────────────────────────────────────────
 
 #[test]

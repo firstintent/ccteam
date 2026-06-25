@@ -112,6 +112,16 @@ struct GatewaySession {
     /// sent from web replies to web, one from Telegram replies to Telegram.
     /// Shared with the detached event pump / watchdog so they route live.
     reply_to: Arc<std::sync::Mutex<ChatKey>>,
+    /// The inbound IM `message_id` whose 👀 ack reaction is still pending
+    /// removal for the in-flight turn, or `None` when no ack is outstanding.
+    /// Set (= `Some(message_id)`) when an IM turn is dispatched (alongside
+    /// emitting `Reaction{on:true}`); the detached event pump TAKEs it on the
+    /// turn's first event and emits `Reaction{on:false}` to clear the 👀.
+    /// Shared (`Arc<Mutex>`) so the pump reads/clears the same cell the submit
+    /// path set. Web turns never set it (web has no reaction). Fires exactly
+    /// once per turn (TAKE → None). Best-effort: a lost clear just leaves a
+    /// stale 👀, never affects delivery.
+    pending_reaction: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +271,23 @@ pub enum GatewayEventKind {
         status_key: String,
         /// The structured per-step activity payload the web renders.
         activity: SessionActivity,
+    },
+    /// The transient 👀 "received, processing" reaction on the inbound IM
+    /// message that drove a turn. `on: true` adds it the moment the turn is
+    /// dispatched (filling the silent time-to-first-token gap); `on: false`
+    /// removes it the moment the turn's first event appears. **IM-only**: the
+    /// daemon egress maps it to the channel's `add_reaction`/`remove_reaction`
+    /// (default no-op for web/discord/slack), and the web SSE drops it (a
+    /// reaction has no web representation — web has its own UI). The
+    /// `GatewayEvent` already carries `channel`/`chat_id`/`sid`; this only adds
+    /// the inbound `message_id` to react to.
+    Reaction {
+        /// The inbound IM message id to react to (Telegram `message_id`, Lark
+        /// `om_…`). Channel-local; the daemon egress passes it verbatim to the
+        /// provider.
+        message_id: String,
+        /// `true` = add the ack reaction; `false` = remove it.
+        on: bool,
     },
 }
 
@@ -1125,7 +1152,7 @@ impl Gateway {
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, turn).await;
+                return self.submit_to_current(&chat, message_id, turn).await;
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
@@ -1138,7 +1165,7 @@ impl Gateway {
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, turn).await;
+                return self.submit_to_current(&chat, message_id, turn).await;
             }
         }
         let templates = self.templates_for_chat(&chat);
@@ -1169,7 +1196,7 @@ impl Gateway {
             }
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
-        self.submit_to_current(&chat, turn).await
+        self.submit_to_current(&chat, message_id, turn).await
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
@@ -1779,6 +1806,7 @@ impl Gateway {
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
+                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         let model_warning =
@@ -1919,6 +1947,7 @@ impl Gateway {
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
+                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         self.current_session
@@ -2039,6 +2068,42 @@ impl Gateway {
                         // TRUE silence (no event for the whole idle window) is a
                         // stall. Counts every event, before any branch/filter.
                         session.activity_events.fetch_add(1, Ordering::SeqCst);
+                        // 👀 ack clear: the FIRST event of a turn is the moment
+                        // the silent gap ends (💭 thinking / first progress), so
+                        // remove the ack reaction added at dispatch. TAKE the
+                        // pending msg_id (→ None) so this fires exactly once per
+                        // turn; route the clear to the session's CURRENT reply
+                        // target (the same reply_to→owner the answer below uses),
+                        // so a turn driven from Telegram clears on Telegram.
+                        // Fire-and-forget: the daemon egress swallows failures.
+                        let pending_ack = session
+                            .pending_reaction
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.take());
+                        if let Some(ack_msg_id) = pending_ack {
+                            let ack_target = session
+                                .reply_to
+                                .lock()
+                                .map(|k| k.clone())
+                                .unwrap_or_else(|_| session.owner.clone());
+                            if !tx.send(GatewayEvent {
+                                id: format!("gateway-reaction-clear-{session_id}-{ack_msg_id}"),
+                                channel: ack_target.channel.clone(),
+                                chat_id: ack_target.chat_id.clone(),
+                                thread_ts: None,
+                                content: String::new(),
+                                kind: GatewayEventKind::Reaction {
+                                    message_id: ack_msg_id,
+                                    on: false,
+                                },
+                                attachments: Vec::new(),
+                                options: Vec::new(),
+                                sid: Some(session_id.clone()),
+                            }) {
+                                break;
+                            }
+                        }
                         // v0.8.11 E4 — for a stream-json session (no hooks), the
                         // pump mirrors each completed turn to progress.jsonl with
                         // the sid, so the session-list activity classifier (which
@@ -2289,6 +2354,7 @@ impl Gateway {
                     visible_events: Arc::new(AtomicU64::new(0)),
                     activity_events: Arc::new(AtomicU64::new(0)),
                     reply_to: Arc::new(std::sync::Mutex::new(saved_session.owner)),
+                    pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 },
             );
         }
@@ -2394,7 +2460,12 @@ impl Gateway {
         }
     }
 
-    async fn submit_to_current(&self, chat: &ChatKey, payload: String) -> Result<Vec<String>> {
+    async fn submit_to_current(
+        &self,
+        chat: &ChatKey,
+        message_id: &str,
+        payload: String,
+    ) -> Result<Vec<String>> {
         let session_id = self
             .current_session
             .read()
@@ -2409,7 +2480,12 @@ impl Gateway {
         // `/model …` to the agent as literal text. The IM handler returns the
         // synchronous receipts up the inbound stack to send over the channel;
         // an async turn's answer streams over the event sink (empty Vec here).
-        match self.submit_resolved(chat, &session_id, payload).await? {
+        // `message_id` (the inbound IM message) seeds the 👀 ack reaction when a
+        // real turn is submitted (empty for the web leg → no reaction).
+        match self
+            .submit_resolved(chat, &session_id, message_id, payload)
+            .await?
+        {
             SubmitResult::Directive(replies) => Ok(replies),
             SubmitResult::Turn { drained, .. } => Ok(drained),
         }
@@ -2428,6 +2504,7 @@ impl Gateway {
         &self,
         chat: &ChatKey,
         session_id: &str,
+        message_id: &str,
         payload: String,
     ) -> Result<SubmitResult> {
         if let Some(directive) = parse_session_directive(&payload) {
@@ -2441,6 +2518,32 @@ impl Gateway {
         // Replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
+        }
+        // 👀 ack: add the transient "received, processing" reaction on the
+        // inbound IM message the moment this turn is dispatched, filling the
+        // silent time-to-first-token gap. IM-only (`web` has its own UI and no
+        // inbound message_id → skip); needs a non-empty message_id. Record the
+        // pending msg_id on the session so the event pump can clear it (emit
+        // `Reaction{on:false}`) the instant the turn's first event appears.
+        // Fire-and-forget: a reaction never affects turn submission.
+        if chat.channel != "web" && !message_id.is_empty() {
+            if let Ok(mut pending) = session.pending_reaction.lock() {
+                *pending = Some(message_id.to_string());
+            }
+            self.emit_user_signal(GatewayEvent {
+                id: format!("gateway-reaction-add-{session_id}-{message_id}"),
+                channel: chat.channel.clone(),
+                chat_id: chat.chat_id.clone(),
+                thread_ts: None,
+                content: String::new(),
+                kind: GatewayEventKind::Reaction {
+                    message_id: message_id.to_string(),
+                    on: true,
+                },
+                attachments: Vec::new(),
+                options: Vec::new(),
+                sid: Some(session_id.to_string()),
+            });
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
         // v0.8.8 bug-fix — keep the user's prompt so it can be mirrored into
@@ -3090,8 +3193,10 @@ impl Gateway {
         // Same core as the IM `submit_to_current` path (parity by construction):
         // a single-line `/command` is a session directive, everything else a
         // turn. The synthetic web `reply_to` routes async answers / progress
-        // back to the per-`sid` SSE subscriber.
-        match self.submit_resolved(&web_api_chat(), sid, text).await? {
+        // back to the per-`sid` SSE subscriber. An empty `message_id` (the web
+        // has no inbound IM message) + the `web` channel both suppress the 👀
+        // ack reaction — web has its own UI.
+        match self.submit_resolved(&web_api_chat(), sid, "", text).await? {
             // A turn's answer streams over the pump → SSE; hand back the turn id
             // so a `session_dispatch` caller can `session_collect{since: id}`.
             SubmitResult::Turn { id, .. } => Ok(id),
@@ -3673,14 +3778,17 @@ fn progress_enabled() -> bool {
     )
 }
 
-/// Minimum interval between status-message edits (default 1500ms — TG
-/// soft-limits edits to ~1/s). `CCTEAM_IM_PROGRESS_THROTTLE_MS=0` makes
-/// every step emit, for deterministic tests that don't rely on sleeps.
+/// Minimum interval between status-message edits (default 800ms — lowered
+/// from 1500ms for snappier activity updates; the live daemon showed ZERO
+/// Telegram 429 backoff at the old rate, and each edit still pays a ~0.5s
+/// platform round-trip so this stays comfortably under the edit rate-limit).
+/// Override with `CCTEAM_IM_PROGRESS_THROTTLE_MS`; `=0` makes every step emit,
+/// for deterministic tests that don't rely on sleeps.
 fn progress_throttle() -> std::time::Duration {
     let ms = std::env::var("CCTEAM_IM_PROGRESS_THROTTLE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1500);
+        .unwrap_or(800);
     std::time::Duration::from_millis(ms)
 }
 
@@ -4995,6 +5103,122 @@ mod tests {
             turns.iter().any(|t| t.user == "what does this repo do?"),
             "the user's prompt must be persisted to turns.jsonl, got {turns:?}"
         );
+    }
+
+    /// v0.8.19 — the 👀 ack reaction lifecycle. Dispatching an IM turn emits
+    /// `Reaction{on:true}` on the inbound `message_id` AND records the pending
+    /// msg_id on the session (so the silent time-to-first-token gap is acked);
+    /// the detached event pump then emits `Reaction{on:false}` on the turn's
+    /// FIRST event AND clears the pending (fires exactly once). Both events
+    /// carry the session's `sid` + the IM channel/chat for routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn im_turn_adds_then_clears_eyes_reaction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir);
+        // Wire the sink (production path) so the add-reaction is emitted there
+        // synchronously and the pump runs (→ clear-reaction). Capture all events.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // Create an IM session (telegram), then drive a turn with a real inbound
+        // message_id (the ack is keyed on it).
+        gateway
+            .handle_text("telegram", "chat-7", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-7",
+                "alice",
+                "tg-555",
+                "do a thing",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The pending msg_id is recorded the instant the turn is dispatched, and
+        // the detached pump TAKEs it on the first event. Collect emitted events
+        // (bounded poll) until both the add + clear reactions arrive.
+        let mut add: Option<(String, String, bool)> = None;
+        let mut clear: Option<(String, String, bool)> = None;
+        for _ in 0..200 {
+            while let Ok(ev) = rx.try_recv() {
+                if let GatewayEventKind::Reaction { message_id, on } = &ev.kind {
+                    let tuple = (ev.channel.clone(), message_id.clone(), *on);
+                    if *on {
+                        add = Some(tuple);
+                    } else {
+                        clear = Some(tuple);
+                    }
+                }
+            }
+            if add.is_some() && clear.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let add = add.expect("dispatching an IM turn must emit Reaction{on:true}");
+        assert_eq!(add.0, "telegram", "add reaction routes to the IM channel");
+        assert_eq!(add.1, "tg-555", "ack reacts to the inbound message_id");
+        assert!(add.2, "add => on:true");
+
+        let clear = clear.expect("the turn's first event must emit Reaction{on:false}");
+        assert_eq!(clear.0, "telegram");
+        assert_eq!(clear.1, "tg-555", "clear targets the same message_id");
+        assert!(!clear.2, "clear => on:false");
+
+        // Pending is cleared after the first event fired the clear (fires once).
+        let pending = {
+            let s = gateway.sessions.values().next().expect("the session");
+            s.pending_reaction.lock().unwrap().clone()
+        };
+        assert!(
+            pending.is_none(),
+            "pending_reaction must be taken after the first event"
+        );
+    }
+
+    /// v0.8.19 — a WEB-driven turn emits NO 👀 reaction (web has its own UI; the
+    /// gateway add-arm skips `channel == "web"` and the web leg passes an empty
+    /// message_id). Regression guard so the IM-only ack never leaks to web.
+    #[tokio::test]
+    async fn web_turn_emits_no_reaction() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-web-noreact");
+        let mut rx = gateway.subscribe_events();
+        // Wire a sink too (emit_user_signal prefers it) so we'd SEE a stray
+        // reaction if one were emitted; subscribe_events tees the broadcast.
+        let (tx, _sink_rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        // Drain the broadcast tee: not a single Reaction event for a web turn.
+        let mut saw_reaction = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev.kind, GatewayEventKind::Reaction { .. }) {
+                saw_reaction = true;
+            }
+        }
+        assert!(!saw_reaction, "a web turn must NOT emit a 👀 reaction");
     }
 
     /// v0.8.8 F1 (regression — closes the BUG-3 blind spot) — the gateway's

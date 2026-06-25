@@ -276,6 +276,42 @@ pub trait Channel: Send + Sync {
     async fn register_commands(&self, _cmds: &[CommandSpec]) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Add the transient "seen/ack" reaction (👀-equivalent) to a message —
+    /// the instant "received, processing" acknowledgement the gateway adds the
+    /// moment an inbound message is dispatched to a session as a turn, filling
+    /// the silent time-to-first-token gap. Removed by [`remove_reaction`] when
+    /// the session's first turn event appears (the "💭 thinking…" sign).
+    ///
+    /// The 👀-equivalent is hardcoded per provider (the only use is this ack,
+    /// so there is no generic emoji argument). Returns an opaque `handle` the
+    /// provider needs to remove it later (e.g. Feishu's `reaction_id`), or
+    /// `None` when the provider clears a reaction by `(chat, message)` alone
+    /// (Telegram). **Default no-op `Ok(None)`** — web/discord/slack/mock/ws
+    /// keep it (reactions are an IM-only affordance), so they need no change.
+    /// Fire-and-forget at the call site: a reaction failure must NEVER break or
+    /// delay turn/answer delivery.
+    async fn add_reaction(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Remove the reaction [`add_reaction`] added. `handle` is whatever that
+    /// returned (the provider's reaction handle, e.g. Feishu's `reaction_id`),
+    /// or `None` for providers that clear by `(chat, message)` alone.
+    /// **Default no-op** — same providers as [`add_reaction`]. Fire-and-forget
+    /// at the call site.
+    async fn remove_reaction(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _handle: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

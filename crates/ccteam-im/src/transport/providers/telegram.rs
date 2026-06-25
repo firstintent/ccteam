@@ -189,6 +189,25 @@ impl TelegramChannel {
         let _ = tx.send(payload).await;
     }
 
+    /// POST a `setMessageReaction` body (the shared transport for both
+    /// add/remove). Bails on a non-2xx so the caller's `?` surfaces it; the
+    /// daemon egress swallows that error (reactions are fire-and-forget).
+    async fn post_set_message_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let url = self.api_url("setMessageReaction");
+        let resp = self.http.post(&url).json(body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("telegram setMessageReaction {chat_id}#{message_id} → {status}: {text}");
+        }
+        Ok(())
+    }
+
     async fn send_with_attachments(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let mut first_id = None;
         for (i, att) in message.attachments.iter().enumerate() {
@@ -657,6 +676,44 @@ impl Channel for TelegramChannel {
         Ok(Some(message_id.to_string()))
     }
 
+    /// Add the 👀 ack reaction via `setMessageReaction` (stateless — Telegram
+    /// clears by `message_id`, so no handle is returned). `message_id` must be
+    /// the numeric Telegram id; a non-numeric id (or an API error) is a hard
+    /// error here, swallowed fire-and-forget by the daemon egress so a reaction
+    /// never affects delivery.
+    async fn add_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mid = message_id.parse::<i64>().map_err(|_| {
+            anyhow::anyhow!("telegram setMessageReaction: non-numeric message_id {message_id}")
+        })?;
+        let body = set_message_reaction_body(chat_id, mid, true);
+        self.post_set_message_reaction(chat_id, message_id, &body)
+            .await?;
+        // Telegram clears a reaction by (chat, message_id) alone — no handle.
+        Ok(None)
+    }
+
+    /// Clear the ack reaction via `setMessageReaction` with an empty array
+    /// (Telegram's documented "remove all reactions" shape). `_handle` is
+    /// always `None` for Telegram (see [`Channel::add_reaction`]).
+    async fn remove_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        _handle: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mid = message_id.parse::<i64>().map_err(|_| {
+            anyhow::anyhow!("telegram setMessageReaction: non-numeric message_id {message_id}")
+        })?;
+        let body = set_message_reaction_body(chat_id, mid, false);
+        self.post_set_message_reaction(chat_id, message_id, &body)
+            .await?;
+        Ok(())
+    }
+
     /// v0.8.5 P1 — publish the gateway's command menu via `setMyCommands`.
     /// Telegram wants **bare** command names (no leading `/`), so the body
     /// builder strips it. An empty spec list clears the menu (Telegram's
@@ -713,6 +770,24 @@ fn set_my_commands_body(
         body["scope"] = scope.clone();
     }
     body
+}
+
+/// Build the `setMessageReaction` request body (pure + isolated so the
+/// 👀-emoji add shape and the empty-array clear shape are unit-testable
+/// without a live Bot API). `add=true` sets `reaction:[{emoji:👀}]`;
+/// `add=false` sets `reaction:[]` (Telegram's documented "clear" shape).
+/// `message_id` is the numeric Telegram id.
+fn set_message_reaction_body(chat_id: &str, message_id: i64, add: bool) -> serde_json::Value {
+    let reaction = if add {
+        serde_json::json!([{ "type": "emoji", "emoji": "👀" }])
+    } else {
+        serde_json::json!([])
+    };
+    serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": reaction,
+    })
 }
 
 #[cfg(test)]
@@ -838,6 +913,46 @@ mod tests {
         }))
         .unwrap();
         assert!(pick_attachment(&m).is_none());
+    }
+
+    #[test]
+    fn set_message_reaction_body_add_carries_eyes_emoji() {
+        // The 👀 ack: add → a single emoji reaction of "👀".
+        let body = set_message_reaction_body("chat-1", 42, true);
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["message_id"], 42);
+        let reaction = body["reaction"].as_array().expect("reaction array");
+        assert_eq!(reaction.len(), 1);
+        assert_eq!(reaction[0]["type"], "emoji");
+        assert_eq!(reaction[0]["emoji"], "👀");
+    }
+
+    #[test]
+    fn set_message_reaction_body_remove_is_empty_array() {
+        // Clearing the ack: Telegram's documented "remove all" shape is an
+        // empty reaction array (NOT a missing key).
+        let body = set_message_reaction_body("chat-1", 42, false);
+        assert_eq!(body["message_id"], 42);
+        assert!(
+            body["reaction"]
+                .as_array()
+                .expect("reaction array")
+                .is_empty(),
+            "clearing a reaction must send an empty array"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_reaction_rejects_non_numeric_message_id() {
+        // The Bot API needs an i64 message id; a non-numeric one is a hard
+        // error here (the daemon egress swallows it — reactions are
+        // fire-and-forget — but the provider must not silently no-op).
+        let ch = TelegramChannel::new("t".into(), vec![]);
+        assert!(ch.add_reaction("chat-1", "not-a-number").await.is_err());
+        assert!(ch
+            .remove_reaction("chat-1", "not-a-number", None)
+            .await
+            .is_err());
     }
 
     #[test]

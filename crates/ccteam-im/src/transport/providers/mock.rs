@@ -11,6 +11,12 @@ use tokio::sync::Mutex;
 
 use crate::transport::{Channel, ChannelMessage, CommandSpec, SendMessage};
 
+/// One recorded reaction call (v0.8.19): `(op, chat_id, message_id, handle)`
+/// where `op` is `"add"`/`"remove"` and `handle` is what was passed to remove
+/// (always `None` on add). Factored out so the [`MockChannel`] field stays a
+/// simple type.
+type RecordedReaction = (String, String, String, Option<String>);
+
 /// Test-only Channel. Cheap to clone (`Arc` inside) so a test can
 /// hand one copy to the daemon and keep another for assertions.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +42,17 @@ pub struct MockChannel {
     /// the menu at startup. A real menu-less channel keeps the trait default
     /// (no-op) — this recorder is purely an observation hook, not behavior.
     registered_commands: Arc<Mutex<Vec<Vec<CommandSpec>>>>,
+    /// v0.8.19 — when set, makes [`Channel::add_reaction`] STATEFUL (return
+    /// `Some(handle)`) so a test can prove the daemon egress round-trips a
+    /// reaction handle (the Lark shape). `None` (the default) keeps the trait's
+    /// stateless `Ok(None)` (the Telegram shape). Recorded reaction calls go to
+    /// `reactions`.
+    reaction_handle: Option<String>,
+    /// v0.8.19 — every `add_reaction`/`remove_reaction` call recorded as
+    /// `(op, chat_id, message_id, handle)` where `op` is `"add"`/`"remove"`
+    /// and `handle` is the handle passed to remove (always `None` on add). Lets
+    /// a test assert the daemon egress add→remove handle round-trip.
+    reactions: Arc<Mutex<Vec<RecordedReaction>>>,
 }
 
 impl MockChannel {
@@ -49,7 +66,24 @@ impl MockChannel {
             max_len: None,
             fail_if_contains: Arc::default(),
             registered_commands: Arc::default(),
+            reaction_handle: None,
+            reactions: Arc::default(),
         }
+    }
+
+    /// Make [`Channel::add_reaction`] return `Some(handle)` (the stateful Lark
+    /// shape) so a test can assert the daemon egress stores + replays it on
+    /// remove. Builder-style; default keeps the stateless `Ok(None)`.
+    pub fn with_reaction_handle(mut self, handle: impl Into<String>) -> Self {
+        self.reaction_handle = Some(handle.into());
+        self
+    }
+
+    /// Snapshot of every reaction call so far, as `(op, chat_id, message_id,
+    /// handle)` (`op` = `"add"`/`"remove"`; `handle` is what was passed to
+    /// remove). v0.8.19.
+    pub async fn reactions(&self) -> Vec<RecordedReaction> {
+        self.reactions.lock().await.clone()
     }
 
     /// Override the platform-name string (default `"mock"`). Builder-style;
@@ -156,6 +190,37 @@ impl Channel for MockChannel {
         self.registered_commands.lock().await.push(cmds.to_vec());
         Ok(())
     }
+
+    async fn add_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Record the call + return the configured handle (None by default =
+        // stateless Telegram shape; Some = stateful Lark shape).
+        self.reactions.lock().await.push((
+            "add".to_string(),
+            chat_id.to_string(),
+            message_id.to_string(),
+            None,
+        ));
+        Ok(self.reaction_handle.clone())
+    }
+
+    async fn remove_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        handle: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.reactions.lock().await.push((
+            "remove".to_string(),
+            chat_id.to_string(),
+            message_id.to_string(),
+            handle.map(str::to_string),
+        ));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +251,23 @@ mod tests {
         let out = ch.outbox().await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content, "pong");
+    }
+
+    /// v0.8.19 — a channel that doesn't override the reaction methods (web /
+    /// discord / slack / mock) gets the trait's no-op defaults: `add_reaction`
+    /// returns `Ok(None)` (no handle), `remove_reaction` returns `Ok(())`.
+    /// Reactions are an IM-only affordance, so this keeps non-IM channels
+    /// change-free.
+    #[tokio::test]
+    async fn reaction_methods_default_to_noop() {
+        let ch = MockChannel::new();
+        let handle = ch.add_reaction("chat-1", "m-1").await.unwrap();
+        assert!(handle.is_none(), "default add_reaction returns no handle");
+        // remove with the (None) handle is a no-op that succeeds.
+        ch.remove_reaction("chat-1", "m-1", handle.as_deref())
+            .await
+            .unwrap();
+        // And it never touched the outbox (a reaction is not a message).
+        assert!(ch.outbox().await.is_empty());
     }
 }
