@@ -107,6 +107,13 @@ enum Command {
         /// would ask. Useful in scripts / CI.
         #[arg(short = 'y', long, default_value_t = false)]
         yes: bool,
+        /// v0.8.20 F1: set the project owner identity (`ProjectState.owner`,
+        /// `"channel:chat_id"` — e.g. `web:<tenant>`). A bare value (no `:`)
+        /// is scoped to the web namespace (`alice` → `web:alice`). Present
+        /// overrides an existing owner on re-init (no `--force` needed);
+        /// absent preserves it.
+        #[arg(long, value_name = "OWNER")]
+        owner: Option<String>,
     },
     /// Run the v8.1 gateway daemon (IM gateway plus, by default, the
     /// web UI in the same process). Foreground is the only supported
@@ -956,6 +963,7 @@ fn main() -> Result<()> {
             reset_agents,
             interactive,
             yes,
+            owner,
         } => {
             let paths = CcteamPaths::from_env()?;
             let report = commands::run_init(
@@ -968,6 +976,7 @@ fn main() -> Result<()> {
                     reset_agents,
                     interactive,
                     yes,
+                    owner,
                 },
             )?;
             print!("{report}");
