@@ -11,6 +11,10 @@
 #   * No sudo. Writes to $HOME/.local/bin by default.
 #   * Override target dir: CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh
 #   * Override tag (CI / pin): CCTEAM_VERSION=<tag> sh install.sh
+#   * Post-install daemon launch: interactive prompt (reads /dev/tty) to
+#     install a systemd --user service, start in the background, or skip.
+#     Non-interactive default = skip. Force a choice with
+#     CCTEAM_POST_INSTALL=systemd|start|none sh install.sh
 #   * Windows is not supported — run ccteam under WSL2 and use the
 #     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
 #
@@ -150,6 +154,144 @@ resolve_tag() {
     info "Latest release (via API fallback): $TAG"
 }
 
+# ---- post-install: launch the daemon (systemd or nohup), then show the
+#      restart command + web console URL (for Telegram / Feishu setup) ----
+
+daemon_running() {
+    command -v pgrep >/dev/null 2>&1 && pgrep -f "ccteam start" >/dev/null 2>&1
+}
+
+have_systemd_user() {
+    [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1
+}
+
+# Poll the daemon for its web URL (up to ~20s), then print the restart
+# command and the link. $1 = ccteam binary path, $2 = restart command.
+show_result() {
+    _bin="$1"
+    _restart="$2"
+    info "Waiting for the daemon to come up..."
+    _i=0
+    _url=""
+    while [ "$_i" -lt 20 ]; do
+        _url="$("$_bin" status 2>/dev/null | grep -i 'web url:' | head -n1 \
+            | sed -E 's/.*web url:[[:space:]]*//' | tr -d '\r')" || _url=""
+        if [ -n "$_url" ]; then break; fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+
+    printf '\n%s==>%s %sccteam is up.%s\n\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
+    printf '    Restart it with:\n      %s\n\n' "$_restart"
+    if [ -n "$_url" ]; then
+        printf '    Open the web console to configure Telegram / Feishu and add projects:\n\n'
+        printf '      %s\n\n' "$_url"
+    else
+        warn "daemon did not report a web URL within 20s; check it with: ccteam status"
+    fi
+}
+
+start_nohup() {
+    _bin="$1"
+    mkdir -p "$HOME/.ccteam" 2>/dev/null || true
+    info "Starting the daemon in the background (nohup; log: ~/.ccteam/daemon.log)..."
+    nohup "$_bin" start >"$HOME/.ccteam/daemon.log" 2>&1 </dev/null &
+    show_result "$_bin" "ccteam stop && nohup ccteam start >~/.ccteam/daemon.log 2>&1 &"
+}
+
+start_systemd() {
+    _bin="$1"
+    _unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    _unit="$_unit_dir/ccteam.service"
+    mkdir -p "$_unit_dir"
+    info "Installing systemd --user service: $_unit"
+    cat > "$_unit" <<EOF
+[Unit]
+Description=ccteam daemon (IM gateway + web console + MCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$_bin start
+Environment=PATH=$PATH
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    # Survive logout / start on boot (best-effort; harmless if not permitted).
+    loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+    if systemctl --user daemon-reload >/dev/null 2>&1 \
+        && systemctl --user enable --now ccteam.service >/dev/null 2>&1; then
+        show_result "$_bin" "systemctl --user restart ccteam"
+    else
+        warn "Could not start the systemd --user service (no active user session / D-Bus?)."
+        printf '    Retry in a login session:  systemctl --user enable --now ccteam\n'
+        printf '    Or use nohup instead:      nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n'
+    fi
+}
+
+post_install() {
+    _bin="$1"
+
+    if daemon_running; then
+        info "A ccteam daemon is already running."
+        show_result "$_bin" "ccteam stop && ccteam start"
+        return 0
+    fi
+
+    # Resolve launch method: env override, else interactive prompt, else skip.
+    _action="${CCTEAM_POST_INSTALL:-}"
+    if [ -z "$_action" ]; then
+        if [ -r /dev/tty ]; then
+            if have_systemd_user; then
+                printf '\n%s==>%s Start the ccteam daemon now?\n' "$BOLD" "$RESET"
+                printf '      [1] systemd --user service — auto-start on boot + auto-restart  (recommended)\n'
+                printf '      [2] nohup — background process for this session\n'
+                printf '      Choice [1]: '
+                read -r _reply </dev/tty || _reply=""
+                case "$_reply" in
+                    2) _action="nohup" ;;
+                    *) _action="systemd" ;;
+                esac
+            else
+                printf '\n%s==>%s Start the ccteam daemon in the background now? [Y/n] ' "$BOLD" "$RESET"
+                read -r _reply </dev/tty || _reply=""
+                case "$_reply" in
+                    [Nn]*) _action="none" ;;
+                    *)     _action="nohup" ;;
+                esac
+            fi
+        else
+            _action="none"   # non-interactive (CI / piped, no tty): don't auto-start
+        fi
+    fi
+
+    case "$_action" in
+        systemd)
+            if have_systemd_user; then
+                start_systemd "$_bin"
+            else
+                warn "systemd --user unavailable here; starting with nohup instead."
+                start_nohup "$_bin"
+            fi
+            ;;
+        nohup|start|background|bg)
+            start_nohup "$_bin"
+            ;;
+        none|skip)
+            info "Skipped. Start it yourself when ready:"
+            printf '      ccteam start                                       # foreground\n'
+            printf '      nohup ccteam start >~/.ccteam/daemon.log 2>&1 &    # background\n'
+            ;;
+        *)
+            warn "unknown CCTEAM_POST_INSTALL='$_action'; skipping auto-start. Run: ccteam start"
+            ;;
+    esac
+}
+
 # ---- main install ----
 main() {
     need_cmd uname
@@ -263,7 +405,7 @@ main() {
         ccteam --version || true
     fi
 
-    info "Next: open a Claude session and run /ccteam \"<what you want>\"."
+    post_install "$INSTALL_DIR/ccteam"
 }
 
 main "$@"
