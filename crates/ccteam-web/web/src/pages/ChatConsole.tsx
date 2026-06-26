@@ -337,14 +337,14 @@ export default function ChatConsole() {
             a static `w-60` column; below md it is an off-canvas drawer toggled
             by the header hamburger (slides in over the backdrop). */}
         <aside
-          className={`w-60 shrink-0 border-r border-surface-700/40 flex flex-col bg-surface-900 ${
+          className={`w-60 shrink-0 border-r border-surface-700/60 flex flex-col bg-surface-950 ${
             sidebarOpen
               ? "fixed inset-y-0 top-12 left-0 z-40 md:static md:top-0"
               : "hidden md:flex"
           }`}
         >
           <div className="h-10 shrink-0 px-3 flex items-center justify-between border-b border-surface-700/30">
-            <span className="text-xs font-mono uppercase text-text-dim">所有 session</span>
+            <span className="text-xs font-mono uppercase text-text-secondary">所有 session</span>
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -374,7 +374,7 @@ export default function ChatConsole() {
                 type="button"
                 onClick={() => setSidebarOpen(false)}
                 aria-label="关闭"
-                className="md:hidden h-6 w-6 grid place-items-center rounded-md text-text-dim hover:text-text-primary hover:bg-surface-800"
+                className="md:hidden h-6 w-6 grid place-items-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-800"
               >
                 <X className="h-3.5 w-3.5" />
               </button>
@@ -390,9 +390,11 @@ export default function ChatConsole() {
                     className="px-1.5 py-1"
                     title={projectPath ? `${project} — ${projectPath}` : project}
                   >
-                    <div className="text-[11px] font-mono text-text-dim truncate">{project}</div>
+                    <div className="text-[11px] font-mono font-medium text-text-primary truncate">
+                      {project}
+                    </div>
                     {projectPath ? (
-                      <div className="text-[10px] font-mono text-text-secondary truncate">
+                      <div className="text-[10px] font-mono text-text-muted truncate">
                         {projectPath}
                       </div>
                     ) : null}
@@ -435,7 +437,7 @@ export default function ChatConsole() {
                               hitl
                             </span>
                           ) : null}
-                          <span className="text-text-dim font-mono">{s.sid}</span>
+                          <span className="text-text-muted font-mono">{s.sid}</span>
                         </button>
                       );
                     })}
@@ -451,7 +453,7 @@ export default function ChatConsole() {
                           setModalProject(project);
                           setModalOpen(true);
                         }}
-                        className="w-full text-left px-2 py-1 rounded-md flex items-center gap-1 text-[10px] text-text-dim/70 hover:text-brand-400 hover:bg-surface-800/70"
+                        className="w-full text-left px-2 py-1 rounded-md flex items-center gap-1 text-[10px] text-text-muted hover:text-brand-400 hover:bg-surface-800/70"
                         title={`为 ${project} 创建第一个 session`}
                       >
                         <Plus className="h-3 w-3" /> 还没有 session — 新建
@@ -462,7 +464,7 @@ export default function ChatConsole() {
               );
             })}
             {projects.length === 0 ? (
-              <div className="px-2 py-3 text-xs text-text-dim leading-5">
+              <div className="px-2 py-3 text-xs text-text-secondary leading-5">
                 {railError ? `加载失败: ${railError}` : "还没有 session。点「＋ 新建」创建。"}
               </div>
             ) : null}
