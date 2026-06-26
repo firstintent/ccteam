@@ -184,7 +184,41 @@ fn build_projects(
             badge_class: badge.css_class(),
             badge_label: badge.label(),
             cost_label: format!("{:.2}", cost_total),
+            broken: false,
         });
+    }
+    // Admin-only: surface ORPHANED registrations — slugs in `config.yaml` whose
+    // `.ccteam/state.json` is gone, which `collect_projects` silently skips (and
+    // which `can_see_project` therefore 403s for everyone). Flag them `broken`
+    // so the web can list + deregister them. The owner is unknowable (it lived
+    // in the now-missing state.json), so a tenant must never see them — only the
+    // admin, matching the orphan branch of `can_see_project`.
+    if identity.is_admin {
+        if let Ok(cfg) = ccteam_core::config::load(&app.paths.root) {
+            let seen: std::collections::HashSet<String> =
+                rows.iter().map(|r| r.slug.clone()).collect();
+            for entry in &cfg.projects {
+                if seen.contains(&entry.slug) {
+                    continue;
+                }
+                // Only genuinely-orphaned entries (no state.json) — a healthy
+                // project would already be in `rows` (admin sees all).
+                if entry.path.join(".ccteam").join("state.json").exists() {
+                    continue;
+                }
+                rows.push(DashboardRow {
+                    slug: entry.slug.clone(),
+                    path: entry.path.display().to_string(),
+                    team: String::new(),
+                    kind: String::new(),
+                    last_event_label: "—".to_string(),
+                    badge_class: "terminal",
+                    badge_label: "broken",
+                    cost_label: "0.00".to_string(),
+                    broken: true,
+                });
+            }
+        }
     }
     Ok(rows)
 }
@@ -232,8 +266,9 @@ pub(crate) async fn handle_me(
 /// project's `state.json` owner and delegates to [`Identity::can_see_owner`]:
 /// the operator/admin sees its own + unowned + IM-owned projects but NOT a
 /// per-user tenant's (`user:<id>`); a tenant sees only one it owns. A
-/// missing/unreadable project is not visible. The single source the session
-/// endpoints consult to scope by project.
+/// missing/unreadable project (orphaned registration) is visible ONLY to the
+/// admin, so it can be deregistered/cleaned from the web. The single source the
+/// session endpoints consult to scope by project.
 pub(crate) fn can_see_project(
     app: &AppState,
     identity: &crate::auth::Identity,
@@ -241,7 +276,12 @@ pub(crate) fn can_see_project(
 ) -> bool {
     match ProjectState::load(&app.paths.project_state(slug)) {
         Ok(state) => identity.can_see_owner(state.owner.as_deref()),
-        Err(_) => false,
+        // Orphaned/unreadable registration (state.json gone) — the owner is
+        // unknowable, so only the admin may act on it (to deregister/clean it
+        // up via DELETE). Tenants fail closed. Without this the ACL layer 403s
+        // EVERYONE on an orphan, so a broken registration could never be removed
+        // from the web. The DELETE handler is config-only (no files), matching.
+        Err(_) => identity.is_admin,
     }
 }
 

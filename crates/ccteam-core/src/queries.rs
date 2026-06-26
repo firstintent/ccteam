@@ -177,7 +177,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
             tracing::warn!(
                 slug = %entry.slug,
                 path = %entry.path.display(),
-                "registered project's state.json is missing; skipping (run `ccteam abandon {}` to clean up)",
+                "registered project's state.json is missing; skipping (run `ccteam project rm {}` to clean up)",
                 entry.slug,
             );
             continue;

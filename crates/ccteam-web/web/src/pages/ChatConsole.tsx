@@ -27,7 +27,17 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
-import { Activity, MessageSquare, Menu, Plus, Puzzle, Server, Settings, X } from "lucide-react";
+import {
+  Activity,
+  MessageSquare,
+  Menu,
+  Plus,
+  Puzzle,
+  Server,
+  Settings,
+  Trash2,
+  X,
+} from "lucide-react";
 import CostPill from "../components/CostPill";
 import AvatarMenu from "../components/AvatarMenu";
 import { Combobox, type ComboboxOption } from "../components/ui";
@@ -36,7 +46,11 @@ import StatusView from "./StatusView";
 import HostsView from "./HostsView";
 import SettingsPage from "./SettingsPage";
 import SessionView from "./SessionView";
-import { createProject as apiCreateProject, fetchDashboard } from "../lib/dashboardApi";
+import {
+  createProject as apiCreateProject,
+  deleteProject,
+  fetchDashboard,
+} from "../lib/dashboardApi";
 import {
   createSession as apiCreateSession,
   listProjectRoles,
@@ -143,6 +157,11 @@ export default function ChatConsole() {
   // sessions-only project (live but not registered) simply has no entry —
   // the path line is then omitted for it.
   const [projectPaths, setProjectPaths] = useState<Record<string, string>>({});
+  // Slugs the server flagged as ORPHANED registrations (config.yaml entry whose
+  // `.ccteam/state.json` is gone). Admin-only — the server only emits `broken`
+  // rows to the admin. The rail marks them and shows an always-on deregister
+  // action so the operator can clean them up (DELETE is registry-only).
+  const [brokenProjects, setBrokenProjects] = useState<Set<string>>(new Set());
   const [railError, setRailError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   // When the new-session modal is opened from a specific project's "还没有
@@ -153,6 +172,15 @@ export default function ChatConsole() {
   // hamburger toggles it). Closed by default; auto-closed on a session switch
   // / global-nav pick so the chosen surface is visible without a manual close.
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Deregister-project confirm dialog. `null` = closed; else the target slug,
+  // whether it's an orphan, and how many live sessions get stopped (so the
+  // copy is honest about the side effect).
+  const [deleteTarget, setDeleteTarget] = useState<{
+    slug: string;
+    broken: boolean;
+    sessionCount: number;
+  } | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   // The active session's rail entry (vendor/role/project), passed to the
   // per-sid SessionView for its crumb + terminal gating. All per-sid state
@@ -175,6 +203,9 @@ export default function ChatConsole() {
       // by slug — the sidebar group header + the picker's `hint` line read it
       // to disambiguate demo / demo2 / demo3.
       setProjectPaths(Object.fromEntries(projects.map((p) => [p.slug, p.path])));
+      // Orphaned registrations the server flagged (admin-only). Drives the
+      // rail's "broken" marker + always-on deregister action.
+      setBrokenProjects(new Set(projects.filter((p) => p.broken).map((p) => p.slug)));
       const lists = await Promise.all(
         projects.map((p) => listSessions(p.slug).catch(() => [] as SessionSummary[])),
       );
@@ -208,6 +239,31 @@ export default function ChatConsole() {
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [refreshSessions]);
+
+  // ---- deregister a project (registry only; dir + .ccteam stay on disk) ---
+  // DELETE /api/v1/projects/{slug} removes the slug from config.yaml and stops
+  // its live sessions server-side. If we're currently viewing a session in the
+  // removed project, leave for the shell root so we don't sit on a gone session.
+  const confirmDelete = useCallback(async () => {
+    if (!deleteTarget || deleting) return;
+    const targetSlug = deleteTarget.slug;
+    const wasActive = activeView?.project === targetSlug;
+    setDeleting(true);
+    try {
+      await deleteProject(targetSlug);
+      toastBus.handler?.info(tr(lang, `已解除注册 ${targetSlug}`, `Deregistered ${targetSlug}`));
+      setDeleteTarget(null);
+      if (wasActive) navigate("/");
+      await refreshSessions();
+    } catch (e) {
+      if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(
+        e instanceof Error ? e.message : tr(lang, "解除注册失败", "Deregister failed"),
+      );
+    } finally {
+      setDeleting(false);
+    }
+  }, [deleteTarget, deleting, activeView, navigate, refreshSessions, lang]);
 
   // ---- create a new session (optionally a brand-new project first) -------
   // `newProjectPath` present ⇒ B2: POST /projects to scaffold+register `slug`
@@ -384,20 +440,52 @@ export default function ChatConsole() {
             {projects.map((project) => {
               const items = railSessions.filter((s) => s.project === project);
               const projectPath = projectPaths[project];
+              const broken = brokenProjects.has(project);
               return (
-                <div key={project}>
+                <div key={project} className="group/proj">
                   <div
-                    className="px-1.5 py-1"
+                    className="px-1.5 py-1 flex items-start justify-between gap-1"
                     title={projectPath ? `${project} — ${projectPath}` : project}
                   >
-                    <div className="text-[11px] font-mono font-medium text-text-primary truncate">
-                      {project}
-                    </div>
-                    {projectPath ? (
-                      <div className="text-[10px] font-mono text-text-muted truncate">
-                        {projectPath}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1">
+                        {broken ? (
+                          <span
+                            className="shrink-0 text-[9px] font-mono px-1 rounded bg-status-error/15 text-status-error"
+                            title="注册损坏:.ccteam/state.json 丢失,解除注册以清理"
+                          >
+                            ⚠
+                          </span>
+                        ) : null}
+                        <div
+                          className={`text-[11px] font-mono font-medium truncate ${
+                            broken ? "text-text-muted" : "text-text-primary"
+                          }`}
+                        >
+                          {project}
+                        </div>
                       </div>
-                    ) : null}
+                      {projectPath ? (
+                        <div className="text-[10px] font-mono text-text-muted truncate">
+                          {projectPath}
+                        </div>
+                      ) : null}
+                    </div>
+                    {/* deregister — registry only; hover-revealed for healthy
+                        projects, always-on for a broken one (it needs cleanup). */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDeleteTarget({ slug: project, broken, sessionCount: items.length })
+                      }
+                      title={tr(lang, "解除注册", "Deregister")}
+                      aria-label={tr(lang, `解除注册 ${project}`, `Deregister ${project}`)}
+                      className={`shrink-0 h-5 w-5 grid place-items-center rounded text-text-muted hover:text-status-error hover:bg-surface-800 transition-opacity focus-visible:opacity-100 ${
+                        broken ? "opacity-100" : "opacity-0 group-hover/proj:opacity-100"
+                      }`}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
                   </div>
                   <div className="space-y-0.5">
                     {items.map((s) => {
@@ -566,6 +654,82 @@ export default function ChatConsole() {
           }}
           onCreate={createSession}
         />
+      ) : null}
+
+      {/* Deregister-project confirm — registry-only, honest about the boundary
+          (the project dir + its .ccteam are NOT deleted) and the side effect
+          (live sessions stop). Broken (orphan) targets get a tailored line. */}
+      {deleteTarget ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 animate-fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-label={tr(lang, "解除注册项目", "Deregister project")}
+          onClick={() => {
+            if (!deleting) setDeleteTarget(null);
+          }}
+        >
+          <div
+            className="w-full max-w-[400px] rounded-lg border border-surface-700 bg-surface-900 p-4 shadow-xl animate-slide-up"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-semibold text-text-primary">
+              {tr(lang, "解除注册「", "Deregister ")}
+              <span className="font-mono">{deleteTarget.slug}</span>
+              {tr(lang, "」?", "?")}
+            </h2>
+            <p className="mt-2 text-xs leading-5 text-text-secondary">
+              {tr(
+                lang,
+                "仅从 ccteam 注册表移除。",
+                "Removes it from ccteam's registry only. ",
+              )}
+              <span className="text-text-primary">
+                {tr(
+                  lang,
+                  "项目目录和其中的 .ccteam 都不会被删除",
+                  "the project directory and its .ccteam are NOT deleted",
+                )}
+              </span>
+              {tr(lang, ",随时可 ", " — re-add anytime with ")}
+              <span className="font-mono">ccteam init</span>
+              {tr(lang, " 重新注册。", ".")}
+              {deleteTarget.broken
+                ? tr(
+                    lang,
+                    " (该注册已损坏:state.json 丢失。)",
+                    " (This registration is broken: its state.json is missing.)",
+                  )
+                : deleteTarget.sessionCount > 0
+                  ? tr(
+                      lang,
+                      ` 该项目下进行中的 ${deleteTarget.sessionCount} 个 session 会被停止。`,
+                      ` Its ${deleteTarget.sessionCount} live session(s) will be stopped.`,
+                    )
+                  : ""}
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(null)}
+                disabled={deleting}
+                className="h-8 px-3 rounded-md text-xs text-text-secondary hover:bg-surface-800 hover:text-text-primary disabled:opacity-50"
+              >
+                {tr(lang, "取消", "Cancel")}
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmDelete()}
+                disabled={deleting}
+                className="h-8 px-3 rounded-md text-xs bg-status-error/90 text-surface-950 hover:bg-status-error disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {deleting
+                  ? tr(lang, "解除中…", "Removing…")
+                  : tr(lang, "解除注册", "Deregister")}
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

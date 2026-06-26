@@ -36,6 +36,14 @@ pub struct DashboardRow {
     pub badge_class: &'static str,
     pub badge_label: &'static str,
     pub cost_label: String,
+    /// True for an ORPHANED registration: the slug is in `config.yaml` but its
+    /// `.ccteam/state.json` is gone (the dir was removed out-of-band, or an
+    /// init half-failed). `collect_projects` skips these, so `GET /projects`
+    /// surfaces them ONLY to the admin (owner is unknowable → tenants fail
+    /// closed) so they can be deregistered/cleaned from the web. Healthy rows
+    /// are `false`.
+    #[serde(default)]
+    pub broken: bool,
 }
 
 #[derive(Serialize, ToSchema)]

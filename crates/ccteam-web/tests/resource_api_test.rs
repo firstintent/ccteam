@@ -339,7 +339,11 @@ async fn post_project_rejects_relative_path() {
 }
 
 #[tokio::test]
-async fn post_project_conflict_on_duplicate_slug() {
+async fn post_project_auto_appends_on_duplicate_slug() {
+    // A duplicate slug does NOT 409 — `handle_create_project` AUTO-APPENDS a
+    // numeric suffix (dup → dup2), the same rule `ccteam init` uses (red line:
+    // "新建项目 slug = 目录名 + 数字累加"). The 201 body carries the slug actually
+    // used. (409 is reserved for the pathological >999-collisions case.)
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let target = tmp.path().join("repo1");
@@ -360,7 +364,12 @@ async fn post_project_conflict_on_duplicate_slug() {
         .send()
         .await
         .unwrap();
-    assert_eq!(second.status(), 409);
+    assert_eq!(second.status(), 201);
+    let created: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(
+        created["slug"], "dup2",
+        "duplicate slug auto-appends: {created}"
+    );
 }
 
 #[tokio::test]

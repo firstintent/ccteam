@@ -34,6 +34,11 @@ export interface DashboardRow {
    *  for the harness pill (claude / codex). F55's session-detail page
    *  carries the authoritative value. Dashboard treats absent ⇒ claude. */
   harness?: string;
+  /** True for an ORPHANED registration: in `config.yaml` but its
+   *  `.ccteam/state.json` is gone. Admin-only (the server only emits these to
+   *  the admin). The rail flags them and offers a deregister action. Absent ⇒
+   *  a healthy project. */
+  broken?: boolean;
 }
 
 /** GET `/api/v1/projects`. Returns the parsed array on 2xx.
@@ -110,4 +115,43 @@ export async function createProject(
     throw new Error(detail);
   }
   return (await resp.json()) as CreatedProject;
+}
+
+/** `DELETE /api/v1/projects/{slug}` — DEREGISTER ONLY. Removes the slug from
+ *  ccteam's registry (`config.yaml`) and stops its live sessions via the spine.
+ *  NEVER touches the project directory or its `.ccteam` (both stay on disk;
+ *  re-runnable with `ccteam init`). Returns `{removed, sessions_stopped}`.
+ *
+ *  401 → `Error("UNAUTHENTICATED")` (global re-auth gate). 403 (not your
+ *  project) / 404 (slug not registered) lift the server's `{error}` message so
+ *  the caller can toast it; otherwise falls back to the status code. */
+export async function deleteProject(
+  slug: string,
+): Promise<{ removed: boolean; sessions_stopped: string[] }> {
+  let resp: Response;
+  try {
+    resp = await fetch(`/api/v1/projects/${encodeURIComponent(slug)}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
+  }
+  if (resp.status === 401) {
+    throw new Error("UNAUTHENTICATED");
+  }
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const data = (await resp.json()) as { error?: string };
+      if (data && typeof data.error === "string" && data.error.length > 0) {
+        detail = data.error;
+      }
+    } catch {
+      // keep the status-code fallback
+    }
+    throw new Error(detail);
+  }
+  return (await resp.json()) as { removed: boolean; sessions_stopped: string[] };
 }
