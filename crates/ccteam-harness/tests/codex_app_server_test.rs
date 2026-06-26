@@ -340,6 +340,116 @@ async fn raw_extras_transport_is_resolved_tag() {
     restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
 }
 
+/// Deterministic resume-before-turn precondition (the codex "thread not found"
+/// fix): `submit_turn` must `ensure_thread_loaded` first — when the thread is
+/// NOT loaded on the current connection (post-reconnect / restored-session /
+/// the bug's evicted-thread shape) it issues `thread/resume` BEFORE
+/// `turn/start`, so `turn/start` can never hit `thread not found`. And it
+/// resumes at most once per connection epoch (a thread already loaded skips
+/// straight to the turn).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("ensure-loaded-resume");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    // Record every id-bearing RPC method the peer sees (skip notifications).
+    let methods: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let methods_h = Arc::clone(&methods);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        let m = req["method"].as_str().unwrap_or("").to_string();
+        if req.get("id").is_some() {
+            methods_h.lock().unwrap().push(m.clone());
+        }
+        match m.as_str() {
+            "initialize" => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            "thread/start" => json!({ "result": { "thread": { "thread_id": "t-ensure" } } }),
+            "thread/resume" => json!({ "result": { "thread": { "thread_id": "t-ensure" } } }),
+            "turn/start" => json!({ "result": { "turn": { "id": "turn-ok" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "demo".into(),
+            },
+            &SpawnCtx {
+                slug: "ensure-loaded".into(),
+                sid: "codex-el".into(),
+                cwd: std::env::temp_dir(),
+                project_dir: std::env::temp_dir(),
+                extra_args: vec![],
+                model_id: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // start_thread marked the thread loaded → the first turn goes straight to
+    // turn/start with NO resume.
+    let t1 = adapter
+        .submit_turn(&h, TurnInput::UserText("hi".into()))
+        .await
+        .expect("first submit_turn succeeds");
+    assert_eq!(t1.0, "turn-ok");
+    assert_eq!(
+        methods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == "thread/resume")
+            .count(),
+        0,
+        "a freshly-started (loaded) thread must NOT be resumed: {:?}",
+        methods.lock().unwrap()
+    );
+
+    // Simulate the thread leaving the app-server's memory (connection replaced
+    // / idle eviction): clear the loaded set. The NEXT turn must resume first.
+    adapter.forget_loaded_for_test().await;
+    let t2 = adapter
+        .submit_turn(&h, TurnInput::UserText("again".into()))
+        .await
+        .expect("submit_turn must resume-then-start, never surface thread-not-found");
+    assert_eq!(t2.0, "turn-ok");
+
+    let seen = methods.lock().unwrap().clone();
+    let resume_idx = seen.iter().rposition(|m| m == "thread/resume");
+    let last_turn_idx = seen.iter().rposition(|m| m == "turn/start");
+    assert!(
+        resume_idx.is_some(),
+        "an unloaded thread must be resumed before the turn: {seen:?}"
+    );
+    assert!(
+        resume_idx < last_turn_idx,
+        "thread/resume must precede the turn/start it enables: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|m| *m == "thread/resume").count(),
+        1,
+        "resume is once-per-connection-epoch, not a per-turn fallback: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|m| *m == "turn/start").count(),
+        2,
+        "both turns must have reached turn/start: {seen:?}"
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
 /// F10 W3 step-0 GATE — real `codex` binary, DEFAULT (stdio) transport.
 /// Constructs a `CodexAppServerAdapter` with NO socket env, so it must
 /// spawn `codex app-server --listen stdio://` itself and complete the

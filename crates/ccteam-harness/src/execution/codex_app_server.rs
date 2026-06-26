@@ -40,7 +40,7 @@
 //! probe codex without touching tmux. The orchestrator's mode-3
 //! dispatch (e2e-wiring's territory) decides which adapter to mount.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, Notification};
+use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, JsonRpcError, Notification};
 use crate::execution::progress_bridge::{
     append_event, build_codex_plan_updated_event, build_codex_rate_limit_event,
     build_codex_thread_status_event, build_codex_token_usage_event, progress_jsonl_from_env,
@@ -240,7 +240,12 @@ impl SessionOverride {
 /// the `skills/changed` notification.
 #[derive(Clone)]
 pub struct CodexAppServerAdapter {
-    inner: Arc<Mutex<Option<Arc<CodexJsonRpcClient>>>>,
+    /// The cached app-server connection. Bundles the JSON-RPC `client` with
+    /// the set of thread ids loaded ON THAT connection (see [`CachedConn`]),
+    /// so replacing the connection (transport death / re-dial) atomically
+    /// resets the load-tracking — the per-connection epoch `ensure_thread_loaded`
+    /// keys off of.
+    inner: Arc<Mutex<Option<CachedConn>>>,
     bridges: Arc<Mutex<HashMap<String, ProgressBridgeCtx>>>,
     /// v0.8.5 D2.4 — harness-owned per-thread live state (usage /
     /// active-turn / model). Fed by ONE dispatcher per cached client.
@@ -254,6 +259,22 @@ pub struct CodexAppServerAdapter {
     /// [`resolve_codex_transport`]). `client()` matches on this — no
     /// per-call env sniffing.
     transport: CodexTransport,
+}
+
+/// One live app-server connection plus the set of thread ids ccteam has
+/// loaded on it. codex keeps a thread resident only while a connection is
+/// subscribed to it (`thread_lifecycle.rs`), and ccteam shares ONE child
+/// connection across all codex sessions — so whenever the connection is
+/// replaced (a transport-death `forget_client`, a child crash, a daemon
+/// restart) every previously-loaded thread is gone from the new connection.
+/// `loaded` is the per-connection epoch: it is created empty with the
+/// connection and dropped wholesale when the connection is forgotten, so
+/// [`CodexAppServerAdapter::ensure_thread_loaded`] knows deterministically
+/// whether `tid` still needs a `thread/resume` before any turn-producing RPC.
+#[derive(Clone)]
+struct CachedConn {
+    client: Arc<CodexJsonRpcClient>,
+    loaded: Arc<Mutex<HashSet<String>>>,
 }
 
 /// v0.8.5 D2 — one entry of the flattened `skills/list` cache.
@@ -330,9 +351,17 @@ impl CodexAppServerAdapter {
     /// returns a clean [`HarnessError::SpawnFailed`] if the socket is
     /// missing, so the caller surfaces the right diagnostic.
     async fn client(&self) -> Result<Arc<CodexJsonRpcClient>, HarnessError> {
+        Ok(self.conn().await?.client)
+    }
+
+    /// Lazily connect (or reuse) the full cached connection — the JSON-RPC
+    /// client plus its per-connection `loaded` set. A fresh connection always
+    /// gets an empty `loaded` set (new epoch); `forget_client` drops the whole
+    /// [`CachedConn`], so the next `conn()` re-dials with a clean epoch.
+    async fn conn(&self) -> Result<CachedConn, HarnessError> {
         let mut guard = self.inner.lock().await;
         if let Some(c) = guard.as_ref() {
-            return Ok(Arc::clone(c));
+            return Ok(c.clone());
         }
         // F10: transport is resolved once at construction; here we just
         // `match` on it. `Stdio` spawns a child app-server; `Socket`
@@ -373,8 +402,63 @@ impl CodexAppServerAdapter {
         // The task exits when the broadcast closes (client dropped /
         // `forget_client`); a subsequent re-dial spawns a fresh one.
         self.spawn_tracker_dispatcher(&shared);
-        *guard = Some(Arc::clone(&shared));
-        Ok(shared)
+        let conn = CachedConn {
+            client: Arc::clone(&shared),
+            loaded: Arc::new(Mutex::new(HashSet::new())),
+        };
+        *guard = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// Deterministic precondition for every turn-producing / thread-scoped RPC:
+    /// guarantee `tid` is resident in the CURRENT app-server connection before
+    /// the call, and return that connection's client.
+    ///
+    /// codex keeps a thread loaded only while a connection is subscribed to it,
+    /// and `turn/start` resolves the thread purely from the app-server's
+    /// in-memory map (no on-disk auto-load) — so a turn issued against a fresh
+    /// connection that never loaded `tid` fails with `thread not found`. Rather
+    /// than send the turn and react to that error, we track (per connection
+    /// epoch) which threads we have loaded and `thread/resume` exactly once,
+    /// up front, when `tid` is missing. The turn RPC then only ever runs where
+    /// the thread is guaranteed resident — `thread not found` is structurally
+    /// impossible in steady state, with no error-string matching and no
+    /// optimistic-send-then-retry fallback.
+    async fn ensure_thread_loaded(
+        &self,
+        tid: &str,
+    ) -> Result<Arc<CodexJsonRpcClient>, HarnessError> {
+        let conn = self.conn().await?;
+        let mut loaded = conn.loaded.lock().await;
+        if loaded.contains(tid) {
+            return Ok(conn.client);
+        }
+        // Not loaded on this connection epoch — resume it (loads from the
+        // on-disk rollout AND subscribes this connection, so codex keeps it
+        // resident for the connection's life). Holding `loaded` across the RPC
+        // makes the resume exactly-once per (thread, connection).
+        conn.client
+            .call("thread/resume", json!({ "threadId": tid }))
+            .await
+            .map_err(|e| {
+                HarnessError::SubmitFailed(format!("thread/resume (ensure-loaded): {e:#}"))
+            })?;
+        loaded.insert(tid.to_string());
+        drop(loaded);
+        // A freshly (re)loaded thread has no in-flight turn; clear any stale
+        // `active_turn` carried over from a previous connection so submit_turn
+        // picks `turn/start` rather than steering a turn that no longer exists.
+        self.tracker.lock().await.entry(tid).active_turn = None;
+        Ok(conn.client)
+    }
+
+    /// Mark `tid` as loaded on the current connection (called after a
+    /// successful `thread/start` / `thread/resume`). Best-effort: a connection
+    /// failure here just means the next [`ensure_thread_loaded`] re-resumes.
+    async fn mark_loaded(&self, tid: &str) {
+        if let Ok(conn) = self.conn().await {
+            conn.loaded.lock().await.insert(tid.to_string());
+        }
     }
 
     /// v0.8.5 D2.4 — spawn the single per-client notification dispatcher
@@ -1318,6 +1402,17 @@ impl CodexAppServerAdapter {
     pub async fn skills_cache_is_some_for_test(&self) -> bool {
         self.skills_cache.lock().await.is_some()
     }
+
+    /// Test hook: clear the current connection's loaded-thread set WITHOUT
+    /// dropping the connection — models a thread that left the app-server's
+    /// memory (the bug) so the next turn must `ensure_thread_loaded` → resume
+    /// it before `turn/start`. No-op when not connected.
+    #[doc(hidden)]
+    pub async fn forget_loaded_for_test(&self) {
+        if let Some(conn) = self.inner.lock().await.as_ref() {
+            conn.loaded.lock().await.clear();
+        }
+    }
 }
 
 #[async_trait]
@@ -1356,6 +1451,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 "thread/start response missing thread.thread_id: {result}"
             ))
         })?;
+        // The freshly started thread is now resident + subscribed on this
+        // connection — record it so subsequent turns skip the resume.
+        self.mark_loaded(&thread_id).await;
         // v0.8.10 — make codex sessions writable by default. Codex's server
         // default thread posture is restrictive (read-only / approval
         // on-request); combined with ccteam's auto-deny approval callback (no
@@ -1444,7 +1542,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
         h: &ThreadHandle,
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
-        let client = self.client().await?;
+        // Deterministic precondition: guarantee this thread is resident on the
+        // current connection (resume-once-per-epoch) BEFORE sending the turn,
+        // so `turn/start` can never hit `thread not found`.
+        let client = self.ensure_thread_loaded(&h.identity).await?;
         if std::env::var(APP_SERVER_FAULT_KILL_BEFORE_TURN_ENV)
             .ok()
             .as_deref()
@@ -1492,7 +1593,15 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let result = match client.call(method, params).await {
             Ok(v) => v,
             Err(e) => {
-                self.forget_client().await;
+                // Only drop the SHARED connection on a genuine transport death.
+                // A logical error from a live peer must NOT tear down the child
+                // — that would evict every other codex session's loaded thread.
+                // After a real transport death the next turn re-dials and
+                // `ensure_thread_loaded` re-resumes, so this stays self-healing
+                // without the mass eviction.
+                if is_transport_death(&e) {
+                    self.forget_client().await;
+                }
                 return Err(HarnessError::SubmitFailed(format!("{method}: {e:#}")));
             }
         };
@@ -1644,6 +1753,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("thread/resume: {e:#}")))?;
         let thread_id = pluck_thread_id(&result).unwrap_or_else(|| persistent_id.to_string());
+        // Resumed thread is resident + subscribed on this connection — record
+        // it so the first turn doesn't redundantly resume again.
+        self.mark_loaded(&thread_id).await;
         // v0.8.19 — seed the tracker's model + effort from the resume
         // response (`result.model` / `result.reasoningEffort` — see
         // [`pluck_model`]). Resumed threads have no `ctx.model_id` (resume
@@ -1690,6 +1802,11 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let _ = client
             .call("thread/unsubscribe", json!({ "threadId": h.identity }))
             .await;
+        // Archived + unsubscribed → codex unloads it; drop it from the
+        // loaded set so a stale entry never suppresses a future resume.
+        if let Some(conn) = self.inner.lock().await.as_ref() {
+            conn.loaded.lock().await.remove(&h.identity);
+        }
         Ok(())
     }
 
@@ -1716,6 +1833,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 reason: "empty command".to_string(),
             });
         }
+        // Every directive below is a thread-scoped RPC (compact / review / init
+        // / fork / skill / …); guarantee the thread is resident on the current
+        // connection first so none of them can hit `thread not found`.
+        let _ = self.ensure_thread_loaded(&h.identity).await?;
         // Layer 1: builtin table. `None` = not a builtin → fall through.
         if let Some(outcome) = self.builtin_directive(h, &name, &d).await? {
             return Ok(outcome);
@@ -1813,6 +1934,24 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}")))?;
         Ok(())
+    }
+}
+
+/// Whether a [`CodexJsonRpcClient::call`] error is a *transport death*
+/// (connection lost / writer-reader task gone) rather than a logical error
+/// response from a live peer. Used to scope `forget_client`: tearing down the
+/// SHARED child connection on a logical error (e.g. a model/state error, or a
+/// `thread not found`) would evict every other codex session's loaded thread.
+///
+/// Deterministic discriminator: a real JSON-RPC error *response* from a live
+/// app-server always carries a numeric `code` (`JsonRpcError.code == Some`).
+/// codex's `fail_pending` connection-loss path sets `code: None`, and any
+/// non-RPC failure (writer channel closed, request send error) is not a
+/// `JsonRpcError` at all — both mean the transport is gone.
+fn is_transport_death(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<JsonRpcError>() {
+        Some(e) => e.code.is_none(),
+        None => true,
     }
 }
 
