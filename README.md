@@ -64,8 +64,12 @@ Build your team by dropping `.md` files into `.claude/agents/` — or one-click-
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
 
-# 1. Install ccteam (prebuilt binary, no Rust toolchain → ~/.local/bin/ccteam):
-curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+# 1. Install ccteam — recommended: build from source with cargo (needs a Rust
+#    toolchain + Node.js for the web-console bundle → ~/.cargo/bin/ccteam):
+cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+
+#    Fallback — prebuilt binary, no toolchain needed (→ ~/.local/bin/ccteam):
+#    curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 
 # 2. Initialize a project, then one-time setup (MCP for Claude + Codex, IM token, prefs):
 cd ~/code/myproject && ccteam init
@@ -93,7 +97,7 @@ http://localhost:7331
 @ccteam status          # group control: status / cost / stop
 ```
 
-Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`. Build from source instead: `cargo install --git https://github.com/firstintent/ccteam ccteam-cli`.
+Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
 
 **Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
 
