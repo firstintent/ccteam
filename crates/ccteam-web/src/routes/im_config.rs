@@ -11,11 +11,15 @@
 //!   plaintext echo is impossible at the type level, not just by omission at
 //!   serialize time. The only secret-derived data returned is a last-4
 //!   fingerprint via [`mask_last4`].
-//! - **Credentials are NOT hot-applied.** The daemon loads creds once at
-//!   startup ([`ccteam_im::credentials::load`]); there is no reload/watch.
-//!   So every mutating response carries `restart_required: true` plus an
-//!   operator-facing `note`. The handlers only write the file (0600, via
-//!   [`ccteam_im::credentials::save`]).
+//! - **Credentials are hot-applied when a daemon is running.** After writing
+//!   the file (0600, via [`ccteam_im::credentials::save`]) each mutating
+//!   handler nudges the daemon's IM-reload task (via
+//!   [`ccteam_im::gateway::Gateway::request_im_reload`]) to rebuild the global
+//!   bot channels from the new creds — no restart needed. The response carries
+//!   `reloaded` (`true` = applied live) and `restart_required` (= `!reloaded`,
+//!   `true` only on the standalone web path with no daemon gateway, where the
+//!   new creds take effect on the next `ccteam start`). Mirrors the per-tenant
+//!   path in [`super::users`]`::apply_tenant_im`.
 //! - **Validate before persist.** A bad Telegram token / Lark app secret is
 //!   rejected (`400` + the [`OnboardingError`] `Display` reason) *before* it
 //!   lands on disk — reusing the CLI validators
@@ -69,11 +73,17 @@ const TRANSPORT_WARNING: &str =
     "ccteam serves plain HTTP (no TLS). On a LAN link these credentials are sent in cleartext; \
      prefer loopback or a trusted network.";
 
-/// Standard "creds changed, restart to apply" note attached to every
-/// mutating response (the daemon loads creds once at startup — no reload).
-const RESTART_NOTE: &str =
-    "Credentials are loaded once at daemon startup and are not hot-applied. Restart ccteam \
-     (`ccteam stop && ccteam start`) for the new IM credentials to take effect.";
+/// Operator-facing note for a mutating IM-config response, branched on whether
+/// the post-write hot-reload nudge landed (see [`nudge_im_reload`]).
+fn reload_note(reloaded: bool) -> &'static str {
+    if reloaded {
+        "Credentials saved and applied live — the IM bot is reloading now with the new \
+         credentials. No restart needed."
+    } else {
+        "Credentials saved. No running daemon to hot-apply them; restart ccteam \
+         (`ccteam stop && ccteam start`) for the new IM credentials to take effect."
+    }
+}
 
 /// Env override for the Telegram Bot API base. Production reads the
 /// `onboarding::TELEGRAM_API_BASE` constant; integration tests set this to a
@@ -228,6 +238,20 @@ fn save_creds(app: &AppState, creds: &Credentials) -> Result<(), String> {
     })
 }
 
+/// Best-effort hot-reload nudge after writing IM creds: ask the daemon to
+/// rebuild the global IM bot channels from `credentials.json` *now*, so a new
+/// bot token takes effect without a restart. Returns `false` on the standalone
+/// web path (no daemon gateway handle) — then the creds apply on the next
+/// `ccteam start`. Mirrors the per-tenant nudge in
+/// [`super::users`]`::apply_tenant_im`; the underlying signal is non-blocking
+/// and coalesces (see [`ccteam_im::gateway::Gateway::request_im_reload`]).
+async fn nudge_im_reload(app: &AppState) -> bool {
+    match app.gateway.as_ref() {
+        Some(gw) => gw.lock().await.request_im_reload(),
+        None => false,
+    }
+}
+
 fn json_400(msg: String) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -301,14 +325,14 @@ pub(crate) async fn handle_get_im_config(
 /// persist it, preserving any existing `allowed_chat_ids`.
 ///
 /// A bad token is rejected `400` (the `OnboardingError` reason) *before* it
-/// touches disk. Success returns `{ok, restart_required, bot_username, note}`.
+/// touches disk. Success returns `{ok, reloaded, restart_required, bot_username, note}`.
 #[utoipa::path(
     put,
     path = "/api/v1/config/im/telegram",
     tag = "config",
     request_body(content = TelegramConfigForm, description = "Telegram bot token (JSON or x-www-form-urlencoded)"),
     responses(
-        (status = 200, description = "Validated + persisted; `{ok, restart_required, bot_username, note}`", body = serde_json::Value),
+        (status = 200, description = "Validated + persisted; `{ok, reloaded, restart_required, bot_username, note}`", body = serde_json::Value),
         (status = 400, description = "Empty token / token rejected by Telegram getMe"),
         (status = 500, description = "Credentials file read/write failed"),
     ),
@@ -350,11 +374,15 @@ pub(crate) async fn handle_put_telegram(
         return json_500(e);
     }
 
+    // Hot-apply the new token now: nudge the daemon to rebuild the global IM
+    // channels from the creds just written (mirrors `users::apply_tenant_im`).
+    let reloaded = nudge_im_reload(&app).await;
     Json(serde_json::json!({
         "ok": true,
-        "restart_required": true,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
         "bot_username": bot_username,
-        "note": RESTART_NOTE,
+        "note": reload_note(reloaded),
     }))
     .into_response()
 }
@@ -500,11 +528,14 @@ pub(crate) async fn handle_telegram_chat_id_poll(
                     .into_response();
                 }
             }
+            // Hot-apply: the allowlist just changed, so rebuild channels now.
+            let reloaded = nudge_im_reload(&app).await;
             Json(serde_json::json!({
                 "status": "captured",
                 "chat_id_last4": mask_last4(&chat_id_str),
-                "restart_required": true,
-                "note": RESTART_NOTE,
+                "reloaded": reloaded,
+                "restart_required": !reloaded,
+                "note": reload_note(reloaded),
             }))
             .into_response()
         }
@@ -524,7 +555,7 @@ pub(crate) async fn handle_telegram_chat_id_poll(
     tag = "config",
     request_body(content = LarkConfigForm, description = "Lark/Feishu app credentials (JSON or x-www-form-urlencoded)"),
     responses(
-        (status = 200, description = "Validated + persisted; `{ok, restart_required, note}`", body = serde_json::Value),
+        (status = 200, description = "Validated + persisted; `{ok, reloaded, restart_required, note}`", body = serde_json::Value),
         (status = 400, description = "Missing field / credentials rejected by Lark"),
         (status = 500, description = "Credentials file read/write failed"),
     ),
@@ -573,10 +604,13 @@ pub(crate) async fn handle_put_lark(
         return json_500(e);
     }
 
+    // Hot-apply the new Lark creds now (mirrors `users::apply_tenant_im`).
+    let reloaded = nudge_im_reload(&app).await;
     Json(serde_json::json!({
         "ok": true,
-        "restart_required": true,
-        "note": RESTART_NOTE,
+        "reloaded": reloaded,
+        "restart_required": !reloaded,
+        "note": reload_note(reloaded),
     }))
     .into_response()
 }

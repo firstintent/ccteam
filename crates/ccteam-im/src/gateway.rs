@@ -6281,6 +6281,35 @@ mod tests {
         assert_eq!(sid, "s1");
     }
 
+    /// v0.8.20 — `request_im_reload` is the web/CLI → daemon nudge that makes a
+    /// newly-saved IM bot token apply WITHOUT a restart: it signals the daemon's
+    /// reload task to rebuild the credential-driven channels. Locks the two-state
+    /// contract the `config/im/*` handlers depend on — a safe no-op `false` on
+    /// the standalone path (no trigger wired), and a delivered signal + `true`
+    /// once the daemon wires its trigger. Regression guard for the bug where a
+    /// web-saved token silently required `ccteam stop && start`.
+    #[tokio::test]
+    async fn request_im_reload_signals_only_when_trigger_wired() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", "/tmp/alpha");
+        // Standalone (no daemon): a reload request is a safe no-op, never panics.
+        assert!(
+            !gw.request_im_reload(),
+            "no trigger wired ⇒ false (standalone/test path)"
+        );
+        // Daemon path: wiring the trigger makes a request deliver a real signal.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        gw.set_im_reload_trigger(tx);
+        assert!(
+            gw.request_im_reload(),
+            "trigger wired ⇒ true (signal accepted)"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the daemon's reload task actually received the nudge"
+        );
+    }
+
     /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
     /// persist → reload → the restored session reports hitl. Uses a state file
     /// so the SavedGatewaySession serde round-trip is exercised.
