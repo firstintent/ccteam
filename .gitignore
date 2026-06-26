@@ -32,6 +32,10 @@ readme.local.txt
 notes/
 graphify-out/
 
+# Version archives + research notes — kept local-only, not tracked (slim the repo)
+docs/versions/
+docs/research/
+
 # Local-only env file — never commit secrets.
 .env
 
