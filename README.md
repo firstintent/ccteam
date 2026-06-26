@@ -75,8 +75,8 @@ cargo install --git https://github.com/firstintent/ccteam ccteam-cli
 cd ~/code/myproject && ccteam init
 ccteam config
 
-# 3. Start the daemon — IM gateway + web console + resource API + MCP, one process:
-ccteam start                              # foreground; detached: nohup ccteam start >~/ccteam.log 2>&1 &
+# 3. Start the daemon in the background — IM gateway + web console + resource API + MCP, one process:
+nohup ccteam start >~/ccteam.log 2>&1 &   # foreground instead: just `ccteam start`
 ```
 
 Then drive it from **either** surface — the web console or IM:
