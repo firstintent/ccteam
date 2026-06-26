@@ -672,8 +672,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/sessions",
-        arg_hint: None,
-        help: "list sessions + status",
+        arg_hint: Some("[all]"),
+        help: "list this project's sessions (`all` = every project)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -691,7 +691,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/newproject",
         arg_hint: Some("<slug> <path>"),
-        help: "scaffold + register a project",
+        help: "scaffold + register a project, then switch into it",
         in_menu: false,
     },
     GatewayCommandSpec {
@@ -1514,12 +1514,29 @@ impl Gateway {
                 // (`user:<tenant>` for a tenant bot), so the tenant's web console
                 // sees the IM-bot-created project too (web ACL is project-owned).
                 let owner_id = canonical_owner(chat).identity();
-                self.create_project(slug, path, Some(&owner_id)).map(Some)
+                // Creating a project in a chat means "I want to work here now":
+                // `create_project` switches the chat into the new project (like a
+                // `/cd`), so the next message spawns a session there instead of
+                // landing back in the previous project.
+                self.create_project(chat, slug, path, Some(&owner_id))
+                    .map(Some)
             }
-            "/sessions" => Ok(Some(self.render_sessions(chat).await)),
+            "/sessions" => {
+                // Default = the current project only (so switching between
+                // projects never shows a confusing cross-project pile). `all`
+                // (or `*`) opts into the full fleet across every project.
+                let all = parts
+                    .next()
+                    .is_some_and(|a| a.eq_ignore_ascii_case("all") || a == "*");
+                Ok(Some(self.render_sessions(chat, all).await))
+            }
             "/status" => Ok(Some(self.render_status(chat).await)),
             "/projects" => Ok(Some(self.render_projects())),
-            "/help" => Ok(Some(render_help())),
+            "/help" => Ok(Some(format!(
+                "📁 当前项目: {}\n\n{}",
+                self.current_project_for(chat),
+                render_help()
+            ))),
             _ => Ok(None),
         }
     }
@@ -1532,6 +1549,7 @@ impl Gateway {
     /// alone). Requires [`Gateway::enable_project_creation`].
     fn create_project(
         &mut self,
+        chat: &ChatKey,
         slug: &str,
         raw_path: &str,
         owner: Option<&str>,
@@ -1577,10 +1595,20 @@ impl Gateway {
         )
         .with_context(|| format!("register project {slug} in config.yaml"))?;
         self.register_project(slug.clone(), abs.clone());
+        // Switch the creating chat INTO the new project (mirror `/cd`): point its
+        // `current_project` at the fresh slug and clear the active session — a
+        // brand-new project owns none, so `adopt_session_in_project` returns
+        // `None` and removes the stale pointer, making the next message spawn a
+        // `cto` session HERE rather than in the chat's previous project.
+        self.current_project.insert(chat.clone(), slug.clone());
+        self.adopt_session_in_project(chat, &slug);
         if let Err(err) = self.persist_state() {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
         }
-        Ok(format!("created project {slug} at {}", abs.display()))
+        Ok(format!(
+            "✅ 已创建并切换到 {slug}\n   📁 {}\n   发条消息即在此开 cto 会话(或 /new)",
+            abs.display()
+        ))
     }
 
     async fn ensure_current_session(&mut self, chat: &ChatKey) -> Result<()> {
@@ -2980,16 +3008,45 @@ impl Gateway {
             .collect()
     }
 
-    async fn render_sessions(&self, chat: &ChatKey) -> String {
+    async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
         // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
-        let visible: Vec<&GatewaySession> = self
+        let accessible: Vec<&GatewaySession> = self
             .sessions
             .values()
             .filter(|s| Self::chat_can_access(chat, s))
             .collect();
+        // Web has its own GUI chrome (project picker, session list, Status page)
+        // AND the chat bridge parses this reply into a structured frame, so the
+        // web reply MUST stay the bare `id:project:vendor:role` rows (no banner /
+        // scoping / footer — those would break `parse_sessions_reply`). The IM
+        // text surface, which has no chrome, instead gets a current-project
+        // banner + project scoping + an `/sessions all` footer.
+        let is_web = chat.channel == "web";
+        // Default scope = the chat's CURRENT project; `all` (and web) lists the
+        // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
+        // the IM footer can point at `/sessions all`.
+        let cur = self.current_project_for(chat);
+        let (visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
+            (accessible, 0)
+        } else {
+            let elsewhere = accessible.iter().filter(|s| s.project != cur).count();
+            let scoped = accessible
+                .into_iter()
+                .filter(|s| s.project == cur)
+                .collect();
+            (scoped, elsewhere)
+        };
         if visible.is_empty() {
-            return "no sessions".to_string();
+            if is_web {
+                return "no sessions".to_string();
+            }
+            if elsewhere > 0 {
+                return format!(
+                    "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
+                );
+            }
+            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
         }
         let mut rows: Vec<String> = Vec::with_capacity(visible.len());
         for s in visible {
@@ -3008,7 +3065,16 @@ impl Gateway {
                 None => rows.push(base),
             }
         }
-        rows.join("\n")
+        if is_web {
+            return rows.join("\n");
+        }
+        let mut out = format!("📁 当前项目: {cur}\n{}", rows.join("\n"));
+        if elsewhere > 0 {
+            out.push_str(&format!(
+                "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
+            ));
+        }
+        out
     }
 
     /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
@@ -3052,10 +3118,18 @@ impl Gateway {
             .as_ref()
             .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid))
         else {
-            return format!(
-                "无当前会话 —— 用 /use <id> 选一个驱动(你有 {} 个会话;/sessions 看全部)",
-                visible.len()
-            );
+            // No focused session — keep the user oriented by leading with the
+            // current project, then point at the right next step: a fresh project
+            // wants a first message; a project with sessions wants `/use`.
+            let cur = self.current_project_for(chat);
+            let in_proj = visible.iter().filter(|s| s.project == cur).count();
+            return if in_proj > 0 {
+                format!(
+                    "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
+                )
+            } else {
+                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开 cto(或 /new)")
+            };
         };
 
         // Pull live facts FROM the harness — never folded by ccteam: the
@@ -3195,10 +3269,21 @@ impl Gateway {
             }
         }
 
-        // Footer: the rest of the fleet lives in /sessions.
-        let other = visible.len().saturating_sub(1);
-        if other > 0 {
-            out.push_str(&format!("\n   ↓ 其他 {other} 个会话 → /sessions"));
+        // Footer: the rest of the fleet lives in /sessions. Split by project so
+        // the counts line up with the project-scoped `/sessions` (same project)
+        // vs the full-fleet `/sessions all` (other projects).
+        let same = visible
+            .iter()
+            .filter(|o| o.project == s.project && o.id != s.id)
+            .count();
+        let other_proj = visible.iter().filter(|o| o.project != s.project).count();
+        if same > 0 {
+            out.push_str(&format!("\n   ↓ 本项目其他 {same} 个会话 → /sessions"));
+        }
+        if other_proj > 0 {
+            out.push_str(&format!(
+                "\n   ↓ 其他项目 {other_proj} 个会话 → /sessions all"
+            ));
         }
         out
     }
@@ -6437,7 +6522,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
 
         // Now report a model + usage → suffix appears, rendered the same
         // way Codex /status renders (shared helper).
@@ -6457,7 +6542,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -6477,7 +6562,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
     }
 
@@ -6814,7 +6899,7 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["no sessions"]);
+        assert_eq!(seen, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
 
         // …and cannot ADDRESS it: /use is refused for a non-owner and reads as
         // unknown (no existence leak).
@@ -6829,7 +6914,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(owner_sees, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(
+            owner_sees,
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
+        );
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -6858,7 +6946,7 @@ mod tests {
             .handle_text("telegram", "339498819", "rob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -6912,7 +7000,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             other,
-            vec!["no sessions"],
+            vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"],
             "ubbb's bot is isolated from uaaa"
         );
     }
@@ -7006,7 +7094,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["s1:beta:Codex:api\ns2:beta:Claude:reviewer"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 当前项目: beta\ns1:beta:Codex:api\ns2:beta:Claude:reviewer"]
+        );
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -7060,14 +7151,16 @@ mod tests {
             .await
             .unwrap();
 
+        // `all` lists the full cross-project fleet (default `/sessions` would now
+        // scope to the current project, `beta`).
         let sessions = gateway
-            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
         assert_eq!(
             sessions,
             vec![
-                "s1:alpha:Claude:reviewer\ns2:alpha:Codex:docs\ns3:beta:Codex:api\ns4:beta:Claude:qa"
+                "📁 当前项目: beta\ns1:alpha:Claude:reviewer\ns2:alpha:Codex:docs\ns3:beta:Codex:api\ns4:beta:Claude:qa"
             ]
         );
         let projects = gateway
@@ -7445,7 +7538,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["s1:beta:Claude:reviewer\ns2:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns1:beta:Claude:reviewer\ns2:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -7821,7 +7914,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -7840,11 +7933,15 @@ mod tests {
             .unwrap();
         assert_eq!(reply, vec!["beta-cto-s2 echo: where am i"]);
 
+        // `all` shows both projects (default `/sessions` now scopes to `beta`).
         let after = gateway
-            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        assert_eq!(after, vec!["s1:alpha:Claude:reviewer\ns2:beta:Claude:cto"]);
+        assert_eq!(
+            after,
+            vec!["📁 当前项目: beta\ns1:alpha:Claude:reviewer\ns2:beta:Claude:cto"]
+        );
     }
 
     #[tokio::test]
@@ -8042,7 +8139,7 @@ mod tests {
             .handle_text("telegram", "tg-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(other, vec!["no sessions"]);
+        assert_eq!(other, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
 
         // The OWNER (tg-1) still sees AND addresses its own session — isolation
         // doesn't break the owner's own flow.
@@ -8103,7 +8200,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listing[0].lines().count(),
+            listing[0].lines().filter(|l| l.starts_with('s')).count(),
             3,
             "expected 3 distinct sessions (no dedup): {}",
             listing[0]
@@ -8167,7 +8264,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["s1:alpha:Claude:reviewer"]);
+        assert_eq!(
+            listing,
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
+        );
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -8236,7 +8336,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["s1:alpha:Claude:cto"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")

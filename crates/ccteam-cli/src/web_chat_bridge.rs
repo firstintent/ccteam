@@ -757,7 +757,7 @@ mod tests {
             &format!("/newproject demo {}", proj_dir.display()),
         )
         .await;
-        recv_reply_contains(&mut socket, "created project demo").await;
+        recv_reply_contains(&mut socket, "已创建并切换到 demo").await;
 
         assert!(proj_dir.join(".ccteam").join("state.json").exists());
         let config = std::fs::read_to_string(ccteam_home.join("config.yaml")).unwrap();

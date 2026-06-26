@@ -184,7 +184,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 /screen [id]               截图一个会话的当前屏幕(省略 id = 当前)
 
 # 查看 / 接入
-/sessions                  列当前 chat 的会话(带 vendor · role · model · 上下文用量)
+/sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目
 /status                    全队健康:每个会话 idle / working / stuck + model · ctx
 /help                      列出网关命令
 ```
