@@ -99,17 +99,11 @@ http://localhost:7331
 
 Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
 
+For every CLI command, slash command, and IM control, see the [complete user manual](docs/usage.md).
+
 **Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
 
 **Platforms.** Linux x86_64 / aarch64 and macOS arm64 / x86_64 (prebuilt). Linux binaries are musl-static (run on any glibc — NAS and older distros included). Windows is supported via WSL2 with the linux-x64 binary; tmux, inotify, and POSIX signals are foundational, so native Windows isn't supported. macOS Gatekeeper on first run: `xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
-
-## Docs
-
-| What you want | Read this |
-|---|---|
-| Command guide — every CLI command, slash command, and IM control | [docs/usage.md](docs/usage.md) |
-| Architecture — components, data protocols, design rationale | [docs/dev/tech-design.md](docs/dev/tech-design.md) |
-| Requirements — the problems ccteam solves, and for whom | [docs/dev/requirements.md](docs/dev/requirements.md) |
 
 ## License
 
