@@ -263,7 +263,16 @@ export default function ChatConsole() {
     } finally {
       setDeleting(false);
     }
-  }, [deleteTarget, deleting, activeView, navigate, refreshSessions, lang]);
+  }, [
+    deleteTarget,
+    deleting,
+    activeView,
+    navigate,
+    refreshSessions,
+    lang,
+    setDeleteTarget,
+    setDeleting,
+  ]);
 
   // ---- create a new session (optionally a brand-new project first) -------
   // `newProjectPath` present ⇒ B2: POST /projects to scaffold+register `slug`

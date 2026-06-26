@@ -425,10 +425,10 @@ export default function SessionView({
                 return (
                   <div
                     key={row.id}
-                    className="flex items-start gap-2 -my-1.5 pl-2 border-l border-surface-700/40 text-[11px] font-mono text-text-muted"
+                    className="flex items-start gap-2 max-w-[760px] py-0.5 pl-2 border-l border-surface-700/40 text-[11px] font-mono text-text-muted"
                   >
                     <Icon className="h-3 w-3 mt-0.5 shrink-0 text-text-dim" />
-                    <span className={`min-w-0 break-words ${thinking ? "italic" : ""}`}>
+                    <span className={`min-w-0 break-words line-clamp-2 ${thinking ? "italic" : ""}`}>
                       {row.content}
                     </span>
                   </div>
