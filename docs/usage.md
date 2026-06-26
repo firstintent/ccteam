@@ -61,8 +61,6 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 **点这个链接就进控制台了** —— 下面所有操作都在里面。
 
-> 模型支持:**Claude + Claude 家族模型(`claude-*` / `sonnet` / `opus` / `haiku`)= 一等支持**;Codex + Codex/OpenAI 模型 = best-effort;Claude + 非 Claude 模型 = 未验证(不阻断,会提示,空转就换回 `sonnet`/`opus`/`haiku`)。
-
 ---
 
 ## 一、Web 控制台(推荐)
