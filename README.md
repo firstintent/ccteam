@@ -108,8 +108,8 @@ Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|n
 | What you want | Read this |
 |---|---|
 | Command guide — every CLI command, slash command, and IM control | [docs/usage.md](docs/usage.md) |
-| Architecture — components, data protocols, design rationale | [docs/tech-design.md](docs/tech-design.md) |
-| Requirements — the problems ccteam solves, and for whom | [docs/requirements.md](docs/requirements.md) |
+| Architecture — components, data protocols, design rationale | [docs/dev/tech-design.md](docs/dev/tech-design.md) |
+| Requirements — the problems ccteam solves, and for whom | [docs/dev/requirements.md](docs/dev/requirements.md) |
 
 ## License
 

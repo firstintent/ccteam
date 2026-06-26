@@ -8,7 +8,7 @@
 
 ## 0. 架构红线
 
-**权威红线清单 = [CLAUDE.md §三](../CLAUDE.md)**(always-loaded 的开发宪法:红线表 + vendor / README / skill 红线;任何 PR 不得违反)。本文档**不重复**该清单 —— 只在下面各组件章节就地给红线的**架构论证**(为什么这么定),并用下表的 R-code 简写引用 §三 的条目。
+**权威红线清单 = [CLAUDE.md §三](../../CLAUDE.md)**(always-loaded 的开发宪法:红线表 + vendor / README / skill 红线;任何 PR 不得违反)。本文档**不重复**该清单 —— 只在下面各组件章节就地给红线的**架构论证**(为什么这么定),并用下表的 R-code 简写引用 §三 的条目。
 
 **R-code 速查**(简写 ↔ CLAUDE.md §三):
 

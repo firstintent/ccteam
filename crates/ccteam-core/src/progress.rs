@@ -1,7 +1,7 @@
 //! progress.jsonl reader / writer + idle detection + workflow event aggregations.
 //!
 //! progress.jsonl is the orchestrator's only state-truth source
-//! (`docs/tech-design.md` §5.5). This module gives both the hook
+//! (`docs/dev/tech-design.md` §5.5). This module gives both the hook
 //! handlers and the orchestrator a single set of primitives so the
 //! file format and idle semantics stay in sync.
 //!

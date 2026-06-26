@@ -25,7 +25,7 @@
 //!
 //! Architecture refs: `docs/versions/v0-3/prd.md` §4 (M5.1 dashboard data
 //! source), `docs/dev-coupling-audit.md` F45 (extends the M5.0
-//! write-helper promotion to the read side), `docs/tech-design.md`
+//! write-helper promotion to the read side), `docs/dev/tech-design.md`
 //! §5.5 progress.jsonl SoT.
 
 use std::collections::{BTreeMap, HashMap};

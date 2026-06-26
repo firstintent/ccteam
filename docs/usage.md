@@ -1,33 +1,6 @@
 # ccteam 使用指南
 
-一份命令为主的端到端用户指南:install → init → config → start → 接入 IM → 日常用 → 运维。
-直接照着代码块敲。所有命令都对照当前 CLI 校验过。
-
-核心模型:**一个 chat 就是一台终端**。四个对象——
-
-- **chat**:Telegram / 飞书(Lark)私聊/群聊或 web 控制台会话。每个 chat 有自己的当前 project、当前 session、session 列表,互相隔离。
-- **project**:本地一个已 `ccteam init` 的目录,用 slug 标识。
-- **session**:一个**独立**的 agent 会话(spawn-on-demand、按 id resume、空闲释放),像 Claude Code 原生 session 一样自带上下文,属于某个 chat + 某个 project。一个项目可同时开多个会话,**互不串台**——哪怕同一个 role 开两个,也各聊各的。每个会话有持久句柄 `s<N>`(单调递增、扛 daemon 重启、不复用)。
-- **role**:session 启动时绑定的角色(`.claude/agents/<role>.md` 定义 persona + 工具)。session 以 `claude --agent <role>` 启动,**就 become 该 role**;role 可留空 = 裸 `claude`(不带 `--agent`,brain 走项目 `CLAUDE.md`)。默认 role 是 `cto`(chat-first 管家)。换 role = IM 里 `/role <role>`(底层 = 带新 `--agent` 原地重启该会话,**句柄 `s<N>` 不变**)。
-
-两类命令别混:
-
-- **shell 里的 `ccteam <子命令>`**(安装 + 运维):扁平 `init / start / stop / status / config / doctor` + 分组 `project <ls|show|new|stop|rm>` + 分组 `session <ls|attach|pause|resume|register|unregister|persona|add-tool|bots|role>`。
-- **IM / web chat 里的网关命令**(日常对话):`/pair /new /use /role /cd /sessions /projects /newproject /help`、路由前缀 `@<handle>`、管理前缀 `@ccteam`。
-
-> **命令菜单**:daemon 启动时会把**网关自有命令**注册进你的 IM 客户端(Telegram 走 `setMyCommands`)—— 在聊天框敲 `/` 就能看到候选(其余透传给 agent 的 slash 不进菜单,因为它跟当前 vendor 相关、列进去会误导)。随时发 `/help` 看网关命令清单 + 「其余 `/` 命令透传给当前 agent」的说明。
-
-整体上手六步(终端一次性 + IM 日常):
-
-```text
-install → init → config → start → /pair(+approve) → /cd(自动 spawn cto)
-
-curl install.sh | sh  →  ccteam init  →  ccteam config  →  ccteam start
-                                                              ↓
-IM: /pair <code>  →  /cd <项目>  →  直接发任务 / /role <role> / /new · /use · @handle
-```
-
----
+**ccteam —— 自托管、7×24 常驻的后台智能体团队:从 Telegram、飞书或网页端远程驱动你的 Claude Code / Codex。** 本文是一份命令为主、对照当前 CLI 校验过的端到端指南(install → init → config → start → 接入 IM → 日常用 → 运维),核心模型「一个 chat = 一台终端」,围绕 chat / project / session / role 四个对象,命令分 shell 侧 `ccteam <子命令>`(安装 + 运维)与 IM/web 网关命令(日常对话)两类。
 
 ## 1. 安装
 
