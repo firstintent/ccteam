@@ -260,9 +260,8 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     out.push_str("  2. init: this project is now initialized\n");
     out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
     out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
-    out.push_str("  5. pair: send `/pair <code>` in IM, if your channel needs pairing\n");
     out.push_str(
-        "  6. cd: send `/cd <project>`; the first message starts the default cto session\n",
+        "  5. cd: send `/cd <project>`; the first message starts the default cto session\n",
     );
     out.push_str("  role tip: roleless uses project CLAUDE.md, cto is the default guide, work roles live in .claude/agents/<role>.md\n");
     out.push_str("  guide: docs/usage.md\n");

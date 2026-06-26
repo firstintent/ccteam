@@ -639,7 +639,6 @@ mod tests {
             "New user asking",
             "ccteam config",
             "ccteam start",
-            "/pair <code>",
             "/cd <project>",
             "roleless = bare Claude",
             "`cto` = the default steward",

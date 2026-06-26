@@ -62,7 +62,6 @@ ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。�
 
 | 命令 | 作用 |
 |---|---|
-| `/pair <code>` | 将当前 chat 建立为可用入口,并确保默认 session 存在 |
 | `/cd <project>` | 当前 chat 切到项目(只切当前 chat) |
 | `/newproject <slug> <path>` | 现场注册并建一个新项目 |
 | `/new [vendor] [role]` | 在当前项目创建新 session(默认 vendor=claude、role=cto;**总铸新 sid**,同 role 也不复用)|

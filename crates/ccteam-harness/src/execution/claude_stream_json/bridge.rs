@@ -12,7 +12,7 @@
 //! - else unknown → Passthrough as text (the bridge never leaks an
 //!   "Unknown skill" reply to the IM user).
 //!
-//! ccteam's own IM commands (`/pair /cd /use /new /role @handle`) never
+//! ccteam's own IM commands (`/cd /use /new /role @handle`) never
 //! reach the adapter — the gateway intercepts them before `handle_directive`.
 
 use async_trait::async_trait;

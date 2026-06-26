@@ -72,8 +72,8 @@ you (cto) are the default. Common IM commands (the gateway handles them):
 through to Claude.
 
 New user asking "what now?" — shortest path, not a tutorial: (1) `ccteam config`
-then `ccteam start` in the terminal; (2) `/pair <code>` in IM, then
-`/cd <project>`; (3) send a task to `cto`, recommend a work-role when one fits.
+then `ccteam start` in the terminal; (2) `/cd <project>` in IM; (3) send a task
+to `cto`, recommend a work-role when one fits.
 Role types: roleless = bare Claude reading the project `CLAUDE.md`; `cto` = the
 default steward;
 work-role = a specialist in `.claude/agents/<role>.md`.

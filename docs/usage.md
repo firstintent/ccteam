@@ -162,14 +162,6 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 > **手写凭证文件后必须重启 daemon 才生效**(Web Settings 配的同理)。飞书/Lark 与 Telegram 对等:文本、富文本、图片/文件收发都支持。
 
-### 配对
-
-每个新 chat 先配对一次(令牌随意):
-
-```text
-/pair phone
-```
-
 ### 网关命令
 
 聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。
@@ -194,7 +186,6 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 # 查看 / 接入
 /sessions                  列当前 chat 的会话(带 vendor · role · model · 上下文用量)
 /status                    全队健康:每个会话 idle / working / stuck + model · ctx
-/pair <code>               配对当前 chat
 /help                      列出网关命令
 ```
 

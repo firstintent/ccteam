@@ -695,12 +695,6 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: false,
     },
     GatewayCommandSpec {
-        name: "/pair",
-        arg_hint: Some("<code>"),
-        help: "pair this chat",
-        in_menu: false,
-    },
-    GatewayCommandSpec {
         name: "/help",
         arg_hint: None,
         help: "show gateway commands",
@@ -1235,14 +1229,6 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
-            "/pair" => {
-                let code = parts
-                    .next()
-                    .ok_or_else(|| anyhow!("/pair requires a code"))?;
-                self.ensure_current_session(chat).await?;
-                self.persist_state()?;
-                Ok(Some(format!("paired {code}")))
-            }
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
@@ -6956,25 +6942,6 @@ mod tests {
         std::env::remove_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS");
 
         assert_eq!(replies, vec!["alpha-reviewer-s1 echo: hi after delay"]);
-    }
-
-    #[tokio::test]
-    async fn gateway_pair_starts_default_session() {
-        let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-
-        let paired = gateway
-            .handle_text("mock", "chat-1", "alice", "/pair 4821-77")
-            .await
-            .unwrap();
-        assert_eq!(paired, vec!["paired 4821-77"]);
-
-        let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "after pair")
-            .await
-            .unwrap();
-        assert_eq!(reply, vec!["alpha-cto-s1 echo: after pair"]);
-        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

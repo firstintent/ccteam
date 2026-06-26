@@ -90,7 +90,6 @@ http://localhost:7331
 
 ```text
 # IM (Telegram):
-/pair <code>            # link your chat (code from `ccteam config`)
 /cd myproject           # switch project → a `cto` session spins up; start chatting
 /role backend-dev       # switch to a work-role
 /new   /use   @handle   # open / switch / address sessions
