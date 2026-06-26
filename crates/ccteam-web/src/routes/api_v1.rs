@@ -276,13 +276,27 @@ pub(crate) fn can_see_project(
 ) -> bool {
     match ProjectState::load(&app.paths.project_state(slug)) {
         Ok(state) => identity.can_see_owner(state.owner.as_deref()),
-        // Orphaned/unreadable registration (state.json gone) — the owner is
-        // unknowable, so only the admin may act on it (to deregister/clean it
-        // up via DELETE). Tenants fail closed. Without this the ACL layer 403s
-        // EVERYONE on an orphan, so a broken registration could never be removed
-        // from the web. The DELETE handler is config-only (no files), matching.
-        Err(_) => identity.is_admin,
+        // state.json is gone. Under multi-tenant auth, allow the admin ONLY for
+        // a genuine ORPHAN (still registered in config.yaml, state.json gone) so
+        // it can be deregistered via DELETE; deny a never-registered "ghost" for
+        // everyone so the ACL layer 404s instead of letting session APIs reach
+        // the gateway on a non-existent project (a ghost would otherwise 200-`[]`
+        // on GET, 500 on POST). In open / single-user mode (auth disabled) the
+        // ACL is permissive — the handler / gateway decides (it may create the
+        // project on demand) — so don't 404 a not-yet-registered slug there.
+        // Tenants always fail closed. The DELETE handler is config-only.
+        Err(_) => identity.is_admin && (!app.auth.enabled || slug_is_registered(app, slug)),
     }
+}
+
+/// Whether `slug` is registered in `config.yaml`, independent of whether its
+/// `.ccteam/state.json` still loads. Tells an orphaned registration (present in
+/// config, state.json gone) apart from a never-registered "ghost" slug in
+/// [`can_see_project`].
+fn slug_is_registered(app: &AppState, slug: &str) -> bool {
+    ccteam_core::config::load(&app.paths.root)
+        .map(|cfg| cfg.projects.iter().any(|p| p.slug == slug))
+        .unwrap_or(false)
 }
 
 /// `GET /api/v1/projects/{slug}` → project detail summary.

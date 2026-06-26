@@ -214,6 +214,63 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     assert_eq!(r.status(), 200, "admin sees its own project detail");
 }
 
+/// Regression: `can_see_project` must NOT wave the admin past the ACL for a
+/// slug that was NEVER registered (a "ghost"). The orphan-deregister feature
+/// loosened the admin branch to allow ANY state.json load failure, so
+/// `/projects/<ghost>/sessions` reached the gateway (200-`[]` on GET, 500 on
+/// POST) instead of 404. Now the admin is allowed only for a genuine ORPHAN
+/// (registered in config.yaml, state.json gone) so it can still be deregistered.
+#[tokio::test]
+async fn admin_404s_on_ghost_slug_but_reaches_registered_orphan() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    // An ORPHAN: registered in config.yaml, but with NO .ccteam/state.json.
+    ccteam_core::config::upsert_project(
+        &paths.root,
+        ccteam_core::config::ProjectEntry {
+            slug: "orphanp".into(),
+            path: tmp.path().join("orphanp"),
+            team: "dev".into(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+    let admin = format!("Bearer ccteam:{ADMIN_HEX}");
+
+    // Ghost (never registered) → 404 for the admin, NOT a gateway hit.
+    let r = c
+        .get(format!("http://{addr}/api/v1/projects/ghostxyz/sessions"))
+        .header("Authorization", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        404,
+        "admin must 404 on a never-registered ghost slug, not reach the gateway"
+    );
+
+    // Orphan (registered, state.json gone) → admin still gets past the ACL so a
+    // broken registration remains cleanable (not 404).
+    let r = c
+        .get(format!("http://{addr}/api/v1/projects/orphanp/sessions"))
+        .header("Authorization", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        r.status(),
+        404,
+        "admin must still reach a registered orphan to deregister it"
+    );
+}
+
 /// v0.8.20 ownership-leak fix: the session cookie (the CURRENT login) must win
 /// over a STALE `Authorization: Bearer` the SPA fetch shim still injects from a
 /// prior admin login. Before the fix, `auth_layer` checked the header FIRST, so

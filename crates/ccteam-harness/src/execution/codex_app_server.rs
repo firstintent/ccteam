@@ -437,8 +437,7 @@ impl CodexAppServerAdapter {
         // on-disk rollout AND subscribes this connection, so codex keeps it
         // resident for the connection's life). Holding `loaded` across the RPC
         // makes the resume exactly-once per (thread, connection).
-        conn.client
-            .call("thread/resume", json!({ "threadId": tid }))
+        self.call_or_drop_dead(&conn.client, "thread/resume", json!({ "threadId": tid }))
             .await
             .map_err(|e| {
                 HarnessError::SubmitFailed(format!("thread/resume (ensure-loaded): {e:#}"))
@@ -458,6 +457,31 @@ impl CodexAppServerAdapter {
     async fn mark_loaded(&self, tid: &str) {
         if let Ok(conn) = self.conn().await {
             conn.loaded.lock().await.insert(tid.to_string());
+        }
+    }
+
+    /// Issue an RPC on `client`; if it fails with a *transport death* (the
+    /// connection / child is gone — see [`is_transport_death`]) drop the cached
+    /// connection so the NEXT call re-dials a fresh app-server. A logical error
+    /// from a LIVE peer leaves the shared connection — and every other session's
+    /// loaded thread — untouched. Returns the raw result for the caller to map
+    /// into its own [`HarnessError`] variant. This is the single home of the
+    /// "forget the shared connection iff the transport died" policy, so every
+    /// RPC path (turn/start, thread/resume, thread/start) recovers identically.
+    async fn call_or_drop_dead(
+        &self,
+        client: &Arc<CodexJsonRpcClient>,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        match client.call(method, params).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if is_transport_death(&e) {
+                    self.forget_client().await;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1442,8 +1466,8 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 spec.role, ctx.slug, ctx.sid
             ),
         });
-        let result = client
-            .call("thread/start", params)
+        let result = self
+            .call_or_drop_dead(&client, "thread/start", params)
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("thread/start: {e:#}")))?;
         let thread_id = pluck_thread_id(&result).ok_or_else(|| {
@@ -1590,21 +1614,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // turn fails. The error is still surfaced to the caller (the current
         // in-flight turn is not auto-retried — crash recovery semantics,
         // see arch §1.1).
-        let result = match client.call(method, params).await {
-            Ok(v) => v,
-            Err(e) => {
-                // Only drop the SHARED connection on a genuine transport death.
-                // A logical error from a live peer must NOT tear down the child
-                // — that would evict every other codex session's loaded thread.
-                // After a real transport death the next turn re-dials and
-                // `ensure_thread_loaded` re-resumes, so this stays self-healing
-                // without the mass eviction.
-                if is_transport_death(&e) {
-                    self.forget_client().await;
-                }
-                return Err(HarnessError::SubmitFailed(format!("{method}: {e:#}")));
-            }
-        };
+        // Drop the SHARED connection only on a genuine transport death (via
+        // `call_or_drop_dead`); a logical error from a live peer leaves it — and
+        // every other session's loaded thread — intact. The current turn is not
+        // auto-retried; the next turn re-dials + `ensure_thread_loaded` re-resumes.
+        let result = self
+            .call_or_drop_dead(&client, method, params)
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("{method}: {e:#}")))?;
         let turn_id = pluck_turn_id(&result).ok_or_else(|| {
             HarnessError::SubmitFailed(format!("{method} response missing turn.id: {result}"))
         })?;
@@ -1748,8 +1765,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         let client = self.client().await?;
-        let result = client
-            .call("thread/resume", json!({ "threadId": persistent_id }))
+        let result = self
+            .call_or_drop_dead(
+                &client,
+                "thread/resume",
+                json!({ "threadId": persistent_id }),
+            )
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("thread/resume: {e:#}")))?;
         let thread_id = pluck_thread_id(&result).unwrap_or_else(|| persistent_id.to_string());
@@ -3217,6 +3238,33 @@ mod tests {
         let p = CodexAppServerAdapter::resolve_socket_path().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/ccteam-test-codex.sock"));
         std::env::remove_var(APP_SERVER_SOCKET_ENV);
+    }
+
+    #[test]
+    fn is_transport_death_discriminates_logical_vs_transport() {
+        // A real error RESPONSE from a live peer always carries a numeric code
+        // (e.g. -32600 "thread not found") → NOT transport death → keep the
+        // shared connection (and every other session's loaded thread).
+        let logical = anyhow::Error::new(JsonRpcError {
+            code: Some(-32600),
+            message: "thread not found: t-1".into(),
+            data: None,
+        });
+        assert!(!is_transport_death(&logical));
+
+        // Connection loss surfaces via `fail_pending` as a code-less JsonRpcError
+        // → transport death → forget the client so the next call re-dials.
+        let closed = anyhow::Error::new(JsonRpcError {
+            code: None,
+            message: "jsonrpc peer closed".into(),
+            data: None,
+        });
+        assert!(is_transport_death(&closed));
+
+        // A non-RPC failure (writer channel gone / send error) isn't a
+        // JsonRpcError at all → also transport death.
+        let io = anyhow::anyhow!("send jsonrpc request turn/start: channel closed");
+        assert!(is_transport_death(&io));
     }
 
     #[test]
