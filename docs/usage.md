@@ -191,91 +191,54 @@ ccteam start > /tmp/ccteam.log 2>&1 &
 
 ## 6. 日常使用(IM 网关命令)
 
-配对当前 chat(`<code>` 任意,如 `phone`;回 `paired <code>`):
+配对后,日常操作都在聊天框里:**网关命令**(`/…`,网关自己处理)、**寻址前缀**(`@…`),或**直接发消息 / 图片 / 文件**给当前会话。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。
+
+全部网关命令:
 
 ```text
-/pair phone
+# 项目
+/cd <project>              切到某个项目(进项目后第一条消息自动起一个 cto 管家)
+/projects                  列出已知项目
+/newproject <slug> <path>  新建并注册一个项目,再切过去
+
+# 会话
+/new [vendor] [role] [hitl]  新建会话 → 回一个句柄 s<N>
+                             · vendor = claude(默认)| codex
+                             · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
+                             · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
+/use <id>                  切到会话 s<N>
+/role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)
+/interrupt [id]            打断正在跑的回合,保留会话(省略 id = 当前)
+/stop <id>                 销毁一个会话
+/screen [id]               截图一个会话的当前屏幕(省略 id = 当前)
+
+# 查看 / 接入
+/sessions                  列当前 chat 的会话(带 vendor · role · model · 上下文用量)
+/status                    全队健康:每个会话 idle / working / stuck + model · ctx
+/pair <code>               配对当前 chat(code 任意,如 phone)
+/help                      列出网关命令
 ```
 
-切项目、建 session:
+寻址前缀:
 
 ```text
-/cd demo-app                当前 chat 切到 demo-app
-/cd demo-api               切另一个项目
-/newproject demo /ws/demo  新建并 init 一个项目(team 前缀目录),再切过去
+@<role>          切到该角色的会话并设为当前(单独 @role 只切换,不发消息)
+@<role> <消息>    切到它并发一条
+@ccteam <verb>   管理:status · cost [today] · list · bots · pause / resume / stop <slug>[/role] · confirm
 ```
 
-`/cd` 进一个项目后,该 chat 第一次发消息会**自动 spawn 一个 `cto` session**(`claude --agent cto`)—— 直接跟 cto 对话即可。cto 是 chat-first 管家:懂 ccteam、会**推荐**合适的 work-role、帮你串流程。本版 cto 只**推荐**,你自己用 `/role` 换角色。
+其它消息:
 
-**换角色干活**(把当前 session 切成另一个 role):
+- **直接发消息**(不带前缀)→ 发给当前会话。
+- **非网关的 `/命令`**(`/compact`、`/clear`、`/model` …)→ 透传给当前 agent;弹窗型(如 `/model`)会弹**选项按钮**,点一下即应用。
+- **发图 / 发文件 + 一句说明** → agent 自动读取(报错截图、日志都行);agent 也能把文件 / 截图发回你的 chat。
+- **回合进行中** → 一条活的进度消息(形如 `⏳ working… · 🔧 bash ×3`),最终答案单独成条(会 ping);超长回答自动分片;agent 中途要你拿主意时会弹**选项按钮**,点一下喂回答案、它继续往下跑。
+
+让 cto 派活:默认 cto 管家能自己起 work-role 子会话、派任务、收结论 —— 不用你手动切来切去,直接用自然语言交代:
 
 ```text
-/role reviewer    当前 session 切到 reviewer 角色(底层 = 带新 --agent 重启,保持同一 session id)
-/role cto         切回管家
+@cto 起一个 backend-architect,评审 src/ 的接口设计,把结论汇总给我
 ```
-
-`/role` 原地换角色:同一个 session id(`/use <id>` 不失效),用新 `--agent <role>` 重启;同 role = no-op(不白扔上下文)。role 必须在项目 `.claude/agents/<role>.md` 有对应文件。
-
-> **work-role 从哪来**:自己写 `.claude/agents/<role>.md`,或从 **ccteam 插件市场**(ccteam-hub,含 agency-agents 等开源 Claude 原生 .md 角色库,MIT)用 `ccteam role search/add` 一键装(见 §7「装 role」)或 web 控制台「插件市场」页装(见 §8);也可手动丢 .md。装完 `/role <role>` 即用。
-
-**多 session + 切换 + 查看**:
-
-```text
-/new                        铸一个新会话(默认 vendor=claude / role=cto / 通道=stream-json),回新句柄 s<N>
-/new claude reviewer        建新会话(vendor = claude|codex;role 可选,默认 cto)
-/new claude reviewer hitl   建一个开了「人工批准」的会话(尾 token hitl;默认是 skip)
-/new claude reviewer terminal  起一个**终端通道**会话,要逐字节终端镜像 / attach / screenshot 时用(尾 token terminal;默认是 stream-json;顺序无关,可配 hitl)
-/use s1                     切到会话 s1(同一项目里多会话间切换)
-/role reviewer              把**当前**会话改成 reviewer 角色(原地重启、同句柄 s<N>)
-/sessions                   列当前 chat 的会话(每行带 vendor + role + model + 上下文用量)
-/projects                   列 daemon 已知项目(= 已 init 且 daemon 已加载)
-```
-
-**发消息 + slash 透传**(`@handle` 决定路由并设为当前 session;不带 `@` 时发给当前 session):
-
-```text
-@reviewer 看一下这个项目的 README,给我三条风险
-@api /review       Codex 原生 RPC(review/start)
-@api /compact      Codex 原生 RPC(thread/compact/start)
-@reviewer /clear   Claude TUI slash 透传
-@reviewer /model   弹出 model 选项按钮,点一下即应用(bare 弹窗型)
-```
-
-> gateway 先回 `submitted <session> turn <id>`,随后把 assistant / error 事件经同一条 outbound ledger 发回 IM。
-
-**slash 在 IM 里按 vendor 的行为**(没有一条会静默变成发给模型的字面文本):
-
-- **Claude session**:开放集(skill / 自定义命令 / `/compact` `/clear` `/usage` …)按字面 `send-keys` 透传给 TUI;弹窗选择型(`/model` 等)带参直接应用、不带参(bare)弹出 **inline 选项按钮**(web chat 里是 chips),点一下即应用;纯设置面板型(`/config` `/agents` 等无法用一句参数驱动的)会**显式拒绝并给提示**(不盲发、免得隐藏 TUI 卡进 modal 吞输入);万一卡住,发 `/esc` 等于按一下 Esc 把 TUI 拉回来。
-- **Codex session**:每条 slash 映射 app-server **原生 RPC** 或即时查询(`/compact` `/review` `/interrupt` `/status` `/skills` …);弹窗型(`/model` `/review` `/permissions` …)bare 先弹**选项按钮**、选了再应用(两段式);`/new` `/clear` `/resume` 这类 Codex 无 in-thread 等价的,会**重定向**提示你用网关命令(如 `/new` 建新 session、`/use` 切 session);确实不支持 / TUI-only 的命令显式回执拒绝。
-
-> 本版 role 绑定(`--agent`)是 **Claude 路径**的能力;Codex session 只保证读项目原生 `AGENTS.md`,role 绑定推后。
-
-**turn 进行中的进度**:turn 跑的时候会有一条活的 status 消息逐步编辑,折叠显示步骤(形如 `⏳ working… · 📖 read ×5 · 🔧 bash ×3`),结束收尾成 `✅ done · n tools · m files`;最终答案单独成一条新消息(会 ping)。想关掉只发答案:daemon 起前设 `CCTEAM_IM_PROGRESS=off`(编辑节流阈值 `CCTEAM_IM_PROGRESS_THROTTLE_MS`,默认 1500ms)。
-
-**长消息自动分片**:超过 Telegram 4096(UTF-16)上限的回答会被有序切成多条发出(代码块跨片自动闭合/重开),不再截断丢数据。
-
-**发图 / 发文件给 bot**:在 TG 或 飞书/Lark 直接发图片或文件 + caption(如「这是报错」)→ agent 会自动 `Read` 落盘的文件(报错截图、日志都行)。TG >20MB / 飞书 >30MB 拒收。
-
-**bot 发文件回来**:agent 调 MCP 工具 `chat_send_file(path, caption?, kind?)` 即可把文件/截图发回你绑定的 chat(零寻址参数,身份取 spawn 注入的 `CCTEAM_CHAT_{SLUG,ROLE}`;图 ≤10MB / 文件 ≤50MB,超限或不存在返回结构化 error)。配合 `screenshot`(返回 PNG 路径)即「发效果图」。
-
-**agent 反问你**:当 agent 自己在 turn 中途要拿主意(发起 AskUserQuestion),它的问题会以**选项按钮**形式弹到你 chat 里 —— 点一下(或回数字 / 回一段自由文本)即把答案喂回 agent,它继续往下跑,不卡死。等太久没答会按兜底策略让它自决。
-
-**给 bot 设定固定行为**走官方机制(**不靠注入**):role 的 persona 写在 `.claude/agents/<role>.md`(`/role` 换的就是它);项目知识走 vendor 原生 —— Claude 读项目 `CLAUDE.md`、Codex 读 `AGENTS.md`(都归项目自己,ccteam 不生成);全局指令放 `~/.claude/CLAUDE.md`。
-
-```bash
-$EDITOR ~/projects/demo-app/.claude/agents/reviewer.md   # 改 reviewer 角色;下次 /role reviewer(fresh start)生效
-$EDITOR ~/projects/demo-app/CLAUDE.md                     # 项目知识(Claude 自动读,vendor 原生)
-```
-
-> 注:改 role.md 在 **fresh start / `/role` 切换**后生效;`/use` resume 一个已活 session 会沿用它历史里展现的 persona(in-context,不重读)。要立刻换 persona 就 `/role`。
-
-**让 cto 调度 work-role 干活(cto dispatch)**:默认 `cto` 管家可以 spawn 一个 work-role 子 session、派任务、收结果 —— 不用你手动切来切去。这是 cto 自己在 turn 里调 MCP 工具完成的,你只要用自然语言让它做:
-
-```text
-@cto 起一个 backend-architect,让它评审 src/ 的接口设计,把结论汇总给我
-```
-
-cto 背后用的是 5 个 `mcp__ccteam__session_*` 工具:`session_spawn`(建子 session)· `session_dispatch`(派一个 turn)· `session_collect`(取子 session 的回复,polled)· `session_list` · `session_stop`。这组工具是 cto **专属**:daemon 校验每个 session 启动时注入的 secret(只有 `cto` session 持有有效 `(role, secret)`,且只能操作自己项目里的 session),work-role 调不到;只走 gateway session map。**注**:所有 agent 同 OS 用户运行,这道门是 best-effort(抬高门槛),**不是**硬隔离 —— 真正的进程隔离需要 per-agent OS 用户 / sandbox(未来版本)。
 
 ---
 
