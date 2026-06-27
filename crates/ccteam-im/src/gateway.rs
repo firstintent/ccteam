@@ -3137,12 +3137,18 @@ impl Gateway {
         // (claude's own `system:task_*` lifecycle), and account usage.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage is ACCOUNT-scoped (same for every session): prefer the
-        // current session, else the first visible session whose adapter answers
-        // (so usage still shows when the current session is idle/released).
+        // Account usage is account-scoped but PER VENDOR: a Codex session must
+        // never display a Claude account's windows (and vice-versa). Prefer the
+        // current session; else borrow from another visible session OF THE SAME
+        // VENDOR whose adapter answers (so usage still shows when the current
+        // session is idle/released). No same-vendor answer ⇒ omit the row.
         let mut account = s.adapter.account_usage(&s.thread).await;
         if account.is_none() {
+            let vendor = s.adapter.vendor();
             for o in &visible {
+                if o.adapter.vendor() != vendor {
+                    continue;
+                }
                 if let Some(u) = o.adapter.account_usage(&o.thread).await {
                     account = Some(u);
                     break;

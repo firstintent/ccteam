@@ -255,6 +255,13 @@ pub struct CodexAppServerAdapter {
     /// v0.8.5 D2 — cached `skills/list` result (flattened `(name, path)`),
     /// invalidated by the `skills/changed` notification. `None` = cold.
     skills_cache: Arc<Mutex<Option<Vec<CachedSkill>>>>,
+    /// v0.8.20 — latest account-scoped rate-limit snapshot (the inner
+    /// `rateLimits` object of `account/rateLimits/updated`). Fed by the same
+    /// single per-client dispatcher as `tracker`; account-, not thread-,
+    /// scoped (the notification carries no thread_id), so ONE slot. Read by
+    /// `account_usage()` so a Codex session surfaces ITS OWN 5h/weekly limits
+    /// in the IM `/status` line instead of borrowing another vendor's.
+    rate_limits: Arc<Mutex<Option<Value>>>,
     /// Transport resolved ONCE at construction (see
     /// [`resolve_codex_transport`]). `client()` matches on this — no
     /// per-call env sniffing.
@@ -293,6 +300,7 @@ impl Default for CodexAppServerAdapter {
             tracker: Arc::new(Mutex::new(CodexThreadTracker::default())),
             overrides: Arc::new(Mutex::new(HashMap::new())),
             skills_cache: Arc::new(Mutex::new(None)),
+            rate_limits: Arc::new(Mutex::new(None)),
             transport: resolve_codex_transport(),
         }
     }
@@ -498,6 +506,7 @@ impl CodexAppServerAdapter {
         let mut rx = client.subscribe();
         let tracker = Arc::clone(&self.tracker);
         let skills_cache = Arc::clone(&self.skills_cache);
+        let rate_limits = Arc::clone(&self.rate_limits);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -505,6 +514,16 @@ impl CodexAppServerAdapter {
                         apply_notification_to_tracker(&tracker, &notif).await;
                         if notif.method == "skills/changed" {
                             *skills_cache.lock().await = None;
+                        }
+                        // Account-scoped rate-limit snapshot (no thread_id) —
+                        // cache the latest so `account_usage()` reports THIS
+                        // vendor's own 5h/weekly windows.
+                        if notif.method == "account/rateLimits/updated" {
+                            if let Some(snap) =
+                                pluck_val(&notif.params, "rate_limits", "rateLimits")
+                            {
+                                *rate_limits.lock().await = Some(snap);
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1439,6 +1458,57 @@ impl CodexAppServerAdapter {
     }
 }
 
+/// Map a codex `account/rateLimits/updated` snapshot (the inner `rateLimits`
+/// object) → the vendor-neutral [`crate::AccountUsage`]. Codex's `primary`
+/// window is the 5-hour limit and `secondary` the weekly (per the codex
+/// protocol `windowDurationMins` 300 / 10080), mirroring Claude's two windows.
+/// `resetsAt` is an absolute Unix epoch (seconds) → ISO-8601 for the renderer;
+/// `planType` → subscription tier; a non-null `rateLimitReachedType` ⇒ weekly
+/// ⚠. `credits_pct` stays `None` — codex's `credits` is a balance object, not a
+/// utilization %, so the `/status` line correctly omits 额度 for codex.
+/// All-`None` ⇒ `None`.
+fn account_usage_from_codex_snapshot(snapshot: &Value) -> Option<crate::AccountUsage> {
+    // dual-key (camelCase wire / snake_case) numeric lookup within a window.
+    let win_i64 = |w: Option<&Value>, snake: &str, camel: &str| -> Option<i64> {
+        w.and_then(|x| x.get(camel).or_else(|| x.get(snake)))
+            .and_then(|v| v.as_i64())
+    };
+    let pct = |w: Option<&Value>| {
+        win_i64(w, "used_percent", "usedPercent").map(|n| n.clamp(0, 100) as u8)
+    };
+    let reset_iso = |w: Option<&Value>| {
+        win_i64(w, "resets_at", "resetsAt")
+            .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+            .map(|dt| dt.to_rfc3339())
+    };
+    let primary = snapshot.get("primary");
+    let secondary = snapshot.get("secondary");
+    let weekly_severity = snapshot
+        .get("rate_limit_reached_type")
+        .or_else(|| snapshot.get("rateLimitReachedType"))
+        .filter(|v| !v.is_null())
+        .map(|_| "warning".to_string());
+    let subscription = snapshot
+        .get("plan_type")
+        .or_else(|| snapshot.get("planType"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let usage = crate::AccountUsage {
+        subscription,
+        five_hour_pct: pct(primary),
+        five_hour_resets_at: reset_iso(primary),
+        weekly_pct: pct(secondary),
+        weekly_resets_at: reset_iso(secondary),
+        weekly_severity,
+        credits_pct: None,
+    };
+    if usage == crate::AccountUsage::default() {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
 #[async_trait]
 impl HarnessAdapter for CodexAppServerAdapter {
     fn name(&self) -> &'static str {
@@ -1447,6 +1517,16 @@ impl HarnessAdapter for CodexAppServerAdapter {
 
     fn vendor(&self) -> AgentVendor {
         AgentVendor::Codex
+    }
+
+    /// Report THIS codex account's usage from the cached
+    /// `account/rateLimits/updated` snapshot (account-, not thread-, scoped —
+    /// `_h` is ignored). `None` until codex has pushed a snapshot (first
+    /// connect / turn); the IM `/status` line then omits the usage row or, via
+    /// the gateway's same-vendor fallback, borrows another live codex session.
+    async fn account_usage(&self, _h: &ThreadHandle) -> Option<crate::AccountUsage> {
+        let snapshot = self.rate_limits.lock().await.clone()?;
+        account_usage_from_codex_snapshot(&snapshot)
     }
 
     async fn start_thread(
@@ -3653,6 +3733,43 @@ mod tests {
         assert_eq!(line["event"], CODEX_RATE_LIMIT);
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["snapshot"]["primary"]["usedPercent"], 80);
+    }
+
+    #[test]
+    fn codex_snapshot_maps_to_account_usage() {
+        // Real wire (camelCase): primary = 5-hour window, secondary = weekly.
+        // `resetsAt` is an absolute Unix epoch (seconds) → ISO-8601.
+        let snap = json!({
+            "primary":   { "usedPercent": 12, "windowDurationMins": 300,   "resetsAt": 1_700_000_000_i64 },
+            "secondary": { "usedPercent": 98, "windowDurationMins": 10080, "resetsAt": 1_700_500_000_i64 },
+            "planType": "pro",
+            "rateLimitReachedType": "rate_limit_reached",
+            "credits": { "hasCredits": true, "unlimited": false, "balance": "5.00" },
+        });
+        let u = account_usage_from_codex_snapshot(&snap).expect("maps to usage");
+        assert_eq!(u.five_hour_pct, Some(12));
+        assert_eq!(u.weekly_pct, Some(98));
+        assert_eq!(u.subscription.as_deref(), Some("pro"));
+        // a reached limit surfaces the weekly ⚠ in the renderer.
+        assert_eq!(u.weekly_severity.as_deref(), Some("warning"));
+        // codex `credits` is a balance, not a %, so 额度 is intentionally omitted.
+        assert_eq!(u.credits_pct, None);
+        assert_eq!(
+            u.five_hour_resets_at.as_deref(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
+        assert!(u.weekly_resets_at.is_some());
+
+        // No windows reported ⇒ nothing to show (clean omission, not a borrow).
+        assert_eq!(account_usage_from_codex_snapshot(&json!({})), None);
+        // snake_case keys also accepted (defensive dual-key).
+        let snake = json!({ "primary": { "used_percent": 5, "resets_at": 1_700_000_000_i64 } });
+        assert_eq!(
+            account_usage_from_codex_snapshot(&snake)
+                .unwrap()
+                .five_hour_pct,
+            Some(5)
+        );
     }
 
     #[test]
