@@ -1902,16 +1902,18 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     .await;
 
     // thread/tokenUsage/updated → usage. CRITICAL: this is the only usage
-    // source; turn/completed carries none on the real wire.
+    // source; turn/completed carries none on the real wire. Occupancy comes
+    // from `last` (the current active context size), NOT `total` (the
+    // cumulative session sum, which balloons past the window).
     notif
         .send(json!({
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": "tid-d2", "turnId": "turn-1",
                 "tokenUsage": {
-                    "total": { "totalTokens": 188000, "inputTokens": 180000, "outputTokens": 8000,
+                    "total": { "totalTokens": 4000000, "inputTokens": 3900000, "outputTokens": 100000,
                                "cachedInputTokens": 0, "reasoningOutputTokens": 0 },
-                    "last": { "totalTokens": 1000, "inputTokens": 900, "outputTokens": 100,
+                    "last": { "totalTokens": 188000, "inputTokens": 180000, "outputTokens": 8000,
                               "cachedInputTokens": 0, "reasoningOutputTokens": 0 },
                     "modelContextWindow": 1000000
                 }
@@ -1955,7 +1957,7 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     let ctx = status.context.expect("usage must be present");
     assert_eq!(
         ctx.used_tokens, 188000,
-        "usage from tokenUsage, not TurnCompleted"
+        "usage from tokenUsage.last (active context size), not .total (cumulative sum)"
     );
     assert_eq!(ctx.window_tokens, 1_000_000);
     // active turn cleared.

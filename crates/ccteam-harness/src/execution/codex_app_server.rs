@@ -3070,9 +3070,11 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
 /// - `turn/completed` → clear `active_turn`.
 /// - `error` with `willRetry == false` (terminal) → clear `active_turn`.
 ///   Retryable errors leave it set (the turn is still alive).
-/// - `thread/tokenUsage/updated` → set `usage` from `tokenUsage.total`
-///   (`total_tokens`) + `tokenUsage.modelContextWindow`. This is the ONLY
-///   source of usage — the real `turn/completed` wire carries none.
+/// - `thread/tokenUsage/updated` → set `usage` from `tokenUsage.last`
+///   (`total_tokens` = current active context size) + `tokenUsage.modelContextWindow`.
+///   NOT `tokenUsage.total` (the cumulative session sum, which over-counts the
+///   re-sent context every turn). This is the ONLY source of usage — the real
+///   `turn/completed` wire carries none.
 async fn apply_notification_to_tracker(
     tracker: &Arc<Mutex<CodexThreadTracker>>,
     notif: &Notification,
@@ -3107,8 +3109,14 @@ async fn apply_notification_to_tracker(
         "thread/tokenUsage/updated" => {
             let usage = pluck_val(&notif.params, "token_usage", "tokenUsage")
                 .unwrap_or(Value::Object(Default::default()));
+            // `last.total_tokens` = the latest turn's active context size (how
+            // full the window is right now). NOT `total.total_tokens`, which is
+            // the cumulative session sum — it re-counts the re-sent context
+            // every turn and balloons into the millions, yielding nonsense like
+            // `4.0M / 258.4k (1535%)`. Codex's own TUI derives context-window
+            // occupancy from `last_token_usage` for exactly this reason.
             let used = usage
-                .get("total")
+                .get("last")
                 .and_then(|t| t.get("total_tokens").or_else(|| t.get("totalTokens")))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
