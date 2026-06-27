@@ -115,6 +115,21 @@ utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# Dev builds are debuginfo-dominated: a single debug binary is ~90% DWARF and
+# every integration-test file links its own copy, so `target/debug` balloons.
+# Trim it so the tree stays lean and links faster WITHOUT losing day-to-day
+# debuggability:
+#   - own crates keep file:line in panics/backtraces (line-tables-only);
+#   - dependencies carry no debuginfo (we never step into tokio/serde/…);
+#   - split-debuginfo keeps DWARF out of the binary file itself (Linux).
+# Need to step into one dependency? add `[profile.dev.package.<dep>] debug = true`.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = true
 codegen-units = 1
