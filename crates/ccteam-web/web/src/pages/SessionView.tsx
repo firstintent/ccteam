@@ -42,9 +42,8 @@ import {
 } from "../lib/sessionsApi";
 import { formatStatusLine } from "../lib/statusLine";
 import {
-  activityIcon,
+  appendEvent,
   appendRow,
-  eventToRow,
   historyToRows,
   loadRows,
   nextRowId,
@@ -116,8 +115,7 @@ export default function SessionView({
     setRows((current) => {
       let next = current;
       for (const ev of fresh) {
-        const row = eventToRow(ev);
-        if (row) next = appendRow(next, row);
+        next = appendEvent(next, ev);
       }
       return next;
     });
@@ -414,23 +412,18 @@ export default function SessionView({
                   </div>
                 );
               }
-              // v0.8.19 — a structured per-step activity (tool call / thinking
-              // / command / file change / web search). A compact mono line,
-              // dimmer than messages, with a lucide icon by kind. A subtle
-              // left border + tight spacing makes consecutive activities read
-              // as one visual cluster (theme tokens only — no emoji).
+              // v0.8.21 — a FOLDED run of activity steps: ONE compact counter
+              // line (⏳ working… · 🔧 bash ×40 · 📖 read ×15 · ✏️ edit ×16),
+              // mirroring the IM ProgressFold, instead of one row per step.
+              // Emoji-led (matching IM); dimmer than messages with a subtle
+              // left border so it reads as a single in-turn activity cluster.
               if (row.kind === "activity") {
-                const Icon = activityIcon(row.activity?.kind ?? "", row.activity?.name ?? "");
-                const thinking = row.activity?.kind === "thinking";
                 return (
                   <div
                     key={row.id}
-                    className="flex items-start gap-2 max-w-[760px] py-0.5 pl-2 border-l border-surface-700/40 text-[11px] font-mono text-text-muted"
+                    className="max-w-[760px] py-0.5 pl-2 border-l border-surface-700/40 text-[11px] font-mono text-text-muted break-words"
                   >
-                    <Icon className="h-3 w-3 mt-0.5 shrink-0 text-text-dim" />
-                    <span className={`min-w-0 break-words line-clamp-2 ${thinking ? "italic" : ""}`}>
-                      {row.content}
-                    </span>
+                    {row.content}
                   </div>
                 );
               }

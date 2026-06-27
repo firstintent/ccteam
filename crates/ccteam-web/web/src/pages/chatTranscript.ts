@@ -9,9 +9,6 @@
 // owns its OWN transcript (a per-sid localStorage key), so switching the
 // sid view NEVER mixes two sessions' rows.
 
-import { Brain, FileText, Pencil, Search, Terminal, Wrench } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
-
 import type {
   SessionActivity,
   SessionEvent,
@@ -38,17 +35,23 @@ export interface TranscriptRow {
   token?: string;
   /** Approval-only: true once an option was clicked. */
   resolved?: boolean;
-  /** Activity-only: the structured per-step payload (kind/name/summary/…),
-   *  so SessionView can pick an icon + render it compactly (v0.8.19). */
+  /** Activity-only (single, legacy): the structured per-step payload. Only a
+   *  bare/malformed activity frame (no fold) carries this now; folded runs use
+   *  {@link fold}. */
   activity?: SessionActivity;
+  /** Activity-only: the FOLDED run of activity steps (v0.8.21). Mirrors the IM
+   *  ProgressFold — a turn's many tool/think steps collapse into ONE counter
+   *  row. Present ⇒ render {@link TranscriptRow.content} as the fold line. */
+  fold?: ActivityFold;
 }
 
 export const ROWS_CAP = 400;
 
-/** Per-sid localStorage key. Bumping the `v2` suffix (vs the old flat
- *  `ccteam.chat.rows.v1`) also abandons the session-mixing buffer. */
+/** Per-sid localStorage key. Bumping the suffix (`v3` ← `v2` ← the old flat
+ *  `ccteam.chat.rows.v1`) abandons the prior buffer; `v3` retires the
+ *  one-row-per-activity-step shape in favor of the folded counter row. */
 export function rowsKeyFor(sid: string): string {
-  return `ccteam.chat.rows.v2.${sid}`;
+  return `ccteam.chat.rows.v3.${sid}`;
 }
 
 /** Stable-ish id for a new row (no crypto dependency — collisions are
@@ -80,10 +83,9 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       token: ev.token,
     };
   }
-  // v0.8.19 — a structured per-step activity (tool call / thinking / …)
-  // renders as a compact mono row. Drop a frame with no usable summary
-  // (nothing to show); the structured `activity` rides onto the row so
-  // SessionView can pick an icon by kind.
+  // A bare/malformed activity frame (no structured payload to fold) renders
+  // as a single compact mono row. Well-formed activity frames are folded by
+  // {@link appendEvent} into ONE counter row, so they never reach here.
   if (ev.kind === "activity") {
     const summary = ev.activity?.summary || ev.content;
     if (!summary) return null;
@@ -105,33 +107,145 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
   return null;
 }
 
-/** Pick a lucide icon for a structured activity row (v0.8.19). Keys off the
- *  activity `kind` first, then the tool `name` to distinguish a bash/command
- *  call (Terminal) from a read (FileText) or a grep/search (Search) within a
- *  generic `tool_call`. Pure + dependency-light (only lucide types) so the
- *  mapping is unit-testable and shared. */
-export function activityIcon(kind: string, name: string): LucideIcon {
-  switch (kind) {
-    case "thinking":
-      return Brain;
-    case "command_exec":
-      return Terminal;
-    case "file_change":
-      return Pencil;
-    case "web_search":
-      return Search;
-    case "tool_call":
-    case "tool_result": {
-      const n = name.toLowerCase();
-      if (["bash", "bashoutput", "killbash", "killshell"].includes(n)) return Terminal;
-      if (["read", "ls", "notebookread"].includes(n)) return FileText;
-      if (["grep", "glob", "websearch", "webfetch"].includes(n)) return Search;
-      if (["edit", "multiedit", "write", "notebookedit"].includes(n)) return Pencil;
-      return Wrench;
-    }
+// ---- activity fold (v0.8.21) ----------------------------------------------
+//
+// THE FIX this enables: the gateway emits one activity frame per item
+// lifecycle (start / update / complete) for EVERY step (see
+// `ccteam-im/src/gateway.rs` "ACTIVITY (web-only)"), so a turn with 40 bash +
+// 15 read + 16 edit calls produced ~140 rows — a wall of `Bash(…)` lines that
+// also blew past {@link ROWS_CAP} and evicted real messages. We fold a run of
+// consecutive activity steps into ONE compact counter row, mirroring the IM
+// `ProgressFold` (ccteam-im/src/progress.rs) so the two surfaces can't drift:
+// `⏳ working… · 🔧 bash ×40 · 📖 read ×15 · ✏️ edit ×16`.
+
+/** A folded run of activity steps: each step counted ONCE (deduped by
+ *  `item_id` — a tool's start+complete pair, or a reasoning item's repeated
+ *  updates, must not double-count) and bucketed by category. */
+export interface ActivityFold {
+  /** `item_id`s already counted (dedup of the start/complete/update lifecycle). */
+  seen: string[];
+  /** Count buckets in first-seen order (stable render). */
+  buckets: { emoji: string; label: string; count: number }[];
+  /** Any reasoning step seen — drives the `💭 thinking…` head when no tool ran. */
+  thinking: boolean;
+}
+
+interface ActivityCategory {
+  emoji: string;
+  label: string;
+}
+
+/** Mirror of the Rust `tool_category` (ccteam-im/src/progress.rs): a raw
+ *  Claude/Codex tool name → a folded category. Match is case-sensitive (the
+ *  adapter emits the canonical tool name); an unknown tool folds under the
+ *  wrench keeping its own lowercased name, so nothing is silently dropped
+ *  (e.g. `Agent` → `🔧 agent`). */
+function toolCategory(name: string): ActivityCategory {
+  switch (name) {
+    case "Read":
+    case "Grep":
+    case "Glob":
+    case "LS":
+    case "NotebookRead":
+      return { emoji: "📖", label: "read" };
+    case "Bash":
+    case "BashOutput":
+    case "KillBash":
+    case "KillShell":
+      return { emoji: "🔧", label: "bash" };
+    case "Edit":
+    case "MultiEdit":
+    case "Write":
+    case "NotebookEdit":
+      return { emoji: "✏️", label: "edit" };
+    case "WebSearch":
+    case "WebFetch":
+      return { emoji: "🔎", label: "web" };
+    case "Task":
+      return { emoji: "🤖", label: "task" };
+    case "TodoWrite":
+      return { emoji: "📝", label: "todo" };
     default:
-      return Wrench;
+      return { emoji: "🔧", label: name.toLowerCase() || "tool" };
   }
+}
+
+/** The count bucket for one structured activity, keyed off its `kind` first
+ *  (command/file/web fold to fixed categories), then the tool `name` for a
+ *  generic `tool_call`. Returns `null` for `thinking` (it sets the head, not a
+ *  bucket). Mirrors `ProgressFold::apply`. */
+function activityCategory(a: SessionActivity): ActivityCategory | null {
+  switch (a.kind) {
+    case "thinking":
+      return null;
+    case "command_exec":
+      return { emoji: "🔧", label: "bash" };
+    case "file_change":
+      return { emoji: "✏️", label: "edit" };
+    case "web_search":
+      return { emoji: "🔎", label: "web" };
+    default: // tool_call / tool_result / anything else → key off the name
+      return toolCategory(a.name);
+  }
+}
+
+/** A fresh, empty fold. */
+export function emptyFold(): ActivityFold {
+  return { seen: [], buckets: [], thinking: false };
+}
+
+/** Fold one structured activity into `prev`, returning a NEW fold (pure +
+ *  immutable). De-dups by `item_id`; a `thinking` step only flags the head. */
+export function foldActivity(prev: ActivityFold, a: SessionActivity): ActivityFold {
+  // Already counted (start↔complete pair, or a repeated reasoning update):
+  // re-assert the thinking flag if needed, otherwise leave the fold untouched.
+  if (a.item_id && prev.seen.includes(a.item_id)) {
+    return a.kind === "thinking" && !prev.thinking ? { ...prev, thinking: true } : prev;
+  }
+  const seen = a.item_id ? [...prev.seen, a.item_id] : prev.seen;
+  const cat = activityCategory(a);
+  if (!cat) return { ...prev, seen, thinking: true };
+  const buckets = prev.buckets.map((b) => ({ ...b }));
+  const hit = buckets.find((b) => b.label === cat.label);
+  if (hit) hit.count += 1;
+  else buckets.push({ emoji: cat.emoji, label: cat.label, count: 1 });
+  return { ...prev, seen, buckets };
+}
+
+/** Render a fold to its one-line summary, mirroring `ProgressFold::render`:
+ *  `⏳ working… · 🔧 bash ×40 · 📖 read ×15`, or `💭 thinking…` when only
+ *  reasoning has happened. */
+export function renderFold(fold: ActivityFold): string {
+  const head = fold.buckets.length === 0 && fold.thinking ? "💭 thinking…" : "⏳ working…";
+  if (fold.buckets.length === 0) return head;
+  const counts = fold.buckets.map((b) => `${b.emoji} ${b.label} ×${b.count}`).join(" · ");
+  return `${head} · ${counts}`;
+}
+
+/** Reduce one SSE {@link SessionEvent} into the transcript, FOLDING a run of
+ *  consecutive structured activity steps into a single counter row. Any other
+ *  event (answer / approval / finalizing progress, or a bare activity frame
+ *  with no payload) lands as its own row via {@link eventToRow} — which
+ *  naturally "closes" the current fold, so the next activity starts a fresh
+ *  one. This is the single entry the live SSE loop uses. */
+export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): TranscriptRow[] {
+  if (ev.kind === "activity" && ev.activity) {
+    const last = rows[rows.length - 1];
+    if (last && last.kind === "activity" && last.fold) {
+      const fold = foldActivity(last.fold, ev.activity);
+      const merged: TranscriptRow = { ...last, fold, content: renderFold(fold) };
+      return [...rows.slice(0, -1), merged];
+    }
+    const fold = foldActivity(emptyFold(), ev.activity);
+    return appendRow(rows, {
+      id: ev.id ?? nextRowId("activity"),
+      kind: "activity",
+      content: renderFold(fold),
+      fold,
+    });
+  }
+  const row = eventToRow(ev);
+  return row ? appendRow(rows, row) : rows;
 }
 
 /** Seed a transcript from mirrored history (`GET /sessions/{sid}`). Each

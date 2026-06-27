@@ -6,20 +6,21 @@
 
 import { describe, expect, it } from "vitest";
 
-import { Brain, FileText, Search, Terminal, Wrench } from "lucide-react";
-
 import {
-  activityIcon,
+  appendEvent,
   appendRow,
   eventToRow,
+  foldActivity,
+  emptyFold,
   historyToRows,
   loadRows,
+  renderFold,
   rowsKeyFor,
   saveRows,
   ROWS_CAP,
   type TranscriptRow,
 } from "./chatTranscript";
-import type { SessionEvent } from "../hooks/useSessionEvents";
+import type { SessionActivity, SessionEvent } from "../hooks/useSessionEvents";
 import type { SessionHistoryEvent } from "../lib/sessionsApi";
 
 /** Minimal in-memory Storage for node-env tests. */
@@ -177,23 +178,92 @@ describe("chatTranscript eventToRow", () => {
   });
 });
 
-describe("chatTranscript activityIcon (v0.8.19 icon-by-kind)", () => {
-  it("maps thinking → Brain regardless of name", () => {
-    expect(activityIcon("thinking", "")).toBe(Brain);
+describe("chatTranscript activity fold (v0.8.21 — mirrors IM ProgressFold)", () => {
+  const act = (a: Partial<SessionActivity>): SessionActivity => ({
+    kind: "tool_call",
+    name: "Bash",
+    summary: "",
+    status: "started",
+    item_id: "",
+    ...a,
   });
-  it("maps command_exec / web_search to Terminal / Search", () => {
-    expect(activityIcon("command_exec", "bash")).toBe(Terminal);
-    expect(activityIcon("web_search", "web")).toBe(Search);
+  const actEv = (a: Partial<SessionActivity>, id?: string): SessionEvent => ({
+    kind: "activity",
+    content: "",
+    id,
+    activity: act(a),
   });
-  it("disambiguates a generic tool_call by tool name", () => {
-    expect(activityIcon("tool_call", "Bash")).toBe(Terminal);
-    expect(activityIcon("tool_call", "Read")).toBe(FileText);
-    expect(activityIcon("tool_call", "Grep")).toBe(Search);
-    // an unknown tool falls back to the generic Wrench.
-    expect(activityIcon("tool_call", "SomeMcpTool")).toBe(Wrench);
+
+  it("folds a run of tool steps into ONE counter row by category", () => {
+    let rows: TranscriptRow[] = [];
+    for (let i = 0; i < 40; i++)
+      rows = appendEvent(rows, actEv({ name: "Bash", item_id: `b${i}` }));
+    for (let i = 0; i < 15; i++)
+      rows = appendEvent(rows, actEv({ name: "Read", item_id: `r${i}` }));
+    for (let i = 0; i < 16; i++)
+      rows = appendEvent(rows, actEv({ name: "Edit", item_id: `e${i}` }));
+    // 71 activity frames → exactly ONE folded row.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("activity");
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×40 · 📖 read ×15 · ✏️ edit ×16");
   });
-  it("falls back to Wrench for an unknown kind", () => {
-    expect(activityIcon("mystery", "x")).toBe(Wrench);
+
+  it("counts each tool ONCE across its start↔complete pair (dedup by item_id)", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ name: "Bash", item_id: "t1", status: "started" }));
+    rows = appendEvent(rows, actEv({ name: "Bash", item_id: "t1", status: "completed" }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×1");
+  });
+
+  it("folds command_exec/file_change/web_search into bash/edit/web buckets", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ kind: "command_exec", name: "bash", item_id: "c1" }));
+    rows = appendEvent(rows, actEv({ kind: "file_change", name: "modified", item_id: "f1" }));
+    rows = appendEvent(rows, actEv({ kind: "web_search", name: "web", item_id: "w1" }));
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×1 · ✏️ edit ×1 · 🔎 web ×1");
+  });
+
+  it("folds an unknown tool under the wrench keeping its lowercased name", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ name: "Agent", item_id: "a1" }));
+    expect(rows[0].content).toBe("⏳ working… · 🔧 agent ×1");
+  });
+
+  it("renders 💭 thinking… when only reasoning has happened (no tool bucket)", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ kind: "thinking", name: "", item_id: "rz" }));
+    rows = appendEvent(rows, actEv({ kind: "thinking", name: "", item_id: "rz" })); // same item → no-op
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe("💭 thinking…");
+    // a tool after thinking flips the head to ⏳ working… (thinking not counted).
+    rows = appendEvent(rows, actEv({ name: "Bash", item_id: "b1" }));
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×1");
+  });
+
+  it("a non-activity event closes the fold — the next activity starts a fresh one", () => {
+    let rows: TranscriptRow[] = [];
+    rows = appendEvent(rows, actEv({ name: "Bash", item_id: "b1" }));
+    rows = appendEvent(rows, { kind: "answer", content: "done", id: "a1" });
+    rows = appendEvent(rows, actEv({ name: "Read", item_id: "r1" }));
+    expect(rows.map((r) => r.kind)).toEqual(["activity", "assistant", "activity"]);
+    expect(rows[0].content).toBe("⏳ working… · 🔧 bash ×1");
+    expect(rows[2].content).toBe("⏳ working… · 📖 read ×1");
+  });
+
+  it("a bare activity frame (no payload) falls back to a single content row", () => {
+    const rows = appendEvent([], { kind: "activity", content: "$ cargo build" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("activity");
+    expect(rows[0].content).toBe("$ cargo build");
+    expect(rows[0].fold).toBeUndefined();
+  });
+
+  it("foldActivity/renderFold are pure (no mutation of prev)", () => {
+    const a = emptyFold();
+    const b = foldActivity(a, act({ name: "Bash", item_id: "x" }));
+    expect(a.buckets).toHaveLength(0); // prev untouched
+    expect(renderFold(b)).toBe("⏳ working… · 🔧 bash ×1");
   });
 });
 
