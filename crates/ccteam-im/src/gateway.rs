@@ -2550,7 +2550,7 @@ impl Gateway {
     }
 
     async fn submit_to_current(
-        &self,
+        &mut self,
         chat: &ChatKey,
         message_id: &str,
         payload: String,
@@ -2580,6 +2580,110 @@ impl Gateway {
         }
     }
 
+    /// Transparently re-establish a session whose underlying child has exited
+    /// (crash / OOM / a long idle window) — the "会话 = resume-by-session-id"
+    /// red line for the dead-child case. Re-spawns via the resume-aware
+    /// `start_thread` with the SAME sid (→ same deterministic vendor uuid →
+    /// `--resume`), REUSING the session's project / role / vendor / protocol /
+    /// permission posture / cto-gate secret, so the Anthropic conversation
+    /// resumes from its transcript (context preserved). The fresh handle/adapter
+    /// are swapped into the existing [`GatewaySession`] IN PLACE (every
+    /// Arc-shared cell — `reply_to` / counters — survives); the stale event pump
+    /// (already ending on the closed transport) is dropped and a fresh one is
+    /// bound to the resumed transport. NOT a `/new`: same sid, same identity, no
+    /// fresh context.
+    async fn resume_dead_session(&mut self, session_id: &str) -> Result<()> {
+        let (project, role, vendor, protocol, permission_mode, secret) = {
+            let s = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("session vanished: {session_id}"))?;
+            (
+                s.project.clone(),
+                s.role.clone(),
+                s.vendor,
+                s.protocol,
+                s.permission_mode,
+                s.secret.clone(),
+            )
+        };
+        // Sync a possibly-registered-after-start project from the config.yaml
+        // SoT before the lookup (mirrors start_session / `/role`).
+        self.ensure_project_loaded(&project);
+        let cwd = self
+            .projects
+            .get(&project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+        let role_detail = ensure_role_exists(&cwd, &role)?;
+        let model_id = role_model_id(role_detail.as_ref());
+        let adapter = (self.adapter_factory)(vendor, protocol);
+        let thread = adapter
+            .start_thread(
+                &AgentSpecBrief { role: role.clone() },
+                &SpawnCtx {
+                    slug: project.clone(),
+                    sid: session_id.to_string(),
+                    cwd: cwd.clone(),
+                    project_dir: cwd,
+                    extra_args: vec![],
+                    model_id,
+                    permission_mode,
+                    // Reuse the existing secret: the resumed child's env is
+                    // re-stamped with it, so pane-env and the cto-gate map stay
+                    // in lockstep (no fresh mint → no stored-secret update).
+                    secret,
+                },
+            )
+            .await?;
+        // Swap the fresh handle/adapter in place — preserves owner / handle /
+        // reply_to / all Arc-shared counters. Clear the stale in-flight turn
+        // tracking so `/status` drops the resumed session from 🔴 STUCK to 🟢
+        // idle (the dead child's turn is over; the next submit re-stamps it).
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.thread = thread;
+            s.adapter = adapter;
+            if let Ok(mut t) = s.turn_started_at.lock() {
+                *t = None;
+            }
+            if let Ok(mut a) = s.latest_activity.lock() {
+                *a = None;
+            }
+        }
+        // Drop the stale pump (its task is already ending — it was bound to the
+        // now-closed transport) so spawn_event_pump installs a fresh one on the
+        // resumed transport (it early-returns while a handle is still keyed).
+        if let Some(old) = self.event_pumps.remove(session_id) {
+            old.abort();
+        }
+        self.spawn_event_pump(session_id);
+        tracing::info!(
+            session_id,
+            project = %project,
+            role = %role,
+            "ccteam-im: resumed dead session in place (child had exited)"
+        );
+        Ok(())
+    }
+
+    /// Probe the session's liveness and transparently [`resume_dead_session`] it
+    /// if its child has died. A no-op for a live session (the hot path) and for
+    /// adapters that never silently die (default `thread_is_live` → `true`).
+    /// Shared by both submit legs so a dead child is recovered uniformly before
+    /// either a turn or a `/command` reaches the adapter — closing the
+    /// "stream-json writer closed (child exited)" send-failure path.
+    async fn ensure_session_live(&mut self, session_id: &str) -> Result<()> {
+        let alive = match self.sessions.get(session_id) {
+            Some(s) => s.adapter.thread_is_live(&s.thread),
+            // Missing → let the caller surface its own missing-session error.
+            None => return Ok(()),
+        };
+        if !alive {
+            self.resume_dead_session(session_id).await?;
+        }
+        Ok(())
+    }
+
     /// Shared submit core (sid already resolved). A single-line `/command` is a
     /// session directive interpreted by the owning adapter — the only thing
     /// that knows its vendor's command surface (`/model` → `set_model`, etc.);
@@ -2590,12 +2694,16 @@ impl Gateway {
     /// drained answer; each caller takes the leg it needs (IM returns the
     /// replies; the web/MCP leg returns the turn id and SSE-emits the receipts).
     async fn submit_resolved(
-        &self,
+        &mut self,
         chat: &ChatKey,
         session_id: &str,
         message_id: &str,
         payload: String,
     ) -> Result<SubmitResult> {
+        // Self-heal first: if the child died (crash / OOM / long idle), resume
+        // it by sid BEFORE driving the adapter, so a turn or `/command` lands on
+        // a live transport instead of failing "writer closed (child exited)".
+        self.ensure_session_live(session_id).await?;
         if let Some(directive) = parse_session_directive(&payload) {
             let replies = self.dispatch_directive(chat, session_id, directive).await?;
             return Ok(SubmitResult::Directive(replies));
@@ -4918,6 +5026,11 @@ mod tests {
         /// order, so the `/interrupt` test can assert the gateway invoked the
         /// adapter's interrupt (not destroy).
         interrupts: Arc<Mutex<Vec<String>>>,
+        /// Liveness reported by `thread_is_live`. A test flips this to `false`
+        /// to simulate the child exiting out from under a held handle (crash /
+        /// OOM / long idle); `start_thread` flips it back `true` so a resume
+        /// "revives" it — exactly the stream-json dead-child → resume case.
+        live: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Default for FakeAdapter {
@@ -4943,6 +5056,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
+                live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
         }
 
@@ -4989,6 +5103,8 @@ mod tests {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.spawn_modes.lock().await.push(ctx.permission_mode);
             self.spawn_secrets.lock().await.push(ctx.secret.clone());
+            // A fresh/resumed child is alive.
+            self.live.store(true, Ordering::SeqCst);
             Ok(ThreadHandle {
                 vendor: self.vendor,
                 mode: ExecutionMode::Chat,
@@ -5104,6 +5220,10 @@ mod tests {
             self.interrupts.lock().await.push(h.identity.clone());
             Ok(())
         }
+
+        fn thread_is_live(&self, _h: &ThreadHandle) -> bool {
+            self.live.load(Ordering::SeqCst)
+        }
     }
 
     #[tokio::test]
@@ -5180,6 +5300,74 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    /// Dead-child recovery: when a session's underlying child has exited out
+    /// from under the held handle (stream-json crash / OOM / long idle —
+    /// `thread_is_live` → false), the NEXT turn must transparently
+    /// resume-by-session-id (re-`start_thread`, SAME sid) and land, instead of
+    /// failing "stream-json writer closed (child exited)". Driven via
+    /// `submit_to_sid`, the shared `submit_resolved` self-heal both user-entry
+    /// legs (web + IM) funnel through. Killed twice to prove it's repeatable,
+    /// not a one-shot.
+    #[tokio::test]
+    async fn gateway_resumes_dead_session_on_next_turn() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+
+        // First turn lands on the freshly-spawned child (one start_thread).
+        gateway.submit_to_sid("s1", "first".into()).await.unwrap();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // The child dies out from under the handle.
+        fake.live.store(false, Ordering::SeqCst);
+
+        // The next turn self-heals — resume (a 2nd start_thread) + submit, SAME
+        // sid, single session (NOT a fresh `/new`).
+        let turn = gateway.submit_to_sid("s1", "second".into()).await.unwrap();
+        assert!(
+            turn.starts_with("turn-alpha-reviewer-s1"),
+            "resume keeps the sid stable: {turn}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "dead child resumed in place (start_thread called again)"
+        );
+        assert!(
+            fake.live.load(Ordering::SeqCst),
+            "the resume revived the child"
+        );
+        assert_eq!(gateway.session_views().len(), 1, "still one session");
+        assert_eq!(gateway.session_views()[0].sid, "s1");
+
+        // Repeatable: kill it again, drive another turn — a 3rd start_thread.
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.submit_to_sid("s1", "third".into()).await.unwrap();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 3, "resumed again");
+
+        // Every turn reached the adapter against the stable identity (and a
+        // LIVE session never re-spawns — exactly 3 starts for 3 deaths, no
+        // spurious resumes on the healthy first turn).
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[
+                ("alpha-reviewer-s1".to_string(), "first".to_string()),
+                ("alpha-reviewer-s1".to_string(), "second".to_string()),
+                ("alpha-reviewer-s1".to_string(), "third".to_string()),
+            ]
+        );
     }
 
     /// `/interrupt` stops the running turn WITHOUT destroying the session — the

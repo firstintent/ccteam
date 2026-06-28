@@ -1048,6 +1048,20 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         })
     }
 
+    /// A stream-json child can exit out from under a held handle (crash / OOM /
+    /// long idle): the [`LiveSession`] then lingers in the registry with a
+    /// CLOSED transport. Liveness = a live session whose transport has not
+    /// signalled close. A missing entry (idle-released / post-`close_thread`) is
+    /// also "not live" → the gateway resumes via the resume-aware `start_thread`.
+    /// Deliberately does NOT gate on `is_initialized()`: claude emits
+    /// `system:init` only on the FIRST turn, so a freshly-spawned-but-unturned
+    /// session is live yet uninitialized.
+    fn thread_is_live(&self, h: &ThreadHandle) -> bool {
+        self.lookup(&h.identity)
+            .map(|live| !live.transport.is_session_closed())
+            .unwrap_or(false)
+    }
+
     async fn submit_turn(
         &self,
         h: &ThreadHandle,

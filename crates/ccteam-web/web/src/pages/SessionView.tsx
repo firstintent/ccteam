@@ -166,9 +166,12 @@ export default function SessionView({
       setBusyMark(doneCount);
       submitTurn(sid, content).catch((e) => {
         setBusyMark(null);
+        const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
           kind: "system",
-          content: `发送失败: ${e instanceof Error ? e.message : "unknown"}`,
+          // The server already returns a fully-localized "发送失败: …。下一步: …"
+          // message; only prefix raw/transport errors so it never doubles up.
+          content: detail.startsWith("发送失败") ? detail : `发送失败: ${detail}`,
         });
       });
     },

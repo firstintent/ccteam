@@ -871,6 +871,22 @@ pub trait HarnessAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Cheap liveness probe: is this thread's underlying process / channel
+    /// still alive and able to accept a turn RIGHT NOW? Default `true`.
+    ///
+    /// Adapters whose thread can silently die out from under a held
+    /// [`ThreadHandle`] — the stream-json `claude` child exiting on crash /
+    /// OOM / a long idle window — override this so the gateway can probe before
+    /// submitting and transparently RESUME-by-session-id (re-`start_thread`,
+    /// which is resume-aware) instead of shipping the turn into a closed pipe
+    /// and surfacing a "writer closed (child exited)" send failure. A `false`
+    /// answer means "needs resume" (the conversation is recoverable from its
+    /// transcript), NOT "gone forever". Must NOT block / do IO — it is called
+    /// on the hot submit path.
+    fn thread_is_live(&self, _h: &ThreadHandle) -> bool {
+        true
+    }
+
     /// Interrupt the session's CURRENTLY-RUNNING turn **without destroying
     /// the session** — the context survives, so the user can immediately
     /// `/model` switch / send a follow-up. This is the non-destructive twin
