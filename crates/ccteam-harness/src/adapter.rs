@@ -949,6 +949,15 @@ pub enum HarnessError {
     /// Generic submit failure (turn rejected by the harness).
     #[error("submit failed: {0}")]
     SubmitFailed(String),
+    /// The thread's underlying process / channel has died and the turn was
+    /// **not** delivered — distinct from [`Self::SubmitFailed`] (a turn the
+    /// harness actively *rejected*, which must NOT be blindly retried). The
+    /// caller may resume-by-session-id and retry EXACTLY once; because nothing
+    /// was sent, the retry cannot double-submit. stream-json returns this when
+    /// its `claude` child has exited (registry miss / writer closed) before the
+    /// line was handed off.
+    #[error("thread died: {0}")]
+    ThreadDied(String),
     /// Unrecoverable IO error (filesystem reservation, etc.).
     #[error("io error: {0}")]
     Io(String),

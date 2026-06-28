@@ -1068,8 +1068,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
         let Some(live) = self.lookup(&h.identity) else {
-            return Err(HarnessError::SubmitFailed(format!(
-                "stream-json session not live: {} (resume_thread / start_thread first)",
+            // Registry miss = the session was idle-released / closed: nothing was
+            // sent, so this is a recoverable ThreadDied (caller resumes + retries
+            // once), not a hard SubmitFailed.
+            return Err(HarnessError::ThreadDied(format!(
+                "stream-json session not live: {} (needs resume)",
                 h.identity
             )));
         };
@@ -1092,7 +1095,10 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         live.transport
             .send_line(protocol::user_text_line(&text))
             .await
-            .map_err(|e| HarnessError::SubmitFailed(format!("stream-json send: {e:#}")))?;
+            // Writer closed = the child exited mid-handoff (the probe→send
+            // race): the line was NOT delivered, so it's a recoverable
+            // ThreadDied the gateway resumes + retries once.
+            .map_err(|e| HarnessError::ThreadDied(format!("stream-json send: {e:#}")))?;
 
         // Synthesize a turn id (the pump keys turns.jsonl off its own seq;
         // this id is only for adapter-side correlation / logs).

@@ -1818,20 +1818,17 @@ impl Gateway {
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
         let secret = ccteam_core::session_secret::mint();
-        let adapter = (self.adapter_factory)(vendor, protocol);
-        let thread = adapter
-            .start_thread(
-                &AgentSpecBrief { role: role.clone() },
-                &SpawnCtx {
-                    slug: project.clone(),
-                    sid: id.clone(),
-                    cwd: cwd.clone(),
-                    project_dir: cwd,
-                    extra_args: vec![],
-                    model_id: model_id.clone(),
-                    permission_mode,
-                    secret: secret.clone(),
-                },
+        let (adapter, thread) = self
+            .spawn_session_thread(
+                vendor,
+                protocol,
+                &role,
+                &project,
+                &id,
+                cwd,
+                model_id.clone(),
+                permission_mode,
+                secret.clone(),
             )
             .await?;
         self.sessions.insert(
@@ -1959,25 +1956,22 @@ impl Gateway {
         }
         let _ = old_adapter.close_thread(&old_thread).await;
 
-        let adapter = (self.adapter_factory)(vendor, protocol);
         // v0.8.7 review-fix (R-M1) — a `/role` switch closes the old pane and
         // spawns a brand-new one, so mint a FRESH secret: the new pane's env
         // gets it, and the in-place record below stores the same value, keeping
         // pane-env and gate-map in lockstep.
         let secret = ccteam_core::session_secret::mint();
-        let thread = adapter
-            .start_thread(
-                &AgentSpecBrief { role: role.clone() },
-                &SpawnCtx {
-                    slug: project.clone(),
-                    sid: sid.clone(),
-                    cwd: cwd.clone(),
-                    project_dir: cwd,
-                    extra_args: vec![],
-                    model_id: model_id.clone(),
-                    permission_mode,
-                    secret: secret.clone(),
-                },
+        let (adapter, thread) = self
+            .spawn_session_thread(
+                vendor,
+                protocol,
+                &role,
+                &project,
+                &sid,
+                cwd,
+                model_id.clone(),
+                permission_mode,
+                secret.clone(),
             )
             .await?;
         // Replace the record in place: same sid, new role/handle/thread, fresh
@@ -2592,6 +2586,11 @@ impl Gateway {
     /// (already ending on the closed transport) is dropped and a fresh one is
     /// bound to the resumed transport. NOT a `/new`: same sid, same identity, no
     /// fresh context.
+    ///
+    /// LOCK SCOPE: like `start_session` / `switch_current_role`, this awaits the
+    /// spawn while holding the coarse gateway lock, so a slow resume briefly
+    /// stalls other gateway ops. Acceptable (one on-demand spawn, same as `/new`
+    /// / `/role`); finer per-session locking is a deferred concurrency refactor.
     async fn resume_dead_session(&mut self, session_id: &str) -> Result<()> {
         let (project, role, vendor, protocol, permission_mode, secret) = {
             let s = self
@@ -2615,40 +2614,32 @@ impl Gateway {
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
-        let role_detail = ensure_role_exists(&cwd, &role)?;
-        let model_id = role_model_id(role_detail.as_ref());
-        let adapter = (self.adapter_factory)(vendor, protocol);
-        let thread = adapter
-            .start_thread(
-                &AgentSpecBrief { role: role.clone() },
-                &SpawnCtx {
-                    slug: project.clone(),
-                    sid: session_id.to_string(),
-                    cwd: cwd.clone(),
-                    project_dir: cwd,
-                    extra_args: vec![],
-                    model_id,
-                    permission_mode,
-                    // Reuse the existing secret: the resumed child's env is
-                    // re-stamped with it, so pane-env and the cto-gate map stay
-                    // in lockstep (no fresh mint → no stored-secret update).
-                    secret,
-                },
+        let model_id = role_model_id(ensure_role_exists(&cwd, &role)?.as_ref());
+        // Reuse the existing secret: the resumed child's env is re-stamped with
+        // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
+        // no stored-secret update).
+        let (adapter, thread) = self
+            .spawn_session_thread(
+                vendor,
+                protocol,
+                &role,
+                &project,
+                session_id,
+                cwd,
+                model_id,
+                permission_mode,
+                secret,
             )
             .await?;
-        // Swap the fresh handle/adapter in place — preserves owner / handle /
-        // reply_to / all Arc-shared counters. Clear the stale in-flight turn
-        // tracking so `/status` drops the resumed session from 🔴 STUCK to 🟢
-        // idle (the dead child's turn is over; the next submit re-stamps it).
+        // Swap the fresh handle/adapter into the existing GatewaySession in
+        // place — every Arc-shared cell (owner / reply_to / counters) survives.
+        // Turn lifecycle (turn_started_at / latest_activity) is owned by the
+        // submit flow + the pump, so resume leaves it ALONE: the turn path
+        // re-stamps turn_started_at itself, and clearing it here would race the
+        // in-flight reactive retry (a turn IS running when that path resumes).
         if let Some(s) = self.sessions.get_mut(session_id) {
             s.thread = thread;
             s.adapter = adapter;
-            if let Ok(mut t) = s.turn_started_at.lock() {
-                *t = None;
-            }
-            if let Ok(mut a) = s.latest_activity.lock() {
-                *a = None;
-            }
         }
         // Drop the stale pump (its task is already ending — it was bound to the
         // now-closed transport) so spawn_event_pump installs a fresh one on the
@@ -2666,12 +2657,57 @@ impl Gateway {
         Ok(())
     }
 
+    /// Build the [`SpawnCtx`] for a session thread and start it via the
+    /// (vendor, protocol) adapter — the SINGLE assembly point every spawn site
+    /// shares (fresh `/new` `start_session`, `/role` re-spawn
+    /// `switch_current_role`, dead-child [`resume_dead_session`]) so the ctx
+    /// fields can't drift between them. Returns the bound adapter + handle; the
+    /// caller records them (insert a fresh [`GatewaySession`], or swap in place).
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_session_thread(
+        &self,
+        vendor: AgentVendor,
+        protocol: SessionProtocol,
+        role: &str,
+        slug: &str,
+        sid: &str,
+        cwd: PathBuf,
+        model_id: Option<String>,
+        permission_mode: PermissionMode,
+        secret: String,
+    ) -> Result<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle), HarnessError> {
+        let adapter = (self.adapter_factory)(vendor, protocol);
+        let thread = adapter
+            .start_thread(
+                &AgentSpecBrief {
+                    role: role.to_string(),
+                },
+                &SpawnCtx {
+                    slug: slug.to_string(),
+                    sid: sid.to_string(),
+                    cwd: cwd.clone(),
+                    project_dir: cwd,
+                    extra_args: vec![],
+                    model_id,
+                    permission_mode,
+                    secret,
+                },
+            )
+            .await?;
+        Ok((adapter, thread))
+    }
+
     /// Probe the session's liveness and transparently [`resume_dead_session`] it
     /// if its child has died. A no-op for a live session (the hot path) and for
     /// adapters that never silently die (default `thread_is_live` → `true`).
-    /// Shared by both submit legs so a dead child is recovered uniformly before
-    /// either a turn or a `/command` reaches the adapter — closing the
-    /// "stream-json writer closed (child exited)" send-failure path.
+    ///
+    /// This PRE-CHECK guards the DIRECTIVE path (`/compact`, `/clear`, …): a
+    /// directive can have side effects, so it must NOT be blindly retried on a
+    /// failure — probe-then-dispatch is the safe shape. The TURN path takes the
+    /// opposite, race-free shape (submit → on [`HarnessError::ThreadDied`]
+    /// resume + retry once): a turn is idempotent on a dead-before-delivery
+    /// signal, so reacting to the failure closes the probe→send TOCTOU window a
+    /// pre-check inherently leaves open.
     async fn ensure_session_live(&mut self, session_id: &str) -> Result<()> {
         let alive = match self.sessions.get(session_id) {
             Some(s) => s.adapter.thread_is_live(&s.thread),
@@ -2700,11 +2736,11 @@ impl Gateway {
         message_id: &str,
         payload: String,
     ) -> Result<SubmitResult> {
-        // Self-heal first: if the child died (crash / OOM / long idle), resume
-        // it by sid BEFORE driving the adapter, so a turn or `/command` lands on
-        // a live transport instead of failing "writer closed (child exited)".
-        self.ensure_session_live(session_id).await?;
         if let Some(directive) = parse_session_directive(&payload) {
+            // Directive path: PROBE-and-resume a dead child before dispatching
+            // (a directive may have side effects → never blindly retried). The
+            // turn path below uses the race-free reactive shape instead.
+            self.ensure_session_live(session_id).await?;
             let replies = self.dispatch_directive(chat, session_id, directive).await?;
             return Ok(SubmitResult::Directive(replies));
         }
@@ -2756,15 +2792,49 @@ impl Gateway {
         // assistant side, so without this the user's message is lost on a
         // history reseed / session switch).
         let user_text = payload.clone();
+        // Submit with reactive resume-and-retry: a turn is idempotent on a
+        // `ThreadDied` (the child exited before the line was delivered), so on
+        // that signal resume-by-sid and retry EXACTLY once — closing the
+        // probe→send race a pre-check can't. Any other error (a real rejection /
+        // timeout) is surfaced as-is, never retried. Each attempt re-borrows the
+        // session so the retry sees the resumed thread/adapter.
         let submit_wait = gateway_submit_timeout_duration();
-        let turn_id = tokio::time::timeout(
-            submit_wait,
-            session
-                .adapter
-                .submit_turn(&session.thread, TurnInput::UserText(payload)),
-        )
-        .await
-        .map_err(|_| anyhow!("submit timed out after {submit_wait:?} for {session_id}"))??;
+        let mut attempt: u8 = 0;
+        let turn_id = loop {
+            attempt += 1;
+            let outcome = {
+                let session = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+                tokio::time::timeout(
+                    submit_wait,
+                    session
+                        .adapter
+                        .submit_turn(&session.thread, TurnInput::UserText(payload.clone())),
+                )
+                .await
+            };
+            match outcome {
+                Err(_) => {
+                    return Err(anyhow!(
+                        "submit timed out after {submit_wait:?} for {session_id}"
+                    ))
+                }
+                Ok(Ok(id)) => break id,
+                Ok(Err(HarnessError::ThreadDied(_))) if attempt == 1 => {
+                    self.resume_dead_session(session_id).await?;
+                    continue;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+            }
+        };
+        // Re-fetch the session (a retry may have swapped its thread/adapter) for
+        // the post-submit mirror + sink-less drain.
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
         self.mirror_user_turn(session, &user_text, &turn_id.0);
         let drained = self
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
@@ -5119,6 +5189,16 @@ mod tests {
             h: &ThreadHandle,
             input: TurnInput,
         ) -> Result<TurnId, HarnessError> {
+            // Model a stream-json child that has exited: a dead session's submit
+            // returns the recoverable ThreadDied WITHOUT delivering (so the
+            // gateway resumes + retries, and no double-submit is recorded). A
+            // resume revives `live` (start_thread sets it true).
+            if !self.live.load(Ordering::SeqCst) {
+                return Err(HarnessError::ThreadDied(format!(
+                    "fake child exited: {}",
+                    h.identity
+                )));
+            }
             let text = match input {
                 TurnInput::UserText(text) => text,
                 _ => String::new(),
@@ -5302,14 +5382,15 @@ mod tests {
         assert!(gateway.stop_session("s1").await.is_err());
     }
 
-    /// Dead-child recovery: when a session's underlying child has exited out
-    /// from under the held handle (stream-json crash / OOM / long idle —
-    /// `thread_is_live` → false), the NEXT turn must transparently
-    /// resume-by-session-id (re-`start_thread`, SAME sid) and land, instead of
-    /// failing "stream-json writer closed (child exited)". Driven via
-    /// `submit_to_sid`, the shared `submit_resolved` self-heal both user-entry
-    /// legs (web + IM) funnel through. Killed twice to prove it's repeatable,
-    /// not a one-shot.
+    /// Dead-child recovery on the TURN path (reactive): when a session's child
+    /// has exited out from under the held handle, `submit_turn` returns the
+    /// recoverable `HarnessError::ThreadDied`, and the gateway transparently
+    /// resumes-by-session-id (re-`start_thread`, SAME sid) and RETRIES once —
+    /// the turn lands instead of failing "stream-json writer closed". The turn
+    /// was never delivered on a ThreadDied, so the single retry can't
+    /// double-submit. Killed twice to prove it's repeatable, not a one-shot, and
+    /// that a LIVE session never re-spawns (3 starts for 3 deaths — no spurious
+    /// resume on the healthy first turn).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -5368,6 +5449,50 @@ mod tests {
                 ("alpha-reviewer-s1".to_string(), "third".to_string()),
             ]
         );
+    }
+
+    /// Dead-child recovery on the DIRECTIVE path (proactive): a `/command` is
+    /// NOT blindly retried (it may have side effects), so the gateway
+    /// PROBES `thread_is_live` and resumes-by-sid BEFORE dispatching. A `/model`
+    /// to a dead session therefore re-spawns (a 2nd start_thread) and the
+    /// directive reaches the live thread, rather than failing on the corpse.
+    #[tokio::test]
+    async fn gateway_resumes_dead_session_before_directive() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // The child dies; the next message is a directive, not a turn.
+        fake.live.store(false, Ordering::SeqCst);
+        let receipt = gateway
+            .submit_to_sid("s1", "/model opus-x".into())
+            .await
+            .unwrap();
+        assert_eq!(receipt, "directive:s1");
+
+        // The probe resumed the dead child (2nd start_thread) and the directive
+        // reached the resumed thread (recorded against the stable identity).
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "directive probe resumed the dead child before dispatch"
+        );
+        assert!(fake.live.load(Ordering::SeqCst), "resume revived the child");
+        let directives = fake.directives.lock().await;
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].0, "alpha-reviewer-s1");
+        assert_eq!(directives[0].1.name, "model");
     }
 
     /// `/interrupt` stops the running turn WITHOUT destroying the session — the
