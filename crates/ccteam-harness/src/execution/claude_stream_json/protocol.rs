@@ -67,6 +67,22 @@ where
         .unwrap_or_default())
 }
 
+/// Deserialize a `String` field the vendor may send as an explicit `null`.
+/// `#[serde(default)]` only covers an ABSENT field — a present-but-`null`
+/// trips `invalid type: null, expected a string` and fails the WHOLE line
+/// parse, dropping the frame. claude does exactly this: a `system:status`
+/// line (e.g. `/compact` completion) ships `status: null`, and the
+/// task-lifecycle taps populate their string fields only contextually. Map
+/// null (and absent, via the paired `default`) → `""` so a contextual
+/// string field never fails the transport parse. Same forward-compat intent
+/// as [`de_command_names`].
+fn de_null_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 /// One entry from claude's `initialize` `response.models[]` — the REAL,
 /// vendor-supplied model list (claude has no `model/list` RPC; the
 /// capability ships on the initialize control_response). `value` is exactly
@@ -86,9 +102,9 @@ pub struct ClaudeModelOption {
 /// `system` message body. Only `subtype: "init"` is meaningful today.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SystemMsg {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub subtype: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub session_id: String,
     #[serde(default)]
     pub model: Option<String>,
@@ -118,19 +134,22 @@ pub struct SystemMsg {
     // reads are typed; all default-absent so non-task system lines (init /
     // commands_changed) still parse unchanged.
     /// `task_*.task_id` — the stable id (add on `task_started`, remove on terminal).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub task_id: String,
     /// `task_started.subagent_type` (e.g. `general-purpose`, `code-reviewer`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub subagent_type: String,
     /// `task_started.description` — the task's short label.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub description: String,
     /// `task_started.task_type` (e.g. `local_agent`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_null_string")]
     pub task_type: String,
-    /// `task_notification.status` (terminal, e.g. `completed`/`failed`).
-    #[serde(default)]
+    /// `task_notification.status` (terminal, e.g. `completed`/`failed`). claude
+    /// also ships `status: null` on a non-task `system:status` line (e.g.
+    /// `/compact` completion) — `de_null_string` maps that to `""` so the frame
+    /// parses instead of failing the whole transport line.
+    #[serde(default, deserialize_with = "de_null_string")]
     pub status: String,
     /// `task_updated.patch` (`{status, end_time}`) — read `patch.status` for removal.
     #[serde(default)]
@@ -372,6 +391,48 @@ mod tests {
                     s.slash_commands,
                     vec!["goal".to_string(), "review".to_string()]
                 );
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_system_status_with_null_status_field() {
+        // Regression (prod crash log 2026-06-29): claude ships a `system:status`
+        // line with `status: null` on `/compact` completion. `#[serde(default)]`
+        // only covers an ABSENT field — a present-but-null `status` tripped
+        // `invalid type: null, expected a string` and failed the WHOLE line
+        // parse, dropping the frame (recurred on every /compact). It MUST parse
+        // now (null → ""), and the line is a non-task system subtype so the
+        // status tap ignores it.
+        let line = r#"{"type":"system","subtype":"status","status":null,
+            "compact_result":"success","session_id":"43fd36b9-f245-489c-a38e-03d7a9b1acda",
+            "uuid":"555adfa1-202c-473a-a6a0-f4a4d2bfb64b"}"#;
+        let out: Outbound = serde_json::from_str(line).expect("must parse, not error");
+        match out {
+            Outbound::System(s) => {
+                assert_eq!(s.subtype, "status");
+                assert_eq!(s.status, "");
+                assert_eq!(s.session_id, "43fd36b9-f245-489c-a38e-03d7a9b1acda");
+                assert!(!s.is_init());
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_string_fields_across_system_msg_dont_fail_parse() {
+        // The whole contextual-string set is null-tolerant — a vendor build that
+        // sends any of them as an explicit null must not fail the transport line.
+        let line = r#"{"type":"system","subtype":null,"session_id":null,
+            "task_id":null,"subagent_type":null,"description":null,"task_type":null,
+            "status":null}"#;
+        let out: Outbound = serde_json::from_str(line).expect("must parse, not error");
+        match out {
+            Outbound::System(s) => {
+                assert_eq!(s.subtype, "");
+                assert_eq!(s.task_id, "");
+                assert_eq!(s.status, "");
             }
             other => panic!("expected System, got {other:?}"),
         }
