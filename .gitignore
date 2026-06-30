@@ -33,9 +33,9 @@ notes/
 graphify-out/
 
 # Version archives + research notes — kept local-only, not tracked (slim the repo)
-docs/versions/
-docs/research/
+docs-local/
 
+nohup.out
 # Local-only env file — never commit secrets.
 .env
 
