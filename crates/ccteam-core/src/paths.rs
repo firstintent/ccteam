@@ -86,9 +86,12 @@ impl CcteamPaths {
         self.root.join("cache")
     }
 
-    /// `~/.ccteam/state/im/` — the IM daemon's state (gateway-state.json, bot
-    /// registry, outbound ledger). Was the top-level `imd/` — the `im/` vs `imd/`
-    /// name clash is gone (global creds are now `secrets/im-credentials.json`).
+    /// `~/.ccteam/state/im/` — the IM daemon's state (bot registry + outbound
+    /// ledger). Was the top-level `imd/` — the `im/` vs `imd/` name clash is gone
+    /// (global creds are now `secrets/im-credentials.json`). v0.8.21 Wave-2: the
+    /// gateway routing snapshot moved out to `state/gateway/routing.json` and the
+    /// sid counter to `state/sessions/next-sid` (the old `gateway-state.json`
+    /// session store is retired; `meta.json` is the session SoT).
     pub fn im_state_dir(&self) -> PathBuf {
         self.state_dir().join("im")
     }

@@ -4,9 +4,11 @@
 //! needed to list and resume a session after it leaves the gateway live map
 //! (stopped, daemon-restarted, or adopted from an external vendor session).
 //!
-//! This is the v0.8.21 Wave-1 additive layer; gateway-state.json is still the
-//! live cache. Wave-2 makes meta.json the sole SoT and retires the `sessions`
-//! vec from gateway-state.json.
+//! v0.8.21 Wave-2 made this the SOLE session SoT: `gateway-state.json`'s
+//! `sessions` vec is retired. The daemon now persists only routing
+//! (`state/gateway/routing.json` — per-chat focus + the live-set) and the
+//! monotonic sid counter (`state/sessions/next-sid`); on restart it cold-start
+//! rebuilds the live map from these `meta.json` files.
 
 use std::path::{Path, PathBuf};
 

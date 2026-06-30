@@ -55,36 +55,50 @@ fn append_event(paths: &CcteamPaths, slug: &str, event: Value) {
 }
 
 fn write_one_tracked_session(root: &std::path::Path) {
-    let path = ccteam_im::gateway_state_path_in(root);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // v0.8.21 Wave-2 — a "tracked" session is now per-session meta.json + a
+    // routing.json live-set (projects enumerated from config.yaml), not the
+    // retired gateway-state.json sessions vec. Seed a COMPLETE one in THIS home
+    // so the test proves the status route reads its OWN `app.paths.root` and
+    // does NOT leak sessions from an unrelated CCTEAM_HOME.
+    let project_dir = root.join("outside-proj");
+    fs::create_dir_all(&project_dir).unwrap();
+    ccteam_core::config::upsert_project(
+        root,
+        ccteam_core::config::ProjectEntry {
+            slug: "outside".to_string(),
+            path: project_dir.clone(),
+            team: "dev".to_string(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+    let now = "2026-06-08T00:00:00Z".to_string();
+    ccteam_harness::write_session_meta(
+        &project_dir,
+        &ccteam_harness::SessionMeta {
+            sid: "s1".to_string(),
+            slug: "outside".to_string(),
+            vendor: ccteam_harness::AgentVendor::Claude,
+            protocol: ccteam_harness::SessionProtocol::StreamJson,
+            role: "cto".to_string(),
+            permission_mode: ccteam_harness::PermissionMode::Skip,
+            owner: "user:outside-chat".to_string(),
+            vendor_uuid: String::new(),
+            host: "local".to_string(),
+            created_at: now.clone(),
+            last_active: now,
+            origin: ccteam_harness::SessionOrigin::Ccteam,
+        },
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("state").join("gateway")).unwrap();
     fs::write(
-        path,
+        root.join("state").join("gateway").join("routing.json"),
         serde_json::to_vec_pretty(&json!({
             "default_project": "outside",
             "current_project": [],
             "current_session": [],
-            "sessions": [{
-                "id": "s1",
-                "owner": {
-                    "channel": "web",
-                    "chat_id": "outside-chat",
-                    "user_id": "outside-user"
-                },
-                "project": "outside",
-                "role": "cto",
-                "vendor": "claude",
-                "permission_mode": "skip",
-                "secret": "outside-secret",
-                "handle": "outside-handle",
-                "thread": {
-                    "vendor": "claude",
-                    "mode": "chat",
-                    "identity": "ccteam-chat-outside-s1",
-                    "started_at": "2026-06-08T00:00:00Z",
-                    "raw_extras": {}
-                }
-            }],
-            "next_session": 2
+            "live_sids": ["s1"],
         }))
         .unwrap(),
     )

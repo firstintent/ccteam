@@ -30,9 +30,9 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.8.21` |
-| 测试 baseline | `2104/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时),非回归 —— 单跑/`--no-fail-fast` 必过 |
+| 测试 baseline | `2105/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时),非回归 —— 单跑/`--no-fail-fast` 必过 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.21 任意历史会话恢复已落地 dev(未 tag、未部署)** —— per-session `meta.json`(spawn 写、`/stop` 不删、扛 daemon 重启)+ 历史会话列表(web 展开/IM `/sessions`)+ web/IM cold-resume(`/use <sid>` 与 `POST …/resume`,按 sid 从 meta 重建)+ 外部原生 Claude 会话收编(import:读 jsonl tail 的 cwd 内容发现 + uuid 归属校验)。恢复梯形 `--resume`/re-seed 复用既有 harness。**逐版改动史 = `git log` + `docs/versions/v0-X-Y/README.md`(冻结归档);协议/实现一律以代码为准,本表只留当前标题。** |
+| 当前在做 | **v0.8.21 任意历史会话恢复 + gateway-state.json 退役已落地 dev(未 tag、未部署)** —— **Wave-1**:per-session `meta.json`(spawn 写、`/stop` 不删、扛 daemon 重启)+ 历史会话列表(web 展开/IM `/sessions`)+ web/IM cold-resume(`/use <sid>` 与 `POST …/resume`,按 sid 从 meta 重建)+ 外部原生 Claude 会话收编(import:读 jsonl tail 的 cwd 内容发现 + uuid 归属校验)。**Wave-2(内部重构,breaking 无迁移)**:`gateway-state.json` 的 `sessions` vec + `SavedGatewaySession` 退役 —— `meta.json` 成 session 唯一 SoT;daemon 只持久 **路由**(`state/gateway/routing.json` = per-chat 焦点 + `live_sids`)+ **单调 sid 计数**(`state/sessions/next-sid`,独立文件,扛 routing/meta 清空不回退)。重启 = 所有 live session **cold-start 重 spawn**(`rebuild_session_from_meta` 单一重建路径,`--resume` 恢复对话;secret 重 mint);`tracked_chat_sessions`/`session ls`/`status` 改读 routing+meta。恢复梯形 `--resume`/re-seed 复用既有 harness。**逐版改动史 = `git log` + `docs/versions/v0-X-Y/README.md`(冻结归档);协议/实现一律以代码为准,本表只留当前标题。** |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 

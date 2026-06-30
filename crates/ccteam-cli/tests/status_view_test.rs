@@ -2,9 +2,10 @@
 //!
 //! F3 rewrote `run_status` so the one-screen health view:
 //!   - nests each project's tracked sessions (role · vendor · status · sid)
-//!     under the project row, sourced from the daemon's persisted
-//!     `gateway-state.json` (the same out-of-process reader `session ls`
-//!     uses — `ccteam_im::gateway::tracked_chat_sessions`);
+//!     under the project row, sourced from the daemon's persisted routing.json
+//!     (live-set) ⋈ per-session `meta.json` (v0.8.21 Wave-2; the same
+//!     out-of-process reader `session ls` uses —
+//!     `ccteam_im::gateway::tracked_chat_sessions`);
 //!   - DROPS the legacy "recent events (last N)" section (and the
 //!     `--tail` arg);
 //!   - prints the web token as BARE hex plus a separate `web url:` line
@@ -12,9 +13,9 @@
 //!
 //! Driven through the real `ccteam status` binary with `CCTEAM_HOME`
 //! pointing at an ephemeral tempdir (project registered via on-disk
-//! `config.yaml` + `state.json`; sessions seeded via a hand-written
-//! `state/im/gateway-state.json`; token seeded via `web-token`). This pins
-//! the operator-facing text for host probe / CI greps.
+//! `config.yaml` + `state.json`; sessions seeded via `state/gateway/routing.json`
+//! (the live-set) + each session's `meta.json`; token seeded via `web-token`).
+//! This pins the operator-facing text for host probe / CI greps.
 
 use ccteam_core::state::ProjectState;
 use serde_json::json;
@@ -40,26 +41,19 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
     std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
     std::fs::create_dir_all(root.join("state").join("im")).unwrap();
 
-    // config.yaml — register the project so `collect_projects` finds it.
-    let cfg = serde_yaml::Value::Mapping({
-        let mut m = serde_yaml::Mapping::new();
-        m.insert(
-            "projects".into(),
-            serde_yaml::Value::Sequence(vec![{
-                let mut p = serde_yaml::Mapping::new();
-                p.insert("slug".into(), slug.into());
-                p.insert(
-                    "path".into(),
-                    project_dir.to_string_lossy().to_string().into(),
-                );
-                serde_yaml::Value::Mapping(p)
-            }]),
-        );
-        m
-    });
-    std::fs::write(
-        root.join("config.yaml"),
-        serde_yaml::to_string(&cfg).unwrap(),
+    // config.yaml — register the project (full ProjectEntry shape) so BOTH
+    // `collect_projects` AND the Wave-2 `tracked_chat_sessions` reader resolve
+    // it. The reader enumerates project dirs from config.yaml to locate each
+    // live sid's meta.json, so a partial entry (missing team/installed_at) would
+    // fail to parse and hide every session — use the canonical writer.
+    ccteam_core::config::append_project(
+        &root,
+        ccteam_core::config::ProjectEntry {
+            slug: slug.to_string(),
+            path: project_dir.clone(),
+            team: "dev".to_string(),
+            installed_at: chrono::Utc::now(),
+        },
     )
     .unwrap();
 
@@ -71,52 +65,54 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
     )
     .unwrap();
 
-    // state/im/gateway-state.json — one claude + one codex session for the project.
-    // Mirrors the `SavedGatewayState` serde shape (AgentVendor / ExecutionMode
-    // both `rename_all = "lowercase"`).
-    let owner = json!({ "channel": "telegram", "chat_id": "c1", "user_id": "u1" });
-    let thread = |vendor: &str| {
-        json!({
-            "vendor": vendor,
-            "mode": "chat",
-            "identity": format!("ccteam-chat-{slug}-sX"),
-            "started_at": "2026-01-01T00:00:00Z",
-            "raw_extras": {}
-        })
+    // v0.8.21 Wave-2 — the session SoT is now per-session meta.json + a
+    // routing.json carrying the live-set; `tracked_chat_sessions` reads
+    // routing.live_sids ⋈ each session's meta.json (projects via config.yaml).
+    // Seed one claude (reviewer) + one codex (builder) session for the project.
+    let write_meta = |sid: &str,
+                      role: &str,
+                      vendor: ccteam_harness::AgentVendor,
+                      mode: ccteam_harness::PermissionMode| {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let meta = ccteam_harness::SessionMeta {
+            sid: sid.to_string(),
+            slug: slug.to_string(),
+            vendor,
+            protocol: ccteam_harness::SessionProtocol::StreamJson,
+            role: role.to_string(),
+            permission_mode: mode,
+            owner: "telegram:c1".to_string(),
+            vendor_uuid: String::new(),
+            host: "local".to_string(),
+            created_at: now.clone(),
+            last_active: now,
+            origin: ccteam_harness::SessionOrigin::Ccteam,
+        };
+        ccteam_harness::write_session_meta(&project_dir, &meta).unwrap();
     };
-    let gw = json!({
-        "default_project": slug,
-        "current_project": [],
-        "current_session": [],
-        "next_session": 3,
-        "sessions": [
-            {
-                "id": "s1",
-                "owner": owner,
-                "project": slug,
-                "role": "reviewer",
-                "vendor": "claude",
-                "permission_mode": "skip",
-                "secret": "",
-                "handle": "reviewer",
-                "thread": thread("claude")
-            },
-            {
-                "id": "s2",
-                "owner": owner,
-                "project": slug,
-                "role": "builder",
-                "vendor": "codex",
-                "permission_mode": "hitl",
-                "secret": "",
-                "handle": "builder",
-                "thread": thread("codex")
-            }
-        ]
-    });
+    write_meta(
+        "s1",
+        "reviewer",
+        ccteam_harness::AgentVendor::Claude,
+        ccteam_harness::PermissionMode::Skip,
+    );
+    write_meta(
+        "s2",
+        "builder",
+        ccteam_harness::AgentVendor::Codex,
+        ccteam_harness::PermissionMode::Hitl,
+    );
+    // routing.json — the live-set the reader filters by.
+    std::fs::create_dir_all(root.join("state").join("gateway")).unwrap();
     std::fs::write(
-        root.join("state").join("im").join("gateway-state.json"),
-        serde_json::to_string_pretty(&gw).unwrap(),
+        root.join("state").join("gateway").join("routing.json"),
+        serde_json::to_string_pretty(&json!({
+            "default_project": slug,
+            "current_project": [],
+            "current_session": [],
+            "live_sids": ["s1", "s2"],
+        }))
+        .unwrap(),
     )
     .unwrap();
 

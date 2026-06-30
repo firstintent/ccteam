@@ -175,11 +175,9 @@ pub(crate) async fn handle_status(
         // Standalone web (no daemon gateway): fall back to the persisted route
         // table the CLI's `run_status` reads. A missing / unreadable file is an
         // empty list, never an error. No live map ⇒ no per-session fleet rows.
-        ccteam_im::gateway::tracked_chat_sessions(&ccteam_im::gateway_state_path_in(
-            &app.paths.root,
-        ))
-        .map(|rows| rows.len() as u32)
-        .unwrap_or(0)
+        ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
+            .map(|rows| rows.len() as u32)
+            .unwrap_or(0)
     };
     let (sessions_live, sessions_idle) = if daemon_healthy {
         (tracked_count, 0)

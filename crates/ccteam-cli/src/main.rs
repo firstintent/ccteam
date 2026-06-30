@@ -3605,8 +3605,7 @@ fn run_status() -> Result<()> {
 
     // Group tracked sessions by project slug. A missing / unreadable registry
     // is non-fatal — just an empty map (no sessions shown).
-    let state_path = ccteam_im::default_gateway_state_path();
-    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&paths.root).unwrap_or_default();
     let mut sessions_by_project: std::collections::BTreeMap<
         String,
         Vec<ccteam_im::gateway::TrackedSessionRow>,

@@ -827,7 +827,7 @@ fn build_gateway(
         root: crate::default_ccteam_root_public(),
         projects_root: projects_root.to_path_buf(),
     });
-    if let Err(err) = gateway.enable_persistence(crate::default_gateway_state_path()) {
+    if let Err(err) = gateway.enable_persistence(crate::default_ccteam_root_public()) {
         tracing::warn!(
             error = %err,
             "ccteam-im: failed to load gateway state; starting with empty route table"

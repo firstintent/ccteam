@@ -1201,8 +1201,7 @@ pub fn run_sessions() -> Result<()> {
 
     // A missing / unreadable registry is non-fatal: no tracked rows, every live
     // pane is then an orphan.
-    let state_path = ccteam_im::default_gateway_state_path();
-    let tracked = ccteam_im::gateway::tracked_chat_sessions(&state_path).unwrap_or_default();
+    let tracked = ccteam_im::gateway::tracked_chat_sessions(&paths.root).unwrap_or_default();
 
     print!("{}", render_sessions_table(&tracked, &live, daemon_up));
     Ok(())

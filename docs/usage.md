@@ -300,7 +300,9 @@ ccteam stop && nohup ccteam start >~/ccteam.log 2>&1 &
 ```bash
 tail -120 ~/ccteam.log                          # daemon 日志(看你重定向到哪)
 cat ~/.ccteam/config.yaml                        # 项目登记(slug → 路径)
-cat ~/.ccteam/state/im/gateway-state.json        # 网关会话状态
+cat ~/.ccteam/state/gateway/routing.json         # 网关路由(每个 chat 的当前项目/会话 + live 集)
+cat ~/.ccteam/state/sessions/next-sid            # 单调 sid 计数(永不复用)
+cat <project>/.ccteam/chat/<sid>/meta.json       # 会话描述(SoT:vendor/role/owner/uuid…)
 tail ~/.ccteam/state/im/outbound.jsonl           # 出站 ledger(重启重放)
 cat <project>/.ccteam/progress.jsonl             # 项目业务事件(状态权威)
 ```

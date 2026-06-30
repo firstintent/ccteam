@@ -133,22 +133,40 @@ pub fn default_ccteam_root_public() -> PathBuf {
     default_ccteam_root()
 }
 
-/// Canonical on-disk path of the gateway route-table snapshot
-/// (`<ccteam_root>/state/im/gateway-state.json`). The daemon persists its tracked
-/// sessions here; the read-only `ccteam sessions` CLI view loads them back via
-/// [`gateway::tracked_chat_session_names`]. Both sides resolve the path through
-/// this one helper so they never drift.
-pub fn gateway_state_path_in(ccteam_root: &Path) -> PathBuf {
+/// v0.8.21 Wave-2 — canonical path of the gateway ROUTING snapshot
+/// (`<ccteam_root>/state/gateway/routing.json`). Holds only transient per-chat
+/// routing (`default_project` / `current_project` / `current_session`) plus the
+/// set of sids that were live at last persist (`live_sids`). The session
+/// CONTENT lives in each session's `meta.json` (the SoT); this file is just the
+/// daemon's runtime focus snapshot. Replaces the retired `gateway-state.json`
+/// `sessions` vec.
+pub fn routing_state_path_in(ccteam_root: &Path) -> PathBuf {
     ccteam_root
         .join("state")
-        .join("im")
-        .join("gateway-state.json")
+        .join("gateway")
+        .join("routing.json")
 }
 
-/// Resolve the gateway route-table snapshot for the current user
-/// (`~/.ccteam/state/im/gateway-state.json`).
-pub fn default_gateway_state_path() -> PathBuf {
-    gateway_state_path_in(&default_ccteam_root())
+/// Resolve the gateway routing snapshot for the current user
+/// (`~/.ccteam/state/gateway/routing.json`).
+pub fn default_routing_state_path() -> PathBuf {
+    routing_state_path_in(&default_ccteam_root())
+}
+
+/// v0.8.21 Wave-2 — canonical path of the monotonic session-id counter
+/// (`<ccteam_root>/state/sessions/next-sid`, plain `u64` text). Kept in its OWN
+/// file — NOT inside routing.json and NOT derived from `max(meta sid)` — so the
+/// "sid is monotonic, never reused" red line holds even if routing.json or the
+/// on-disk meta.json set is wiped (a cleared focus table or purged history must
+/// never let an `s<N>` be handed out twice).
+pub fn next_sid_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("state").join("sessions").join("next-sid")
+}
+
+/// Resolve the session-id counter for the current user
+/// (`~/.ccteam/state/sessions/next-sid`).
+pub fn default_next_sid_path() -> PathBuf {
+    next_sid_path_in(&default_ccteam_root())
 }
 
 /// `<ccteam_root>/state/im/registry/` — base registry dir given an explicit

@@ -171,7 +171,19 @@ pub struct Gateway {
         dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync> + Send + Sync,
     >,
     default_project: String,
-    state_path: Option<PathBuf>,
+    /// v0.8.21 Wave-2 — persisted gateway ROUTING snapshot
+    /// (`~/.ccteam/state/gateway/routing.json`): per-chat focus + the set of
+    /// sids that were live at last persist. Session CONTENT lives in each
+    /// session's `meta.json` (the SoT), never here. `None` ⇒ in-memory only.
+    routing_path: Option<PathBuf>,
+    /// v0.8.21 Wave-2 — persisted monotonic session-id counter
+    /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
+    /// reused" survives a wiped routing table / purged meta.json set.
+    next_sid_path: Option<PathBuf>,
+    /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
+    /// `load_state` (sync) for the async `resume_restored_sessions` step to
+    /// cold-start rebuild from their `meta.json`. Drained once on startup.
+    restore_pending: Vec<String>,
     projects: BTreeMap<String, PathBuf>,
     current_project: BTreeMap<ChatKey, String>,
     /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
@@ -556,64 +568,47 @@ pub struct SessionResolve {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SavedGatewayState {
-    default_project: String,
-    current_project: Vec<SavedGatewayRoute>,
-    current_session: Vec<SavedGatewayRoute>,
-    sessions: Vec<SavedGatewaySession>,
-    next_session: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct SavedGatewayRoute {
     chat: ChatKey,
     value: String,
 }
 
+/// v0.8.21 Wave-2 — the gateway's persisted ROUTING snapshot
+/// (`~/.ccteam/state/gateway/routing.json`). Holds only the transient per-chat
+/// focus (`default_project` / `current_project` / `current_session`) plus
+/// `live_sids` (the set of sessions resident in the live map at last persist).
+/// Session CONTENT is NOT here — it lives in each session's `meta.json` (the
+/// SoT); on restart `live_sids` is cold-start rebuilt from those meta files.
+/// This struct replaces the retired `SavedGatewayState.sessions` vec.
 #[derive(Debug, Serialize, Deserialize)]
-struct SavedGatewaySession {
-    id: String,
-    owner: ChatKey,
-    project: String,
-    role: String,
-    vendor: AgentVendor,
-    /// v0.8.11 E2 — persisted protocol axis so a daemon restart re-binds the
-    /// same adapter. `#[serde(default)]` ⇒ pre-existing state files (no field)
-    /// restore as `StreamJson` (the new default). NOTE: such an old session's
-    /// live handle is a tmux handle; resume re-spawns it under the default
-    /// protocol — acceptable for pre-v0.8.11 state (dev-stage, no migration).
-    #[serde(default)]
-    protocol: SessionProtocol,
-    /// v0.8.11 §七 ② — persisted host axis (reserved). `#[serde(default)]` ⇒
-    /// empty restores; normalized to `local` on load.
-    #[serde(default)]
-    host: String,
-    /// v0.8.7 W2 (DB.1) — persisted permission posture so a daemon restart
-    /// re-spawns a hitl session as hitl. `#[serde(default)]` ⇒ already-saved
-    /// state files (no field) restore as `Skip`, matching prior behavior.
-    #[serde(default)]
-    permission_mode: PermissionMode,
-    /// v0.8.7 review-fix (R-M1) — persisted per-session cto-gate secret so the
-    /// restored in-memory map still matches the live pane's `CCTEAM_CHAT_SECRET`
-    /// (and the recreate-fallback re-spawn re-injects the SAME value).
-    /// `#[serde(default)]` ⇒ pre-existing state files (no field) restore as
-    /// `""`; such a session simply can't pass the secret check until re-spawned
-    /// — fail-closed, never fail-open.
-    #[serde(default)]
-    secret: String,
-    handle: String,
-    thread: ThreadHandle,
+struct RoutingState {
+    default_project: String,
+    current_project: Vec<SavedGatewayRoute>,
+    current_session: Vec<SavedGatewayRoute>,
+    /// sids live at last persist; rebuilt from meta.json on next start.
+    live_sids: Vec<String>,
 }
 
-#[derive(Clone)]
-struct RestoredSessionSnapshot {
-    id: String,
-    project: String,
+/// v0.8.21 Wave-2 — the sync-computed inputs needed to spawn + insert a
+/// rebuilt session. Splitting "plan" (sync, cheap) from "spawn" (the slow
+/// `start_thread` await) lets the batch-restore path run the await OUTSIDE the
+/// gateway lock — so a concurrent web `POST /sessions` never waits behind a
+/// stale session's `system:init` — while the on-demand resume path runs the
+/// same core under its already-held lock. One construction site, no drift.
+struct MetaRebuildPlan {
+    sid: String,
+    slug: String,
     role: String,
     vendor: AgentVendor,
+    protocol: SessionProtocol,
+    host: String,
     permission_mode: PermissionMode,
+    /// Canonical owner (from meta, else the rebuild's reply target).
+    owner: ChatKey,
+    /// @mention handle = role, else sid for a roleless session.
+    handle: String,
+    model_id: Option<String>,
     secret: String,
-    thread: ThreadHandle,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
 }
@@ -766,7 +761,9 @@ impl Gateway {
         Self {
             adapter_factory,
             default_project,
-            state_path: None,
+            routing_path: None,
+            next_sid_path: None,
+            restore_pending: Vec::new(),
             projects,
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -863,187 +860,251 @@ impl Gateway {
         self.project_paths = Some(paths);
     }
 
-    /// Load and persist route/session state at `path`.
+    /// Load and persist gateway routing + the session-id counter under
+    /// `ccteam_root` (`<root>/state/gateway/routing.json` +
+    /// `<root>/state/sessions/next-sid`). Session content is NOT persisted here
+    /// — it lives in each session's `meta.json` (the v0.8.21 Wave-2 SoT); this
+    /// only restores the per-chat focus + the live-set, then cold-start rebuilds
+    /// those sessions from their meta.json (async, via
+    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)).
     ///
-    /// The daemon uses this for v8.1 spawn-on-demand continuity across
-    /// restarts. Unit tests keep the default in-memory mode.
-    pub fn enable_persistence(&mut self, path: impl Into<PathBuf>) -> Result<()> {
-        self.state_path = Some(path.into());
+    /// The daemon uses this for spawn-on-demand continuity across restarts.
+    /// Unit tests keep the default in-memory mode (or pass a tempdir root).
+    pub fn enable_persistence(&mut self, ccteam_root: impl Into<PathBuf>) -> Result<()> {
+        let root = ccteam_root.into();
+        self.routing_path = Some(crate::routing_state_path_in(&root));
+        self.next_sid_path = Some(crate::next_sid_path_in(&root));
         self.load_state()
     }
 
-    /// Reconnect persisted sessions after daemon restart.
-    ///
-    /// Claude TUI sessions first use the live tmux `resume_thread`
-    /// path, then merge persisted transcript-tail context back in.
-    /// If the pane is gone, real Claude handles fall through to
-    /// `start_thread` so the adapter can reattach/recreate. Codex
-    /// app-server sessions use the native `thread/resume` RPC.
-    pub async fn resume_restored_sessions(&mut self) {
-        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
-        for id in ids {
-            let Some(snapshot) = self.restored_session_snapshot(&id) else {
-                continue;
-            };
-            let resumed = Self::resume_restored_snapshot(&snapshot).await;
-            match resumed {
-                Ok(thread) => {
-                    self.apply_resumed_restored_session(&id, snapshot.adapter, thread);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        session = %id,
-                        vendor = ?snapshot.vendor,
-                        error = %err,
-                        "ccteam-im: restored gateway session resume failed; keeping persisted handle"
-                    );
-                }
-            }
-        }
-        if let Err(err) = self.persist_state() {
-            tracing::warn!(
-                error = %err,
-                "ccteam-im: failed to persist resumed gateway sessions"
-            );
+    /// v0.8.21 Wave-2 — compute the (sync, no-`.await`) plan to rebuild a
+    /// session from its `meta.json`: resolve the model (lenient — a rebuild must
+    /// not fail because the role file was later deleted), mint a FRESH cto-gate
+    /// secret (the old one died with the prior process; the re-spawned child's
+    /// env gets this one, so pane-env and the gate map stay in lockstep at a new
+    /// value), and select the adapter. The caller then `spawn_for_plan` (the
+    /// slow await) + `apply_rebuilt_session` (insert + pump).
+    fn plan_session_rebuild(
+        &self,
+        slug: &str,
+        cwd: PathBuf,
+        meta: &SessionMeta,
+        reply_to: &ChatKey,
+    ) -> MetaRebuildPlan {
+        let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
+        let model_id = role_model_id(role_detail.as_ref());
+        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| reply_to.clone());
+        // Empty role ⇒ roleless: fall back to sid so @handle addressing stays
+        // unique + non-empty (mirrors start_session / switch_current_role).
+        let handle = if meta.role.is_empty() {
+            meta.sid.clone()
+        } else {
+            meta.role.clone()
+        };
+        MetaRebuildPlan {
+            sid: meta.sid.clone(),
+            slug: slug.to_string(),
+            role: meta.role.clone(),
+            vendor: meta.vendor,
+            protocol: meta.protocol,
+            host: meta.host.clone(),
+            permission_mode: meta.permission_mode,
+            owner,
+            handle,
+            model_id,
+            secret: ccteam_core::session_secret::mint(),
+            cwd,
+            adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
         }
     }
 
-    /// Resume restored sessions without holding the shared web/IM gateway lock
-    /// across adapter startup. Stream-json may wait for `system:init` and time
-    /// out; keeping that await outside the mutex prevents stale restored
-    /// sessions from blocking fresh web `POST /sessions` requests.
-    pub async fn resume_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
-        let ids = {
-            let g = gateway.lock().await;
-            g.sessions.keys().cloned().collect::<Vec<_>>()
-        };
-        for id in ids {
-            let Some(snapshot) = ({
-                let g = gateway.lock().await;
-                g.restored_session_snapshot(&id)
-            }) else {
+    /// Cold-start the planned thread via the resume ladder (deterministic vendor
+    /// uuid → `--resume`, so the Anthropic conversation resumes from transcript).
+    /// The SLOW await — the batch-restore path runs this OUTSIDE the gateway lock.
+    async fn spawn_for_plan(plan: &MetaRebuildPlan) -> Result<ThreadHandle, HarnessError> {
+        plan.adapter
+            .start_thread(
+                &AgentSpecBrief {
+                    role: plan.role.clone(),
+                },
+                &SpawnCtx {
+                    slug: plan.slug.clone(),
+                    sid: plan.sid.clone(),
+                    cwd: plan.cwd.clone(),
+                    project_dir: plan.cwd.clone(),
+                    extra_args: vec![],
+                    model_id: plan.model_id.clone(),
+                    permission_mode: plan.permission_mode,
+                    secret: plan.secret.clone(),
+                },
+            )
+            .await
+    }
+
+    /// Insert the rebuilt session into the live map (sync) and start its event
+    /// pump. `reply_to` is where this session's async turn answers route.
+    fn apply_rebuilt_session(
+        &mut self,
+        plan: MetaRebuildPlan,
+        thread: ThreadHandle,
+        reply_to: ChatKey,
+    ) {
+        let sid = plan.sid.clone();
+        self.sessions.insert(
+            sid.clone(),
+            GatewaySession {
+                id: plan.sid,
+                owner: plan.owner,
+                project: plan.slug,
+                role: plan.role,
+                vendor: plan.vendor,
+                protocol: plan.protocol,
+                host: plan.host,
+                permission_mode: plan.permission_mode,
+                secret: plan.secret,
+                handle: plan.handle,
+                thread,
+                adapter: plan.adapter,
+                visible_events: Arc::new(AtomicU64::new(0)),
+                activity_events: Arc::new(AtomicU64::new(0)),
+                reply_to: Arc::new(std::sync::Mutex::new(reply_to)),
+                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                latest_activity: Arc::new(std::sync::Mutex::new(None)),
+            },
+        );
+        self.spawn_event_pump(&sid);
+    }
+
+    /// v0.8.21 Wave-2 — cold-start rebuild a live [`GatewaySession`] from its
+    /// persisted `meta.json` (the session SoT), holding the gateway lock across
+    /// the spawn (the scope on-demand `/use`/web resume + import already take).
+    /// Does NOT touch `current_session` routing or persist — each caller owns
+    /// that. The SINGLE rebuild core (`plan` + `spawn` + `apply`) shared by
+    /// `/use`/web cold-resume ([`resume_stopped_session`](Self::resume_stopped_session)),
+    /// external adopt ([`import_external_session`](Self::import_external_session)),
+    /// and the batch restore (which instead spawns outside the lock).
+    async fn rebuild_session_from_meta(
+        &mut self,
+        slug: &str,
+        cwd: PathBuf,
+        meta: &SessionMeta,
+        reply_to: ChatKey,
+    ) -> Result<()> {
+        let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to);
+        let thread = Self::spawn_for_plan(&plan).await?;
+        self.apply_rebuilt_session(plan, thread, reply_to);
+        Ok(())
+    }
+
+    /// Drop `current_session` routes pointing at a sid no longer in the live
+    /// map (e.g. a session that failed to rebuild after restart, or a state
+    /// file edited out-of-band). Interior-mutates the shared route table.
+    fn drop_dead_session_routes(&self) {
+        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, sid| live.contains(sid));
+    }
+
+    /// v0.8.21 Wave-2 — cold-start rebuild the sessions that were live at last
+    /// persist (stashed in `restore_pending` by `load_state`) from their
+    /// `meta.json`. A daemon restart kills every child (stream-json children are
+    /// the daemon's own subprocesses; a terminal session also loses its tmux
+    /// pane — authorized breaking), so there is nothing to reattach to: each
+    /// session is re-spawned and resumes its conversation from the transcript
+    /// (`--resume`). Routes to a session that fails to rebuild are dropped, then
+    /// routing is re-persisted to reflect the rebuilt live-set. (The `&mut self`
+    /// form holds the lock across spawns; the daemon uses the `_shared` form.)
+    pub async fn resume_restored_sessions(&mut self) {
+        let pending = std::mem::take(&mut self.restore_pending);
+        for sid in pending {
+            if self.sessions.contains_key(&sid) {
+                continue;
+            }
+            let Ok((slug, cwd, meta)) = self.find_meta_for_sid(&sid) else {
+                tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
                 continue;
             };
-            let resumed = Self::resume_restored_snapshot(&snapshot).await;
-            let mut g = gateway.lock().await;
-            match resumed {
-                Ok(thread) => {
-                    g.apply_resumed_restored_session(&id, snapshot.adapter, thread);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        session = %id,
-                        vendor = ?snapshot.vendor,
-                        error = %err,
-                        "ccteam-im: restored gateway session resume failed; keeping persisted handle"
-                    );
-                }
-            }
-            if let Err(err) = g.persist_state() {
+            let reply_to = ChatKey::from_identity(&meta.owner)
+                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+            if let Err(err) = self
+                .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
+                .await
+            {
                 tracing::warn!(
+                    session = %sid,
                     error = %err,
-                    "ccteam-im: failed to persist resumed gateway session"
+                    "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
                 );
             }
         }
+        self.drop_dead_session_routes();
+        if let Err(err) = self.persist_routing() {
+            tracing::warn!(error = %err, "ccteam-im: failed to persist restored routing");
+        }
     }
 
-    fn restored_session_snapshot(&self, id: &str) -> Option<RestoredSessionSnapshot> {
-        let snapshot = self.sessions.get(id)?;
-        let Some(cwd) = self.projects.get(&snapshot.project).cloned() else {
-            tracing::warn!(
-                session = %id,
-                project = %snapshot.project,
-                "ccteam-im: restored gateway session skipped; project root missing"
-            );
-            return None;
+    /// Startup-restore variant that does NOT hold the gateway lock across the
+    /// slow `start_thread` await. Per session it: locks → builds the rebuild
+    /// plan (sync, cheap) → UNLOCKS → spawns the thread (slow; stream-json may
+    /// block on `system:init`) → re-locks → inserts. So a concurrent web `POST
+    /// /sessions` never waits behind a stale session's startup.
+    pub async fn resume_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let pending = {
+            let mut g = gateway.lock().await;
+            std::mem::take(&mut g.restore_pending)
         };
-        Some(RestoredSessionSnapshot {
-            id: snapshot.id.clone(),
-            project: snapshot.project.clone(),
-            role: snapshot.role.clone(),
-            vendor: snapshot.vendor,
-            permission_mode: snapshot.permission_mode,
-            secret: snapshot.secret.clone(),
-            thread: snapshot.thread.clone(),
-            cwd,
-            adapter: (self.adapter_factory)(snapshot.vendor, snapshot.protocol),
-        })
-    }
-
-    async fn resume_restored_snapshot(
-        snapshot: &RestoredSessionSnapshot,
-    ) -> Result<ThreadHandle, HarnessError> {
-        match snapshot.vendor {
-            AgentVendor::Claude => match snapshot
-                .adapter
-                .resume_thread(&snapshot.thread.identity)
-                .await
-            {
-                Ok(mut thread) => {
-                    thread.raw_extras =
-                        merge_thread_extras(snapshot.thread.raw_extras.clone(), thread.raw_extras);
-                    Ok(thread)
+        for sid in pending {
+            // Build the plan under the lock, then drop it before the spawn await.
+            let plan_and_reply = {
+                let g = gateway.lock().await;
+                if g.sessions.contains_key(&sid) {
+                    None
+                } else {
+                    match g.find_meta_for_sid(&sid) {
+                        Ok((slug, cwd, meta)) => {
+                            let reply_to = ChatKey::from_identity(&meta.owner)
+                                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+                            Some((
+                                g.plan_session_rebuild(&slug, cwd, &meta, &reply_to),
+                                reply_to,
+                            ))
+                        }
+                        Err(_) => {
+                            tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
+                            None
+                        }
+                    }
                 }
-                Err(err) if is_real_claude_tui_handle(&snapshot.thread) => {
-                    tracing::warn!(
-                        session = %snapshot.id,
-                        error = %err,
-                        "ccteam-im: Claude restored-session resume failed; trying start_thread reattach/recreate"
-                    );
-                    snapshot
-                        .adapter
-                        .start_thread(
-                            &AgentSpecBrief {
-                                role: snapshot.role.clone(),
-                            },
-                            &SpawnCtx {
-                                slug: snapshot.project.clone(),
-                                sid: snapshot.id.clone(),
-                                cwd: snapshot.cwd.clone(),
-                                project_dir: snapshot.cwd.clone(),
-                                extra_args: vec![],
-                                // Preserve the user's `/model` across a daemon
-                                // restart: re-spawn at the persisted (last-known)
-                                // model, not claude's default. `None` for a
-                                // never-run session (then claude picks default).
-                                model_id: ccteam_harness::persisted_session_model(
-                                    &snapshot.cwd,
-                                    &snapshot.id,
-                                ),
-                                permission_mode: snapshot.permission_mode,
-                                secret: snapshot.secret.clone(),
-                            },
-                        )
+            };
+            let Some((plan, reply_to)) = plan_and_reply else {
+                continue;
+            };
+            // Spawn OUTSIDE the lock — the slow part.
+            match Self::spawn_for_plan(&plan).await {
+                Ok(thread) => {
+                    gateway
+                        .lock()
                         .await
+                        .apply_rebuilt_session(plan, thread, reply_to);
                 }
-                Err(err) => Err(err),
-            },
-            AgentVendor::Codex => {
-                snapshot
-                    .adapter
-                    .resume_thread(&snapshot.thread.identity)
-                    .await
+                Err(err) => {
+                    tracing::warn!(
+                        session = %plan.sid,
+                        error = %err,
+                        "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
+                    );
+                }
             }
         }
-    }
-
-    fn apply_resumed_restored_session(
-        &mut self,
-        id: &str,
-        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
-        thread: ThreadHandle,
-    ) {
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.thread = thread;
-            session.adapter = adapter;
-            session.visible_events = Arc::new(AtomicU64::new(0));
-            session.activity_events = Arc::new(AtomicU64::new(0));
+        let g = gateway.lock().await;
+        g.drop_dead_session_routes();
+        if let Err(err) = g.persist_routing() {
+            tracing::warn!(error = %err, "ccteam-im: failed to persist restored routing");
         }
-        if let Some(pump) = self.event_pumps.remove(id) {
-            pump.abort();
-        }
-        self.spawn_event_pump(id);
     }
 
     /// Register or update a project root addressable by `/cd <slug>`.
@@ -1360,7 +1421,7 @@ impl Gateway {
                     .write()
                     .unwrap()
                     .insert(chat.clone(), sid.clone());
-                self.persist_state()?;
+                self.persist_routing()?;
                 Ok(Some(format!("using session {sid}")))
             }
             "/stop" => {
@@ -1523,7 +1584,7 @@ impl Gateway {
                 // otherwise clear the active session so the next message spawns
                 // one on demand in the target project via `ensure_current_session`.
                 let adopted = self.adopt_session_in_project(chat, project);
-                self.persist_state()?;
+                self.persist_routing()?;
                 Ok(Some(match adopted {
                     Some(sid) => format!("project set to {project} (switched to {sid})"),
                     None => {
@@ -1638,7 +1699,7 @@ impl Gateway {
         // `cto` session HERE rather than in the chat's previous project.
         self.current_project.insert(chat.clone(), slug.clone());
         self.adopt_session_in_project(chat, &slug);
-        if let Err(err) = self.persist_state() {
+        if let Err(err) = self.persist_routing() {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
         }
         Ok(format!(
@@ -1839,6 +1900,9 @@ impl Gateway {
         let role_detail = ensure_role_exists(&cwd, &role)?;
         let model_id = role_model_id(role_detail.as_ref());
         self.next_session += 1;
+        // Make the counter durable BEFORE the sid is used (a later spawn failure
+        // then leaves a harmless gap, never a reused sid — red line: monotonic).
+        self.persist_next_sid()?;
         let id = format!("s{}", self.next_session);
         // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
         // 而空 handle 会让 @handle 路由(session_by_handle / template_by_handle)
@@ -1911,7 +1975,7 @@ impl Gateway {
             .write()
             .unwrap()
             .insert(owner, id.clone());
-        self.persist_state()?;
+        self.persist_routing()?;
         // Write per-session meta.json for history list + resume after stop.
         {
             let now = chrono::Utc::now().to_rfc3339();
@@ -2034,6 +2098,11 @@ impl Gateway {
         // gets it, and the in-place record below stores the same value, keeping
         // pane-env and gate-map in lockstep.
         let secret = ccteam_core::session_secret::mint();
+        // Capture before `cwd`/`role` are moved into the spawn + insert below —
+        // needed to sync meta.json (the session SoT) with the new role (v0.8.21
+        // Wave-2: a restart rebuilds from meta, so the role change must persist).
+        let meta_dir = cwd.clone();
+        let meta_role = role.clone();
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -2078,7 +2147,16 @@ impl Gateway {
             .write()
             .unwrap()
             .insert(chat.clone(), sid.clone());
-        self.persist_state()?;
+        self.persist_routing()?;
+        // v0.8.21 Wave-2 — keep meta.json (the session SoT) in sync: `/role`
+        // changed the role, so a daemon restart must rebuild at the NEW role.
+        // The rest of the descriptor (vendor/uuid/owner/origin) is unchanged
+        // (same sid ⇒ same deterministic vendor uuid). Best-effort.
+        if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
+            meta.role = meta_role;
+            meta.last_active = chrono::Utc::now().to_rfc3339();
+            let _ = write_session_meta(&meta_dir, &meta);
+        }
         self.spawn_event_pump(&sid);
         let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
         Ok(sid)
@@ -2456,15 +2534,30 @@ impl Gateway {
         self.event_pumps.insert(pump_key, handle);
     }
 
+    /// v0.8.21 Wave-2 — restore ROUTING + the sid counter (sync). The live map
+    /// is left EMPTY; the sids that were live at last persist are stashed in
+    /// `restore_pending` for the async
+    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)
+    /// step to cold-start rebuild from each session's `meta.json` (the SoT).
+    /// No session content is read here (spawning is async; load_state is not).
     fn load_state(&mut self) -> Result<()> {
-        let Some(path) = self.state_path.as_ref() else {
+        // Monotonic sid counter — its own file, read independently of routing so
+        // a wiped routing table never resets it (red line: sid never reused).
+        if let Some(path) = self.next_sid_path.as_ref() {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(n) = raw.trim().parse::<u64>() {
+                    self.next_session = n;
+                }
+            }
+        }
+        let Some(path) = self.routing_path.as_ref() else {
             return Ok(());
         };
         if !path.exists() {
             return Ok(());
         }
         let raw = std::fs::read_to_string(path)?;
-        let saved: SavedGatewayState = serde_json::from_str(&raw)?;
+        let saved: RoutingState = serde_json::from_str(&raw)?;
         self.default_project = saved.default_project;
         self.current_project = saved
             .current_project
@@ -2476,66 +2569,27 @@ impl Gateway {
             .into_iter()
             .map(|route| (route.chat, route.value))
             .collect();
-        self.next_session = saved.next_session;
+        // Live map stays empty; rebuild happens async from meta.json. Dead-route
+        // cleanup is deferred to AFTER rebuild (a route to a sid that fails to
+        // rebuild is dropped there), since nothing is live yet at this point.
         self.sessions.clear();
-        // v0.8.8 F1 — restore ALL saved sessions: each is keyed by its own sid
-        // (pane/--name/turns all key on `s<N>`), so multiple same-(project,role)
-        // records are now legitimately independent sessions, NOT duplicates to
-        // collapse. The prior seen-panes collapse is gone with the dedup.
-        for saved_session in saved.sessions {
-            let adapter = (self.adapter_factory)(saved_session.vendor, saved_session.protocol);
-            let host = if saved_session.host.is_empty() {
-                "local".to_string()
-            } else {
-                saved_session.host
-            };
-            self.sessions.insert(
-                saved_session.id.clone(),
-                GatewaySession {
-                    id: saved_session.id,
-                    owner: saved_session.owner.clone(),
-                    project: saved_session.project,
-                    role: saved_session.role,
-                    vendor: saved_session.vendor,
-                    protocol: saved_session.protocol,
-                    host,
-                    permission_mode: saved_session.permission_mode,
-                    // R-M1 — restore the persisted secret so the gate-map matches
-                    // the live pane's `CCTEAM_CHAT_SECRET` after a daemon restart.
-                    secret: saved_session.secret,
-                    handle: saved_session.handle,
-                    thread: saved_session.thread,
-                    adapter,
-                    visible_events: Arc::new(AtomicU64::new(0)),
-                    activity_events: Arc::new(AtomicU64::new(0)),
-                    reply_to: Arc::new(std::sync::Mutex::new(saved_session.owner)),
-                    pending_reaction: Arc::new(std::sync::Mutex::new(None)),
-                    turn_started_at: Arc::new(std::sync::Mutex::new(None)),
-                    last_event_at: Arc::new(std::sync::Mutex::new(None)),
-                    latest_activity: Arc::new(std::sync::Mutex::new(None)),
-                },
-            );
-        }
-        // Defensive dead-route cleanup: drop current-session routes that point
-        // at a sid with no restored session record (e.g. a state file edited or
-        // truncated out-of-band). With sid-keying nothing is collapsed here, but
-        // a dangling route would otherwise address a non-existent session.
-        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, sid| live.contains(sid));
+        self.restore_pending = saved.live_sids;
         Ok(())
     }
 
-    fn persist_state(&self) -> Result<()> {
-        let Some(path) = self.state_path.as_ref() else {
+    /// v0.8.21 Wave-2 — persist the ROUTING snapshot (per-chat focus + the
+    /// current live-set). Idempotent: always serializes the full current state,
+    /// so every call site need only call this after ANY routing / live-map
+    /// change without tracking exactly what moved. Session content is NOT
+    /// written (it lives in `meta.json`).
+    fn persist_routing(&self) -> Result<()> {
+        let Some(path) = self.routing_path.as_ref() else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let saved = SavedGatewayState {
+        let saved = RoutingState {
             default_project: self.default_project.clone(),
             current_project: self
                 .current_project
@@ -2555,27 +2609,27 @@ impl Gateway {
                     value: value.clone(),
                 })
                 .collect(),
-            sessions: self
-                .sessions
-                .values()
-                .map(|session| SavedGatewaySession {
-                    id: session.id.clone(),
-                    owner: session.owner.clone(),
-                    project: session.project.clone(),
-                    role: session.role.clone(),
-                    vendor: session.vendor,
-                    protocol: session.protocol,
-                    host: session.host.clone(),
-                    permission_mode: session.permission_mode,
-                    secret: session.secret.clone(),
-                    handle: session.handle.clone(),
-                    thread: session.thread.clone(),
-                })
-                .collect(),
-            next_session: self.next_session,
+            live_sids: self.sessions.keys().cloned().collect(),
         };
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(&saved)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// v0.8.21 Wave-2 — persist the monotonic session-id counter to its own
+    /// file. Called right after each `next_session` bump so the counter is
+    /// durable BEFORE the sid is used (a spawn failure then leaves a harmless
+    /// gap, never a reused sid).
+    fn persist_next_sid(&self) -> Result<()> {
+        let Some(path) = self.next_sid_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, self.next_session.to_string())?;
         std::fs::rename(tmp, path)?;
         Ok(())
     }
@@ -3188,20 +3242,18 @@ impl Gateway {
     /// `"<platform>@<tenant>"`) sees ONLY what it owns: it gets neither the shared
     /// pool nor other tenants' IM sessions.
     fn chat_owner_visible(chat: &ChatKey, owner: &ChatKey) -> bool {
-        // Own = the session is owned by the chat's CANONICAL identity. v0.8.20
-        // web↔IM convergence: a per-tenant bot's canonical identity is its
-        // tenant `user:<tid>`, so it sees BOTH its IM sessions AND that tenant's
-        // web-created sessions (and the tenant's web console sees the bot's).
-        if *owner == canonical_owner(chat) {
-            return true;
-        }
-        // A per-tenant bot gets NO shared pool — only its own (above).
-        if crate::transport::is_tenant_bot_channel(&chat.channel) {
-            return false;
-        }
-        // The admin/global bot + the web querier: own + the shared user pool
-        // (every web/tenant-owned session, the `user:` identity namespace).
-        owner.channel == "user"
+        // v0.8.21 Wave-2 — delegate to the identity-string rule. A session
+        // rebuilt from `meta.json` (daemon restart) or cold-resumed carries an
+        // owner round-tripped through `from_identity`, which forces
+        // `user_id = chat_id`; a raw `ChatKey ==` own-check would then wrongly
+        // DENY the legitimate owner. Ownership is chat-level by design
+        // (`identity()` drops `user_id` — "owned by the CHAT, not a member"), so
+        // comparing canonical identity strings is the correct, round-trip-safe
+        // invariant. This unifies the live-map ACL with the cold-resume ACL onto
+        // one rule; chat_id isolation is preserved (different chat_id ⇒ different
+        // identity ⇒ not visible). The convergence + isolation cases are
+        // unchanged (tenant/web/admin identities have `user_id == chat_id`).
+        Self::owner_identity_visible(chat, &owner.identity())
     }
 
     /// Identity-string form of [`chat_owner_visible`] for the cold-resume path,
@@ -3759,54 +3811,16 @@ impl Gateway {
                 anyhow::bail!("session {sid} does not belong to project {exp}");
             }
         }
-        let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
-        let model_id = role_model_id(role_detail.as_ref());
-        // Mint a fresh secret (old one is gone with the stopped session).
-        let secret = ccteam_core::session_secret::mint();
-        let (adapter, thread) = self
-            .spawn_session_thread(
-                meta.vendor,
-                meta.protocol,
-                &meta.role,
-                &slug,
-                sid,
-                cwd.clone(),
-                model_id,
-                meta.permission_mode,
-                secret.clone(),
-            )
+        // Cold-start rebuild from meta.json — the SINGLE rebuild path (shared
+        // with import + daemon-restart restore). Spawns via the resume ladder,
+        // mints a fresh secret, inserts into the live map, starts the pump.
+        self.rebuild_session_from_meta(&slug, cwd, &meta, caller.clone())
             .await?;
-        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| caller.clone());
-        self.sessions.insert(
-            sid.to_string(),
-            GatewaySession {
-                id: sid.to_string(),
-                owner: owner.clone(),
-                project: slug.clone(),
-                role: meta.role.clone(),
-                vendor: meta.vendor,
-                protocol: meta.protocol,
-                host: meta.host.clone(),
-                permission_mode: meta.permission_mode,
-                secret,
-                handle: sid.to_string(),
-                thread,
-                adapter,
-                visible_events: Arc::new(AtomicU64::new(0)),
-                activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(caller.clone())),
-                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
-                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
-                last_event_at: Arc::new(std::sync::Mutex::new(None)),
-                latest_activity: Arc::new(std::sync::Mutex::new(None)),
-            },
-        );
         self.current_session
             .write()
             .unwrap()
             .insert(caller, sid.to_string());
-        self.persist_state()?;
-        self.spawn_event_pump(sid);
+        self.persist_routing()?;
         Ok(sid.to_string())
     }
 
@@ -3848,6 +3862,9 @@ impl Gateway {
             );
         }
         self.next_session += 1;
+        // Make the counter durable BEFORE the sid is used (a later failure then
+        // leaves a harmless gap, never a reused sid).
+        self.persist_next_sid()?;
         let sid = format!("s{}", self.next_session);
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
@@ -3865,54 +3882,18 @@ impl Gateway {
             last_active: now,
             origin: SessionOrigin::Adopted,
         };
-        let secret = ccteam_core::session_secret::mint();
-        let (adapter, thread) = self
-            .spawn_session_thread(
-                AgentVendor::Claude,
-                SessionProtocol::StreamJson,
-                "",
-                slug,
-                &sid,
-                cwd.clone(),
-                None,
-                PermissionMode::Skip,
-                secret.clone(),
-            )
+        // Cold-start rebuild from the freshly-built meta (shared path: spawn via
+        // the resume ladder, insert, pump). Persist `meta.json` only AFTER a
+        // successful spawn so a spawn failure leaves no orphan meta (a phantom
+        // "stopped" session in history).
+        self.rebuild_session_from_meta(slug, cwd.clone(), &meta, caller.clone())
             .await?;
-        // Persist meta only AFTER a successful spawn so a spawn failure does not
-        // leave an orphan `meta.json` (a phantom "stopped" session in history).
         write_session_meta(&cwd, &meta)?;
-        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| caller.clone());
-        self.sessions.insert(
-            sid.clone(),
-            GatewaySession {
-                id: sid.clone(),
-                owner,
-                project: slug.to_string(),
-                role: String::new(),
-                vendor: AgentVendor::Claude,
-                protocol: SessionProtocol::StreamJson,
-                host: "local".to_string(),
-                permission_mode: PermissionMode::Skip,
-                secret,
-                handle: sid.clone(),
-                thread,
-                adapter,
-                visible_events: Arc::new(AtomicU64::new(0)),
-                activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(caller.clone())),
-                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
-                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
-                last_event_at: Arc::new(std::sync::Mutex::new(None)),
-                latest_activity: Arc::new(std::sync::Mutex::new(None)),
-            },
-        );
         self.current_session
             .write()
             .unwrap()
             .insert(caller, sid.clone());
-        self.persist_state()?;
-        self.spawn_event_pump(&sid);
+        self.persist_routing()?;
         Ok(sid)
     }
 
@@ -4212,7 +4193,7 @@ impl Gateway {
             .write()
             .unwrap()
             .retain(|_, v| v != sid);
-        self.persist_state()?;
+        self.persist_routing()?;
         Ok(())
     }
 
@@ -4319,39 +4300,67 @@ pub fn reconcile_chat_sessions(
     inventory
 }
 
-/// Load the set of canonical chat-session names (`ccteam-chat-<slug>-<sid>`)
-/// the gateway has tracked, from its persisted route table at `state_path`
-/// (see [`default_gateway_state_path`](crate::default_gateway_state_path)).
+/// v0.8.21 Wave-2 — the session `meta.json`s that were LIVE at last persist,
+/// resolved from `routing.json.live_sids` (the live-set) ⋈ each session's
+/// `meta.json` (the SoT). The daemon-independent source the `ccteam session ls`
+/// / `status` views reconcile against — replaces parsing the retired
+/// `gateway-state.json` `sessions` vec. STOPPED sessions (whose meta.json
+/// lingers as history) are excluded because they are not in `live_sids`.
 ///
-/// Returns an empty set when the file is absent — no daemon has persisted a
-/// registry yet, so every live chat session is by definition an orphan. This
-/// is the daemon-independent registry source the `ccteam sessions` CLI view
-/// reconciles against; it is strictly read-only and never mutates the file.
-pub fn tracked_chat_session_names(state_path: &Path) -> Result<std::collections::BTreeSet<String>> {
-    if !state_path.exists() {
-        return Ok(std::collections::BTreeSet::new());
+/// Returns empty when routing.json is absent / unreadable / lists no live sids,
+/// or when config.yaml can't be loaded — every case means "nothing to reconcile
+/// against", never an error (these are glance views, not liveness gates).
+fn live_session_metas(ccteam_root: &Path) -> Vec<SessionMeta> {
+    let routing_path = crate::routing_state_path_in(ccteam_root);
+    let Ok(raw) = std::fs::read_to_string(&routing_path) else {
+        return vec![];
+    };
+    let Ok(routing) = serde_json::from_str::<RoutingState>(&raw) else {
+        return vec![];
+    };
+    let live: HashSet<String> = routing.live_sids.into_iter().collect();
+    if live.is_empty() {
+        return vec![];
     }
-    let raw = std::fs::read_to_string(state_path)
-        .with_context(|| format!("read gateway state {}", state_path.display()))?;
-    let saved: SavedGatewayState = serde_json::from_str(&raw)
-        .with_context(|| format!("parse gateway state {}", state_path.display()))?;
-    Ok(saved
-        .sessions
+    let Ok(cfg) = ccteam_core::config::load(ccteam_root) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for project in cfg.projects {
+        for meta in list_session_metas(&project.path) {
+            if live.contains(&meta.sid) {
+                out.push(meta);
+            }
+        }
+    }
+    out
+}
+
+/// Load the set of canonical chat-session names (`ccteam-chat-<slug>-<sid>`)
+/// the gateway has live, from `routing.json` + the live sessions' `meta.json`
+/// (v0.8.21 Wave-2; see [`live_session_metas`]).
+///
+/// Returns an empty set when nothing is persisted yet — so every live OS pane
+/// is by definition an orphan. The daemon-independent registry source the
+/// `ccteam sessions` CLI view reconciles against; strictly read-only.
+pub fn tracked_chat_session_names(
+    ccteam_root: &Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    Ok(live_session_metas(ccteam_root)
         .into_iter()
         // v0.8.8 F1 — canonical name keys on the sid (`s<N>`), matching the
         // pane name the adapter spawns; computing from role here would make
         // every live pane reconcile as an orphan.
-        .map(|s| chat_session_name(&s.project, &s.id))
+        .map(|m| chat_session_name(&m.slug, &m.sid))
         .collect())
 }
 
 /// v0.8.8 B4/F3 — one tracked gateway session, flattened for out-of-process
 /// readers (the `ccteam session ls` / `ccteam status` CLI). The gateway's
 /// in-memory [`SessionView`] lives inside the daemon process; the CLI is a
-/// separate process and can only reach the persisted [`SavedGatewayState`]
-/// file. This projection exposes exactly the columns those views render
-/// (sid · project · role · vendor · permission_mode) without leaking the
-/// persisted struct's private fields (`secret` / `handle` / `thread`).
+/// separate process and reads the persisted `routing.json` + `meta.json` (the
+/// v0.8.21 Wave-2 SoT). This projection exposes exactly the columns those views
+/// render (sid · project · role · vendor · permission_mode).
 #[derive(Debug, Clone)]
 pub struct TrackedSessionRow {
     /// Gateway session id (`s<N>`) — the unique session key (F1).
@@ -4366,35 +4375,24 @@ pub struct TrackedSessionRow {
     pub permission_mode: String,
 }
 
-/// Load the gateway's tracked sessions as flat [`TrackedSessionRow`]s from the
-/// persisted route table at `state_path` (see
-/// [`default_gateway_state_path`](crate::default_gateway_state_path)).
+/// Load the gateway's live sessions as flat [`TrackedSessionRow`]s from
+/// `routing.json` + each live session's `meta.json` (v0.8.21 Wave-2; see
+/// [`live_session_metas`]).
 ///
-/// Shares the exact read path of [`tracked_chat_session_names`] (same
-/// [`SavedGatewayState`] file; **absent ⇒ empty `Vec`**, never an error) so
-/// the two daemon-independent CLI views (`session ls` reconcile + `status`
-/// nesting) never drift on what the daemon has persisted. Strictly read-only.
-///
-/// The sub-second drift between the in-memory gateway map and this on-disk
-/// snapshot is accepted for the status / ls views (they're a glance, not a
-/// liveness gate).
-pub fn tracked_chat_sessions(state_path: &Path) -> Result<Vec<TrackedSessionRow>> {
-    if !state_path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(state_path)
-        .with_context(|| format!("read gateway state {}", state_path.display()))?;
-    let saved: SavedGatewayState = serde_json::from_str(&raw)
-        .with_context(|| format!("parse gateway state {}", state_path.display()))?;
-    Ok(saved
-        .sessions
+/// Shares the exact read path of [`tracked_chat_session_names`] so the two
+/// daemon-independent CLI views (`session ls` reconcile + `status` nesting)
+/// never drift. **Nothing persisted ⇒ empty `Vec`**, never an error. The
+/// sub-second drift between the in-memory gateway map and this on-disk snapshot
+/// is accepted for the status / ls views (a glance, not a liveness gate).
+pub fn tracked_chat_sessions(ccteam_root: &Path) -> Result<Vec<TrackedSessionRow>> {
+    Ok(live_session_metas(ccteam_root)
         .into_iter()
-        .map(|s| TrackedSessionRow {
-            sid: s.id,
-            project: s.project,
-            role: s.role,
-            vendor: vendor_str(s.vendor).to_string(),
-            permission_mode: s.permission_mode.as_str().to_string(),
+        .map(|m| TrackedSessionRow {
+            sid: m.sid,
+            project: m.slug,
+            role: m.role,
+            vendor: vendor_str(m.vendor).to_string(),
+            permission_mode: m.permission_mode.as_str().to_string(),
         })
         .collect())
 }
@@ -4854,34 +4852,6 @@ fn thread_vendor_uuid(thread: &ThreadHandle) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-}
-
-/// True when a restored Claude `ThreadHandle` carries enough context
-/// (`cwd` + `project_dir`) to rebuild from the persisted `SpawnCtx` via
-/// `start_thread` after a `resume_thread` failure. Covers BOTH Claude spawn
-/// paths: the tmux/terminal handle (keyed by `tmux_session`) and the
-/// v0.8.11 stream-json handle (`adapter = "claude-stream-json"`, resumed via
-/// the deterministic per-sid uuid + `--resume`). A handle missing the cwd
-/// pair can't be rebuilt, so the resume keeps the stale handle instead.
-fn is_real_claude_tui_handle(thread: &ThreadHandle) -> bool {
-    let has = |k: &str| thread.raw_extras.get(k).and_then(|v| v.as_str()).is_some();
-    let is_tmux = has("tmux_session");
-    let is_stream_json =
-        thread.raw_extras.get("adapter").and_then(|v| v.as_str()) == Some("claude-stream-json");
-    (is_tmux || is_stream_json) && has("cwd") && has("project_dir")
-}
-
-fn merge_thread_extras(
-    persisted: serde_json::Value,
-    resumed: serde_json::Value,
-) -> serde_json::Value {
-    let mut merged = persisted.as_object().cloned().unwrap_or_default();
-    if let Some(resumed) = resumed.as_object() {
-        for (key, value) in resumed {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    serde_json::Value::Object(merged)
 }
 
 /// Outcome of [`Gateway::submit_resolved`] — the one core both user-entry
@@ -5402,6 +5372,10 @@ mod tests {
         events_notify: Arc<tokio::sync::Notify>,
         event_delay: std::time::Duration,
         resume_delay: std::time::Duration,
+        /// v0.8.21 Wave-2 — delay inside `start_thread` so a test can assert the
+        /// batch restore (which cold-starts via `start_thread`) does not hold the
+        /// gateway lock across the slow spawn.
+        start_delay: std::time::Duration,
         resume_started: Arc<AtomicUsize>,
         /// Recorded `handle_directive` calls (thread id + directive) for
         /// routing + choice-reentry assertions (v0.8.5 D1).
@@ -5451,6 +5425,7 @@ mod tests {
                 events_notify: Arc::new(tokio::sync::Notify::new()),
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
+                start_delay: std::time::Duration::ZERO,
                 resume_started: Arc::new(AtomicUsize::new(0)),
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
@@ -5482,8 +5457,8 @@ mod tests {
             }
         }
 
-        fn with_resume_delay(mut self, resume_delay: std::time::Duration) -> Self {
-            self.resume_delay = resume_delay;
+        fn with_start_delay(mut self, start_delay: std::time::Duration) -> Self {
+            self.start_delay = start_delay;
             self
         }
     }
@@ -5504,6 +5479,9 @@ mod tests {
             ctx: &SpawnCtx,
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            if !self.start_delay.is_zero() {
+                tokio::time::sleep(self.start_delay).await;
+            }
             self.spawn_modes.lock().await.push(ctx.permission_mode);
             self.spawn_secrets.lock().await.push(ctx.secret.clone());
             // A fresh/resumed child is alive.
@@ -6513,17 +6491,19 @@ mod tests {
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
     /// The web API shares the same Gateway mutex, so restore work must not hold
     /// that lock while awaiting the adapter; otherwise `POST /sessions` blocks
-    /// behind every stale restored session.
+    /// behind every stale restored session. v0.8.21 Wave-2 — restore now
+    /// COLD-STARTS (`start_thread`, not `resume_thread`); the `_shared` path
+    /// builds the plan under the lock, then spawns OUTSIDE it.
     #[tokio::test]
     async fn restored_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let state_path = tmp.path().join("gateway.json");
         let project_dir = tmp.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
 
+        // Seed: create s1 so its meta.json + routing.json (live_sids=[s1]) persist.
         let seed = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(seed, "alpha", project_dir.clone());
-        gateway.enable_persistence(&state_path).unwrap();
+        gateway.enable_persistence(tmp.path()).unwrap();
         let sid = gateway
             .create_session_api_proto(
                 "alpha".into(),
@@ -6536,33 +6516,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sid, "s1");
+        drop(gateway);
 
+        // Restart with a SLOW cold start (Wave-2 rebuilds via start_thread).
         let slow = Arc::new(
             FakeAdapter::new(AgentVendor::Claude)
-                .with_resume_delay(std::time::Duration::from_millis(250)),
+                .with_start_delay(std::time::Duration::from_millis(250)),
         );
         let mut restored = Gateway::new(slow.clone(), "alpha", project_dir);
-        restored.enable_persistence(&state_path).unwrap();
+        restored.enable_persistence(tmp.path()).unwrap();
         let gateway = Arc::new(tokio::sync::Mutex::new(restored));
 
         let resume_task = tokio::spawn(Gateway::resume_restored_sessions_shared(Arc::clone(
             &gateway,
         )));
+        // Wait until the cold-start spawn is in flight.
         for _ in 0..50 {
-            if slow.resume_started.load(Ordering::SeqCst) > 0 {
+            if slow.starts.load(Ordering::SeqCst) > 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(slow.resume_started.load(Ordering::SeqCst), 1);
+        assert_eq!(slow.starts.load(Ordering::SeqCst), 1);
 
-        let guard = tokio::time::timeout(std::time::Duration::from_millis(50), gateway.lock())
-            .await
-            .expect("gateway lock must stay available while restored resume awaits adapter");
-        assert_eq!(guard.session_views().len(), 1);
-        drop(guard);
+        // The lock must stay obtainable while the 250ms spawn is in flight (the
+        // spawn runs OUTSIDE the lock). The session is inserted only AFTER the
+        // spawn completes, so it is not yet in the live map here.
+        {
+            let guard = tokio::time::timeout(std::time::Duration::from_millis(50), gateway.lock())
+                .await
+                .expect("gateway lock must stay available while restored spawn awaits adapter");
+            assert!(
+                guard.session_views().is_empty(),
+                "rebuilt session is applied only after the spawn completes"
+            );
+        }
 
         resume_task.await.unwrap();
+        // After restore completes, the session is live.
+        assert_eq!(gateway.lock().await.session_views().len(), 1);
     }
 
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
@@ -7062,16 +7054,20 @@ mod tests {
     }
 
     /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
-    /// persist → reload → the restored session reports hitl. Uses a state file
-    /// so the SavedGatewaySession serde round-trip is exercised.
+    /// persist → reload → cold-start rebuild → the restored session reports
+    /// hitl. v0.8.21 Wave-2 — the posture round-trips through `meta.json`
+    /// (`permission_mode`), and the live map is rebuilt by the async restore.
     #[tokio::test]
     async fn hitl_mode_persists_across_reload() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let state = tmp.path().join("gateway-state.json");
+        // Project dir under the tempdir so the session's meta.json write is
+        // isolated (the rebuild reads it back on restart).
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
         {
             let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-            gateway.enable_persistence(&state).unwrap();
+            let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
             gateway
                 .create_session_api(
                     "alpha".into(),
@@ -7082,15 +7078,18 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Fresh gateway loading the same state file.
+        // Fresh gateway loading the same persisted root. Wave-2: load_state
+        // restores routing (sync); the live map is cold-start rebuilt from
+        // meta.json by the async restore step (mirrors daemon startup).
         let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gw2 = Gateway::new(fake2.clone(), "alpha", "/tmp/alpha");
-        gw2.enable_persistence(&state).unwrap();
+        let mut gw2 = Gateway::new(fake2.clone(), "alpha", project_dir);
+        gw2.enable_persistence(tmp.path()).unwrap();
+        gw2.resume_restored_sessions().await;
         let views = gw2.session_views();
         assert_eq!(views.len(), 1, "the session restored from disk");
         assert_eq!(
             views[0].permission_mode, "hitl",
-            "the hitl posture must survive the persist/reload round-trip"
+            "the hitl posture must survive the persist/reload round-trip (via meta.json)"
         );
     }
 
@@ -8328,15 +8327,20 @@ mod tests {
     #[tokio::test]
     async fn gateway_persistence_restores_routes_and_sessions() {
         let tmp = tempfile::tempdir().unwrap();
-        let state_path = tmp.path().join("gateway-state.json");
+        // Project dirs under the tempdir so each session's meta.json (the
+        // Wave-2 SoT the restart rebuilds from) is isolated + auto-cleaned.
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
         let fake = Arc::new(FakeAdapter::default());
 
         let original_secret_s1;
         let original_secret_s2;
         {
-            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-            gateway.register_project("beta", "/tmp/beta");
-            gateway.enable_persistence(&state_path).unwrap();
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.register_project("beta", beta.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
             gateway
                 .handle_text("mock", "chat-1", "alice", "/cd beta")
                 .await
@@ -8349,7 +8353,6 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap();
-            // R-M1 — the minted secret is non-empty and will be persisted.
             original_secret_s1 = gateway.sessions.get("s1").unwrap().secret.clone();
             original_secret_s2 = gateway.sessions.get("s2").unwrap().secret.clone();
             assert_eq!(original_secret_s1.len(), 32);
@@ -8357,21 +8360,29 @@ mod tests {
             assert_ne!(original_secret_s1, original_secret_s2);
         }
 
-        let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-        restored.register_project("beta", "/tmp/beta");
-        restored.enable_persistence(&state_path).unwrap();
+        let mut restored = Gateway::new(fake.clone(), "alpha", alpha);
+        restored.register_project("beta", beta);
+        restored.enable_persistence(tmp.path()).unwrap();
+        // Wave-2 — load_state restores routing (sync); the live map is cold-start
+        // rebuilt from each live sid's meta.json by the async restore step.
+        restored.resume_restored_sessions().await;
 
-        // R-M1 — the per-session secret survives the daemon restart so the gate
-        // map still matches the live pane's `CCTEAM_CHAT_SECRET`.
-        assert_eq!(
-            restored.sessions.get("s1").unwrap().secret,
-            original_secret_s1,
-            "s1 cto-gate secret must round-trip through persisted state"
+        // v0.8.21 Wave-2 — the cto-gate secret is NOT persisted; a cold-start
+        // rebuild MINTS a fresh one (the prior child died with the prior process,
+        // so its secret is gone). The re-spawned child's env gets this new value,
+        // so pane-env + the gate map stay in lockstep at a fresh 32-char secret
+        // that differs from the pre-restart one.
+        let restored_s1 = restored.sessions.get("s1").unwrap().secret.clone();
+        let restored_s2 = restored.sessions.get("s2").unwrap().secret.clone();
+        assert_eq!(restored_s1.len(), 32);
+        assert_eq!(restored_s2.len(), 32);
+        assert_ne!(
+            restored_s1, original_secret_s1,
+            "secret is re-minted on cold-start rebuild, not persisted"
         );
-        assert_eq!(
-            restored.sessions.get("s2").unwrap().secret,
-            original_secret_s2,
-            "s2 cto-gate secret must round-trip through persisted state"
+        assert_ne!(
+            restored_s2, original_secret_s2,
+            "secret is re-minted on cold-start rebuild, not persisted"
         );
 
         let sessions = restored
@@ -8408,7 +8419,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply_s2, vec!["beta-reviewer-s2 echo: after restart two"]);
-        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
+        // 2 original creates + 2 cold-start rebuilds on restart (Wave-2 re-spawns
+        // each live session; both were live, so both restart via start_thread).
+        // /use s1 + /use s2 then hit the already-rebuilt sessions (no new spawn).
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 4);
     }
 
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
@@ -8422,12 +8436,15 @@ mod tests {
     #[tokio::test]
     async fn sid_stable_and_not_reused_across_restart() {
         let tmp = tempfile::tempdir().unwrap();
-        let state_path = tmp.path().join("gateway-state.json");
+        // Project dir under the tempdir so the sessions' meta.json (Wave-2 SoT)
+        // is isolated — the restart rebuilds the live set from it.
+        let project_dir = tmp.path().join("alpha-reuse");
+        std::fs::create_dir_all(&project_dir).unwrap();
         let fake = Arc::new(FakeAdapter::default());
 
         {
-            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-reuse");
-            gateway.enable_persistence(&state_path).unwrap();
+            let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
             // Two SAME-role sessions → s1 + s2 (no dedup post-F1).
             let s1 = gateway
                 .create_session_api(
@@ -8448,24 +8465,25 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!((s1.as_str(), s2.as_str()), ("s1", "s2"));
-            // Free s1 (persists the removal + the bumped counter).
+            // Free s1 (persists the removal from live_sids + the bumped counter).
             gateway.stop_session("s1").await.unwrap();
             assert!(gateway.session_resolve("s1").is_none());
             assert!(gateway.session_resolve("s2").is_some());
         }
 
-        // Rebuild from the same on-disk state.
-        let mut restored = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-reuse");
-        restored.enable_persistence(&state_path).unwrap();
-        // s2 survived the restart (both same-role records were persisted; only
-        // s1 was explicitly stopped).
+        // Rebuild from the same on-disk state (routing.json + next-sid + meta).
+        let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
+        restored.enable_persistence(tmp.path()).unwrap();
+        // Wave-2 — cold-start rebuild the live set (only s2; s1 was stopped, so
+        // it left live_sids and is not rebuilt — its meta.json lingers as history).
+        restored.resume_restored_sessions().await;
         assert!(
             restored.session_resolve("s2").is_some(),
             "the surviving same-role session must restore after restart"
         );
         assert!(
             restored.session_resolve("s1").is_none(),
-            "the stopped session must not resurrect"
+            "the stopped session must not resurrect (left live_sids; history only)"
         );
         // The NEXT create resumes the counter → s3, NEVER recycling s1.
         let s3 = restored
@@ -8480,6 +8498,59 @@ mod tests {
         assert_eq!(
             s3, "s3",
             "the monotonic sid counter must persist — the freed s1 is never reused"
+        );
+    }
+
+    /// v0.8.21 Wave-2 — the monotonic sid counter lives in its OWN file
+    /// (`state/sessions/next-sid`), NOT derived from `max(meta sid)` and NOT
+    /// inside routing.json. So even if routing.json AND every `meta.json` are
+    /// wiped (a state purge / `rm -rf .ccteam/chat`), the next create never
+    /// RE-USES a freed sid — the "sid monotonic, never reused" red line holds
+    /// independently of the routing table and the session history on disk.
+    #[tokio::test]
+    async fn next_sid_monotonic_survives_routing_and_meta_wipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            for _ in 0..3 {
+                gateway
+                    .create_session_api(
+                        "alpha".into(),
+                        "reviewer".into(),
+                        AgentVendor::Claude,
+                        ccteam_harness::PermissionMode::Skip,
+                    )
+                    .await
+                    .unwrap();
+            }
+            // s1, s2, s3 created → the next-sid counter file now reads 3.
+        }
+        // Wipe BOTH the routing snapshot AND every session's meta.json, leaving
+        // ONLY the next-sid counter file behind.
+        let _ = std::fs::remove_file(crate::routing_state_path_in(tmp.path()));
+        let _ = std::fs::remove_dir_all(project_dir.join(".ccteam").join("chat"));
+
+        let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
+        restored.enable_persistence(tmp.path()).unwrap();
+        // Nothing to rebuild (routing + meta gone) — but the counter survives.
+        restored.resume_restored_sessions().await;
+        let next = restored
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next, "s4",
+            "next-sid persists independently of routing.json + meta.json — a wiped \
+             state must never recycle s1/s2/s3"
         );
     }
 
@@ -8513,16 +8584,26 @@ mod tests {
     #[tokio::test]
     async fn tracked_chat_session_names_reads_persisted_canonical_names() {
         let tmp = tempfile::tempdir().unwrap();
-        let state_path = tmp.path().join("gateway-state.json");
+        // v0.8.21 Wave-2 — the out-of-process reader enumerates projects from
+        // config.yaml under the ccteam_root, then resolves each routing.json
+        // live sid to its meta.json. So register the project in config + spawn.
+        let root = tmp.path().join("home");
+        std::fs::create_dir_all(&root).unwrap();
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        ccteam_core::config::upsert_project(
+            &root,
+            ccteam_core::config::ProjectEntry {
+                slug: "beta".to_string(),
+                path: beta.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
         let fake = Arc::new(FakeAdapter::default());
-
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-        gateway.register_project("beta", "/tmp/beta");
-        gateway.enable_persistence(&state_path).unwrap();
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/cd beta")
-            .await
-            .unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "beta", beta);
+        gateway.enable_persistence(&root).unwrap();
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -8531,7 +8612,7 @@ mod tests {
         // v0.8.8 F1 — the canonical pane name is keyed by the session sid
         // (`s1`), not the role: a same-role second session would otherwise
         // collide on one name. The first `/new` minted s1.
-        let names = tracked_chat_session_names(&state_path).unwrap();
+        let names = tracked_chat_session_names(&root).unwrap();
         assert!(
             names.contains("ccteam-chat-beta-s1"),
             "expected sid-keyed canonical chat-session name, got {names:?}"
@@ -8548,13 +8629,27 @@ mod tests {
     #[tokio::test]
     async fn tracked_chat_sessions_projects_vendor_role_sid() {
         // v0.8.8 B4/F3 — spawn one claude + one codex session through the
-        // gateway, persist, then read the flat rows back out-of-process.
+        // gateway, persist, then read the flat rows back out-of-process. Wave-2:
+        // the reader resolves routing.json live_sids ⋈ each session's meta.json,
+        // enumerating project dirs from config.yaml under the ccteam_root.
         let tmp = tempfile::tempdir().unwrap();
-        let state_path = tmp.path().join("gateway-state.json");
+        let root = tmp.path().join("home");
+        std::fs::create_dir_all(&root).unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        ccteam_core::config::upsert_project(
+            &root,
+            ccteam_core::config::ProjectEntry {
+                slug: "alpha".to_string(),
+                path: alpha.clone(),
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
         let fake = Arc::new(FakeAdapter::default());
-
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-        gateway.enable_persistence(&state_path).unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(&root).unwrap();
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -8564,7 +8659,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = tracked_chat_sessions(&state_path).unwrap();
+        let rows = tracked_chat_sessions(&root).unwrap();
         assert_eq!(rows.len(), 2, "expected two tracked rows, got {rows:?}");
 
         let claude = rows
