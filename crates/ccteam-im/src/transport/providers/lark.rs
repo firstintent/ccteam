@@ -30,6 +30,7 @@
 //!   empty = open; a populated list enforces per-user.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,12 +38,13 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, OutboundFile, OutboundFileKind, SendMessage,
+    ChannelMessage, LarkOpenIdProbe, OutboundFile, OutboundFileKind, SendMessage,
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -369,6 +371,10 @@ pub struct LarkChannel {
     /// Dedup set: WS `message_id`s seen in the last ~30 min to prevent
     /// double-dispatch.
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Optional setup-helper JSONL path. Unauthorized sender `open_id`s are
+    /// appended here so the web Settings page can surface them without asking
+    /// users to inspect daemon logs. This does NOT authorize the message.
+    open_id_probe_path: Option<PathBuf>,
     name: String,
 }
 
@@ -392,6 +398,7 @@ impl LarkChannel {
                 .expect("reqwest client"),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            open_id_probe_path: None,
             name: "lark".to_string(),
         }
     }
@@ -400,6 +407,14 @@ impl LarkChannel {
     /// per-tenant bot (see [`super::telegram::TelegramChannel::with_name`]).
     pub fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Record unauthorized sender `open_id`s to this JSONL path. The daemon
+    /// sets this for real channels; tests and standalone providers may leave
+    /// it unset.
+    pub fn with_open_id_probe_path(mut self, path: PathBuf) -> Self {
+        self.open_id_probe_path = Some(path);
         self
     }
 
@@ -644,6 +659,7 @@ impl LarkChannel {
                     let Some(decoded) = self.decode_event(&payload) else { continue };
 
                     if !self.is_user_allowed(&decoded.open_id) {
+                        self.record_open_id_probe(&decoded).await;
                         tracing::warn!("Lark WS: ignoring {} (not in allowed_users)", decoded.open_id);
                         continue;
                     }
@@ -705,6 +721,59 @@ impl LarkChannel {
     /// empty = deny all, `"*"` = open).
     fn is_user_allowed(&self, open_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+    }
+
+    async fn record_open_id_probe(&self, decoded: &DecodedMessage) {
+        let Some(path) = self.open_id_probe_path.as_ref() else {
+            return;
+        };
+        let probe = LarkOpenIdProbe {
+            channel: self.name.clone(),
+            open_id: decoded.open_id.clone(),
+            chat_id: decoded.chat_id.clone(),
+            message_id: decoded.message_id.clone(),
+            timestamp: decoded.timestamp,
+        };
+        let line = match serde_json::to_string(&probe) {
+            Ok(line) => format!("{line}\n"),
+            Err(err) => {
+                tracing::warn!(error = %err, "Lark open_id probe encode failed");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(
+                    path = %parent.display(),
+                    error = %err,
+                    "Lark open_id probe dir create failed"
+                );
+                return;
+            }
+        }
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()).await {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Lark open_id probe append failed"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Lark open_id probe open failed"
+                );
+            }
+        }
     }
 
     /// Get or refresh the tenant access token (cached).

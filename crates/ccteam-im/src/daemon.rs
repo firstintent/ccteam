@@ -502,15 +502,18 @@ async fn reload_im_channels(
     // registrations; per-tenant bots come from tenants.json.
     let bots = list_bots().unwrap_or_default();
     let mut rebuilt: ChannelMap = HashMap::new();
+    let lark_probe_path = lark_open_id_probe_path_for(args);
     if creds_changed {
         for (name, builder) in CHANNEL_BUILDERS {
-            if let Some(ch) = builder(&new_creds, &bots) {
+            if let Some(ch) = builder(&new_creds, &bots, Some(lark_probe_path.as_path())) {
                 rebuilt.insert((*name).to_string(), ch);
             }
         }
     }
     if tenants_changed {
-        for (name, ch) in build_tenant_channels(&daemon_tenants(args)) {
+        for (name, ch) in
+            build_tenant_channels(&daemon_tenants(args), Some(lark_probe_path.as_path()))
+        {
             rebuilt.insert(name, ch);
         }
     }
@@ -582,7 +585,7 @@ const INBOUND_BUF: usize = 64;
 /// Builders are stateless free fns, so `fn`-pointers (not `Box<dyn Fn>`)
 /// keep the table a zero-alloc `const` that's `#[cfg]`-gateable per-row.
 type ChannelBuilder =
-    fn(&Credentials, &[BotRegistration]) -> Option<Arc<dyn Channel + Send + Sync>>;
+    fn(&Credentials, &[BotRegistration], Option<&Path>) -> Option<Arc<dyn Channel + Send + Sync>>;
 
 /// The platform-agnostic provider table. Each row pairs a channel key
 /// with its builder; `#[cfg]` on const-array elements drops a row when
@@ -610,8 +613,9 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
         return ch; // test MockChannel injection still wins, unchanged
     }
     let mut out: ChannelMap = HashMap::new();
+    let lark_probe_path = lark_open_id_probe_path_for(args);
     for (name, builder) in CHANNEL_BUILDERS {
-        if let Some(ch) = builder(creds, bots) {
+        if let Some(ch) = builder(creds, bots, Some(lark_probe_path.as_path())) {
             out.insert((*name).to_string(), ch);
             tracing::info!(channel = %name, "imd: provider channel built from credentials");
         }
@@ -619,7 +623,8 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
     // v0.8.20 F2 — one listener per tenant bot (tenants.json), additive to the
     // global/admin bot above. Keyed "<platform>@<tenant_id>" so reply routing
     // and the inbound→tenant binding work without colliding on the platform.
-    for (name, ch) in build_tenant_channels(&daemon_tenants(args)) {
+    for (name, ch) in build_tenant_channels(&daemon_tenants(args), Some(lark_probe_path.as_path()))
+    {
         tracing::info!(channel = %name, "imd: per-tenant bot channel built");
         out.insert(name, ch);
     }
@@ -637,6 +642,7 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
 fn build_telegram_channel(
     creds: &Credentials,
     bots: &[BotRegistration],
+    _lark_probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let tg = creds.telegram.as_ref()?;
     let mut allowed = tg.allowed_chat_ids.clone();
@@ -658,6 +664,7 @@ fn build_telegram_channel(
 fn build_slack_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
+    _lark_probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let slack = creds.slack.as_ref()?;
     Some(Arc::new(
@@ -675,6 +682,7 @@ fn build_slack_channel(
 fn build_discord_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
+    _lark_probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let discord = creds.discord.as_ref()?;
     Some(Arc::new(
@@ -699,6 +707,7 @@ fn build_discord_channel(
 fn build_lark_channel(
     creds: &Credentials,
     bots: &[BotRegistration],
+    lark_probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let lark = creds.lark.as_ref()?;
     let mut allowed = lark.allowed_user_ids.clone();
@@ -707,14 +716,43 @@ fn build_lark_channel(
     }
     allowed.sort();
     allowed.dedup();
-    Some(Arc::new(
-        crate::transport::providers::lark::LarkChannel::new(
-            lark.app_id.clone(),
-            lark.app_secret.clone(),
-            allowed,
-            lark.use_feishu,
-        ),
-    ))
+    let mut ch = crate::transport::providers::lark::LarkChannel::new(
+        lark.app_id.clone(),
+        lark.app_secret.clone(),
+        allowed,
+        lark.use_feishu,
+    );
+    if let Some(path) = lark_probe_path {
+        ch = ch.with_open_id_probe_path(path.to_path_buf());
+    }
+    Some(Arc::new(ch))
+}
+
+/// JSONL file where Lark channels record unauthorized sender `open_id`s for
+/// the web self-serve setup flow. When tests override the credentials path,
+/// derive the matching fake `~/.ccteam` root from that path instead of touching
+/// the real home.
+fn lark_open_id_probe_path_for(args: &DaemonArgs) -> PathBuf {
+    if let Some(creds) = &args.credentials {
+        if let Some(secrets) = creds.parent() {
+            if let Some(root) = secrets.parent() {
+                return root
+                    .join("state")
+                    .join("im")
+                    .join("lark-open-id-probes.jsonl");
+            }
+        }
+    }
+    ccteam_core::CcteamPaths::from_env()
+        .map(|p| p.im_state_dir().join("lark-open-id-probes.jsonl"))
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".ccteam")
+                .join("state")
+                .join("im")
+                .join("lark-open-id-probes.jsonl")
+        })
 }
 
 /// v0.8.20 — the per-user tenant registry DIR (`~/.ccteam/secrets/users/`, one
@@ -759,6 +797,7 @@ fn tenants_fingerprint(args: &DaemonArgs) -> String {
 /// tenants WITH IM creds get a channel.
 fn build_tenant_channels(
     reg: &ccteam_core::tenants::TenantRegistry,
+    lark_probe_path: Option<&Path>,
 ) -> Vec<(String, Arc<dyn Channel + Send + Sync>)> {
     let mut out: Vec<(String, Arc<dyn Channel + Send + Sync>)> = Vec::new();
     for t in reg.list() {
@@ -775,13 +814,16 @@ fn build_tenant_channels(
         {
             if let Some(lk) = &t.lark {
                 let name = format!("lark@{}", t.id);
-                let ch = crate::transport::providers::lark::LarkChannel::new(
+                let mut ch = crate::transport::providers::lark::LarkChannel::new(
                     lk.app_id.clone(),
                     lk.app_secret.clone(),
                     lk.allowed_user_ids.clone(),
                     lk.use_feishu,
-                )
-                .with_name(name.clone());
+                );
+                if let Some(path) = lark_probe_path {
+                    ch = ch.with_open_id_probe_path(path.to_path_buf());
+                }
+                let ch = ch.with_name(name.clone());
                 out.push((name, Arc::new(ch)));
             }
         }
@@ -1534,7 +1576,7 @@ mod tests {
             }),
         );
         let _bob = reg.add("bob"); // no IM creds → no channel
-        let chans = build_tenant_channels(&reg);
+        let chans = build_tenant_channels(&reg, None);
         let names: Vec<String> = chans.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
             names,

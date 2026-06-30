@@ -108,6 +108,28 @@ pub fn tenant_of_bot_channel(channel: &str) -> Option<&str> {
     channel.split_once('@').map(|(_platform, tid)| tid)
 }
 
+/// Lark/Feishu setup helper event: an inbound message whose sender was parsed
+/// successfully but rejected by the provider-level `allowed_user_ids` gate.
+///
+/// The daemon records these to a small JSONL file so the web Settings flow can
+/// show the user their own `ou_...` open_id without asking them to inspect
+/// server logs. The message is still denied and never reaches the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LarkOpenIdProbe {
+    /// Channel key that saw the event: `"lark"` for the global/admin bot or
+    /// `"lark@<tenant_id>"` for a per-user bot.
+    pub channel: String,
+    /// Sender `open_id` (`ou_...`) to place in `allowed_user_ids`.
+    pub open_id: String,
+    /// Conversation id (`oc_...`), kept for diagnostics and masked by the web
+    /// API.
+    pub chat_id: String,
+    /// Raw Lark/Feishu message id (`om_...`).
+    pub message_id: String,
+    /// Event time in Unix seconds, copied from the Lark message when present.
+    pub timestamp: u64,
+}
+
 /// How an [`OutboundFile`] should be sent (V0.8.4 P2b).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -361,6 +361,7 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     reg.save(&paths.users_dir()).unwrap();
     let alice_tok = alice.web_token.clone();
     let tenants_path = paths.users_dir();
+    let probe_path = paths.im_state_dir().join("lark-open-id-probes.jsonl");
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;
@@ -370,7 +371,11 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     let r = c
         .put(format!("http://{addr}/api/v1/me/im"))
         .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
-        .json(&serde_json::json!({"lark": {"app_id": "cli_a", "app_secret": "sek"}}))
+        .json(&serde_json::json!({"lark": {
+            "app_id": "cli_a",
+            "app_secret": "sek",
+            "allowed_user_ids": ["ou_alice"]
+        }}))
         .send()
         .await
         .unwrap();
@@ -378,7 +383,84 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     let a = TenantRegistry::load(&tenants_path);
     let a = a.by_id(&alice.id).unwrap().clone();
     assert_eq!(a.lark.as_ref().unwrap().app_id, "cli_a");
+    assert_eq!(
+        a.lark.as_ref().unwrap().allowed_user_ids,
+        vec!["ou_alice"],
+        "self-serve Lark allowlist must persist",
+    );
     assert!(a.telegram.is_none(), "no telegram in body → none");
+
+    // 1b. Setup-helper capture is tenant-scoped: alice only sees probes from
+    // her own `lark@<tenant>` bot, then can save that open_id without
+    // re-submitting app_secret.
+    std::fs::create_dir_all(probe_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &probe_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "channel": format!("lark@{}", alice.id),
+                "open_id": "ou_captured_alice",
+                "chat_id": "oc_alice_room",
+                "message_id": "om_alice",
+                "timestamp": 2000_u64
+            }),
+            serde_json::json!({
+                "channel": format!("lark@{}", bob.id),
+                "open_id": "ou_bob_private",
+                "chat_id": "oc_bob_room",
+                "message_id": "om_bob",
+                "timestamp": 2001_u64
+            }),
+        ),
+    )
+    .unwrap();
+    let candidates: serde_json::Value = c
+        .get(format!(
+            "http://{addr}/api/v1/me/im/lark/open-id-candidates?since=1500"
+        ))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates["candidates"][0]["open_id"],
+        serde_json::json!("ou_captured_alice"),
+    );
+    assert_eq!(
+        candidates["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["open_id"] == "ou_bob_private")
+            .count(),
+        0,
+        "alice must not see bob's rejected open_id probes",
+    );
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im/lark/allowed-users"))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(
+            &serde_json::json!({"allowed_user_ids": [" ou_captured_alice ", "ou_captured_alice"]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "alice saves captured allowlist");
+    let a = TenantRegistry::load(&tenants_path);
+    assert_eq!(
+        a.by_id(&alice.id)
+            .unwrap()
+            .lark
+            .as_ref()
+            .unwrap()
+            .allowed_user_ids,
+        vec!["ou_captured_alice"],
+        "allowlist-only update trims + dedups without needing app_secret",
+    );
 
     // 2. A tenant can NOT set another tenant's bot via the admin route.
     let r = c
@@ -394,7 +476,12 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     let r = c
         .put(format!("http://{addr}/api/v1/users/{}/im", bob.id))
         .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
-        .json(&serde_json::json!({"lark": {"app_id": "cli_bob", "app_secret": "s", "use_feishu": false}}))
+        .json(&serde_json::json!({"lark": {
+            "app_id": "cli_bob",
+            "app_secret": "s",
+            "allowed_user_ids": ["ou_bob"],
+            "use_feishu": false
+        }}))
         .send()
         .await
         .unwrap();
@@ -402,6 +489,11 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     let b = TenantRegistry::load(&tenants_path);
     let b = b.by_id(&bob.id).unwrap().clone();
     assert_eq!(b.lark.as_ref().unwrap().app_id, "cli_bob");
+    assert_eq!(
+        b.lark.as_ref().unwrap().allowed_user_ids,
+        vec!["ou_bob"],
+        "admin-set tenant Lark allowlist must persist",
+    );
     assert!(
         !b.lark.as_ref().unwrap().use_feishu,
         "use_feishu=false honored"

@@ -63,13 +63,52 @@ export interface PutMyImForm {
   /** The tenant's own Telegram bot token. Omit/empty → no Telegram bot. */
   telegram_bot_token?: string;
   /** The tenant's own Lark/Feishu app. Omit → no Lark bot. */
-  lark?: { app_id: string; app_secret: string; use_feishu?: boolean };
+  lark?: {
+    app_id: string;
+    app_secret: string;
+    allowed_user_ids?: string[];
+    use_feishu?: boolean;
+  };
 }
 
 /** `PUT /api/v1/me/im` — the caller sets its OWN per-user IM bot (self-serve).
  *  The Telegram token is `getMe`-validated server-side before it is stored. */
 export function putMyIm(form: PutMyImForm): Promise<{ ok: boolean }> {
   return sendJson<{ ok: boolean }>("/api/v1/me/im", "PUT", form);
+}
+
+export interface LarkOpenIdCandidate {
+  open_id: string;
+  seen_at: number;
+  message_id: string;
+  chat_id_last4: string;
+}
+
+export interface LarkOpenIdCandidatesResponse {
+  candidates: LarkOpenIdCandidate[];
+}
+
+/** Poll rejected Lark/Feishu sender open_ids for the caller's own per-user bot.
+ *  These messages were denied by the allowlist and never routed to an agent. */
+export function getMyLarkOpenIdCandidates(
+  since?: number,
+): Promise<LarkOpenIdCandidatesResponse> {
+  const qs = since ? `?since=${encodeURIComponent(String(since))}` : "";
+  return getJson<LarkOpenIdCandidatesResponse>(
+    `/api/v1/me/im/lark/open-id-candidates${qs}`,
+  );
+}
+
+/** Update only the caller's Lark/Feishu allowlist, preserving the stored app
+ *  secret. Used after the setup flow captures the user's `ou_...` open_id. */
+export function putMyLarkAllowedUsers(
+  allowed_user_ids: string[],
+): Promise<{ ok: boolean; allowed_user_id_count: number; note?: string }> {
+  return sendJson<{ ok: boolean; allowed_user_id_count: number; note?: string }>(
+    "/api/v1/me/im/lark/allowed-users",
+    "PUT",
+    { allowed_user_ids },
+  );
 }
 
 async function getJson<T>(url: string): Promise<T> {

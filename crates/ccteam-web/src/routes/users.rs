@@ -15,7 +15,7 @@
 //! into the `/api/v1` [`OpenApiRouter`] so the web-token gate applies.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
@@ -250,12 +250,28 @@ pub struct PutTenantImForm {
 pub struct LarkImForm {
     pub app_id: String,
     pub app_secret: String,
+    /// `open_id`s (`ou_...`) allowed to drive this tenant's Lark/Feishu bot.
+    /// Empty keeps the bot fail-closed, but the web setup helper can still
+    /// discover candidates from rejected messages.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
     #[serde(default = "default_true_im")]
     pub use_feishu: bool,
 }
 
 fn default_true_im() -> bool {
     true
+}
+
+fn normalize_lark_user_ids(ids: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Validate + REPLACE a tenant's per-user IM creds, then persist. Shared by the
@@ -292,7 +308,7 @@ async fn apply_tenant_im(app: &AppState, tenant_id: &str, form: PutTenantImForm)
     let lark = form.lark.map(|l| TenantLark {
         app_id: l.app_id,
         app_secret: l.app_secret,
-        allowed_user_ids: Vec::new(),
+        allowed_user_ids: normalize_lark_user_ids(l.allowed_user_ids),
         use_feishu: l.use_feishu,
     });
     let has_telegram = telegram.is_some();
@@ -368,6 +384,187 @@ pub(crate) async fn handle_put_me_im(
             .into_response();
     }
     apply_tenant_im(&app, &identity.id, form).await
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LarkAllowedUsersForm {
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LarkCandidateQuery {
+    #[serde(default)]
+    pub since: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LarkOpenIdCandidate {
+    pub open_id: String,
+    pub seen_at: u64,
+    pub message_id: String,
+    pub chat_id_last4: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LarkOpenIdCandidatesResponse {
+    pub candidates: Vec<LarkOpenIdCandidate>,
+}
+
+fn last4(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect()
+}
+
+fn lark_probe_path(app: &AppState) -> std::path::PathBuf {
+    app.paths.im_state_dir().join("lark-open-id-probes.jsonl")
+}
+
+fn read_lark_candidates(
+    path: &std::path::Path,
+    channel: &str,
+    since: Option<u64>,
+) -> Vec<LarkOpenIdCandidate> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut by_open_id: std::collections::HashMap<String, LarkOpenIdCandidate> =
+        std::collections::HashMap::new();
+    for line in raw.lines() {
+        let Ok(probe) = serde_json::from_str::<ccteam_im::transport::LarkOpenIdProbe>(line) else {
+            continue;
+        };
+        if probe.channel != channel {
+            continue;
+        }
+        if since.is_some_and(|min| probe.timestamp < min) {
+            continue;
+        }
+        let candidate = LarkOpenIdCandidate {
+            open_id: probe.open_id.clone(),
+            seen_at: probe.timestamp,
+            message_id: probe.message_id,
+            chat_id_last4: last4(&probe.chat_id),
+        };
+        match by_open_id.get(&probe.open_id) {
+            Some(existing) if existing.seen_at >= candidate.seen_at => {}
+            _ => {
+                by_open_id.insert(probe.open_id, candidate);
+            }
+        }
+    }
+    let mut out: Vec<LarkOpenIdCandidate> = by_open_id.into_values().collect();
+    out.sort_by(|a, b| b.seen_at.cmp(&a.seen_at).then(a.open_id.cmp(&b.open_id)));
+    out.truncate(10);
+    out
+}
+
+/// `GET /api/v1/me/im/lark/open-id-candidates` — tenants poll this while
+/// setting up Lark/Feishu. It returns recent `open_id`s that this tenant's bot
+/// saw but rejected because they were not in `allowed_user_ids`; those messages
+/// were not routed to any agent.
+#[utoipa::path(
+    get,
+    path = "/api/v1/me/im/lark/open-id-candidates",
+    tag = "users",
+    params(("since" = Option<u64>, Query, description = "Only candidates at/after this Unix timestamp")),
+    responses(
+        (status = 200, description = "Recent rejected Lark sender open_ids for this tenant", body = LarkOpenIdCandidatesResponse),
+        (status = 400, description = "Admin caller (uses global config)"),
+    ),
+)]
+pub(crate) async fn handle_get_me_lark_open_id_candidates(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Query(query): Query<LarkCandidateQuery>,
+) -> Response {
+    if identity.is_admin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the owner's bot is the global bot — tenant open_id capture is under /api/v1/me"})),
+        )
+            .into_response();
+    }
+    let channel = format!("lark@{}", identity.id);
+    Json(LarkOpenIdCandidatesResponse {
+        candidates: read_lark_candidates(&lark_probe_path(&app), &channel, query.since),
+    })
+    .into_response()
+}
+
+/// `PUT /api/v1/me/im/lark/allowed-users` — update only the allowlist of an
+/// already-configured tenant Lark app. This lets the web setup flow save the
+/// captured `ou_...` without asking the user to re-enter the app secret.
+#[utoipa::path(
+    put,
+    path = "/api/v1/me/im/lark/allowed-users",
+    tag = "users",
+    request_body(content = LarkAllowedUsersForm, description = "Full desired allowed_user_ids list"),
+    responses(
+        (status = 200, description = "Allowlist updated; `{ok, lark, reloaded, note}`", body = serde_json::Value),
+        (status = 400, description = "Admin caller / no Lark app configured"),
+        (status = 404, description = "Caller is not a registered tenant"),
+        (status = 500, description = "Registry write failed"),
+    ),
+)]
+pub(crate) async fn handle_put_me_lark_allowed_users(
+    State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(form): Json<LarkAllowedUsersForm>,
+) -> Response {
+    if identity.is_admin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the owner's bot is the global bot — set it via /api/v1/config/im"})),
+        )
+            .into_response();
+    }
+    let path = app.paths.users_dir();
+    let mut reg = TenantRegistry::load(&path);
+    let Some(tenant) = reg.by_id(&identity.id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown tenant: {}", identity.id)})),
+        )
+            .into_response();
+    };
+    let Some(mut lark) = tenant.lark else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": "no Lark/Feishu app configured; save App ID and App Secret first"}),
+            ),
+        )
+            .into_response();
+    };
+    lark.allowed_user_ids = normalize_lark_user_ids(form.allowed_user_ids);
+    let allow_count = lark.allowed_user_ids.len();
+    reg.set_lark(&identity.id, Some(lark));
+    if let Err(err) = reg.save(&path) {
+        tracing::error!(%err, "PUT /api/v1/me/im/lark/allowed-users: registry save failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{err}")})),
+        )
+            .into_response();
+    }
+    let reloaded = match app.gateway.as_ref() {
+        Some(gw) => gw.lock().await.request_im_reload(),
+        None => false,
+    };
+    Json(json!({
+        "ok": true,
+        "lark": true,
+        "allowed_user_id_count": allow_count,
+        "reloaded": reloaded,
+        "note": if reloaded {
+            "saved; your Lark bot listener is (re)starting now"
+        } else {
+            "saved; takes effect on the next daemon reload/restart"
+        },
+    }))
+    .into_response()
 }
 
 /// `PUT /api/v1/users/{id}/im` — the admin sets a tenant's per-user IM bot.

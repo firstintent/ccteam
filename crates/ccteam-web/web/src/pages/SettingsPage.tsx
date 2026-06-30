@@ -52,9 +52,12 @@ import { toastBus } from "../lib/toastBus";
 import {
   createUser,
   deleteUser,
+  getMyLarkOpenIdCandidates,
   getUserLink,
   listUsers,
   putMyIm,
+  putMyLarkAllowedUsers,
+  type LarkOpenIdCandidate,
   type PutMyImForm,
   type TenantView,
 } from "../lib/usersApi";
@@ -759,22 +762,77 @@ function MyImSection() {
   const [larkOpen, setLarkOpen] = useState(false);
   const [larkAppId, setLarkAppId] = useState("");
   const [larkSecret, setLarkSecret] = useState("");
+  const [larkUsersRaw, setLarkUsersRaw] = useState("");
   const [useFeishu, setUseFeishu] = useState(true);
+  const [larkCaptureSince, setLarkCaptureSince] = useState<number | null>(null);
+  const [larkCandidates, setLarkCandidates] = useState<LarkOpenIdCandidate[]>([]);
   const [pending, setPending] = useState(false);
   const [saved, setSaved] = useState(false);
+  const larkCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const larkUserIds = parseUserIds(larkUsersRaw);
+
+  useEffect(() => {
+    if (larkCaptureSince === null) return;
+    let cancelled = false;
+
+    const tick = () => {
+      getMyLarkOpenIdCandidates(larkCaptureSince)
+        .then((res) => {
+          if (cancelled) return;
+          setLarkCandidates(res.candidates);
+          larkCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          if (!(err instanceof Error) || err.message !== "UNAUTHENTICATED") {
+            toastBus.handler?.error(err instanceof Error ? err.message : "open_id capture failed");
+          }
+          larkCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        });
+    };
+    larkCaptureTimerRef.current = setTimeout(tick, 300);
+    return () => {
+      cancelled = true;
+      if (larkCaptureTimerRef.current) {
+        clearTimeout(larkCaptureTimerRef.current);
+        larkCaptureTimerRef.current = null;
+      }
+    };
+  }, [larkCaptureSince]);
+
+  function startLarkCapture() {
+    setLarkCandidates([]);
+    setLarkCaptureSince(Math.floor(Date.now() / 1000) - 2);
+    toastBus.handler?.info("私聊 Lark / 飞书 bot,或在群里 @ bot,这里会出现 open_id");
+  }
 
   async function onSave(e: React.FormEvent) {
     e.preventDefault();
     if (pending) return;
+    const tok = telegram.trim();
+    const larkApp = larkAppId.trim();
+    const larkSecretValue = larkSecret.trim();
+    if (larkOpen && (larkApp || larkSecretValue) && !(larkApp && larkSecretValue)) {
+      toastBus.handler?.error("Lark App ID 和 App Secret 需要一起填写");
+      return;
+    }
+    if (larkOpen && !larkApp && !larkSecretValue && larkUserIds.length > 0) {
+      if (tok) {
+        toastBus.handler?.error("请先单独保存 Lark open_id,再保存 Telegram token");
+        return;
+      }
+      void saveLarkAllowlist(larkUserIds);
+      return;
+    }
     setPending(true);
     setSaved(false);
     const form: PutMyImForm = {};
-    const tok = telegram.trim();
     if (tok) form.telegram_bot_token = tok;
-    if (larkOpen && larkAppId.trim() && larkSecret.trim()) {
+    if (larkOpen && larkApp && larkSecretValue) {
       form.lark = {
-        app_id: larkAppId.trim(),
-        app_secret: larkSecret.trim(),
+        app_id: larkApp,
+        app_secret: larkSecretValue,
+        allowed_user_ids: larkUserIds,
         use_feishu: useFeishu,
       };
     }
@@ -784,6 +842,9 @@ function MyImSection() {
       setTelegram("");
       setLarkAppId("");
       setLarkSecret("");
+      if (larkOpen && larkUserIds.length === 0) {
+        startLarkCapture();
+      }
       toastBus.handler?.info("已保存 / Saved");
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
@@ -791,6 +852,30 @@ function MyImSection() {
     } finally {
       setPending(false);
     }
+  }
+
+  async function saveLarkAllowlist(ids: string[]) {
+    if (pending) return;
+    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort();
+    setPending(true);
+    try {
+      const res = await putMyLarkAllowedUsers(normalized);
+      setLarkUsersRaw(normalized.join("\n"));
+      setSaved(true);
+      setLarkCaptureSince(null);
+      setLarkCandidates([]);
+      toastBus.handler?.info(res.note || "open_id 已保存到 allowlist");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function saveCapturedOpenId(openId: string) {
+    const merged = Array.from(new Set([...larkUserIds, openId])).sort();
+    await saveLarkAllowlist(merged);
   }
 
   return (
@@ -870,6 +955,68 @@ function MyImSection() {
                 />
                 飞书(CN);取消勾选 = Lark intl
               </label>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="my-im-lark-users">允许的 open_id</Label>
+                <Textarea
+                  id="my-im-lark-users"
+                  value={larkUsersRaw}
+                  onChange={(e) => setLarkUsersRaw(e.target.value)}
+                  disabled={pending}
+                  rows={3}
+                  spellCheck={false}
+                  placeholder="ou_abc…"
+                  className="font-mono"
+                />
+                {larkUserIds.length === 0 ? (
+                  <p className="text-[10px] text-status-error">
+                    空 allowlist = fail-closed。保存 App 后可在下方发现自己的 open_id。
+                  </p>
+                ) : (
+                  <p className="text-[10px] text-text-dim">
+                    {larkUserIds.length} 个 open_id 将被允许。
+                  </p>
+                )}
+              </div>
+              <div className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-text-secondary">
+                    发现 open_id
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={startLarkCapture}
+                    disabled={pending}
+                  >
+                    开始
+                  </Button>
+                </div>
+                {larkCaptureSince !== null ? (
+                  <p className="text-[10px] text-text-dim">
+                    现在私聊这个 Lark / 飞书 bot,或在群里 @ bot;消息会被拒绝,只用于显示 sender
+                    open_id。
+                  </p>
+                ) : null}
+                {larkCandidates.length > 0 ? (
+                  <div className="flex flex-col gap-1">
+                    {larkCandidates.map((c) => (
+                      <button
+                        key={`${c.open_id}:${c.message_id}`}
+                        type="button"
+                        onClick={() => void saveCapturedOpenId(c.open_id)}
+                        disabled={pending}
+                        className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
+                      >
+                        <span>{c.open_id}</span>
+                        <span className="text-[10px] text-text-dim">填入并保存</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : larkCaptureSince !== null ? (
+                  <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
+                ) : null}
+              </div>
             </div>
           ) : null}
 

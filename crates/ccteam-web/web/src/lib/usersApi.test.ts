@@ -2,7 +2,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createUser, deleteUser, listUsers } from "./usersApi";
+import {
+  createUser,
+  deleteUser,
+  getMyLarkOpenIdCandidates,
+  listUsers,
+  putMyIm,
+  putMyLarkAllowedUsers,
+} from "./usersApi";
 
 const realFetch = globalThis.fetch;
 
@@ -67,6 +74,66 @@ describe("usersApi", () => {
       expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
     );
     expect(got.removed).toBe(true);
+  });
+
+  it("putMyIm sends tenant Lark allowed_user_ids", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+    await putMyIm({
+      lark: {
+        app_id: "cli_a",
+        app_secret: "sek",
+        allowed_user_ids: ["ou_me"],
+        use_feishu: true,
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/me/im",
+      expect.objectContaining({
+        method: "PUT",
+        credentials: "same-origin",
+        body: JSON.stringify({
+          lark: {
+            app_id: "cli_a",
+            app_secret: "sek",
+            allowed_user_ids: ["ou_me"],
+            use_feishu: true,
+          },
+        }),
+      }),
+    );
+  });
+
+  it("polls and saves tenant Lark open_id candidates", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(200, {
+          candidates: [
+            {
+              open_id: "ou_me",
+              seen_at: 2000,
+              message_id: "om_1",
+              chat_id_last4: "room",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true, allowed_user_id_count: 1 }));
+    const got = await getMyLarkOpenIdCandidates(1500);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/me/im/lark/open-id-candidates?since=1500",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(got.candidates[0].open_id).toBe("ou_me");
+    await putMyLarkAllowedUsers(["ou_me"]);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/v1/me/im/lark/allowed-users",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ allowed_user_ids: ["ou_me"] }),
+      }),
+    );
   });
 
   it("maps 401 → UNAUTHENTICATED, 403 → FORBIDDEN, 500 → HTTP 500", async () => {
