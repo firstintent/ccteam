@@ -4,6 +4,49 @@
 
 ccteam is a **self-hosted control plane for coding agents.** One resident daemon sits in front of the stock [Claude Code](https://code.claude.com/) and OpenAI Codex agents and owns everything *around* the work — routing, session identity, lifecycle, and budget — while never touching the work itself: no injected prompts, no scraped terminals, no forked runtime. You drive the real Claude Code / Codex, every native capability intact.
 
+## Quickstart
+
+```bash
+# 0. Install Claude Code first: https://code.claude.com/docs/install
+
+# 1. Install ccteam — recommended: build from source with cargo (needs a Rust
+#    toolchain + Node.js for the web-console bundle → ~/.cargo/bin/ccteam):
+cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+
+#    Fallback — prebuilt binary, no toolchain needed (→ ~/.local/bin/ccteam):
+#    curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+
+# 2. Initialize a project, then one-time setup (MCP for Claude + Codex, IM token, prefs):
+cd ~/code/myproject && ccteam init
+ccteam config
+
+# 3. Start the daemon in the background — IM gateway + web console + resource API + MCP, one process:
+nohup ccteam start >~/ccteam.log 2>&1 &   # foreground instead: just `ccteam start`
+```
+
+Then drive it from **either** surface — the web console or IM:
+
+```text
+# Web console — open in your browser:
+http://localhost:7331
+#   Token auth: paste the token shown when the daemon starts
+#   (also stored at ~/.ccteam/secrets/web-token).
+```
+
+```text
+# IM (Telegram):
+/cd myproject           # switch project → a `cto` session spins up; start chatting
+/role backend-dev       # switch to a work-role
+/new   /use   @handle   # open / switch / address sessions
+@ccteam status          # group control: status / cost / stop
+```
+
+Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
+
+For every CLI command, slash command, and IM control, see the [complete user manual](docs/usage.md).
+
+**Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
+
 ## Architecture
 
 ```text
@@ -58,51 +101,6 @@ Build your team by dropping `.md` files into `.claude/agents/` — or one-click-
 - **Full slash coverage from chat** — Claude's open commands pass through; picker commands (model, review target) become inline buttons in IM (chips in web); an agent's own `AskUserQuestion` surfaces the same way, answerable from your phone.
 - **Optional human-in-the-loop** — `/new claude <role> hitl` makes every non-allowlisted tool call pause for your inline approve / deny via Claude's native permission hook. Deny blocks just that tool, never the turn; the rest run hands-off.
 - **Cost-aware & durable** — per-vendor 24h budget caps with a hard ceiling (a long session is never killed unless a cap is hit, or you stop it); all state is reconstructable from disk (hooks, transcripts, RPC events — never scraped text). A killed Claude pane reloads losslessly with `claude --resume`, or falls back to a fresh session with a visible reset event rather than silently forgetting.
-
-## Quickstart
-
-```bash
-# 0. Install Claude Code first: https://code.claude.com/docs/install
-
-# 1. Install ccteam — recommended: build from source with cargo (needs a Rust
-#    toolchain + Node.js for the web-console bundle → ~/.cargo/bin/ccteam):
-cargo install --git https://github.com/firstintent/ccteam ccteam-cli
-
-#    Fallback — prebuilt binary, no toolchain needed (→ ~/.local/bin/ccteam):
-#    curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-
-# 2. Initialize a project, then one-time setup (MCP for Claude + Codex, IM token, prefs):
-cd ~/code/myproject && ccteam init
-ccteam config
-
-# 3. Start the daemon in the background — IM gateway + web console + resource API + MCP, one process:
-nohup ccteam start >~/ccteam.log 2>&1 &   # foreground instead: just `ccteam start`
-```
-
-Then drive it from **either** surface — the web console or IM:
-
-```text
-# Web console — open in your browser:
-http://localhost:7331
-#   Token auth: paste the token shown when the daemon starts
-#   (also stored at ~/.ccteam/secrets/web-token).
-```
-
-```text
-# IM (Telegram):
-/cd myproject           # switch project → a `cto` session spins up; start chatting
-/role backend-dev       # switch to a work-role
-/new   /use   @handle   # open / switch / address sessions
-@ccteam status          # group control: status / cost / stop
-```
-
-Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
-
-For every CLI command, slash command, and IM control, see the [complete user manual](docs/usage.md).
-
-**Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
-
-**Platforms.** Linux x86_64 / aarch64 and macOS arm64 / x86_64 (prebuilt). Linux binaries are musl-static (run on any glibc — NAS and older distros included). Windows is supported via WSL2 with the linux-x64 binary; tmux, inotify, and POSIX signals are foundational, so native Windows isn't supported. macOS Gatekeeper on first run: `xattr -d com.apple.quarantine ~/.local/bin/ccteam`.
 
 ## License
 
