@@ -4,6 +4,8 @@
 
 ccteam is a **self-hosted control plane for coding agents.** One resident daemon sits in front of the stock [Claude Code](https://code.claude.com/) and OpenAI Codex agents and owns everything *around* the work — routing, session identity, lifecycle, and budget — while never touching the work itself: no injected prompts, no scraped terminals, no forked runtime. You drive the real Claude Code / Codex, every native capability intact.
 
+[English](docs/usage.md) • [中文](docs/usage-cn.md)
+
 ## Quickstart
 
 ```bash
@@ -43,7 +45,7 @@ http://localhost:7331
 
 Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
 
-For every CLI command, slash command, and IM control, see the [complete user manual](docs/usage.md).
+For every CLI command, slash command, and IM control, see the user manual: [English](docs/usage.md) • [中文](docs/usage-cn.md).
 
 **Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
 
