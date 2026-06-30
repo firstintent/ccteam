@@ -270,3 +270,65 @@ export function createSession(
   if (opts.protocol) body.protocol = opts.protocol;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }
+
+// ── v0.8.21 history / resume / external-import ───────────────────────────────
+
+/** A stopped ccteam session from `GET .../sessions/history`. */
+export interface HistorySessionView {
+  sid: string;
+  slug: string;
+  vendor: string;
+  protocol: string;
+  role: string;
+  permission_mode: string;
+  owner: string;
+  vendor_uuid: string;
+  created_at: string;
+  last_active: string;
+  origin: "ccteam" | "adopted";
+  /** True when the vendor transcript still exists → precise `--resume`. */
+  transcript_present: boolean;
+}
+
+/** An external vendor session from `GET .../external-sessions`. */
+export interface ExternalSessionView {
+  vendor: string;
+  vendor_uuid: string;
+  title: string;
+  last_active: string;
+  cwd: string;
+  adoptable: boolean;
+}
+
+/** Fetch stopped ccteam sessions for a project (lazy — call on expand). */
+export function listHistorySessions(slug: string): Promise<HistorySessionView[]> {
+  return getJson<HistorySessionView[]>(
+    `${sessionsUrl(slug)}/history`,
+  );
+}
+
+/** Re-activate a stopped session. Returns `{sid}`. */
+export function resumeSession(slug: string, sid: string): Promise<{ sid: string }> {
+  return postJson<{ sid: string }>(
+    `${sessionsUrl(slug)}/${encodeURIComponent(sid)}/resume`,
+    {},
+  );
+}
+
+/** Discover external Claude sessions for a project. */
+export function listExternalSessions(slug: string): Promise<ExternalSessionView[]> {
+  return getJson<ExternalSessionView[]>(
+    `/api/v1/projects/${encodeURIComponent(slug)}/external-sessions`,
+  );
+}
+
+/** Import (adopt) an external Claude session. Returns `{sid}` of the new ccteam session. */
+export function importExternalSession(
+  slug: string,
+  vendorUuid: string,
+): Promise<{ sid: string }> {
+  return postJson<{ sid: string }>(
+    `${sessionsUrl(slug)}/import`,
+    { vendor: "claude", vendor_uuid: vendorUuid },
+  );
+}

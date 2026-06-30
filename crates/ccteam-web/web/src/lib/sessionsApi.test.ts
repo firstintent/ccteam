@@ -10,14 +10,20 @@ import {
   getHistory,
   getRoleDetail,
   getSessionStatus,
+  importExternalSession,
   interruptSession,
+  listExternalSessions,
+  listHistorySessions,
   listProjectRoles,
   listSessions,
   resolveApproval,
+  resumeSession,
   sessionUrl,
   sessionsUrl,
   stopSession,
   submitTurn,
+  type ExternalSessionView,
+  type HistorySessionView,
   type RoleDetail,
   type RoleSummary,
   type SessionStatus,
@@ -354,5 +360,130 @@ describe("getRoleDetail", () => {
     await expect(getRoleDetail("p", "ghost")).rejects.toThrow("NOT_FOUND");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
     await expect(getRoleDetail("p", "x")).rejects.toThrow("UNAUTHENTICATED");
+  });
+});
+
+// ── v0.8.21 history / resume / external-import ───────────────────────────────
+describe("sessionsApi history / resume / external-import (v0.8.21)", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("listHistorySessions GETs .../sessions/history and returns stopped rows", async () => {
+    const rows: HistorySessionView[] = [
+      {
+        sid: "s7",
+        slug: "dex-ui",
+        vendor: "claude",
+        protocol: "stream-json",
+        role: "cto",
+        permission_mode: "skip",
+        owner: "user:web-api",
+        vendor_uuid: "11111111-1111-1111-1111-111111111111",
+        created_at: "2026-06-29T00:00:00Z",
+        last_active: "2026-06-29T01:00:00Z",
+        origin: "ccteam",
+        transcript_present: true,
+      },
+    ];
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, rows));
+    const got = await listHistorySessions("dex-ui");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/dex-ui/sessions/history", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual(rows);
+    expect(got[0].transcript_present).toBe(true);
+    expect(got[0].origin).toBe("ccteam");
+  });
+
+  it("listHistorySessions returns [] when no stopped sessions", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(200, []));
+    expect(await listHistorySessions("empty")).toEqual([]);
+  });
+
+  it("resumeSession POSTs {} to .../sessions/{sid}/resume and returns {sid}", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { sid: "s7" }));
+    const got = await resumeSession("dex-ui", "s7");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/dex-ui/sessions/s7/resume", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(got.sid).toBe("s7");
+  });
+
+  it("resumeSession encodes the sid", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(200, { sid: "s/odd" }));
+    await resumeSession("dex-ui", "s/odd");
+    expect(vi.mocked(globalThis.fetch).mock.calls[0][0]).toBe(
+      "/api/v1/projects/dex-ui/sessions/s%2Fodd/resume",
+    );
+  });
+
+  it("listExternalSessions GETs .../external-sessions and returns discovered rows", async () => {
+    const rows: ExternalSessionView[] = [
+      {
+        vendor: "claude",
+        vendor_uuid: "22222222-2222-2222-2222-222222222222",
+        title: "refactor gateway",
+        last_active: "2026-06-28T00:00:00Z",
+        cwd: "/home/u/proj",
+        adoptable: true,
+      },
+    ];
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, rows));
+    const got = await listExternalSessions("dex-ui");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/dex-ui/external-sessions", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual(rows);
+    expect(got[0].adoptable).toBe(true);
+  });
+
+  it("importExternalSession POSTs {vendor,vendor_uuid} to .../sessions/import", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, { sid: "s8" }));
+    const got = await importExternalSession(
+      "dex-ui",
+      "33333333-3333-3333-3333-333333333333",
+    );
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/dex-ui/sessions/import", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        vendor: "claude",
+        vendor_uuid: "33333333-3333-3333-3333-333333333333",
+      }),
+    });
+    expect(got.sid).toBe("s8");
+  });
+
+  it("importExternalSession lifts the server error body (uuid not adoptable)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: "vendor_uuid 33333333 is not an adoptable session for project dex-ui",
+      }),
+    );
+    await expect(
+      importExternalSession("dex-ui", "33333333-3333-3333-3333-333333333333"),
+    ).rejects.toThrow("is not an adoptable session");
+  });
+
+  it("history/resume map 401 → UNAUTHENTICATED and 404 → NOT_FOUND", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
+    await expect(listHistorySessions("x")).rejects.toThrow("UNAUTHENTICATED");
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, { error: "nope" }));
+    await expect(resumeSession("x", "sZ")).rejects.toThrow("NOT_FOUND");
   });
 });

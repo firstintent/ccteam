@@ -9,6 +9,7 @@ pub mod codex_jsonrpc;
 pub mod codex_typed_events;
 pub mod process_inspect;
 pub mod progress_bridge;
+pub mod session_meta;
 pub mod session_recovery;
 pub mod transcript_tail;
 pub mod turns_mirror;

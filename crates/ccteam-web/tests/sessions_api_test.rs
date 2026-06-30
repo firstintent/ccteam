@@ -302,3 +302,252 @@ async fn session_events_no_gateway_streams_unavailable_notice() {
 
     assert_eq!(saw_notice.as_deref(), Some("gateway_unavailable"));
 }
+
+// ── v0.8.21 history + resume + external-import (gateway-attached, real HTTP) ──
+
+/// End-to-end user flow over a real router + real gateway: create a session
+/// (meta.json lands on disk), stop it (meta.json SURVIVES the stop), the live
+/// list drops it while the history list now shows it, then resume puts it back
+/// into the live list (and out of history). This is the "resume any past
+/// session" acceptance path exercised exactly as the SPA drives it.
+#[tokio::test]
+async fn history_and_resume_roundtrip_over_http() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_role_with_model(&project_dir, "cto", None);
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    // 1. Create → 201 {sid:"s1"}.
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "cto", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(sid, "s1");
+
+    // 2. meta.json was written at spawn.
+    let meta_path = project_dir
+        .join(".ccteam")
+        .join("chat")
+        .join(&sid)
+        .join("meta.json");
+    assert!(
+        meta_path.exists(),
+        "create must write meta.json at {meta_path:?}"
+    );
+
+    // 3. Stop → 200; meta.json must NOT be deleted (resume depends on it).
+    let stopped = client
+        .post(format!("{base}/sessions/{sid}/stop"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), 200);
+    assert!(meta_path.exists(), "stop must NOT delete meta.json");
+
+    // 4. Live list no longer shows it.
+    let live: Value = client
+        .get(format!("{base}/projects/demo/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        live.as_array().unwrap().len(),
+        0,
+        "stopped session is not live"
+    );
+
+    // 5. History list shows exactly the one stopped session.
+    let hist: Value = client
+        .get(format!("{base}/projects/demo/sessions/history"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = hist.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "history shows the one stopped session: {hist}"
+    );
+    assert_eq!(rows[0]["sid"], "s1");
+    assert_eq!(rows[0]["role"], "cto");
+    assert_eq!(rows[0]["origin"], "ccteam");
+
+    // 6. Resume → 200 {sid:"s1"}.
+    let resumed = client
+        .post(format!("{base}/projects/demo/sessions/{sid}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), 200, "resume a stopped session");
+    assert_eq!(resumed.json::<Value>().await.unwrap()["sid"], "s1");
+
+    // 7. Back in the live list…
+    let live2: Value = client
+        .get(format!("{base}/projects/demo/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        live2.as_array().unwrap().len(),
+        1,
+        "resumed session is live again"
+    );
+    assert_eq!(live2.as_array().unwrap()[0]["sid"], "s1");
+
+    // 8. …and dropped from history (history excludes live sessions).
+    let hist2: Value = client
+        .get(format!("{base}/projects/demo/sessions/history"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        hist2.as_array().unwrap().len(),
+        0,
+        "a live session is not in history"
+    );
+}
+
+/// End-to-end adopt flow: a native Claude session whose recorded `cwd` matches
+/// the project is discovered as adoptable; importing a uuid that does NOT match
+/// is rejected (the cross-project ACL — Fix 2); importing the real uuid mints a
+/// ccteam session with an `adopted` meta.json, after which it drops out of
+/// external discovery. Mutates `$HOME` (discovery reads `~/.claude/projects/`);
+/// the other tests in this binary never read `$HOME`, so there is no clash.
+#[tokio::test]
+async fn import_external_claude_session_over_http() {
+    let home = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cwd = project_dir.to_string_lossy().to_string();
+
+    // A fake native Claude transcript whose cwd == this project.
+    let claude_dir = home.path().join(".claude").join("projects").join("enc");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
+    std::fs::write(
+        claude_dir.join(format!("{uuid}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"custom-title\",\"customTitle\":\"adopt me\"}}"
+        ),
+    )
+    .unwrap();
+    std::env::set_var("HOME", home.path());
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    // Discovery lists the matching-cwd session as adoptable.
+    let ext: Value = client
+        .get(format!("{base}/projects/demo/external-sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ext.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["vendor_uuid"] == uuid && r["adoptable"] == true),
+        "external discovery lists the matching-cwd session: {ext}"
+    );
+
+    // A uuid with no matching transcript is NOT adoptable for this project → 400.
+    let bad = client
+        .post(format!("{base}/projects/demo/sessions/import"))
+        .json(&serde_json::json!({
+            "vendor": "claude",
+            "vendor_uuid": "00000000-0000-0000-0000-000000000000"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "a uuid with no matching cwd is rejected");
+
+    // The real uuid adopts → 201 {sid}.
+    let ok = client
+        .post(format!("{base}/projects/demo/sessions/import"))
+        .json(&serde_json::json!({"vendor": "claude", "vendor_uuid": uuid}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 201, "adopt the matching session");
+    let new_sid = ok.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // meta.json written with the foreign uuid + adopted origin.
+    let meta_path = project_dir
+        .join(".ccteam")
+        .join("chat")
+        .join(&new_sid)
+        .join("meta.json");
+    assert!(meta_path.exists(), "import writes meta.json");
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["vendor_uuid"], uuid,
+        "adopted meta keeps the foreign uuid"
+    );
+    assert_eq!(meta["origin"], "adopted");
+
+    // Now adopted → it drops out of external discovery (known uuid excluded).
+    let ext2: Value = client
+        .get(format!("{base}/projects/demo/external-sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !ext2
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["vendor_uuid"] == uuid),
+        "an adopted session is no longer offered for import"
+    );
+}

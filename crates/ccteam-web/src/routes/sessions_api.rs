@@ -811,6 +811,230 @@ pub(crate) async fn handle_session_interrupt(
     }
 }
 
+// ── v0.8.21 history / resume / external-import ───────────────────────────────
+
+/// `GET /api/v1/projects/{slug}/sessions/history`
+///
+/// Lists *stopped* ccteam sessions for this project — sessions with a
+/// `meta.json` on disk that are NOT currently in the gateway live map.
+/// Caller-lazy: only invoked when the user expands "more history" in the UI.
+/// 200 `[HistorySessionView]` sorted by `last_active` desc.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/sessions/history",
+    tag = "sessions",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "Stopped sessions list", body = serde_json::Value),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_session_history_list(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(slug): Path<String>,
+) -> Response {
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let metas = {
+        let guard = gw.lock().await;
+        guard.list_history_sessions(&slug)
+    };
+    let views: Vec<serde_json::Value> = metas
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "sid": m.sid,
+                "slug": m.slug,
+                "vendor": format!("{:?}", m.vendor).to_lowercase(),
+                "protocol": format!("{:?}", m.protocol).to_lowercase().replace("json", "-json"),
+                "role": m.role,
+                "permission_mode": format!("{:?}", m.permission_mode).to_lowercase(),
+                "owner": m.owner,
+                "vendor_uuid": m.vendor_uuid,
+                "created_at": m.created_at,
+                "last_active": m.last_active,
+                "origin": format!("{:?}", m.origin).to_lowercase(),
+                "transcript_present": !m.vendor_uuid.is_empty(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!(views)).into_response()
+}
+
+/// `POST /api/v1/projects/{slug}/sessions/{sid}/resume`
+///
+/// Re-activate a stopped ccteam session: read its `meta.json`, re-insert
+/// into the gateway live map, spawn the child. 200 `{sid}` on success.
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{slug}/sessions/{sid}/resume",
+    tag = "sessions",
+    params(
+        ("slug" = String, Path, description = "Project slug"),
+        ("sid"  = String, Path, description = "Session id"),
+    ),
+    responses(
+        (status = 200, description = "Resumed `{sid}`", body = serde_json::Value),
+        (status = 404, description = "Session or project not found"),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_session_resume(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path((slug, sid)): Path<(String, String)>,
+) -> Response {
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let caller_identity = identity.owner_tag();
+    let result = {
+        let mut guard = gw.lock().await;
+        // Bind the resume to the authorised project slug: the sid must belong to
+        // `slug` (gated by `can_see_project` above). Without this a tenant could
+        // resume another project's session by passing its sid under a slug they
+        // own.
+        guard
+            .resume_stopped_session(&sid, &caller_identity, Some(&slug))
+            .await
+    };
+    match result {
+        Ok(resumed_sid) => Json(json!({"sid": resumed_sid})).into_response(),
+        Err(err) => {
+            tracing::warn!(%sid, %err, "resume_stopped_session failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/projects/{slug}/external-sessions`
+///
+/// Discover Claude sessions in `~/.claude/projects/` whose recorded `cwd`
+/// matches this project, excluding already-adopted ones.
+/// 200 `[{vendor_uuid, title, last_active, adoptable}]`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{slug}/external-sessions",
+    tag = "sessions",
+    params(("slug" = String, Path, description = "Project slug")),
+    responses(
+        (status = 200, description = "External sessions list", body = serde_json::Value),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_external_sessions(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(slug): Path<String>,
+) -> Response {
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let sessions = {
+        let guard = gw.lock().await;
+        guard.list_external_claude_sessions(&slug)
+    };
+    let views: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "vendor": "claude",
+                "vendor_uuid": s.vendor_uuid,
+                "title": s.title,
+                "last_active": s.last_active,
+                "cwd": s.cwd,
+                "adoptable": true,
+            })
+        })
+        .collect();
+    Json(serde_json::json!(views)).into_response()
+}
+
+/// Request body for `POST /api/v1/projects/{slug}/sessions/import`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(crate) struct ImportSessionRequest {
+    pub vendor: String,
+    pub vendor_uuid: String,
+}
+
+/// `POST /api/v1/projects/{slug}/sessions/import`
+///
+/// Adopt an external Claude session: mint a new ccteam `sid`, write
+/// `meta.json`, resume via fidelity ladder. 201 `{sid}`.
+/// v1: Claude only (`vendor == "claude"`); Codex deferred to v0.9.
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{slug}/sessions/import",
+    tag = "sessions",
+    params(("slug" = String, Path, description = "Project slug")),
+    request_body = ImportSessionRequest,
+    responses(
+        (status = 201, description = "Imported session `{sid}`", body = serde_json::Value),
+        (status = 400, description = "Unsupported vendor or missing uuid"),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_import_session(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(slug): Path<String>,
+    Json(body): Json<ImportSessionRequest>,
+) -> Response {
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
+        return project_not_visible(&slug);
+    }
+    if body.vendor != "claude" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "only claude vendor supported for import in v1"})),
+        )
+            .into_response();
+    }
+    if body.vendor_uuid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "vendor_uuid required"})),
+        )
+            .into_response();
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let caller_identity = identity.owner_tag();
+    let result = {
+        let mut guard = gw.lock().await;
+        guard
+            .import_external_session(&slug, &body.vendor_uuid, &caller_identity)
+            .await
+    };
+    match result {
+        Ok(sid) => (StatusCode::CREATED, Json(json!({"sid": sid}))).into_response(),
+        Err(err) => {
+            tracing::warn!(%slug, %err, "import_external_session failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// The per-session SSE filter key (cross-stage from the spine): keep a
 /// [`GatewayEvent`] iff its `sid` is exactly `Some(target)`. Events with a
 /// different `sid` — or none at all (the `chat_send_file` MCP path, the D6

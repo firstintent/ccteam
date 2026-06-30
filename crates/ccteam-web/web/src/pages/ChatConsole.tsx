@@ -53,10 +53,16 @@ import {
 } from "../lib/dashboardApi";
 import {
   createSession as apiCreateSession,
+  listHistorySessions,
+  listExternalSessions,
+  importExternalSession,
+  resumeSession,
   listProjectRoles,
   listSessions,
   type RoleSummary,
   type SessionView as SessionSummary,
+  type HistorySessionView,
+  type ExternalSessionView,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
 import { ROLE_SUGGESTIONS, ROLELESS, resolveRole } from "./chatDefaults";
@@ -181,6 +187,17 @@ export default function ChatConsole() {
     sessionCount: number;
   } | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // v0.8.21 — per-project history expand state + loaded history sessions.
+  const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
+  const [historyByProject, setHistoryByProject] = useState<
+    Record<string, HistorySessionView[]>
+  >({});
+  const [historyLoading, setHistoryLoading] = useState<Set<string>>(new Set());
+  // External sessions import dialog.
+  const [importSlug, setImportSlug] = useState<string | null>(null);
+  const [externalSessions, setExternalSessions] = useState<ExternalSessionView[]>([]);
+  const [externalLoading, setExternalLoading] = useState(false);
+  const [importing, setImporting] = useState<string | null>(null);
 
   // The active session's rail entry (vendor/role/project), passed to the
   // per-sid SessionView for its crumb + terminal gating. All per-sid state
@@ -556,6 +573,64 @@ export default function ChatConsole() {
                         <Plus className="h-3 w-3" /> 还没有 session — 新建
                       </button>
                     ) : null}
+                    {/* v0.8.21 — history expand/collapse (admin-only beta-gate) */}
+                    {isAdmin ? (
+                      <HistorySection
+                        project={project}
+                        expanded={expandedHistory.has(project)}
+                        loading={historyLoading.has(project)}
+                        history={historyByProject[project] ?? []}
+                        activeSid={sid}
+                        onToggle={() => {
+                          const next = new Set(expandedHistory);
+                          if (next.has(project)) {
+                            next.delete(project);
+                            setExpandedHistory(next);
+                          } else {
+                            next.add(project);
+                            setExpandedHistory(next);
+                            if (!historyByProject[project]) {
+                              setHistoryLoading((s) => new Set(s).add(project));
+                              listHistorySessions(project)
+                                .then((rows) => {
+                                  setHistoryByProject((prev) => ({
+                                    ...prev,
+                                    [project]: rows,
+                                  }));
+                                })
+                                .catch(() => {})
+                                .finally(() => {
+                                  setHistoryLoading((s) => {
+                                    const next2 = new Set(s);
+                                    next2.delete(project);
+                                    return next2;
+                                  });
+                                });
+                            }
+                          }
+                        }}
+                        onResume={(hsid) => {
+                          resumeSession(project, hsid)
+                            .then(({ sid: newSid }) => {
+                              void refreshSessions();
+                              navigate(`/chat/s/${encodeURIComponent(newSid)}`);
+                              setSidebarOpen(false);
+                            })
+                            .catch((e) =>
+                              toastBus.handler?.error(`Resume failed: ${String(e)}`),
+                            );
+                        }}
+                        onOpenImport={() => {
+                          setImportSlug(project);
+                          setExternalSessions([]);
+                          setExternalLoading(true);
+                          listExternalSessions(project)
+                            .then(setExternalSessions)
+                            .catch(() => {})
+                            .finally(() => setExternalLoading(false));
+                        }}
+                      />
+                    ) : null}
                   </div>
                 </div>
               );
@@ -735,6 +810,78 @@ export default function ChatConsole() {
                 {deleting
                   ? tr(lang, "解除中…", "Removing…")
                   : tr(lang, "解除注册", "Deregister")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* v0.8.21 — Import external session dialog */}
+      {importSlug ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4 animate-fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-label="导入历史会话"
+          onClick={() => setImportSlug(null)}
+        >
+          <div
+            className="w-full max-w-[480px] rounded-lg border border-surface-700 bg-surface-900 p-4 shadow-xl animate-slide-up"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-semibold text-text-primary mb-3">
+              导入历史会话 —{" "}
+              <span className="font-mono text-brand-400">{importSlug}</span>
+            </h2>
+            {externalLoading ? (
+              <p className="text-xs text-text-muted">扫描中…</p>
+            ) : externalSessions.length === 0 ? (
+              <p className="text-xs text-text-muted">未发现可收编的外部 Claude 会话。</p>
+            ) : (
+              <div className="space-y-1 max-h-64 overflow-y-auto">
+                {externalSessions.map((es) => (
+                  <div
+                    key={es.vendor_uuid}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-surface-800"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs truncate text-text-primary">
+                        {es.title || es.vendor_uuid.slice(0, 8) + "…"}
+                      </div>
+                      <div className="text-[10px] font-mono text-text-muted truncate">
+                        {es.last_active ? es.last_active.slice(0, 16).replace("T", " ") : ""}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={importing === es.vendor_uuid}
+                      onClick={() => {
+                        setImporting(es.vendor_uuid);
+                        importExternalSession(importSlug, es.vendor_uuid)
+                          .then(({ sid: newSid }) => {
+                            void refreshSessions();
+                            setImportSlug(null);
+                            navigate(`/chat/s/${encodeURIComponent(newSid)}`);
+                            setSidebarOpen(false);
+                          })
+                          .catch((e) => toastBus.handler?.error(`Import failed: ${String(e)}`))
+                          .finally(() => setImporting(null));
+                      }}
+                      className="shrink-0 px-2 py-1 rounded text-[10px] bg-brand-600/80 hover:bg-brand-500 text-white disabled:opacity-50"
+                    >
+                      {importing === es.vendor_uuid ? "收编中…" : "收编"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="mt-3 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setImportSlug(null)}
+                className="px-3 py-1.5 rounded text-xs text-text-muted hover:text-text-primary hover:bg-surface-800"
+              >
+                关闭
               </button>
             </div>
           </div>
@@ -1186,6 +1333,107 @@ export function NewSessionModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── v0.8.21 HistorySection ────────────────────────────────────────────────────
+
+interface HistorySectionProps {
+  project: string;
+  expanded: boolean;
+  loading: boolean;
+  history: HistorySessionView[];
+  activeSid: string | null | undefined;
+  onToggle: () => void;
+  onResume: (sid: string) => void;
+  onOpenImport: () => void;
+}
+
+function HistorySection({
+  project,
+  expanded,
+  loading,
+  history,
+  activeSid,
+  onToggle,
+  onResume,
+  onOpenImport,
+}: HistorySectionProps) {
+  return (
+    <div className="mt-0.5">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full text-left px-2 py-0.5 flex items-center gap-1 text-[10px] text-text-muted hover:text-text-secondary"
+        title={expanded ? "折叠历史会话" : "展开历史会话"}
+      >
+        <span className="font-mono">{expanded ? "▾" : "▸"}</span>
+        {loading ? (
+          <span>历史加载中…</span>
+        ) : (
+          <span>
+            {expanded && history.length > 0
+              ? `历史 (${history.length})`
+              : "更多历史"}
+          </span>
+        )}
+      </button>
+      {expanded && !loading && (
+        <div className="space-y-0.5 mt-0.5">
+          {history.length === 0 ? (
+            <div className="px-3 text-[10px] text-text-muted italic">暂无历史会话</div>
+          ) : null}
+          {history.map((h) => {
+            const isActive = h.sid === activeSid;
+            const isClaude = h.vendor === "claude";
+            return (
+              <button
+                key={h.sid}
+                type="button"
+                onClick={() => onResume(h.sid)}
+                title={
+                  h.transcript_present
+                    ? "精确恢复 (vendor transcript 存在)"
+                    : "按记录重放 (transcript 已清理)"
+                }
+                className={`w-full text-left px-2 py-1.5 rounded-md flex items-center gap-2 text-xs opacity-70 hover:opacity-100 ${
+                  isActive
+                    ? "bg-surface-700 text-text-primary opacity-100"
+                    : "text-text-secondary hover:bg-surface-800/70"
+                }`}
+              >
+                <span className="h-1.5 w-1.5 rounded-full shrink-0 bg-surface-600" />
+                <span
+                  className={`font-mono px-1 rounded text-[10px] ${
+                    isClaude
+                      ? "bg-vendor-claude/15 text-vendor-claude"
+                      : "bg-vendor-codex/15 text-vendor-codex"
+                  }`}
+                >
+                  {h.vendor}
+                </span>
+                <span className="truncate flex-1">{h.role || "(无 role)"}</span>
+                {h.transcript_present ? (
+                  <span className="text-[9px] text-brand-400/80 font-mono shrink-0">精确</span>
+                ) : (
+                  <span className="text-[9px] text-text-muted font-mono shrink-0">重放</span>
+                )}
+                <span className="text-text-muted font-mono shrink-0">{h.sid}</span>
+              </button>
+            );
+          })}
+          {/* Import external session entry point */}
+          <button
+            type="button"
+            onClick={() => onOpenImport()}
+            className="w-full text-left px-2 py-0.5 flex items-center gap-1 text-[10px] text-text-muted hover:text-brand-400 hover:bg-surface-800/70 rounded-md"
+            title={`导入 ${project} 的外部 Claude 会话`}
+          >
+            <Plus className="h-3 w-3 shrink-0" /> 导入历史会话
+          </button>
+        </div>
+      )}
     </div>
   );
 }

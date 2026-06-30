@@ -16,10 +16,12 @@ use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
-    chat_session_name, parse_chat_session_name, AccountUsage, AgentSpecBrief, AgentVendor,
-    ChoicePrompt, ChoiceSelection, Directive, DirectiveOutcome, HarnessAdapter, HarnessError,
-    PermissionMode, ProcessBackend, RunningTask, SessionProtocol, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadItemDetails, TurnInput,
+    chat_session_name, discover_external_claude_sessions, list_session_metas,
+    parse_chat_session_name, read_session_meta, touch_last_active, write_session_meta,
+    AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, Directive,
+    DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
+    ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -63,6 +65,13 @@ impl ChatKey {
     /// is owned by the CHAT, not a single member of it.
     fn identity(&self) -> String {
         format!("{}:{}", self.channel, self.chat_id)
+    }
+
+    /// Parse `"channel:chat_id"` back into a `ChatKey`. Returns `None` if the
+    /// string doesn't contain a colon.
+    fn from_identity(s: &str) -> Option<Self> {
+        let (channel, chat_id) = s.split_once(':')?;
+        Some(Self::new(channel, chat_id, chat_id))
     }
 }
 
@@ -1298,16 +1307,43 @@ impl Gateway {
                 // reach (web↔IM) returns via 档1. The pairing ACL upstream gates
                 // who reaches the daemon at all; replies follow the per-turn
                 // submitter (`reply_to`).
-                let session = match self
+                let live_session = self
                     .sessions
                     .get(id)
-                    .filter(|s| Self::chat_can_access(chat, s))
-                {
-                    Some(s) => s,
-                    // Own-only: a non-owner (or a typo'd id) reads as unknown —
-                    // a clean message, not a raw error, and no existence leak.
-                    None => return Ok(Some(format!("unknown session for this chat: {id}"))),
-                };
+                    .filter(|s| Self::chat_can_access(chat, s));
+                if live_session.is_none() {
+                    // v0.8.21 — try to cold-resume a stopped session from meta.json.
+                    // ACL pre-check: peek at the stored owner BEFORE spawning so we
+                    // don't leak session existence to an unauthorised chat.
+                    let acl_ok = self
+                        .find_meta_for_sid(id)
+                        .ok()
+                        .map(|(_, _, meta)| Self::owner_identity_visible(chat, &meta.owner))
+                        .unwrap_or(false);
+                    if !acl_ok {
+                        return Ok(Some(format!("unknown session for this chat: {id}")));
+                    }
+                    let caller_identity = canonical_owner(chat).identity();
+                    // IM already owner-checked above (chat_owner_visible), so no
+                    // project-slug binding is needed here — pass None.
+                    match self
+                        .resume_stopped_session(id, &caller_identity, None)
+                        .await
+                    {
+                        Ok(resumed_sid) => {
+                            // Move current project to this session's project.
+                            if let Some(s) = self.sessions.get(&resumed_sid) {
+                                let proj = s.project.clone();
+                                self.current_project.insert(chat.clone(), proj);
+                            }
+                            return Ok(Some(format!("resumed session {resumed_sid}")));
+                        }
+                        Err(_) => {
+                            return Ok(Some(format!("unknown session for this chat: {id}")));
+                        }
+                    }
+                }
+                let session = live_session.expect("checked above");
                 let sid = session.id.clone();
                 // v0.8.10 — capture the target session's project so the switch can
                 // also move the chat's project context (below).
@@ -1831,6 +1867,15 @@ impl Gateway {
                 secret.clone(),
             )
             .await?;
+        // Capture before the session insert moves these.
+        let meta_vendor_uuid = thread
+            .raw_extras
+            .get("vendor_uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let meta_project = project.clone();
+        let meta_role = role.clone();
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -1867,6 +1912,34 @@ impl Gateway {
             .unwrap()
             .insert(owner, id.clone());
         self.persist_state()?;
+        // Write per-session meta.json for history list + resume after stop.
+        {
+            let now = chrono::Utc::now().to_rfc3339();
+            let owner_tag = self
+                .sessions
+                .get(&id)
+                .map(|s| canonical_owner(&s.owner).identity())
+                .unwrap_or_default();
+            let meta = SessionMeta {
+                sid: id.clone(),
+                slug: meta_project.clone(),
+                vendor,
+                protocol,
+                role: meta_role,
+                permission_mode,
+                owner: owner_tag,
+                vendor_uuid: meta_vendor_uuid,
+                host: "local".to_string(),
+                created_at: now.clone(),
+                last_active: now,
+                origin: SessionOrigin::Ccteam,
+            };
+            if let Some(cwd) = self.projects.get(&meta_project) {
+                if let Err(e) = write_session_meta(cwd, &meta) {
+                    tracing::warn!(sid = %id, err = %e, "failed to write session meta.json");
+                }
+            }
+        }
         self.spawn_event_pump(&id);
         Ok(StartOutcome {
             id,
@@ -2265,6 +2338,8 @@ impl Gateway {
                                         "ccteam-im: failed to mirror turn to turns.jsonl"
                                     );
                                 }
+                                // Update last_active in meta.json on turn completion.
+                                touch_last_active(dir, &session_id);
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
                             // fallback, same as pump_target) and reuse it for the
@@ -3129,6 +3204,30 @@ impl Gateway {
         owner.channel == "user"
     }
 
+    /// Identity-string form of [`chat_owner_visible`] for the cold-resume path,
+    /// where the owner is a persisted `meta.owner` canonical identity string
+    /// (`"channel:chat_id"`) rather than a live [`GatewaySession`]'s `ChatKey`.
+    ///
+    /// We MUST compare on the identity string, not by reconstructing a `ChatKey`
+    /// via `from_identity` and using `==`: `ChatKey` equality includes `user_id`,
+    /// but `identity()` drops it and `from_identity` forces `user_id = chat_id`,
+    /// so a round-trip loses the real `user_id`. For a non-tenant IM bot (whose
+    /// `canonical_owner` keeps the sender's `user_id`), that round-trip would
+    /// wrongly deny the legitimate owner. Comparing the user_id-free identity
+    /// strings sidesteps the lossy round-trip entirely.
+    fn owner_identity_visible(chat: &ChatKey, owner_identity: &str) -> bool {
+        // Own = the chat's canonical identity string.
+        if owner_identity == canonical_owner(chat).identity() {
+            return true;
+        }
+        // A per-tenant bot gets NO shared pool — only its own (above).
+        if crate::transport::is_tenant_bot_channel(&chat.channel) {
+            return false;
+        }
+        // Admin/global bot + web querier: the shared `user:` pool.
+        owner_identity.starts_with("user:")
+    }
+
     /// Point the chat's active session at an existing session owned by this
     /// chat in `project` (deterministic: smallest session index), returning its
     /// id. When none exists, clear the active session so the next message spawns
@@ -3596,6 +3695,235 @@ impl Gateway {
             .collect();
         views.sort_by_key(|v| session_index(&v.sid));
         views
+    }
+
+    // ── v0.8.21 history / resume / external-import ────────────────────────────
+
+    /// List *stopped* ccteam sessions for a project — sessions with a
+    /// `meta.json` on disk that are NOT currently in the live map.
+    /// Returns them sorted by `last_active` descending (scan-on-demand,
+    /// called lazily from the web UI "expand history" affordance).
+    pub fn list_history_sessions(&self, slug: &str) -> Vec<SessionMeta> {
+        let Some(cwd) = self.projects.get(slug) else {
+            return vec![];
+        };
+        let live_sids: HashSet<&str> = self.sessions.keys().map(|s| s.as_str()).collect();
+        list_session_metas(cwd)
+            .into_iter()
+            .filter(|m| !live_sids.contains(m.sid.as_str()))
+            .collect()
+    }
+
+    /// Discover external Claude sessions under `~/.claude/projects/` whose
+    /// recorded `cwd` matches this project, excluding any already adopted
+    /// (i.e. uuid already tracked in a `meta.json` for this project).
+    pub fn list_external_claude_sessions(&self, slug: &str) -> Vec<ExternalClaudeSession> {
+        let Some(cwd) = self.projects.get(slug) else {
+            return vec![];
+        };
+        let known_uuids: HashSet<String> = list_session_metas(cwd)
+            .into_iter()
+            .filter(|m| !m.vendor_uuid.is_empty())
+            .map(|m| m.vendor_uuid)
+            .collect();
+        discover_external_claude_sessions(cwd, &known_uuids)
+    }
+
+    /// Resume a *stopped* ccteam session by its sid: read `meta.json`, re-insert
+    /// into the live map, spawn the child via the fidelity ladder, persist state.
+    /// The `caller` chat becomes the `reply_to` target for this session.
+    /// Returns the sid on success so the caller can navigate to it.
+    pub async fn resume_stopped_session(
+        &mut self,
+        sid: &str,
+        caller_identity: &str,
+        expected_slug: Option<&str>,
+    ) -> Result<String> {
+        let caller = ChatKey::from_identity(caller_identity)
+            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        // Guard: already live.
+        if self.sessions.contains_key(sid) {
+            return Ok(sid.to_string());
+        }
+        // Find which project this session belongs to.
+        let (slug, cwd, meta) = self.find_meta_for_sid(sid)?;
+        // ACL: the web caller is authorised for a SPECIFIC project (the URL
+        // slug). `find_meta_for_sid` resolves the sid across ALL projects, so
+        // without this guard a tenant authorised for project A could resume a
+        // session belonging to project B by passing B's sid under A's slug.
+        // Bind the resolved project to the caller's authorised slug. (The IM
+        // path passes `None` — it owner-checks via `chat_owner_visible` before
+        // calling, which is the IM equivalent of this project gate.)
+        if let Some(exp) = expected_slug {
+            if exp != slug {
+                anyhow::bail!("session {sid} does not belong to project {exp}");
+            }
+        }
+        let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
+        let model_id = role_model_id(role_detail.as_ref());
+        // Mint a fresh secret (old one is gone with the stopped session).
+        let secret = ccteam_core::session_secret::mint();
+        let (adapter, thread) = self
+            .spawn_session_thread(
+                meta.vendor,
+                meta.protocol,
+                &meta.role,
+                &slug,
+                sid,
+                cwd.clone(),
+                model_id,
+                meta.permission_mode,
+                secret.clone(),
+            )
+            .await?;
+        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| caller.clone());
+        self.sessions.insert(
+            sid.to_string(),
+            GatewaySession {
+                id: sid.to_string(),
+                owner: owner.clone(),
+                project: slug.clone(),
+                role: meta.role.clone(),
+                vendor: meta.vendor,
+                protocol: meta.protocol,
+                host: meta.host.clone(),
+                permission_mode: meta.permission_mode,
+                secret,
+                handle: sid.to_string(),
+                thread,
+                adapter,
+                visible_events: Arc::new(AtomicU64::new(0)),
+                activity_events: Arc::new(AtomicU64::new(0)),
+                reply_to: Arc::new(std::sync::Mutex::new(caller.clone())),
+                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                latest_activity: Arc::new(std::sync::Mutex::new(None)),
+            },
+        );
+        self.current_session
+            .write()
+            .unwrap()
+            .insert(caller, sid.to_string());
+        self.persist_state()?;
+        self.spawn_event_pump(sid);
+        Ok(sid.to_string())
+    }
+
+    /// Adopt an external Claude session: mint a new sid, write `meta.json`,
+    /// insert into live map, and resume via fidelity ladder.
+    /// Returns the new ccteam `sid`.
+    pub async fn import_external_session(
+        &mut self,
+        slug: &str,
+        vendor_uuid: &str,
+        caller_identity: &str,
+    ) -> Result<String> {
+        let caller = ChatKey::from_identity(caller_identity)
+            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        self.ensure_project_loaded(slug);
+        let cwd = self
+            .projects
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {slug}"))?;
+        // ACL: the caller-supplied `vendor_uuid` MUST be a session whose recorded
+        // cwd matches THIS project — otherwise a tenant authorised for one
+        // project could adopt (and read) any Claude transcript on the host by
+        // uuid. Re-run the same cwd-filtered discovery the list endpoint uses and
+        // require the uuid to appear in it (this also rejects already-adopted
+        // uuids, which discovery excludes). Done BEFORE bumping `next_session` so
+        // a rejected import does not burn an `s{n}`.
+        let known_uuids: HashSet<String> = list_session_metas(&cwd)
+            .into_iter()
+            .filter(|m| !m.vendor_uuid.is_empty())
+            .map(|m| m.vendor_uuid)
+            .collect();
+        let adoptable = discover_external_claude_sessions(&cwd, &known_uuids)
+            .into_iter()
+            .any(|s| s.vendor_uuid == vendor_uuid);
+        if !adoptable {
+            anyhow::bail!(
+                "vendor_uuid {vendor_uuid} is not an adoptable session for project {slug}"
+            );
+        }
+        self.next_session += 1;
+        let sid = format!("s{}", self.next_session);
+        let now = chrono::Utc::now().to_rfc3339();
+        let owner_tag = canonical_owner(&caller).identity();
+        let meta = SessionMeta {
+            sid: sid.clone(),
+            slug: slug.to_string(),
+            vendor: AgentVendor::Claude,
+            protocol: SessionProtocol::StreamJson,
+            role: String::new(),
+            permission_mode: PermissionMode::Skip,
+            owner: owner_tag,
+            vendor_uuid: vendor_uuid.to_string(),
+            host: "local".to_string(),
+            created_at: now.clone(),
+            last_active: now,
+            origin: SessionOrigin::Adopted,
+        };
+        let secret = ccteam_core::session_secret::mint();
+        let (adapter, thread) = self
+            .spawn_session_thread(
+                AgentVendor::Claude,
+                SessionProtocol::StreamJson,
+                "",
+                slug,
+                &sid,
+                cwd.clone(),
+                None,
+                PermissionMode::Skip,
+                secret.clone(),
+            )
+            .await?;
+        // Persist meta only AFTER a successful spawn so a spawn failure does not
+        // leave an orphan `meta.json` (a phantom "stopped" session in history).
+        write_session_meta(&cwd, &meta)?;
+        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| caller.clone());
+        self.sessions.insert(
+            sid.clone(),
+            GatewaySession {
+                id: sid.clone(),
+                owner,
+                project: slug.to_string(),
+                role: String::new(),
+                vendor: AgentVendor::Claude,
+                protocol: SessionProtocol::StreamJson,
+                host: "local".to_string(),
+                permission_mode: PermissionMode::Skip,
+                secret,
+                handle: sid.clone(),
+                thread,
+                adapter,
+                visible_events: Arc::new(AtomicU64::new(0)),
+                activity_events: Arc::new(AtomicU64::new(0)),
+                reply_to: Arc::new(std::sync::Mutex::new(caller.clone())),
+                pending_reaction: Arc::new(std::sync::Mutex::new(None)),
+                turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                last_event_at: Arc::new(std::sync::Mutex::new(None)),
+                latest_activity: Arc::new(std::sync::Mutex::new(None)),
+            },
+        );
+        self.current_session
+            .write()
+            .unwrap()
+            .insert(caller, sid.clone());
+        self.persist_state()?;
+        self.spawn_event_pump(&sid);
+        Ok(sid)
+    }
+
+    /// Find a `meta.json` for `sid` by scanning all registered project dirs.
+    fn find_meta_for_sid(&self, sid: &str) -> Result<(String, PathBuf, SessionMeta)> {
+        for (slug, cwd) in &self.projects {
+            if let Ok(meta) = read_session_meta(cwd, sid) {
+                return Ok((slug.clone(), cwd.clone(), meta));
+            }
+        }
+        anyhow::bail!("no meta.json found for session {sid}")
     }
 
     /// Resolve a session id to the data a collector needs to tail its
@@ -5068,6 +5396,10 @@ mod tests {
         starts: AtomicUsize,
         submissions: Arc<Mutex<Vec<(String, String)>>>,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
+        /// Notified whenever an event is pushed so `events()` can wait rather
+        /// than terminate when the queue is momentarily empty (fixes the
+        /// multi-thread runtime race where the pump polls before `submit_turn`).
+        events_notify: Arc<tokio::sync::Notify>,
         event_delay: std::time::Duration,
         resume_delay: std::time::Duration,
         resume_started: Arc<AtomicUsize>,
@@ -5116,6 +5448,7 @@ mod tests {
                 starts: AtomicUsize::new(0),
                 submissions: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(VecDeque::new())),
+                events_notify: Arc::new(tokio::sync::Notify::new()),
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
                 resume_started: Arc::new(AtomicUsize::new(0)),
@@ -5236,25 +5569,39 @@ mod tests {
                     },
                 ));
             }
+            // Wake any pump task that is waiting in `events()` for new work.
+            self.events_notify.notify_one();
             Ok(TurnId::new(format!("turn-{}", h.identity)))
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let events = Arc::clone(&self.events);
+            let notify = Arc::clone(&self.events_notify);
             let wanted = h.identity.clone();
             let delay = self.event_delay;
             Box::pin(futures::stream::unfold((), move |_| {
                 let events = Arc::clone(&events);
+                let notify = Arc::clone(&notify);
                 let wanted = wanted.clone();
-                let delay = delay;
                 async move {
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+                    loop {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let mut guard = events.lock().await;
+                        let idx = guard.iter().position(|(thread, _)| thread == &wanted);
+                        if let Some(idx) = idx {
+                            let (_, evt) = guard.remove(idx).unwrap();
+                            return Some((evt, ()));
+                        }
+                        drop(guard);
+                        // Queue is empty; wait for new events rather than
+                        // terminating the stream. This matches the behaviour of
+                        // a real adapter (which blocks until the child writes)
+                        // and prevents a multi-thread runtime race where the pump
+                        // polls before `submit_turn` has pushed anything.
+                        notify.notified().await;
                     }
-                    let mut guard = events.lock().await;
-                    let idx = guard.iter().position(|(thread, _)| thread == &wanted)?;
-                    let (_, evt) = guard.remove(idx)?;
-                    Some((evt, ()))
                 }
             }))
         }
@@ -7198,6 +7545,182 @@ mod tests {
         assert!(
             Gateway::chat_owner_visible(&admin_tg, &web_a),
             "the admin/global bot oversees all web sessions"
+        );
+    }
+
+    /// v0.8.21 cold-resume ACL — `owner_identity_visible` (the identity-string
+    /// form used when resuming a STOPPED session from `meta.owner`) must agree
+    /// with the live `chat_owner_visible` rule. The regression it guards: the
+    /// earlier cold path reconstructed a `ChatKey` via `from_identity` and
+    /// compared with `==`, but `ChatKey` equality includes `user_id` while
+    /// `identity()` drops it — so an admin IM bot (whose `canonical_owner` keeps
+    /// the sender's `user_id`) was wrongly DENIED resume of its OWN session.
+    #[test]
+    fn owner_identity_visible_matches_live_acl_on_strings() {
+        // meta.owner is the canonical identity STRING (user_id dropped).
+        let admin_tg = ChatKey::new("telegram", "339", "rob"); // user_id ≠ chat_id
+        let admin_owns = canonical_owner(&admin_tg).identity(); // "telegram:339"
+
+        // THE REGRESSION: the admin bot must see its own cold session even
+        // though `meta.owner` ("telegram:339") lost the "rob" user_id.
+        assert!(
+            Gateway::owner_identity_visible(&admin_tg, &admin_owns),
+            "owner must see its own stopped session (user_id round-trip must not deny)"
+        );
+        // A DIFFERENT admin chat (other chat_id) does not see it.
+        let other_tg = ChatKey::new("telegram", "999", "eve");
+        assert!(!Gateway::owner_identity_visible(&other_tg, &admin_owns));
+
+        // Web/tenant convergence + isolation, mirrored from the live-ACL test.
+        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
+        let bot_a = ChatKey::new("telegram@uaaa", "111", "alice");
+        let bot_b = ChatKey::new("telegram@ubbb", "222", "bob");
+        assert!(
+            Gateway::owner_identity_visible(&bot_a, &web_a),
+            "a tenant bot sees its tenant's web-created (cold) sessions"
+        );
+        assert!(
+            !Gateway::owner_identity_visible(&bot_b, &web_a),
+            "another tenant's bot does NOT"
+        );
+        assert!(
+            !Gateway::owner_identity_visible(&bot_a, &admin_owns),
+            "a tenant bot gets no admin pool"
+        );
+        // The admin/global bot oversees the shared web pool.
+        assert!(Gateway::owner_identity_visible(&admin_tg, &web_a));
+    }
+
+    /// v0.8.21 cold-resume ACL (web path) — `resume_stopped_session` resolves a
+    /// sid across ALL registered projects (`find_meta_for_sid`), so the web
+    /// caller's authorised slug MUST bind the resolved project. Without the
+    /// `expected_slug` guard a tenant authorised for project B could resume a
+    /// session belonging to project A by POSTing A's sid under B's slug. This
+    /// proves a mismatched slug is rejected BEFORE any child is spawned.
+    #[tokio::test]
+    async fn resume_stopped_session_rejects_cross_project_slug_before_spawn() {
+        let alpha_dir = tempfile::TempDir::new().unwrap();
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha_dir.path());
+        gateway.register_project("beta", beta_dir.path());
+
+        // A stopped session s1 belongs to project alpha (meta.json on disk).
+        let meta = SessionMeta {
+            sid: "s1".into(),
+            slug: "alpha".into(),
+            vendor: AgentVendor::Claude,
+            protocol: SessionProtocol::StreamJson,
+            role: String::new(),
+            permission_mode: PermissionMode::Skip,
+            owner: "user:web-api".into(),
+            vendor_uuid: String::new(),
+            host: "local".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_active: "2026-01-01T00:00:00Z".into(),
+            origin: SessionOrigin::Ccteam,
+        };
+        write_session_meta(alpha_dir.path(), &meta).unwrap();
+
+        // Resuming s1 under the WRONG slug (beta) must be rejected, and crucially
+        // must NOT spawn the child.
+        let denied = gateway
+            .resume_stopped_session("s1", "user:web-api", Some("beta"))
+            .await;
+        assert!(
+            denied.is_err(),
+            "resume must reject a sid that doesn't belong to the authorised slug"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            0,
+            "a rejected cross-project resume must not spawn a child"
+        );
+
+        // The correct slug (alpha) proceeds to spawn (the guard doesn't over-block).
+        let allowed = gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await;
+        assert!(
+            allowed.is_ok(),
+            "the owning project's slug is allowed: {allowed:?}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "correct slug spawns once"
+        );
+    }
+
+    /// v0.8.21 IM cold-resume — `/use <sid>` on a STOPPED session (meta.json on
+    /// disk, no live thread) re-activates it, and the own-only ACL still holds:
+    /// a chat that doesn't own it reads it as unknown (no existence leak) and
+    /// the denied `/use` must NOT resurrect it; the owner resumes it. The IM
+    /// peer of the web `POST .../resume` path.
+    #[tokio::test]
+    async fn im_use_cold_resumes_stopped_session_own_only() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let agents = proj.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\n---\nbody\n",
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        // Owner creates s1, then stops it: the live thread is gone but meta.json
+        // survives, so it shows up in history.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert!(
+            gateway.session_views().iter().any(|v| v.sid == "s1"),
+            "created s1"
+        );
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/stop s1")
+            .await
+            .unwrap();
+        assert!(
+            !gateway.session_views().iter().any(|v| v.sid == "s1"),
+            "s1 is stopped (no longer live)"
+        );
+        assert!(
+            gateway
+                .list_history_sessions("alpha")
+                .iter()
+                .any(|m| m.sid == "s1"),
+            "stopped s1 survives in history (meta.json kept)"
+        );
+
+        // A different chat cannot cold-resume it — own-only ACL reads it as
+        // unknown (no existence leak), and the denied /use must not resurrect it.
+        let denied = gateway
+            .handle_text("mock", "chat-2", "bob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(
+            denied,
+            vec!["unknown session for this chat: s1".to_string()]
+        );
+        assert!(
+            !gateway.session_views().iter().any(|v| v.sid == "s1"),
+            "a denied /use must not resurrect the session"
+        );
+
+        // The owner /use s1 cold-resumes it from meta.json → live again.
+        let resumed = gateway
+            .handle_text("mock", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(resumed, vec!["resumed session s1".to_string()]);
+        assert!(
+            gateway.session_views().iter().any(|v| v.sid == "s1"),
+            "owner cold-resumed s1 from meta.json"
         );
     }
 

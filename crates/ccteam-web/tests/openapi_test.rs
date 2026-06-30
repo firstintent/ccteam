@@ -67,6 +67,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/users/{id}/link"),
         // v0.8.20 F2 — per-user IM bot config (self-serve + admin).
         ("PUT", "/api/v1/me/im"),
+        ("GET", "/api/v1/me/im/lark/open-id-candidates"),
+        ("PUT", "/api/v1/me/im/lark/allowed-users"),
         ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
@@ -103,6 +105,11 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/sessions/{sid}/stop"),
         // v0.8.19 — interrupt the running turn (non-destructive; keeps session).
         ("POST", "/api/v1/sessions/{sid}/interrupt"),
+        // v0.8.21 — history resume + external session import.
+        ("GET", "/api/v1/projects/{slug}/sessions/history"),
+        ("POST", "/api/v1/projects/{slug}/sessions/{sid}/resume"),
+        ("GET", "/api/v1/projects/{slug}/external-sessions"),
+        ("POST", "/api/v1/projects/{slug}/sessions/import"),
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
         ("GET", "/api/v1/config/im"),
         ("PUT", "/api/v1/config/im/telegram"),

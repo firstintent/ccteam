@@ -154,6 +154,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::users::handle_user_link))
         // v0.8.20 F2 — per-user IM bot config (self-serve `/me/im` + admin).
         .routes(routes!(super::users::handle_put_me_im))
+        .routes(routes!(
+            super::users::handle_get_me_lark_open_id_candidates,
+            super::users::handle_put_me_lark_allowed_users
+        ))
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
@@ -199,6 +203,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // v0.8.19 — interrupt the running turn WITHOUT destroying the session
         // (the non-destructive twin of /stop; keeps context for a /model switch).
         .routes(routes!(super::sessions_api::handle_session_interrupt))
+        // v0.8.21 — history list, resume stopped session, external discover, import.
+        .routes(routes!(super::sessions_api::handle_session_history_list))
+        .routes(routes!(super::sessions_api::handle_session_resume))
+        .routes(routes!(super::sessions_api::handle_external_sessions))
+        .routes(routes!(super::sessions_api::handle_import_session))
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist
         // PUTs + async telegram chat_id capture). All inside the web-token gate.
         .routes(routes!(super::im_config::handle_get_im_config))
