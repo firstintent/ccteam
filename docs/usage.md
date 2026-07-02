@@ -32,11 +32,12 @@ These are the only terminal steps required. Afterward, the web console is the re
 ccteam calls the Claude Code and Codex CLIs already installed and logged in on your machine. It does not bundle them.
 
 ```bash
-# Recommended: install from source with cargo
-# Requires Rust and Node.js for the web console bundle.
-cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+# Recommended: build from source and install as a service.
+# Requires Rust and Node.js (for the web console bundle).
+git clone https://github.com/firstintent/ccteam && cd ccteam
+make install
 
-# Fallback: prebuilt binary, no toolchain required.
+# Alternative: prebuilt binary, no toolchain required (also offers systemd setup).
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 
 ccteam --version
@@ -46,15 +47,11 @@ codex --version    # optional; only needed for Codex sessions
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
 
-### 2. Start the Service
+### 2. The Service
 
-`ccteam start` launches the only resident process. It hosts the web console, IM gateway, standard resource API, and MCP socket. The prebuilt installer can offer a systemd/background setup; manual start:
+`make install` already started the service: one resident process (web console + IM gateway + standard resource API + MCP socket) supervised by systemd `--user` on Linux or a launchd agent on macOS — it starts at boot/login, restarts on crash, and survives logout. Manage it with `make daemon-status` / `daemon-logs` / `daemon-restart` / `daemon-stop` on either platform (macOS logs go to `~/.ccteam/daemon.log`). Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both remove the service and binary but keep `~/.ccteam`. Without any supervisor, run `ccteam start` in the foreground.
 
-```bash
-nohup ccteam start >~/ccteam.log 2>&1 &
-```
-
-The startup log, and `ccteam status`, print the web console URL, for example:
+`make install`, and `ccteam status` at any time, print the web console URL, for example:
 
 ```text
 web url:   http://<your-lan-ip>:7331/?token=ccteam:<token>
@@ -295,13 +292,13 @@ ccteam doctor --check-cost-orphan  # Cost ledger reconciliation.
 Restart daemon only; sessions reconnect by id afterward:
 
 ```bash
-ccteam stop && nohup ccteam start >~/ccteam.log 2>&1 &
+systemctl --user restart ccteam    # or: make daemon-restart (rebuilds first)
 ```
 
 State file quick reference. `~/.ccteam` is grouped by responsibility: `secrets/` for credentials, `state/` for daemon-written state, `cache/` for disposable cache, and `run/` for sockets.
 
 ```bash
-tail -120 ~/ccteam.log                          # Daemon log, depending on your redirect.
+journalctl --user -u ccteam -n 120               # Daemon log (systemd journal; or make daemon-logs).
 cat ~/.ccteam/config.yaml                        # Project registry: slug -> path.
 cat ~/.ccteam/state/gateway/routing.json         # Chat routing: current project/session + live set.
 cat ~/.ccteam/state/sessions/next-sid            # Monotonic sid counter; never reused.
@@ -327,7 +324,7 @@ Start with these three commands; they usually locate the issue:
 ```bash
 ccteam doctor
 ccteam status
-tail -120 ~/ccteam.log
+journalctl --user -u ccteam -n 120
 ```
 
 1. **`ccteam: command not found`** - `~/.local/bin` is not in PATH. Run `export PATH="$HOME/.local/bin:$PATH"`.

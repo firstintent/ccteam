@@ -32,10 +32,11 @@
 ccteam 调用你机器上**已装好并登录的** Claude Code(必需)/ Codex(可选),自己不打包它们。
 
 ```bash
-# 推荐:用 cargo 从源码装(需要 Rust 工具链 + Node.js 用于 web 控制台打包)
-cargo install --git https://github.com/firstintent/ccteam ccteam-cli
+# 推荐:从源码构建并装成服务(需要 Rust 工具链 + Node.js 用于 web 控制台打包)
+git clone https://github.com/firstintent/ccteam && cd ccteam
+make install
 
-# 备用:预编译二进制(无需工具链;linux + macOS arm/x64,Windows 走 WSL2)
+# 备用:预编译二进制(无需工具链;linux + macOS arm/x64,Windows 走 WSL2;同样会问装 systemd)
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 
 ccteam --version
@@ -45,15 +46,11 @@ codex --version    # 可选,用 Codex 会话才需要
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
 
-### 2. 起服务
+### 2. 服务
 
-`ccteam start` 启动唯一的常驻进程 —— 同时提供 Web 控制台、IM 网关、标准资源 API 和 MCP。预编译安装脚本会问你要不要装成 systemd 服务或后台启动;手动起:
+`make install` 已经把服务起好了:唯一的常驻进程(Web 控制台 + IM 网关 + 标准资源 API + MCP)在 Linux 由 systemd `--user` 托管、在 macOS 由 launchd agent 托管 —— 开机/登录自启、崩溃自动重启、退出登录也不死。两个平台都用 `make daemon-status` / `daemon-logs` / `daemon-restart` / `daemon-stop` 管理(macOS 日志在 `~/.ccteam/daemon.log`)。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除服务和二进制,但保留 `~/.ccteam`。没有任何 supervisor 的环境用 `ccteam start` 前台跑。
 
-```bash
-nohup ccteam start >~/ccteam.log 2>&1 &
-```
-
-启动后日志(或随时 `ccteam status`)会打印 Web 控制台地址,形如:
+`make install` 结束时(或随时 `ccteam status`)会打印 Web 控制台地址,形如:
 
 ```text
 web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
@@ -292,13 +289,13 @@ ccteam doctor --check-cost-orphan   # 成本 ledger 对账
 重启(只停 daemon,重启后按会话 id 自动接回):
 
 ```bash
-ccteam stop && nohup ccteam start >~/ccteam.log 2>&1 &
+systemctl --user restart ccteam    # 或 make daemon-restart(先重编译再重启)
 ```
 
 状态文件速查(`~/.ccteam` 按职责分组:`secrets/` 凭证、`state/` daemon 写的、`cache/` 可删、`run/` 套接字):
 
 ```bash
-tail -120 ~/ccteam.log                          # daemon 日志(看你重定向到哪)
+journalctl --user -u ccteam -n 120               # daemon 日志(systemd journal;或 make daemon-logs)
 cat ~/.ccteam/config.yaml                        # 项目登记(slug → 路径)
 cat ~/.ccteam/state/gateway/routing.json         # 网关路由(每个 chat 的当前项目/会话 + live 集)
 cat ~/.ccteam/state/sessions/next-sid            # 单调 sid 计数(永不复用)
@@ -324,7 +321,7 @@ CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=...   # 覆盖 vendor CLI 路径
 ```bash
 ccteam doctor
 ccteam status
-tail -120 ~/ccteam.log
+journalctl --user -u ccteam -n 120
 ```
 
 1. **`ccteam: command not found`** — `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"`。

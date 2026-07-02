@@ -12,9 +12,12 @@
 #   * Override target dir: CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh
 #   * Override tag (CI / pin): CCTEAM_VERSION=<tag> sh install.sh
 #   * Post-install daemon launch: interactive prompt (reads /dev/tty) to
-#     install a systemd --user service, start in the background, or skip.
-#     Non-interactive default = skip. Force a choice with
-#     CCTEAM_POST_INSTALL=systemd|start|none sh install.sh
+#     install a supervised service (systemd --user on Linux, launchd on
+#     macOS), start in the background, or skip. Non-interactive default =
+#     skip. Force a choice with
+#     CCTEAM_POST_INSTALL=systemd|launchd|start|none sh install.sh
+#   * Uninstall (stops + removes the service and the binary; keeps ~/.ccteam):
+#     curl -sSL .../install.sh | sh -s -- --uninstall
 #   * Windows is not supported — run ccteam under WSL2 and use the
 #     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
 #
@@ -154,8 +157,8 @@ resolve_tag() {
     info "Latest release (via API fallback): $TAG"
 }
 
-# ---- post-install: launch the daemon (systemd or nohup), then show the
-#      restart command + web console URL (for Telegram / Feishu setup) ----
+# ---- post-install: launch the daemon (systemd / launchd / nohup), then show
+#      the restart command + web console URL (for Telegram / Feishu setup) ----
 
 daemon_running() {
     command -v pgrep >/dev/null 2>&1 && pgrep -f "ccteam start" >/dev/null 2>&1
@@ -163,6 +166,10 @@ daemon_running() {
 
 have_systemd_user() {
     [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1
+}
+
+have_launchd() {
+    [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1
 }
 
 # Poll the daemon for its web URL (up to ~20s), then print the restart
@@ -233,6 +240,45 @@ EOF
     fi
 }
 
+start_launchd() {
+    _bin="$1"
+    _label="com.firstintent.ccteam"
+    _plist_dir="$HOME/Library/LaunchAgents"
+    _plist="$_plist_dir/$_label.plist"
+    _log="$HOME/.ccteam/daemon.log"
+    mkdir -p "$_plist_dir" "$HOME/.ccteam"
+    info "Installing launchd agent: $_plist"
+    cat > "$_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$_label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$_bin</string>
+        <string>start</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>$PATH</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>$_log</string>
+    <key>StandardErrorPath</key><string>$_log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)/$_label" >/dev/null 2>&1 || true
+    if launchctl bootstrap "gui/$(id -u)" "$_plist" >/dev/null 2>&1; then
+        show_result "$_bin" "launchctl kickstart -k gui/\$(id -u)/$_label"
+    else
+        warn "Could not bootstrap the launchd agent (SSH / no GUI session?)."
+        printf '    Retry after logging in:  launchctl bootstrap gui/$(id -u) %s\n' "$_plist"
+        printf '    Or use nohup instead:    nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n'
+    fi
+}
+
 post_install() {
     _bin="$1"
 
@@ -256,6 +302,16 @@ post_install() {
                     2) _action="nohup" ;;
                     *) _action="systemd" ;;
                 esac
+            elif have_launchd; then
+                printf '\n%s==>%s Start the ccteam daemon now?\n' "$BOLD" "$RESET"
+                printf '      [1] launchd agent — auto-start at login + auto-restart  (recommended)\n'
+                printf '      [2] nohup — background process for this session\n'
+                printf '      Choice [1]: '
+                read -r _reply </dev/tty || _reply=""
+                case "$_reply" in
+                    2) _action="nohup" ;;
+                    *) _action="launchd" ;;
+                esac
             else
                 printf '\n%s==>%s Start the ccteam daemon in the background now? [Y/n] ' "$BOLD" "$RESET"
                 read -r _reply </dev/tty || _reply=""
@@ -278,6 +334,14 @@ post_install() {
                 start_nohup "$_bin"
             fi
             ;;
+        launchd)
+            if have_launchd; then
+                start_launchd "$_bin"
+            else
+                warn "launchd unavailable here; starting with nohup instead."
+                start_nohup "$_bin"
+            fi
+            ;;
         nohup|start|background|bg)
             start_nohup "$_bin"
             ;;
@@ -292,8 +356,41 @@ post_install() {
     esac
 }
 
+# ---- uninstall: stop + remove the service (systemd / launchd) and the
+#      binary. State (~/.ccteam) is kept — remove it manually for a purge. ----
+do_uninstall() {
+    _unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ccteam.service"
+    _label="com.firstintent.ccteam"
+    _plist="$HOME/Library/LaunchAgents/$_label.plist"
+    if [ -f "$_unit" ]; then
+        systemctl --user disable --now ccteam.service >/dev/null 2>&1 || true
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        rm -f "$_unit"
+        info "Removed service: $_unit"
+    fi
+    if [ -f "$_plist" ]; then
+        launchctl bootout "gui/$(id -u)/$_label" >/dev/null 2>&1 || true
+        rm -f "$_plist"
+        info "Removed service: $_plist"
+    fi
+    if [ -x "$INSTALL_DIR/ccteam" ]; then
+        # Graceful stop for a nohup-started daemon (service paths already stopped).
+        "$INSTALL_DIR/ccteam" stop >/dev/null 2>&1 || true
+        rm -f "$INSTALL_DIR/ccteam"
+        info "Removed binary: $INSTALL_DIR/ccteam"
+    else
+        info "No binary at $INSTALL_DIR/ccteam."
+    fi
+    info "Kept: ~/.ccteam (config, secrets, state) and per-project .ccteam/ — delete manually for a full purge."
+    exit 0
+}
+
 # ---- main install ----
 main() {
+    case "${1:-}" in
+        --uninstall|uninstall) do_uninstall ;;
+    esac
+    if [ -n "${CCTEAM_UNINSTALL:-}" ]; then do_uninstall; fi
     need_cmd uname
     need_cmd tar
     need_cmd mktemp
