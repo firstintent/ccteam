@@ -1,10 +1,32 @@
 # ccteam
 
-> **Remote Claude Code & Codex, done right — autonomous, online 24/7, answers the moment you ping.** Your AI dev team, resident on your own machine, driven from IM and a web console.
+> **Remote Claude Code & Codex, done right — autonomous, online 24/7, answers the moment you ping.**
 
-ccteam is a **self-hosted control plane for coding agents.** One resident daemon sits in front of the stock [Claude Code](https://code.claude.com/) and OpenAI Codex agents and owns everything *around* the work — routing, session identity, lifecycle, and budget — while never touching the work itself: no injected prompts, no scraped terminals, no forked runtime. You drive the real Claude Code / Codex, every native capability intact.
+ccteam is a self-hosted gateway that turns the stock [Claude Code](https://code.claude.com/) and OpenAI Codex CLIs into a resident AI dev team. One daemon on your machine keeps every agent session alive and reachable; you drive them from Telegram, Lark/Feishu, or a local web console — spawn a session, hand it work, answer its mid-task questions, approve the risky command, read the result — all from your phone. ccteam owns everything *around* the work (routing, session identity, lifecycle, cost) and never touches the work itself: **no injected prompts, no scraped terminals, no forked runtime.**
 
-[English](docs/usage.md) • [中文](docs/usage-cn.md)
+[Quickstart](#quickstart) • User manual: [English](docs/usage.md) · [中文](docs/usage-cn.md)
+
+## Why
+
+Coding agents got good. Running them didn't.
+
+- **You're chained to a desk.** Claude Code and Codex are desktop CLIs. The idea you get on the train — and the question your agent asks five minutes after you walk away — both wait until you're back at a keyboard.
+- **You babysit instead of delegating.** Close the laptop and the session dies. Leave it running and you're checking the terminal every five minutes: stuck? done? off the rails?
+- **One serialized conversation.** Real work wants a backend session, a frontend session, and a reviewer running side by side — with you switching between them like a tech lead, not retyping context into a single chat.
+
+The ceiling on how much you can delegate stopped being the model a while ago — it's your attention, and your presence at a keyboard. ccteam removes that bottleneck without touching the agent: **your machine does the work; your phone does the deciding.**
+
+## What you get
+
+- **Your agents, in your pocket.** DM your bot on Telegram or Lark: every gateway command and the agent's full slash-command surface work straight from chat. Picker commands (`/model`, review targets) become inline buttons, an agent's mid-task questions arrive as tappable options, and files flow in both directions.
+- **A team, not a chat.** Sessions are independent, addressable agents (`s1`, `s2`, …), each with its own role, vendor, model, and context. Run five in parallel across three projects; switch with `@handle`, see them all with `/sessions`.
+- **Nothing is lost.** Sessions survive closed laptops, network drops, and daemon restarts. Any past session — one you stopped, one from before a restart, even a native `claude` session you started outside ccteam — can be re-activated with its transcript intact.
+- **Hands-off by default, human-in-the-loop when it matters.** Sessions run unattended; start one in `hitl` mode and every non-allowlisted tool call pauses for your approve / deny from chat. Deny blocks that one call, never the whole turn.
+- **Roles and a plugin marketplace.** A role is a plain Markdown persona in `.claude/agents/` — write your own, or one-click-install roles, skills, workflows, and Claude Code plugins from a curated catalog ([agency-agents](https://github.com/wshobson/agents), [mattpocock/skills](https://github.com/mattpocock/skills), official plugins, …) that pins every upstream at a revision and integrity-checks every install.
+- **Cost you can see.** A live cost pill in the console, per-session spend, and per-vendor 24-hour budget caps with a hard ceiling.
+- **A real API underneath.** Everything the console does is a standard, self-documenting HTTP API (`/api/v1`, interactive docs at `/api/docs`) — script it, integrate it, or build your own front end.
+- **Multi-user.** Share one daemon: the owner mints per-user web login links, each user can connect their own IM bot, and projects and sessions stay isolated per user.
+- **Vendor-native, zero lock-in.** ccteam launches the real `claude` / `codex` from your `PATH`. A new vendor feature works the day it ships; the vendor is a per-session choice, not a platform bet.
 
 ## Quickstart
 
@@ -22,7 +44,7 @@ cargo install --git https://github.com/firstintent/ccteam ccteam-cli
 cd ~/code/myproject && ccteam init
 ccteam config
 
-# 3. Start the daemon in the background — IM gateway + web console + resource API + MCP, one process:
+# 3. Start the daemon in the background — IM gateway + web console + API + MCP, one process:
 nohup ccteam start >~/ccteam.log 2>&1 &   # foreground instead: just `ccteam start`
 ```
 
@@ -43,17 +65,40 @@ http://localhost:7331
 @ccteam status          # group control: status / cost / stop
 ```
 
-Manage from the CLI (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
+Manage from the CLI whenever you prefer (the daemon stays the source of truth): `ccteam project ls|new|stop|rm`, `ccteam session ls`, `ccteam status`, `ccteam doctor`.
 
-For every CLI command, slash command, and IM control, see the user manual: [English](docs/usage.md) • [中文](docs/usage-cn.md).
+Every CLI command, slash command, and IM control is in the user manual: [English](docs/usage.md) · [中文](docs/usage-cn.md).
 
-**Web console** binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
+> **Note:** the web console binds to `0.0.0.0:7331` with token auth and no TLS — keep it on a trusted LAN; don't expose it to the public internet.
+
+## Three front ends, one team
+
+- **IM (Telegram · Lark/Feishu)** — DM a bot to work a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`). Made for the phone: quick check-ins, approvals, and course corrections from anywhere.
+- **Web console** — one chat-style console (English or 中文, light/dark): create projects, open and switch sessions, watch live transcripts or a byte-faithful per-session terminal, install plugins from the marketplace, check each host's agent install / MCP status, and track spend at a glance.
+- **Inside a session** — the `mcp__ccteam__*` MCP tools are the programmatic surface: register a bot, send a file to chat, take a screenshot, run a multi-agent vote. The default `cto` manager uses them to spawn a work-role session, dispatch a task to it, and collect the result.
+
+## The model: chat ⇄ project ⇄ session ⇄ role
+
+- A **chat** is one conversation surface — an IM DM or group, or a browser tab. It's your terminal: it spans projects and holds many live sessions at once. Another chat — another person, even on the same daemon — sees only its own sessions.
+- A **project** is a local directory you ran `ccteam init` in.
+- A **session** is one independent agent handle (`s<N>`) with its own context, exactly like a native Claude Code session — `/compact`, `/clear`, and `/model` are per-session. `/new` spawns, `/sessions` lists (project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Sessions are durable: `/use <id>` — or the console's history list — re-activates **any** past session, and can even adopt a native Claude session started outside ccteam.
+- A **role** is who a session *is* — a plain Markdown persona at `.claude/agents/<role>.md`, or no role at all (a bare `claude` guided by your project's `CLAUDE.md`). `ccteam init` seeds a `cto` manager that recommends the right work-role; swap any session's role live with `/role`.
+
+Build your team by dropping `.md` files into `.claude/agents/` — or install them from the marketplace (web console, or `ccteam role search` / `add`).
+
+## Under the hood
+
+- **One gateway daemon.** `ccteam start` runs a single resident process: IM gateway + web server + HTTP API + local MCP socket. It routes and manages lifecycle; it never orchestrates or edits the agent's work.
+- **No prompt injection, ever.** A session launches as `claude --agent <role>`, so the vendor loads and obeys its own persona file. Project memory (`CLAUDE.md` / `AGENTS.md`) stays yours — never generated, never rewritten.
+- **No terminal scraping.** State comes from transcripts and structured vendor events, never parsed screen text. The web terminal is a read-only, byte-faithful mirror.
+- **Sessions on demand.** Spawned when addressed, resumed by id, released when idle — context is preserved on disk, not held hostage in a process. Claude runs over a lightweight structured pipe by default; pick the terminal (tmux) channel per session when you want to attach, watch, or screenshot.
+- **Never killed silently.** A long-running session is stopped only by you or by a budget cap — and a dead process resumes losslessly, or restarts fresh with a visible reset event rather than a silent memory wipe.
 
 ## Architecture
 
 ```text
-   IM (Telegram · Slack · Lark)        web console        MCP tools (in a session)
-              │                            │                        │
+   IM (Telegram · Lark/Feishu)          web console        MCP tools (in a session)
+              │                             │                        │
               └─────────────────────────────┼────────────────────────┘
                                             ▼
                   ┌───────────────────────────────────────┐
@@ -72,37 +117,6 @@ For every CLI command, slash command, and IM control, see the user manual: [Engl
                               │
            your machine · your files · state on disk (resumes after any restart)
 ```
-
-## Why
-
-- **Remote-first** — your phone is a terminal into your machine; answer an agent's mid-task questions right in chat.
-- **Always-on** — runs on *your* computer and keeps working after you close the lid.
-- **A team, not a chat** — many independent sessions run side by side, not one serialized conversation.
-- **Vendor-native, zero lock-in** — a new Claude Code / Codex feature works the day it ships; the vendor is a per-session attribute, not a platform bet.
-
-## Three ways to drive it
-
-- **From IM** — DM a bot to work a project, or `@ccteam <natural language>` in a group for control (`pause`, `cost`, `list`, `stop everything`). The agent's full slash-command surface works straight from chat.
-- **From a web console** — one chat-style local console (in 中文 or English): create projects, open and switch sessions, watch live transcripts and a byte-faithful per-session terminal, one-click-install plugins from the marketplace, check each host's agent install / MCP-registration status, and see a live cost pill plus per-session spend — plus a standard, self-documenting HTTP API at `/api/v1` (`GET /api/docs`).
-- **Inside a session** — the `mcp__ccteam__*` MCP tools are the programmatic surface (register a bot, send a file to chat, screenshot, run a vote). The default `cto` manager can spawn a work-role session, dispatch a task to it, and collect the result.
-
-## The model: chat ⇄ project ⇄ session ⇄ role
-
-- A **chat** is one IM conversation or browser surface — your terminal. It spans projects and holds many live sessions at once; another chat — another person, even sharing the same machine and daemon — sees only its own sessions (soft per-chat isolation under one OS account). Several people can share one daemon: the owner mints a **per-user web login link**, and each user can run their **own** IM bot (its own Telegram / Lark token, set self-serve in the web console) that drives only their sessions.
-- A **project** is a local directory you ran `ccteam init` on.
-- A **session** is an independent, resident agent handle (`s<N>`) with its own context (`/compact` and `/clear` are per-session) — exactly like a native Claude Code session. `/new` spawns, `/sessions` lists (handle, project, vendor, role, model, live context), `@handle` / `/use` switches, `/cd` changes project. Two sessions of the same role never cross-talk. Sessions are durable: `/use <id>` — or the web console's history list — re-activates **any** past session (one you stopped, one from before a daemon restart), and can even adopt a native Claude session you started outside ccteam, transcript intact.
-- A **role** is who a session *is* — a plain Markdown persona at `.claude/agents/<role>.md`, or no role at all (a bare `claude` driven by your project's `CLAUDE.md`). `ccteam init` seeds a `cto` manager that recommends the right work-role; swap any session's role live with `/role`.
-
-Build your team by dropping `.md` files into `.claude/agents/` — or one-click-install roles, skills, and workflows from the **plugin marketplace** (the web console, or `ccteam role search` / `add`): a curated catalog — official ccteam plugins first, then tracked open-source libraries like [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills) — that pins each upstream at a revision (pointers, not copies) and content-integrity-checks every install.
-
-## How it works
-
-- **One gateway daemon, no tick loop** — `ccteam start` runs a single resident process: IM gateway + web server + resource API + local MCP socket. It routes; it does not orchestrate.
-- **No prompt injection** — a session launches as `claude --agent <role>`, so the vendor loads and obeys its own role file; ccteam never injects a system prompt. Project memory stays vendor-native (`CLAUDE.md` / `AGENTS.md`), neither generated nor rewritten.
-- **Harness × provider** — each agentic CLI is a *harness* (claude-code first-class, Codex best-effort, more by design); the model behind it is the *provider*. Claude is driven over the default **stream-json** channel (a long-lived process over an NDJSON pipe — lightweight, no terminal) or a **terminal** channel (a tmux TUI) when you want the byte-faithful mirror / attach / screenshot. ccteam never scrapes terminal output. `GET /capabilities` reports what's actually installed on your `PATH`.
-- **Full slash coverage from chat** — Claude's open commands pass through; picker commands (model, review target) become inline buttons in IM (chips in web); an agent's own `AskUserQuestion` surfaces the same way, answerable from your phone.
-- **Optional human-in-the-loop** — `/new claude <role> hitl` makes every non-allowlisted tool call pause for your inline approve / deny via Claude's native permission hook. Deny blocks just that tool, never the turn; the rest run hands-off.
-- **Cost-aware & durable** — per-vendor 24h budget caps with a hard ceiling (a long session is never killed unless a cap is hit, or you stop it); all state is reconstructable from disk (hooks, transcripts, RPC events — never scraped text). A killed Claude pane reloads losslessly with `claude --resume`, or falls back to a fresh session with a visible reset event rather than silently forgetting.
 
 ## License
 
