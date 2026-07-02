@@ -192,8 +192,9 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ```text
 @<role>          切到该角色的会话并设为当前(单独 @role 只切换,不发消息)
 @<role> <消息>    切到它并发一条
-@ccteam <verb>   管理:status · cost [today] · list · bots · pause / resume / stop <slug>[/role] · confirm
 ```
+
+`@` 永远指向一个会话。确定性控制走上面的斜杠命令面(`/status` `/sessions` `/stop` …);自由形式的运维问题("今天哪个项目烧钱最多?")直接跟会话聊 —— `cto` 角色会用它的工具回答。
 
 ### 直接对话 + 收发文件
 

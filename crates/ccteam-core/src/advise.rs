@@ -786,10 +786,10 @@ pub fn sum_advise_today(ledger: &AdviseBudgetLedger) -> f64 {
     ccteam_cost::sum_advise_today(ledger)
 }
 
-/// V0.6.6 F169 — per-vendor 24h spend, surfaced to the IM `@ccteam
-/// cost today` admin path so the user sees `claude: $X / codex: $Y`
-/// rather than the V0.6.1 bot-count placeholder. Same rolling window
-/// the bare [`sum_advise_today`] uses, just filtered by vendor.
+/// V0.6.6 F169 — per-vendor 24h spend for the cost surfaces, so the
+/// user sees `claude: $X / codex: $Y` rather than an aggregate. Same
+/// rolling window the bare [`sum_advise_today`] uses, just filtered by
+/// vendor.
 pub fn sum_advise_today_by_vendor(ledger: &AdviseBudgetLedger, vendor: AgentVendor) -> f64 {
     ccteam_cost::sum_advise_today_by_vendor(ledger, vendor.cost_vendor())
 }

@@ -1265,7 +1265,7 @@ impl Gateway {
             let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
             handles.sort();
             handles.dedup();
-            return Ok(vec![crate::inbound::format_ambiguous_dm_reply(&handles)]);
+            return Ok(vec![format_ambiguous_dm_reply(&handles)]);
         }
         self.ensure_current_session(&chat).await?;
         // v0.8.10 — codex `/clear` = recycle + recreate at the gateway, so its
@@ -1736,7 +1736,7 @@ impl Gateway {
             let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
             handles.sort();
             handles.dedup();
-            return Err(anyhow!(crate::inbound::format_ambiguous_dm_reply(&handles)));
+            return Err(anyhow!(format_ambiguous_dm_reply(&handles)));
         }
         let project = self.current_project_for(chat);
         self.start_session(
@@ -4499,6 +4499,19 @@ fn spawn_turn_timeout_watchdog(
             sid: Some(session_id.clone()),
         });
     });
+}
+
+/// Reply for a DM that could bind to more than one registered-bot
+/// template: ask the user to pick a handle instead of guessing.
+fn format_ambiguous_dm_reply(available: &[String]) -> String {
+    if available.is_empty() {
+        return "No bots available in this chat.".to_string();
+    }
+    let mentions: Vec<String> = available.iter().map(|h| format!("@{h}")).collect();
+    format!(
+        "Multiple bots in this chat. Specify one: {}",
+        mentions.join(" ")
+    )
 }
 
 /// Build the turn text for an inbound message (V0.8.4 P2a). With no

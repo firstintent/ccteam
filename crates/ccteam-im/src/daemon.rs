@@ -955,8 +955,8 @@ pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> R
 /// `CCTEAM_MUX_BACKEND=tmux` also keeps daemon startup side-effect-free on the
 /// default backend. Timeout-guarded so a stale tmux server never blocks boot.
 ///
-/// A richer operator surface — orphans in `@ccteam list` / a
-/// `ccteam sessions --all` command, plus an explicit reclaim verb — can reuse
+/// A richer operator surface — orphans in `/sessions` / a
+/// `ccteam session ls --all` command, plus an explicit reclaim verb — can reuse
 /// [`Gateway::render_all_sessions`], which already renders tracked + orphan
 /// rows; this startup hook is the read-only visibility half.
 async fn log_orphan_chat_sessions(gateway: &Gateway) {

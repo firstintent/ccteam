@@ -215,8 +215,8 @@ fn admin_list_workflows() {
 
 /// F150 smoke 2 — `admin_cost_today`:
 /// `ccteam__admin_ls` response must carry `cost_24h_usd` on every
-/// project entry — that is the data backing `/ccteam-control show-cost`
-/// and `@ccteam cost today`.
+/// project entry — that is the data backing the per-project cost
+/// surfaces (web cost pill, `/status`).
 #[test]
 fn admin_cost_today() {
     let tmp = TempDir::new().unwrap();

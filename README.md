@@ -50,7 +50,7 @@ make install    # release build → ~/.local/bin/ccteam → service (systemd / l
 ```text
 /cd myproject           # switch project → a `cto` session spins up; start chatting
 /new   /use   @handle   # open / switch / address sessions
-@ccteam status          # group control: status / cost / stop
+/status   /sessions     # deterministic control: state · cost · fleet · stop
 ```
 
 Day-2 ops: `make daemon-logs` · `make daemon-restart` (rebuild + reload) · `ccteam status` · `ccteam doctor` · `make uninstall` (removes service + binary, keeps state).

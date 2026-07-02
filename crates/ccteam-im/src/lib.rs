@@ -37,9 +37,7 @@ pub mod gateway;
 // so the primitives leaf stays free of an async HTTP + sha2 dependency (the
 // `core` half is just the base-URL constant + path utils in `ccteam_core::hub`).
 pub mod hub;
-pub mod inbound;
 pub mod latency;
-pub mod nl_admin;
 // v0.8.6 Item 4 — Telegram bot-token onboarding (token validation +
 // owner chat_id capture). Wrapped by `ccteam config` (the IM-token menu
 // item); the former `ccteam-im-setup` skill's job moves into the CLI.
@@ -85,11 +83,7 @@ pub struct BotRegistration {
     pub im_chat_id: String,
     /// Optional IM handle this bot answers to in chat-mode messages.
     /// `None` (legacy / pre-`chat_handle` registrations) falls back to
-    /// `role` as the routing handle. The daemon's `build_handle_map`
-    /// resolves cross-slug collisions by suffixing the second claimant
-    /// with `__<slug>` (double underscore — see
-    /// [`crate::router::collision_suffix`] for the rationale; `@` would
-    /// be eaten by the mention parser). `chat_register_bot` auto-mints
+    /// `role` as the routing handle. `chat_register_bot` auto-mints
     /// a scientist nickname from `ccteam_core::agent_naming::SCIENTIST_NAMES`
     /// when the caller omits this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,10 +119,9 @@ fn default_ccteam_root() -> PathBuf {
         .join(".ccteam")
 }
 
-/// V0.6.6 F169 — pub wrapper around [`default_ccteam_root`] so the
-/// `nl_admin::AdminExecutor` (and other library callers) can resolve
-/// the production ccteam-root without re-implementing the home-derived
-/// path. Tests inject a tempdir via `AdminExecutor::with_ccteam_root`.
+/// Pub wrapper around [`default_ccteam_root`] so library callers (the
+/// daemon, transports) can resolve the production ccteam-root without
+/// re-implementing the home-derived path.
 pub fn default_ccteam_root_public() -> PathBuf {
     default_ccteam_root()
 }
@@ -324,8 +317,7 @@ impl BotRegistration {
     ///    slug → path SoT introduced in V0.4.2 F73).
     /// 3. `<projects_root>/<workflow_slug>/` (historical layout).
     ///
-    /// The daemon hands a populated `config_projects` to
-    /// `DefaultMailboxResolver::with_config_projects` so legacy
+    /// The daemon hands a populated `config_projects` in so legacy
     /// registrations (no `project_dir`) whose project lives outside the
     /// home tree (NAS shares, dir basename ≠ workflow slug) still route
     /// correctly without re-registering every bot.
@@ -378,9 +370,9 @@ impl BotRegistration {
 /// 3. `projects_root.join(reg.workflow_slug)` — historical
 ///    `<projects_root>/<slug>/` layout used by pre-F185 registrations.
 ///
-/// MailboxResolver and gateway template registration funnel through
-/// this helper so the same priority chain applies everywhere; resolvers
-/// don't re-implement the logic.
+/// Gateway template registration and the `chat_*` MCP paths funnel
+/// through this helper so the same priority chain applies everywhere;
+/// resolvers don't re-implement the logic.
 pub fn resolve_project_dir(
     reg: &BotRegistration,
     projects_root: &Path,

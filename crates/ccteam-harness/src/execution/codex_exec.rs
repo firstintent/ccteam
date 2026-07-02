@@ -298,9 +298,9 @@ impl HarnessAdapter for CodexExecAdapter {
         // F173 — Codex daemon-routed critic + unified cost rollup.
         // Pre-turn budget check + post-turn ledger row keep every
         // Codex call (chat bot, critic, advise_*) on the same
-        // `<ccteam_root>/cost-budget.json` SoT, so `@ccteam cost today`
-        // and `ccteam doctor --check-cost-orphan` can reconcile vendor
-        // calls against ledger rows without leaks.
+        // `<ccteam_root>/cost-budget.json` SoT, so the cost surfaces
+        // (`/status`, `admin_ls`) and `ccteam doctor --check-cost-orphan`
+        // can reconcile vendor calls against ledger rows without leaks.
         //
         // The hook only fires when **`CCTEAM_HOME` is explicitly set**
         // (matching production `ccteam start` / `ccteam doctor` flows

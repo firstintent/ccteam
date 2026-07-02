@@ -12,9 +12,7 @@
 //!
 //! Single-bot DM stays unprefixed (one sender, no ambiguity). The
 //! "should I prefix" decision keys off the bot's sibling count for
-//! `(im_platform, im_chat_id)` in the active registry snapshot — same
-//! tuple `inbound::auto_route_dm_mention` uses, so the two decisions
-//! stay in sync.
+//! `(im_platform, im_chat_id)` in the active registry snapshot.
 
 use crate::BotRegistration;
 
@@ -23,10 +21,7 @@ use crate::BotRegistration;
 ///
 /// `true` when the bot shares its `(im_platform, im_chat_id)` tuple
 /// with at least one other registered bot (typical chat-squad
-/// posture), `false` otherwise. The comparison key matches
-/// [`crate::inbound::auto_route_dm_mention`] so the inbound auto-route
-/// and outbound prefix observe the same "is this a multi-bot chat"
-/// signal.
+/// posture), `false` otherwise.
 ///
 /// `bot` need not be present in `bots` — the caller usually re-reads
 /// the registry from disk on the dispatcher hot path so the slice

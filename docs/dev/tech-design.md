@@ -69,7 +69,8 @@ ccteam gateway 把 IM / web chat 消息路由到真实 Claude/Codex session。�
 | `/role <role>` | **原地换当前 session 的 role**(底层 = 带新 `--agent` 重启,**保持同一 sid + pane**)|
 | `/sessions` / `/projects` | 列当前 chat 的 session / daemon 已知项目 |
 | `@handle <text>` | 路由到指定 session 并设为当前;不带 `@handle` 则发给当前 session |
-| `@ccteam <NL>` | IM admin(status / pause / resume / list / cost / stop) |
+
+> `@` 只指会话,**无 meta-handle**(v0.8.21 删除 `@ccteam`/nl_admin 遗留管线):确定性控制 = 上面的斜杠命令面;自由形式运维问题 = 普通聊天,由 session(如 cto)用工具回答。
 
 `/compact` `/review` `/clear` 这类**不是** gateway 命令,会作为一个普通 turn / directive 透传给当前 session 的 adapter,由 adapter 翻译成 vendor-native 操作(详 §2.5)。
 
@@ -424,7 +425,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 
 **`session_` 调度门(defense-in-depth,非硬边界)**:① cto role.md `tools:` 行授予 5 个 `mcp__ccteam__session_*`(work-role 模板不列 → Claude allow-list 第一道;**注**:MCP 工具可能绕 vendor per-agent allow-list,故此层 best-effort、非承重);② **per-session secret 校验(安全相关层)**:spawn 时 daemon mint 128-bit secret 注入 pane env(`CCTEAM_CHAT_SECRET`,随 `CCTEAM_CHAT_ROLE`),存 `sid→{role,secret}`;stdio forwarder 转发 `_caller_secret`;daemon `execute_session_tool` 先跑廉价 role 预筛(`session_caller_authorized`,gateway down 也拒明显非 cto),再 `Gateway::verify_session_caller` 用 constant-time 比对认证 `(role,secret)` 对(**不信明文 role**,缺/错 secret fail-closed);③ **project 维度**:`session_spawn` 只在 caller 自己 slug 建 session(无 project 参数),`dispatch`/`collect`/`stop` 先 `assert_caller_owns_session`(`session_resolve(sid).project == _caller_slug`),跨项目 sid 拒。collect = polled MVP(tail 子 session `turns.jsonl`,`since` 游标 + `n` 上限)。**诚实范围**:单 OS-uid 全信任模型下 agent 间**无硬边界**(同 uid 可读他 pane 的 env / 文件 / ptrace → 拿到 secret),secret 只**抬高门槛**,**不 close** 漏洞;真隔离 = per-agent OS user / sandbox(v0.8.8 deferred)。
 
-> **曾经的 `workflow_*`(15→8→0)与 4+3 bundled skill 均已退役**:推后编排的 marker 工具 v0.8.6 无 consumer,session 生命周期改走 CLI(`project`/`session` 组)/ IM(`/new` `/role` `@ccteam`)/ 标准 API(§2.6)。原 skill 功能落 MCP 工具 + cto role + work-role + config CLI。
+> **曾经的 `workflow_*`(15→8→0)与 4+3 bundled skill 均已退役**:推后编排的 marker 工具 v0.8.6 无 consumer,session 生命周期改走 CLI(`project`/`session` 组)/ IM(`/new` `/role` `/stop`)/ 标准 API(§2.6)。原 skill 功能落 MCP 工具 + cto role + work-role + config CLI。
 
 **Wire 协议纪律**:`ccteam internal mcp-serve` stdout 是 line-delimited JSON-RPC frame channel,**所有 tracing / 日志走 stderr**,否则污染 frame parse。两条 transport(stdio + daemon 的 `~/.ccteam/run/mcp.sock`)共用同一 handler。
 

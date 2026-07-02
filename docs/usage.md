@@ -195,8 +195,9 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 ```text
 @<role>          Switch to that role's session and make it current. Alone = switch only.
 @<role> <text>   Switch to it and send a message.
-@ccteam <verb>   Admin: status, cost [today], list, bots, pause/resume/stop <slug>[/role], confirm
 ```
+
+`@` always addresses a session. Deterministic control is the slash surface above (`/status`, `/sessions`, `/stop`, …); free-form ops questions ("which project burned the most today?") are ordinary chat to a session — the `cto` role answers them with its tools.
 
 ### Direct Chat and File Exchange
 

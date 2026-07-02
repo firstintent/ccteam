@@ -1,9 +1,8 @@
 //! F185 + V0.6.8 F190 — `BotRegistration.project_dir` /
 //! `~/.ccteam/config.yaml::projects[]` path-resolution coverage.
 //!
-//! Anchors the contract `chat_inbox_dir` / `turns_jsonl_path` /
-//! `inbound::DefaultMailboxResolver::inbox_dir` honor on top of
-//! the F185 optional field + F190 three-tier priority chain:
+//! Anchors the contract `chat_inbox_dir` / `turns_jsonl_path` honor on
+//! top of the F185 optional field + F190 three-tier priority chain:
 //!
 //! 1. When the registration carries an explicit `project_dir`, every
 //!    resolver lays out paths under that absolute path directly.
@@ -23,7 +22,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ccteam_harness::AgentVendor;
-use ccteam_im::inbound::{DefaultMailboxResolver, MailboxResolver};
 use ccteam_im::{chat_inbox_dir, resolve_project_dir, turns_jsonl_path, BotRegistration};
 
 fn mk_reg(slug: &str, role: &str, project_dir: Option<PathBuf>) -> BotRegistration {
@@ -68,32 +66,6 @@ fn turns_jsonl_path_honors_explicit_project_dir() {
     assert_eq!(
         turns,
         PathBuf::from("/vol4/ccteam/.ccteam/chat/support/turns.jsonl")
-    );
-}
-
-#[test]
-fn default_mailbox_resolver_honors_explicit_project_dir() {
-    let reg = mk_reg(
-        "research-squad",
-        "tech-helper",
-        Some(PathBuf::from("/vol4/ccteam")),
-    );
-    let mailbox = DefaultMailboxResolver::with_projects_root("/home/user/projects");
-    let dir = mailbox.inbox_dir(&reg).unwrap();
-    assert_eq!(
-        dir,
-        PathBuf::from("/vol4/ccteam/.ccteam/chat/tech-helper/inbox")
-    );
-}
-
-#[test]
-fn default_mailbox_resolver_falls_back_when_project_dir_none() {
-    let reg = mk_reg("dev-foo", "lead", None);
-    let mailbox = DefaultMailboxResolver::with_projects_root("/home/user/projects");
-    let dir = mailbox.inbox_dir(&reg).unwrap();
-    assert_eq!(
-        dir,
-        PathBuf::from("/home/user/projects/dev-foo/.ccteam/chat/lead/inbox")
     );
 }
 
@@ -213,48 +185,6 @@ fn resolve_project_dir_falls_through_with_unrelated_config_entries() {
     cfg.insert("other-project".into(), PathBuf::from("/srv/other"));
     let got = resolve_project_dir(&reg, std::path::Path::new("/home/u/projects"), &cfg);
     assert_eq!(got, PathBuf::from("/home/u/projects/orphan"));
-}
-
-#[test]
-fn default_mailbox_resolver_consults_config_when_reg_none() {
-    // F190 — resolver constructed via `with_config_projects` honors
-    // tier 2 of the priority chain when the registration lacks an
-    // explicit `project_dir`.
-    let reg = mk_reg("nas-bot", "lead", None);
-    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
-    cfg.insert("nas-bot".into(), PathBuf::from("/vol4/1000/ccteam"));
-    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
-    let dir = mailbox.inbox_dir(&reg).unwrap();
-    assert_eq!(
-        dir,
-        PathBuf::from("/vol4/1000/ccteam/.ccteam/chat/lead/inbox")
-    );
-}
-
-#[test]
-fn default_mailbox_resolver_falls_through_when_slug_absent_from_config() {
-    // F190 — slug not in the config map. Resolver falls through to
-    // projects_root layout (pre-F190 behavior preserved).
-    let reg = mk_reg("orphan", "lead", None);
-    let cfg: HashMap<String, PathBuf> = HashMap::new(); // empty
-    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
-    let dir = mailbox.inbox_dir(&reg).unwrap();
-    assert_eq!(
-        dir,
-        PathBuf::from("/home/u/projects/orphan/.ccteam/chat/lead/inbox")
-    );
-}
-
-#[test]
-fn default_mailbox_resolver_explicit_project_dir_beats_config() {
-    // F190 — when both reg.project_dir AND config map have entries
-    // for the slug, reg.project_dir wins (F185 priority preserved).
-    let reg = mk_reg("dual", "lead", Some(PathBuf::from("/from/explicit")));
-    let mut cfg: HashMap<String, PathBuf> = HashMap::new();
-    cfg.insert("dual".into(), PathBuf::from("/from/config"));
-    let mailbox = DefaultMailboxResolver::with_config_projects("/home/u/projects", cfg);
-    let dir = mailbox.inbox_dir(&reg).unwrap();
-    assert_eq!(dir, PathBuf::from("/from/explicit/.ccteam/chat/lead/inbox"));
 }
 
 #[test]

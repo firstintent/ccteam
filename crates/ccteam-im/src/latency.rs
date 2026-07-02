@@ -12,8 +12,8 @@
 //! - `event = "latency"` — common marker so `journalctl | grep latency`
 //!   yields the timing rows and nothing else.
 //! - `cid` — correlation id. For TG: `"tg-{message_id}"` (synthesized
-//!   in `TelegramChannel::listen`). Flows through `ChannelMessage::id`,
-//!   `InboxEnvelope::message_id`, and is preserved verbatim into the
+//!   in `TelegramChannel::listen`). Flows through `ChannelMessage::id`
+//!   and is preserved verbatim into the
 //!   downstream logs that can see it (stages A–D, G). Stages F + parts
 //!   of E correlate via `turn_id` instead — the Claude session never
 //!   sees the cid.

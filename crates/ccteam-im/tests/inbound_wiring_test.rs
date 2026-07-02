@@ -9,15 +9,10 @@
 //! without a real network round-trip:
 //!
 //!   `MockChannel` → daemon listener task → mpsc consumer →
-//!   `process_inbound_admin_aware` → mailbox `.md` file →
-//!   `drain_inboxes` → `BotSupervisor::handle_inbound` →
-//!   stub `HarnessAdapter::submit_turn`.
+//!   `Gateway::handle_message` → stub `HarnessAdapter::submit_turn`.
 //!
-//! Two assertions guard the regression:
-//! 1. The mailbox `.md` file appears under
-//!    `<projects_root>/<slug>/.ccteam/chat/<role>/inbox/`.
-//! 2. The stub adapter's `submit_turn` counter advances (proves the
-//!    supervisor inbox drain reached the harness layer).
+//! The stub adapter's `submit_turn` counter advancing proves an
+//! inbound IM message reached the harness layer.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
