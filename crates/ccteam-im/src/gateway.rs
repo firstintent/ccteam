@@ -2554,6 +2554,7 @@ impl Gateway {
             return Ok(());
         };
         if !path.exists() {
+            self.recover_routing_from_meta();
             return Ok(());
         }
         let raw = std::fs::read_to_string(path)?;
@@ -2575,6 +2576,35 @@ impl Gateway {
         self.sessions.clear();
         self.restore_pending = saved.live_sids;
         Ok(())
+    }
+
+    /// `routing.json` doesn't exist yet — either this is the daemon's very
+    /// first boot, or the file was lost some other way. There is no persisted
+    /// live-set to trust, but every session's `meta.json` is real, independent,
+    /// on-disk history (written at spawn, per project) — rebuild the live-set
+    /// from it rather than starting blank, which would otherwise read as
+    /// "every in-flight chat session vanished" the moment routing.json is
+    /// absent. A chat's `current_project`/`current_session` FOCUS still starts
+    /// blank: `meta.json`'s `owner` tag is deliberately `"channel:chat_id"`
+    /// only (project ownership is per-CHAT, see [`ChatKey::identity`]), so it
+    /// can't be turned back into the exact `(channel, chat_id, user_id)` key
+    /// the routing maps use — guessing would risk steering one user's message
+    /// into another user's recovered session. The owner just needs one
+    /// `/use <sid>` (surfaced by `/sessions`, which reads the live map this
+    /// populates) to reattach.
+    ///
+    /// Best-effort and one-time: `meta.json` carries no "explicitly stopped"
+    /// marker (`/stop` never touches it), so a session the owner stopped long
+    /// ago could get resurrected here too. That's an acceptable one-off cost
+    /// (a stray `/stop` afterwards) against the alternative of silently
+    /// dropping genuinely-live conversations.
+    fn recover_routing_from_meta(&mut self) {
+        self.restore_pending = self
+            .projects
+            .values()
+            .flat_map(|dir| list_session_metas(dir))
+            .map(|meta| meta.sid)
+            .collect();
     }
 
     /// v0.8.21 Wave-2 — persist the ROUTING snapshot (per-chat focus + the
@@ -8436,6 +8466,63 @@ mod tests {
         // each live session; both were live, so both restart via start_thread).
         // /use s1 + /use s2 then hit the already-rebuilt sessions (no new spawn).
         assert_eq!(fake.starts.load(Ordering::SeqCst), 4);
+    }
+
+    /// Guards the fix for the incident where a breaking routing-schema jump
+    /// (or any other loss of `routing.json`) made a live chat session read as
+    /// "vanished": with no routing.json to load, `load_state` must fall back
+    /// to each project's `meta.json` to rebuild the live-set, so the session
+    /// is findable again via `/sessions` + `/use` instead of gone for good.
+    #[tokio::test]
+    async fn gateway_recovers_live_sessions_from_meta_when_routing_json_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+
+        {
+            let mut gateway = Gateway::new(fake.clone(), "beta", beta.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+                .await
+                .unwrap();
+        }
+
+        // Simulate the incident: routing.json is gone (never written yet under
+        // the new schema, or lost some other way), but the session's meta.json
+        // — an independent per-project file — is untouched.
+        std::fs::remove_file(crate::routing_state_path_in(tmp.path())).unwrap();
+        assert!(ccteam_harness::execution::session_meta::session_meta_path(&beta, "s1").exists());
+
+        let mut restored = Gateway::new(fake.clone(), "beta", beta);
+        restored.enable_persistence(tmp.path()).unwrap();
+        restored.resume_restored_sessions().await;
+
+        // s1 is live again and listed — not silently gone — even though
+        // routing.json never said so. The chat's FOCUS wasn't (and can't
+        // losslessly be) restored, so `/use` is still needed once.
+        let sessions = restored
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1:beta:Claude:reviewer"]);
+
+        assert_eq!(
+            restored
+                .handle_text("mock", "chat-1", "alice", "/use s1")
+                .await
+                .unwrap(),
+            vec!["using session s1"]
+        );
+        let reply = restored
+            .handle_text("mock", "chat-1", "alice", "after routing.json loss")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            vec!["beta-reviewer-s1 echo: after routing.json loss"]
+        );
     }
 
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
