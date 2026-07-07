@@ -474,6 +474,16 @@ pub struct SessionView {
     /// Seconds since this session's latest progress event when known.
     #[serde(default)]
     pub last_activity_seconds: Option<u64>,
+    /// v0.8.22 P0-3 — RFC3339 spawn time, read from `meta.json`. Empty when
+    /// the meta can't be resolved (never blocks the listing). `#[serde(default)]`
+    /// keeps older clients tolerant.
+    #[serde(default)]
+    pub created_at: String,
+    /// v0.8.22 P0-3 — RFC3339 last-turn-completion time, read from
+    /// `meta.json`. Drives the SPA/IM "recency" sort and relative-time
+    /// display; empty when the meta can't be resolved.
+    #[serde(default)]
+    pub last_active: String,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -3381,15 +3391,16 @@ impl Gateway {
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
         // web reply MUST stay the bare `id:project:vendor:role` rows (no banner /
-        // scoping / footer — those would break `parse_sessions_reply`). The IM
-        // text surface, which has no chrome, instead gets a current-project
-        // banner + project scoping + an `/sessions all` footer.
+        // scoping / footer / history section — those would break
+        // `parse_sessions_reply`). The IM text surface, which has no chrome,
+        // instead gets a current-project banner + project scoping + an
+        // `/sessions all` footer + a "最近结束" history section (v0.8.22 P0-4).
         let is_web = chat.channel == "web";
         // Default scope = the chat's CURRENT project; `all` (and web) lists the
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
         // the IM footer can point at `/sessions all`.
         let cur = self.current_project_for(chat);
-        let (visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
+        let (mut visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
             (accessible, 0)
         } else {
             let elsewhere = accessible.iter().filter(|s| s.project != cur).count();
@@ -3399,16 +3410,47 @@ impl Gateway {
                 .collect();
             (scoped, elsewhere)
         };
+        // v0.8.22 P0-3 — order by recency (last_active desc), not the
+        // `BTreeMap<sid, _>` iteration order (`s1,s10,s2…` string sort).
+        // `last_active` is read best-effort from each session's `meta.json`;
+        // a missing/unreadable meta sorts as "oldest" (empty string). Numeric
+        // sid desc breaks ties (equal or both-missing last_active) so the
+        // order stays fully deterministic.
+        visible.sort_by(|a, b| {
+            let la = self.session_last_active(a);
+            let lb = self.session_last_active(b);
+            lb.cmp(&la)
+                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
+        });
+        // v0.8.22 P0-4 — up to 5 most-recently-ended sessions this chat can
+        // see (same visibility rule as the live list), scoped like the live
+        // list (current project unless `all`). Reuses the existing on-disk
+        // `meta.json` scan (`list_history_sessions`) — no new store. IM-only:
+        // every web return below happens before this is rendered, so
+        // `parse_sessions_reply` still only ever sees live
+        // `id:project:vendor:role` rows.
+        let history = if is_web {
+            Vec::new()
+        } else {
+            let slugs: Vec<String> = if all {
+                self.projects.keys().cloned().collect()
+            } else {
+                vec![cur.clone()]
+            };
+            self.recent_ended_sessions(chat, &slugs, 5)
+        };
         if visible.is_empty() {
             if is_web {
                 return "no sessions".to_string();
             }
-            if elsewhere > 0 {
-                return format!(
+            let head = if elsewhere > 0 {
+                format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
-                );
-            }
-            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
+                )
+            } else {
+                format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个")
+            };
+            return Self::append_history_section(head, &history);
         }
         let mut rows: Vec<String> = Vec::with_capacity(visible.len());
         for s in visible {
@@ -3436,7 +3478,69 @@ impl Gateway {
                 "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
             ));
         }
-        out
+        Self::append_history_section(out, &history)
+    }
+
+    /// Best-effort `last_active` (RFC3339) for a LIVE session, read from its
+    /// `meta.json`. Empty when the project/meta can't be resolved — sorts as
+    /// "oldest" in [`render_sessions`]'s ordering, never panics/blocks the list.
+    fn session_last_active(&self, s: &GatewaySession) -> String {
+        self.projects
+            .get(&s.project)
+            .and_then(|dir| read_session_meta(dir, &s.id).ok())
+            .map(|m| m.last_active)
+            .unwrap_or_default()
+    }
+
+    /// Up to `limit` most-recently-ended sessions across `slugs` that `chat`
+    /// may see (same rule as the live list: own sessions + the shared `user:`
+    /// pool for the admin/web querier). Draws from on-disk `meta.json` via
+    /// [`Gateway::list_history_sessions`] (already excludes anything still in
+    /// the live map) — no new store, no new persistence.
+    fn recent_ended_sessions(
+        &self,
+        chat: &ChatKey,
+        slugs: &[String],
+        limit: usize,
+    ) -> Vec<SessionMeta> {
+        let mut metas: Vec<SessionMeta> = slugs
+            .iter()
+            .flat_map(|slug| self.list_history_sessions(slug))
+            .filter(|m| Self::owner_identity_visible(chat, &m.owner))
+            .collect();
+        metas.sort_by(|a, b| {
+            b.last_active
+                .cmp(&a.last_active)
+                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
+        });
+        metas.truncate(limit);
+        metas
+    }
+
+    /// Append the "最近结束" section (when non-empty) to an IM `/sessions`
+    /// reply. Each row carries `sid:project:vendor:role`, a relative
+    /// `last_active` time, and a `/use <sid>` resume hint — the cold-resume
+    /// path already exists (see `/use` handling); this just gives it a
+    /// visible entry point.
+    fn append_history_section(head: String, history: &[SessionMeta]) -> String {
+        if history.is_empty() {
+            return head;
+        }
+        let rows: Vec<String> = history
+            .iter()
+            .map(|m| {
+                let role = if m.role.is_empty() { "—" } else { &m.role };
+                format!(
+                    "{}:{}:{:?}:{role} — {} → /use {}",
+                    m.sid,
+                    m.slug,
+                    m.vendor,
+                    relative_time_zh(&m.last_active),
+                    m.sid
+                )
+            })
+            .collect();
+        format!("{head}\n\n📜 最近结束:\n{}", rows.join("\n"))
     }
 
     /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
@@ -3746,10 +3850,14 @@ impl Gateway {
     // =================================================================
 
     /// Snapshot every tracked session as a [`SessionView`] (W5b). Holds the
-    /// gateway only long enough to clone scalar fields — no `.await` runs
-    /// under any lock — so an SSE/list handler can call this cheaply. A
-    /// session is `current` when it is the active session for at least one
-    /// routed chat. Ordered by `s{n}` index for stable rendering.
+    /// gateway only long enough to clone scalar fields plus a best-effort
+    /// `meta.json` read per session (sync fs, no `.await` runs under any
+    /// lock) — so an SSE/list handler can call this cheaply. A session is
+    /// `current` when it is the active session for at least one routed chat.
+    /// v0.8.22 P0-3 — ordered by `last_active` desc (numeric sid desc
+    /// tiebreak for equal/missing `last_active`), replacing the old
+    /// creation-order (`session_index` ascending) sort so the REST session
+    /// list reads recency-first like the IM `/sessions` view.
     pub fn session_views(&self) -> Vec<SessionView> {
         let current: std::collections::HashSet<String> = self
             .current_session
@@ -3761,24 +3869,44 @@ impl Gateway {
         let mut views: Vec<SessionView> = self
             .sessions
             .values()
-            .map(|s| SessionView {
-                sid: s.id.clone(),
-                project: s.project.clone(),
-                role: s.role.clone(),
-                vendor: vendor_str(s.vendor).to_string(),
-                permission_mode: s.permission_mode.as_str().to_string(),
-                protocol: s.protocol.as_str().to_string(),
-                host: if s.host.is_empty() {
-                    "local".to_string()
-                } else {
-                    s.host.clone()
-                },
-                current: current.contains(&s.id),
-                status: "live".to_string(),
-                last_activity_seconds: None,
+            .map(|s| {
+                // Best-effort `meta.json` read for created_at/last_active — a
+                // missing/unreadable meta degrades to empty strings (never
+                // panics, never drops the row).
+                let meta = self
+                    .projects
+                    .get(&s.project)
+                    .and_then(|dir| read_session_meta(dir, &s.id).ok());
+                let created_at = meta
+                    .as_ref()
+                    .map(|m| m.created_at.clone())
+                    .unwrap_or_default();
+                let last_active = meta.map(|m| m.last_active).unwrap_or_default();
+                SessionView {
+                    sid: s.id.clone(),
+                    project: s.project.clone(),
+                    role: s.role.clone(),
+                    vendor: vendor_str(s.vendor).to_string(),
+                    permission_mode: s.permission_mode.as_str().to_string(),
+                    protocol: s.protocol.as_str().to_string(),
+                    host: if s.host.is_empty() {
+                        "local".to_string()
+                    } else {
+                        s.host.clone()
+                    },
+                    current: current.contains(&s.id),
+                    status: "live".to_string(),
+                    last_activity_seconds: None,
+                    created_at,
+                    last_active,
+                }
             })
             .collect();
-        views.sort_by_key(|v| session_index(&v.sid));
+        views.sort_by(|a, b| {
+            b.last_active
+                .cmp(&a.last_active)
+                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
+        });
         views
     }
 
@@ -4406,6 +4534,9 @@ pub struct TrackedSessionRow {
     pub vendor: String,
     /// Permission posture wire string (`"skip"` / `"hitl"`).
     pub permission_mode: String,
+    /// RFC3339 `last_active` from `meta.json` (v0.8.22 P0-3), used to sort
+    /// `ccteam session ls` by recency instead of sid string order.
+    pub last_active: String,
 }
 
 /// Load the gateway's live sessions as flat [`TrackedSessionRow`]s from
@@ -4426,6 +4557,7 @@ pub fn tracked_chat_sessions(ccteam_root: &Path) -> Result<Vec<TrackedSessionRow
             role: m.role,
             vendor: vendor_str(m.vendor).to_string(),
             permission_mode: m.permission_mode.as_str().to_string(),
+            last_active: m.last_active,
         })
         .collect())
 }
@@ -4883,6 +5015,45 @@ fn humanize_dur(d: std::time::Duration) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// v0.8.22 P0-4 — Chinese relative-time phrase for an RFC3339 timestamp,
+/// matching the surrounding hardcoded-Chinese IM copy ("3分钟前"/"昨天"/
+/// "3天前"). Unparseable/empty input renders as `"—"` rather than panicking a
+/// `/sessions` reply (a missing `meta.json` read is already handled upstream
+/// by [`Gateway::session_last_active`] / [`Gateway::recent_ended_sessions`]).
+fn relative_time_zh(rfc3339: &str) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return "—".to_string();
+    };
+    let now = chrono::Utc::now();
+    let secs = now
+        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        return "刚刚".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}分钟前");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}小时前");
+    }
+    let days = hours / 24;
+    if days == 1 {
+        return "昨天".to_string();
+    }
+    if days < 7 {
+        return format!("{days}天前");
+    }
+    let weeks = days / 7;
+    if weeks < 5 {
+        return format!("{weeks}周前");
+    }
+    dt.format("%Y-%m-%d").to_string()
 }
 
 /// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
@@ -7222,7 +7393,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_sessions_shows_model_and_context() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // v0.8.22 P0-3/P0-4 — an isolated tempdir, not the shared literal
+        // "/tmp/alpha": `render_sessions` now also scans on-disk `meta.json`
+        // history for its "最近结束" section, so a fixed path shared with other
+        // tests would leak cross-test session residue into this assertion.
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -7534,6 +7710,30 @@ mod tests {
         assert_eq!(humanize_dur(Duration::from_millis(400)), "0s");
     }
 
+    /// v0.8.22 P0-4 — `relative_time_zh` phrase boundaries: seconds → 刚刚,
+    /// minutes/hours/days-per-unit thresholds, the "yesterday" special case,
+    /// the ≥5-week fallback to an absolute date, and the unparsable/empty
+    /// input fallback (never panics a `/sessions` reply).
+    #[test]
+    fn relative_time_zh_covers_all_bands() {
+        let ts =
+            |secs_ago: i64| (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+        assert_eq!(relative_time_zh(""), "—");
+        assert_eq!(relative_time_zh("not-a-timestamp"), "—");
+        assert_eq!(relative_time_zh(&ts(10)), "刚刚");
+        assert_eq!(relative_time_zh(&ts(5 * 60)), "5分钟前");
+        assert_eq!(relative_time_zh(&ts(3 * 3600)), "3小时前");
+        assert_eq!(relative_time_zh(&ts(24 * 3600)), "昨天");
+        assert_eq!(relative_time_zh(&ts(3 * 24 * 3600)), "3天前");
+        assert_eq!(relative_time_zh(&ts(14 * 24 * 3600)), "2周前");
+        // ≥5 weeks falls back to an absolute `YYYY-MM-DD` date.
+        let old = chrono::Utc::now() - chrono::Duration::days(40);
+        assert_eq!(
+            relative_time_zh(&old.to_rfc3339()),
+            old.format("%Y-%m-%d").to_string()
+        );
+    }
+
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — own-only isolation: a
     /// session created by one chat is NOT visible OR addressable from a
     /// DIFFERENT chat, even in the same project. This REVERSES the v0.8.13
@@ -7769,10 +7969,70 @@ mod tests {
         );
     }
 
+    /// v0.8.22 P0-4 — `/sessions` grows a "📜 最近结束" section listing
+    /// recently-ended sessions with a `/use <sid>` resume hint, giving the
+    /// existing cold-resume path (exercised above) a visible entry point.
+    /// Own-only ACL applies to the history section too: a chat that doesn't
+    /// own the stopped session must not see it listed as "最近结束".
+    #[tokio::test]
+    async fn im_sessions_lists_recently_ended_with_use_hint_own_only() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let agents = proj.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\n---\nbody\n",
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/stop s1")
+            .await
+            .unwrap();
+
+        // The owner sees s1 under "最近结束" with a `/use s1` resume hint.
+        let owner_view = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(owner_view.len(), 1);
+        assert!(
+            owner_view[0].contains("📜 最近结束:"),
+            "history section present: {owner_view:?}"
+        );
+        assert!(
+            owner_view[0].contains("s1:alpha:Claude:reviewer") && owner_view[0].contains("/use s1"),
+            "s1 row carries a /use resume hint: {owner_view:?}"
+        );
+
+        // A different chat's `/sessions` must NOT list it — own-only ACL
+        // covers the history section exactly like the live list.
+        let other_view = gateway
+            .handle_text("mock", "chat-2", "bob", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            !other_view[0].contains("最近结束") && !other_view[0].contains("s1"),
+            "a non-owner must not see the ended s1 in history: {other_view:?}"
+        );
+    }
+
     #[tokio::test]
     async fn gateway_sessions_are_own_only_across_chats() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // v0.8.22 P0-3/P0-4 — isolated tempdir (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha" literal is unsafe now that `/sessions` also reads
+        // on-disk history).
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // chat-1 creates a session in the default project "alpha".
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -7821,7 +8081,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_web_owned_session_visible_from_im() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // v0.8.22 P0-3/P0-4 — isolated tempdir (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha" literal is unsafe now that `/sessions` also reads
+        // on-disk history).
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // A session created from the web console (channel "web").
         gateway
             .handle_text("web", "web-api", "web-api", "/new claude reviewer")
@@ -7951,8 +8216,14 @@ mod tests {
     #[tokio::test]
     async fn gateway_commands_switch_project_and_session() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-        gateway.register_project("beta", "/tmp/beta");
+        // v0.8.22 P0-3/P0-4 — isolated tempdirs (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha"/"/tmp/beta" literals are unsafe now that `/sessions`
+        // also reads on-disk history).
+        let tmp_alpha = tempfile::TempDir::new().unwrap();
+        let tmp_beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp_alpha.path());
+        gateway.register_project("beta", tmp_beta.path());
 
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
@@ -7977,13 +8248,15 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
+        // v0.8.22 P0-3 — ordered by last_active desc: s2 (spawned after s1)
+        // sorts first.
         let sessions = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns1:beta:Codex:api\ns2:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Codex:api"]
         );
 
         let use_first = gateway
@@ -8014,8 +8287,14 @@ mod tests {
                 },
             )
         };
-        let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
-        gateway.register_project("beta", "/tmp/beta");
+        // v0.8.22 P0-3/P0-4 — isolated tempdirs (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha"/"/tmp/beta" literals are unsafe now that `/sessions`
+        // also reads on-disk history).
+        let tmp_alpha = tempfile::TempDir::new().unwrap();
+        let tmp_beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp_alpha.path());
+        gateway.register_project("beta", tmp_beta.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -8039,7 +8318,8 @@ mod tests {
             .unwrap();
 
         // `all` lists the full cross-project fleet (default `/sessions` would now
-        // scope to the current project, `beta`).
+        // scope to the current project, `beta`). v0.8.22 P0-3 — ordered by
+        // last_active desc: s4 (most recently spawned) first, s1 last.
         let sessions = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
@@ -8047,7 +8327,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\ns1:alpha:Claude:reviewer\ns2:alpha:Codex:docs\ns3:beta:Codex:api\ns4:beta:Claude:qa"
+                "📁 当前项目: beta\ns4:beta:Claude:qa\ns3:beta:Codex:api\ns2:alpha:Codex:docs\ns1:alpha:Claude:reviewer"
             ]
         );
         let projects = gateway
@@ -8431,13 +8711,15 @@ mod tests {
             "secret is re-minted on cold-start rebuild, not persisted"
         );
 
+        // v0.8.22 P0-3 — ordered by last_active desc: s2 (spawned after s1,
+        // pre-restart) sorts first.
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns1:beta:Claude:reviewer\ns2:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -8942,8 +9224,14 @@ mod tests {
     #[tokio::test]
     async fn gateway_cd_switches_active_session_to_target_project() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
-        gateway.register_project("beta", "/tmp/beta");
+        // v0.8.22 P0-3/P0-4 — isolated tempdirs (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha"/"/tmp/beta" literals are unsafe now that `/sessions`
+        // also reads on-disk history).
+        let tmp_alpha = tempfile::TempDir::new().unwrap();
+        let tmp_beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp_alpha.path());
+        gateway.register_project("beta", tmp_beta.path());
 
         // Active session s1 lives in project alpha.
         gateway
@@ -8974,13 +9262,15 @@ mod tests {
         assert_eq!(reply, vec!["beta-cto-s2 echo: where am i"]);
 
         // `all` shows both projects (default `/sessions` now scopes to `beta`).
+        // v0.8.22 P0-3 — ordered by last_active desc: s2 (just spawned) sorts
+        // before s1.
         let after = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns1:alpha:Claude:reviewer\ns2:beta:Claude:cto"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:cto\ns1:alpha:Claude:reviewer"]
         );
     }
 
@@ -9147,7 +9437,12 @@ mod tests {
         // project sharing are gone; both return for ONE user via 档1 (a shared
         // identity linking the web token to the chat_id).
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        // v0.8.22 P0-3/P0-4 — isolated tempdir (see
+        // `gateway_sessions_shows_model_and_context` for why the shared
+        // "/tmp/alpha" literal is unsafe now that `/sessions` also reads
+        // on-disk history).
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
 
         // A Telegram chat creates a session.
         gateway
@@ -9210,7 +9505,11 @@ mod tests {
         // contains_key early-return for PLAIN messages, not this dedup — see
         // plain_messages_reuse_current_session_no_storm.)
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        // v0.8.22 P0-3/P0-4 — isolated tempdir: the count-based assertion
+        // below (`starts_with('s')`) would over-count if a "最近结束" history
+        // row leaked in from another test sharing the literal "/tmp/alpha".
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
 
         let first = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")

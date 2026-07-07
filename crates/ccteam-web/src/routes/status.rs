@@ -336,6 +336,8 @@ mod tests {
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
+            created_at: String::new(),
+            last_active: String::new(),
         }
     }
 

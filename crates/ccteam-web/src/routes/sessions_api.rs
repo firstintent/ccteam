@@ -1494,6 +1494,8 @@ mod tests {
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
+            created_at: String::new(),
+            last_active: String::new(),
         }];
 
         let stale_completed = serde_json::json!({
@@ -1533,6 +1535,8 @@ mod tests {
                 current: true,
                 status: "live".into(),
                 last_activity_seconds: None,
+                created_at: String::new(),
+                last_active: String::new(),
             },
             SessionView {
                 sid: "s2".into(),
@@ -1545,6 +1549,8 @@ mod tests {
                 current: false,
                 status: "live".into(),
                 last_activity_seconds: None,
+                created_at: String::new(),
+                last_active: String::new(),
             },
         ];
 
@@ -1591,6 +1597,8 @@ mod tests {
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
+            created_at: String::new(),
+            last_active: String::new(),
         }];
 
         ccteam_core::progress::append_event(
@@ -1624,6 +1632,8 @@ mod tests {
             current: true,
             status: "live".into(),
             last_activity_seconds: None,
+            created_at: String::new(),
+            last_active: String::new(),
         }];
 
         ccteam_core::progress::append_event(

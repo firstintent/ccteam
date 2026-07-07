@@ -35,6 +35,13 @@ export interface SessionView {
   protocol?: string;
   /** Where the session runs: `"local"` (reserved; ignored in the UI). */
   host?: string;
+  /** v0.8.22 P0-3 — RFC3339 spawn time, read from `meta.json`. Optional for
+   *  backward-compat / a session whose meta couldn't be resolved. */
+  created_at?: string;
+  /** v0.8.22 P0-3 — RFC3339 last-turn-completion time, read from
+   *  `meta.json`. Drives recency sort/relative-time display server-side; the
+   *  live rail list already arrives sorted `last_active` desc. */
+  last_active?: string;
 }
 
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn

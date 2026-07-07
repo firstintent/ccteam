@@ -1207,13 +1207,38 @@ pub fn run_sessions() -> Result<()> {
     Ok(())
 }
 
+/// `s<N>` → `N` for a recency-tiebreak sort; a malformed/orphan sid (no
+/// number, e.g. one the process backend can't parse) sorts last (`u64::MAX`).
+/// Mirrors `ccteam-im`'s private `gateway::session_index` (not exported —
+/// this CLI-side copy is tiny and each call site is deterministic).
+fn numeric_sid(sid: &str) -> u64 {
+    sid.strip_prefix('s')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// `Some(rfc3339)` → `"<age> ago"`; `None`/unparseable → `"-"` (never
+/// fabricates an age for a row with no `meta.json` backing, e.g. an orphan).
+fn format_last_active(raw: &str) -> String {
+    match parse_rfc3339_age_secs(raw) {
+        Some(secs) => format!("{} ago", humanize_secs_local(secs)),
+        None => "-".to_string(),
+    }
+}
+
 /// Pure renderer for `ccteam session ls` (testable without a daemon / terminal).
 ///
 /// `tracked` = persisted gateway session records (each shows **live** when the
 /// daemon is up, else `registered (daemon down)`); `live_panes` = live
 /// `ccteam-chat-*` OS pane names used only to flag **orphans** (live pane ∧ not
-/// tracked). Columns: SLUG · SID · ROLE · VENDOR · STATUS. An orphan has no
-/// role/vendor (the pane name only carries slug+sid post-F1) → `-`.
+/// tracked). Columns: SLUG · SID · ROLE · VENDOR · LAST ACTIVE · STATUS. An
+/// orphan has no role/vendor (the pane name only carries slug+sid post-F1) →
+/// `-`, and no `meta.json` to read a last-active time from → `-`.
+///
+/// v0.8.22 P0-3 — rows sort by `last_active` desc (numeric sid desc tiebreak
+/// for equal/missing `last_active`, e.g. every orphan), replacing the old
+/// slug-then-sid order so the CLI view reads recency-first like the IM
+/// `/sessions` and REST session list.
 fn render_sessions_table(
     tracked: &[ccteam_im::gateway::TrackedSessionRow],
     live_panes: &[String],
@@ -1231,6 +1256,7 @@ fn render_sessions_table(
         role: String,
         vendor: String,
         status: String,
+        last_active: String,
     }
 
     let tracked_status = if daemon_up {
@@ -1247,6 +1273,7 @@ fn render_sessions_table(
             role: r.role.clone(),
             vendor: r.vendor.clone(),
             status: tracked_status.to_string(),
+            last_active: r.last_active.clone(),
         })
         .collect();
 
@@ -1262,12 +1289,16 @@ fn render_sessions_table(
                 role: "-".to_string(),
                 vendor: "-".to_string(),
                 status: "orphan (untracked live pane)".to_string(),
+                last_active: String::new(),
             });
         }
     }
 
-    // Deterministic order: slug, then sid.
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug).then(a.sid.cmp(&b.sid)));
+    rows.sort_by(|a, b| {
+        b.last_active
+            .cmp(&a.last_active)
+            .then_with(|| numeric_sid(&b.sid).cmp(&numeric_sid(&a.sid)))
+    });
 
     if rows.is_empty() {
         let mut out = String::new();
@@ -1289,18 +1320,28 @@ fn render_sessions_table(
         .max()
         .unwrap_or(0)
         .max(6);
+    let last_active_display: Vec<String> = rows
+        .iter()
+        .map(|r| format_last_active(&r.last_active))
+        .collect();
+    let w_last_active = last_active_display
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max(11); // "LAST ACTIVE".len()
 
     let mut out = String::new();
     let header = format!(
-        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  STATUS",
-        "SLUG", "SID", "ROLE", "VENDOR"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {:<w_last_active$}  STATUS",
+        "SLUG", "SID", "ROLE", "VENDOR", "LAST ACTIVE"
     );
     out.push_str(header.trim_end());
     out.push('\n');
-    for r in &rows {
+    for (r, last_active) in rows.iter().zip(last_active_display.iter()) {
         let line = format!(
-            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {}",
-            r.slug, r.sid, r.role, r.vendor, r.status,
+            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {:<w_last_active$}  {}",
+            r.slug, r.sid, r.role, r.vendor, last_active, r.status,
         );
         out.push_str(line.trim_end());
         out.push('\n');
@@ -5413,6 +5454,7 @@ mod tests {
                 role: "reviewer".into(),
                 vendor: "claude".into(),
                 permission_mode: "skip".into(),
+                last_active: "2024-01-01T00:00:00Z".into(),
             },
             ccteam_im::gateway::TrackedSessionRow {
                 sid: "s2".into(),
@@ -5420,15 +5462,18 @@ mod tests {
                 role: "builder".into(),
                 vendor: "codex".into(),
                 permission_mode: "hitl".into(),
+                last_active: "2024-01-02T00:00:00Z".into(),
             },
         ];
         let out = render_sessions_table(&tracked, &[], true);
 
-        // Header carries the new VENDOR column alongside SLUG/SID/ROLE.
+        // Header carries the new VENDOR + LAST ACTIVE columns alongside
+        // SLUG/SID/ROLE.
         assert!(out.contains("SLUG"));
         assert!(out.contains("SID"));
         assert!(out.contains("ROLE"));
         assert!(out.contains("VENDOR"));
+        assert!(out.contains("LAST ACTIVE"));
 
         // Both rows present with their sid + vendor.
         let claude_line = out.lines().find(|l| l.contains("s1")).expect("claude row");
@@ -5445,6 +5490,15 @@ mod tests {
             !out.contains("registered, not running"),
             "BUG-5 regression: false not-running note returned: {out}"
         );
+
+        // v0.8.22 P0-3 — rows order by last_active desc: s2 (2024-01-02) is
+        // more recent than s1 (2024-01-01), so it must render first.
+        let s1_pos = out.find("s1").expect("s1 present");
+        let s2_pos = out.find("s2").expect("s2 present");
+        assert!(
+            s2_pos < s1_pos,
+            "more recently active s2 must sort before s1: {out}"
+        );
     }
 
     /// v0.8.8 B4 — a live `ccteam-chat-*` pane the daemon does not track is an
@@ -5458,6 +5512,7 @@ mod tests {
             role: "cto".into(),
             vendor: "claude".into(),
             permission_mode: "skip".into(),
+            last_active: "2024-01-01T00:00:00Z".into(),
         }];
         // One untracked live pane → orphan; the tracked s1's own pane is NOT
         // listed, so it must not double as an orphan.
@@ -5488,6 +5543,7 @@ mod tests {
             role: "cto".into(),
             vendor: "claude".into(),
             permission_mode: "skip".into(),
+            last_active: "2024-01-01T00:00:00Z".into(),
         }];
         // The live pane name matches the canonical name of the tracked s1.
         let live = vec!["ccteam-chat-alpha-s1".to_string()];

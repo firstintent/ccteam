@@ -573,64 +573,69 @@ export default function ChatConsole() {
                         <Plus className="h-3 w-3" /> 还没有 session — 新建
                       </button>
                     ) : null}
-                    {/* v0.8.21 — history expand/collapse (admin-only beta-gate) */}
-                    {isAdmin ? (
-                      <HistorySection
-                        project={project}
-                        expanded={expandedHistory.has(project)}
-                        loading={historyLoading.has(project)}
-                        history={historyByProject[project] ?? []}
-                        activeSid={sid}
-                        onToggle={() => {
-                          const next = new Set(expandedHistory);
-                          if (next.has(project)) {
-                            next.delete(project);
-                            setExpandedHistory(next);
-                          } else {
-                            next.add(project);
-                            setExpandedHistory(next);
-                            if (!historyByProject[project]) {
-                              setHistoryLoading((s) => new Set(s).add(project));
-                              listHistorySessions(project)
-                                .then((rows) => {
-                                  setHistoryByProject((prev) => ({
-                                    ...prev,
-                                    [project]: rows,
-                                  }));
-                                })
-                                .catch(() => {})
-                                .finally(() => {
-                                  setHistoryLoading((s) => {
-                                    const next2 = new Set(s);
-                                    next2.delete(project);
-                                    return next2;
-                                  });
+                    {/* v0.8.22 P0-3/P0-4 review — history expand/collapse is a
+                        tenant-visible feature (a stopped session's owner can
+                        see + resume it), NOT an admin-only beta surface: the
+                        backend already scopes `.../sessions/history` and
+                        `.../resume` by project ownership (`can_see_project`
+                        via the shared `project_acl_layer`/`gate_sid` chokepoint
+                        — see `sessions_api.rs`), so dropping the UI gate here
+                        exposes nothing a tenant couldn't already reach. */}
+                    <HistorySection
+                      project={project}
+                      expanded={expandedHistory.has(project)}
+                      loading={historyLoading.has(project)}
+                      history={historyByProject[project] ?? []}
+                      activeSid={sid}
+                      onToggle={() => {
+                        const next = new Set(expandedHistory);
+                        if (next.has(project)) {
+                          next.delete(project);
+                          setExpandedHistory(next);
+                        } else {
+                          next.add(project);
+                          setExpandedHistory(next);
+                          if (!historyByProject[project]) {
+                            setHistoryLoading((s) => new Set(s).add(project));
+                            listHistorySessions(project)
+                              .then((rows) => {
+                                setHistoryByProject((prev) => ({
+                                  ...prev,
+                                  [project]: rows,
+                                }));
+                              })
+                              .catch(() => {})
+                              .finally(() => {
+                                setHistoryLoading((s) => {
+                                  const next2 = new Set(s);
+                                  next2.delete(project);
+                                  return next2;
                                 });
-                            }
+                              });
                           }
-                        }}
-                        onResume={(hsid) => {
-                          resumeSession(project, hsid)
-                            .then(({ sid: newSid }) => {
-                              void refreshSessions();
-                              navigate(`/chat/s/${encodeURIComponent(newSid)}`);
-                              setSidebarOpen(false);
-                            })
-                            .catch((e) =>
-                              toastBus.handler?.error(`Resume failed: ${String(e)}`),
-                            );
-                        }}
-                        onOpenImport={() => {
-                          setImportSlug(project);
-                          setExternalSessions([]);
-                          setExternalLoading(true);
-                          listExternalSessions(project)
-                            .then(setExternalSessions)
-                            .catch(() => {})
-                            .finally(() => setExternalLoading(false));
-                        }}
-                      />
-                    ) : null}
+                        }
+                      }}
+                      onResume={(hsid) => {
+                        resumeSession(project, hsid)
+                          .then(({ sid: newSid }) => {
+                            void refreshSessions();
+                            navigate(`/chat/s/${encodeURIComponent(newSid)}`);
+                            setSidebarOpen(false);
+                          })
+                          .catch((e) =>
+                            toastBus.handler?.error(`Resume failed: ${String(e)}`),
+                          );
+                      }}
+                      onOpenImport={() => {
+                        setImportSlug(project);
+                        setExternalSessions([]);
+                        setExternalLoading(true);
+                        listExternalSessions(project)
+                          .then(setExternalSessions)
+                          .catch(() => {})
+                          .finally(() => setExternalLoading(false));
+                      }}
+                    />
                   </div>
                 </div>
               );
@@ -1339,6 +1344,29 @@ export function NewSessionModal({
 
 // ── v0.8.21 HistorySection ────────────────────────────────────────────────────
 
+/** v0.8.22 P0-3 review — Chinese relative-time phrase for an RFC3339
+ *  timestamp, matching the surrounding hardcoded-Chinese copy ("3分钟前"/
+ *  "昨天"/"3天前"). Mirrors `ccteam-im::gateway::relative_time_zh` so the IM
+ *  `/sessions` history section and the SPA history rail read the same way.
+ *  Unparseable/empty input renders as `"—"`. Exported for a small unit test. */
+export function relativeTimeZh(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "—";
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (secs < 60) return "刚刚";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}小时前`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "昨天";
+  if (days < 7) return `${days}天前`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 5) return `${weeks}周前`;
+  return new Date(then).toISOString().slice(0, 10);
+}
+
 interface HistorySectionProps {
   project: string;
   expanded: boolean;
@@ -1414,6 +1442,12 @@ function HistorySection({
                   {h.vendor}
                 </span>
                 <span className="truncate flex-1">{h.role || "(无 role)"}</span>
+                <span
+                  className="text-[9px] text-text-muted shrink-0"
+                  title={h.last_active || h.created_at}
+                >
+                  {relativeTimeZh(h.last_active || h.created_at)}
+                </span>
                 {h.transcript_present ? (
                   <span className="text-[9px] text-brand-400/80 font-mono shrink-0">精确</span>
                 ) : (

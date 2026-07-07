@@ -28,9 +28,39 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import { NewSessionModal } from "./ChatConsole";
+import { NewSessionModal, relativeTimeZh } from "./ChatConsole";
 import { mergeProjectSlugs } from "./projectList";
 import type { SessionView } from "../lib/sessionsApi";
+
+// ---- relativeTimeZh (v0.8.22 P0-3/P0-4 — history rail + IM `/sessions`
+// share this phrasing; mirrors `ccteam-im::gateway::relative_time_zh`) ------
+describe("relativeTimeZh", () => {
+  it("renders an em-dash for missing/unparseable input", () => {
+    expect(relativeTimeZh(undefined)).toBe("—");
+    expect(relativeTimeZh(null)).toBe("—");
+    expect(relativeTimeZh("")).toBe("—");
+    expect(relativeTimeZh("not-a-timestamp")).toBe("—");
+  });
+
+  it("buckets recent timestamps into 刚刚 / N分钟前 / N小时前", () => {
+    const secondsAgo = (s: number) => new Date(Date.now() - s * 1000).toISOString();
+    expect(relativeTimeZh(secondsAgo(10))).toBe("刚刚");
+    expect(relativeTimeZh(secondsAgo(5 * 60))).toBe("5分钟前");
+    expect(relativeTimeZh(secondsAgo(3 * 3600))).toBe("3小时前");
+  });
+
+  it("special-cases yesterday and buckets multi-day/week spans", () => {
+    const secondsAgo = (s: number) => new Date(Date.now() - s * 1000).toISOString();
+    expect(relativeTimeZh(secondsAgo(24 * 3600))).toBe("昨天");
+    expect(relativeTimeZh(secondsAgo(3 * 24 * 3600))).toBe("3天前");
+    expect(relativeTimeZh(secondsAgo(14 * 24 * 3600))).toBe("2周前");
+  });
+
+  it("falls back to an absolute date at >= 5 weeks", () => {
+    const old = new Date(Date.now() - 40 * 24 * 3600 * 1000);
+    expect(relativeTimeZh(old.toISOString())).toBe(old.toISOString().slice(0, 10));
+  });
+});
 
 // ---- mergeProjectSlugs (the union that fixes the chicken-and-egg bug) ------
 describe("mergeProjectSlugs", () => {
