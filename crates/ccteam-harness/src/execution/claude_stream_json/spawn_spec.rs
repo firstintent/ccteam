@@ -15,7 +15,16 @@
 
 use std::path::Path;
 
+use crate::execution::claude_common;
 use crate::PermissionMode;
+
+// Binary resolution is shared with the tmux path (`claude_common`); re-exported
+// here so existing `spawn_spec::claude_bin` callers keep resolving.
+pub use claude_common::claude_bin;
+// `strip_context_tag` moved to `claude_common` (used via `push_model_arg`); the
+// re-export exists only so the module's own strip test keeps resolving it.
+#[cfg(test)]
+pub(crate) use claude_common::strip_context_tag;
 
 /// Inputs to [`build_argv`] — everything that varies per spawn. Borrowed
 /// so the builder stays allocation-light and the caller owns the strings.
@@ -93,38 +102,25 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         "--setting-sources=user,project,local".into(),
     ];
 
-    // Role persona — vendor-native self-read, never injected. Empty =
-    // roleless (omit `--agent`).
-    if !input.role.is_empty() {
-        argv.push("--agent".into());
-        argv.push(input.role.to_string());
-    }
+    // Role persona (`--agent <role>`, omitted when roleless) + `--model`.
+    // Shared with the tmux path via `claude_common`. `strip_1m = true`: the
+    // `[1m]` suffix is ccteam's 1M-context DISPLAY tag, not part of any claude
+    // model id — `--model …[1m]` is rejected and claude silently defaults to
+    // sonnet (the model-loss-on-restart bug), so the base id goes here and the
+    // 1M window is re-requested post-init via `set_model`.
+    claude_common::push_agent_arg(&mut argv, input.role);
+    claude_common::push_model_arg(&mut argv, input.model_id, true);
 
-    if let Some(model) = input.model_id.map(str::trim).filter(|m| !m.is_empty()) {
-        argv.push("--model".into());
-        // The `[1m]` suffix is ccteam's 1M-context DISPLAY tag, not part of any
-        // claude model id. `--model claude-…[1m]` is rejected and claude falls
-        // back to its DEFAULT model (sonnet) — the model-loss-on-restart bug.
-        // Strip it so resume gets a valid base id (claude `--model` accepts both
-        // short aliases and full ids); the 1M window is re-requested post-init
-        // via `set_model` (the live `/model` path that DOES accept `[1m]`).
-        argv.push(strip_context_tag(model).to_string());
+    // Permission posture. The Skip flag / `--permission-mode default` core is
+    // shared (`claude_common::permission_args`). Stream-json ADDITIONALLY routes
+    // every non-allowlist tool through the `can_use_tool` reverse RPC
+    // (`--permission-prompt-tool stdio`) for Hitl — a transport-specific extra
+    // the tmux path has no equivalent to (it uses the `PermissionRequest` hook).
+    if input.permission_mode.is_hitl() {
+        argv.push("--permission-prompt-tool".into());
+        argv.push("stdio".into());
     }
-
-    // Permission posture. Skip = no prompts (today's default); Hitl =
-    // route every non-allowlist tool through the `can_use_tool` reverse
-    // RPC to the IM user (`--permission-prompt-tool stdio`). The native
-    // ask-path needs `--permission-mode default` alongside it so a
-    // user-global auto mode can't mask prompts.
-    match input.permission_mode {
-        PermissionMode::Skip => argv.push("--dangerously-skip-permissions".into()),
-        PermissionMode::Hitl => {
-            argv.push("--permission-prompt-tool".into());
-            argv.push("stdio".into());
-            argv.push("--permission-mode".into());
-            argv.push("default".into());
-        }
-    }
+    argv.extend(claude_common::permission_args(input.permission_mode));
 
     // Identity — mutually exclusive with the prior arg.
     if input.resume {
@@ -135,19 +131,6 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     argv.push(input.session_uuid.to_string());
 
     argv
-}
-
-/// Strip a trailing `[1m]` (case-insensitive) — ccteam's 1M-context display
-/// tag — from a model id. claude's `--model` rejects the tagged form (`…[1m]`)
-/// and silently defaults to sonnet; the bare base id (short alias or full id)
-/// is accepted. The 1M window is re-requested separately via `set_model`.
-pub(crate) fn strip_context_tag(model: &str) -> &str {
-    let m = model.trim();
-    if m.len() >= 4 && m[m.len() - 4..].eq_ignore_ascii_case("[1m]") {
-        m[..m.len() - 4].trim_end()
-    } else {
-        m
-    }
 }
 
 /// Env pairs forwarded into the stream-json child. Mirrors the tmux
@@ -161,23 +144,18 @@ pub(crate) fn strip_context_tag(model: &str) -> &str {
 /// `CCTEAM_CHAT_ROLE` / `CCTEAM_CHAT_SLUG` are forwarded only for the MCP
 /// forwarder's benefit, not for any hook subprocess.
 pub fn build_env(role: &str, slug: &str, secret: &str, sid: &str) -> Vec<(String, String)> {
-    let mut env = vec![
-        ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
-        ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
-        // This protocol is hookless: events come from the child's stdout, not
-        // the hook chain. We DO include `local` in `--setting-sources` (so a
-        // marketplace-enabled plugin in settings.local.json loads), but that
-        // also pulls in ccteam's tmux-path hooks — so mark the child hookless
-        // and `hook.sh` / `internal hook` no-op for it (no SessionStart-POST
-        // init deadlock, no double-emit). See spawn argv `--setting-sources`.
-        ("CCTEAM_HOOKLESS".to_string(), "1".to_string()),
-    ];
-    if !secret.is_empty() {
-        env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
-    }
-    if !sid.is_empty() {
-        env.push(("CCTEAM_CHAT_SID".to_string(), sid.to_string()));
-    }
+    // ROLE + SLUG base and the optional SECRET / SID are shared with the tmux
+    // path (`claude_common`). The `CCTEAM_HOOKLESS` marker is stream-json-only
+    // and sits BETWEEN the base and the secret/sid to preserve the exact env
+    // ordering this path historically emitted: this protocol is hookless
+    // (events come from the child's stdout), yet it includes `local` in
+    // `--setting-sources` (so a marketplace-enabled plugin loads) which also
+    // pulls in ccteam's tmux-path hooks — so mark the child hookless and
+    // `hook.sh` / `internal hook` no-op for it (no SessionStart-POST init
+    // deadlock, no double-emit). See spawn argv `--setting-sources`.
+    let mut env = claude_common::chat_env_role_slug(role, slug);
+    env.push(("CCTEAM_HOOKLESS".to_string(), "1".to_string()));
+    claude_common::push_secret_sid(&mut env, secret, sid);
     env
 }
 
@@ -255,13 +233,6 @@ fn fnv1a64(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// Resolve the `claude` binary, honoring `CCTEAM_CLAUDE_BIN` (tests point
-/// it at a fake NDJSON-emitting script). Free fn so [`build_argv`] callers
-/// and the transport agree on the program path.
-pub fn claude_bin() -> String {
-    std::env::var(crate::CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
 }
 
 /// True only for a well-formed lowercase RFC-4122 v4 UUID string — used to

@@ -1,6 +1,7 @@
 //! Execution support modules shared by concrete harness adapters.
 //!
 pub mod claude_bg;
+pub mod claude_common;
 pub mod claude_stream_json;
 pub mod claude_tui;
 pub mod codex_app_server;

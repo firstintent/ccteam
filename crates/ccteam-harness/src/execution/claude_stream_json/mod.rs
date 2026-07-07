@@ -44,6 +44,7 @@ use futures::stream::BoxStream;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
@@ -534,12 +535,8 @@ fn claude_model_options(models: &[ClaudeModelOption]) -> Vec<ChoiceOption> {
 /// name-based token would collide when two sessions raise the same picker at
 /// once. Mirrors `claude_tui::claude_popup_prompt`'s `cj{hex}` scheme.
 fn claude_choice_prompt(title: &str, options: Vec<ChoiceOption>) -> ChoicePrompt {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     ChoicePrompt {
-        token: format!("cm{:x}", (nanos as u64) & 0xff_ffff_ffff),
+        token: claude_common::unique_prompt_token("cm"),
         title: title.to_string(),
         options,
         multi: false,

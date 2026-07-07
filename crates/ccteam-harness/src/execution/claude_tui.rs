@@ -45,6 +45,9 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::execution::claude_common::{
+    self, claude_bin, permission_args, push_agent_arg, push_model_arg, unique_prompt_token,
+};
 use crate::execution::process_inspect::pane_runs_process;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, hooks_script_from_env,
@@ -58,7 +61,7 @@ use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput, CLAUDE_BIN_ENV,
+    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -325,10 +328,6 @@ pub fn ensure_telegram_plugin_disabled(project_dir: &Path) -> Result<(), Harness
     Ok(())
 }
 
-fn claude_bin() -> String {
-    std::env::var(CLAUDE_BIN_ENV).unwrap_or_else(|_| "claude".to_string())
-}
-
 /// Build the env var pairs forwarded into the mux session at spawn so
 /// the Claude Code hook subprocess can derive role/slug. The hook reads
 /// `CCTEAM_CHAT_ROLE` via `std::env::var`; without these the hook's
@@ -351,16 +350,11 @@ fn claude_bin() -> String {
 /// 旧路径)整个略过该 var,逐字保持原 spawn env。**注意**:这是 ccteam
 /// 的 `s<N>` sid,绝非 Anthropic 的原生 session UUID(红线:二者不可混淆)。
 fn chat_spawn_env_owned(role: &str, slug: &str, secret: &str, sid: &str) -> Vec<(String, String)> {
-    let mut env = vec![
-        ("CCTEAM_CHAT_ROLE".to_string(), role.to_string()),
-        ("CCTEAM_CHAT_SLUG".to_string(), slug.to_string()),
-    ];
-    if !secret.is_empty() {
-        env.push(("CCTEAM_CHAT_SECRET".to_string(), secret.to_string()));
-    }
-    if !sid.is_empty() {
-        env.push(("CCTEAM_CHAT_SID".to_string(), sid.to_string()));
-    }
+    // Shared with the stream-json path via `claude_common`: ROLE + SLUG always,
+    // SECRET / SID only when non-empty. The tmux path has no `CCTEAM_HOOKLESS`
+    // marker (its hook chain IS the event surface — only stream-json is hookless).
+    let mut env = claude_common::chat_env_role_slug(role, slug);
+    claude_common::push_secret_sid(&mut env, secret, sid);
     env
 }
 
@@ -378,31 +372,6 @@ async fn pane_runs_claude(backend: &dyn crate::PaneBackend, id: &MuxSessionId) -
     pane_runs_process(backend, id, "claude")
         .await
         .unwrap_or(false)
-}
-
-/// V0.8 W2c — `MuxSessionSpec` for the dead-pane recreate path: relaunch
-/// `claude --agent <role> --resume <session_id_name>` so Claude reloads the
-/// prior session jsonl (lossless context restore via Anthropic's own CLI)
-/// AND re-binds the role persona from `.claude/agents/<role>.md` — the
-/// session-is-the-role keystone (v0.8.6 W1; resume must carry `--agent`
-/// because Anthropic does not persist the agent binding into the jsonl).
-/// v0.8.7 W2 (DB.2) — the permission-posture argv segment for a chat spawn.
-///
-/// - `Skip` (default) → `["--dangerously-skip-permissions"]`: today's
-///   behavior, every tool runs without prompting.
-/// - `Hitl` → `["--permission-mode", "default"]` and DROP the skip flag, so
-///   Claude's native permission ask-path stays alive. SMOKE-GATE GROUND
-///   TRUTH: passing `--permission-mode default` is MANDATORY because a
-///   user-global `defaultMode: "auto"` would otherwise mask prompts and the
-///   `PermissionRequest` hook would never fire.
-///
-/// Sits between the `--agent <role>` pair and the `--name`/`--resume` pair
-/// in the argv. Returned as a `Vec` so it can be one or two elements.
-fn permission_args(mode: PermissionMode) -> Vec<String> {
-    match mode {
-        PermissionMode::Skip => vec!["--dangerously-skip-permissions".to_string()],
-        PermissionMode::Hitl => vec!["--permission-mode".to_string(), "default".to_string()],
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -454,17 +423,15 @@ impl<'a> ClaudeTuiSpecInput<'a> {
 }
 
 fn claude_spawn_argv_base(input: ClaudeTuiSpecInput<'_>) -> Vec<String> {
-    // v0.8.8 F2 — 空 role = roleless,不加 `--agent`(裸 claude 自读项目
-    // CLAUDE.md);非空 role 仍绑 `.claude/agents/<role>.md` persona。
+    // Shared with the stream-json path via `claude_common`: bin resolution,
+    // `--agent <role>` (omitted when roleless — v0.8.8 F2), `--model`, and the
+    // permission core. The tmux path forwards the model id VERBATIM
+    // (`strip_1m = false`) — see `push_model_arg`'s divergence note; and it needs
+    // no `--permission-prompt-tool` (HITL rides the `PermissionRequest` hook,
+    // not the stdio reverse-RPC), so `permission_args` is used as-is.
     let mut argv = vec![claude_bin()];
-    if !input.role.is_empty() {
-        argv.push("--agent".to_string());
-        argv.push(input.role.to_string());
-    }
-    if let Some(model) = input.model_id.map(str::trim).filter(|m| !m.is_empty()) {
-        argv.push("--model".to_string());
-        argv.push(model.to_string());
-    }
+    push_agent_arg(&mut argv, input.role);
+    push_model_arg(&mut argv, input.model_id, false);
     argv.extend(permission_args(input.permission_mode));
     argv
 }
@@ -590,12 +557,8 @@ fn claude_popup_prompt(name: &str) -> ChoicePrompt {
         "effort" => ("Pick a reasoning effort", CLAUDE_EFFORT_LEVELS),
         _ => ("Pick an option", &[]),
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     ChoicePrompt {
-        token: format!("cj{:x}", (nanos as u64) & 0xff_ffff_ffff),
+        token: unique_prompt_token("cj"),
         title: title.to_string(),
         options: opts
             .iter()
