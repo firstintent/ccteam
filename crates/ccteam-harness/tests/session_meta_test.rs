@@ -27,6 +27,10 @@ fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionM
         created_at: "2026-01-01T00:00:00Z".into(),
         last_active: last_active.into(),
         origin: SessionOrigin::Ccteam,
+        title: None,
+        title_source: None,
+        turn_count: 0,
+        cost_usd: None,
     }
 }
 

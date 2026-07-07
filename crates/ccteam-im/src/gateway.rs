@@ -16,12 +16,12 @@ use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
-    atomic_write_durable, chat_session_name, discover_external_claude_sessions, list_session_metas,
-    parse_chat_session_name, read_session_meta, touch_last_active, write_session_meta,
-    AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, Directive,
-    DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
-    ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput,
+    apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
+    list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
+    write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
+    Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
+    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnInput,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -465,7 +465,10 @@ pub struct SessionInventory {
 /// operator view, so "current for someone" is the useful hint). `status`
 /// is a cheap, synchronous liveness label — the async per-session model /
 /// context detail stays in `/sessions` (which `.await`s `thread_status`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` dropped (v0.8.22 P1): `cost_usd: Option<f64>` is PartialEq-only (`f64`
+// has no total order → no `Eq`). Every existing comparison site uses
+// `assert_eq!`/`==`, which only need `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionView {
     /// Gateway session id (`s{n}`) — the network-API session namespace.
     pub sid: String,
@@ -505,6 +508,19 @@ pub struct SessionView {
     /// display; empty when the meta can't be resolved.
     #[serde(default)]
     pub last_active: String,
+    /// v0.8.22 P1 — user-facing session title (session-title system), read
+    /// from `meta.json`. `None` until the first user message is auto-titled
+    /// or a vendor/explicit title is set — callers fall back to `role`/`sid`
+    /// display. `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// v0.8.22 P1 — turns.jsonl line count, read from `meta.json`.
+    #[serde(default)]
+    pub turn_count: u64,
+    /// v0.8.22 P1 — accrued priced cost (USD), read from `meta.json`. `None`
+    /// when no turn has priced yet (never a faked `0.0`).
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -697,6 +713,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         name: "/role",
         arg_hint: Some("<role>"),
         help: "switch the current session to a fresh agent role",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
+        name: "/rename",
+        arg_hint: Some("<title>"),
+        help: "rename the current session's title (rule-based, no LLM)",
         in_menu: false,
     },
     GatewayCommandSpec {
@@ -1397,6 +1419,27 @@ impl Gateway {
                 let sid = self.switch_current_role(chat, role.clone()).await?;
                 Ok(Some(format!("switched session {sid} to role {role}")))
             }
+            "/rename" => {
+                // Raw remainder (like `/newproject`'s path arg) — a title may
+                // contain spaces, so this must NOT be whitespace-split.
+                let mut it = trimmed.splitn(2, char::is_whitespace);
+                let _cmd = it.next();
+                let raw_title = it.next().unwrap_or("").trim();
+                if raw_title.is_empty() {
+                    return Err(anyhow!("用法: /rename <新标题>(重命名当前会话)"));
+                }
+                let sid = self
+                    .current_session
+                    .read()
+                    .unwrap()
+                    .get(chat)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!("/rename 需要一个活动会话:先 /new 或发条消息再重命名。")
+                    })?;
+                let title = self.rename_session(&sid, raw_title)?;
+                Ok(Some(format!("已重命名 {sid} → {title}")))
+            }
             "/use" => {
                 let id = parts
                     .next()
@@ -2052,6 +2095,12 @@ impl Gateway {
                 created_at: now.clone(),
                 last_active: now,
                 origin: SessionOrigin::Ccteam,
+                // A fresh spawn has no title yet — the first mirrored user
+                // message auto-titles it (see `mirror_user_turn`).
+                title: None,
+                title_source: None,
+                turn_count: 0,
+                cost_usd: None,
             };
             if let Some(cwd) = self.projects.get(&meta_project) {
                 if let Err(e) = write_session_meta(cwd, &meta) {
@@ -2471,8 +2520,14 @@ impl Gateway {
                                         "ccteam-im: failed to mirror turn to turns.jsonl"
                                     );
                                 }
-                                // Update last_active in meta.json on turn completion.
-                                touch_last_active(dir, &session_id);
+                                // Refresh last_active/turn_count/cost_usd in
+                                // meta.json on turn completion (v0.8.22 P1).
+                                refresh_session_activity_meta(
+                                    dir,
+                                    &session_id,
+                                    session.vendor,
+                                    progress_path.as_deref(),
+                                );
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
                             // fallback, same as pump_target) and reuse it for the
@@ -2739,6 +2794,22 @@ impl Gateway {
         let Some(project_dir) = self.projects.get(&session.project).cloned() else {
             return;
         };
+        // v0.8.22 P1 — the session's default title = a rule-based truncation
+        // of its FIRST user message (never an LLM call — pure string logic).
+        // Gated on `title.is_none()` so this only ever fires once: a vendor
+        // title adopted at import, or an earlier `/rename`, already occupies
+        // the slot and is left alone (`apply_title`'s precedence would reject
+        // an Auto write over either anyway — this check just skips the
+        // redundant meta.json read/write on every later turn).
+        if let Ok(mut meta) = read_session_meta(&project_dir, &session.id) {
+            if meta.title.is_none() {
+                if let Some(candidate) = truncate_title(user_text) {
+                    if apply_title(&mut meta, candidate, TitleSource::Auto) {
+                        let _ = write_session_meta(&project_dir, &meta);
+                    }
+                }
+            }
+        }
         let record = ccteam_harness::execution::turns_mirror::TurnRecord {
             turn_id: turn_id.to_string(),
             ts: chrono::Utc::now(),
@@ -3509,10 +3580,20 @@ impl Gateway {
                 Ok(status) => status.status_suffix(),
                 Err(_) => None,
             };
-            match suffix {
-                Some(sfx) => rows.push(format!("{base} — {sfx}")),
-                None => rows.push(base),
+            let mut row = match suffix {
+                Some(sfx) => format!("{base} — {sfx}"),
+                None => base,
+            };
+            // v0.8.22 P1 — the IM `/sessions` row carries the session's title
+            // when it has one (fallback: the bare row above, unchanged). Web
+            // rows stay untouched (`parse_sessions_reply` splits on exactly
+            // 4 colon fields and must not see extra content appended).
+            if !is_web {
+                if let Some(title) = self.session_title(s) {
+                    row.push_str(&format!(" 「{title}」"));
+                }
             }
+            rows.push(row);
         }
         if is_web {
             return rows.join("\n");
@@ -3535,6 +3616,18 @@ impl Gateway {
             .and_then(|dir| read_session_meta(dir, &s.id).ok())
             .map(|m| m.last_active)
             .unwrap_or_default()
+    }
+
+    /// Best-effort user-facing title (v0.8.22 P1) for a LIVE session, read
+    /// from its `meta.json`. `None` when untitled or the meta can't be
+    /// resolved — [`render_sessions`] then falls back to the existing bare
+    /// `id:project:vendor:role` row (no behavior change for an untitled
+    /// session).
+    fn session_title(&self, s: &GatewaySession) -> Option<String> {
+        self.projects
+            .get(&s.project)
+            .and_then(|dir| read_session_meta(dir, &s.id).ok())
+            .and_then(|m| m.title)
     }
 
     /// Up to `limit` most-recently-ended sessions across `slugs` that `chat`
@@ -3575,8 +3668,15 @@ impl Gateway {
             .iter()
             .map(|m| {
                 let role = if m.role.is_empty() { "—" } else { &m.role };
+                // v0.8.22 P1 — show the session's title when it has one
+                // (fallback: the existing bare role/sid row, unchanged).
+                let title_suffix = m
+                    .title
+                    .as_deref()
+                    .map(|t| format!(" 「{t}」"))
+                    .unwrap_or_default();
                 format!(
-                    "{}:{}:{:?}:{role} — {} → /use {}",
+                    "{}:{}:{:?}:{role}{title_suffix} — {} → /use {}",
                     m.sid,
                     m.slug,
                     m.vendor,
@@ -3926,7 +4026,13 @@ impl Gateway {
                     .as_ref()
                     .map(|m| m.created_at.clone())
                     .unwrap_or_default();
-                let last_active = meta.map(|m| m.last_active).unwrap_or_default();
+                let last_active = meta
+                    .as_ref()
+                    .map(|m| m.last_active.clone())
+                    .unwrap_or_default();
+                let title = meta.as_ref().and_then(|m| m.title.clone());
+                let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
+                let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
                 SessionView {
                     sid: s.id.clone(),
                     project: s.project.clone(),
@@ -3944,6 +4050,9 @@ impl Gateway {
                     last_activity_seconds: None,
                     created_at,
                     last_active,
+                    title,
+                    turn_count,
+                    cost_usd,
                 }
             })
             .collect();
@@ -4059,14 +4168,18 @@ impl Gateway {
             .filter(|m| !m.vendor_uuid.is_empty())
             .map(|m| m.vendor_uuid)
             .collect();
-        let adoptable = discover_external_claude_sessions(&cwd, &known_uuids)
+        // v0.8.22 P1 — keep the MATCHED row (not just a bool) so its
+        // best-effort vendor title (extracted from the jsonl tail's
+        // `ai-title`/`custom-title`) can seed `meta.title` below instead of
+        // being discarded after the import dialog shows it once.
+        let matched = discover_external_claude_sessions(&cwd, &known_uuids)
             .into_iter()
-            .any(|s| s.vendor_uuid == vendor_uuid);
-        if !adoptable {
+            .find(|s| s.vendor_uuid == vendor_uuid);
+        let Some(matched) = matched else {
             anyhow::bail!(
                 "vendor_uuid {vendor_uuid} is not an adoptable session for project {slug}"
             );
-        }
+        };
         self.next_session += 1;
         // Make the counter durable BEFORE the sid is used (a later failure then
         // leaves a harmless gap, never a reused sid).
@@ -4074,7 +4187,7 @@ impl Gateway {
         let sid = format!("s{}", self.next_session);
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
-        let meta = SessionMeta {
+        let mut meta = SessionMeta {
             sid: sid.clone(),
             slug: slug.to_string(),
             vendor: AgentVendor::Claude,
@@ -4087,7 +4200,19 @@ impl Gateway {
             created_at: now.clone(),
             last_active: now,
             origin: SessionOrigin::Adopted,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
         };
+        // v0.8.22 P1 — adopt the vendor's own title (if any) as the session's
+        // starting title. `TitleSource::Vendor` still yields to a later
+        // explicit `/rename` (precedence in `apply_title`), but wins over the
+        // first-message auto-title (the session's first LIVE turn after
+        // import is not really its "first message" — it already has history).
+        if !matched.title.trim().is_empty() {
+            apply_title(&mut meta, matched.title.clone(), TitleSource::Vendor);
+        }
         // Cold-start rebuild from the freshly-built meta (shared path: spawn via
         // the resume ladder, insert, pump). Persist `meta.json` only AFTER a
         // successful spawn so a spawn failure leaves no orphan meta (a phantom
@@ -4452,6 +4577,35 @@ impl Gateway {
             .map_err(|e| anyhow!("interrupt failed for {sid}: {e}"))?;
         Ok(())
     }
+
+    /// v0.8.22 P1 — rename a LIVE session's user-facing title. An explicit
+    /// user action ⇒ `TitleSource::User`, which `apply_title` treats as
+    /// STICKY (never later overwritten by the first-message auto-title or a
+    /// vendor `ai-title`). Applies the same rule-based [`truncate_title`] the
+    /// auto-title path uses (no LLM, ever) and returns the cleaned title
+    /// actually stored. This is the ACL-less core shared by the IM `/rename`
+    /// command (targets the chat's own current session — already
+    /// ownership-scoped by `current_session`) and the web `PATCH
+    /// /api/v1/sessions/{sid}` route (project-ACL'd via `gate_sid` first).
+    /// Sync (no `.await`): a plain meta.json read-modify-write.
+    pub fn rename_session(&self, sid: &str, raw_title: &str) -> Result<String> {
+        let session = self
+            .sessions
+            .get(sid)
+            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        let dir = self
+            .projects
+            .get(&session.project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+        let cleaned =
+            truncate_title(raw_title).ok_or_else(|| anyhow!("title must not be blank"))?;
+        let mut meta = read_session_meta(&dir, sid)
+            .map_err(|e| anyhow!("meta.json missing for session {sid}: {e}"))?;
+        apply_title(&mut meta, cleaned.clone(), TitleSource::User);
+        write_session_meta(&dir, &meta)?;
+        Ok(cleaned)
+    }
 }
 
 /// Stringify a vendor for the [`SessionView`] wire shape. Kept local so
@@ -4461,6 +4615,72 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Claude => "claude",
         AgentVendor::Codex => "codex",
     }
+}
+
+/// v0.8.22 P1 — one read-modify-write refreshing meta.json's activity trio
+/// after an assistant turn lands: `last_active` (as `touch_last_active` always
+/// did), `turn_count` (the turns.jsonl line count), and `cost_usd` (this sid's
+/// priced `chat_turn_completed` events in progress.jsonl — the same
+/// deterministic per-turn accounting `GET /api/v1/status`'s
+/// `build_session_cost_rows` uses, scoped to one sid). Best-effort, like the
+/// `touch_last_active` it replaces: a missing/unreadable meta is silently
+/// skipped, never blocking the reply. Called from the detached event pump
+/// (free function, not a `&self` method — the pump has already moved its
+/// captures out of the gateway by the time this runs).
+fn refresh_session_activity_meta(
+    project_dir: &Path,
+    sid: &str,
+    vendor: AgentVendor,
+    progress_path: Option<&Path>,
+) {
+    let Ok(mut meta) = read_session_meta(project_dir, sid) else {
+        return;
+    };
+    meta.last_active = chrono::Utc::now().to_rfc3339();
+    meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
+        .map(|turns| turns.len() as u64)
+        .unwrap_or(meta.turn_count);
+    if let Some(path) = progress_path {
+        meta.cost_usd = session_cost_usd(path, sid, vendor);
+    }
+    let _ = write_session_meta(project_dir, &meta);
+}
+
+/// Sum the deterministic per-turn cost of every `chat_turn_completed` event in
+/// `progress_path` tagged with `sid`, pricing each turn's `usage` against its
+/// own canonical `model` via [`ccteam_cost::estimate_cost`] — mirrors
+/// `ccteam-web`'s `status::build_session_cost_rows`, scoped to one sid so it
+/// can run from the harness-side pump (which has no access to that
+/// web-layer helper). `None` when nothing priced yet (never a faked `0.0`);
+/// a turn whose model is absent/not in the pricing table is silently skipped
+/// (no fallback to a wrong rate — same honesty contract as the status route).
+fn session_cost_usd(progress_path: &Path, sid: &str, vendor: AgentVendor) -> Option<f64> {
+    let events = ccteam_core::progress::read_all_events(progress_path).ok()?;
+    let cost_vendor = vendor.cost_vendor();
+    let mut total = 0.0_f64;
+    let mut priced = 0usize;
+    for ev in &events {
+        if ev.get("event").and_then(|v| v.as_str())
+            != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+        {
+            continue;
+        }
+        if ev.get("sid").and_then(|v| v.as_str()) != Some(sid) {
+            continue;
+        }
+        let Some(usage) = ev
+            .get("usage")
+            .and_then(|u| serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(u.clone()).ok())
+        else {
+            continue;
+        };
+        let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(cost) = ccteam_cost::estimate_cost(&usage, cost_vendor, model) {
+            total += cost;
+            priced += 1;
+        }
+    }
+    (priced > 0).then_some(total)
 }
 
 /// The synthetic chat key used by the network resource API (W5b) as the
@@ -4604,6 +4824,9 @@ pub struct TrackedSessionRow {
     /// RFC3339 `last_active` from `meta.json` (v0.8.22 P0-3), used to sort
     /// `ccteam session ls` by recency instead of sid string order.
     pub last_active: String,
+    /// v0.8.22 P1 — user-facing session title from `meta.json`. `None` when
+    /// not yet titled — `ccteam session ls` falls back to role/sid display.
+    pub title: Option<String>,
 }
 
 /// Load the gateway's live sessions as flat [`TrackedSessionRow`]s from
@@ -4625,6 +4848,7 @@ pub fn tracked_chat_sessions(ccteam_root: &Path) -> Result<Vec<TrackedSessionRow
             vendor: vendor_str(m.vendor).to_string(),
             permission_mode: m.permission_mode.as_str().to_string(),
             last_active: m.last_active,
+            title: m.title,
         })
         .collect())
 }
@@ -7931,6 +8155,10 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),
             origin: SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
         };
         write_session_meta(alpha_dir.path(), &meta).unwrap();
 
@@ -9335,9 +9563,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
+        // v0.8.22 P1 — s2's first plain message ("where am i") auto-titles it
+        // (rule-based truncation, no LLM); s1 never sent a plain message
+        // (only the `/new` directive), so it stays untitled/bare.
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns2:beta:Claude:cto\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:cto 「where am i」\ns1:alpha:Claude:reviewer"]
         );
     }
 
@@ -9666,13 +9897,16 @@ mod tests {
         assert_eq!(after, vec!["alpha-reviewer-s1 echo: still here?"]);
 
         // The session list shows the new role bound to the same sid (no s2).
+        // v0.8.22 P1 — s1's first plain message ("hi") auto-titled it; the
+        // title is sid-scoped (not role-scoped), so it survives the `/role`
+        // re-spawn untouched.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer 「hi」"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -9738,11 +9972,15 @@ mod tests {
         );
 
         // The session is still resolvable, still s1, still `cto`.
+        // v0.8.22 P1 — carries the title auto-set from its earlier "hi".
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto"]);
+        assert_eq!(
+            listing,
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「hi」"]
+        );
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -9766,6 +10004,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, vec!["alpha-reviewer-s1 echo: now?"]);
+    }
+
+    // ===== v0.8.22 P1 — session-title system: `/rename` =====
+
+    /// `/rename` with no active session gives the usage/context error (not a
+    /// system-fault message) — mirrors `/role`'s no-active-session path.
+    #[tokio::test]
+    async fn gateway_rename_with_no_active_session_errors() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rename-noop");
+
+        let err = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename hello")
+            .await
+            .expect_err("/rename with no active session should error");
+        assert!(
+            format!("{err:#}").contains("活动会话"),
+            "expected the no-active-session hint: {err:#}"
+        );
+    }
+
+    /// `/rename` with a blank title is rejected with a usage hint (never a
+    /// silent no-op or a system-fault message).
+    #[tokio::test]
+    async fn gateway_rename_blank_title_is_rejected() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        let err = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename    ")
+            .await
+            .expect_err("/rename with a blank title should error");
+        assert!(
+            format!("{err:#}").contains("用法"),
+            "expected the usage hint: {err:#}"
+        );
+    }
+
+    /// `/rename` on the current session sets its title (rule-based, no LLM —
+    /// verified by the input surviving verbatim short and getting collapsed
+    /// when it has extra whitespace), and the title is STICKY: a later plain
+    /// message must NOT overwrite it via the first-message auto-title path
+    /// (the precedence `apply_title` enforces).
+    #[tokio::test]
+    async fn gateway_rename_sets_sticky_title_surfaced_in_sessions() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        let renamed = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename  my   custom title  ")
+            .await
+            .unwrap();
+        assert_eq!(renamed, vec!["已重命名 s1 → my custom title"]);
+
+        // /sessions shows the rename.
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            listing,
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「my custom title」"]
+        );
+
+        // A later plain message must NOT clobber the rename via auto-title.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "totally different first message")
+            .await
+            .unwrap();
+        let listing2 = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            listing2,
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「my custom title」"],
+            "an explicit /rename must survive a later message (sticky user title)"
+        );
     }
 
     // ===== v0.8.5 D6 — AskUserQuestion → IM round-trip (External origin) =====

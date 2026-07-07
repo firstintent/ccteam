@@ -253,6 +253,22 @@ async fn session_interrupt_no_gateway_is_503() {
     assert_eq!(resp.status(), 503);
 }
 
+/// v0.8.22 P1 — `PATCH /sessions/{sid}` (rename) follows the same no-gateway
+/// contract as every other by-sid session route.
+#[tokio::test]
+async fn session_patch_no_gateway_is_503() {
+    let tmp = TempDir::new().unwrap();
+    let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!("http://{addr}/api/v1/sessions/s1"))
+        .json(&serde_json::json!({"title": "new title"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
 /// The SSE endpoint must NOT 503 — it keeps the stream open and emits a
 /// one-shot `gateway_unavailable` frame so a browser EventSource shows the
 /// state without hammering reconnects. It is still a 200 text/event-stream.
@@ -532,6 +548,14 @@ async fn import_external_claude_session_over_http() {
         "adopted meta keeps the foreign uuid"
     );
     assert_eq!(meta["origin"], "adopted");
+    // v0.8.22 P1 — the vendor's own `custom-title` (extracted by discovery for
+    // the import dialog) is now PERSISTED into meta.json instead of being
+    // discarded once the dialog closes.
+    assert_eq!(
+        meta["title"], "adopt me",
+        "the vendor custom-title survives into meta.json: {meta}"
+    );
+    assert_eq!(meta["title_source"], "vendor");
 
     // Now adopted → it drops out of external discovery (known uuid excluded).
     let ext2: Value = client
@@ -550,4 +574,167 @@ async fn import_external_claude_session_over_http() {
             .any(|r| r["vendor_uuid"] == uuid),
         "an adopted session is no longer offered for import"
     );
+}
+
+// ── v0.8.22 P1 — session-title system: PATCH /api/v1/sessions/{sid} ─────────
+
+/// Happy path + input validation for the rename route: 200 `{sid, title}`
+/// with the rule-based-cleaned title persisted to meta.json (and reflected in
+/// the live session list), a blank title 400s, and an unknown sid 404s.
+#[tokio::test]
+async fn rename_session_over_http_happy_path_and_validation() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_role_with_model(&project_dir, "cto", None);
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "cto", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Blank title → 400, meta.json untouched.
+    let blank = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blank.status(), 400);
+
+    // Happy path: whitespace-padded, multi-space title is rule-truncated
+    // (collapsed + trimmed) server-side, never stored verbatim with padding.
+    let renamed = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "  Fix   the login   bug  "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), 200);
+    let body: Value = renamed.json().await.unwrap();
+    assert_eq!(body["sid"], sid);
+    assert_eq!(body["title"], "Fix the login bug");
+
+    // meta.json on disk carries the User-sourced title.
+    let meta_path = project_dir
+        .join(".ccteam")
+        .join("chat")
+        .join(&sid)
+        .join("meta.json");
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["title"], "Fix the login bug");
+    assert_eq!(meta["title_source"], "user");
+
+    // The live session list reflects the new title too.
+    let live: Value = client
+        .get(format!("{base}/projects/demo/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(live.as_array().unwrap()[0]["title"], "Fix the login bug");
+
+    // Unknown sid → 404.
+    let unknown = client
+        .patch(format!("{base}/sessions/s999"))
+        .json(&serde_json::json!({"title": "whatever"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+}
+
+/// ACL: a tenant may rename its OWN project's session, but a different
+/// tenant (no ownership of that project) gets 404 — the same project-owned
+/// gate every other `/sessions/{sid}/*` route uses (`gate_sid` →
+/// `can_see_project`), proven end to end with real per-tenant tokens.
+#[tokio::test]
+async fn rename_session_denies_cross_tenant_project() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_role_with_model(&project_dir, "cto", None);
+
+    // Two tenants; the project is owned by tenant A only.
+    let mut reg = ccteam_core::tenants::TenantRegistry::default();
+    let tenant_a = reg.add("alice");
+    let tenant_b = reg.add("bob");
+    reg.save(&paths.users_dir()).unwrap();
+    let token_a = tenant_a.web_token.clone();
+    let token_b = tenant_b.web_token.clone();
+
+    let state_path = paths.project_state("demo");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let mut st = ccteam_core::ProjectState::initial_for_team("demo".into(), "dev".into());
+    st.owner = Some(format!("user:{}", tenant_a.id));
+    st.save(&state_path).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    const ADMIN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+    let state = AppState::with_auth(paths, ccteam_web::AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+    let addr = spawn_server(state).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    // Tenant A creates a session in its own project.
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .header("Authorization", format!("Bearer ccteam:{token_a}"))
+        .json(&serde_json::json!({"role": "cto", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "tenant A creates in its own project");
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Tenant B (no ownership) is denied — 404, not a leak of the sid's
+    // existence.
+    let denied = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .header("Authorization", format!("Bearer ccteam:{token_b}"))
+        .json(&serde_json::json!({"title": "hijacked"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 404, "cross-tenant rename must be denied");
+
+    // Tenant A (the owner) can rename it.
+    let ok = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .header("Authorization", format!("Bearer ccteam:{token_a}"))
+        .json(&serde_json::json!({"title": "my own session"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
 }

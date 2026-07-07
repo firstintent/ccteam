@@ -28,9 +28,33 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import { NewSessionModal, relativeTimeZh } from "./ChatConsole";
+import { NewSessionModal, railSessionLabel, relativeTimeZh } from "./ChatConsole";
 import { mergeProjectSlugs } from "./projectList";
 import type { SessionView } from "../lib/sessionsApi";
+
+// ---- railSessionLabel (v0.8.22 P1 — session-title system). The rail row and
+// the history row both render this pure helper; there is no
+// `@testing-library/react` DOM harness in this repo to simulate the inline
+// rename click/keypress flow, so the extracted display-fallback logic is
+// tested directly (same precedent as relativeTimeZh/mergeProjectSlugs below).
+// -----------------------------------------------------------------------
+describe("railSessionLabel", () => {
+  it("prefers the title when set", () => {
+    expect(railSessionLabel({ title: "Fix the login bug", role: "reviewer" })).toBe(
+      "Fix the login bug",
+    );
+  });
+
+  it("falls back to the role when untitled", () => {
+    expect(railSessionLabel({ title: null, role: "reviewer" })).toBe("reviewer");
+    expect(railSessionLabel({ role: "reviewer" })).toBe("reviewer");
+  });
+
+  it("falls back to the roleless placeholder when neither is set", () => {
+    expect(railSessionLabel({ title: null, role: "" })).toBe("(无 role)");
+    expect(railSessionLabel({ title: "", role: "" })).toBe("(无 role)");
+  });
+});
 
 // ---- relativeTimeZh (v0.8.22 P0-3/P0-4 — history rail + IM `/sessions`
 // share this phrasing; mirrors `ccteam-im::gateway::relative_time_zh`) ------

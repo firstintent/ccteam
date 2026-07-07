@@ -87,6 +87,10 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             created_at: now.clone(),
             last_active: now,
             origin: ccteam_harness::SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
         };
         ccteam_harness::write_session_meta(&project_dir, &meta).unwrap();
     };

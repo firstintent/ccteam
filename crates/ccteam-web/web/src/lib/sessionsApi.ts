@@ -42,6 +42,15 @@ export interface SessionView {
    *  `meta.json`. Drives recency sort/relative-time display server-side; the
    *  live rail list already arrives sorted `last_active` desc. */
   last_active?: string;
+  /** v0.8.22 P1 — user-facing session title (session-title system), read
+   *  from `meta.json`. `null`/absent until the first user message is
+   *  auto-titled (or a vendor/explicit title is set) — render `role`/`sid`
+   *  as the fallback (unchanged from before this field existed). */
+  title?: string | null;
+  /** v0.8.22 P1 — turns.jsonl line count. */
+  turn_count?: number;
+  /** v0.8.22 P1 — accrued priced cost (USD); `null` when nothing priced yet. */
+  cost_usd?: number | null;
 }
 
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn
@@ -152,6 +161,26 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function patchJson<T>(url: string, body: unknown): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(
+      `network: ${e instanceof Error ? e.message : "connection failed"}`,
+    );
+  }
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("NOT_FOUND");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
+}
+
 async function errorMessage(res: Response): Promise<string> {
   const fallback = `HTTP ${res.status}`;
   const contentType = res.headers.get("content-type") ?? "";
@@ -219,6 +248,19 @@ export function submitTurn(sid: string, text: string): Promise<{ accepted: boole
 /** `POST /api/v1/sessions/{sid}/stop` — deregister the session. */
 export function stopSession(sid: string): Promise<{ stopped: boolean }> {
   return postJson<{ stopped: boolean }>(`${sessionUrl(sid)}/stop`, {});
+}
+
+/** `PATCH /api/v1/sessions/{sid}` — rename a session's user-facing title
+ *  (v0.8.22 P1 session-title system). The server rule-truncates the title
+ *  (whitespace-collapsed, capped ~40 chars — never an LLM call) and records
+ *  it as the STICKY user-source (never later overwritten by the
+ *  first-message auto-title or a vendor `ai-title`). Returns the cleaned
+ *  title actually stored. */
+export function renameSession(
+  sid: string,
+  title: string,
+): Promise<{ sid: string; title: string }> {
+  return patchJson<{ sid: string; title: string }>(sessionUrl(sid), { title });
 }
 
 /** `POST /api/v1/sessions/{sid}/interrupt` — interrupt the session's
@@ -295,6 +337,12 @@ export interface HistorySessionView {
   origin: "ccteam" | "adopted";
   /** True when the vendor transcript still exists → precise `--resume`. */
   transcript_present: boolean;
+  /** v0.8.22 P1 — user-facing session title, when set. */
+  title?: string | null;
+  /** v0.8.22 P1 — turns.jsonl line count. */
+  turn_count?: number;
+  /** v0.8.22 P1 — accrued priced cost (USD); `null` when nothing priced yet. */
+  cost_usd?: number | null;
 }
 
 /** An external vendor session from `GET .../external-sessions`. */

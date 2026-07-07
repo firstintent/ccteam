@@ -88,6 +88,10 @@ fn write_one_tracked_session(root: &std::path::Path) {
             created_at: now.clone(),
             last_active: now,
             origin: ccteam_harness::SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
         },
     )
     .unwrap();

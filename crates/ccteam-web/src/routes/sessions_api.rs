@@ -395,6 +395,68 @@ pub(crate) async fn handle_session_history(
     Json(json!({ "sid": sid, "events": events })).into_response()
 }
 
+/// PATCH body for `PATCH /api/v1/sessions/{sid}` — the only mutable field is
+/// `title` (v0.8.22 P1 session-title system).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct RenameSessionRequest {
+    pub title: String,
+}
+
+/// `PATCH /api/v1/sessions/{sid}`
+///
+/// Rename a LIVE session's user-facing title. The title is rule-based
+/// truncated server-side (whitespace-collapsed, capped ~40 chars — never an
+/// LLM call) and recorded as `TitleSource::User`, which is STICKY: it is
+/// never later overwritten by the first-message auto-title or a vendor
+/// `ai-title` (see [`ccteam_harness::apply_title`]'s precedence). 200
+/// `{sid, title}` with the cleaned title actually stored. 400 for a blank
+/// title. 404 unknown/inaccessible session (project-ACL'd via `gate_sid`,
+/// same as every other `/sessions/{sid}/*` route). 503 no gateway.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/sessions/{sid}",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body = RenameSessionRequest,
+    responses(
+        (status = 200, description = "Renamed `{sid, title}`", body = serde_json::Value),
+        (status = 400, description = "Blank title"),
+        (status = 404, description = "Unknown session"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_patch_session(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+    Json(body): Json<RenameSessionRequest>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    if body.title.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "title must not be blank"})),
+        )
+            .into_response();
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let result = {
+        let guard = gw.lock().await;
+        guard.rename_session(&sid, &body.title)
+    };
+    match result {
+        Ok(title) => Json(json!({"sid": sid, "title": title})).into_response(),
+        Err(err) => {
+            tracing::warn!(%sid, %err, "rename_session failed");
+            unknown_session(&sid)
+        }
+    }
+}
+
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
 /// `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (the same file the W1
 /// `session_collect` path reads). Each [`TurnRecord`] becomes one event
@@ -860,6 +922,11 @@ pub(crate) async fn handle_session_history_list(
                 "last_active": m.last_active,
                 "origin": format!("{:?}", m.origin).to_lowercase(),
                 "transcript_present": !m.vendor_uuid.is_empty(),
+                // v0.8.22 P1 — session-title system: surface the title (if
+                // any) + the casually-added turn_count/cost_usd bookkeeping.
+                "title": m.title,
+                "turn_count": m.turn_count,
+                "cost_usd": m.cost_usd,
             })
         })
         .collect();
@@ -1496,6 +1563,9 @@ mod tests {
             last_activity_seconds: None,
             created_at: String::new(),
             last_active: String::new(),
+            title: None,
+            turn_count: 0,
+            cost_usd: None,
         }];
 
         let stale_completed = serde_json::json!({
@@ -1537,6 +1607,9 @@ mod tests {
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),
+                title: None,
+                turn_count: 0,
+                cost_usd: None,
             },
             SessionView {
                 sid: "s2".into(),
@@ -1551,6 +1624,9 @@ mod tests {
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),
+                title: None,
+                turn_count: 0,
+                cost_usd: None,
             },
         ];
 
@@ -1599,6 +1675,9 @@ mod tests {
             last_activity_seconds: None,
             created_at: String::new(),
             last_active: String::new(),
+            title: None,
+            turn_count: 0,
+            cost_usd: None,
         }];
 
         ccteam_core::progress::append_event(
@@ -1634,6 +1713,9 @@ mod tests {
             last_activity_seconds: None,
             created_at: String::new(),
             last_active: String::new(),
+            title: None,
+            turn_count: 0,
+            cost_usd: None,
         }];
 
         ccteam_core::progress::append_event(

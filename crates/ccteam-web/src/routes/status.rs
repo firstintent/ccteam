@@ -338,6 +338,9 @@ mod tests {
             last_activity_seconds: None,
             created_at: String::new(),
             last_active: String::new(),
+            title: None,
+            turn_count: 0,
+            cost_usd: None,
         }
     }
 

@@ -96,6 +96,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/projects/{slug}/sessions"),
         ("POST", "/api/v1/projects/{slug}/sessions"),
         ("GET", "/api/v1/sessions/{sid}"),
+        // v0.8.22 P1 — session-title system: rename a session's title.
+        ("PATCH", "/api/v1/sessions/{sid}"),
         // live statusline (model + context-window usage) for the SPA top bar.
         ("GET", "/api/v1/sessions/{sid}/status"),
         ("POST", "/api/v1/sessions/{sid}/turn"),

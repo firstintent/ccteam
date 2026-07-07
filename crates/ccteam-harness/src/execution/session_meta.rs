@@ -32,6 +32,84 @@ pub enum SessionOrigin {
     Adopted,
 }
 
+// ── title system (v0.8.22 P1) ────────────────────────────────────────────────
+
+/// Which mechanism produced [`SessionMeta::title`]. Precedence (low → high):
+/// `Auto` < `Vendor` < `User` — enforced by [`apply_title`] at WRITE time, so
+/// an explicit rename is sticky (never later clobbered by the first-message
+/// truncation or a vendor `ai-title`). `#[serde(default)]`-friendly: absent on
+/// any meta.json predating this field (reads back as `None`, i.e. no title
+/// yet — the caller falls back to `role`/`sid` display).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// Rule-based truncation of the session's first user message.
+    Auto,
+    /// Extracted from the vendor's own transcript (`ai-title` / `custom-title`).
+    Vendor,
+    /// Explicit user rename (`/rename`, `PATCH /api/v1/sessions/{sid}`, or the
+    /// SPA inline editor). Sticky: never overwritten by `Auto` or `Vendor`.
+    User,
+}
+
+impl TitleSource {
+    /// Precedence rank — higher wins. Used by [`apply_title`] to reject a
+    /// lower-ranked write over an existing higher-ranked title.
+    fn rank(self) -> u8 {
+        match self {
+            TitleSource::Auto => 0,
+            TitleSource::Vendor => 1,
+            TitleSource::User => 2,
+        }
+    }
+}
+
+/// Cap (in `char`s, not bytes — CJK-safe) for an auto-generated title.
+const TITLE_MAX_CHARS: usize = 40;
+
+/// Rule-based session title from a user's first message: collapse internal
+/// whitespace/newlines to single spaces, trim, and cap at [`TITLE_MAX_CHARS`]
+/// chars with a trailing ellipsis. **Pure, deterministic — no LLM call** (the
+/// "no prompt injection" discipline extends to "no covert side-calls" for
+/// something this cheap). Returns `None` for a blank/whitespace-only message
+/// (nothing worth titling, e.g. a lone attachment).
+pub fn truncate_title(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= TITLE_MAX_CHARS {
+        return Some(chars.into_iter().collect());
+    }
+    let head: String = chars[..TITLE_MAX_CHARS].iter().collect();
+    Some(format!("{head}…"))
+}
+
+/// Set `meta.title` to `candidate` under [`TitleSource`] precedence
+/// (`Auto < Vendor < User`): a write is rejected iff a title already exists
+/// AND `source` ranks lower than the title's current source — so a `User`
+/// rename is never clobbered by a later `Auto`/`Vendor` write, and a `Vendor`
+/// title survives a later `Auto` one. A blank `candidate` is always rejected
+/// (never clears a title). Returns `true` iff the title was actually written
+/// — callers that only persist on change (e.g. avoiding a redundant
+/// `write_session_meta`) can skip the write on `false`.
+pub fn apply_title(meta: &mut SessionMeta, candidate: String, source: TitleSource) -> bool {
+    if candidate.trim().is_empty() {
+        return false;
+    }
+    if meta.title.is_some() {
+        let current_rank = meta.title_source.map(TitleSource::rank).unwrap_or(0);
+        if source.rank() < current_rank {
+            return false;
+        }
+    }
+    meta.title = Some(candidate);
+    meta.title_source = Some(source);
+    true
+}
+
 // ── core struct ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +130,28 @@ pub struct SessionMeta {
     /// Updated only on turn completion — not on every event.
     pub last_active: String,
     pub origin: SessionOrigin,
+    /// v0.8.22 P1 — user-facing session title (session-title system). `None`
+    /// until either the first user message is auto-titled or a vendor
+    /// `ai-title`/`custom-title` is adopted — see [`TitleSource`] +
+    /// [`apply_title`] for precedence. `#[serde(default)]` keeps every
+    /// pre-existing meta.json parseable (reads back `None`).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Which mechanism produced [`Self::title`]; `None` alongside a `None`
+    /// title (nothing set yet). `#[serde(default)]` for the same reason.
+    #[serde(default)]
+    pub title_source: Option<TitleSource>,
+    /// v0.8.22 P1 — number of turns recorded in this session's
+    /// `turns.jsonl` (best-effort, refreshed on each completed turn).
+    /// `#[serde(default)]` keeps older metas parseable (reads back `0`).
+    #[serde(default)]
+    pub turn_count: u64,
+    /// v0.8.22 P1 — accrued cost (USD) for this session's priced turns —
+    /// the same deterministic per-turn accounting `GET /api/v1/status`'s
+    /// per-session cost row uses. `None` when no turn has priced yet
+    /// (never a faked `0.0`). `#[serde(default)]` for old metas.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -288,4 +388,196 @@ fn is_subagent_jsonl(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    fn blank_meta() -> SessionMeta {
+        SessionMeta {
+            sid: "s1".into(),
+            slug: "demo".into(),
+            vendor: AgentVendor::Claude,
+            protocol: SessionProtocol::StreamJson,
+            role: "cto".into(),
+            permission_mode: PermissionMode::Skip,
+            owner: "user:web-api".into(),
+            vendor_uuid: String::new(),
+            host: "local".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_active: "2026-01-01T00:00:00Z".into(),
+            origin: SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
+        }
+    }
+
+    // ---- truncate_title ----------------------------------------------------
+
+    #[test]
+    fn truncate_title_short_message_passes_through_trimmed() {
+        assert_eq!(
+            truncate_title("  fix the login bug  "),
+            Some("fix the login bug".to_string())
+        );
+    }
+
+    #[test]
+    fn truncate_title_collapses_internal_whitespace_and_newlines() {
+        assert_eq!(
+            truncate_title("fix\n\nthe   login\tbug"),
+            Some("fix the login bug".to_string())
+        );
+    }
+
+    #[test]
+    fn truncate_title_blank_or_whitespace_only_is_none() {
+        assert_eq!(truncate_title(""), None);
+        assert_eq!(truncate_title("   \n\t  "), None);
+    }
+
+    #[test]
+    fn truncate_title_caps_at_40_chars_with_ellipsis() {
+        let long = "a".repeat(100);
+        let got = truncate_title(&long).unwrap();
+        // 40 kept chars + one ellipsis char.
+        assert_eq!(got.chars().count(), TITLE_MAX_CHARS + 1);
+        assert!(got.ends_with('…'));
+        assert_eq!(
+            got.chars().take(TITLE_MAX_CHARS).collect::<String>(),
+            "a".repeat(TITLE_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn truncate_title_is_cjk_safe_char_not_byte_capped() {
+        // Each CJK char is >1 byte in UTF-8; the cap must count chars, so a
+        // 100-char CJK string still yields exactly 40 kept chars + ellipsis,
+        // never panicking on a mid-codepoint byte slice.
+        let long = "会".repeat(100);
+        let got = truncate_title(&long).unwrap();
+        assert_eq!(got.chars().count(), TITLE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn truncate_title_exactly_at_cap_has_no_ellipsis() {
+        let exact = "b".repeat(TITLE_MAX_CHARS);
+        assert_eq!(truncate_title(&exact), Some(exact));
+    }
+
+    // ---- apply_title precedence / rename-stability -------------------------
+
+    #[test]
+    fn apply_title_sets_on_blank_meta() {
+        let mut meta = blank_meta();
+        assert!(apply_title(
+            &mut meta,
+            "first message".into(),
+            TitleSource::Auto
+        ));
+        assert_eq!(meta.title.as_deref(), Some("first message"));
+        assert_eq!(meta.title_source, Some(TitleSource::Auto));
+    }
+
+    #[test]
+    fn apply_title_rejects_blank_candidate() {
+        let mut meta = blank_meta();
+        assert!(!apply_title(&mut meta, "   ".into(), TitleSource::Auto));
+        assert!(meta.title.is_none());
+    }
+
+    #[test]
+    fn apply_title_user_rename_is_never_overwritten_by_auto_or_vendor() {
+        let mut meta = blank_meta();
+        assert!(apply_title(
+            &mut meta,
+            "renamed by user".into(),
+            TitleSource::User
+        ));
+
+        // A later first-message auto-title must NOT clobber the rename.
+        assert!(!apply_title(
+            &mut meta,
+            "auto from message".into(),
+            TitleSource::Auto
+        ));
+        assert_eq!(meta.title.as_deref(), Some("renamed by user"));
+
+        // Nor may a vendor ai-title.
+        assert!(!apply_title(
+            &mut meta,
+            "vendor ai-title".into(),
+            TitleSource::Vendor
+        ));
+        assert_eq!(meta.title.as_deref(), Some("renamed by user"));
+        assert_eq!(meta.title_source, Some(TitleSource::User));
+    }
+
+    #[test]
+    fn apply_title_vendor_beats_auto_but_not_vice_versa() {
+        let mut meta = blank_meta();
+        assert!(apply_title(
+            &mut meta,
+            "auto title".into(),
+            TitleSource::Auto
+        ));
+        assert!(apply_title(
+            &mut meta,
+            "vendor title".into(),
+            TitleSource::Vendor
+        ));
+        assert_eq!(meta.title.as_deref(), Some("vendor title"));
+
+        // A later Auto write (e.g. a stray call) must not downgrade Vendor.
+        assert!(!apply_title(
+            &mut meta,
+            "later auto".into(),
+            TitleSource::Auto
+        ));
+        assert_eq!(meta.title.as_deref(), Some("vendor title"));
+    }
+
+    #[test]
+    fn apply_title_user_can_rename_again() {
+        let mut meta = blank_meta();
+        assert!(apply_title(
+            &mut meta,
+            "first rename".into(),
+            TitleSource::User
+        ));
+        assert!(apply_title(
+            &mut meta,
+            "second rename".into(),
+            TitleSource::User
+        ));
+        assert_eq!(meta.title.as_deref(), Some("second rename"));
+    }
+
+    #[test]
+    fn session_meta_json_round_trips_without_title_fields_present() {
+        // A pre-v0.8.22 meta.json has no title/title_source/turn_count/cost_usd
+        // keys at all — `#[serde(default)]` must still parse it.
+        let legacy = serde_json::json!({
+            "sid": "s1",
+            "slug": "demo",
+            "vendor": "claude",
+            "protocol": "stream-json",
+            "role": "cto",
+            "permission_mode": "skip",
+            "owner": "user:web-api",
+            "vendor_uuid": "",
+            "host": "local",
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_active": "2026-01-01T00:00:00Z",
+            "origin": "ccteam",
+        });
+        let meta: SessionMeta = serde_json::from_value(legacy).expect("legacy meta.json parses");
+        assert!(meta.title.is_none());
+        assert!(meta.title_source.is_none());
+        assert_eq!(meta.turn_count, 0);
+        assert!(meta.cost_usd.is_none());
+    }
 }

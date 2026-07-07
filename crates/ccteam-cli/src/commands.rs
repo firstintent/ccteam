@@ -1254,6 +1254,10 @@ fn render_sessions_table(
         slug: String,
         sid: String,
         role: String,
+        // v0.8.22 P1 — user-facing session title (session-title system);
+        // `"-"` when the session has none yet (fallback: the ROLE column
+        // alongside it already carries the role/sid identity as today).
+        title: String,
         vendor: String,
         status: String,
         last_active: String,
@@ -1271,6 +1275,12 @@ fn render_sessions_table(
             slug: r.project.clone(),
             sid: r.sid.clone(),
             role: r.role.clone(),
+            title: r
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("-")
+                .to_string(),
             vendor: r.vendor.clone(),
             status: tracked_status.to_string(),
             last_active: r.last_active.clone(),
@@ -1287,6 +1297,7 @@ fn render_sessions_table(
                 slug,
                 sid,
                 role: "-".to_string(),
+                title: "-".to_string(),
                 vendor: "-".to_string(),
                 status: "orphan (untracked live pane)".to_string(),
                 last_active: String::new(),
@@ -1314,6 +1325,7 @@ fn render_sessions_table(
     let w_slug = rows.iter().map(|r| r.slug.len()).max().unwrap_or(0).max(4);
     let w_sid = rows.iter().map(|r| r.sid.len()).max().unwrap_or(0).max(3);
     let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(0).max(4);
+    let w_title = rows.iter().map(|r| r.title.len()).max().unwrap_or(0).max(5);
     let w_vendor = rows
         .iter()
         .map(|r| r.vendor.len())
@@ -1333,15 +1345,15 @@ fn render_sessions_table(
 
     let mut out = String::new();
     let header = format!(
-        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {:<w_last_active$}  STATUS",
-        "SLUG", "SID", "ROLE", "VENDOR", "LAST ACTIVE"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_title$}  {:<w_vendor$}  {:<w_last_active$}  STATUS",
+        "SLUG", "SID", "ROLE", "TITLE", "VENDOR", "LAST ACTIVE"
     );
     out.push_str(header.trim_end());
     out.push('\n');
     for (r, last_active) in rows.iter().zip(last_active_display.iter()) {
         let line = format!(
-            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_vendor$}  {:<w_last_active$}  {}",
-            r.slug, r.sid, r.role, r.vendor, last_active, r.status,
+            "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_title$}  {:<w_vendor$}  {:<w_last_active$}  {}",
+            r.slug, r.sid, r.role, r.title, r.vendor, last_active, r.status,
         );
         out.push_str(line.trim_end());
         out.push('\n');
@@ -5455,6 +5467,7 @@ mod tests {
                 vendor: "claude".into(),
                 permission_mode: "skip".into(),
                 last_active: "2024-01-01T00:00:00Z".into(),
+                title: None,
             },
             ccteam_im::gateway::TrackedSessionRow {
                 sid: "s2".into(),
@@ -5463,6 +5476,7 @@ mod tests {
                 vendor: "codex".into(),
                 permission_mode: "hitl".into(),
                 last_active: "2024-01-02T00:00:00Z".into(),
+                title: None,
             },
         ];
         let out = render_sessions_table(&tracked, &[], true);
@@ -5501,6 +5515,49 @@ mod tests {
         );
     }
 
+    /// v0.8.22 P1 — `ccteam session ls` surfaces the session-title system: a
+    /// titled session shows its title in a TITLE column; an untitled one
+    /// falls back to `-` (role/sid stay exactly as today alongside it).
+    #[test]
+    fn render_sessions_table_shows_title_with_fallback() {
+        let tracked = vec![
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s1".into(),
+                project: "alpha".into(),
+                role: "reviewer".into(),
+                vendor: "claude".into(),
+                permission_mode: "skip".into(),
+                last_active: "2024-01-02T00:00:00Z".into(),
+                title: Some("Fix the login bug".into()),
+            },
+            ccteam_im::gateway::TrackedSessionRow {
+                sid: "s2".into(),
+                project: "alpha".into(),
+                role: "builder".into(),
+                vendor: "codex".into(),
+                permission_mode: "skip".into(),
+                last_active: "2024-01-01T00:00:00Z".into(),
+                title: None,
+            },
+        ];
+        let out = render_sessions_table(&tracked, &[], true);
+
+        assert!(
+            out.contains("TITLE"),
+            "header must carry a TITLE column: {out}"
+        );
+        let titled_line = out.lines().find(|l| l.contains("s1")).expect("titled row");
+        assert!(titled_line.contains("Fix the login bug"), "{titled_line}");
+        let untitled_line = out
+            .lines()
+            .find(|l| l.contains("s2"))
+            .expect("untitled row");
+        assert!(
+            untitled_line.contains(" - "),
+            "an untitled session's TITLE cell falls back to `-`: {untitled_line}"
+        );
+    }
+
     /// v0.8.8 B4 — a live `ccteam-chat-*` pane the daemon does not track is an
     /// orphan (role/vendor `-`); daemon-down degrades tracked rows to
     /// `registered (daemon down)` rather than erroring.
@@ -5513,6 +5570,7 @@ mod tests {
             vendor: "claude".into(),
             permission_mode: "skip".into(),
             last_active: "2024-01-01T00:00:00Z".into(),
+            title: None,
         }];
         // One untracked live pane → orphan; the tracked s1's own pane is NOT
         // listed, so it must not double as an orphan.
@@ -5544,6 +5602,7 @@ mod tests {
             vendor: "claude".into(),
             permission_mode: "skip".into(),
             last_active: "2024-01-01T00:00:00Z".into(),
+            title: None,
         }];
         // The live pane name matches the canonical name of the tracked s1.
         let live = vec!["ccteam-chat-alpha-s1".to_string()];

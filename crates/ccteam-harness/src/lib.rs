@@ -65,8 +65,9 @@ pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT
 pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::session_meta::{
-    discover_external_claude_sessions, list_session_metas, read_session_meta, touch_last_active,
-    write_session_meta, ExternalClaudeSession, SessionMeta, SessionOrigin,
+    apply_title, discover_external_claude_sessions, list_session_metas, read_session_meta,
+    touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,
+    SessionOrigin, TitleSource,
 };
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};

@@ -31,6 +31,7 @@ import {
   Activity,
   MessageSquare,
   Menu,
+  Pencil,
   Plus,
   Puzzle,
   Server,
@@ -56,6 +57,7 @@ import {
   listHistorySessions,
   listExternalSessions,
   importExternalSession,
+  renameSession,
   resumeSession,
   listProjectRoles,
   listSessions,
@@ -73,6 +75,18 @@ import { navLabel, tr } from "../lib/i18n";
 
 /** A switcher entry — one live gateway session, grouped under its project. */
 type RailSession = SessionSummary;
+
+/** Display label for a rail/history session row (v0.8.22 P1 session-title
+ *  system): the user-facing title when set, else the pre-existing role
+ *  fallback (`"(无 role)"` for a roleless session — unchanged from before
+ *  titles existed). Pure + exported so it has a cheap unit test: this repo
+ *  has no DOM/interaction test harness (no `@testing-library/react`), so
+ *  inline-rename UI is exercised via this extracted pure helper rather than
+ *  a simulated click/keypress (mirrors `relativeTimeZh`/`mergeProjectSlugs`'s
+ *  precedent of testing the pure logic directly). */
+export function railSessionLabel(s: { title?: string | null; role: string }): string {
+  return s.title || s.role || "(无 role)";
+}
 
 /** Frontend-only soft cap on how many active sessions one user may hold at
  *  once. "Active" = the sessions in this caller's own cross-project list
@@ -197,6 +211,10 @@ export default function ChatConsole() {
   const [importSlug, setImportSlug] = useState<string | null>(null);
   const [externalSessions, setExternalSessions] = useState<ExternalSessionView[]>([]);
   const [externalLoading, setExternalLoading] = useState(false);
+  // v0.8.22 P1 — inline rail rename: the sid currently in edit mode (`null` =
+  // none), and its draft text. Enter commits, Escape/blur cancels.
+  const [renamingSid, setRenamingSid] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const [importing, setImporting] = useState<string | null>(null);
 
   // The active session's rail entry (vendor/role/project), passed to the
@@ -517,42 +535,96 @@ export default function ChatConsole() {
                     {items.map((s) => {
                       const active = s.sid === sid;
                       const isClaude = s.vendor === "claude";
+                      const editing = renamingSid === s.sid;
+                      const commitRename = () => {
+                        const title = renameDraft.trim();
+                        setRenamingSid(null);
+                        if (!title || title === (s.title ?? "")) return;
+                        renameSession(s.sid, title)
+                          .then(() => refreshSessions())
+                          .catch((e) =>
+                            toastBus.handler?.error(`Rename failed: ${String(e)}`),
+                          );
+                      };
                       return (
-                        <button
+                        <div
                           key={s.sid}
-                          type="button"
-                          onClick={() => switchTo(s)}
-                          className={`w-full text-left px-2 py-1.5 rounded-md flex items-center gap-2 text-xs ${
+                          className={`group/sess w-full flex items-center gap-1 rounded-md text-xs ${
                             active
                               ? "bg-surface-700 text-text-primary"
                               : "text-text-secondary hover:bg-surface-800/70"
                           }`}
                         >
-                          <span
-                            className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                              active ? "bg-status-running" : "bg-surface-700"
-                            }`}
-                          />
-                          <span
-                            className={`font-mono px-1 rounded text-[10px] ${
-                              isClaude
-                                ? "bg-vendor-claude/15 text-vendor-claude"
-                                : "bg-vendor-codex/15 text-vendor-codex"
-                            }`}
-                          >
-                            {s.vendor}
-                          </span>
-                          <span className="truncate flex-1">{s.role || "(无 role)"}</span>
-                          {s.permission_mode === "hitl" ? (
-                            <span
-                              className="font-mono text-[9px] text-brand-400/90"
-                              title="HITL: 非 allowlist 工具需批准"
+                          {editing ? (
+                            <input
+                              autoFocus
+                              value={renameDraft}
+                              onChange={(e) => setRenameDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") commitRename();
+                                if (e.key === "Escape") {
+                                  // Reset the draft to the pristine value FIRST:
+                                  // removing this input from the DOM (via the
+                                  // renamingSid state flip below) may itself
+                                  // trigger a native blur — resetting the draft
+                                  // makes `commitRename`'s no-op-when-unchanged
+                                  // guard cover that case too, so Escape can
+                                  // never save a discarded edit either way.
+                                  setRenameDraft(s.title || s.role || "");
+                                  setRenamingSid(null);
+                                }
+                              }}
+                              onBlur={commitRename}
+                              className="flex-1 min-w-0 mx-1.5 my-1 px-1.5 py-0.5 rounded bg-surface-900 text-text-primary text-xs outline-none ring-1 ring-brand-500/60"
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => switchTo(s)}
+                              className="flex-1 min-w-0 text-left px-2 py-1.5 rounded-md flex items-center gap-2"
                             >
-                              hitl
-                            </span>
-                          ) : null}
-                          <span className="text-text-muted font-mono">{s.sid}</span>
-                        </button>
+                              <span
+                                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                                  active ? "bg-status-running" : "bg-surface-700"
+                                }`}
+                              />
+                              <span
+                                className={`font-mono px-1 rounded text-[10px] ${
+                                  isClaude
+                                    ? "bg-vendor-claude/15 text-vendor-claude"
+                                    : "bg-vendor-codex/15 text-vendor-codex"
+                                }`}
+                              >
+                                {s.vendor}
+                              </span>
+                              <span className="truncate flex-1">{railSessionLabel(s)}</span>
+                              {s.permission_mode === "hitl" ? (
+                                <span
+                                  className="font-mono text-[9px] text-brand-400/90"
+                                  title="HITL: 非 allowlist 工具需批准"
+                                >
+                                  hitl
+                                </span>
+                              ) : null}
+                              <span className="text-text-muted font-mono">{s.sid}</span>
+                            </button>
+                          )}
+                          {editing ? null : (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRenamingSid(s.sid);
+                                setRenameDraft(s.title || s.role || "");
+                              }}
+                              title={tr(lang, "重命名", "Rename")}
+                              aria-label={tr(lang, `重命名 ${s.sid}`, `Rename ${s.sid}`)}
+                              className="shrink-0 h-5 w-5 mr-1 grid place-items-center rounded text-text-muted opacity-0 group-hover/sess:opacity-100 hover:text-brand-400 hover:bg-surface-800 transition-opacity focus-visible:opacity-100"
+                            >
+                              <Pencil className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
                       );
                     })}
                     {items.length === 0 ? (
@@ -1441,7 +1513,7 @@ function HistorySection({
                 >
                   {h.vendor}
                 </span>
-                <span className="truncate flex-1">{h.role || "(无 role)"}</span>
+                <span className="truncate flex-1">{railSessionLabel(h)}</span>
                 <span
                   className="text-[9px] text-text-muted shrink-0"
                   title={h.last_active || h.created_at}

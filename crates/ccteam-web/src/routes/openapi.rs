@@ -192,7 +192,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_list_sessions,
             super::sessions_api::handle_create_session
         ))
-        .routes(routes!(super::sessions_api::handle_session_history))
+        // v0.8.22 P1 — GET history + PATCH rename share `/api/v1/sessions/{sid}`.
+        .routes(routes!(
+            super::sessions_api::handle_session_history,
+            super::sessions_api::handle_patch_session
+        ))
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_turn))
         // v0.8.7 review-fix (R-H1) — token-resolve for the web HITL approve/deny
