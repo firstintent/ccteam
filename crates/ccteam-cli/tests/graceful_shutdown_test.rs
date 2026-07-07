@@ -110,9 +110,10 @@ fn send_signal(pid: u32, sig: libc::c_int) -> Result<(), String> {
     if ret == 0 {
         Ok(())
     } else {
-        Err(format!("kill({pid}, {sig}) failed: errno={}", unsafe {
-            *libc::__errno_location()
-        }))
+        Err(format!(
+            "kill({pid}, {sig}) failed: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
