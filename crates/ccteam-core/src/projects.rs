@@ -1,4 +1,4 @@
-//! Project bootstrap helpers used by `ccteam new` (and reusable by the
+//! Project bootstrap helpers used by `ccteam project new` (and reusable by the
 //! M3+ inbox triage path). Pure: no tmux side effects, just file
 //! creation under `~/projects/<slug>/`.
 
@@ -136,7 +136,7 @@ pub fn pick_unused_slug(paths: &CcteamPaths, base: &str, team: &str) -> Result<S
 /// V0.4.2 F75 reviewer fix: validate that `slug` matches the on-disk
 /// slug grammar — `[a-z0-9][a-z0-9-]*`, length ≤ 60, no leading /
 /// trailing dash. Returns the trimmed string on success. Use this
-/// from CLI parsers (`ccteam init --slug`, `ccteam new <slug>`) so
+/// from CLI parsers (`ccteam init --slug`, `ccteam project new <slug>`) so
 /// invalid input fails loud before any directory is created.
 pub fn validate_slug_format(slug: &str) -> Result<String> {
     let trimmed = slug.trim();

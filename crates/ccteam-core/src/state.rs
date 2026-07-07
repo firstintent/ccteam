@@ -212,7 +212,7 @@ impl ProjectState {
     }
 
     /// Like `initial` but lets the caller pin the team. Used by
-    /// `bootstrap_project` so `ccteam new --team <name>` carries
+    /// `bootstrap_project` so `ccteam project new --team <name>` carries
     /// through to state.json.
     pub fn initial_for_team(slug: String, team: String) -> Self {
         let now = Utc::now();

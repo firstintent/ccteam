@@ -7,7 +7,7 @@
 //! got an empty skeleton created elsewhere and none of their code.
 //! `--slug` is now a pure name override; the install target is the cwd
 //! (or `--in <path>`). To create a fresh central project use
-//! `ccteam new <slug>`.
+//! `ccteam project new <slug>`.
 //!
 //! Runs the real binary via `CARGO_BIN_EXE_ccteam` with a child cwd
 //! (`Command::current_dir`) so the chdir is process-local and can't race

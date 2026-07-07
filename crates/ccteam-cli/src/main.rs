@@ -84,7 +84,7 @@ enum Command {
         /// install-dir basename default. Does NOT change where the
         /// project installs — that stays the cwd (or `--in <path>`). To
         /// create a fresh project under `<projects_root>/<team>-<slug>/`,
-        /// use `ccteam new <slug>`.
+        /// use `ccteam project new <slug>` (e.g. `ccteam project new demo`).
         #[arg(long, value_name = "NAME")]
         slug: Option<String>,
         /// V0.4.2 F72: team name for new installs (default `dev`).
@@ -1736,7 +1736,7 @@ fn run_start(
             .unwrap_or(true)
     {
         eprintln!(
-            "ccteam: no projects under {} yet.\n  start one in another terminal: ccteam new \"<your idea>\"",
+            "ccteam: no projects under {} yet.\n  start one in another terminal: ccteam project new <slug> (e.g. `ccteam project new demo`)",
             paths.projects_root.display()
         );
     }
@@ -3618,7 +3618,7 @@ fn run_status() -> Result<()> {
     }
 
     if projects.is_empty() {
-        println!("  projects: (none — `ccteam new \"<idea>\"` to create one)");
+        println!("  projects: (none — `ccteam project new <slug>` to create one, e.g. `ccteam project new demo`)");
     } else {
         println!("  projects ({}):", projects.len());
         // Classify each project from the same file-backed progress truth that
@@ -3837,7 +3837,7 @@ fn show_slug_picker() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
     if projects.is_empty() {
-        println!("no projects yet — `ccteam new \"<your idea>\"` to make one.");
+        println!("no projects yet — `ccteam project new <slug>` to make one, e.g. `ccteam project new demo`.");
         return Ok(());
     }
     println!("`ccteam show` needs a slug. Available:");
@@ -3984,15 +3984,15 @@ fn run_spawn(paths: &CcteamPaths, slug: &str, role: &str, prompt: Option<&str>) 
 
 fn run_new(slug: String, team: String) -> Result<()> {
     if team.trim().is_empty() {
-        anyhow::bail!("ccteam new: --team must be non-empty");
+        anyhow::bail!("ccteam project new: --team must be non-empty");
     }
     // V0.4.3 F76: fail loud at the CLI boundary on invalid slug grammar
     // (whitespace / unicode / leading dash etc.) so we don't spawn
     // `~/projects/<garbage>/` and leave junk for the user to clean up.
-    let validated =
-        ccteam_core::validate_slug_format(&slug).with_context(|| format!("ccteam new {slug:?}"))?;
+    let validated = ccteam_core::validate_slug_format(&slug)
+        .with_context(|| format!("ccteam project new {slug:?}"))?;
     let paths = CcteamPaths::from_env()?;
-    // V0.4.2 F75: `ccteam new <slug>` delegates to `ccteam init` with
+    // V0.4.2 F75: `ccteam project new <slug>` delegates to `ccteam init` with
     // `install_in = <projects_root>/<final_slug>`. F22 invariant: if
     // the user-supplied slug isn't already prefixed with `<team>-`,
     // we prepend automatically so `~/.claude/rules/ccteam-lessons-

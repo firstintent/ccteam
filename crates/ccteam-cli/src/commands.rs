@@ -277,7 +277,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
 /// — a drift from the documented "override the derived slug" intent that
 /// silently sent users standing in an existing repo to an empty skeleton
 /// elsewhere). To create a fresh project under
-/// `<projects_root>/<team>-<slug>/`, use `ccteam new <slug>`.
+/// `<projects_root>/<team>-<slug>/`, use `ccteam project new <slug>`.
 fn resolve_install_target(opts: &InitOptions) -> Result<std::path::PathBuf> {
     if let Some(p) = &opts.install_in {
         let abs = if p.is_absolute() {
@@ -3441,7 +3441,7 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
     ));
     if projects.is_empty() {
         out.push_str(
-            "(no projects under ~/projects/. start one with `ccteam new \"<request>\"`.)\n",
+            "(no projects under ~/projects/. start one with `ccteam project new <slug>`, e.g. `ccteam project new demo`.)\n",
         );
         return out;
     }
@@ -3469,7 +3469,7 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
     out
 }
 
-/// `current_phase` is empty between `ccteam new` and the first
+/// `current_phase` is empty between `ccteam project new` and the first
 /// dispatch; surface that as `pending` instead of a blank column so
 /// `ls` and `show` are readable on fresh projects.
 fn display_phase(phase: &str) -> &str {
