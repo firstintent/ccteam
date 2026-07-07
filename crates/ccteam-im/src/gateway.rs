@@ -16,7 +16,7 @@ use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
-    chat_session_name, discover_external_claude_sessions, list_session_metas,
+    atomic_write_durable, chat_session_name, discover_external_claude_sessions, list_session_metas,
     parse_chat_session_name, read_session_meta, touch_last_active, write_session_meta,
     AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, Directive,
     DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
@@ -2612,6 +2612,10 @@ impl Gateway {
     /// so every call site need only call this after ANY routing / live-map
     /// change without tracking exactly what moved. Session content is NOT
     /// written (it lives in `meta.json`).
+    ///
+    /// Durability review P0-5: `atomic_write_durable` fsyncs the tmp file
+    /// before rename (+ best-effort parent-dir fsync) so a power loss can't
+    /// roll `live_sids` back to a stale snapshot.
     fn persist_routing(&self) -> Result<()> {
         let Some(path) = self.routing_path.as_ref() else {
             return Ok(());
@@ -2641,16 +2645,18 @@ impl Gateway {
                 .collect(),
             live_sids: self.sessions.keys().cloned().collect(),
         };
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&saved)?)?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        atomic_write_durable(path, &serde_json::to_vec_pretty(&saved)?)
     }
 
     /// v0.8.21 Wave-2 — persist the monotonic session-id counter to its own
     /// file. Called right after each `next_session` bump so the counter is
     /// durable BEFORE the sid is used (a spawn failure then leaves a harmless
     /// gap, never a reused sid).
+    ///
+    /// Durability review P0-5: this is the file whose power-loss rollback
+    /// risk is sharpest — a reverted counter means a REUSED sid, breaking
+    /// the "sid never reused" invariant. `atomic_write_durable` fsyncs the
+    /// tmp file before rename (+ best-effort parent-dir fsync).
     fn persist_next_sid(&self) -> Result<()> {
         let Some(path) = self.next_sid_path.as_ref() else {
             return Ok(());
@@ -2658,10 +2664,7 @@ impl Gateway {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.next_session.to_string())?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        atomic_write_durable(path, self.next_session.to_string().as_bytes())
     }
 
     /// v0.8.8 bug-fix — persist the USER side of a turn to

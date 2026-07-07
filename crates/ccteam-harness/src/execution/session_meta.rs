@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentVendor, PermissionMode, SessionProtocol};
 
+use super::fs_atomic::atomic_write_durable;
 use super::turns_mirror::chat_dir;
 
 // ── origin tag ────────────────────────────────────────────────────────────────
@@ -61,14 +62,16 @@ pub fn session_meta_path(project_dir: &Path, sid: &str) -> PathBuf {
 
 // ── write / read ──────────────────────────────────────────────────────────────
 
-/// Atomically write `meta.json` (tmp + rename) to `.ccteam/chat/<sid>/`.
+/// Durably write `meta.json` to `.ccteam/chat/<sid>/`: tmp file + `fsync` +
+/// rename + best-effort parent-dir `fsync` (see [`atomic_write_durable`]).
+/// `meta.json` is the sole session SoT (v0.8.21 Wave-2), so a power-loss
+/// rollback here would resurrect stale session state — worth the extra
+/// fsync given this file is written only at spawn / turn-completion
+/// frequency, not per-event.
 pub fn write_session_meta(project_dir: &Path, meta: &SessionMeta) -> Result<()> {
     let path = session_meta_path(project_dir, &meta.sid);
     std::fs::create_dir_all(path.parent().expect("path has parent"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(meta)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    atomic_write_durable(&path, serde_json::to_string_pretty(meta)?.as_bytes())
 }
 
 pub fn read_session_meta(project_dir: &Path, sid: &str) -> Result<SessionMeta> {

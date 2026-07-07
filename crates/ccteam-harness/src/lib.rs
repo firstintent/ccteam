@@ -63,6 +63,7 @@ pub use enriched_event::{
 pub use execution::claude_stream_json::{persisted_session_model, ClaudeStreamJsonAdapter};
 pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT_SESSION_PREFIX};
 pub use execution::codex_exec::codex_chat_session_name;
+pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::session_meta::{
     discover_external_claude_sessions, list_session_metas, read_session_meta, touch_last_active,
     write_session_meta, ExternalClaudeSession, SessionMeta, SessionOrigin,
