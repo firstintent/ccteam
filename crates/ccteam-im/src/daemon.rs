@@ -64,23 +64,50 @@ pub type AdapterFactory = Arc<
 /// vendor's memoised child (codex app-server) / live-session registry
 /// (stream-json) is shared across all that vendor's chat sessions.
 ///
-/// NOTE (v0.8.11): the stream-json adapter is constructed WITHOUT a HITL
-/// `CanUseToolResolver`, so a `hitl` stream-json session default-denies tool
-/// approvals (the safe direction). The default posture is `skip`, so the
-/// common path is unaffected; wiring the production resolver
-/// (→ `permission/ask` → IM) is a follow-up.
+/// v0.8.22 P0-2: the stream-json adapter's HITL resolver is wired
+/// POST-construction (see [`default_adapter_factory_with_stream_json_handle`]
+/// and `run_daemon_with_shutdown`) — a bare call to this fn returns an
+/// adapter with no resolver, so a `hitl` stream-json session default-denies
+/// until something calls `ClaudeStreamJsonAdapter::set_resolver` on the
+/// handle.
 pub fn default_adapter_factory() -> AdapterFactory {
+    default_adapter_factory_with_stream_json_handle().0
+}
+
+/// Like [`default_adapter_factory`], but also returns a direct handle to the
+/// stream-json Claude adapter singleton the factory captured.
+///
+/// The factory closure only hands out type-erased `Arc<dyn HarnessAdapter>`s
+/// (so the gateway can stay adapter-agnostic), which cannot be downcast back
+/// to the concrete `ClaudeStreamJsonAdapter` — but wiring the production HITL
+/// `CanUseToolResolver` (v0.8.22 P0-2, review §3.1-1) needs exactly that
+/// concrete type's `set_resolver`. This fn hands back BOTH: the
+/// `Arc<ClaudeStreamJsonAdapter>` and the type-erased `Arc<dyn HarnessAdapter>`
+/// wrapping it are clones of the SAME inner state (the adapter's `live`
+/// registry + its interior-mutable resolver cell), so calling
+/// `.set_resolver(..)` on the handle is visible to every session the factory
+/// spawns through the type-erased clone — no matter which was constructed
+/// first.
+///
+/// `run_daemon_with_shutdown` calls this (not the plain
+/// [`default_adapter_factory`]) so it can wire the resolver once the
+/// gateway, pending registry, and event sink all exist; the composition
+/// root (`ccteam start`) gets its handle from [`build_gateway_for_daemon`],
+/// which also routes through here.
+pub fn default_adapter_factory_with_stream_json_handle(
+) -> (AdapterFactory, Arc<ClaudeStreamJsonAdapter>) {
     let claude_tui: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
-    let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> =
-        Arc::new(ClaudeStreamJsonAdapter::new());
+    let claude_stream_json = Arc::new(ClaudeStreamJsonAdapter::new());
+    let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> = claude_stream_json.clone();
     let codex: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(CodexAppServerAdapter::new());
-    Arc::new(
+    let factory: AdapterFactory = Arc::new(
         move |vendor: AgentVendor, protocol: SessionProtocol| match (vendor, protocol) {
             (AgentVendor::Claude, SessionProtocol::StreamJson) => Arc::clone(&claude_stream),
             (AgentVendor::Claude, SessionProtocol::Terminal) => Arc::clone(&claude_tui),
             (AgentVendor::Codex, _) => Arc::clone(&codex),
         },
-    )
+    );
+    (factory, claude_stream_json)
 }
 
 fn format_gateway_user_error(err: &anyhow::Error) -> String {
@@ -158,6 +185,16 @@ pub struct DaemonArgs {
     /// (standalone `ccteam-im run`, no web) → the daemon builds + owns its
     /// gateway exactly as before.
     pub gateway: Option<Arc<Mutex<Gateway>>>,
+    /// v0.8.22 P0-2 — the stream-json Claude adapter singleton PAIRED with
+    /// `gateway` (both built together by [`build_gateway_for_daemon`] via
+    /// [`default_adapter_factory_with_stream_json_handle`]). The daemon calls
+    /// `set_resolver` on this handle once `pending` + the event sink are
+    /// wired, so a `hitl` stream-json session's `can_use_tool` reverse-RPCs
+    /// route to the SAME approval machinery IM/web already use. `None` on the
+    /// standalone path (`ccteam-im run`) — the daemon then builds + wires its
+    /// own via `default_adapter_factory_with_stream_json_handle`, UNLESS
+    /// `adapter_factory` is test-overridden (no production adapter to wire).
+    pub claude_stream_json_adapter: Option<Arc<ClaudeStreamJsonAdapter>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -179,6 +216,10 @@ impl std::fmt::Debug for DaemonArgs {
             .field("gateway_event_rx", &self.gateway_event_rx.is_some())
             .field("pending", &self.pending.is_some())
             .field("gateway", &self.gateway.is_some())
+            .field(
+                "claude_stream_json_adapter",
+                &self.claude_stream_json_adapter.is_some(),
+            )
             .finish()
     }
 }
@@ -207,10 +248,19 @@ where
         "ccteam-im daemon starting"
     );
 
-    let factory = args
-        .adapter_factory
-        .clone()
-        .unwrap_or_else(default_adapter_factory);
+    // v0.8.22 P0-2 — when no test-injected `adapter_factory` is present, build
+    // the production factory via the handle-returning variant so the
+    // standalone path (`args.gateway` is `None`) can wire the HITL resolver
+    // onto the stream-json adapter it is ABOUT to bake into the gateway
+    // below. A test-injected factory means test doubles, not the production
+    // `ClaudeStreamJsonAdapter` — nothing to wire.
+    let (factory, standalone_stream_json_handle) = match args.adapter_factory.clone() {
+        Some(f) => (f, None),
+        None => {
+            let (f, handle) = default_adapter_factory_with_stream_json_handle();
+            (f, Some(handle))
+        }
+    };
     // V0.6.8 F190 — load `~/.ccteam/config.yaml::projects[]` once at
     // startup so legacy bots (no `reg.project_dir`) whose project
     // lives outside the projects_root tree resolve correctly. Daemon
@@ -323,8 +373,30 @@ where
             g.set_pending(pending);
         }
         log_orphan_chat_sessions(&g).await;
-        g.set_event_sink(gateway_event_tx);
+        g.set_event_sink(gateway_event_tx.clone());
         g.set_im_reload_trigger(reload_tx);
+        // v0.8.22 P0-2 — wire the production HITL resolver onto the
+        // stream-json Claude adapter singleton, now that the gateway +
+        // pending registry + event sink all exist. Composition root
+        // (`ccteam start`) supplies its handle via
+        // `args.claude_stream_json_adapter` (built alongside `args.gateway`
+        // by `build_gateway_for_daemon`, so both name the SAME adapter this
+        // gateway spawns stream-json sessions through); the standalone path
+        // uses the one it just built above (`standalone_stream_json_handle`).
+        // `None` (a test-injected `adapter_factory`) ⇒ skip: nothing to wire
+        // (tests inject their own fake harness / deterministic resolver
+        // stub, never the production `ClaudeStreamJsonAdapter`).
+        if let Some(adapter) = args
+            .claude_stream_json_adapter
+            .clone()
+            .or(standalone_stream_json_handle)
+        {
+            adapter.set_resolver(Arc::new(crate::hitl::GatewayCanUseToolResolver::new(
+                Arc::clone(&gateway),
+                g.pending_handle(),
+                gateway_event_tx.clone(),
+            )));
+        }
     }
     let restore_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {
@@ -887,13 +959,24 @@ fn build_gateway(
 /// `Arc<Mutex<…>>`, clones the handle into both the web `AppState`
 /// (`AppState::with_gateway`) and [`DaemonArgs::gateway`], and the daemon
 /// then runs its identical post-build wiring (pending registry, restored
-/// session resume, event sink) on the shared handle. Building it here —
-/// instead of after the daemon spawns — eliminates the spawn-order race
-/// between the web task and the IM task: the handle exists before either
-/// runs. `registry` mirrors [`DaemonArgs::registry`] (the projects_root
-/// override; `None` → `~/projects`).
-pub fn build_gateway_for_daemon(registry: Option<PathBuf>) -> Result<Gateway> {
-    let factory = default_adapter_factory();
+/// session resume, event sink, and — v0.8.22 P0-2 — the stream-json HITL
+/// resolver) on the shared handle. Building it here — instead of after the
+/// daemon spawns — eliminates the spawn-order race between the web task and
+/// the IM task: the handle exists before either runs. `registry` mirrors
+/// [`DaemonArgs::registry`] (the projects_root override; `None` →
+/// `~/projects`).
+///
+/// Returns the [`Gateway`] PAIRED with the stream-json Claude adapter
+/// singleton `default_adapter_factory_with_stream_json_handle` built it
+/// with — the composition root threads this handle into
+/// [`DaemonArgs::claude_stream_json_adapter`] so `run_daemon_with_shutdown`
+/// can wire the production HITL resolver onto the SAME adapter this gateway
+/// spawns stream-json sessions through (a fresh, unrelated adapter singleton
+/// would silently never receive the wiring).
+pub fn build_gateway_for_daemon(
+    registry: Option<PathBuf>,
+) -> Result<(Gateway, Arc<ClaudeStreamJsonAdapter>)> {
+    let (factory, claude_stream_json) = default_adapter_factory_with_stream_json_handle();
     let projects_root: PathBuf = registry.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -902,12 +985,8 @@ pub fn build_gateway_for_daemon(registry: Option<PathBuf>) -> Result<Gateway> {
     let ccteam_root = crate::default_ccteam_root_public();
     let config_projects = crate::load_config_projects_map(&ccteam_root).unwrap_or_default();
     let bots = list_bots()?;
-    Ok(build_gateway(
-        factory,
-        &projects_root,
-        &config_projects,
-        &bots,
-    ))
+    let gateway = build_gateway(factory, &projects_root, &config_projects, &bots);
+    Ok((gateway, claude_stream_json))
 }
 
 /// Best-effort: (re)publish the gateway command menu to Telegram's

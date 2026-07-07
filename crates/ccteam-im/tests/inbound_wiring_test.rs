@@ -2424,6 +2424,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
         gateway_event_rx: Some(rx),
         pending: None,
         gateway: None,
+        ..Default::default()
     };
     run_daemon_with_shutdown(args, async {
         futures::future::pending::<()>().await;

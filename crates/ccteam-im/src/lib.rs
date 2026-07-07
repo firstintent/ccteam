@@ -30,6 +30,11 @@ pub mod acl;
 pub mod credentials;
 pub mod daemon;
 pub mod gateway;
+// v0.8.22 P0-2 — the shared "ask the user to approve/deny a tool call" HITL
+// core. Both Claude HITL surfaces (terminal `permission/ask` over mcp.sock,
+// stream-json's in-process `can_use_tool` resolver) funnel through this so
+// approval buttons / TTL / deny semantics never drift between protocols.
+pub mod hitl;
 // v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) read + install
 // backend. Reads the hub `index.json` over HTTPS + a `~/.ccteam/hub-cache/`
 // local cache, verifies each plugin body's sha256 against the index, and

@@ -404,6 +404,27 @@ impl GatewayEventSink {
     }
 }
 
+/// Everything a HITL approval prompt needs to render + route for one
+/// session, resolved in one shot by [`Gateway::hitl_prompt_context_for`]
+/// (v0.8.22 P0-2). Shared by BOTH Claude HITL surfaces — the terminal
+/// protocol's `permission/ask` (over mcp.sock) and the stream-json
+/// protocol's in-process `can_use_tool` resolver — so they render the exact
+/// same prompt shape from the exact same session state.
+#[derive(Debug, Clone)]
+pub struct HitlPromptContext {
+    /// IM/web channel to render the approve/deny prompt on.
+    pub channel: String,
+    /// Platform chat/recipient id within `channel`.
+    pub chat_id: String,
+    /// The session's role (persona), for the "session sX (role) wants to
+    /// run …" label.
+    pub role: String,
+    /// The owning project's `progress.jsonl` path, for the best-effort
+    /// `chat_permission_prompt_outstanding` operator-visibility line.
+    /// `None` when the gateway was never given project paths (unit tests).
+    pub progress_path: Option<PathBuf>,
+}
+
 /// A live `ccteam-chat-*` process with no matching tracked gateway session —
 /// a survivor of a prior daemon. The process name carries only slug+sid (not
 /// the owning chat), so orphans are a global concern and are never attributed
@@ -851,6 +872,16 @@ impl Gateway {
         pending: Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>>,
     ) {
         self.pending = pending;
+    }
+
+    /// v0.8.22 P0-2 — the live pending-interaction registry `Arc`, whichever
+    /// one is currently wired (an externally-injected one via
+    /// [`Self::set_pending`], or the fresh default `Gateway::new_with_factory`
+    /// created). Lets a caller wire a HITL resolver onto the SAME registry the
+    /// gateway itself resolves IM/web clicks through, without having to know
+    /// which of the two it is.
+    pub fn pending_handle(&self) -> Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>> {
+        Arc::clone(&self.pending)
     }
 
     /// Enable `/newproject <slug> <path>` by giving the gateway the path
@@ -1769,6 +1800,20 @@ impl Gateway {
     /// Build the `/new` receipt. v0.8.8 F1 — every `/new` mints a fresh sid
     /// (no more `(project, role)` reuse), so the posture is always exactly the
     /// requested one; the receipt just names the new session + flags hitl.
+    ///
+    /// v0.8.22 P0-2 (review §3.1-1) — this claim is Claude-only-honest as of
+    /// this fix: BOTH Claude protocols now route non-allowlist tool calls to
+    /// an IM/web approval prompt (terminal via the `PermissionRequest` hook's
+    /// `permission/ask`; stream-json — the default — via the in-process
+    /// `can_use_tool` resolver `daemon::default_adapter_factory_with_stream_json_handle`
+    /// wires). Before this fix a `hitl` stream-json session silently denied
+    /// every non-allowlist tool with NO prompt ever rendered, making this
+    /// exact wording false for the default protocol. Codex `hitl` sessions
+    /// are NOT covered (`codex_app_server.rs` documents: no codex→IM
+    /// approval routing exists yet, so they stay locked-down rather than
+    /// prompting) — this receipt is still emitted for a codex hitl spawn and
+    /// is honest ONLY in the "you get less access, not a bypass" sense, not
+    /// the "you'll be asked" sense a Claude user would read into it.
     fn new_session_receipt(outcome: &StartOutcome) -> String {
         let id = &outcome.id;
         let suffix = if outcome.permission_mode.is_hitl() {
@@ -4154,6 +4199,28 @@ impl Gateway {
     pub fn reply_target_for(&self, sid: &str) -> Option<(String, String)> {
         let session = self.sessions.get(sid)?;
         Some(pump_target(session))
+    }
+
+    /// v0.8.22 P0-2 — everything a HITL approval prompt needs for `sid`, in
+    /// one lock acquisition: the live reply target ([`Self::reply_target_for`]),
+    /// the role (for the "session sX (role) wants to run …" label), and the
+    /// project's `progress.jsonl` path (best-effort operator visibility —
+    /// `None` when `project_paths` was never wired, e.g. unit tests). `None`
+    /// when `sid` is not tracked, so a firing resolver fails safe to deny
+    /// (no chat to ask) instead of panicking. Read-only, holds no `.await`.
+    pub fn hitl_prompt_context_for(&self, sid: &str) -> Option<HitlPromptContext> {
+        let session = self.sessions.get(sid)?;
+        let (channel, chat_id) = pump_target(session);
+        let progress_path = self
+            .project_paths
+            .as_ref()
+            .map(|paths| paths.progress_jsonl(&session.project));
+        Some(HitlPromptContext {
+            channel,
+            chat_id,
+            role: session.role.clone(),
+            progress_path,
+        })
     }
 
     /// Create a session from the network API (W5b). Thin wrapper over

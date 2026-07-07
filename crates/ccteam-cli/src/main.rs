@@ -1860,19 +1860,28 @@ fn run_start(
         // web" has no daemon gateway) or IM is off, leave it `None`: the daemon
         // then builds + owns its own gateway exactly as before, and any web
         // session endpoint returns 503 (gateway is `None` in `AppState`).
-        let shared_gateway: Option<
-            std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>,
-        > = if web.disabled || imd.disabled {
-            None
+        // v0.8.22 P0-2 — `build_gateway_for_daemon` now also returns the
+        // stream-json Claude adapter singleton it baked into the gateway, so
+        // it can be threaded into `DaemonArgs::claude_stream_json_adapter`
+        // below: the daemon wires the production HITL resolver onto this
+        // EXACT adapter once pending + the event sink exist.
+        let (shared_gateway, shared_claude_stream_json): (
+            Option<std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>>,
+            Option<std::sync::Arc<ccteam_harness::ClaudeStreamJsonAdapter>>,
+        ) = if web.disabled || imd.disabled {
+            (None, None)
         } else {
             match ccteam_im::build_gateway_for_daemon(None) {
-                Ok(g) => Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
+                Ok((g, adapter)) => (
+                    Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
+                    Some(adapter),
+                ),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
                         "ccteam start: failed to build shared gateway; web session API will be unavailable (503), daemon builds its own"
                     );
-                    None
+                    (None, None)
                 }
             }
         };
@@ -1968,6 +1977,11 @@ fn run_start(
                 // the daemon and the web `AppState` drive ONE session map. When
                 // `None` (web off), the daemon builds + owns its own.
                 gateway: shared_gateway.clone(),
+                // v0.8.22 P0-2 — pairs with `gateway`: the stream-json Claude
+                // adapter singleton `build_gateway_for_daemon` baked into it,
+                // so the daemon can wire the production HITL resolver onto
+                // the EXACT adapter this gateway spawns sessions through.
+                claude_stream_json_adapter: shared_claude_stream_json.clone(),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {
@@ -2347,18 +2361,13 @@ const INTERACTION_ASK_TIMEOUT_SECS: u64 = 600;
 /// agent's whole turn, so a long park is worse than a fast fail-safe deny.
 /// On lapse the hook still denies (fail-safe = deny). Env-overridable
 /// (`CCTEAM_PERMISSION_PROMPT_TTL_SECS`) for ops + tests.
-const PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT: u64 = 120;
-
-/// Resolve the HITL permission-prompt TTL: the env override when set + valid,
-/// else [`PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT`]. Clamped to ≥1s so a
-/// misconfig can't make the prompt expire instantly (which would deny every
-/// tool before the user can possibly click).
+///
+/// v0.8.22 P0-2 — delegates to [`ccteam_im::hitl::permission_prompt_timeout_secs`]
+/// (the SAME knob the stream-json protocol's in-process HITL resolver reads),
+/// so the terminal protocol's `permission/ask` hook and the stream-json
+/// protocol's `can_use_tool` resolver can never drift on the TTL.
 fn permission_prompt_timeout_secs() -> u64 {
-    std::env::var("CCTEAM_PERMISSION_PROMPT_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT)
+    ccteam_im::hitl::permission_prompt_timeout_secs()
 }
 
 /// Monotonic id source so each `chat_send_file` gets a distinct durable
@@ -2985,24 +2994,13 @@ fn emit_permission_prompt_outstanding(
 /// call for the approval prompt. Picks the most useful field per common tool
 /// (`Bash` → command, file tools → path) and truncates so the IM message
 /// stays compact. Falls back to the tool name when no obvious field exists.
+///
+/// v0.8.22 P0-2 — delegates to [`ccteam_im::hitl::summarize_tool_input`] (the
+/// SAME renderer the stream-json protocol's in-process HITL resolver uses),
+/// so an approval prompt reads identically regardless of which protocol
+/// produced it.
 fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> String {
-    const MAX: usize = 160;
-    let pick = |key: &str| tool_input.get(key).and_then(|v| v.as_str());
-    let detail = pick("command")
-        .or_else(|| pick("file_path"))
-        .or_else(|| pick("path"))
-        .or_else(|| pick("url"))
-        .or_else(|| pick("pattern"));
-    let body = match detail {
-        Some(d) => format!("{tool_name} {d}"),
-        None => tool_name.to_string(),
-    };
-    if body.chars().count() > MAX {
-        let truncated: String = body.chars().take(MAX).collect();
-        format!("{truncated}…")
-    } else {
-        body
-    }
+    ccteam_im::hitl::summarize_tool_input(tool_name, tool_input)
 }
 
 // =====================================================================

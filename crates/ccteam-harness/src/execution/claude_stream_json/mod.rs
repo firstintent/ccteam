@@ -113,9 +113,20 @@ pub struct ClaudeStreamJsonAdapter {
     live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
     /// HITL resolver for `can_use_tool` reverse RPCs. `None` = no HITL
     /// wiring (a hitl session then default-denies, the safe direction).
-    /// The gateway wires the production resolver (→ `permission/ask` → IM)
-    /// in Wave 3; tests inject a deterministic stub.
-    resolver: Option<Arc<dyn CanUseToolResolver>>,
+    ///
+    /// Interior-mutable (`Arc<StdMutex<..>>`, not a plain field) because this
+    /// adapter is a per-(vendor,protocol) SINGLETON constructed inside
+    /// `ccteam_im::daemon::default_adapter_factory` — before the gateway's
+    /// pending-approval machinery (event sink + pending registry) exists.
+    /// The daemon calls [`Self::set_resolver`] once that machinery is wired
+    /// (`run_daemon_with_shutdown`); every clone of this adapter — including
+    /// the one already captured inside the factory closure the gateway holds
+    /// — observes the update because the cell is shared, not copied. Each new
+    /// session spawn reads the CURRENT value at `start_thread` time, so
+    /// wiring the resolver after the adapter is constructed (but before any
+    /// session spawns) works correctly (v0.8.22 P0-2). Tests inject a
+    /// deterministic stub via [`Self::with_resolver`].
+    resolver: Arc<StdMutex<Option<Arc<dyn CanUseToolResolver>>>>,
 }
 
 impl std::fmt::Debug for ClaudeStreamJsonAdapter {
@@ -780,10 +791,23 @@ impl ClaudeStreamJsonAdapter {
         Self::default()
     }
 
-    /// Attach the HITL `can_use_tool` resolver (gateway wiring, Wave 3).
-    pub fn with_resolver(mut self, resolver: Arc<dyn CanUseToolResolver>) -> Self {
-        self.resolver = Some(resolver);
+    /// Attach the HITL `can_use_tool` resolver at construction time
+    /// (test-only builder pattern — production wiring happens post-
+    /// construction via [`Self::set_resolver`], see the field doc).
+    pub fn with_resolver(self, resolver: Arc<dyn CanUseToolResolver>) -> Self {
+        self.set_resolver(resolver);
         self
+    }
+
+    /// Wire (or replace) the production HITL resolver AFTER construction.
+    /// `&self` (not `&mut self`): the resolver lives behind a shared
+    /// `Arc<StdMutex<..>>` cell so every clone of this adapter — including
+    /// the singleton the gateway's `(vendor, protocol)` factory closure
+    /// captured — sees the update (v0.8.22 P0-2: the daemon calls this once
+    /// the gateway + pending registry + event sink are ready, closing the
+    /// "stream-json hitl sessions silently deny with no resolver wired" gap).
+    pub fn set_resolver(&self, resolver: Arc<dyn CanUseToolResolver>) {
+        *self.resolver.lock().unwrap() = Some(resolver);
     }
 
     fn lookup(&self, identity: &str) -> Option<Arc<LiveSession>> {
@@ -964,11 +988,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // replies with a control_response. A skip session never gets one,
         // so no dispatcher is needed.
         if ctx.permission_mode.is_hitl() {
-            spawn_hitl_dispatcher(
-                Arc::clone(&transport),
-                ctx.sid.clone(),
-                self.resolver.clone(),
-            );
+            // Snapshot the CURRENT resolver at spawn time (not at adapter
+            // construction time — see the field doc on why this is a
+            // shared, lazily-wired cell).
+            let resolver = self.resolver.lock().unwrap().clone();
+            spawn_hitl_dispatcher(Arc::clone(&transport), ctx.sid.clone(), resolver);
         }
         // v0.8.19 — restore the 1M context window on resume. `build_argv`
         // stripped the `[1m]` tag from `--model` (claude rejects `…[1m]` and
