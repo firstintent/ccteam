@@ -18,6 +18,11 @@ mod mcp_tool_groups;
 // `.claude/agents/<bot>.md` + emit progress events).
 mod mcp_admin_tools;
 mod web_chat_bridge;
+// v0.8.22 — bare `ccteam doctor` full readiness checkup (claude/codex/
+// tmux binaries, MCP registration, daemon health, pricing, home-layout
+// drift). Historical one-shot migration/repair flags keep dispatching
+// through `commands::run_doctor` unchanged; see `doctor::is_bare_invocation`.
+mod doctor;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -265,16 +270,26 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCommand,
     },
-    /// Health checks + tool-surface maintenance.
+    /// Bare `ccteam doctor` (no flags) runs a full readiness checkup:
+    /// claude/codex binaries, tmux, MCP registration (Claude + Codex),
+    /// daemon health, pricing staleness, and `~/.ccteam` home-layout
+    /// drift — one `[PASS]/[WARN]/[FAIL]/[SKIP]` line per check plus a
+    /// summary line, exit code 1 iff any check FAILs. `--verify-mcp` is
+    /// a separate CI-oriented invariant (the MCP tool-surface / STUB
+    /// self-check) and stays a visible flag. A handful of historical
+    /// one-shot migration / repair flags from older ccteam versions
+    /// still work exactly as before but are hidden from `--help` to
+    /// keep it short (see `docs/versions/` for what each one does).
     Doctor {
         /// Print + return what would happen without touching the
-        /// filesystem.
-        #[arg(long, default_value_t = false)]
+        /// filesystem. Only meaningful paired with one of the hidden
+        /// migration/repair flags below.
+        #[arg(long, default_value_t = false, hide = true)]
         dry_run: bool,
         /// Cross-check every shipped phase template's tools_required
         /// against the live tool surface (plugin pipeline + user
         /// agents/skills + MCP servers) and print a markdown report.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         tool_surface: bool,
         // v0.8.6 Item 4 — the setup actions formerly exposed here
         // (`--install-mcp` / `--install-skill` / `--install-all`) moved to
@@ -287,14 +302,14 @@ enum Command {
         /// User content outside markers is preserved. Discovers teams by
         /// scanning `~/.ccteam/teams/<name>/team.yaml` for non-empty
         /// `retro_schema` (V0.2 M0.16.2).
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         install_memory_bridge: bool,
         /// V0.2 M0.16.2: re-write every shipped team's seed
         /// (`~/.ccteam/teams/<name>/team.yaml` + `~/.ccteam/<phase_dir>/*.md`)
         /// from the in-binary bundle. `force=false` preserves operator
         /// hand-edits; pair with `--force` to clobber. Useful after a
         /// ccteam upgrade ships schema-additive team.yaml fields.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         reset_shipped_teams: bool,
         /// V0.2 M0.18.5: load + validate the named team's
         /// `team.yaml` and every phase markdown under its phase dir.
@@ -302,7 +317,7 @@ enum Command {
         /// (without failing) on protocol-literal residue in phase
         /// bodies. Pass the team name as the value (e.g.
         /// `--validate-team dev`).
-        #[arg(long, value_name = "TEAM")]
+        #[arg(long, value_name = "TEAM", hide = true)]
         validate_team: Option<String>,
         /// V0.2 M0.20: remove stale `~/.claude/agents/<name>.md`
         /// symlinks left by the V0.1 `--install-recommended-agents`
@@ -311,13 +326,13 @@ enum Command {
         /// `enabledPlugins` in `<project>/.claude/settings.json`, so
         /// these symlinks are obsolete. Idempotent — no-op when no
         /// marketplace symlinks remain.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         migrate_recommended_agents: bool,
         /// V0.2.2 F38: render a one-shot PNG screenshot of the given
         /// project's tmux pane to verify the `vt100 + imageproc` path
         /// end-to-end. Reports the font in use + the resulting PNG
         /// path or the degrade reason (tmux missing / font / IO).
-        #[arg(long, value_name = "SLUG")]
+        #[arg(long, value_name = "SLUG", hide = true)]
         screenshot_smoke: Option<String>,
         /// V0.4.2 F74: fold V0.4.1 project layout into the new
         /// `~/.ccteam/config.yaml`. Walks `~/projects/*` and appends
@@ -325,7 +340,7 @@ enum Command {
         /// projects[]`; folds `~/.ccteam/watchdog.yaml` into
         /// `config.yaml::watchdog` and renames the old file to
         /// `watchdog.yaml.migrated`. Idempotent.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         migrate_v041_to_v042: bool,
         /// V0.4.6 F83: move every registered project's root
         /// `workflow.yaml` into `<project>/.ccteam/workflow.yaml`.
@@ -333,7 +348,7 @@ enum Command {
         /// the files. Conflicts (both locations populated) are
         /// fail-safe — neither file is touched and the user is told
         /// to resolve by hand. Idempotent.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         migrate_workflow_to_ccteam_dir: bool,
         /// V0.4.6 F85: reclaim terminated `~/.claude/jobs/<id>/`
         /// directories older than
@@ -343,30 +358,30 @@ enum Command {
         /// `rm -rf` eligible entries. Never touches dirs whose
         /// `state.json::state == "working"` or whose `state.json` is
         /// missing / unparseable.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         gc_claude_jobs: bool,
         /// V0.4.6 F91: walk every registered project's
         /// `.claude/settings.json` and strip the legacy
         /// `ccteam hook cost-accumulate` PostToolUse entry. Idempotent —
         /// re-runs after success are no-ops. Pair with `--dry-run` to
         /// preview the scrub.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         update_hooks: bool,
         /// V0.5.0 F92: print the embedded `pricing.json` schema_version
         /// next to today's date and WARN when the table is older than
         /// 180 days. No fs mutation; pure readout to remind operators
         /// to upgrade ccteam when the bundled rate sheet ages out.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         check_pricing_version: bool,
         /// V0.6.0 Wave 3 F112: probe `codex --version` and warn when
         /// older than 0.131 (minimum supported by Wave 3 mode-3 codex
         /// bot path). No fs mutation. Pairs with --check-codex-auth.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         check_codex_version: bool,
         /// V0.6.0 Wave 3 F112: probe `codex login status` and report
         /// whether the operator is logged in to ChatGPT / API. No fs
         /// mutation. Pairs with --check-codex-version.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         check_codex_auth: bool,
         /// V0.6.5 F155: deterministic gate for the `ccteam-creator`
         /// Phase 3.5 Codex auto-critic detection. Probes whether
@@ -379,7 +394,7 @@ enum Command {
         /// `executor: codex`). The skill consults this subprocess
         /// instead of running `codex --version && codex login status`
         /// inline so the gate is deterministic + testable.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         check_codex_auto_critic: bool,
         /// V0.6.6 F173: reconcile `<ccteam_root>/cost-budget.json` ledger
         /// rows against every registered project's `progress.jsonl`
@@ -389,14 +404,14 @@ enum Command {
         /// ledger row). Silent OK when fully reconciled. No fs mutation —
         /// pure-readout invariant check; future regressions (a new vendor
         /// adapter that forgets the ledger hook) surface here.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         check_cost_orphan: bool,
         /// V0.6.1 F139: materialize the `~/.ccteam/hooks/hook.sh`
         /// daemon-aware Claude Code hook dispatcher (idempotent, chmod
         /// 0755). Run after a ccteam binary upgrade to refresh the
         /// script body. `ccteam init` already does this on first
         /// install.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         install_hooks: bool,
         /// V0.6.1 F139: rewrite every registered project's
         /// `.claude/settings.json` so hook commands invoke
@@ -404,13 +419,13 @@ enum Command {
         /// `<ccteam-bin> internal hook ...` form (or older `cct hook
         /// ...` / `ccteam hook ...` forms). Idempotent; pair with
         /// `--dry-run` to preview without writing.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         migrate_hook_commands: bool,
         /// V0.4.6 F83/F85: pair with `--migrate-workflow-to-ccteam-dir`
         /// or `--gc-claude-jobs` to commit changes to disk instead of
         /// previewing them. Without it, those subcommands run as
         /// dry-run.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, hide = true)]
         apply: bool,
         /// V0.6.6 F171: assert the MCP tool surface is fully wired.
         /// Counts active vs STUB tools (cross-checked against
@@ -1607,6 +1622,20 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
         };
         print!("{body}");
         if !report.ok() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // v0.8.22 — a truly bare `ccteam doctor` (no flags at all) now runs
+    // the full readiness checkup instead of only the implicit pricing
+    // check; any explicit flag (including the now-hidden migration/
+    // repair ones) still dispatches through `commands::run_doctor`
+    // completely unchanged, so every existing flag-driven test keeps
+    // pinning the exact same behavior.
+    if doctor::is_bare_invocation(&opts) {
+        let (body, any_fail) = doctor::run_readiness_checkup(&paths);
+        print!("{body}");
+        if any_fail {
             std::process::exit(1);
         }
         return Ok(());

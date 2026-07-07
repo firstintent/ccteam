@@ -115,28 +115,49 @@ fn check_pricing_version_errors_when_table_is_400_days_old() {
 }
 
 #[test]
-fn doctor_without_flag_runs_pricing_check_implicitly() {
-    // F121 acceptance gate #3 — `ccteam doctor` (no mode flag) must
-    // run the pricing-staleness check (otherwise operators only see
-    // it when they remember the explicit flag).
+fn doctor_without_flag_runs_full_readiness_checkup_including_pricing() {
+    // v0.8.22 — F121 acceptance gate #3 originally required the bare
+    // `ccteam doctor` (no mode flag) to surface pricing staleness
+    // without the operator remembering the explicit flag. Bare doctor
+    // now runs a *full* readiness checkup (claude/codex/tmux/MCP/
+    // daemon/pricing/home-layout — one line per check); this asserts
+    // the pricing checklist line is still one of them. The detailed
+    // per-vendor `[pricing.anthropic]` / `[pricing.openai]` breakdown
+    // (and the `CCTEAM_TEST_NOW` staleness-threshold coverage above)
+    // remains exercised via the explicit, still-functional (if now
+    // hidden from `--help`) `--check-pricing-version` flag.
+    //
+    // Full env sandbox (isolated CCTEAM_HOME / HOME / CLAUDE_CONFIG_HOME)
+    // so this never reads the developer's real `~/.claude.json` /
+    // `~/.ccteam` — the bare checkup also probes MCP registration and
+    // home-layout drift now, not just pricing.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let claude_config_home = tmp.path().join(".claude");
+    std::fs::create_dir_all(&claude_config_home).unwrap();
+    let fake_home = tmp.path().join("fake-home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
         .env("CCTEAM_TEST_NOW", "2026-06-24")
+        .env("CLAUDE_CONFIG_HOME", &claude_config_home)
+        .env("CCTEAM_HOME", tmp.path().join("ccteam-home"))
+        .env("HOME", &fake_home)
+        .env("CODEX_HOME", tmp.path().join("codex-home"))
         .arg("doctor")
         .output()
         .expect("spawn ccteam doctor");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(out.status.code().unwrap_or(-1), 0, "stdout:\n{stdout}");
     assert!(
-        stdout.contains("ccteam doctor --check-pricing-version"),
-        "implicit pricing-check report missing when no flag passed. \
-         stdout:\n{stdout}",
+        stdout.contains("ccteam doctor: readiness checkup"),
+        "bare doctor should run the full readiness checkup. stdout:\n{stdout}",
     );
-    assert_both_vendor_lines(&stdout);
-    // Help block should still be printed after the report so
-    // first-time users discover the opt-in mutation modes.
     assert!(
-        stdout.contains("pass at least one mode flag"),
-        "help block missing in implicit run. stdout:\n{stdout}",
+        stdout.contains("pricing tables"),
+        "pricing checklist line missing from bare doctor. stdout:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("summary:"),
+        "bare doctor should end with a summary line. stdout:\n{stdout}",
     );
 }
