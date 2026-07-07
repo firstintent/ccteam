@@ -210,12 +210,9 @@ fn probe_binary(
 /// `tmux` is only needed for the `terminal` session protocol (the
 /// bundled rmux backend works with no external tmux) — WARN, not FAIL.
 fn check_tmux() -> CheckLine {
-    match Command::new("tmux").arg("-V").output() {
-        Ok(out) if out.status.success() => {
-            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            CheckLine::new(CheckStatus::Pass, "tmux", version)
-        }
-        _ => CheckLine::new(
+    match ccteam_core::tmux::tmux_version() {
+        Some(version) => CheckLine::new(CheckStatus::Pass, "tmux", version),
+        None => CheckLine::new(
             CheckStatus::Warn,
             "tmux",
             "not found on PATH — only needed for the `terminal` session protocol \
