@@ -78,6 +78,12 @@ pub struct AppState {
     /// started this process. Single slot is enough: the web config flow is
     /// one operator binding one chat at a time.
     pub im_poll: Arc<Mutex<Option<TelegramChatIdPoll>>>,
+    /// v0.8.22 P1 (review §3.1-3) — per-session SSE replay ring + live tap
+    /// (see `crate::ring`'s module doc). Always present (even with no
+    /// gateway — it just never gets fed), so the SSE handler doesn't need a
+    /// separate `Option`. The feeder task is spawned once, alongside the
+    /// gateway, in [`Self::with_gateway`].
+    pub(crate) session_ring: Arc<crate::ring::SessionEventRing>,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -150,6 +156,7 @@ impl AppState {
             gateway: None,
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
+            session_ring: Arc::new(crate::ring::SessionEventRing::new()),
         }
     }
 
@@ -173,7 +180,18 @@ impl AppState {
     /// drive the *same* in-memory session map. The standalone "internal
     /// web" path never calls this, leaving `gateway = None` so session
     /// endpoints return 503.
+    ///
+    /// v0.8.22 P1 (review §3.1-3) — also spawns the ONE persistent
+    /// [`crate::ring::spawn_ring_feeder`] task for this gateway, so the SSE
+    /// replay ring stays populated for as long as the daemon runs,
+    /// independent of whether any per-session SSE client is connected. This
+    /// is a composition-root call (mirrors the gateway attach itself): call
+    /// it more than once and you get one feeder task per call, each
+    /// independently recording the same events into the ring under
+    /// different seqs — harmless in practice (nothing production does this)
+    /// but not something to do casually.
     pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
+        crate::ring::spawn_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.session_ring));
         self.gateway = Some(gateway);
         self
     }

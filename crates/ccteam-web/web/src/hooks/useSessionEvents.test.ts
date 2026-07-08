@@ -11,6 +11,7 @@ import {
   appendSessionEvent,
   parseSessionEvent,
   sessionEventsUrl,
+  shouldAcceptEventSeq,
   SESSION_RING_CAP,
   type SessionEvent,
 } from "./useSessionEvents";
@@ -23,6 +24,39 @@ describe("sessionEventsUrl", () => {
   });
   it("encodes the sid", () => {
     expect(sessionEventsUrl("s/odd")).toBe("/api/v1/sessions/s%2Fodd/events");
+  });
+
+  // v0.8.22 P1 (review §3.1-3) — the reconnect watermark query fallback.
+  it("omits last_event_id when absent, zero, or negative (a fresh connect)", () => {
+    expect(sessionEventsUrl("s1")).toBe("/api/v1/sessions/s1/events");
+    expect(sessionEventsUrl("s1", 0)).toBe("/api/v1/sessions/s1/events");
+    expect(sessionEventsUrl("s1", -1)).toBe("/api/v1/sessions/s1/events");
+  });
+  it("appends last_event_id when it names a real watermark", () => {
+    expect(sessionEventsUrl("s1", 42)).toBe("/api/v1/sessions/s1/events?last_event_id=42");
+  });
+});
+
+describe("shouldAcceptEventSeq (review §3.1-3 reconnect dedup)", () => {
+  it("accepts and advances on a strictly-increasing seq", () => {
+    const first = shouldAcceptEventSeq("1", 0);
+    expect(first).toEqual({ accept: true, nextHighest: 1 });
+    const second = shouldAcceptEventSeq("2", first.nextHighest);
+    expect(second).toEqual({ accept: true, nextHighest: 2 });
+  });
+
+  it("rejects a replayed/reseeded frame at or below the watermark", () => {
+    expect(shouldAcceptEventSeq("2", 5)).toEqual({ accept: false, nextHighest: 5 });
+    expect(shouldAcceptEventSeq("5", 5)).toEqual({ accept: false, nextHighest: 5 });
+  });
+
+  it("passes through a frame with no seq at all (never dedups it)", () => {
+    expect(shouldAcceptEventSeq(undefined, 5)).toEqual({ accept: true, nextHighest: 5 });
+    expect(shouldAcceptEventSeq("", 5)).toEqual({ accept: true, nextHighest: 5 });
+  });
+
+  it("passes through a non-numeric id defensively (never throws)", () => {
+    expect(shouldAcceptEventSeq("not-a-number", 5)).toEqual({ accept: true, nextHighest: 5 });
   });
 });
 

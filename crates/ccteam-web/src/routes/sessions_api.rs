@@ -55,8 +55,8 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -64,8 +64,9 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol, ThreadStatus};
+use ccteam_harness::{AgentVendor, ChoicePrompt, PermissionMode, SessionProtocol, ThreadStatus};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
+use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -707,14 +708,150 @@ pub(crate) async fn handle_session_resolve(
     }
 }
 
+/// Query-string fallback for `Last-Event-ID` (v0.8.22 P1, review §3.1-3).
+/// `EventSource` cannot set arbitrary request headers, and
+/// [`handle_session_events`] deliberately opens a BRAND NEW `EventSource` on
+/// every reconnect (see `useSessionEvents.ts`'s `connect()` — it explicitly
+/// closes + reopens rather than relying on the browser's own auto-retry, so
+/// the browser's native "resend `Last-Event-ID` on its own reconnect"
+/// behavior never applies here). The SPA therefore threads the watermark
+/// through this query param; the standard header is ALSO honored (useful
+/// for curl / future non-browser SSE clients, and it wins if both are
+/// somehow present).
+#[derive(Debug, Deserialize)]
+pub(crate) struct SessionEventsQuery {
+    #[serde(default)]
+    last_event_id: Option<String>,
+}
+
+/// Resolve the reconnect watermark from the standard `Last-Event-ID` header
+/// or the `?last_event_id=` query fallback. `None` for a fresh connect (no
+/// watermark at all) or an unparseable value — defensive: a bad query
+/// string degrades to "no replay", never a 4xx.
+fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuery) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .or(query.last_event_id.as_deref())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Rebuild the exact [`GatewayEvent`] shape the HITL approval flow
+/// (`ccteam_im::hitl::ask_permission` / `ccteam-cli`'s
+/// `execute_permission_ask`) originally broadcast, from the
+/// [`ccteam_im::pending::PendingInteractions`] entry alone — used to
+/// re-seed a still-outstanding approval on SSE (re)connect (v0.8.22 P1,
+/// review §3.1-3). The `id` mirrors the original (`"permission-{token}"`)
+/// so [`session_event_payload`] renders the identical `token`/`options`
+/// shape the live broadcast used.
+fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
+    use ccteam_im::gateway::GatewayEventKind;
+    GatewayEvent {
+        id: format!("permission-{}", prompt.token),
+        channel: String::new(),
+        chat_id: String::new(),
+        thread_ts: None,
+        content: prompt.title.clone(),
+        kind: GatewayEventKind::Answer,
+        attachments: Vec::new(),
+        options: prompt
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| MessageOption {
+                data: format!("{}:{i}", prompt.token),
+                label: opt.label.clone(),
+                id: opt.id.clone(),
+            })
+            .collect(),
+        sid: Some(sid.to_string()),
+    }
+}
+
+/// Build the catch-up batch a (re)connecting SSE client gets BEFORE the live
+/// tail (v0.8.22 P1, review §3.1-3): the ring's best-effort backlog replay
+/// (only when the caller sent a `last_id` watermark) PLUS an unconditional
+/// pending-approval reseed. The reseed is independent of ring contents/
+/// `last_id` on purpose — a brand-new tab with no watermark at all must
+/// still see a still-outstanding approval, not just a reconnecting one whose
+/// gap happens to be covered by the ring. Skips the reseed when the ring
+/// replay already carries that same approval's token (avoids an
+/// always-visible double-render on a plain reconnect).
+///
+/// Returns `(seq, event)` pairs rather than rendered [`Event`]s — split out
+/// so this is unit-testable with plain assertions (mirrors why
+/// [`session_event_payload`] is split from [`session_event`]: asserting on
+/// an axum `Event`'s rendered body is awkward). [`build_catchup_events`] is
+/// the thin wrapper the handler actually calls.
+async fn build_catchup_entries(
+    app: &AppState,
+    sid: &str,
+    last_id: Option<u64>,
+) -> Vec<(u64, GatewayEvent)> {
+    let Some(gw) = app.gateway.as_ref() else {
+        return Vec::new();
+    };
+    let ring_entries: Vec<crate::ring::RingEntry> = match last_id {
+        Some(since) => app
+            .session_ring
+            .replay_since(sid, since)
+            .into_iter()
+            .filter(|e| !is_im_only_event(&e.event))
+            .collect(),
+        None => Vec::new(),
+    };
+    let already_seeded_token = ring_entries
+        .iter()
+        .rev()
+        .find_map(|e| approval_token(&e.event));
+
+    let mut entries: Vec<(u64, GatewayEvent)> =
+        ring_entries.into_iter().map(|e| (e.seq, e.event)).collect();
+
+    let pending_prompt = {
+        let pending = gw.lock().await.pending_handle();
+        let guard = pending.lock().await;
+        guard.pending_for_sid(sid).map(|p| p.prompt.clone())
+    };
+    if let Some(prompt) = pending_prompt {
+        if already_seeded_token.as_deref() != Some(prompt.token.as_str()) {
+            let synthetic = synthetic_approval_event(sid, &prompt);
+            let seq = app.session_ring.record(sid, synthetic.clone());
+            entries.push((seq, synthetic));
+        }
+    }
+    entries
+}
+
+/// Render [`build_catchup_entries`]'s output as SSE [`Event`]s — the form
+/// [`handle_session_events`] actually streams.
+async fn build_catchup_events(app: &AppState, sid: &str, last_id: Option<u64>) -> Vec<Event> {
+    build_catchup_entries(app, sid, last_id)
+        .await
+        .into_iter()
+        .map(|(seq, ev)| session_event(&ev, seq))
+        .collect()
+}
+
 /// `GET /api/v1/sessions/{sid}/events`
 ///
-/// SSE stream for one session. Subscribes to the gateway's event broadcast
-/// ([`Gateway::subscribe_events`](ccteam_im::gateway::Gateway::subscribe_events))
-/// and keeps only [`GatewayEvent`]s whose `sid` matches this session id —
-/// the cross-stage filter key. 15s keep-alive; a lagging consumer (broadcast
+/// SSE stream for one session. Subscribes to the SSE replay ring's live tap
+/// ([`crate::ring::SessionEventRing::subscribe`], fed by the ONE persistent
+/// feeder off the gateway's event broadcast — see `crate::ring`'s module
+/// doc) and keeps only entries whose `sid` matches this session id — the
+/// cross-stage filter key. 15s keep-alive; a lagging consumer (broadcast
 /// `Lagged`) gets a synthetic `reconnect_hint` then the stream closes for the
 /// SPA's `EventSource` to auto-reconnect.
+///
+/// v0.8.22 P1 (review §3.1-3) — before the live tail, a (re)connecting
+/// client gets a catch-up batch ([`build_catchup_events`]): the ring's
+/// best-effort backlog replay when `Last-Event-ID` (header or
+/// `?last_event_id=` query fallback) names a watermark, PLUS an
+/// unconditional pending-approval reseed so an outstanding HITL approval
+/// renders again on ANY (re)connect — including a brand-new tab that never
+/// had a watermark. Every emitted frame now carries an SSE `id:` (the
+/// ring's per-sid monotonic seq) so the client can dedupe a replayed/
+/// reseeded frame against one it already rendered.
 ///
 /// No-gateway: a 503 here would close the `EventSource` and the SPA would
 /// retry-loop, so we instead emit a single `gateway_unavailable` SSE frame
@@ -729,57 +866,64 @@ pub(crate) async fn handle_session_resolve(
 /// OpenAPI note: this is a **Server-Sent Events** stream, which OpenAPI
 /// cannot fully model as a JSON response body. The response is declared
 /// as `text/event-stream`; each `event: progress` frame's `data` is a
-/// JSON line `{id, sid, kind:"answer"|"progress", content, done?, options?}`.
+/// JSON line `{id, sid, kind:"answer"|"progress", content, done?, options?}`,
+/// and the SSE frame itself carries an `id:` (the replay-ring seq).
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{sid}/events",
     tag = "sessions",
-    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    params(
+        ("sid" = String, Path, description = "Gateway session id (`s{n}`)"),
+        ("last_event_id" = Option<String>, Query, description = "Reconnect watermark (query fallback for the `Last-Event-ID` header — EventSource can't set custom headers)"),
+    ),
     responses(
-        (status = 200, description = "SSE stream (text/event-stream). Frames: `event: progress` with `data` = `{id, sid, kind, content, done?, options?}`. Never 503 — a no-gateway path emits one `gateway_unavailable` frame then keep-alives.", content_type = "text/event-stream"),
+        (status = 200, description = "SSE stream (text/event-stream). Frames: `event: progress` with `data` = `{id, sid, kind, content, done?, options?}`, each carrying an SSE `id:` seq. Never 503 — a no-gateway path emits one `gateway_unavailable` frame then keep-alives.", content_type = "text/event-stream"),
     ),
 )]
 pub(crate) async fn handle_session_events(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
+    Query(query): Query<SessionEventsQuery>,
+    headers: HeaderMap,
 ) -> Response {
     // v0.8.18 档1 — gate by the session's project (per-user isolation); a
     // tenant can't subscribe to a session in a project it can't see.
     if let Some(deny) = gate_sid(&app, &identity, &sid).await {
         return deny;
     }
-    // Subscribe under a brief lock (subscribe_events only clones a Sender +
-    // registers a Receiver; no `.await` is held under the guard). `None`
-    // gateway keeps the standalone no-gateway contract.
-    let rx = match app.gateway.as_ref() {
-        Some(gw) => Some(gw.lock().await.subscribe_events()),
-        None => None,
-    };
+    let last_id = parse_last_event_id(&headers, &query);
+    // Subscribe to the ring's live tap BEFORE computing the catchup batch:
+    // any event recorded in the small window between the two lands in the
+    // LIVE tail (a possible, harmless at-most-once duplicate the client's
+    // seq-based dedup swallows) rather than a silent gap. `None` gateway
+    // keeps the standalone no-gateway contract.
+    let rx = app.gateway.as_ref().map(|_| app.session_ring.subscribe());
     let target_sid = sid.clone();
     // Unify both arms into one stream type (`Either`) so the function has a
-    // single `impl Stream` return. With a gateway: the filtered broadcast.
-    // Without: a one-shot `gateway_unavailable` notice (then only keep-alives).
+    // single `impl Stream` return. With a gateway: the catchup batch chained
+    // into the filtered live tap. Without: a one-shot `gateway_unavailable`
+    // notice (then only keep-alives).
     let stream = match rx {
-        Some(rx) => BroadcastStream::new(rx)
-            .filter_map(move |item| {
-                let target_sid = target_sid.clone();
-                async move {
-                    match item {
-                        // v0.8.19 — the 👀 ack `Reaction` is IM-only (web has its
-                        // own UI). Drop it here so the SSE contract is unchanged,
-                        // even though it carries this session's `sid`.
-                        Ok(ev) if event_matches_sid(&ev, &target_sid) && !is_im_only_event(&ev) => {
-                            Some(Ok(session_event(&ev)))
-                        }
-                        Ok(_) => None,
-                        Err(BroadcastStreamRecvError::Lagged(n)) => {
-                            Some(Ok(reconnect_hint(&format!("lagged {n} events"))))
+        Some(rx) => {
+            let catchup = build_catchup_events(&app, &sid, last_id).await;
+            futures::stream::iter(catchup.into_iter().map(Ok::<Event, Infallible>))
+                .chain(BroadcastStream::new(rx).filter_map(move |item| {
+                    let target_sid = target_sid.clone();
+                    async move {
+                        match item {
+                            Ok(entry) if event_matches_sid(&entry.event, &target_sid) => {
+                                Some(Ok(session_event(&entry.event, entry.seq)))
+                            }
+                            Ok(_) => None,
+                            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                                Some(Ok(reconnect_hint(&format!("lagged {n} events"))))
+                            }
                         }
                     }
-                }
-            })
-            .left_stream(),
+                }))
+                .left_stream()
+        }
         None => futures::stream::iter(vec![Ok::<Event, Infallible>(gateway_unavailable_event())])
             .right_stream(),
     };
@@ -1113,10 +1257,13 @@ fn event_matches_sid(ev: &GatewayEvent, target: &str) -> bool {
 /// True for [`GatewayEvent`]s the web SSE must never emit because they have no
 /// web representation (v0.8.19): the 👀 ack `Reaction` is an IM-only affordance
 /// (Telegram/Lark message reaction). The web chat has its own UI, so these are
-/// dropped at the stream filter, keeping the SSE contract unchanged.
+/// dropped at the stream filter, keeping the SSE contract unchanged. Delegates
+/// to [`crate::ring::is_im_only_event`] — v0.8.22 P1 moved the canonical
+/// definition there so the ring feeder can skip recording them at all (they
+/// never occupy a ring slot / never reach the live tap), while this local
+/// name stays stable for every existing call site + test in this module.
 fn is_im_only_event(ev: &GatewayEvent) -> bool {
-    use ccteam_im::gateway::GatewayEventKind;
-    matches!(ev.kind, GatewayEventKind::Reaction { .. })
+    crate::ring::is_im_only_event(ev)
 }
 
 /// Build the `event: progress` SSE frame for one [`GatewayEvent`]. The
@@ -1126,8 +1273,15 @@ fn is_im_only_event(ev: &GatewayEvent) -> bool {
 /// as `Answer` events whose `options` are non-empty; those are surfaced too
 /// so the SPA can render them. The SSE event name stays `progress` so the
 /// SPA's existing per-session parser handles it unchanged.
-fn session_event(ev: &GatewayEvent) -> Event {
+///
+/// v0.8.22 P1 (review §3.1-3) — also sets the SSE-protocol `id:` field to
+/// `seq` (the replay ring's per-sid monotonic sequence number), which is
+/// what a client's `Last-Event-ID` reconnect watermark is built from and
+/// what its dedup logic compares against a replayed/reseeded frame's
+/// `MessageEvent.lastEventId`.
+fn session_event(ev: &GatewayEvent, seq: u64) -> Event {
     Event::default()
+        .id(seq.to_string())
         .event("progress")
         .data(session_event_payload(ev).to_string())
 }
@@ -1758,5 +1912,266 @@ mod tests {
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         let state = ccteam_core::ProjectState::initial(slug.to_string());
         std::fs::write(state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    }
+
+    // ── v0.8.22 P1 (review §3.1-3) — SSE Last-Event-ID / reseed ────────────
+
+    #[test]
+    fn parse_last_event_id_prefers_header_over_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "42".parse().unwrap());
+        let query = SessionEventsQuery {
+            last_event_id: Some("7".to_string()),
+        };
+        assert_eq!(parse_last_event_id(&headers, &query), Some(42));
+    }
+
+    #[test]
+    fn parse_last_event_id_falls_back_to_query() {
+        let headers = HeaderMap::new();
+        let query = SessionEventsQuery {
+            last_event_id: Some("7".to_string()),
+        };
+        assert_eq!(parse_last_event_id(&headers, &query), Some(7));
+    }
+
+    #[test]
+    fn parse_last_event_id_absent_or_unparseable_is_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            parse_last_event_id(
+                &headers,
+                &SessionEventsQuery {
+                    last_event_id: None
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            parse_last_event_id(
+                &headers,
+                &SessionEventsQuery {
+                    last_event_id: Some("not-a-number".to_string())
+                }
+            ),
+            None
+        );
+    }
+
+    fn test_choice_prompt(token: &str) -> ChoicePrompt {
+        ChoicePrompt {
+            token: token.to_string(),
+            title: format!("session s1 wants to run: Bash rm -rf /tmp/{token}"),
+            options: vec![
+                ccteam_harness::ChoiceOption {
+                    id: "allow".into(),
+                    label: "✅ Approve".into(),
+                },
+                ccteam_harness::ChoiceOption {
+                    id: "deny".into(),
+                    label: "⛔ Deny".into(),
+                },
+            ],
+            multi: false,
+        }
+    }
+
+    #[test]
+    fn synthetic_approval_event_mirrors_the_original_broadcast_shape() {
+        let prompt = test_choice_prompt("ptok");
+        let ev = synthetic_approval_event("s1", &prompt);
+        assert_eq!(ev.id, "permission-ptok");
+        assert_eq!(ev.sid.as_deref(), Some("s1"));
+        assert_eq!(ev.content, prompt.title);
+
+        let payload = session_event_payload(&ev);
+        assert_eq!(payload["token"], "ptok");
+        let opts = payload["options"].as_array().expect("options array");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["id"], "allow");
+        assert_eq!(opts[1]["id"], "deny");
+    }
+
+    /// A minimal `HarnessAdapter` never actually invoked by these tests —
+    /// `Gateway::new_with_factory` requires a factory, but none of the
+    /// `build_catchup_entries` tests spawn a session through it.
+    struct RingTestAdapter;
+
+    #[async_trait::async_trait]
+    impl ccteam_harness::HarnessAdapter for RingTestAdapter {
+        fn name(&self) -> &'static str {
+            "ring-test-adapter"
+        }
+        fn vendor(&self) -> AgentVendor {
+            AgentVendor::Claude
+        }
+        async fn start_thread(
+            &self,
+            _spec: &ccteam_harness::AgentSpecBrief,
+            _ctx: &ccteam_harness::SpawnCtx,
+        ) -> Result<ccteam_harness::ThreadHandle, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn submit_turn(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+            _input: ccteam_harness::TurnInput,
+        ) -> Result<ccteam_harness::TurnId, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
+        fn events(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> futures::stream::BoxStream<'static, ccteam_harness::ThreadEvent> {
+            Box::pin(futures::stream::empty())
+        }
+        async fn resume_thread(
+            &self,
+            _persistent_id: &str,
+        ) -> Result<ccteam_harness::ThreadHandle, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn close_thread(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> Result<(), ccteam_harness::HarnessError> {
+            Ok(())
+        }
+        async fn handle_directive(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+            _d: ccteam_harness::Directive,
+        ) -> Result<ccteam_harness::DirectiveOutcome, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn thread_status(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> Result<ccteam_harness::ThreadStatus, ccteam_harness::HarnessError> {
+            Ok(ccteam_harness::ThreadStatus::default())
+        }
+    }
+
+    /// An `AppState` with a real (but session-less) gateway attached, so
+    /// `build_catchup_entries`'s `app.gateway`/`app.session_ring` paths are
+    /// exercised for real (spawns the ring feeder too, harmlessly idle since
+    /// nothing ever turns through this gateway).
+    fn test_app_with_gateway(tmp: &std::path::Path) -> AppState {
+        let paths = test_paths(tmp);
+        let factory = std::sync::Arc::new(|_vendor, _protocol| {
+            std::sync::Arc::new(RingTestAdapter)
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let gateway = ccteam_im::gateway::Gateway::new_with_factory(
+            factory,
+            "demo",
+            paths.projects_root.join("demo"),
+        );
+        AppState::new(paths).with_gateway(std::sync::Arc::new(tokio::sync::Mutex::new(gateway)))
+    }
+
+    /// Register + sid-tag a pending approval directly against the app's
+    /// gateway's shared pending registry — the same steps
+    /// `ccteam_im::hitl::ask_permission` takes, without needing a live HITL
+    /// turn.
+    async fn seed_pending_approval(app: &AppState, sid: &str, token: &str) {
+        let gw = app.gateway.as_ref().unwrap();
+        let pending = gw.lock().await.pending_handle();
+        let mut guard = pending.lock().await;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        guard.register(
+            token.to_string(),
+            test_choice_prompt(token),
+            ccteam_im::pending::InteractionOrigin::External { reply: tx },
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        guard.tag_sid(token, sid.to_string());
+    }
+
+    /// review §3.1-3's explicit ask: "a fresh page load must also see a
+    /// pending approval, not just reconnects" — no `last_id` at all (a
+    /// brand-new tab) still gets the outstanding approval.
+    #[tokio::test]
+    async fn build_catchup_entries_fresh_connect_seeds_pending_even_without_last_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        seed_pending_approval(&app, "s1", "ptok").await;
+
+        let entries = build_catchup_entries(&app, "s1", None).await;
+        assert_eq!(entries.len(), 1, "the pending approval must still surface");
+        assert_eq!(entries[0].1.id, "permission-ptok");
+    }
+
+    /// No pending, no ring data ⇒ nothing to catch up on.
+    #[tokio::test]
+    async fn build_catchup_entries_empty_when_nothing_pending_or_buffered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        assert!(build_catchup_entries(&app, "s1", None).await.is_empty());
+        assert!(build_catchup_entries(&app, "s1", Some(0)).await.is_empty());
+    }
+
+    /// A reconnect with `last_id` replays the ring gap for that sid only.
+    #[tokio::test]
+    async fn build_catchup_entries_replays_the_ring_gap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        let ans = |id: &str, sid: &str| GatewayEvent {
+            id: id.to_string(),
+            channel: "web".into(),
+            chat_id: "web-api".into(),
+            thread_ts: None,
+            content: id.to_string(),
+            kind: ccteam_im::gateway::GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+        };
+        app.session_ring.record("s1", ans("a", "s1"));
+        let since = app.session_ring.record("s1", ans("b", "s1"));
+        app.session_ring.record("s1", ans("c", "s1"));
+        // A different sid's traffic must not leak into s1's replay.
+        app.session_ring.record("s2", ans("z", "s2"));
+
+        let entries = build_catchup_entries(&app, "s1", Some(since)).await;
+        let ids: Vec<&str> = entries.iter().map(|(_, ev)| ev.id.as_str()).collect();
+        assert_eq!(ids, vec!["c"]);
+    }
+
+    /// If the ring replay ALREADY carries the outstanding approval's token
+    /// (a plain reconnect whose gap the ring still covers), the reseed must
+    /// not ALSO append a duplicate entry.
+    #[tokio::test]
+    async fn build_catchup_entries_skips_reseed_when_ring_already_covers_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        seed_pending_approval(&app, "s1", "ptok").await;
+        // The SAME token's original broadcast, already in the ring (as if
+        // ask_permission's own `sink.send` had recorded it moments ago).
+        let original = synthetic_approval_event("s1", &test_choice_prompt("ptok"));
+        app.session_ring.record("s1", original);
+
+        let entries = build_catchup_entries(&app, "s1", Some(0)).await;
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|(_, ev)| approval_token(ev).as_deref() == Some("ptok"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "must not double-render the same outstanding approval"
+        );
+    }
+
+    /// A pending approval for a DIFFERENT sid must never leak into this
+    /// sid's catchup.
+    #[tokio::test]
+    async fn build_catchup_entries_ignores_other_sids_pending() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        seed_pending_approval(&app, "s2", "ptok").await;
+
+        let entries = build_catchup_entries(&app, "s1", None).await;
+        assert!(entries.is_empty());
     }
 }

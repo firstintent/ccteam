@@ -388,7 +388,16 @@ export default function SessionView({
                     key={row.id}
                     className="max-w-[760px] rounded-md px-3 py-2.5 text-sm bg-brand-500/10 border border-brand-500/30"
                   >
-                    <div className="text-brand-400 mb-2">{row.content}</div>
+                    {/* v0.8.22 P1 (review §3.1-2) — the tool-aware summary
+                        (Write content preview / Edit old→new snippet) is
+                        multi-line; without `whitespace-pre-wrap` the browser
+                        collapses those newlines to spaces, showing LESS
+                        structure than the IM prompt (which renders them as
+                        real line breaks). Mirrors the `user`/`tool` row
+                        treatment just below. */}
+                    <div className="text-brand-400 mb-2 whitespace-pre-wrap break-words">
+                      {row.content}
+                    </div>
                     <div className="flex flex-wrap gap-2">
                       {(row.options ?? []).map((opt, i) => (
                         <button

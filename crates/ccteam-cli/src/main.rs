@@ -2851,7 +2851,11 @@ async fn execute_permission_ask(
     };
 
     let summary = summarize_tool_input(&tool_name, &tool_input);
-    let title = format!("{session_desc} wants to run: {summary}");
+    let risk = ccteam_im::hitl::classify_tool_risk(&tool_name, &tool_input);
+    let title = format!(
+        "{badge} {session_desc} wants to run: {summary}",
+        badge = ccteam_im::hitl::risk_badge(risk),
+    );
 
     // Mint a short token (≤16B ASCII, no `:` — the ChoicePrompt contract).
     let nanos = std::time::SystemTime::now()
@@ -2906,6 +2910,12 @@ async fn execute_permission_ask(
             InteractionOrigin::External { reply: tx },
             std::time::Instant::now() + ttl,
         );
+        // v0.8.22 P1 (review §3.1-3) — tag this pending with its sid so a web
+        // SSE reconnect (or a brand-new tab) can re-seed it, same as the
+        // stream-json protocol's `ask_permission` does.
+        if let Some(sid) = sid_label.as_deref() {
+            guard.tag_sid(&token, sid.to_string());
+        }
     }
 
     // Render the approve/deny buttons in IM.
@@ -4610,23 +4620,38 @@ mod session_tool_tests {
             summarize_tool_input("Bash", &json!({ "command": "rm -rf /tmp/x" })),
             "Bash rm -rf /tmp/x"
         );
-        // File tools → file_path / path.
+        // Write with no content → just the path (no dangling preview).
         assert_eq!(
             summarize_tool_input("Write", &json!({ "file_path": "/a/b.rs" })),
             "Write /a/b.rs"
         );
-        // No obvious field → just the tool name.
+        // No dedicated renderer + empty params → just the tool name.
         assert_eq!(summarize_tool_input("Glob", &json!({})), "Glob");
+    }
+
+    /// v0.8.22 P1 (review §3.1-2) — delegates to `ccteam_im::hitl`'s
+    /// tool-aware summarizer: a `Write`/`Edit` approval now shows the
+    /// content/diff, not just the path (see `hitl.rs`'s own unit tests for
+    /// full per-tool coverage; this just locks in the CLI's delegation).
+    #[test]
+    fn summarize_tool_input_write_shows_content_preview() {
+        assert_eq!(
+            summarize_tool_input(
+                "Write",
+                &json!({ "file_path": "/a/b.rs", "content": "fn f(){}" })
+            ),
+            "Write /a/b.rs\n  + fn f(){}"
+        );
     }
 
     #[test]
     fn summarize_tool_input_truncates_long_detail() {
         let long = "x".repeat(500);
         let out = summarize_tool_input("Bash", &json!({ "command": long }));
-        // Truncated with an ellipsis; comfortably bounded.
+        // Truncated with an ellipsis; comfortably bounded (~200-char cap).
         assert!(out.ends_with('…'));
         assert!(
-            out.chars().count() <= 162,
+            out.chars().count() <= 207,
             "got {} chars",
             out.chars().count()
         );

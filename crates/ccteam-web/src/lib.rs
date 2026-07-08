@@ -39,6 +39,10 @@ pub mod chat_protocol;
 pub mod decisions;
 pub mod pty;
 pub mod queries;
+// v0.8.22 P1 (review §3.1-3) — per-session SSE replay ring + live tap; see
+// `ring.rs`'s module doc. `pub(crate)`: only `state.rs` (spawns the feeder)
+// and `routes::sessions_api` (the SSE handler) need it.
+mod ring;
 pub mod routes;
 pub mod state;
 pub mod status;

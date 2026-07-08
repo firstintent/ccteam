@@ -47,6 +47,16 @@ pub struct PendingInteraction {
     pub origin: InteractionOrigin,
     /// When this prompt lapses (TTL); past this it is denied / dropped.
     pub expires_at: Instant,
+    /// v0.8.22 P1 (review §3.1-3) — the gateway session sid (`s{n}`) this
+    /// prompt belongs to, when the caller knows it. `None` by default
+    /// (`register` never sets it, to avoid a signature break for the many
+    /// existing callers); the HITL approval flow
+    /// ([`crate::hitl::ask_permission`] / `ccteam-cli`'s
+    /// `execute_permission_ask`) calls [`PendingInteractions::tag_sid`]
+    /// right after `register` so a web SSE reconnect can re-seed a still-
+    /// outstanding approval for that sid (see
+    /// [`PendingInteractions::pending_for_sid`]).
+    pub sid: Option<String>,
 }
 
 /// Registry of outstanding choices, single-flight per key.
@@ -77,8 +87,32 @@ impl PendingInteractions {
                 prompt,
                 origin,
                 expires_at,
+                sid: None,
             },
         )
+    }
+
+    /// Tag an already-[`register`](Self::register)ed pending with the
+    /// gateway sid it belongs to (v0.8.22 P1). Best-effort: a `key` that
+    /// isn't (or is no longer) registered is a silent no-op — the caller
+    /// just loses the reseed-on-reconnect affordance for that one prompt,
+    /// never a hard failure.
+    pub fn tag_sid(&mut self, key: &str, sid: String) {
+        if let Some(p) = self.map.get_mut(key) {
+            p.sid = Some(sid);
+        }
+    }
+
+    /// Find the (still outstanding) pending interaction tagged with `sid`
+    /// (v0.8.22 P1 — SSE reconnect reseed, review §3.1-3): a fresh page
+    /// load or a reconnect during an outstanding HITL approval must render
+    /// it again, not just live-stream events going forward. `None` when
+    /// nothing pending is tagged with this sid (either nothing pending, or
+    /// a prompt whose flow never calls [`Self::tag_sid`] — e.g. a Directive
+    /// `/model`-style choice, out of scope for this fix). Scans linearly;
+    /// the registry is small (one prompt per blocked turn in practice).
+    pub fn pending_for_sid(&self, sid: &str) -> Option<&PendingInteraction> {
+        self.map.values().find(|p| p.sid.as_deref() == Some(sid))
     }
 
     /// Peek the prompt for `key` without removing it (idx→id reverse
@@ -262,5 +296,46 @@ mod tests {
             _ => panic!("expected External origin"),
         }
         assert_eq!(rx.try_recv().unwrap().ids, vec!["a".to_string()]);
+    }
+
+    /// v0.8.22 P1 (review §3.1-3) — `register` never tags a sid (no
+    /// signature break for existing callers); `tag_sid` is the opt-in step
+    /// the HITL approval flow takes right after registering.
+    #[test]
+    fn register_leaves_sid_unset_until_tagged() {
+        let mut p = PendingInteractions::new();
+        let exp = Instant::now() + Duration::from_secs(60);
+        p.register("k".into(), prompt("t1"), directive_origin(), exp);
+        assert!(p.pending_for_sid("s1").is_none());
+        p.tag_sid("k", "s1".to_string());
+        assert!(p.pending_for_sid("s1").is_some());
+    }
+
+    /// `pending_for_sid` finds a tagged prompt regardless of what its
+    /// registry key looks like (a token, a composite chat key, ...) — it
+    /// scans by the `sid` field, not the key.
+    #[test]
+    fn pending_for_sid_finds_the_tagged_entry() {
+        let mut p = PendingInteractions::new();
+        let exp = Instant::now() + Duration::from_secs(60);
+        p.register("ptok1".into(), prompt("ptok1"), directive_origin(), exp);
+        p.register("ptok2".into(), prompt("ptok2"), directive_origin(), exp);
+        p.tag_sid("ptok2", "s7".to_string());
+
+        assert!(
+            p.pending_for_sid("s1").is_none(),
+            "untagged entries don't match"
+        );
+        let found = p.pending_for_sid("s7").expect("tagged entry found");
+        assert_eq!(found.prompt.token, "ptok2");
+    }
+
+    /// A `tag_sid` for a key that was never registered (or already taken) is
+    /// a harmless no-op — never panics.
+    #[test]
+    fn tag_sid_on_missing_key_is_a_noop() {
+        let mut p = PendingInteractions::new();
+        p.tag_sid("nope", "s1".to_string());
+        assert!(p.pending_for_sid("s1").is_none());
     }
 }

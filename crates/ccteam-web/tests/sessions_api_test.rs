@@ -319,6 +319,201 @@ async fn session_events_no_gateway_streams_unavailable_notice() {
     assert_eq!(saw_notice.as_deref(), Some("gateway_unavailable"));
 }
 
+// ── v0.8.22 P1 (review §3.1-3) — SSE Last-Event-ID replay + approval reseed ──
+
+/// Seed a pending HITL approval directly against a gateway's shared pending
+/// registry — the SAME `register` + `tag_sid` steps
+/// `ccteam_im::hitl::ask_permission` takes, without needing a live stream-json
+/// turn actually blocked on one.
+async fn seed_pending_approval(
+    gateway: &Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>,
+    sid: &str,
+    token: &str,
+) {
+    let pending = gateway.lock().await.pending_handle();
+    let mut guard = pending.lock().await;
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    guard.register(
+        token.to_string(),
+        ccteam_harness::ChoicePrompt {
+            token: token.to_string(),
+            title: format!("🔴 session {sid} wants to run: Bash rm -rf /tmp/x"),
+            options: vec![
+                ccteam_harness::ChoiceOption {
+                    id: "allow".into(),
+                    label: "✅ Approve".into(),
+                },
+                ccteam_harness::ChoiceOption {
+                    id: "deny".into(),
+                    label: "⛔ Deny".into(),
+                },
+            ],
+            multi: false,
+        },
+        ccteam_im::pending::InteractionOrigin::External { reply: tx },
+        std::time::Instant::now() + Duration::from_secs(60),
+    );
+    guard.tag_sid(token, sid.to_string());
+}
+
+/// Read `data:` lines off an SSE response body until `pred` matches one, or
+/// the timeout lapses (`None`). Mirrors the existing `event:`-line scanner
+/// above, but for the JSON `data:` payload.
+async fn read_sse_data_until(
+    resp: reqwest::Response,
+    pred: impl Fn(&str) -> bool,
+) -> Option<String> {
+    use futures_util::StreamExt;
+    let stream = resp.bytes_stream();
+    let mapped = stream.map(|r| r.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(mapped);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let next = lines.next_line().await.ok().flatten()?;
+            if let Some(rest) = next.strip_prefix("data:") {
+                let data = rest.trim().to_string();
+                if pred(&data) {
+                    return Some(data);
+                }
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Like [`read_sse_data_until`], but returns the matching frame's SSE `id:`
+/// (parsed as the ring seq) instead of its `data:` payload — frames are
+/// blank-line delimited, so this tracks both fields per-frame regardless of
+/// which order axum renders them in.
+async fn read_sse_seq_until(resp: reqwest::Response, pred: impl Fn(&str) -> bool) -> Option<u64> {
+    use futures_util::StreamExt;
+    let stream = resp.bytes_stream();
+    let mapped = stream.map(|r| r.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(mapped);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut frame_id: Option<u64> = None;
+        let mut frame_data: Option<String> = None;
+        loop {
+            let next = lines.next_line().await.ok().flatten()?;
+            if let Some(rest) = next.strip_prefix("id:") {
+                frame_id = rest.trim().parse().ok();
+            } else if let Some(rest) = next.strip_prefix("data:") {
+                frame_data = Some(rest.trim().to_string());
+            } else if next.is_empty() {
+                if let Some(data) = frame_data.take() {
+                    if pred(&data) {
+                        return frame_id;
+                    }
+                }
+                frame_id = None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// review §3.1-3's explicit ask: "a fresh page load must also see a pending
+/// approval, not just reconnects". A BRAND-NEW SSE connection (no
+/// `Last-Event-ID` at all) while an approval is outstanding for that sid must
+/// still render the approve/deny prompt.
+#[tokio::test]
+async fn session_events_fresh_connect_reseeds_a_pending_approval() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
+        factory,
+        "demo",
+        paths.projects_root.join("demo"),
+    );
+    let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+    seed_pending_approval(&gateway, "s1", "ptok").await;
+
+    let addr = spawn_server(AppState::new(paths).with_gateway(gateway)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+        .await
+        .expect("sse get");
+    assert_eq!(resp.status(), 200);
+
+    let payload = read_sse_data_until(resp, |d| d.contains("\"token\""))
+        .await
+        .expect("expected a reseeded approval frame on a fresh connect");
+    let json: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(json["token"], "ptok");
+    assert!(json["content"].as_str().unwrap().contains("rm -rf"));
+}
+
+/// End-to-end proof that the `?last_event_id=` query wiring (axum's `Query`
+/// extractor → [`parse_last_event_id`](ccteam_web) → the catchup batch) works
+/// over a real HTTP round-trip, and that it composes correctly with the
+/// pending-approval reseed's token dedup: connection #1 observes approval
+/// "first" and records its SSE seq; "first" then resolves and approval
+/// "second" fires for the same sid while connection #1 is gone; connection
+/// #2 reconnects naming that seq as `last_event_id` and must see ONLY
+/// "second" — a stale/already-delivered approval is not re-sent just
+/// because a later one shares its sid. (The ring's plain-event backlog
+/// replay itself — no approval involved — is covered directly by
+/// `build_catchup_entries_replays_the_ring_gap` in the lib's own unit tests,
+/// which can seed the ring without a live turn.)
+#[tokio::test]
+async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
+        factory,
+        "demo",
+        paths.projects_root.join("demo"),
+    );
+    let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+    let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
+
+    // Connection #1 observes the first HITL prompt for s1 and records its
+    // seq (the SSE frame's `id:` line) as the watermark it'll reconnect
+    // with.
+    seed_pending_approval(&gateway, "s1", "first").await;
+    let resp1 = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+        .await
+        .unwrap();
+    let seq1 = read_sse_seq_until(resp1, |d| d.contains("first"))
+        .await
+        .expect("connection #1 sees the first approval");
+
+    // "first" gets resolved (simulating the user's click) — no longer
+    // outstanding — THEN a second approval fires for the same sid while
+    // connection #1 is gone. This is the "missed while disconnected" event
+    // `pending_for_sid` must now report (single-flight: only one prompt
+    // outstanding per sid at a time, matching the real HITL flow).
+    let pending = gateway.lock().await.pending_handle();
+    pending.lock().await.take_by_token("first");
+    seed_pending_approval(&gateway, "s1", "second").await;
+
+    // Connection #2 reconnects naming seq1 as its watermark: it must see the
+    // second approval (the gap), not a re-delivery of the first.
+    let resp2 = reqwest::get(format!(
+        "http://{addr}/api/v1/sessions/s1/events?last_event_id={seq1}"
+    ))
+    .await
+    .unwrap();
+    let payload = read_sse_data_until(resp2, |d| d.contains("second"))
+        .await
+        .expect("expected the missed second approval to be replayed");
+    assert!(
+        !payload.contains("\"token\":\"first\""),
+        "must not re-deliver what connection #1 already had: {payload}"
+    );
+}
+
 // ── v0.8.21 history + resume + external-import (gateway-attached, real HTTP) ──
 
 /// End-to-end user flow over a real router + real gateway: create a session

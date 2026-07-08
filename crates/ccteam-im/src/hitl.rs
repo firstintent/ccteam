@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use ccteam_harness::execution::claude_stream_json::bridge::{
     ApprovalDecision, CanUseToolReq, CanUseToolResolver,
 };
-use ccteam_harness::{ChoiceOption, ChoicePrompt, ChoiceSelection};
+use ccteam_harness::{ApprovalRisk, ChoiceOption, ChoicePrompt, ChoiceSelection};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind, HitlPromptContext};
@@ -51,27 +51,242 @@ pub fn permission_prompt_timeout_secs() -> u64 {
         .unwrap_or(PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT)
 }
 
-/// Render a short, human-readable one-liner of a tool call for the approval
-/// prompt. Picks the most useful field per common tool (`Bash` → command,
-/// file tools → path) and truncates so the IM message stays compact. Falls
-/// back to the tool name when no obvious field exists.
+/// Render a rich, human-readable summary of a tool call for the approval
+/// prompt (v0.8.22 P1, review §3.1-2). The prior version showed only the
+/// tool name + the first matching field truncated at 160 chars, so a
+/// `Write`/`Edit` approval showed nothing but the file path — "见文件路径
+/// 不见写入内容,等于盲批" (you see the path, never the content: a blind
+/// approval). Tool-aware:
+///
+/// - `Write` → file path + a content preview (~200 chars).
+/// - `Edit`/`MultiEdit` → path + an old→new snippet (~100 chars each side).
+/// - `Bash`/`KillShell`/`KillBash` → the command string (~200 chars).
+/// - anything else (Read, Glob, MCP tools, …) → a compact `key: value`
+///   digest of the top-level params, length-capped — NEVER a raw JSON dump.
 pub fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> String {
-    const MAX: usize = 160;
-    let pick = |key: &str| tool_input.get(key).and_then(|v| v.as_str());
-    let detail = pick("command")
-        .or_else(|| pick("file_path"))
-        .or_else(|| pick("path"))
-        .or_else(|| pick("url"))
-        .or_else(|| pick("pattern"));
-    let body = match detail {
-        Some(d) => format!("{tool_name} {d}"),
-        None => tool_name.to_string(),
+    match tool_name {
+        "Write" => summarize_write(tool_input),
+        "Edit" => summarize_edit(tool_input),
+        "MultiEdit" => summarize_multi_edit(tool_input),
+        "Bash" | "KillShell" | "KillBash" => summarize_bash(tool_name, tool_input),
+        _ => summarize_generic(tool_name, tool_input),
+    }
+}
+
+const CONTENT_PREVIEW_MAX: usize = 200;
+const SNIPPET_MAX: usize = 100;
+const COMMAND_MAX: usize = 200;
+const GENERIC_DIGEST_MAX: usize = 200;
+const GENERIC_VALUE_MAX: usize = 60;
+
+fn summarize_write(tool_input: &serde_json::Value) -> String {
+    let path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no file_path)");
+    let content = tool_input
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if content.is_empty() {
+        format!("Write {path}")
+    } else {
+        format!(
+            "Write {path}\n  + {}",
+            truncate_chars(content, CONTENT_PREVIEW_MAX)
+        )
+    }
+}
+
+fn summarize_edit(tool_input: &serde_json::Value) -> String {
+    let path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no file_path)");
+    let old = tool_input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new = tool_input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!(
+        "Edit {path}\n  - {}\n  + {}",
+        truncate_chars(old, SNIPPET_MAX),
+        truncate_chars(new, SNIPPET_MAX),
+    )
+}
+
+fn summarize_multi_edit(tool_input: &serde_json::Value) -> String {
+    let path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no file_path)");
+    let edits = tool_input.get("edits").and_then(|v| v.as_array());
+    let Some(first) = edits.and_then(|e| e.first()) else {
+        return format!("MultiEdit {path}");
     };
-    if body.chars().count() > MAX {
-        let truncated: String = body.chars().take(MAX).collect();
+    let old = first
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new = first
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let extra_count = edits.map(|e| e.len()).unwrap_or(1).saturating_sub(1);
+    let extra = if extra_count > 0 {
+        format!(
+            " (+{extra_count} more edit{})",
+            if extra_count == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "MultiEdit {path}{extra}\n  - {}\n  + {}",
+        truncate_chars(old, SNIPPET_MAX),
+        truncate_chars(new, SNIPPET_MAX),
+    )
+}
+
+fn summarize_bash(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    let command = tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no command)");
+    format!("{tool_name} {}", truncate_chars(command, COMMAND_MAX))
+}
+
+/// Fallback for every tool without a dedicated renderer (Read/Glob/Grep,
+/// MCP tools, …): a compact `key: value` digest of the top-level params,
+/// length-capped. Collapses nested arrays/objects to a size marker instead
+/// of recursing, so a generic tool call can never dump a raw JSON blob into
+/// the approval prompt.
+fn summarize_generic(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    let Some(obj) = tool_input.as_object() else {
+        return tool_name.to_string();
+    };
+    if obj.is_empty() {
+        return tool_name.to_string();
+    }
+    let mut parts = Vec::new();
+    let mut total = 0usize;
+    for (key, value) in obj {
+        let piece = format!("{key}: {}", compact_value(value));
+        total += piece.chars().count();
+        parts.push(piece);
+        if total >= GENERIC_DIGEST_MAX {
+            break;
+        }
+    }
+    let digest = truncate_chars(&parts.join(", "), GENERIC_DIGEST_MAX);
+    format!("{tool_name} {digest}")
+}
+
+/// A JSON value collapsed to a short, single-line preview — arrays/objects
+/// become a size marker (`[3 items]` / `{2 keys}`), never their full
+/// recursive contents.
+fn compact_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => truncate_chars(s, GENERIC_VALUE_MAX),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(a) => {
+            format!("[{} item{}]", a.len(), if a.len() == 1 { "" } else { "s" })
+        }
+        serde_json::Value::Object(o) => {
+            format!("{{{} key{}}}", o.len(), if o.len() == 1 { "" } else { "s" })
+        }
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max).collect();
         format!("{truncated}…")
     } else {
-        body
+        s.to_string()
+    }
+}
+
+/// Coarse severity bucket for a tool call (v0.8.22 P1, review §3.1-2),
+/// reusing the [`ApprovalRisk`] enum ccteam-harness already defined but no
+/// approval surface actually populated. Best-effort classification, NOT a
+/// security boundary: it exists so the human clicking Approve/Deny can tell
+/// "reading a file" from "rewriting one" from "rm -rf" at a glance instead
+/// of blind-approving every prompt identically. Errs toward the pessimistic
+/// tier when unsure — an unrecognized tool is `Unknown`, never silently
+/// treated as `Low`.
+pub fn classify_tool_risk(tool_name: &str, tool_input: &serde_json::Value) -> ApprovalRisk {
+    match tool_name {
+        "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "TodoRead" | "WebSearch"
+        | "WebFetch" | "BashOutput" => ApprovalRisk::Low,
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "TodoWrite" => ApprovalRisk::Medium,
+        "Bash" | "KillShell" | "KillBash" => {
+            let command = tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if is_destructive_command(command) {
+                ApprovalRisk::High
+            } else {
+                ApprovalRisk::Medium
+            }
+        }
+        _ => ApprovalRisk::Unknown,
+    }
+}
+
+/// Coarse substring match for shell commands that destroy data or hand over
+/// the machine — `rm -rf`, force-pushes, disk-level writes, fork bombs,
+/// pipe-to-shell installers, … Intentionally broad/best-effort: a false
+/// positive (flagging a harmless command `High`) costs nothing; the
+/// review's complaint was the false NEGATIVE (an `rm -rf` rendering
+/// identical to a `Read`), so this deliberately errs toward over-flagging.
+fn is_destructive_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    const DESTRUCTIVE_SUBSTRINGS: &[&str] = &[
+        "rm -rf",
+        "rm -fr",
+        "rm -r -f",
+        "rm -f -r",
+        "sudo rm",
+        "mkfs",
+        "dd if=",
+        "dd of=",
+        "git push --force",
+        "git push -f",
+        "git reset --hard",
+        "chmod -r 777",
+        "drop table",
+        "drop database",
+        "truncate table",
+        "shutdown",
+        "reboot",
+        ":(){ :|:& };:",
+        "curl | sh",
+        "curl | bash",
+        "wget | sh",
+        "wget | bash",
+        "> /dev/sd",
+    ];
+    DESTRUCTIVE_SUBSTRINGS.iter().any(|p| lower.contains(p))
+}
+
+/// Map a risk tier to its emoji prefix for the approval prompt (review
+/// §3.1-2's "风险等级映射颜色/emoji" — IM/web render emoji, not CSS color,
+/// so this is the portable choice for both surfaces). 🟢 read-only /
+/// 🟡 mutating / 🔴 destructive / ⚪ unknown (an unrecognized tool — never
+/// silently treated as safe).
+pub fn risk_badge(risk: ApprovalRisk) -> &'static str {
+    match risk {
+        ApprovalRisk::Low => "🟢",
+        ApprovalRisk::Medium => "🟡",
+        ApprovalRisk::High => "🔴",
+        ApprovalRisk::Unknown => "⚪",
     }
 }
 
@@ -115,7 +330,11 @@ pub async fn ask_permission(
         format!("session {sid_label} ({role})", role = ctx.role)
     };
     let summary = summarize_tool_input(tool_name, tool_input);
-    let title = format!("{session_desc} wants to run: {summary}");
+    let risk = classify_tool_risk(tool_name, tool_input);
+    let title = format!(
+        "{badge} {session_desc} wants to run: {summary}",
+        badge = risk_badge(risk),
+    );
 
     // Mint a short token (≤16B ASCII, no `:` — the ChoicePrompt contract).
     let nanos = std::time::SystemTime::now()
@@ -163,6 +382,10 @@ pub async fn ask_permission(
             InteractionOrigin::External { reply: tx },
             Instant::now() + ttl,
         );
+        // v0.8.22 P1 (review §3.1-3) — tag this pending with its sid so a web
+        // SSE reconnect (or a brand-new tab) can re-seed it even if it fell
+        // outside the transport-layer replay ring's window.
+        guard.tag_sid(&token, sid_label.to_string());
     }
 
     // Render the approve/deny buttons in IM/web.
@@ -297,28 +520,189 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn summarize_tool_input_picks_the_useful_field() {
+    fn summarize_tool_input_bash_shows_the_command() {
         assert_eq!(
             summarize_tool_input("Bash", &json!({"command": "ls -la"})),
             "Bash ls -la"
         );
-        assert_eq!(
-            summarize_tool_input("Read", &json!({"file_path": "/tmp/x"})),
-            "Read /tmp/x"
-        );
-        assert_eq!(summarize_tool_input("Glob", &json!({})), "Glob");
     }
 
     #[test]
-    fn summarize_tool_input_truncates_long_detail() {
-        let long = "x".repeat(300);
+    fn summarize_tool_input_generic_fallback_is_a_key_value_digest() {
+        // Read has no dedicated renderer — falls to the generic digest, not
+        // a raw path echo (still legible: `key: value`).
+        assert_eq!(
+            summarize_tool_input("Read", &json!({"file_path": "/tmp/x"})),
+            "Read file_path: /tmp/x"
+        );
+        // Empty params → just the tool name, no dangling digest.
+        assert_eq!(summarize_tool_input("Glob", &json!({})), "Glob");
+    }
+
+    /// review §3.1-2 — a `Write` approval must show WHAT is being written,
+    /// not just the path (the old "见文件路径不见写入内容,等于盲批" gap).
+    #[test]
+    fn summarize_tool_input_write_shows_path_and_content_preview() {
+        let out = summarize_tool_input(
+            "Write",
+            &json!({"file_path": "/a/b.rs", "content": "fn main() {}"}),
+        );
+        assert_eq!(out, "Write /a/b.rs\n  + fn main() {}");
+    }
+
+    /// A `Write` with no content field (rare, but shouldn't panic/garble)
+    /// degrades to just the path.
+    #[test]
+    fn summarize_tool_input_write_without_content_shows_just_the_path() {
+        assert_eq!(
+            summarize_tool_input("Write", &json!({"file_path": "/a/b.rs"})),
+            "Write /a/b.rs"
+        );
+    }
+
+    /// review §3.1-2 — an `Edit` approval must show the old→new snippet, not
+    /// just the path.
+    #[test]
+    fn summarize_tool_input_edit_shows_old_and_new_snippets() {
+        let out = summarize_tool_input(
+            "Edit",
+            &json!({"file_path": "/a/b.rs", "old_string": "foo()", "new_string": "bar()"}),
+        );
+        assert_eq!(out, "Edit /a/b.rs\n  - foo()\n  + bar()");
+    }
+
+    #[test]
+    fn summarize_tool_input_multi_edit_shows_first_snippet_and_extra_count() {
+        let out = summarize_tool_input(
+            "MultiEdit",
+            &json!({
+                "file_path": "/a/b.rs",
+                "edits": [
+                    {"old_string": "a", "new_string": "b"},
+                    {"old_string": "c", "new_string": "d"},
+                ],
+            }),
+        );
+        assert_eq!(out, "MultiEdit /a/b.rs (+1 more edit)\n  - a\n  + b");
+    }
+
+    #[test]
+    fn summarize_tool_input_truncates_long_bash_command() {
+        let long = "x".repeat(500);
         let out = summarize_tool_input("Bash", &json!({"command": long}));
+        assert!(out.starts_with("Bash "));
+        assert!(out.ends_with('…'));
+        // "Bash " (5) + COMMAND_MAX (200) + the ellipsis char.
         assert!(
-            out.chars().count() <= 161,
+            out.chars().count() <= 207,
             "got {} chars",
             out.chars().count()
         );
+    }
+
+    #[test]
+    fn summarize_tool_input_truncates_long_write_content() {
+        let long = "y".repeat(1000);
+        let out = summarize_tool_input("Write", &json!({"file_path": "/x", "content": long}));
         assert!(out.ends_with('…'));
+        assert!(out.len() < 1000, "content preview must be capped");
+    }
+
+    /// review §3.1-2 — the generic fallback must never dump a raw JSON
+    /// blob: nested arrays/objects collapse to a size marker.
+    #[test]
+    fn summarize_tool_input_generic_never_dumps_raw_json() {
+        let out = summarize_tool_input(
+            "mcp__example__do_thing",
+            &json!({"items": [1, 2, 3], "nested": {"a": 1, "b": 2}, "name": "x"}),
+        );
+        assert!(
+            !out.contains("1, 2, 3"),
+            "the array's raw elements must not appear: {out}"
+        );
+        assert!(
+            out.contains("items: [3 items]"),
+            "expected a size marker, got: {out}"
+        );
+        assert!(
+            out.contains("nested: {2 keys}"),
+            "expected a size marker, got: {out}"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_input_generic_caps_total_length() {
+        let mut fields = serde_json::Map::new();
+        for i in 0..30 {
+            fields.insert(format!("field_{i}"), json!("x".repeat(50)));
+        }
+        let out =
+            summarize_tool_input("mcp__example__do_thing", &serde_json::Value::Object(fields));
+        assert!(
+            out.chars().count() < 400,
+            "digest must stay capped, got {} chars",
+            out.chars().count()
+        );
+    }
+
+    // ---- risk classification (review §3.1-2) -------------------------------
+
+    #[test]
+    fn classify_tool_risk_read_only_tools_are_low() {
+        for tool in ["Read", "Glob", "Grep", "LS", "WebFetch"] {
+            assert_eq!(
+                classify_tool_risk(tool, &json!({})),
+                ApprovalRisk::Low,
+                "{tool} should be Low"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_tool_risk_file_mutations_are_medium() {
+        for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+            assert_eq!(
+                classify_tool_risk(tool, &json!({})),
+                ApprovalRisk::Medium,
+                "{tool} should be Medium"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_tool_risk_plain_bash_is_medium_destructive_bash_is_high() {
+        assert_eq!(
+            classify_tool_risk("Bash", &json!({"command": "ls -la"})),
+            ApprovalRisk::Medium
+        );
+        assert_eq!(
+            classify_tool_risk("Bash", &json!({"command": "rm -rf /tmp/x"})),
+            ApprovalRisk::High
+        );
+        assert_eq!(
+            classify_tool_risk("Bash", &json!({"command": "git push --force origin main"})),
+            ApprovalRisk::High
+        );
+    }
+
+    #[test]
+    fn classify_tool_risk_unknown_tool_is_unknown_not_low() {
+        assert_eq!(
+            classify_tool_risk("mcp__example__do_thing", &json!({})),
+            ApprovalRisk::Unknown,
+            "an unrecognized tool must never be silently treated as safe"
+        );
+    }
+
+    /// review §3.1-2's explicit ask: "rm -rf 级命令必须视觉上区别于 Read".
+    #[test]
+    fn destructive_bash_and_read_have_visually_distinct_badges() {
+        let read_risk = classify_tool_risk("Read", &json!({"file_path": "/tmp/x"}));
+        let bash_risk = classify_tool_risk("Bash", &json!({"command": "rm -rf /"}));
+        assert_ne!(read_risk, bash_risk);
+        assert_ne!(risk_badge(read_risk), risk_badge(bash_risk));
+        assert_eq!(risk_badge(read_risk), "🟢");
+        assert_eq!(risk_badge(bash_risk), "🔴");
     }
 
     #[test]

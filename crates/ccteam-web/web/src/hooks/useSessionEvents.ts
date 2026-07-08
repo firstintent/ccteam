@@ -84,9 +84,41 @@ const retryDelayMs = (attempt: number): number =>
   Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (attempt - 1));
 
 /** Build the per-session SSE URL. Exported for unit tests + so callers
- *  share one template. */
-export function sessionEventsUrl(sid: string): string {
-  return `/api/v1/sessions/${encodeURIComponent(sid)}/events`;
+ *  share one template.
+ *
+ *  v0.8.22 P1 (review §3.1-3) — `lastEventId`, when given and > 0, is
+ *  appended as `?last_event_id=`: the reconnect watermark. `EventSource`
+ *  cannot set arbitrary request headers, and this hook deliberately opens a
+ *  BRAND NEW `EventSource` on every reconnect (see `connect()` below), so
+ *  the browser's native "resend `Last-Event-ID` on ITS OWN reconnect"
+ *  behavior never applies — the server has to be told via the query string
+ *  instead (it also accepts the standard header, for non-browser clients). */
+export function sessionEventsUrl(sid: string, lastEventId?: number): string {
+  const base = `/api/v1/sessions/${encodeURIComponent(sid)}/events`;
+  return lastEventId && lastEventId > 0 ? `${base}?last_event_id=${lastEventId}` : base;
+}
+
+/** Decide whether an incoming SSE frame should be appended, given the
+ *  highest replay-ring `seq` already applied (from the frame's SSE-level
+ *  `id:`, i.e. `MessageEvent.lastEventId` — NOT the JSON payload's own
+ *  `id`, which some frames intentionally REUSE across edits, e.g. a
+ *  `Progress` status message edited in place; that field must never be a
+ *  dedup key). A frame with no parseable seq (id missing/non-numeric, e.g.
+ *  the very first events emitted before this field existed, or a
+ *  non-numeric id from a future server) always passes through — only
+ *  numbered frames participate in dedup. Pure + DOM-free so it is
+ *  unit-testable without a real `EventSource`. Used both to filter a
+ *  replayed/reseeded duplicate at reconnect AND to advance the watermark
+ *  for the next reconnect. */
+export function shouldAcceptEventSeq(
+  lastEventId: string | undefined,
+  highestSeenSeq: number,
+): { accept: boolean; nextHighest: number } {
+  if (!lastEventId) return { accept: true, nextHighest: highestSeenSeq };
+  const seq = Number(lastEventId);
+  if (!Number.isFinite(seq)) return { accept: true, nextHighest: highestSeenSeq };
+  if (seq <= highestSeenSeq) return { accept: false, nextHighest: highestSeenSeq };
+  return { accept: true, nextHighest: seq };
 }
 
 /** Parse one raw SSE `progress` payload into a {@link SessionEvent}, or
@@ -178,9 +210,22 @@ export function useSessionEvents(
   // clearing here, a brand-new sid is observed with an empty buffer from its
   // very first render — streams never mix across a switch.
   const [streamedSid, setStreamedSid] = useState<string | null>(sid);
+  // v0.8.22 P1 (review §3.1-3) — the highest replay-ring seq applied so far
+  // for the CURRENT sid. Threaded into the reconnect URL as `last_event_id`
+  // (the query fallback — `EventSource` can't set the standard header) and
+  // used by `shouldAcceptEventSeq` to dedupe a replayed/reseeded frame this
+  // hook already rendered. Survives across reconnects WITHIN one sid (reset
+  // only on an actual sid change, below) — that persistence is exactly what
+  // makes the reconnect watermark work.
+  const lastSeenSeqRef = useRef(0);
   if (sid !== streamedSid) {
     setStreamedSid(sid);
     setEvents([]);
+    // A new sid starts its own seq watermark; carrying over the PREVIOUS
+    // sid's seq would either wrongly drop the new sid's early frames (if it
+    // happened to be numerically lower) or just be meaningless (ring seqs
+    // are per-sid, not global).
+    lastSeenSeqRef.current = 0;
   }
 
   const esRef = useRef<EventSource | null>(null);
@@ -217,11 +262,16 @@ export function useSessionEvents(
       setEvents([]);
       setGatewayUnavailable(false);
     });
-    const url = sessionEventsUrl(sid);
 
     const connect = () => {
       if (cancelled) return;
-      const es = new EventSource(url);
+      // v0.8.22 P1 (review §3.1-3) — build the URL AT CONNECT TIME (not once
+      // per effect run): a reconnect must carry the watermark accumulated so
+      // far, and this closure runs again on every `scheduleReconnect` retry
+      // — a genuinely NEW `EventSource`, not the browser's own auto-retry
+      // (which would resend `Last-Event-ID` on its own but never fires here
+      // since we always `.close()` first).
+      const es = new EventSource(sessionEventsUrl(sid, lastSeenSeqRef.current));
       esRef.current = es;
 
       es.addEventListener("open", () => {
@@ -233,7 +283,15 @@ export function useSessionEvents(
 
       es.addEventListener("progress", (ev) => {
         if (cancelled) return;
-        const parsed = parseSessionEvent((ev as MessageEvent).data);
+        const msgEvent = ev as MessageEvent;
+        // v0.8.22 P1 — dedupe a replayed/reseeded frame this hook already
+        // rendered (the ring-replay/reseed catchup batch can legitimately
+        // repeat a frame at a reconnect boundary — see `ring.rs`'s module
+        // doc); a frame with no parseable seq always passes through.
+        const decision = shouldAcceptEventSeq(msgEvent.lastEventId, lastSeenSeqRef.current);
+        lastSeenSeqRef.current = decision.nextHighest;
+        if (!decision.accept) return;
+        const parsed = parseSessionEvent(msgEvent.data);
         if (parsed) setEvents((prev) => appendSessionEvent(prev, parsed));
       });
 
