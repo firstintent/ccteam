@@ -341,6 +341,7 @@ mod tests {
             title: None,
             turn_count: 0,
             cost_usd: None,
+            waiting_approval: false,
         }
     }
 

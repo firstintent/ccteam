@@ -88,6 +88,131 @@ export function railSessionLabel(s: { title?: string | null; role: string }): st
   return s.title || s.role || "(无 role)";
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.23 review §1.3-D item 9/10 — session attention (waiting-approval /
+// unread / error) + real alive/busy dot semantics. Data all comes from the
+// existing `SessionView` fields (`waiting_approval`, `status`, `turn_count`)
+// — this is pure aggregation, no new backend polling. Split into small pure
+// functions (no DOM/localStorage inside the ones that matter for logic) so
+// they get the same direct-unit-test treatment as `railSessionLabel` /
+// `relativeTimeZh` above (this repo has no `@testing-library/react` DOM
+// harness).
+// ---------------------------------------------------------------------------
+
+/** Item 10 — the rail dot's color is the session's REAL liveness/business
+ *  (the `status` field the backend already derives from progress.jsonl via
+ *  `classify_progress_activity_for_sid`: `"idle" | "working" | "stale" |
+ *  "stuck"`, or the `"live"` fallback when no progress event has landed
+ *  yet), never "is this the currently-selected row" — that's now expressed
+ *  ONLY by the row's background highlight. Mirrors `sessionActivityMeta` in
+ *  `StatusView.tsx` (the fleet-table precedent for this same status
+ *  vocabulary), specialized to a plain dot color. */
+export function sessionDotClass(status: string | null | undefined): string {
+  switch (status) {
+    case "working":
+      return "bg-status-waiting animate-pulse"; // amber, pulsing — busy in a turn
+    case "stale":
+      return "bg-status-waiting"; // amber, steady — aging without a fresh event
+    case "stuck":
+      return "bg-status-error"; // red — the watchdog's stuck verdict
+    default:
+      return "bg-status-running"; // green — idle/live, nothing wrong
+  }
+}
+
+/** One row's attention state, in priority order (a row shows at most one
+ *  badge — the most urgent). `null` = nothing needs the user's attention. */
+export type AttentionKind = "approval" | "error" | "unread" | null;
+
+/** Item 9b — a session's last completed turn is "unread" once its
+ *  `turn_count` has grown past what was last recorded as viewed for that
+ *  sid (see `markSessionViewed`/`getLastViewedTurnCount` below). A session
+ *  that has never completed a turn (`turn_count` 0/absent) is never unread.
+ *  Pure: takes the last-viewed count as a plain argument instead of reading
+ *  localStorage itself, so it's directly unit-testable. */
+export function isSessionUnread(
+  turnCount: number | null | undefined,
+  lastViewedTurnCount: number,
+): boolean {
+  const count = turnCount ?? 0;
+  return count > 0 && count > lastViewedTurnCount;
+}
+
+/** Minimal shape `sessionAttention`/`attentionCount` need — satisfied by both
+ *  the live `SessionView` (rail rows) and `HistorySessionView` (history rows,
+ *  which carry no `status`/`waiting_approval` — a stopped session can't have
+ *  either, so those rows only ever resolve to `"unread"` or `null`). */
+export interface AttentionInput {
+  sid: string;
+  status?: string | null;
+  waiting_approval?: boolean;
+  turn_count?: number | null;
+}
+
+/** Item 9 — derive one row's attention kind, most-urgent-first: a pending
+ *  approval outranks an error, which outranks a plain unread reply (an
+ *  action-needed state always beats a passive one). Pure (see
+ *  `isSessionUnread`). */
+export function sessionAttention(s: AttentionInput, lastViewedTurnCount: number): AttentionKind {
+  if (s.waiting_approval) return "approval";
+  if (s.status === "stuck") return "error";
+  if (isSessionUnread(s.turn_count, lastViewedTurnCount)) return "unread";
+  return null;
+}
+
+/** Display copy + chip color for one attention kind (mirrors the compact
+ *  `hitl` chip already on the rail row). `null` renders nothing. */
+export function attentionMeta(kind: AttentionKind): { label: string; className: string } | null {
+  switch (kind) {
+    case "approval":
+      return { label: "等待批准", className: "bg-status-waiting/15 text-status-waiting" };
+    case "error":
+      return { label: "报错", className: "bg-status-error/15 text-status-error" };
+    case "unread":
+      return { label: "未读", className: "bg-brand-500/15 text-brand-400" };
+    default:
+      return null;
+  }
+}
+
+/** Item 9 — the global attention count for the bottom nav (sum across every
+ *  visible session with a non-null attention kind). `lastViewedTurnCount` is
+ *  injected as a lookup function (not read from localStorage internally) so
+ *  this stays pure/testable; production calls it with `getLastViewedTurnCount`. */
+export function attentionCount(
+  sessions: AttentionInput[],
+  lastViewedTurnCount: (sid: string) => number,
+): number {
+  return sessions.filter((s) => sessionAttention(s, lastViewedTurnCount(s.sid)) !== null).length;
+}
+
+const LAST_VIEWED_TURN_COUNT_PREFIX = "ccteam.lastViewedTurnCount.";
+
+/** Best-effort read of the last turn_count this sid was marked viewed at
+ *  (item 9b unread tracking — client-side only, no server per-user
+ *  read-state store). `0` (never viewed) on any failure — private-mode
+ *  storage, a missing/garbled entry, or no `localStorage` at all (SSR) all
+ *  degrade the same way: never throws. */
+export function getLastViewedTurnCount(sid: string): number {
+  try {
+    const raw = localStorage.getItem(`${LAST_VIEWED_TURN_COUNT_PREFIX}${sid}`);
+    const n = raw ? Number(raw) : 0;
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Record `sid` as viewed at `turnCount` — call when the user opens/keeps
+ *  looking at that session's chat. Best-effort (see `getLastViewedTurnCount`). */
+export function markSessionViewed(sid: string, turnCount: number): void {
+  try {
+    localStorage.setItem(`${LAST_VIEWED_TURN_COUNT_PREFIX}${sid}`, String(turnCount));
+  } catch {
+    // Storage unavailable — the badge just won't clear; never throw.
+  }
+}
+
 /** Frontend-only soft cap on how many active sessions one user may hold at
  *  once. "Active" = the sessions in this caller's own cross-project list
  *  (`railSessions`), which the backend already ACL-scopes to the caller — so
@@ -226,6 +351,17 @@ export default function ChatConsole() {
     () => railSessions.find((s) => s.sid === sid) ?? null,
     [railSessions, sid],
   );
+
+  // Item 9b — the session currently open is always "read": mark it viewed at
+  // its latest known `turn_count` on every switch AND every time a poll
+  // (`refreshSessions`) brings a fresh count in while it's still the active
+  // one — so a turn completing while the user is looking never flashes an
+  // "unread" badge once the next poll lands. Client-side only (localStorage),
+  // no server per-user read-state.
+  useEffect(() => {
+    if (!sid || !activeView) return;
+    markSessionViewed(sid, activeView.turn_count ?? 0);
+  }, [sid, activeView]);
 
   // ---- switcher list (cross-project fan-out) -----------------------------
   const refreshSessions = useCallback(async () => {
@@ -389,6 +525,13 @@ export default function ChatConsole() {
   // entry at the limit so the affordance reflects the block; the create
   // funnel (`createSession`) still hard-guards + toasts as the source of truth.
   const atSessionCap = railSessions.length >= MAX_ACTIVE_SESSIONS;
+  // Item 9 — global attention count (waiting-approval / error / unread)
+  // across every session this caller can see, surfaced as a badge near the
+  // top of the nav so it's visible whether or not the sidebar/drawer is open.
+  const totalAttention = useMemo(
+    () => attentionCount(railSessions, getLastViewedTurnCount),
+    [railSessions],
+  );
 
   const switchTo = useCallback(
     (s: RailSession) => {
@@ -404,14 +547,24 @@ export default function ChatConsole() {
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
       {/* standalone app bar */}
       <header className="h-12 shrink-0 border-b border-surface-700/40 px-3 sm:px-4 flex items-center gap-2 sm:gap-3">
-        {/* mobile drawer toggle — hidden on md+ where the rail is always shown */}
+        {/* mobile drawer toggle — hidden on md+ where the rail is always shown.
+            Item 9 — the global attention count overlays it (visible whether
+            or not the drawer/sidebar is currently open). */}
         <button
           type="button"
           onClick={() => setSidebarOpen(true)}
           aria-label="打开会话列表"
-          className="md:hidden h-8 w-8 -ml-1 grid place-items-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-800"
+          className="md:hidden relative h-8 w-8 -ml-1 grid place-items-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-800"
         >
           <Menu className="h-4 w-4" />
+          {totalAttention > 0 ? (
+            <span
+              className="absolute top-0.5 right-0.5 min-w-[14px] h-[14px] px-[3px] rounded-full bg-status-error text-surface-950 text-[9px] font-mono leading-[14px] text-center"
+              title={`${totalAttention} 个 session 需要关注`}
+            >
+              {totalAttention > 9 ? "9+" : totalAttention}
+            </span>
+          ) : null}
         </button>
         <MessageSquare className="h-4 w-4 text-brand-400 shrink-0" />
         <span className="text-sm font-semibold">
@@ -444,7 +597,19 @@ export default function ChatConsole() {
           }`}
         >
           <div className="h-10 shrink-0 px-3 flex items-center justify-between border-b border-surface-700/30">
-            <span className="text-xs font-mono uppercase text-text-secondary">所有 session</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-xs font-mono uppercase text-text-secondary">所有 session</span>
+              {/* Item 9 — same global attention count as the header badge,
+                  shown here too so it's visible on desktop (no hamburger). */}
+              {totalAttention > 0 ? (
+                <span
+                  className="shrink-0 min-w-[16px] h-4 px-1 rounded-full bg-status-error/15 text-status-error text-[10px] font-mono leading-4 text-center"
+                  title={`${totalAttention} 个 session 需要关注`}
+                >
+                  {totalAttention}
+                </span>
+              ) : null}
+            </div>
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -536,6 +701,12 @@ export default function ChatConsole() {
                       const active = s.sid === sid;
                       const isClaude = s.vendor === "claude";
                       const editing = renamingSid === s.sid;
+                      // Item 9/10 — attention badge + real-status dot. The
+                      // dot no longer encodes "selected" (the row background
+                      // above already does that); it encodes the session's
+                      // actual liveness/business (`s.status`).
+                      const attention = sessionAttention(s, getLastViewedTurnCount(s.sid));
+                      const attentionInfo = attentionMeta(attention);
                       const commitRename = () => {
                         const title = renameDraft.trim();
                         setRenamingSid(null);
@@ -584,9 +755,8 @@ export default function ChatConsole() {
                               className="flex-1 min-w-0 text-left px-2 py-1.5 rounded-md flex items-center gap-2"
                             >
                               <span
-                                className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                                  active ? "bg-status-running" : "bg-surface-700"
-                                }`}
+                                title={`状态: ${s.status || "live"}`}
+                                className={`h-1.5 w-1.5 rounded-full shrink-0 ${sessionDotClass(s.status)}`}
                               />
                               <span
                                 className={`font-mono px-1 rounded text-[10px] ${
@@ -604,6 +774,14 @@ export default function ChatConsole() {
                                   title="HITL: 非 allowlist 工具需批准"
                                 >
                                   hitl
+                                </span>
+                              ) : null}
+                              {attentionInfo ? (
+                                <span
+                                  className={`shrink-0 font-mono text-[9px] px-1 rounded ${attentionInfo.className}`}
+                                  title={attentionInfo.label}
+                                >
+                                  {attentionInfo.label}
                                 </span>
                               ) : null}
                               <span className="text-text-muted font-mono">{s.sid}</span>
@@ -1487,6 +1665,12 @@ function HistorySection({
           {history.map((h) => {
             const isActive = h.sid === activeSid;
             const isClaude = h.vendor === "claude";
+            // Item 9 — a stopped session can never be waiting-approval or
+            // "stuck" (both are live-only concepts), so history rows only
+            // ever resolve to "unread" or nothing.
+            const attentionInfo = attentionMeta(
+              sessionAttention(h, getLastViewedTurnCount(h.sid)),
+            );
             return (
               <button
                 key={h.sid}
@@ -1514,6 +1698,14 @@ function HistorySection({
                   {h.vendor}
                 </span>
                 <span className="truncate flex-1">{railSessionLabel(h)}</span>
+                {attentionInfo ? (
+                  <span
+                    className={`shrink-0 font-mono text-[9px] px-1 rounded ${attentionInfo.className}`}
+                    title={attentionInfo.label}
+                  >
+                    {attentionInfo.label}
+                  </span>
+                ) : null}
                 <span
                   className="text-[9px] text-text-muted shrink-0"
                   title={h.last_active || h.created_at}

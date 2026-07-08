@@ -51,6 +51,11 @@ export interface SessionView {
   turn_count?: number;
   /** v0.8.22 P1 — accrued priced cost (USD); `null` when nothing priced yet. */
   cost_usd?: number | null;
+  /** v0.8.23 review §1.3-D item 9 — true when a HITL approval is currently
+   *  outstanding for this session (`PendingInteractions::pending_for_sid`).
+   *  Drives the "等待批准" attention badge + the rail/history sort. Optional
+   *  for backward-compat — absent/omitted reads as `false`. */
+  waiting_approval?: boolean;
 }
 
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn

@@ -521,6 +521,15 @@ pub struct SessionView {
     /// when no turn has priced yet (never a faked `0.0`).
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// v0.8.23 review §1.3-D item 9 — true when a HITL approval is currently
+    /// outstanding for this sid ([`crate::pending::PendingInteractions::pending_for_sid`]).
+    /// Drives the "等待批准" attention badge (web rail/history rows) and the
+    /// IM `/sessions` top-pin. Cheap best-effort: [`Gateway::session_views`]
+    /// reads this via `try_lock` (never blocks on the async pending registry
+    /// — a momentary contention just omits the flag for that one call, never
+    /// panics/blocks). `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub waiting_approval: bool,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -3645,6 +3654,26 @@ impl Gateway {
             lb.cmp(&la)
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
+        // v0.8.23 review §1.3-D item 9 — the IM `/sessions` view (NOT the web
+        // bare-row feed `parse_sessions_reply` depends on) pins a session
+        // waiting on a HITL approval to the top: a stable sort on top of the
+        // recency order above, so ties within each group (waiting / not)
+        // keep their recency order. Cheap — reuses the existing pending
+        // registry (already shared with the daemon's `permission/ask`
+        // handler), no new progress.jsonl read.
+        let waiting_sids: HashSet<String> = if is_web {
+            HashSet::new()
+        } else {
+            let pend = self.pending.lock().await;
+            visible
+                .iter()
+                .filter(|s| pend.pending_for_sid(&s.id).is_some())
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        if !waiting_sids.is_empty() {
+            visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
+        }
         // v0.8.22 P0-4 — up to 5 most-recently-ended sessions this chat can
         // see (same visibility rule as the live list), scoped like the live
         // list (current project unless `all`). Reuses the existing on-disk
@@ -3698,6 +3727,12 @@ impl Gateway {
             if !is_web {
                 if let Some(title) = self.session_title(s) {
                     row.push_str(&format!(" 「{title}」"));
+                }
+                // v0.8.23 review item 9 — ⏳ marks a session pinned to the
+                // top for an outstanding HITL approval (see the reorder
+                // above). Prefixed last so it stays the leftmost glance cue.
+                if waiting_sids.contains(&s.id) {
+                    row = format!("⏳ {row}");
                 }
             }
             rows.push(row);
@@ -4150,6 +4185,15 @@ impl Gateway {
                 let title = meta.as_ref().and_then(|m| m.title.clone());
                 let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
                 let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
+                // v0.8.23 review item 9 — best-effort (never blocks): a
+                // `try_lock` failure (rare, momentary registry contention)
+                // just reports "not waiting" for this one snapshot rather
+                // than making the whole sync `session_views()` async.
+                let waiting_approval = self
+                    .pending
+                    .try_lock()
+                    .map(|guard| guard.pending_for_sid(&s.id).is_some())
+                    .unwrap_or(false);
                 SessionView {
                     sid: s.id.clone(),
                     project: s.project.clone(),
@@ -4170,6 +4214,7 @@ impl Gateway {
                     title,
                     turn_count,
                     cost_usd,
+                    waiting_approval,
                 }
             })
             .collect();
@@ -6368,6 +6413,57 @@ mod tests {
         assert!(gateway.stop_session("s1").await.is_err());
     }
 
+    /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
+    /// the shared pending registry: `false` for an ordinary session, flips to
+    /// `true` the instant an External-origin HITL prompt is tagged with its
+    /// sid (`PendingInteractions::tag_sid`, the exact step `hitl::ask_permission`
+    /// takes), and back to `false` once the prompt is taken/resolved. Read via
+    /// `try_lock` so `session_views()` stays a sync, non-blocking snapshot.
+    #[tokio::test]
+    async fn gateway_session_views_reports_waiting_approval() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-waiting-approval");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !gateway.session_views()[0].waiting_approval,
+            "no pending yet"
+        );
+
+        let token = "pwaiting001";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        shared.lock().await.tag_sid(token, sid.to_string());
+
+        assert!(
+            gateway.session_views()[0].waiting_approval,
+            "tagged pending flips the flag"
+        );
+
+        // Resolving the approval consumes the pending — the flag drops again.
+        gateway.resolve_web_selection(token, "allow").await.unwrap();
+        assert!(
+            !gateway.session_views()[0].waiting_approval,
+            "resolved pending clears the flag"
+        );
+    }
+
     /// Dead-child recovery on the TURN path (reactive): when a session's child
     /// has exited out from under the held handle, `submit_turn` returns the
     /// recoverable `HarnessError::ThreadDied`, and the gateway transparently
@@ -7988,6 +8084,103 @@ mod tests {
         assert_eq!(
             baseline,
             vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+        );
+    }
+
+    /// v0.8.23 review §1.3-D item 9 — IM `/sessions` pins a session with an
+    /// outstanding HITL approval to the top of the live list (a ⏳ marker
+    /// prefixes its row), even when it is LESS recent than its siblings.
+    /// `s2` (qa) is created after `s1` (reviewer) so the default recency
+    /// order is `s2` then `s1`; tagging `s1` with a pending approval must
+    /// invert that.
+    #[tokio::test]
+    async fn gateway_sessions_pins_waiting_approval_to_top_with_marker() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude qa")
+            .await
+            .unwrap();
+
+        // No pending yet — plain recency order (s2 newer, sorts first).
+        let before = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            before,
+            vec!["📁 当前项目: alpha\ns2:alpha:Claude:qa\ns1:alpha:Claude:reviewer"]
+        );
+
+        // Tag s1 (the OLDER session) with an outstanding approval.
+        let token = "pwaitpin001";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        shared.lock().await.tag_sid(token, "s1".to_string());
+
+        let after = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            after,
+            vec!["📁 当前项目: alpha\n⏳ s1:alpha:Claude:reviewer\ns2:alpha:Claude:qa"],
+            "s1 pinned to the top + ⏳-marked despite being less recent"
+        );
+    }
+
+    /// v0.8.23 review §1.3-D item 9 — the web bare-row feed (`parse_sessions_reply`'s
+    /// contract, fixed-shape `id:project:vendor:role` text) is UNCHANGED by
+    /// the waiting-approval pin: no reorder, no ⏳ marker, even with a
+    /// tagged pending outstanding. Sessions are created + queried from the
+    /// SAME `web` chat so ownership (the shared ACL) isn't a confound.
+    #[tokio::test]
+    async fn gateway_sessions_web_bare_rows_unaffected_by_waiting_approval() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        gateway
+            .handle_text("web", "web-chat", "web-user", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("web", "web-chat", "web-user", "/new claude qa")
+            .await
+            .unwrap();
+
+        let token = "pwaitweb001";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            permission_prompt(token),
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        shared.lock().await.tag_sid(token, "s1".to_string());
+
+        let web_view = gateway
+            .handle_text("web", "web-chat", "web-user", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            web_view,
+            vec!["s2:alpha:Claude:qa\ns1:alpha:Claude:reviewer"]
         );
     }
 

@@ -28,7 +28,16 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import { NewSessionModal, railSessionLabel, relativeTimeZh } from "./ChatConsole";
+import {
+  attentionCount,
+  attentionMeta,
+  isSessionUnread,
+  NewSessionModal,
+  railSessionLabel,
+  relativeTimeZh,
+  sessionAttention,
+  sessionDotClass,
+} from "./ChatConsole";
 import { mergeProjectSlugs } from "./projectList";
 import type { SessionView } from "../lib/sessionsApi";
 
@@ -83,6 +92,122 @@ describe("relativeTimeZh", () => {
   it("falls back to an absolute date at >= 5 weeks", () => {
     const old = new Date(Date.now() - 40 * 24 * 3600 * 1000);
     expect(relativeTimeZh(old.toISOString())).toBe(old.toISOString().slice(0, 10));
+  });
+});
+
+// ---- sessionDotClass (v0.8.23 review item 10 — the dot is REAL liveness/
+// business, never "is this row selected" — that's now the row's background
+// highlight only). Mirrors the status vocabulary `classify_progress_activity_
+// for_sid` produces server-side (`"idle" | "working" | "stale" | "stuck"`). --
+describe("sessionDotClass", () => {
+  it("renders amber + pulsing while a turn is actively working", () => {
+    expect(sessionDotClass("working")).toContain("bg-status-waiting");
+    expect(sessionDotClass("working")).toContain("animate-pulse");
+  });
+
+  it("renders steady amber for a stale (aging, not confirmed stuck) session", () => {
+    expect(sessionDotClass("stale")).toBe("bg-status-waiting");
+  });
+
+  it("renders red for a stuck session (the error state)", () => {
+    expect(sessionDotClass("stuck")).toBe("bg-status-error");
+  });
+
+  it("renders green for idle/live/unknown statuses", () => {
+    expect(sessionDotClass("idle")).toBe("bg-status-running");
+    expect(sessionDotClass("live")).toBe("bg-status-running");
+    expect(sessionDotClass(undefined)).toBe("bg-status-running");
+    expect(sessionDotClass(null)).toBe("bg-status-running");
+  });
+});
+
+// ---- isSessionUnread / sessionAttention / attentionMeta / attentionCount
+// (v0.8.23 review item 9 — attention badges). Pure: last-viewed turn_count is
+// a plain argument (no localStorage read inside), so these are directly
+// unit-testable without stubbing browser storage. ------------------------
+describe("isSessionUnread", () => {
+  it("is unread once turn_count has grown past the last-viewed count", () => {
+    expect(isSessionUnread(3, 1)).toBe(true);
+  });
+
+  it("is read once the last-viewed count catches up (or is ahead)", () => {
+    expect(isSessionUnread(3, 3)).toBe(false);
+    expect(isSessionUnread(1, 3)).toBe(false);
+  });
+
+  it("a session with no completed turn is never unread", () => {
+    expect(isSessionUnread(0, 0)).toBe(false);
+    expect(isSessionUnread(undefined, 0)).toBe(false);
+    expect(isSessionUnread(null, 0)).toBe(false);
+  });
+});
+
+describe("sessionAttention", () => {
+  it("prioritizes a pending approval over everything else", () => {
+    expect(
+      sessionAttention(
+        { sid: "s1", waiting_approval: true, status: "stuck", turn_count: 5 },
+        0,
+      ),
+    ).toBe("approval");
+  });
+
+  it("falls back to error (stuck) when not waiting on approval", () => {
+    expect(sessionAttention({ sid: "s1", status: "stuck", turn_count: 5 }, 0)).toBe("error");
+  });
+
+  it("falls back to unread when neither waiting nor stuck", () => {
+    expect(sessionAttention({ sid: "s1", status: "idle", turn_count: 5 }, 0)).toBe("unread");
+  });
+
+  it("is null once everything has been seen and nothing is wrong", () => {
+    expect(sessionAttention({ sid: "s1", status: "idle", turn_count: 5 }, 5)).toBeNull();
+    expect(sessionAttention({ sid: "s1", status: "working", turn_count: 0 }, 0)).toBeNull();
+  });
+
+  it("a stopped (history) row with no status/waiting_approval only ever resolves unread/null", () => {
+    expect(sessionAttention({ sid: "h1", turn_count: 3 }, 0)).toBe("unread");
+    expect(sessionAttention({ sid: "h1", turn_count: 3 }, 3)).toBeNull();
+  });
+});
+
+describe("attentionMeta", () => {
+  it("labels each attention kind in Chinese with a distinct color", () => {
+    expect(attentionMeta("approval")).toEqual({
+      label: "等待批准",
+      className: "bg-status-waiting/15 text-status-waiting",
+    });
+    expect(attentionMeta("error")?.label).toBe("报错");
+    expect(attentionMeta("unread")?.label).toBe("未读");
+  });
+
+  it("renders nothing for a session needing no attention", () => {
+    expect(attentionMeta(null)).toBeNull();
+  });
+});
+
+describe("attentionCount", () => {
+  it("sums every session with a non-null attention kind", () => {
+    const sessions = [
+      { sid: "s1", waiting_approval: true, turn_count: 0 },
+      { sid: "s2", status: "stuck", turn_count: 0 },
+      { sid: "s3", status: "idle", turn_count: 5 }, // unread against a 0 last-viewed
+      { sid: "s4", status: "idle", turn_count: 0 }, // nothing to report
+    ];
+    expect(attentionCount(sessions, () => 0)).toBe(3);
+  });
+
+  it("respects the last-viewed lookup per sid (the active session reads as seen)", () => {
+    const sessions = [
+      { sid: "s1", status: "idle", turn_count: 5 },
+      { sid: "s2", status: "idle", turn_count: 5 },
+    ];
+    const lastViewed = (sid: string) => (sid === "s1" ? 5 : 0);
+    expect(attentionCount(sessions, lastViewed)).toBe(1);
+  });
+
+  it("is 0 for an empty session list", () => {
+    expect(attentionCount([], () => 0)).toBe(0);
   });
 });
 

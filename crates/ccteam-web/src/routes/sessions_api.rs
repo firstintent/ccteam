@@ -1720,6 +1720,7 @@ mod tests {
             title: None,
             turn_count: 0,
             cost_usd: None,
+            waiting_approval: false,
         }];
 
         let stale_completed = serde_json::json!({
@@ -1764,6 +1765,7 @@ mod tests {
                 title: None,
                 turn_count: 0,
                 cost_usd: None,
+                waiting_approval: false,
             },
             SessionView {
                 sid: "s2".into(),
@@ -1781,6 +1783,7 @@ mod tests {
                 title: None,
                 turn_count: 0,
                 cost_usd: None,
+                waiting_approval: false,
             },
         ];
 
@@ -1832,6 +1835,7 @@ mod tests {
             title: None,
             turn_count: 0,
             cost_usd: None,
+            waiting_approval: false,
         }];
 
         ccteam_core::progress::append_event(
@@ -1870,6 +1874,7 @@ mod tests {
             title: None,
             turn_count: 0,
             cost_usd: None,
+            waiting_approval: false,
         }];
 
         ccteam_core::progress::append_event(
