@@ -519,6 +519,14 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         &["hello gateway".to_string()]
     );
 
+    // v0.8.23 review §3.2-5 — a focused IM answer now carries the compact
+    // "→ slug/sid (role)" context echo suffix; the session's independent
+    // v0.8.22 P1 auto-title (from its first user message) can ALSO land on
+    // the same meta.json and append an OPTIONAL `「title」` tag after it, so
+    // match the deterministic prefix rather than betting on whether that
+    // race won.
+    let echo = "gateway echo: hello gateway\n\n→ default/s1 (helper)";
+
     let outbox = mock.outbox().await;
     let contents: Vec<String> = outbox.into_iter().map(|m| m.content).collect();
     let mut content_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -531,7 +539,11 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     // there is no progress seed either.
     assert_eq!(content_counts.len(), 2, "got {content_counts:?}");
     assert_eq!(content_counts.get("created session s1"), Some(&1));
-    assert_eq!(content_counts.get("gateway echo: hello gateway"), Some(&1));
+    let echo_matches = content_counts
+        .keys()
+        .filter(|c| c.starts_with(echo))
+        .count();
+    assert_eq!(echo_matches, 1, "got {content_counts:?}");
     assert_eq!(
         content_counts.get("submitted s1 turn gateway-turn"),
         None,
@@ -578,7 +590,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     assert!(rows_by_id.values().any(|entries| {
         entries
             .iter()
-            .any(|(_, state, content)| state == "sent" && content == "gateway echo: hello gateway")
+            .any(|(_, state, content)| state == "sent" && content.starts_with(echo))
     }));
 }
 
@@ -653,7 +665,10 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
     .await
     .unwrap();
 
-    let echo = format!("gateway echo: {long_input}");
+    // v0.8.23 review §3.2-5 — a focused IM answer now carries the compact
+    // "→ slug/sid (role)" context echo suffix (folded into the split budget
+    // just like the rest of the reply text).
+    let echo = format!("gateway echo: {long_input}\n\n→ default/s1 (helper)");
 
     // ---- ledger: multiset + pairing (no cross-message ordering) ----
     let rows = read_durable_outbound_rows();
@@ -717,10 +732,17 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
             "split part exceeds 40-unit budget: {content:?}"
         );
     }
+    // v0.8.22 P1's auto-title (from the session's first user message) can
+    // independently land on this same session's meta.json, appending an
+    // OPTIONAL `「title」` tag after the context echo — orthogonal to this
+    // test's splitting behavior, so match the deterministic prefix rather
+    // than betting on whether that race won. `reconstructed` itself (not a
+    // hand-computed guess) is then the source of truth for the outbox
+    // cross-check below.
     let reconstructed: String = echo_parts.iter().map(|(_, c)| c.as_str()).collect();
-    assert_eq!(
-        reconstructed, echo,
-        "ordered parts must concatenate to echo"
+    assert!(
+        reconstructed.starts_with(&echo),
+        "ordered parts must concatenate to the echo (+ optional title tag): {reconstructed:?}"
     );
 
     // ---- the mock outbox carries the same ordered parts ------------
@@ -728,11 +750,11 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
     let echo_outbox: Vec<String> = outbox
         .into_iter()
         .map(|m| m.content)
-        .filter(|c| !c.is_empty() && c != &echo && echo.contains(c.as_str()))
+        .filter(|c| !c.is_empty() && c != &reconstructed && reconstructed.contains(c.as_str()))
         .collect();
     assert_eq!(
         echo_outbox.concat(),
-        echo,
+        reconstructed,
         "outbox echo parts must reconstruct"
     );
 }
@@ -1371,7 +1393,18 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
     // V0.8.4 P1 (F1): no "submitted … turn …" ack — the answer is the
     // next (and only) send.
     let reply = recv_ws_send(&mut socket).await;
-    assert_eq!(reply.content, "gateway echo: hello over ws");
+    // v0.8.23 review §3.2-5 — a focused IM answer now carries the compact
+    // "→ slug/sid (role)" context echo suffix ("ws" is an IM text surface,
+    // not "web", so the echo applies). The session's independent v0.8.22 P1
+    // auto-title can ALSO land on the same meta.json and append an OPTIONAL
+    // `「title」` tag after it, so match the deterministic prefix.
+    assert!(
+        reply
+            .content
+            .starts_with("gateway echo: hello over ws\n\n→ default/s1 (helper)"),
+        "got: {:?}",
+        reply.content
+    );
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
 
@@ -1400,10 +1433,15 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         "created session s1"
     );
     send_ws_text(&mut first_socket, "ws-r1-msg", "before restart").await;
-    // V0.8.4 P1 (F1): ack folded away — the answer is the only send.
-    assert_eq!(
-        recv_ws_send(&mut first_socket).await.content,
-        "gateway echo: before restart"
+    // V0.8.4 P1 (F1): ack folded away — the answer is the only send. Carries
+    // the v0.8.23 review §3.2-5 context echo suffix; the session's
+    // independent v0.8.22 P1 auto-title can ALSO land on the same
+    // meta.json and append an OPTIONAL `「title」` tag after it, so match
+    // the deterministic prefix rather than betting on whether that race won.
+    let first_reply = recv_ws_send(&mut first_socket).await.content;
+    assert!(
+        first_reply.starts_with("gateway echo: before restart\n\n→ default/s1 (helper)"),
+        "got: {first_reply:?}"
     );
     drop(first_socket);
     let _ = first_stop_tx.send(());
@@ -1415,10 +1453,13 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         spawn_ws_gateway_daemon(projects_root, second_ws, Arc::clone(&adapter));
     let mut second_socket = connect_ws_with_retry(&ws_url).await;
     send_ws_text(&mut second_socket, "ws-r2-msg", "after restart").await;
-    // V0.8.4 P1 (F1): ack folded away — the answer is the only send.
-    assert_eq!(
-        recv_ws_send(&mut second_socket).await.content,
-        "gateway echo: after restart"
+    // V0.8.4 P1 (F1): ack folded away — the answer is the only send. Carries
+    // the v0.8.23 review §3.2-5 context echo suffix (role survives restart);
+    // see the note above the first assertion re: the optional title tag.
+    let second_reply = recv_ws_send(&mut second_socket).await.content;
+    assert!(
+        second_reply.starts_with("gateway echo: after restart\n\n→ default/s1 (helper)"),
+        "got: {second_reply:?}"
     );
     drop(second_socket);
     let _ = second_stop_tx.send(());
@@ -1448,13 +1489,13 @@ async fn daemon_restart_preserves_ws_gateway_session() {
         .filter(|row| row["state"] == "sent")
         .filter_map(|row| row["message"]["content"].as_str().map(str::to_string))
         .collect();
+    // Cross-check against the ACTUAL delivered content observed above
+    // (already prefix-verified) rather than a hand-computed guess, so the
+    // optional auto-title tag can't desync this from the two assertions
+    // above it.
     assert_eq!(
         sent_contents,
-        vec![
-            "created session s1".to_string(),
-            "gateway echo: before restart".to_string(),
-            "gateway echo: after restart".to_string()
-        ]
+        vec!["created session s1".to_string(), first_reply, second_reply,]
     );
 }
 

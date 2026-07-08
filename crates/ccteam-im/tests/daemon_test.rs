@@ -76,14 +76,36 @@ async fn daemon_registers_command_menu_per_channel() {
 
     let expected = menu_command_specs();
     assert!(!expected.is_empty(), "there are in-menu gateway commands");
-    // Only zero-arg/menu-friendly gateway commands appear — passthrough
-    // vendor slashes must never be advertised.
+    // Only commands flagged `in_menu` in `GATEWAY_COMMANDS` appear —
+    // passthrough vendor slashes must never be advertised.
     assert!(expected.iter().any(|c| c.name == "/sessions"));
     assert!(expected.iter().any(|c| c.name == "/help"));
     assert!(
         !expected.iter().any(|c| c.name == "/compact"),
         "passthrough vendor slashes must stay out of the menu"
     );
+    // v0.8.23 review §3.2-4 — the multi-session navigation verbs used to be
+    // menu-invisible (in_menu:false), hiding the workflow's core verbs behind
+    // /help. They're in_menu now, with the arg hint woven into the
+    // description so a menu tap still teaches the argument.
+    for (name, hint) in [
+        ("/use", "<id|@role>"),
+        ("/cd", "<project>"),
+        ("/role", "<role>"),
+        ("/stop", "<id>"),
+        ("/interrupt", "[id]"),
+        ("/newproject", "<slug> <path>"),
+    ] {
+        let spec = expected
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} must be in the menu: {expected:?}"));
+        assert!(
+            spec.description.starts_with(hint),
+            "{name} menu description must lead with its arg hint: {:?}",
+            spec.description
+        );
+    }
 
     for ch in [&ch_a, &ch_b] {
         let calls = ch.registered_commands().await;

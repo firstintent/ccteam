@@ -687,21 +687,30 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/use",
-        arg_hint: Some("<id>"),
-        help: "switch to a session",
-        in_menu: false,
+        arg_hint: Some("<id|@role>"),
+        // v0.8.23 review §3.2-5 — `@role` is a shorthand for "the most
+        // recently active session with that role" (silent recency tie-break;
+        // an unmatched role lists what IS available).
+        help: "switch to a session (`@role` = most-recent session with that role)",
+        // v0.8.23 review §3.2-4 — the navigation verbs were menu-invisible
+        // (only zero-arg commands were advertised), hiding most of the
+        // multi-session workflow behind `/help`. Arg-bearing commands still
+        // work fine from a menu tap: Telegram inserts the bare `/name ` and
+        // the description (below, via `command_menu_description`) teaches
+        // the argument.
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>"),
         help: "stop (destroy) a session by id",
-        in_menu: false,
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/interrupt",
         arg_hint: Some("[id]"),
         help: "interrupt the running turn (keeps the session; bare = current)",
-        in_menu: false,
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/screen",
@@ -713,7 +722,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         name: "/role",
         arg_hint: Some("<role>"),
         help: "switch the current session to a fresh agent role",
-        in_menu: false,
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/rename",
@@ -725,7 +734,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         name: "/cd",
         arg_hint: Some("<project>"),
         help: "switch project",
-        in_menu: false,
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/sessions",
@@ -749,7 +758,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         name: "/newproject",
         arg_hint: Some("<slug> <path>"),
         help: "scaffold + register a project, then switch into it",
-        in_menu: false,
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/help",
@@ -766,15 +775,34 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
 /// `/model`, …) deliberately stay out of the menu — they are vendor-relative
 /// and would mislead. `name` keeps the leading `/` (each channel strips it
 /// if its API wants bare names, e.g. Telegram `setMyCommands`).
+///
+/// v0.8.23 review §3.2-4 — navigation verbs that take an argument (`/use`,
+/// `/cd`, `/role`, `/stop`, `/interrupt`, `/newproject`) are now `in_menu`
+/// too (a menu tap still only inserts the bare command name — the channel
+/// has no per-command "fill in the blank" affordance), so their
+/// [`command_menu_description`] weaves the `arg_hint` into the description
+/// the menu shows, teaching the user what to type next.
 pub fn menu_command_specs() -> Vec<crate::transport::CommandSpec> {
     GATEWAY_COMMANDS
         .iter()
         .filter(|c| c.in_menu)
         .map(|c| crate::transport::CommandSpec {
             name: c.name.to_string(),
-            description: c.help.to_string(),
+            description: command_menu_description(c),
         })
         .collect()
+}
+
+/// Menu-facing description for one [`GatewayCommandSpec`]: the arg hint
+/// woven in front of the help text (e.g. `"<id|@role> — switch to a
+/// session…"`) so an arg-bearing command's menu entry still teaches the
+/// argument even though tapping it only inserts the bare command name.
+/// Zero-arg commands are unaffected (just their `help`).
+fn command_menu_description(c: &GatewayCommandSpec) -> String {
+    match c.arg_hint {
+        Some(hint) => format!("{hint} — {}", c.help),
+        None => c.help.to_string(),
+    }
 }
 
 impl Gateway {
@@ -1441,9 +1469,22 @@ impl Gateway {
                 Ok(Some(format!("已重命名 {sid} → {title}")))
             }
             "/use" => {
-                let id = parts
+                let arg = parts
                     .next()
-                    .ok_or_else(|| anyhow!("/use requires a session id"))?;
+                    .ok_or_else(|| anyhow!("/use requires a session id or @role"))?;
+                // v0.8.23 review §3.2-5 — `/use @<role>` shorthand: resolve to
+                // the chat-visible session with that role, most recently
+                // active wins (silent recency tie-break). Only matches LIVE
+                // sessions (a cold-resume-by-role would be ambiguous with a
+                // stopped session's history); an unmatched role lists what IS
+                // available.
+                let owned_id;
+                let id: &str = if let Some(role) = arg.strip_prefix('@') {
+                    owned_id = self.resolve_use_role_shorthand(chat, role)?;
+                    &owned_id
+                } else {
+                    arg
+                };
                 // `/use <sid>` switches the chat's focus to one of ITS OWN
                 // sessions (it then moves the chat's current project to the
                 // target's). v0.8.18 柱2 档0 — own-only: a chat can no longer
@@ -2551,8 +2592,34 @@ impl Gateway {
                                 .read()
                                 .map(|m| m.get(&chat_key).map(|s| s == &session_id).unwrap_or(false))
                                 .unwrap_or(true);
+                            // v0.8.23 review §3.2-5 (item 2a) — a FOCUSED answer
+                            // otherwise carries NO context at all, so the "which
+                            // session just answered" question only had an answer for
+                            // the out-of-focus case above. Append a compact one-line
+                            // echo (`→ slug/sid (role)`) so a multi-session chat
+                            // always knows. IM text surface only (`channel != "web"`)
+                            // — the web console already shows the session in its own
+                            // chrome (per-session tab, project picker). Best-effort
+                            // title lookup from the same meta.json this turn just
+                            // refreshed above.
                             let content = if is_focused {
-                                text
+                                if channel == "web" {
+                                    text
+                                } else {
+                                    let title = project_dir
+                                        .as_ref()
+                                        .and_then(|dir| read_session_meta(dir, &session_id).ok())
+                                        .and_then(|m| m.title);
+                                    format!(
+                                        "{text}\n\n{}",
+                                        context_echo_line(
+                                            &session.project,
+                                            &session_id,
+                                            &session.role,
+                                            title.as_deref(),
+                                        )
+                                    )
+                                }
                             } else {
                                 format!(
                                     "[{} {} {} {}] {}",
@@ -3481,6 +3548,46 @@ impl Gateway {
             .map(|s| s.id.clone())
     }
 
+    /// `/use @<role>` shorthand (v0.8.23 review §3.2-5, item 2b): resolve
+    /// `role` to the sid of the chat-VISIBLE session (same rule as
+    /// `/sessions`/`/status` — [`Self::chat_can_access`], i.e. own + the
+    /// shared `user:` pool for the admin/web querier) with that role whose
+    /// `last_active` is most recent. Ambiguity (two+ sessions share the role)
+    /// is resolved SILENTLY by recency — documented in `/help`, not an error.
+    /// An unmatched role returns a usage error listing the roles that ARE
+    /// available to this chat, so the user can immediately retry.
+    fn resolve_use_role_shorthand(&self, chat: &ChatKey, role: &str) -> Result<String> {
+        let mut candidates: Vec<&GatewaySession> = self
+            .sessions
+            .values()
+            .filter(|s| Self::chat_can_access(chat, s) && s.role == role)
+            .collect();
+        if candidates.is_empty() {
+            let mut available: Vec<&str> = self
+                .sessions
+                .values()
+                .filter(|s| Self::chat_can_access(chat, s) && !s.role.is_empty())
+                .map(|s| s.role.as_str())
+                .collect();
+            available.sort_unstable();
+            available.dedup();
+            return Err(if available.is_empty() {
+                anyhow!("没有可按 role 匹配的会话 —— 用 /use <sid>,或先 /new 一个")
+            } else {
+                anyhow!(
+                    "未找到 role `{role}` 的会话 —— 可用: {}",
+                    available.join(", ")
+                )
+            });
+        }
+        candidates.sort_by(|a, b| {
+            self.session_last_active(b)
+                .cmp(&self.session_last_active(a))
+                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
+        });
+        Ok(candidates[0].id.clone())
+    }
+
     fn template_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<GatewayRouteTemplate> {
         self.templates
             .iter()
@@ -3799,9 +3906,19 @@ impl Gateway {
         };
 
         let role = if s.role.is_empty() { "—" } else { &s.role };
+        // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
+        // giving the project slug + current session (sid/role/title) ahead of
+        // the existing deep-view body, so the two-pointer (project × session)
+        // mental model has one line that answers both at a glance. Same
+        // format as the turn-answer context echo (`context_echo_line`), so
+        // the two surfaces read identically.
+        let title = self.session_title(s);
         let mut out = format!(
-            "📍 当前会话 {} · {} · {:?} · {role} · {state} {detail}",
-            s.id, s.project, s.vendor
+            "🧭 {}\n📍 当前会话 {} · {} · {:?} · {role} · {state} {detail}",
+            context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
+            s.id,
+            s.project,
+            s.vendor
         );
 
         // Project working-tree PATH — disambiguates an auto-appended slug
@@ -4615,6 +4732,23 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Claude => "claude",
         AgentVendor::Codex => "codex",
     }
+}
+
+/// v0.8.23 review §3.2-5 (item 2a) — the compact "which session just spoke"
+/// context line (`→ <slug>/<sid> (<role>)`), shared by the turn-answer echo
+/// (the detached event pump, IM only) and the `/status` "you are here"
+/// header, so the two surfaces read identically. `role` is omitted for a
+/// roleless session; `title` (when cheaply available from `meta.json`) is
+/// appended as a trailing `「tag」`.
+fn context_echo_line(slug: &str, sid: &str, role: &str, title: Option<&str>) -> String {
+    let mut line = format!("→ {slug}/{sid}");
+    if !role.is_empty() {
+        line.push_str(&format!(" ({role})"));
+    }
+    if let Some(t) = title.filter(|t| !t.is_empty()) {
+        line.push_str(&format!(" 「{t}」"));
+    }
+    line
 }
 
 /// v0.8.22 P1 — one read-modify-write refreshing meta.json's activity trio
@@ -5575,6 +5709,25 @@ mod tests {
             format!("---\nname: {role}\n{model}---\n{role} role.\n"),
         )
         .unwrap();
+    }
+
+    /// Poll a [`Gateway::subscribe_events`] receiver for the next `Answer`
+    /// event, skipping any `Reaction`/`Progress` noise in between. Bounded so
+    /// a real regression (the pump never sends) fails the test instead of
+    /// hanging.
+    async fn recv_answer(
+        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+    ) -> GatewayEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = events.recv().await.expect("broadcast tee still open");
+                if matches!(ev.kind, GatewayEventKind::Answer) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("an Answer event arrives")
     }
 
     /// Regression: a real `codex app-server` turn emits the agent message
@@ -6940,6 +7093,100 @@ mod tests {
         );
     }
 
+    /// v0.8.23 review §3.2-5 (item 2a) — a FOCUSED session's IM answer
+    /// carries a compact "→ slug/sid (role)" context echo (previously only
+    /// the out-of-focus case carried any context at all), so a multi-session
+    /// chat always knows which session just spoke.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_answer_carries_context_echo_for_focused_im_session() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-focused");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+
+        let ev = recv_answer(&mut events).await;
+        assert!(
+            ev.content.contains("echo: hello"),
+            "answer still carries the real reply text: {}",
+            ev.content
+        );
+        assert!(
+            ev.content.ends_with("\n\n→ alpha/s1 (reviewer)"),
+            "context echo suffix present: {:?}",
+            ev.content
+        );
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2a) — a roleless session's echo omits the
+    /// `(role)` parens (own `FakeAdapter`/gateway — the fake's `events()`
+    /// shares ONE `Notify` across every identity, so driving two live
+    /// sessions' pumps to completion in the SAME test can misdirect a wakeup
+    /// to the wrong session's still-parked pump; one live session per test
+    /// sidesteps that test-double-only race entirely).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_answer_context_echo_omits_role_when_roleless() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-roleless");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut im_events = gateway.subscribe_events();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hi")
+            .await
+            .unwrap();
+        let im_ev = recv_answer(&mut im_events).await;
+        assert!(
+            im_ev.content.ends_with("\n\n→ alpha/s1"),
+            "roleless echo carries no (role) parens: {:?}",
+            im_ev.content
+        );
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2a) — a WEB-owned session's answer gets NO
+    /// echo at all (the web console already shows its session context in its
+    /// own chrome). Own `FakeAdapter`/gateway, see the sibling roleless test
+    /// for why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_answer_context_echo_skips_web_channel() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-web");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let mut web_events = gateway.subscribe_events();
+        gateway.submit_to_sid(&sid, "ping".into()).await.unwrap();
+        let web_ev = recv_answer(&mut web_events).await;
+        assert!(
+            !web_ev.content.contains('→'),
+            "web answers must not carry the IM-only context echo: {:?}",
+            web_ev.content
+        );
+    }
+
     /// v0.8.11 E4 — a stream-json session has no chat-progress hooks, so the
     /// pump must be its progress.jsonl writer: a completed turn lands a
     /// `chat_turn_completed` event carrying the sid, so the session-list
@@ -7860,6 +8107,28 @@ mod tests {
         );
     }
 
+    /// v0.8.23 review §3.2-5 (item 2c) — `/status` leads with a standalone
+    /// "你在哪" header line (project slug + current session sid/role) ahead
+    /// of the existing `📍 当前会话` deep-view body, so the two-pointer
+    /// (project × session) mental model has one line answering both.
+    #[tokio::test]
+    async fn gateway_status_leads_with_where_am_i_header() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-status-header");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 当前会话"),
+            "leads with the you-are-here header before the existing body: {out:?}"
+        );
+    }
+
     /// v0.8.19 `/status` — empty fleet renders a friendly line, never an error.
     #[tokio::test]
     async fn gateway_status_empty_is_friendly() {
@@ -8261,6 +8530,99 @@ mod tests {
         assert!(
             gateway.session_views().iter().any(|v| v.sid == "s1"),
             "owner cold-resumed s1 from meta.json"
+        );
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2b) — `/use @<role>` resolves to the ONE
+    /// chat-visible session carrying that role (unambiguous case).
+    #[tokio::test]
+    async fn use_at_role_shorthand_resolves_unambiguous_role() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-happy");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap(); // s1
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude qa")
+            .await
+            .unwrap(); // s2, now current
+        let used = gateway
+            .handle_text("mock", "chat-1", "alice", "/use @reviewer")
+            .await
+            .unwrap();
+        assert_eq!(used, vec!["using session s1".to_string()]);
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2b) — two sessions share a role: `/use
+    /// @role` resolves the ambiguity SILENTLY by recency (most-recent
+    /// `last_active` wins; sid-desc tiebreaks when `last_active` is
+    /// unavailable, as here with no real project backing meta.json) rather
+    /// than erroring.
+    #[tokio::test]
+    async fn use_at_role_shorthand_ambiguous_picks_most_recent() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-ambiguous");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap(); // s1
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap(); // s2 — same role, spawned later
+        let used = gateway
+            .handle_text("mock", "chat-1", "alice", "/use @reviewer")
+            .await
+            .unwrap();
+        assert_eq!(
+            used,
+            vec!["using session s2".to_string()],
+            "ambiguous role resolves to the most-recently-active session"
+        );
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2b) — an unmatched role is a clear usage
+    /// error listing the roles this chat CAN see, not a silent no-op.
+    #[tokio::test]
+    async fn use_at_role_shorthand_unknown_role_lists_available_roles() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-unknown");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let err = gateway
+            .handle_text("mock", "chat-1", "alice", "/use @qa")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("qa"), "names the unmatched role: {msg}");
+        assert!(msg.contains("reviewer"), "lists the available roles: {msg}");
+    }
+
+    /// v0.8.23 review §3.2-5 (item 2b) — `@role` visibility follows the SAME
+    /// own-only ACL as `/sessions`/`/status` (`chat_can_access`): a foreign
+    /// chat's session with a matching role must not resolve, and must not
+    /// leak into the "available roles" list either.
+    #[tokio::test]
+    async fn use_at_role_shorthand_respects_chat_acl() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-acl");
+        // tg-1 owns a `reviewer` session.
+        gateway
+            .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
+            .await
+            .unwrap();
+        // A different IM chat cannot see it via @role — own-only isolation.
+        let err = gateway
+            .handle_text("telegram", "tg-2", "bob", "/use @reviewer")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("reviewer"),
+            "another chat's role must not leak into the available-roles hint: {msg}"
         );
     }
 

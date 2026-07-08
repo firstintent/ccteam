@@ -272,15 +272,26 @@ async fn run_round_trip(decision: &str, expect_answer: &str) {
         .expect("resolve the pending approval");
 
     // The turn completed (never killed) with the vendor's verdict for this
-    // decision — deny blocks ONLY the tool call.
+    // decision — deny blocks ONLY the tool call. The focused answer now also
+    // carries the v0.8.23 review §3.2-5 context echo (`→ slug/sid (role)`),
+    // so match on a prefix rather than full equality.
     let answer = wait_for_outbox(
         &mock,
         Duration::from_secs(10),
         "the turn's final answer",
-        |m| m.content == expect_answer,
+        |m| m.content.starts_with(expect_answer),
     )
     .await;
-    assert_eq!(answer.content, expect_answer);
+    assert!(
+        answer.content.starts_with(expect_answer),
+        "got: {}",
+        answer.content
+    );
+    assert!(
+        answer.content.contains("→ default/s1 (helper)"),
+        "carries the context echo: {}",
+        answer.content
+    );
 
     // The session is still tracked/live — denial never killed it.
     assert_eq!(gateway.lock().await.session_views().len(), 1);

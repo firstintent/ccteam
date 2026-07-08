@@ -272,9 +272,10 @@ async fn progress_edits_one_status_message_not_spam() {
         status_sends, 1,
         "expected exactly one status seed in outbox, got: {outbox:?}"
     );
-    // The answer is its own (new) message.
+    // The answer is its own (new) message. It carries the v0.8.23 review
+    // §3.2-5 context echo suffix on a focused answer, so match on a prefix.
     assert!(
-        outbox.iter().any(|c| c == "done"),
+        outbox.iter().any(|c| c.starts_with("done")),
         "answer not delivered as a new message: {outbox:?}"
     );
     // V0.8.4 P1 (F1): the machine-ish "submitted … turn …" ack must be
@@ -330,8 +331,10 @@ async fn progress_off_sends_only_answers() {
         !outbox.iter().any(|c| is_status(c)),
         "no status messages expected when off: {outbox:?}"
     );
+    // Carries the v0.8.23 review §3.2-5 context echo suffix on a focused
+    // answer, so match on a prefix rather than full equality.
     assert!(
-        outbox.iter().any(|c| c == "done"),
+        outbox.iter().any(|c| c.starts_with("done")),
         "answer must still be delivered: {outbox:?}"
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
@@ -359,9 +362,14 @@ async fn codex_streaming_delta_not_sent_as_answer() {
         !outbox.iter().any(|c| c == "par" || c == "partial ans"),
         "codex delta was sent as a standalone message: {outbox:?}"
     );
-    // The final answer is delivered exactly once.
+    // The final answer is delivered exactly once. It carries the v0.8.23
+    // review §3.2-5 context echo suffix on a focused answer, so match on a
+    // prefix rather than full equality.
     assert_eq!(
-        outbox.iter().filter(|c| *c == "full answer").count(),
+        outbox
+            .iter()
+            .filter(|c| c.starts_with("full answer"))
+            .count(),
         1,
         "final answer not delivered exactly once: {outbox:?}"
     );
