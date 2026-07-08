@@ -1156,6 +1156,68 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
+            // v0.8.x (concurrency review §4.1 P1) — LOCKING PROTOCOL. Before
+            // this fix, `gateway.lock().await.handle_message(...).await` held
+            // the gateway's global lock for the ENTIRE call, and this loop
+            // awaited it inline before pulling the next message off `rx` — so
+            // one chat spawning a session (tmux/subprocess spawn, stream-json
+            // `system:init`) queued every other chat's message behind it,
+            // both on the lock AND on this loop never reaching `rx.recv()`
+            // again.
+            //
+            // `inbound_may_spawn` is a cheap, synchronous, always-safe-either-
+            // way hint: a message that can only ever SUBMIT to an
+            // already-live session (no gateway command, no `@mention`, the
+            // chat already has a current session) is still processed INLINE
+            // exactly as before — its own lock section is bounded by the
+            // adapter's submit timeout, never a spawn, so keeping it on this
+            // loop costs nothing. A message that might need the implicit
+            // first-message spawn is instead handed to
+            // `Gateway::handle_message_shared` on its OWN task: that entry
+            // point plans under a short lock, drops the lock for the slow
+            // spawn, then re-locks briefly to apply the result — freeing this
+            // loop to `rx.recv()` the next chat's message immediately rather
+            // than queuing behind the spawn.
+            //
+            // SCOPE: explicit spawning commands (`/new` `/role` `/use`
+            // `/clear` `@mention`-to-a-template) are NOT decomposed in this
+            // pass — `inbound_may_spawn` returns `false` for them, so they
+            // still run inline, holding the gateway lock across their own
+            // spawn exactly as before (a pre-existing, documented tradeoff —
+            // see `resume_dead_session`'s LOCK SCOPE note in gateway.rs). A
+            // scoped, incremental step, not a full fix.
+            let may_spawn = {
+                let g = gateway.lock().await;
+                g.inbound_may_spawn(
+                    &msg.channel,
+                    &msg.reply_target,
+                    &msg.sender,
+                    &clean_payload,
+                    msg.selection.is_some(),
+                )
+            };
+            if may_spawn {
+                let gateway = Arc::clone(&gateway);
+                let channel = Arc::clone(&channel);
+                let msg = msg.clone();
+                let cid = cid.clone();
+                tokio::spawn(async move {
+                    let replies = Gateway::handle_message_shared(
+                        gateway,
+                        &msg.channel,
+                        &msg.reply_target,
+                        &msg.sender,
+                        &msg.id,
+                        &clean_payload,
+                        &msg.attachments,
+                        msg.selection.as_ref(),
+                    )
+                    .await;
+                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+                });
+                continue;
+            }
+
             let replies = gateway
                 .lock()
                 .await
@@ -1169,39 +1231,52 @@ fn spawn_inbound_consumer(
                     msg.selection.as_ref(),
                 )
                 .await;
-            match replies {
-                Ok(replies) => {
-                    for (seq, reply) in replies.into_iter().enumerate() {
-                        let out = SendMessage::new(reply, msg.reply_target.clone())
-                            .in_thread(msg.thread_ts.clone());
-                        send_gateway_outbound(&cid, seq, &msg.channel, channel.as_ref(), out).await;
-                    }
-                    tracing::info!(
-                        event = "latency",
-                        stage = "imd.gateway.done",
-                        cid = %cid,
-                        elapsed_ms = route_t0.elapsed().as_millis() as u64,
-                        "latency imd.gateway.done"
-                    );
-                }
-                Err(err) => {
-                    let out =
-                        SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
-                            .in_thread(msg.thread_ts.clone());
-                    send_gateway_outbound(&cid, 0, &msg.channel, channel.as_ref(), out).await;
-                    tracing::warn!(
-                        event = "latency",
-                        stage = "imd.gateway.err",
-                        cid = %cid,
-                        elapsed_ms = route_t0.elapsed().as_millis() as u64,
-                        error = %err,
-                        "latency imd.gateway.err"
-                    );
-                }
-            }
+            deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+/// Send the outcome of one `handle_message`/`handle_message_shared` call to
+/// the originating channel — shared by `spawn_inbound_consumer`'s inline and
+/// backgrounded-spawn branches so the reply-delivery + latency logging can
+/// never drift between them.
+async fn deliver_gateway_replies(
+    cid: &str,
+    route_t0: std::time::Instant,
+    msg: &ChannelMessage,
+    channel: &(dyn Channel + Send + Sync),
+    replies: Result<Vec<String>>,
+) {
+    match replies {
+        Ok(replies) => {
+            for (seq, reply) in replies.into_iter().enumerate() {
+                let out = SendMessage::new(reply, msg.reply_target.clone())
+                    .in_thread(msg.thread_ts.clone());
+                send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
+            }
+            tracing::info!(
+                event = "latency",
+                stage = "imd.gateway.done",
+                cid = %cid,
+                elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                "latency imd.gateway.done"
+            );
+        }
+        Err(err) => {
+            let out = SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
+                .in_thread(msg.thread_ts.clone());
+            send_gateway_outbound(cid, 0, &msg.channel, channel, out).await;
+            tracing::warn!(
+                event = "latency",
+                stage = "imd.gateway.err",
+                cid = %cid,
+                elapsed_ms = route_t0.elapsed().as_millis() as u64,
+                error = %err,
+                "latency imd.gateway.err"
+            );
+        }
+    }
 }
 
 /// A live, editable progress status message (V0.8.4 P1): the platform

@@ -153,6 +153,17 @@ struct GatewaySession {
     /// two never drift). Updated by the pump whenever the fold changes; cleared
     /// to `None` on `TurnCompleted`. `/status` appends it on the 🔵 working line.
     latest_activity: Arc<std::sync::Mutex<Option<String>>>,
+    /// v0.8.x (concurrency review §4.1 P1) — the in-flight turn's watchdog
+    /// arm: `Some((turn_id, start_visible_events))` from the moment
+    /// `after_turn_submitted` submits a turn until the session's own event
+    /// pump either sees it answer (`visible_events` moves past
+    /// `start_visible_events`) or fires the one-shot stall warning for it.
+    /// Folds the old detached per-turn `spawn_turn_timeout_watchdog` task into
+    /// the pump's own `tokio::select!` loop (one fewer task per turn); kept
+    /// separate from `turn_started_at` (directive-driven turns intentionally
+    /// never touch that field, but DID get a watchdog before this fold — this
+    /// preserves that).
+    watched_turn: Arc<std::sync::Mutex<Option<(String, u64)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +244,10 @@ pub struct Gateway {
     /// (where there is no reload task), so [`Gateway::request_im_reload`] is a
     /// safe no-op that returns `false`.
     im_reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// v0.8.x (concurrency review §4.1 P1) — per-chat spawn single-flight for
+    /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
+    /// never held under the gateway's own mutex for longer than a map lookup.
+    spawn_claims: Arc<SpawnClaims>,
 }
 
 /// One structured step of session activity (v0.8.19). Carried by
@@ -669,6 +684,83 @@ struct MetaRebuildPlan {
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
 }
 
+/// v0.8.x (concurrency review §4.1 P1) — the sync-computed inputs needed to
+/// spawn + insert a BRAND NEW session (fresh `/new`, the implicit
+/// first-message spawn `ensure_current_session` drives, and a bot template).
+/// Same split as [`MetaRebuildPlan`]: "plan" (sync, cheap — resolves the
+/// project/role/model, mints the sid + secret) is separated from "spawn" (the
+/// slow `start_thread` await) so a caller that holds the gateway across a
+/// wider critical section (today: every existing caller) can still do so
+/// unchanged, while the hot-path entry point
+/// ([`Gateway::handle_message_shared`]) drops the lock between the two. One
+/// construction site (`plan_new_session`), no drift between the inline and
+/// lock-dropping callers.
+struct NewSessionPlan {
+    id: String,
+    owner: ChatKey,
+    project: String,
+    vendor: AgentVendor,
+    role: String,
+    handle: String,
+    permission_mode: PermissionMode,
+    protocol: SessionProtocol,
+    secret: String,
+    cwd: PathBuf,
+    model_id: Option<String>,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+}
+
+/// What [`Gateway::plan_ensure_current_session`] decided: either the chat
+/// already has a session (nothing to do), or a brand-new one must be spawned
+/// (the caller runs [`Gateway::spawn_for_new_session_plan`] + applies it).
+enum EnsureSessionOutcome {
+    AlreadyHasSession,
+    // Boxed — `NewSessionPlan` is ~264 bytes and `AlreadyHasSession` carries
+    // none, so boxing keeps the enum itself small regardless of which arm.
+    Spawn(Box<NewSessionPlan>),
+}
+
+/// v0.8.x (concurrency review §4.1 P1) — per-chat spawn single-flight for the
+/// inbound hot path. DELIBERATELY a lock separate from the gateway's own
+/// `Arc<tokio::sync::Mutex<Gateway>>` — the same independent-lock house
+/// pattern [`crate::pending::PendingInteractions`] already uses (see
+/// `Gateway::pending`). [`Gateway::handle_message_shared`] uses this to
+/// serialize the rare case where two concurrent inbound messages for the SAME
+/// chat both observe "no session yet": only the first actually spawns, the
+/// second just waits for the first's per-chat guard to release, then
+/// re-checks (finds the session the first one just created) instead of
+/// spawning a duplicate. Built on `tokio::sync::Mutex`'s own correct, FIFO
+/// wait queue rather than a hand-rolled `Notify` (which has a well-known
+/// registration-timing footgun if the "check, then wait" isn't done
+/// carefully) — a second caller for the same chat simply blocks on
+/// `.lock_owned().await` until the first's guard drops. Entries are never
+/// removed: one tiny `tokio::sync::Mutex<()>` per DISTINCT chat that has ever
+/// hit the implicit-spawn path, bounded exactly like the gateway's own
+/// `current_project`/`current_session` maps (a chat is permanent once first
+/// seen).
+#[derive(Default)]
+struct SpawnClaims {
+    per_chat: std::sync::Mutex<BTreeMap<ChatKey, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SpawnClaims {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire (waiting if necessary) the single-flight claim for `chat`.
+    async fn lock_for(&self, chat: &ChatKey) -> tokio::sync::OwnedMutexGuard<()> {
+        let entry = {
+            let mut map = self.per_chat.lock().unwrap();
+            Arc::clone(
+                map.entry(chat.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        entry.lock_owned().await
+    }
+}
+
 /// A gateway-owned command (v0.8.5 P1): the single source of truth for the
 /// command names the gateway handles itself + their menu/help metadata.
 /// `is_gateway_command`, `/help`, and the channel menu registration all
@@ -870,6 +962,7 @@ impl Gateway {
             config: None,
             model_warned: HashSet::new(),
             im_reload_tx: None,
+            spawn_claims: Arc::new(SpawnClaims::new()),
         }
     }
 
@@ -1072,6 +1165,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
+                watched_turn: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         self.spawn_event_pump(&sid);
@@ -1389,6 +1483,128 @@ impl Gateway {
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
         self.submit_to_current(&chat, message_id, turn).await
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
+    /// path hint for `spawn_inbound_consumer`: true when this inbound message
+    /// MIGHT make [`Self::handle_message`] take a branch that spawns a
+    /// brand-new session thread (`ensure_current_session`'s implicit
+    /// first-message spawn — the common "new chat says hello" / "chat has no
+    /// session yet" case). Deliberately conservative in BOTH directions
+    /// because either wrong answer is safe, never a correctness bug: a
+    /// `false` that turns out to need a spawn just runs the ordinary inline
+    /// `handle_message` unchanged (today's behavior, holding the gateway lock
+    /// across the spawn); a `true` that turns out NOT to need one just falls
+    /// through inside [`Self::handle_message_shared`] to the same
+    /// `handle_message` call. So this never has to track `handle_message`'s
+    /// full branch tree exactly — it only needs to be right often enough to
+    /// unblock the common case (see the daemon's `spawn_inbound_consumer` for
+    /// how the two outcomes are used).
+    ///
+    /// A selection click, a recognized gateway command (`/new` `/role` `/use`
+    /// `/clear` …), and an `@mention` are all left on the slow/legacy inline
+    /// path in this pass — they have their OWN (rarer) spawning branches
+    /// (`/new`, `/use` cold-resume, `/clear` codex-recycle, an
+    /// `@mention`-to-a-template) that still hold the gateway lock across
+    /// their spawn, same as before this change (a documented, scoped
+    /// limitation — see the locking-protocol comment on
+    /// `spawn_inbound_consumer`).
+    pub fn inbound_may_spawn(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        text: &str,
+        has_selection: bool,
+    ) -> bool {
+        if has_selection {
+            return false;
+        }
+        if self.has_current_session(channel, chat_id, user_id) {
+            return false;
+        }
+        if Self::is_gateway_command(text) {
+            return false;
+        }
+        if crate::router::parse_first_mention(text).is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — production entry point for the
+    /// daemon's inbound hot path (`spawn_inbound_consumer`) for a message
+    /// [`Self::inbound_may_spawn`] flagged as a candidate for the implicit
+    /// first-message spawn. LOCKING PROTOCOL: everything that reads/mutates
+    /// gateway state runs under a freshly (re-)acquired `gateway.lock().await`
+    /// guard held only across synchronous work; the slow
+    /// `adapter.start_thread` await (tmux/subprocess spawn, stream-json
+    /// `system:init`) runs with NO gateway lock held at all — the same shape
+    /// [`Self::resume_restored_sessions_shared`] already established. Two
+    /// concurrent inbound messages for the SAME chat that both observe "no
+    /// session yet" are serialized through [`SpawnClaims`] (a lock separate
+    /// from the gateway's own — the `PendingInteractions` house pattern) so
+    /// only ONE of them actually spawns; the other waits for the claim to
+    /// clear and then re-checks, finding the session the first one created.
+    // Same inbound per-field shape as `handle_message` plus the `Arc<Mutex<Gateway>>`
+    // handle this "shared" variant needs to manage the lock itself — allow the
+    // arg count for the same reason `handle_message` does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_message_shared(
+        gateway: Arc<tokio::sync::Mutex<Gateway>>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
+    ) -> Result<Vec<String>> {
+        let chat = ChatKey::new(channel, chat_id, user_id);
+        // Re-derive the "implicit spawn candidate" decision authoritatively
+        // (the daemon's `inbound_may_spawn` call is only a hint to decide
+        // inline-vs-background — this is the one that actually acts). Any
+        // other shape (selection / command / mention / already-has-a-session)
+        // falls straight through to the ordinary `handle_message` call below,
+        // unchanged.
+        let candidate = selection.is_none()
+            && !Self::is_gateway_command(text)
+            && crate::router::parse_first_mention(text).is_none()
+            && !gateway
+                .lock()
+                .await
+                .has_current_session(channel, chat_id, user_id);
+        if candidate {
+            let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+            // Hold the per-chat claim across plan+spawn+apply so a second
+            // concurrent "no session yet" message for this SAME chat waits
+            // here instead of racing to spawn a duplicate session.
+            let _claim = claims.lock_for(&chat).await;
+            let outcome = {
+                let mut g = gateway.lock().await;
+                g.plan_ensure_current_session(&chat)?
+            };
+            if let EnsureSessionOutcome::Spawn(plan) = outcome {
+                // The slow part — deliberately NO gateway lock held here.
+                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                gateway.lock().await.apply_new_session(*plan, thread)?;
+            }
+            // `_claim` (and thus the per-chat single-flight) releases here,
+            // waking any waiter for this same chat.
+        }
+        gateway
+            .lock()
+            .await
+            .handle_message(
+                channel,
+                chat_id,
+                user_id,
+                message_id,
+                text,
+                attachments,
+                selection,
+            )
+            .await
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
@@ -1843,8 +2059,27 @@ impl Gateway {
     }
 
     async fn ensure_current_session(&mut self, chat: &ChatKey) -> Result<()> {
+        match self.plan_ensure_current_session(chat)? {
+            EnsureSessionOutcome::AlreadyHasSession => Ok(()),
+            EnsureSessionOutcome::Spawn(plan) => {
+                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                self.apply_new_session(*plan, thread)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — the sync half of
+    /// `ensure_current_session`: decide whether this chat needs a brand-new
+    /// implicit session and, if so, build its [`NewSessionPlan`] WITHOUT
+    /// awaiting the spawn. Same decision tree as the pre-fold
+    /// `ensure_current_session` (single-template auto-spawn / ambiguous
+    /// multi-template error / default `cto`), just stopping short of the
+    /// slow await so [`Gateway::handle_message_shared`] can drop the gateway
+    /// lock before running it.
+    fn plan_ensure_current_session(&mut self, chat: &ChatKey) -> Result<EnsureSessionOutcome> {
         if self.current_session.read().unwrap().contains_key(chat) {
-            return Ok(());
+            return Ok(EnsureSessionOutcome::AlreadyHasSession);
         }
         let templates = self.templates_for_chat(chat);
         if templates.len() == 1 {
@@ -1855,15 +2090,30 @@ impl Gateway {
             // rather than silently dragging the message back into the bot's
             // project. (Tradeoff: the bot's role/vendor are not reused once you
             // `/cd` off its project.)
-            let template = &templates[0];
+            let template = templates[0].clone();
             let cd_elsewhere = self
                 .current_project
                 .get(chat)
                 .is_some_and(|p| *p != template.project);
             if !cd_elsewhere {
-                self.start_template_session(chat.clone(), template.clone())
-                    .await?;
-                return Ok(());
+                // Mirrors `start_template_session`'s pre-spawn mutation: switching
+                // INTO the bot's project happens regardless of whether the spawn
+                // itself later runs inline or with the lock dropped.
+                self.current_project
+                    .insert(chat.clone(), template.project.clone());
+                let plan = self.plan_new_session(
+                    chat.clone(),
+                    template.project,
+                    template.vendor,
+                    template.role,
+                    template.handle,
+                    // Template-spawned sessions are skip (the route template has
+                    // no mode field; HITL is opt-in per session, not per route).
+                    PermissionMode::Skip,
+                    // Template sessions default to the stream-json protocol.
+                    SessionProtocol::StreamJson,
+                )?;
+                return Ok(EnsureSessionOutcome::Spawn(Box::new(plan)));
             }
         }
         if templates.len() > 1 {
@@ -1873,7 +2123,7 @@ impl Gateway {
             return Err(anyhow!(format_ambiguous_dm_reply(&handles)));
         }
         let project = self.current_project_for(chat);
-        self.start_session(
+        let plan = self.plan_new_session(
             chat.clone(),
             project,
             AgentVendor::Claude,
@@ -1885,9 +2135,8 @@ impl Gateway {
             // v0.8.11 E2 — cto defaults to the stream-json protocol (a pure
             // chat role with no terminal needs).
             SessionProtocol::StreamJson,
-        )
-        .await?;
-        Ok(())
+        )?;
+        Ok(EnsureSessionOutcome::Spawn(Box::new(plan)))
     }
 
     /// Build the `/new` receipt. v0.8.8 F1 — every `/new` mints a fresh sid
@@ -2012,6 +2261,44 @@ impl Gateway {
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
     ) -> Result<StartOutcome> {
+        // v0.8.x (concurrency review §4.1 P1) — split into plan (sync) / spawn
+        // (the slow `start_thread` await) / apply (sync), same shape as the
+        // meta-rebuild trio (`plan_session_rebuild` / `spawn_for_plan` /
+        // `apply_rebuilt_session`). This caller composes all three inline
+        // (unchanged behavior/lock-scope: every existing `start_session`
+        // caller still awaits the spawn under whatever lock IT holds);
+        // `Gateway::handle_message_shared` is the one caller that instead
+        // drops the gateway lock between `plan_new_session` and
+        // `spawn_for_new_session_plan`.
+        let plan = self.plan_new_session(
+            owner,
+            project,
+            vendor,
+            role,
+            handle,
+            permission_mode,
+            protocol,
+        )?;
+        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        self.apply_new_session(plan, thread)
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — the sync half of `start_session`:
+    /// resolve the project/role/model, mint the fresh monotonic sid + secret
+    /// (durable BEFORE use — red line: sid never reused), and select the
+    /// adapter. No `.await` at all, so a caller can run this under the
+    /// gateway lock and then drop it before the slow spawn.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_new_session(
+        &mut self,
+        owner: ChatKey,
+        project: String,
+        vendor: AgentVendor,
+        role: String,
+        handle: String,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+    ) -> Result<NewSessionPlan> {
         // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
         // pane/--name/turns/marker all key on `s<N>`, so one (project, role) can
         // host multiple INDEPENDENT sessions (each its own pane + transcript).
@@ -2066,19 +2353,70 @@ impl Gateway {
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
         let secret = ccteam_core::session_secret::mint();
-        let (adapter, thread) = self
-            .spawn_session_thread(
-                vendor,
-                protocol,
-                &role,
-                &project,
-                &id,
-                cwd,
-                model_id.clone(),
-                permission_mode,
-                secret.clone(),
+        let adapter = (self.adapter_factory)(vendor, protocol);
+        Ok(NewSessionPlan {
+            id,
+            owner,
+            project,
+            vendor,
+            role,
+            handle,
+            permission_mode,
+            protocol,
+            secret,
+            cwd,
+            model_id,
+            adapter,
+        })
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — the SLOW await for a
+    /// [`NewSessionPlan`]. Self-less (no `&self`/`&mut self`) so a caller can
+    /// run it with NO gateway lock held at all — mirrors [`Self::spawn_for_plan`].
+    async fn spawn_for_new_session_plan(
+        plan: &NewSessionPlan,
+    ) -> Result<ThreadHandle, HarnessError> {
+        plan.adapter
+            .start_thread(
+                &AgentSpecBrief {
+                    role: plan.role.clone(),
+                },
+                &SpawnCtx {
+                    slug: plan.project.clone(),
+                    sid: plan.id.clone(),
+                    cwd: plan.cwd.clone(),
+                    project_dir: plan.cwd.clone(),
+                    extra_args: vec![],
+                    model_id: plan.model_id.clone(),
+                    permission_mode: plan.permission_mode,
+                    secret: plan.secret.clone(),
+                },
             )
-            .await?;
+            .await
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — the sync half after the spawn:
+    /// insert the live [`GatewaySession`], persist routing + `meta.json`, and
+    /// start its event pump. Mirrors `apply_rebuilt_session`'s shape.
+    fn apply_new_session(
+        &mut self,
+        plan: NewSessionPlan,
+        thread: ThreadHandle,
+    ) -> Result<StartOutcome> {
+        let NewSessionPlan {
+            id,
+            owner,
+            project,
+            vendor,
+            role,
+            handle,
+            permission_mode,
+            protocol,
+            secret,
+            cwd: _,
+            model_id,
+            adapter,
+        } = plan;
         // Capture before the session insert moves these.
         let meta_vendor_uuid = thread
             .raw_extras
@@ -2115,6 +2453,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
+                watched_turn: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         let model_warning =
@@ -2295,6 +2634,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
+                watched_turn: Arc::new(std::sync::Mutex::new(None)),
             },
         );
         self.current_session
@@ -2401,6 +2741,26 @@ impl Gateway {
             let mut dirty = false;
             let mut last_emit: Option<Instant> = None;
             let mut last_sent: Option<String> = None;
+            // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog,
+            // folded from a detached per-turn `tokio::spawn` into THIS
+            // per-session pump's own `tokio::select!` loop (one fewer task per
+            // turn; the pump already lives for the session's whole lifetime).
+            // `watch_timeout == 0` disables it entirely (matches the pre-fold
+            // early return). `stream_ended` tracks whether the adapter's own
+            // event stream has terminated (child exited): once it has, the
+            // `events.next()` branch is permanently disabled (a `select!`
+            // guard, not a `break`) so this loop doesn't hot-spin re-polling
+            // an exhausted stream, but the watchdog keeps ticking (mirrors the
+            // pre-fold design, where the watchdog task was fully independent
+            // of the pump's own stream lifecycle — a dead/hung child still
+            // gets the heads-up).
+            let watch_timeout = gateway_turn_timeout_duration();
+            let watch_poll = watch_timeout.min(std::time::Duration::from_secs(10));
+            let mut stream_ended = false;
+            let mut watch_tracked_turn: Option<String> = None;
+            let mut watch_idle = std::time::Duration::ZERO;
+            let mut watch_last_activity: u64 = 0;
+            let mut watch_warned_turn: Option<String> = None;
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -2413,11 +2773,30 @@ impl Gateway {
                         }
                     }
                 };
+                // Watchdog tick, armed only while the window is enabled — a
+                // fresh timer each loop iteration (same shape as `flush`), so
+                // it naturally restarts on every event this select! observes
+                // (`biased` events.next()/flush always win a simultaneous
+                // wakeup), giving idle timing that starts from the true last
+                // activity rather than a fixed independent cadence.
+                let watchdog_tick = async {
+                    if watch_timeout.is_zero() {
+                        std::future::pending::<()>().await;
+                    } else {
+                        tokio::time::sleep(watch_poll).await;
+                    }
+                };
 
                 tokio::select! {
                     biased;
-                    maybe = events.next() => {
-                        let Some(evt) = maybe else { break; };
+                    maybe = events.next(), if !stream_ended => {
+                        let Some(evt) = maybe else {
+                            stream_ended = true;
+                            if watch_timeout.is_zero() {
+                                break;
+                            }
+                            continue;
+                        };
                         // Liveness tick: ANY event (assistant delta, tool-use,
                         // progress, turn-completed) means the turn is doing work,
                         // so the turn-timeout watchdog resets its idle clock. Only
@@ -2699,6 +3078,60 @@ impl Gateway {
                             &mut last_sent, &mut last_emit, &mut dirty,
                         ) {
                             break;
+                        }
+                    }
+                    _ = watchdog_tick => {
+                        // Snapshot + release immediately (never hold this
+                        // std::sync::Mutex across an .await).
+                        let armed = session.watched_turn.lock().ok().and_then(|g| g.clone());
+                        match armed {
+                            None => {
+                                watch_tracked_turn = None;
+                                watch_idle = std::time::Duration::ZERO;
+                            }
+                            Some((turn_id, start_visible)) => {
+                                if session.visible_events.load(Ordering::SeqCst) != start_visible {
+                                    // The turn already produced a visible answer
+                                    // (finished) — clear the arm so a stale one
+                                    // is never re-warned, mirroring the pre-fold
+                                    // watchdog's own "already answered" early
+                                    // return.
+                                    if let Ok(mut w) = session.watched_turn.lock() {
+                                        *w = None;
+                                    }
+                                    watch_tracked_turn = None;
+                                    watch_idle = std::time::Duration::ZERO;
+                                } else if watch_warned_turn.as_deref() != Some(turn_id.as_str()) {
+                                    if watch_tracked_turn.as_deref() != Some(turn_id.as_str()) {
+                                        // Newly-noticed turn (or the pump only
+                                        // just started tracking it) — start its
+                                        // idle clock fresh.
+                                        watch_tracked_turn = Some(turn_id.clone());
+                                        watch_idle = std::time::Duration::ZERO;
+                                        watch_last_activity =
+                                            session.activity_events.load(Ordering::SeqCst);
+                                    } else {
+                                        let cur = session.activity_events.load(Ordering::SeqCst);
+                                        if cur != watch_last_activity {
+                                            watch_last_activity = cur;
+                                            watch_idle = std::time::Duration::ZERO; // still working
+                                        } else {
+                                            watch_idle += watch_poll;
+                                        }
+                                    }
+                                    if watch_idle >= watch_timeout {
+                                        // A full idle window of total silence —
+                                        // ONE-SHOT, warn-only (red line: never
+                                        // kill). `emit_turn_stall_warning` never
+                                        // interrupts the turn on any protocol.
+                                        emit_turn_stall_warning(
+                                            &tx, &session, &turn_id, watch_timeout,
+                                            progress_path.as_deref(),
+                                        );
+                                        watch_warned_turn = Some(turn_id);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3258,12 +3691,22 @@ impl Gateway {
         start_visible_events: u64,
         turn_id: &str,
     ) -> Result<Vec<String>> {
-        if let Some(tx) = self.event_sink.clone() {
-            let progress_path = self
-                .project_paths
-                .as_ref()
-                .map(|paths| paths.progress_jsonl(&session.project));
-            spawn_turn_timeout_watchdog(tx, session, start_visible_events, turn_id, progress_path);
+        if self.event_sink.is_some() {
+            // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog
+            // used to be a detached `tokio::spawn`ed task PER TURN
+            // (`spawn_turn_timeout_watchdog`). It is now folded into the
+            // session's own (already-running, one-per-session) event pump: arm
+            // the pump's watchdog by recording this turn's id + the
+            // `visible_events` snapshot at submission time, and the pump's own
+            // `tokio::select!` loop does the idle-polling + one-shot warn
+            // (`emit_turn_stall_warning`) that `spawn_turn_timeout_watchdog`
+            // used to do standalone. Skip arming entirely when the window is
+            // disabled (`0` = off) — matches the old early return.
+            if !gateway_turn_timeout_duration().is_zero() {
+                if let Ok(mut watch) = session.watched_turn.lock() {
+                    *watch = Some((turn_id.to_string(), start_visible_events));
+                }
+            }
             Ok(Vec::new())
         } else {
             let mut replies = Vec::new();
@@ -5040,99 +5483,65 @@ impl Drop for Gateway {
     }
 }
 
-fn spawn_turn_timeout_watchdog(
-    tx: GatewayEventSink,
+/// v0.8.x (concurrency review §4.1 P2) — the ONE-SHOT "turn went silent"
+/// warn-only heads-up, folded from the old detached per-turn
+/// `spawn_turn_timeout_watchdog` task into the session's own event pump (see
+/// `spawn_event_pump`'s watchdog-tick branch, which calls this once idle time
+/// reaches the configured window). Content/shape is byte-identical to the
+/// pre-fold task. **NEVER interrupts** the turn, on ANY protocol (tmux / rmux
+/// / stream-json) — red line: 永不主动 kill long sessions/turns. A long
+/// SILENT command (a benchmark, a big build) is real work; mis-killing it
+/// would be worse than a stray heads-up. The user `/stop`s if it is genuinely
+/// stuck.
+fn emit_turn_stall_warning(
+    tx: &GatewayEventSink,
     session: &GatewaySession,
-    start_visible_events: u64,
     turn_id: &str,
-    progress_path: Option<PathBuf>,
+    timeout: std::time::Duration,
+    progress_path: Option<&Path>,
 ) {
-    let timeout = gateway_turn_timeout_duration();
-    if timeout.is_zero() {
-        return;
-    }
-    let visible_events = Arc::clone(&session.visible_events);
-    let activity_events = Arc::clone(&session.activity_events);
-    let session_id = session.id.clone();
-    let project = session.project.clone();
-    let role = session.role.clone();
-    let reply_to = Arc::clone(&session.reply_to);
-    let owner = session.owner.clone();
-    let turn_id = turn_id.to_string();
-    // IDLE-based silence detector (v0.8.15): reset on any activity so a
-    // long-but-working turn (tool calls / streaming for minutes) never trips it;
-    // only TRUE silence for the whole window does. v0.8.18 (owner request) —
-    // **WARN-ONLY**: the watchdog NEVER interrupts / never `esc`s, on ANY
-    // protocol (tmux / rmux / stream-json). A long SILENT command (a benchmark,
-    // a big build) is real work — mis-killing it is worse than a stray heads-up.
-    // The user `/stop`s if it is genuinely stuck.
-    tokio::spawn(async move {
-        // Poll at a fraction of the idle window (cap so turn-completion is still
-        // noticed promptly on a long window). Reset `idle` whenever the activity
-        // counter ticks; interrupt only after a full `timeout` of NO events.
-        let poll = timeout.min(std::time::Duration::from_secs(10));
-        let mut last_activity = activity_events.load(Ordering::SeqCst);
-        let mut idle = std::time::Duration::ZERO;
-        loop {
-            tokio::time::sleep(poll).await;
-            // The turn produced a visible answer → finished, never interrupt.
-            if visible_events.load(Ordering::SeqCst) != start_visible_events {
-                return;
-            }
-            let cur = activity_events.load(Ordering::SeqCst);
-            if cur != last_activity {
-                last_activity = cur;
-                idle = std::time::Duration::ZERO; // still working → not a stall
-                continue;
-            }
-            idle += poll;
-            if idle < timeout {
-                continue;
-            }
-            break; // a full idle window of total silence → genuine stall
-        }
-        if let Some(progress_path) = progress_path.as_ref() {
-            let ev = ccteam_core::progress::build_chat_turn_timeout_event(
-                &role,
-                &session_id,
-                &project,
-                &turn_id,
-                timeout.as_secs(),
-            );
-            if let Err(err) = ccteam_core::progress::append_event(progress_path, &ev) {
-                tracing::warn!(
-                    session = %session_id,
-                    path = %progress_path.display(),
-                    error = %err,
-                    "turn-watchdog: failed to append chat_turn_timeout progress event"
-                );
-            }
-        }
-        // v0.8.18 (owner request) — WARN-ONLY: never interrupt. A turn that
-        // produced NO events for the whole window is FLAGGED, not killed — a
-        // long silent command (a benchmark, a big build) is real work, and an
-        // `esc` here mis-kills it. The user `/stop`s if it is genuinely stuck.
-        let (channel, chat_id) = match reply_to.lock() {
-            Ok(target) => (target.channel.clone(), target.chat_id.clone()),
-            Err(_) => (owner.channel.clone(), owner.chat_id.clone()),
-        };
-        let content = format!(
-            "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id} (no tokens, tool \
-             calls or progress). Heads-up only — the watchdog does NOT interrupt it (a long \
-             command like a benchmark legitimately emits no events). If it is truly stuck, \
-             `/stop` the session; tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+    let session_id = session.id.as_str();
+    if let Some(progress_path) = progress_path {
+        let ev = ccteam_core::progress::build_chat_turn_timeout_event(
+            &session.role,
+            session_id,
+            &session.project,
+            turn_id,
+            timeout.as_secs(),
         );
-        let _ = tx.send(GatewayEvent {
-            id: format!("gateway-timeout-{session_id}-{turn_id}"),
-            channel,
-            chat_id,
-            thread_ts: None,
-            content,
-            kind: GatewayEventKind::Answer,
-            attachments: Vec::new(),
-            options: Vec::new(),
-            sid: Some(session_id.clone()),
-        });
+        if let Err(err) = ccteam_core::progress::append_event(progress_path, &ev) {
+            tracing::warn!(
+                session = %session_id,
+                path = %progress_path.display(),
+                error = %err,
+                "turn-watchdog: failed to append chat_turn_timeout progress event"
+            );
+        }
+    }
+    // v0.8.18 (owner request) — WARN-ONLY: never interrupt. A turn that
+    // produced NO events for the whole window is FLAGGED, not killed — a
+    // long silent command (a benchmark, a big build) is real work, and an
+    // `esc` here mis-kills it. The user `/stop`s if it is genuinely stuck.
+    let (channel, chat_id) = match session.reply_to.lock() {
+        Ok(target) => (target.channel.clone(), target.chat_id.clone()),
+        Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
+    };
+    let content = format!(
+        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id} (no tokens, tool \
+         calls or progress). Heads-up only — the watchdog does NOT interrupt it (a long \
+         command like a benchmark legitimately emits no events). If it is truly stuck, \
+         `/stop` the session; tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+    );
+    let _ = tx.send(GatewayEvent {
+        id: format!("gateway-timeout-{session_id}-{turn_id}"),
+        channel,
+        chat_id,
+        thread_ts: None,
+        content,
+        kind: GatewayEventKind::Answer,
+        attachments: Vec::new(),
+        options: Vec::new(),
+        sid: Some(session_id.to_string()),
     });
 }
 
@@ -7406,6 +7815,163 @@ mod tests {
         resume_task.await.unwrap();
         // After restore completes, the session is live.
         assert_eq!(gateway.lock().await.session_views().len(), 1);
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — head-of-line regression: chat A's
+    /// message triggers the IMPLICIT first-message spawn (slow, via a
+    /// delayed `FakeAdapter::start_thread`); chat B's message to an
+    /// ALREADY-LIVE session must complete without waiting for A's spawn.
+    /// Drives `handle_message_shared` directly — the same entry point the
+    /// daemon's `spawn_inbound_consumer` uses for this exact shape — with A
+    /// on its own task (mirroring the daemon backgrounding it) and B run
+    /// inline (mirroring the daemon's loop moving straight on to the next
+    /// chat). Timing assertion is loose (well under the 250ms spawn delay)
+    /// to avoid flake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_message_shared_does_not_block_other_chats_behind_a_slow_spawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slow = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_delay(std::time::Duration::from_millis(250)),
+        );
+        let mut gw = Gateway::new(slow.clone(), "alpha", tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        // Chat B already has a live session BEFORE the concurrent phase below
+        // (its own spawn also pays the adapter's delay, but that is setup,
+        // not what this test measures).
+        gw.handle_text("telegram", "chat-b", "bob", "hello")
+            .await
+            .unwrap();
+        assert_eq!(slow.starts.load(Ordering::SeqCst), 1);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        // Chat A: a brand-new chat's first message — implicit spawn, slow.
+        let gw_a = Arc::clone(&gateway);
+        let a_task = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result = Gateway::handle_message_shared(
+                gw_a,
+                "telegram",
+                "chat-a",
+                "alice",
+                "a-1",
+                "hi there",
+                &[],
+                None,
+            )
+            .await;
+            (result, start.elapsed())
+        });
+
+        // Wait until chat A's spawn is actually in flight (entered
+        // `start_thread`'s delay) before driving chat B, so this exercises
+        // "B runs WHILE A's spawn is in flight" rather than an arbitrary race.
+        for _ in 0..100 {
+            if slow.starts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            slow.starts.load(Ordering::SeqCst),
+            2,
+            "chat A's spawn must have started"
+        );
+
+        // Chat B: existing session, plain text — must complete promptly, NOT
+        // queue behind chat A's 250ms spawn.
+        let b_start = std::time::Instant::now();
+        let b_result = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-b",
+            "bob",
+            "b-1",
+            "still there?",
+            &[],
+            None,
+        )
+        .await;
+        let b_elapsed = b_start.elapsed();
+        assert!(
+            b_result.is_ok(),
+            "chat B's message must succeed: {b_result:?}"
+        );
+        assert!(
+            b_elapsed < std::time::Duration::from_millis(150),
+            "chat B must not queue behind chat A's slow spawn (took {b_elapsed:?})"
+        );
+
+        let (a_result, a_elapsed) = a_task.await.unwrap();
+        assert!(
+            a_result.is_ok(),
+            "chat A's message must eventually succeed: {a_result:?}"
+        );
+        assert!(
+            a_elapsed >= std::time::Duration::from_millis(250),
+            "sanity: chat A really did pay the spawn delay ({a_elapsed:?})"
+        );
+        // B finished (well) before A did — the actual head-of-line proof.
+        assert!(b_elapsed < a_elapsed);
+    }
+
+    /// v0.8.x (concurrency review §4.1 P1) — two RAPID messages from the SAME
+    /// brand-new chat (no session yet) must spawn exactly ONE session, not
+    /// two: `SpawnClaims`'s per-chat single-flight serializes the racing
+    /// `handle_message_shared` calls so the loser observes the session the
+    /// winner just created instead of spawning a duplicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_message_shared_does_not_double_spawn_for_concurrent_first_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_delay(std::time::Duration::from_millis(80)),
+        );
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        let mut tasks = Vec::new();
+        for i in 0..2 {
+            let gw = Arc::clone(&gateway);
+            tasks.push(tokio::spawn(async move {
+                Gateway::handle_message_shared(
+                    gw,
+                    "telegram",
+                    "chat-new",
+                    "carol",
+                    &format!("m-{i}"),
+                    &format!("msg {i}"),
+                    &[],
+                    None,
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            let r = t.await.unwrap();
+            assert!(r.is_ok(), "both racing first messages must succeed: {r:?}");
+        }
+
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "exactly one session must be spawned for two racing first messages on the same chat"
+        );
+        assert_eq!(
+            gateway.lock().await.session_views().len(),
+            1,
+            "exactly one session must be live"
+        );
+        // Neither message was silently dropped — both landed as turns on the
+        // one session that got spawned.
+        assert_eq!(
+            fake.submissions.lock().await.len(),
+            2,
+            "both messages must have been submitted as turns"
+        );
     }
 
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
