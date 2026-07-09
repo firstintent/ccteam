@@ -34,6 +34,12 @@ The base is deliberately unopinionated. On top of it, everyone shapes their own 
 
 ## Quickstart
 
+**Let an agent install it for you.** In any Claude Code / Codex / Grok session on the target machine, paste a prompt like:
+
+> Install ccteam from https://github.com/firstintent/ccteam on this machine: run its `install.sh`, confirm `ccteam --version`, then run `ccteam config` to register the MCP server and `ccteam start` to launch the daemon. Print the web console URL with its token, then walk me through connecting Telegram or Lark under **Settings → IM**.
+
+The agent fetches the repo, installs the binary, starts the background service, hands you a ready-to-click console link, and guides you through IM setup. Prefer to do it by hand? Same result:
+
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
 
