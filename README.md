@@ -1,8 +1,8 @@
 # ccteam
 
-> **Remote control for Claude Code & Codex — agents that run 24/7 on your own machine, driven from your phone.**
+> **Remote control for Claude Code, Codex & Grok — agents that run 24/7 on your own machine, driven from your phone.**
 
-ccteam makes you asynchronous. A resident daemon keeps the stock [Claude Code](https://code.claude.com/) and OpenAI Codex CLIs alive around the clock; you drop in from Telegram, Lark/Feishu, or a web console — hand off work, answer the agent's mid-task question, approve the risky command — whenever it suits you, from wherever you are. ccteam owns everything *around* the agent (routing, session lifetime, cost) and never touches the work itself: **no injected prompts, no scraped terminals, no forked runtime.**
+ccteam makes you asynchronous. A resident daemon keeps the stock [Claude Code](https://code.claude.com/), OpenAI Codex, and Grok Build CLIs alive around the clock; you drop in from Telegram, Lark/Feishu, or a web console — hand off work, answer the agent's mid-task question, approve the risky command — whenever it suits you, from wherever you are. ccteam owns everything *around* the agent (routing, session lifetime, cost) and never touches the work itself: **no injected prompts, no scraped terminals, no forked runtime.**
 
 [Quickstart](#quickstart) • User manual: [English](docs/usage.md) · [中文](docs/usage-cn.md)
 
@@ -21,7 +21,7 @@ ccteam breaks the synchronous link: **the machine works; you decide — on your 
 - **Always on, nothing lost.** The daemon runs as a supervised service (systemd on Linux, launchd on macOS): it survives logout, crashes, and reboots, and sessions resume where they left off. Any past session — one you stopped, one from before a restart, even a native `claude` session you started outside ccteam — can be re-activated with its transcript intact. Per-vendor 24-hour budget caps put a hard ceiling on spend.
 - **Everything from your phone.** The agent's full slash-command surface works from chat; picker commands (`/model`, review targets) become inline buttons; a mid-task question arrives as tappable options; files flow both directions. Start a session in `hitl` mode and every non-allowlisted tool call waits for your approve / deny — deny blocks that one call, never the whole turn.
 - **A team, not a chat.** Sessions are independent, addressable agents (`s1`, `s2`, …), each with its own role, vendor, model, and context — run several in parallel across projects and switch with `@handle`. Watch any of them live in the console: transcript view or a byte-faithful terminal, with per-session spend.
-- **Vendor-native, zero lock-in.** ccteam launches the real `claude` / `codex` from your `PATH`, so a new vendor feature works the day it ships. No prompt injection (`--agent <role>` — the vendor loads its own persona file), no terminal scraping (state comes from transcripts and structured events), and your `CLAUDE.md` / `AGENTS.md` are never rewritten.
+- **Vendor-native, zero lock-in.** ccteam launches the real `claude` / `codex` / `grok` from your `PATH`, so a new vendor feature works the day it ships. Claude speaks its long-lived `stream-json` control plane, Codex its app-server, and Grok Build the standard Agent Client Protocol (ACP) over stdio — each normalized to the same session model, so chat, resume, and cost look identical from your phone. No prompt injection (the vendor loads its own persona file), no terminal scraping (state comes from transcripts and structured events), and your `CLAUDE.md` / `AGENTS.md` are never rewritten.
 
 ## Your workflow — built on top
 
@@ -74,13 +74,13 @@ Day-2 ops: `make daemon-logs` · `make daemon-restart` (rebuild + reload) · `cc
            ▼                 ▼                  ▼
       ┌─────────┐       ┌─────────┐        ┌─────────┐
       │ s1 cto  │       │ s2 dev  │        │ s3  …   │    independent sessions, each its
-      │ claude  │       │ claude  │        │ codex   │    own role + context (handle s<N>)
+      │ claude  │       │ codex   │        │ grok    │    own role + context (handle s<N>)
       └────┬────┘       └────┬────┘        └────┬────┘
-           └───────  the real Claude Code / Codex  ───────┘   --agent <role>, no injection
+           └────  the real Claude Code / Codex / Grok  ────┘   vendor persona, no injection
                               │
            your machine · your files · state on disk (resumes after any restart)
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/) and OpenAI Codex.
+MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/), OpenAI Codex, and Grok Build.

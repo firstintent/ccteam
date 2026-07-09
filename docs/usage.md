@@ -1,6 +1,6 @@
 # ccteam User Manual
 
-**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex on your own machine from the web console, Telegram, or Lark/Feishu.**
+**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build on your own machine from the web console, Telegram, or Lark/Feishu.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
@@ -29,7 +29,7 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ### 1. Install
 
-ccteam calls the Claude Code and Codex CLIs already installed and logged in on your machine. It does not bundle them.
+ccteam calls the Claude Code, Codex, and Grok Build CLIs already installed and logged in on your machine. It does not bundle them.
 
 ```bash
 # Recommended: build from source and install as a service.
@@ -43,6 +43,7 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 ccteam --version
 claude --version   # required; log in if prompted
 codex --version    # optional; only needed for Codex sessions
+grok --version     # optional; only needed for Grok Build sessions
 ```
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
@@ -77,13 +78,13 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex) and a role. Roles come from the project's `.claude/agents/` directory, plus a roleless bare-Claude option. If you do not choose, ccteam defaults to `cto`. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok) and a role. Roles come from the project's `.claude/agents/` directory, plus a roleless bare-Claude option. If you do not choose, ccteam defaults to `cto`. The session gets a handle like `s1`. Grok sessions run roleless in this release (the role picker applies to Claude/Codex).
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
-- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions.
+- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex and Grok are chat-only (Grok runs over ACP, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
 
-> Some advanced options (protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex flow by default; advanced controls will open up as they stabilize.
+> Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok chat flow by default; advanced controls will open up as they stabilize.
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
@@ -110,7 +111,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- Cost is tracked separately by vendor (Claude / Codex).
+- Cost is tracked separately by vendor (Claude / Codex / Grok). Grok reports token usage per turn; its USD amount shows as "—" until public pricing is configured.
 
 ### Standard Resource API
 
@@ -175,8 +176,9 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 # Sessions
 /new [vendor] [role] [hitl]  Create a session and return handle s<N>.
-                             vendor = claude (default) | codex
+                             vendor = claude (default) | codex | grok
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
+                             grok = roleless ACP session (role/hitl args ignored)
                              add hitl = approve tools in IM; default skip runs directly
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
@@ -208,7 +210,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 ### Human-in-the-Loop (HITL)
 
-Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode.
+Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode. Grok sessions currently run in `skip` (auto-approve) only; IM approval for Grok is planned but not yet wired.
 
 ### Let `cto` Dispatch Work
 
@@ -313,7 +315,7 @@ Environment variables:
 ```bash
 CCTEAM_HOME=~/.ccteam2          # Isolate a full state/config/session tree; pairs with ccteam --home.
 CCTEAM_PROJECTS_ROOT=...        # Default project root; default ~/projects.
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=...   # Override vendor CLI paths.
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=...   # Override vendor CLI paths.
 ```
 
 ---

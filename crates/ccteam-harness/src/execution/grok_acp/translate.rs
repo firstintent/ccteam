@@ -8,8 +8,11 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
+use tokio::sync::Notify;
 
-use super::protocol::{content_text, is_replay, usage_from_prompt_result, AvailableCommand};
+use super::protocol::{
+    content_text, is_replay, is_turn_boundary, usage_from_prompt_result, AvailableCommand,
+};
 use super::transport::Notification;
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails};
 
@@ -24,6 +27,11 @@ pub struct TurnBuffer {
 #[derive(Debug, Default)]
 pub struct SessionTranslateState {
     pub buffer: Option<TurnBuffer>,
+    /// Fired once by the dispatcher when it processes this turn's boundary
+    /// (`turn_completed` / `prompt_complete`), which is FIFO-ordered after
+    /// every `agent_message_chunk`. The submit task awaits this before
+    /// finalizing so no trailing chunk is lost to the buffer/finalize race.
+    pub turn_done: Option<Arc<Notify>>,
     pub available_commands: Vec<AvailableCommand>,
     pub model: Option<String>,
     pub window_tokens: Option<u64>,
@@ -34,16 +42,24 @@ pub struct SessionTranslateState {
 }
 
 impl SessionTranslateState {
-    pub fn begin_turn(&mut self, turn_id: impl Into<String>) {
+    pub fn begin_turn(&mut self, turn_id: impl Into<String>, done: Arc<Notify>) {
         self.buffer = Some(TurnBuffer {
             turn_id: turn_id.into(),
             text: String::new(),
         });
+        self.turn_done = Some(done);
     }
 
     pub fn append_message(&mut self, chunk: &str) {
         if let Some(b) = self.buffer.as_mut() {
             b.text.push_str(chunk);
+        }
+    }
+
+    /// Signal (once) that the turn boundary was reached.
+    fn signal_turn_done(&mut self) {
+        if let Some(done) = self.turn_done.take() {
+            done.notify_one();
         }
     }
 
@@ -55,41 +71,25 @@ impl SessionTranslateState {
 /// Apply one notification. Returns optional mid-stream events (tools).
 /// Does **not** emit final agent message — that waits for the prompt response.
 pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -> Vec<ThreadEvent> {
-    // Drop full replay frames from session/load.
+    // Drop full replay frames from session/load (isReplay covers top-level and
+    // nested `update._meta.isReplay`).
     if is_replay(&n.params) {
         return Vec::new();
     }
 
-    // Standard session/update path.
+    // Turn boundary (FIFO-ordered after every chunk) → release the finalize
+    // barrier. Must run before the vendor-noise skip below.
+    if is_turn_boundary(&n.method, &n.params) {
+        state.signal_turn_done();
+        return Vec::new();
+    }
+
+    // Standard session/update path (`session/update` or `_x.ai/session/update`).
     if n.method == "session/update" || n.method.ends_with("session/update") {
         return apply_session_update(state, &n.params);
     }
 
-    // Underscore-prefixed x.ai noise + other unknown methods: warn once.
-    if n.method.starts_with("_x.ai/") || n.method.starts_with("x.ai/") {
-        if state.warned_methods.insert(n.method.clone()) {
-            tracing::warn!(
-                method = %n.method,
-                "grok_acp: skipping unknown vendor notification (warn-once)"
-            );
-        }
-        // Still peek inside for isReplay already handled; some replays use
-        // `_x.ai/session/update` with isReplay — already dropped above if params carry it.
-        // If nested update exists without top-level isReplay, try nested.
-        if let Some(update) = n.params.get("update") {
-            if is_replay(&n.params)
-                || update
-                    .get("_meta")
-                    .and_then(|m| m.get("isReplay"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            {
-                return Vec::new();
-            }
-        }
-        return Vec::new();
-    }
-
+    // Everything else (`_x.ai/*` push noise, unknown methods): warn once, skip.
     if state.warned_methods.insert(n.method.clone()) {
         tracing::warn!(
             method = %n.method,
@@ -260,12 +260,13 @@ pub fn apply_notification_shared(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use serde_json::json;
 
     #[test]
     fn buffers_message_not_thought_and_finalizes_once() {
         let mut st = SessionTranslateState::default();
-        st.begin_turn("t1");
+        st.begin_turn("t1", Arc::new(Notify::new()));
         apply_notification(
             &mut st,
             &Notification {
@@ -345,5 +346,27 @@ mod tests {
             ThreadEvent::TurnCompleted { usage, .. } => *usage,
             _ => unreachable!(),
         };
+    }
+
+    #[test]
+    fn turn_boundary_notification_fires_finalize_barrier() {
+        let mut st = SessionTranslateState::default();
+        let done = Arc::new(Notify::new());
+        st.begin_turn("t1", done.clone());
+        // A `turn_completed` update must release the barrier (and not be
+        // treated as an unknown vendor notification).
+        let out = apply_notification(
+            &mut st,
+            &Notification {
+                method: "_x.ai/session_notification".into(),
+                params: json!({ "update": { "sessionUpdate": "turn_completed" } }),
+            },
+        );
+        assert!(out.is_empty());
+        // notify_one before notified() stores a permit → this returns Ready.
+        assert!(
+            done.notified().now_or_never().is_some(),
+            "turn boundary must have signalled the barrier"
+        );
     }
 }

@@ -29,10 +29,10 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.8.21` |
+| Workspace version | `0.8.23` |
 | 测试 baseline | `2048/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;v0.8.21 删 @ccteam/nl_admin 遗留管线时净删 ~58 个死测试);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时);**跑着 live daemon 的宿主上 `daemon_*`/`im_progress` 集成测试也会环境挂**(端口/环境竞争,基线提交同样挂)—— 均非回归,干净环境必过 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.21 任意历史会话恢复 + gateway-state.json 退役已落地 dev(未 tag、未部署)** —— **Wave-1**:per-session `meta.json`(spawn 写、`/stop` 不删、扛 daemon 重启)+ 历史会话列表(web 展开/IM `/sessions`)+ web/IM cold-resume(`/use <sid>` 与 `POST …/resume`,按 sid 从 meta 重建)+ 外部原生 Claude 会话收编(import:读 jsonl tail 的 cwd 内容发现 + uuid 归属校验)。**Wave-2(内部重构,breaking 无迁移)**:`gateway-state.json` 的 `sessions` vec + `SavedGatewaySession` 退役 —— `meta.json` 成 session 唯一 SoT;daemon 只持久 **路由**(`state/gateway/routing.json` = per-chat 焦点 + `live_sids`)+ **单调 sid 计数**(`state/sessions/next-sid`,独立文件,扛 routing/meta 清空不回退)。重启 = 所有 live session **cold-start 重 spawn**(`rebuild_session_from_meta` 单一重建路径,`--resume` 恢复对话;secret 重 mint);`tracked_chat_sessions`/`session ls`/`status` 改读 routing+meta。恢复梯形 `--resume`/re-seed 复用既有 harness。**逐版改动史 = `git log` + `docs/versions/v0-X-Y/README.md`(冻结归档);协议/实现一律以代码为准,本表只留当前标题。** |
+| 当前在做 | **v0.8.23 Grok Build 接成第三 harness vendor(ACP stdio)已落地 dev(未 tag、未部署)** —— `AgentVendor::Grok` + `SessionProtocol::Acp` + `GrokAcpAdapter`(`crates/ccteam-harness/src/execution/grok_acp/`:每 session 一 `grok agent stdio` child = Claude stream-json 拓扑;JSON-RPC 2.0 transport 仿 codex_jsonrpc;`initialize` client caps `fs/terminal:false`;buffer `agent_message_chunk` 出 final,drop thoughts;**turn-end + token 认 `session/prompt` response**,并用 dispatcher 的 turn-boundary(`turn_completed`/`prompt_complete`)信号做 finalize barrier 防丢尾块;`session/load` resume + 过滤 `isReplay`;skip→`--always-approve`,HITL/W5 deferred)。多端改全:工厂 vendor-first、IM/web `parse_vendor`、cost `Vendor::Grok`(空 `xai.toml`→"—")、`PROBE_SPECS`、doctor WARN、SPA runtime picker + 3-way vendor 配色。MVP roleless。**逐版改动史 = `git log` + `docs/versions/v0-X-Y/README.md`(冻结归档);协议/实现一律以代码为准,本表只留当前标题。** |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
 

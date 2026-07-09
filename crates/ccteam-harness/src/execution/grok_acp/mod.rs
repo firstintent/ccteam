@@ -28,12 +28,17 @@ use crate::{
 };
 
 use crate::execution::session_meta::read_session_meta;
-use protocol::{pluck_model_and_window, pluck_session_id};
+use protocol::{pluck_model_info, pluck_session_id, ModelInfo};
 use spawn_spec::{build_argv, grok_bin, GrokSpawnInput};
 use translate::{
     apply_notification, fail_turn, finalize_from_prompt_result, SessionTranslateState,
 };
 use transport::AcpTransport;
+
+/// Max wait for the dispatcher to reach the turn boundary after the prompt
+/// response, before finalizing anyway (best-effort if `turn_completed` is
+/// ever absent). The boundary is normally already signalled by then.
+const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Adapter name — stable id for handles / logs / tests.
 pub const GROK_ACP_ADAPTER_NAME: &str = "grok-acp";
@@ -76,7 +81,7 @@ impl GrokAcpAdapter {
     async fn handshake_and_new(
         transport: &AcpTransport,
         cwd: &std::path::Path,
-    ) -> Result<(String, Option<String>, Option<u64>), HarnessError> {
+    ) -> Result<(String, ModelInfo), HarnessError> {
         let _init = transport
             .call(
                 "initialize",
@@ -116,15 +121,14 @@ impl GrokAcpAdapter {
         let session_id = pluck_session_id(&new_result).ok_or_else(|| {
             HarnessError::SpawnFailed("grok session/new missing sessionId".into())
         })?;
-        let (model, window) = pluck_model_and_window(&new_result);
-        Ok((session_id, model, window))
+        Ok((session_id, pluck_model_info(&new_result)))
     }
 
     async fn handshake_and_load(
         transport: &AcpTransport,
         cwd: &std::path::Path,
         session_id: &str,
-    ) -> Result<(Option<String>, Option<u64>), HarnessError> {
+    ) -> Result<ModelInfo, HarnessError> {
         let _init = transport
             .call(
                 "initialize",
@@ -165,8 +169,7 @@ impl GrokAcpAdapter {
             )
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("grok session/load failed: {e}")))?;
-        let (model, window) = pluck_model_and_window(&load_result);
-        Ok((model, window))
+        Ok(pluck_model_info(&load_result))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -178,12 +181,12 @@ impl GrokAcpAdapter {
         sid: String,
         project_dir: PathBuf,
         cwd: PathBuf,
-        model: Option<String>,
-        window: Option<u64>,
+        info: ModelInfo,
     ) -> Arc<LiveSession> {
         let state = Arc::new(StdMutex::new(SessionTranslateState {
-            model,
-            window_tokens: window,
+            model: info.model,
+            window_tokens: info.window,
+            effort: info.effort,
             ..Default::default()
         }));
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
@@ -253,48 +256,6 @@ impl GrokAcpAdapter {
             effort: st.effort.clone(),
             goal: None,
         }
-    }
-
-    /// Cold-resume with full spawn context (daemon rebuild path).
-    pub async fn resume_with_ctx(
-        &self,
-        persistent_id: &str,
-        ctx: &SpawnCtx,
-    ) -> Result<ThreadHandle, HarnessError> {
-        if let Some(live) = self.get_live(persistent_id) {
-            return Ok(Self::make_handle(&live));
-        }
-        let bin = grok_bin();
-        let argv = build_argv(
-            &bin,
-            &GrokSpawnInput {
-                permission_mode: ctx.permission_mode,
-                model_id: ctx.model_id.as_deref(),
-            },
-        );
-        let program = argv[0].clone();
-        let args: Vec<String> = argv.into_iter().skip(1).collect();
-        let cwd = if ctx.cwd.as_os_str().is_empty() {
-            ctx.project_dir.clone()
-        } else {
-            ctx.cwd.clone()
-        };
-        let transport = AcpTransport::spawn_command(&program, &args, &cwd)
-            .await
-            .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok for resume: {e}")))?;
-        let transport = Arc::new(transport);
-        let (model, window) = Self::handshake_and_load(&transport, &cwd, persistent_id).await?;
-        let live = self.register_live(
-            transport,
-            persistent_id.to_string(),
-            ctx.slug.clone(),
-            ctx.sid.clone(),
-            ctx.project_dir.clone(),
-            cwd,
-            model,
-            window,
-        );
-        Ok(Self::make_handle(&live))
     }
 }
 
@@ -374,7 +335,7 @@ impl HarnessAdapter for GrokAcpAdapter {
         }
 
         let try_load = prior_uuid.clone();
-        let (transport, session_id, model, window) = match try_load {
+        let (transport, session_id, info) = match try_load {
             Some(uuid) => {
                 let transport = AcpTransport::spawn_command(&program, &args, &cwd)
                     .await
@@ -383,7 +344,7 @@ impl HarnessAdapter for GrokAcpAdapter {
                     })?;
                 let transport = Arc::new(transport);
                 match Self::handshake_and_load(&transport, &cwd, &uuid).await {
-                    Ok((model, window)) => (transport, uuid, model, window),
+                    Ok(info) => (transport, uuid, info),
                     Err(load_err) => {
                         tracing::warn!(
                             error = %load_err,
@@ -398,9 +359,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                                 ))
                             })?;
                         let transport = Arc::new(transport);
-                        let (sid, model, window) =
-                            Self::handshake_and_new(&transport, &cwd).await?;
-                        (transport, sid, model, window)
+                        let (sid, info) = Self::handshake_and_new(&transport, &cwd).await?;
+                        (transport, sid, info)
                     }
                 }
             }
@@ -411,8 +371,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                         HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}"))
                     })?;
                 let transport = Arc::new(transport);
-                let (sid, model, window) = Self::handshake_and_new(&transport, &cwd).await?;
-                (transport, sid, model, window)
+                let (sid, info) = Self::handshake_and_new(&transport, &cwd).await?;
+                (transport, sid, info)
             }
         };
 
@@ -423,8 +383,7 @@ impl HarnessAdapter for GrokAcpAdapter {
             ctx.sid.clone(),
             ctx.project_dir.clone(),
             cwd,
-            model,
-            window,
+            info,
         );
         let mut handle = Self::make_handle(&live);
         if let Ok(st) = live.state.lock() {
@@ -454,12 +413,22 @@ impl HarnessAdapter for GrokAcpAdapter {
         };
 
         let turn_id = format!("t-{}", Utc::now().timestamp_millis());
+        // Barrier the dispatcher fires on the turn boundary so finalize sees
+        // every buffered chunk (see FINALIZE_BARRIER / SessionTranslateState).
+        let turn_done = Arc::new(tokio::sync::Notify::new());
         {
             let mut st = live
                 .state
                 .lock()
                 .map_err(|_| HarnessError::Io("grok state lock poisoned".into()))?;
-            st.begin_turn(turn_id.clone());
+            // Guard against a clobbered in-flight turn (the gateway serializes
+            // turns per session; this is defense-in-depth).
+            if st.buffer.is_some() {
+                return Err(HarnessError::SubmitFailed(
+                    "grok_acp: a turn is already in progress for this session".into(),
+                ));
+            }
+            st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
         }
 
         let transport = Arc::clone(&live.transport);
@@ -483,6 +452,11 @@ impl HarnessAdapter for GrokAcpAdapter {
                 .await;
             let events = match result {
                 Ok(result) => {
+                    // Wait until the dispatcher has drained through the turn
+                    // boundary (all `agent_message_chunk` buffered) before
+                    // finalizing. A stored permit makes this return instantly
+                    // when the boundary already arrived (the common case).
+                    let _ = tokio::time::timeout(FINALIZE_BARRIER, turn_done.notified()).await;
                     if let Ok(mut st) = state.lock() {
                         finalize_from_prompt_result(&mut st, &result)
                     } else {
@@ -526,12 +500,14 @@ impl HarnessAdapter for GrokAcpAdapter {
         if let Some(live) = self.get_live(persistent_id) {
             return Ok(Self::make_handle(&live));
         }
-        // Cold resume needs cwd — daemon should call `resume_with_ctx`.
-        // Best-effort: if a previous handle stored cwd is unavailable,
-        // fail with a clear NotImplemented so rebuild path is used.
+        // Cold resume needs the project cwd, which this bare-id entrypoint
+        // lacks. The daemon rebuild path (`rebuild_session_from_meta`) instead
+        // calls `start_thread` with the same sid, which reads meta.vendor_uuid
+        // and runs the `session/load` ladder — that is the working cold-resume
+        // route for Grok. Fail loudly here so nothing silently relies on it.
         Err(HarnessError::NotImplemented {
             reason: format!(
-                "grok cold resume of {persistent_id} needs project cwd — use resume_with_ctx / rebuild_session_from_meta"
+                "grok cold resume of {persistent_id} needs project cwd — rebuild via start_thread (rebuild_session_from_meta)"
             ),
         })
     }

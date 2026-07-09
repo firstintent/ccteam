@@ -1,6 +1,6 @@
 # ccteam 使用手册
 
-**ccteam —— 自托管、7×24 常驻的后台智能体团队:从网页端、Telegram、飞书远程驱动你机器上的 Claude Code / Codex。**
+**ccteam —— 自托管、7×24 常驻的后台智能体团队:从网页端、Telegram、飞书远程驱动你机器上的 Claude Code / Codex / Grok Build。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
@@ -42,6 +42,7 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 ccteam --version
 claude --version   # 必需,需要时按提示登录
 codex --version    # 可选,用 Codex 会话才需要
+grok --version     # 可选,用 Grok Build 会话才需要
 ```
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
@@ -76,13 +77,13 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex)和角色。角色是从项目 `.claude/agents/` 读出的真实下拉列表,另有「(无角色 / 裸 Claude)」选项;不选则默认 `cto`。建好回一个句柄 `s<N>`。
+- **新建会话**:选 vendor(Claude / Codex / Grok)和角色。角色是从项目 `.claude/agents/` 读出的真实下拉列表,另有「(无角色 / 裸 Claude)」选项;不选则默认 `cto`。建好回一个句柄 `s<N>`。Grok 本版为无角色 ACP 会话(角色选择仅对 Claude/Codex 生效)。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
 - **历史会话与恢复**:会话列表下点「更多历史 (N) ▸」展开已**停止但未销毁**的会话(灰显)。点任意一个即从磁盘 `meta.json` **冷恢复**(cold-resume) —— 停止的会话、甚至 daemon 重启前的会话都不丢,随时可恢复(手机上 `/use <sid>` 同样能恢复)。「+ 导入历史会话」对话框还能发现你在 ccteam 之外用原生 `claude` 跑过的会话(按工作目录内容匹配),一键**收编**成普通 ccteam 会话,对话原文保留。
 
-> 部分高级选项(会话协议、在 Web 里选角色、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex 会话;随功能稳定会逐步放开。
+> 部分高级选项(terminal/rmux 协议、在 Web 里选角色、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
 
 ### 插件市场:装角色 / 技能 / 工作流
 
@@ -107,7 +108,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ### Status / 成本
 
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
-- 成本按 vendor(Claude / Codex)分别记账。
+- 成本按 vendor(Claude / Codex / Grok)分别记账。Grok 每回合上报 token 用量;未配置公开价前 USD 金额显示为「—」。
 
 ### 标准资源 API(给集成方)
 
@@ -172,8 +173,9 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 # 会话
 /new [vendor] [role] [hitl]  新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex
+                             · vendor = claude(默认)| codex | grok
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
+                             · grok = 无角色 ACP 会话(忽略 role/hitl 参数)
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
 /use <id>                  切到会话 s<N>(已停止的会话会自动从磁盘冷恢复)
 /role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)
@@ -205,7 +207,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 人工批准(HITL)
 
-默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Codex 会话自带 sandbox,忽略此模式。
+默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Codex 会话自带 sandbox,忽略此模式。Grok 会话本版仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。
 
 ### 让 cto 派活
 
@@ -310,7 +312,7 @@ cat <project>/.ccteam/progress.jsonl             # 项目业务事件(状态权�
 ```bash
 CCTEAM_HOME=~/.ccteam2          # 隔离一整套状态/配置/会话(配合 ccteam --home 跑多实例)
 CCTEAM_PROJECTS_ROOT=...        # 默认项目根(默认 ~/projects)
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=...   # 覆盖 vendor CLI 路径
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=...   # 覆盖 vendor CLI 路径
 ```
 
 ---

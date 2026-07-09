@@ -60,14 +60,24 @@ pub fn pluck_session_id(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pull `currentModelId` + window from `session/new` / `session/load` result.
-pub fn pluck_model_and_window(result: &Value) -> (Option<String>, Option<u64>) {
+/// Model + context window + reasoning effort from a `session/new` /
+/// `session/load` result.
+#[derive(Debug, Clone, Default)]
+pub struct ModelInfo {
+    pub model: Option<String>,
+    pub window: Option<u64>,
+    pub effort: Option<String>,
+}
+
+/// Pull `currentModelId` + `totalContextTokens` + `reasoningEffort` from a
+/// `session/new` / `session/load` result.
+pub fn pluck_model_info(result: &Value) -> ModelInfo {
     let models = result.get("models");
     let model = models
         .and_then(|m| m.get("currentModelId"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let window = models
+    let selected = models
         .and_then(|m| m.get("availableModels"))
         .and_then(|a| a.as_array())
         .and_then(|arr| {
@@ -75,11 +85,40 @@ pub fn pluck_model_and_window(result: &Value) -> (Option<String>, Option<u64>) {
             arr.iter()
                 .find(|m| m.get("modelId").and_then(|v| v.as_str()) == want)
                 .or_else(|| arr.first())
-        })
-        .and_then(|m| m.get("_meta"))
+        });
+    let meta = selected.and_then(|m| m.get("_meta"));
+    let window = meta
         .and_then(|meta| meta.get("totalContextTokens"))
         .and_then(|v| v.as_u64());
-    (model, window)
+    let effort = meta
+        .and_then(|meta| meta.get("reasoningEffort"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    ModelInfo {
+        model,
+        window,
+        effort,
+    }
+}
+
+/// True for a turn-completion signal — the FIFO-ordered `turn_completed`
+/// update or a `prompt_complete` notification. Used as the barrier that
+/// guarantees all `agent_message_chunk` frames were buffered before the
+/// prompt response finalizes the turn.
+pub fn is_turn_boundary(method: &str, params: &Value) -> bool {
+    if method.ends_with("prompt_complete") {
+        return true;
+    }
+    for scope in [params.get("update"), Some(params)].into_iter().flatten() {
+        let kind = scope
+            .get("sessionUpdate")
+            .or_else(|| scope.get("type"))
+            .and_then(|v| v.as_str());
+        if kind == Some("turn_completed") {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when `_meta.isReplay == true` (session/load history replay).
@@ -132,5 +171,44 @@ mod tests {
         assert!(is_replay(&json!({"_meta":{"isReplay":true}})));
         assert!(!is_replay(&json!({"_meta":{"isReplay":false}})));
         assert!(!is_replay(&json!({})));
+    }
+
+    #[test]
+    fn model_info_pulls_model_window_and_effort() {
+        let result = json!({
+            "sessionId": "abc",
+            "models": {
+                "currentModelId": "grok-4.5",
+                "availableModels": [{
+                    "modelId": "grok-4.5",
+                    "_meta": { "totalContextTokens": 500000, "reasoningEffort": "high" }
+                }]
+            }
+        });
+        let info = pluck_model_info(&result);
+        assert_eq!(info.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(info.window, Some(500000));
+        assert_eq!(info.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn turn_boundary_matches_completed_and_prompt_complete() {
+        assert!(is_turn_boundary(
+            "_x.ai/session_notification",
+            &json!({"update":{"sessionUpdate":"turn_completed"}})
+        ));
+        // fake shape: `type` at params top level.
+        assert!(is_turn_boundary(
+            "_x.ai/session_notification",
+            &json!({"type":"turn_completed"})
+        ));
+        assert!(is_turn_boundary(
+            "_x.ai/session/prompt_complete",
+            &json!({})
+        ));
+        assert!(!is_turn_boundary(
+            "session/update",
+            &json!({"update":{"sessionUpdate":"agent_message_chunk"}})
+        ));
     }
 }
