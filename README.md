@@ -83,4 +83,4 @@ Day-2 ops: `make daemon-logs` · `make daemon-restart` (rebuild + reload) · `cc
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on [Claude Code](https://code.claude.com/), OpenAI Codex, and Grok Build.
+MIT — see [LICENSE](LICENSE). Built on **Claude Code**, **OpenAI Codex**, and **Grok Build**.
