@@ -188,6 +188,14 @@ impl CodexThreadTracker {
     pub fn snapshot(&self, thread_id: &str) -> Option<ThreadLive> {
         self.threads.get(thread_id).cloned()
     }
+
+    /// True if any tracked thread has an in-flight turn. Gates the
+    /// config-change app-server re-spawn: dropping the shared connection
+    /// aborts a live turn (turns are not auto-retried), so we only re-spawn
+    /// when the child is idle.
+    fn any_active_turn(&self) -> bool {
+        self.threads.values().any(|t| t.active_turn.is_some())
+    }
 }
 
 /// v0.8.5 D2.1 — per-session command overrides applied on the NEXT
@@ -282,6 +290,14 @@ pub struct CodexAppServerAdapter {
 struct CachedConn {
     client: Arc<CodexJsonRpcClient>,
     loaded: Arc<Mutex<HashSet<String>>>,
+    /// mtime of `$CODEX_HOME/config.toml` captured when this app-server child
+    /// was spawned. `codex app-server` snapshots its config at process start
+    /// and never re-reads the file, so a long-lived child serves every new
+    /// `thread/start` from the config it saw at boot. `start_thread` compares
+    /// this against the live on-disk mtime and re-spawns the child when they
+    /// differ, so a new session picks up edited config without a ccteam
+    /// restart. `None` when the file couldn't be stat'd at dial time.
+    config_mtime: Option<std::time::SystemTime>,
 }
 
 /// v0.8.5 D2 — one entry of the flattened `skills/list` cache.
@@ -413,9 +429,54 @@ impl CodexAppServerAdapter {
         let conn = CachedConn {
             client: Arc::clone(&shared),
             loaded: Arc::new(Mutex::new(HashSet::new())),
+            config_mtime: codex_config_mtime(),
         };
         *guard = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// `codex app-server` reads `config.toml` once at process start and never
+    /// re-reads it, so on-disk edits are invisible to the long-lived child ccteam
+    /// caches — every new `thread/start` inherits the config from when the child
+    /// was spawned. Detect an edit (config mtime differs from the dial-time
+    /// snapshot) and drop the cached connection so the next `conn()` re-spawns a
+    /// fresh child that reads the new config.
+    ///
+    /// Two guards keep it safe and honest:
+    /// - **Stdio transport only** — ccteam owns that child. The `Socket` override
+    ///   dials an external app-server ccteam can't restart; bouncing would just
+    ///   reconnect to the same stale daemon, so we skip it.
+    /// - **Idle only** — dropping the shared connection aborts any in-flight turn
+    ///   (turns are not auto-retried, see `submit_turn`). If any thread is
+    ///   mid-turn we skip and warn; the new session uses the previous config until
+    ///   the child is idle (or ccteam restarts).
+    ///
+    /// Called from `start_thread`. Existing resumed threads keep codex's
+    /// per-thread config regardless (codex resume semantics), so this targets new
+    /// threads only.
+    async fn reload_app_server_if_config_changed(&self) {
+        let is_stdio = matches!(self.transport, CodexTransport::Stdio { .. });
+        let disk = codex_config_mtime();
+        let (had_child, stored) = {
+            let guard = self.inner.lock().await;
+            (guard.is_some(), guard.as_ref().and_then(|c| c.config_mtime))
+        };
+        let busy = self.tracker.lock().await.any_active_turn();
+        match decide_config_reload(is_stdio, had_child, stored, disk, busy) {
+            ConfigReloadDecision::Respawn => {
+                tracing::info!(
+                    "codex config.toml changed on disk; re-spawning the app-server so \
+                     the new session reads the updated config"
+                );
+                self.forget_client().await;
+            }
+            ConfigReloadDecision::Busy => tracing::warn!(
+                "codex config.toml changed on disk but the shared app-server has an \
+                 in-flight turn; the new session will use the previously-loaded config \
+                 until the app-server is idle (or ccteam restarts)"
+            ),
+            ConfigReloadDecision::Skip => {}
+        }
     }
 
     /// Deterministic precondition for every turn-producing / thread-scoped RPC:
@@ -1534,6 +1595,11 @@ impl HarnessAdapter for CodexAppServerAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // Pick up on-disk `~/.codex/config.toml` edits: `codex app-server`
+        // snapshots its config at process start, so re-spawn the shared child
+        // when the file changed since it was dialed. Otherwise this new session
+        // would silently inherit the config from when the daemon last started.
+        self.reload_app_server_if_config_changed().await;
         let client = self.client().await?;
         let cwd_str = ctx.cwd.to_string_lossy().to_string();
         let params = json!({
@@ -2049,6 +2115,60 @@ impl HarnessAdapter for CodexAppServerAdapter {
 /// codex's `fail_pending` connection-loss path sets `code: None`, and any
 /// non-RPC failure (writer channel closed, request send error) is not a
 /// `JsonRpcError` at all — both mean the transport is gone.
+/// Resolve `$CODEX_HOME/config.toml`, falling back to `~/.codex/config.toml`
+/// — the same file `codex app-server` reads. ccteam inherits `CODEX_HOME` into
+/// the child, so both resolve identically.
+fn codex_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("config.toml"))
+}
+
+/// Last-modified time of codex's `config.toml`, or `None` if it can't be
+/// resolved / stat'd (treated as "unknown" — never forces a re-spawn).
+fn codex_config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(codex_config_path()?)
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Outcome of the config-change check in [`CodexAppServerAdapter::reload_app_server_if_config_changed`].
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigReloadDecision {
+    /// Wrong transport, no child yet, unreadable file, or unchanged mtime.
+    Skip,
+    /// Config changed and the child is idle → re-spawn.
+    Respawn,
+    /// Config changed but a turn is in flight → skip and warn.
+    Busy,
+}
+
+/// Pure decision for whether an on-disk `config.toml` edit should re-spawn the
+/// cached codex app-server child. Split out so the branching is unit-testable
+/// without a live child. See [`CodexAppServerAdapter::reload_app_server_if_config_changed`]
+/// for the guard rationale.
+fn decide_config_reload(
+    is_stdio: bool,
+    had_child: bool,
+    stored_mtime: Option<std::time::SystemTime>,
+    disk_mtime: Option<std::time::SystemTime>,
+    any_active_turn: bool,
+) -> ConfigReloadDecision {
+    // Only the ccteam-owned Stdio child can be re-spawned; a change is only
+    // actionable when we have a child, can read the file now, and its mtime
+    // differs from the dial-time snapshot.
+    if !is_stdio || !had_child || disk_mtime.is_none() || stored_mtime == disk_mtime {
+        return ConfigReloadDecision::Skip;
+    }
+    if any_active_turn {
+        ConfigReloadDecision::Busy
+    } else {
+        ConfigReloadDecision::Respawn
+    }
+}
+
 fn is_transport_death(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<JsonRpcError>() {
         Some(e) => e.code.is_none(),
@@ -3353,6 +3473,60 @@ mod tests {
         // JsonRpcError at all → also transport death.
         let io = anyhow::anyhow!("send jsonrpc request turn/start: channel closed");
         assert!(is_transport_death(&io));
+    }
+
+    #[test]
+    fn config_reload_decision_matrix() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH;
+        let t1 = t0 + std::time::Duration::from_secs(1);
+
+        // Changed + idle + stdio + child present → re-spawn.
+        assert_eq!(
+            decide_config_reload(true, true, Some(t0), Some(t1), false),
+            ConfigReloadDecision::Respawn
+        );
+        // Changed but a turn is in flight → don't bounce the shared child.
+        assert_eq!(
+            decide_config_reload(true, true, Some(t0), Some(t1), true),
+            ConfigReloadDecision::Busy
+        );
+        // Unchanged mtime → nothing to do.
+        assert_eq!(
+            decide_config_reload(true, true, Some(t0), Some(t0), false),
+            ConfigReloadDecision::Skip
+        );
+        // Socket transport (external app-server ccteam can't restart) → skip.
+        assert_eq!(
+            decide_config_reload(false, true, Some(t0), Some(t1), false),
+            ConfigReloadDecision::Skip
+        );
+        // No child dialed yet → next conn() reads fresh config anyway → skip.
+        assert_eq!(
+            decide_config_reload(true, false, None, Some(t1), false),
+            ConfigReloadDecision::Skip
+        );
+        // config.toml unreadable now → treat as unknown, never force a bounce.
+        assert_eq!(
+            decide_config_reload(true, true, Some(t0), None, false),
+            ConfigReloadDecision::Skip
+        );
+        // File appeared after dial (dialed with none, now present) → changed.
+        assert_eq!(
+            decide_config_reload(true, true, None, Some(t1), false),
+            ConfigReloadDecision::Respawn
+        );
+    }
+
+    #[test]
+    fn tracker_any_active_turn() {
+        let mut tracker = CodexThreadTracker::default();
+        assert!(!tracker.any_active_turn());
+        // A seen-but-idle thread doesn't count.
+        tracker.entry("t-1");
+        assert!(!tracker.any_active_turn());
+        // An in-flight turn does.
+        tracker.entry("t-2").active_turn = Some("turn-9".into());
+        assert!(tracker.any_active_turn());
     }
 
     #[test]
