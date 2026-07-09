@@ -34,11 +34,11 @@ The base is deliberately unopinionated. On top of it, everyone shapes their own 
 
 ## Quickstart
 
-**Let an agent install it for you.** In any Claude Code / Codex / Grok session on the target machine, paste a prompt like:
+**Let an agent install it for you.** In any Claude Code / Codex / Grok session on the target machine, paste one line:
 
-> Install ccteam from https://github.com/firstintent/ccteam on this machine: clone it and run `make install`, which builds the release binary and brings the daemon up as a supervised service (systemd --user on Linux, launchd on macOS) — do not run `ccteam start` or `ccteam config` by hand. Give me the web console URL it prints (with its token), then walk me through finishing setup in the console: register the MCP server (one-time), create a project, and connect Telegram or Lark under **Settings → IM**.
+> Install https://github.com/firstintent/ccteam for me.
 
-The agent clones the repo, runs `make install` (which starts the supervised service), hands you a ready-to-click console link, and guides you through registering MCP and connecting IM — all in the console. Prefer to do it by hand? Same result:
+The agent clones the repo and follows its install guide (the steps below): `make install` brings the daemon up as a supervised service and prints a web console link where you register MCP and connect Telegram / Lark. Prefer to do it by hand? Same steps:
 
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
