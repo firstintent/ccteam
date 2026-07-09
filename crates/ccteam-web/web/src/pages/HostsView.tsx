@@ -238,12 +238,18 @@ function AgentCard({
           <span>{agent.installed ? "已安装" : "未安装"}</span>
           {agent.version ? <span className="font-mono text-text-dim">{agent.version}</span> : null}
           <span className="text-text-dim">·</span>
-          <span>{agent.mcp_registered ? "MCP 已注册" : "MCP 未注册"}</span>
+          <span>
+            {!agent.mcp_registrable
+              ? "MCP 随会话协议（无需注册）"
+              : agent.mcp_registered
+                ? "MCP 已注册"
+                : "MCP 未注册"}
+          </span>
         </div>
 
         {agent.hint ? <div className="mt-2 text-[11px] text-text-dim">{agent.hint}</div> : null}
 
-        {agent.installed && !agent.mcp_registered ? (
+        {agent.installed && agent.mcp_registrable && !agent.mcp_registered ? (
           <Button
             size="sm"
             data-testid={`register-mcp-${agent.vendor}`}

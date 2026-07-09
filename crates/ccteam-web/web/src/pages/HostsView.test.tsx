@@ -31,6 +31,7 @@ const HOST: HostDetail = {
       version: "claude 1.2.3",
       bin: "claude",
       mcp_registered: false,
+      mcp_registrable: true,
       status: "needs_config",
       hint: "register the ccteam MCP server: POST /api/v1/hosts/local/register-mcp?vendor=claude",
     },
@@ -41,8 +42,21 @@ const HOST: HostDetail = {
       version: null,
       bin: "codex",
       mcp_registered: false,
+      mcp_registrable: true,
       status: "not_installed",
       hint: "codex not found on PATH",
+    },
+    {
+      // grok/ACP: installed, no config-file MCP seam → ready, no register CTA.
+      vendor: "grok",
+      harness_id: "grok",
+      installed: true,
+      version: "grok 0.2.93",
+      bin: "grok",
+      mcp_registered: false,
+      mcp_registrable: false,
+      status: "ready",
+      hint: null,
     },
   ],
 };
@@ -77,12 +91,15 @@ describe("HostDetailCards (seeded)", () => {
     expect(html).toContain("claude 1.2.3"); // captured version string
   });
 
-  it("shows the register-MCP button only for an installed-but-unregistered agent", () => {
+  it("shows the register-MCP button only for an installed-but-unregistered registrable agent", () => {
     const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} />);
     // claude is installed + MCP not registered → button present.
     expect(html).toContain('data-testid="register-mcp-claude"');
     // codex is not installed → no register button (ccteam never installs a CLI).
     expect(html).not.toContain('data-testid="register-mcp-codex"');
+    // grok/ACP has no config-file MCP seam → ready, never a (no-op) CTA.
+    expect(html).not.toContain('data-testid="register-mcp-grok"');
+    expect(html).toContain("随会话协议");
   });
 
   it("renders a ready agent with the 就绪 badge and no register button", () => {
@@ -96,6 +113,7 @@ describe("HostDetailCards (seeded)", () => {
           version: "claude 1.2.3",
           bin: "claude",
           mcp_registered: true,
+          mcp_registrable: true,
           status: "ready",
           hint: null,
         },

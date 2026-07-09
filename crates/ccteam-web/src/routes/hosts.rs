@@ -55,6 +55,13 @@ pub(crate) struct ProbeSpec {
     pub bin_env: &'static str,
     /// Default binary name resolved on `PATH` when the env override is unset.
     pub default_bin: &'static str,
+    /// Whether ccteam registers its MCP server into a persistent vendor config
+    /// file for this vendor (claude `~/.claude.json` / codex `config.toml`).
+    /// `false` for vendors with no config-file MCP seam (grok/ACP passes
+    /// `mcpServers` per-session over the wire, so there is nothing to register
+    /// on the host page): such a vendor never shows `needs_config` or a
+    /// register CTA, and `register-mcp` rejects it with 400.
+    pub mcp_registrable: bool,
 }
 
 /// The agent vendors surfaced on the host page. Extend here to add a vendor.
@@ -64,18 +71,22 @@ pub(crate) const PROBE_SPECS: &[ProbeSpec] = &[
         harness_id: "claude-code",
         bin_env: CLAUDE_BIN_ENV,
         default_bin: "claude",
+        mcp_registrable: true,
     },
     ProbeSpec {
         vendor: "codex",
         harness_id: "codex",
         bin_env: CODEX_BIN_ENV,
         default_bin: "codex",
+        mcp_registrable: true,
     },
     ProbeSpec {
         vendor: "grok",
         harness_id: "grok",
         bin_env: GROK_BIN_ENV,
         default_bin: "grok",
+        // grok/ACP has no config-file MCP seam — nothing to register here.
+        mcp_registrable: false,
     },
 ];
 
@@ -95,10 +106,16 @@ pub struct AgentHealth {
     pub bin: String,
     /// Whether the ccteam MCP server is registered in this vendor's config
     /// (`~/.claude.json` / Codex `config.toml`). The single thing
-    /// `register-mcp` can flip.
+    /// `register-mcp` can flip. Always `false` when [`Self::mcp_registrable`]
+    /// is `false` (no config-file seam to register into).
     pub mcp_registered: bool,
-    /// `ready` (installed + MCP registered) / `needs_config` (installed,
-    /// MCP not registered) / `not_installed`.
+    /// Whether config-file MCP registration applies to this vendor at all
+    /// (`false` for grok/ACP — MCP rides the session protocol, not a config).
+    /// Drives whether the register CTA is offered.
+    pub mcp_registrable: bool,
+    /// `ready` (installed + MCP registered, or installed for a
+    /// non-registrable vendor) / `needs_config` (installed, MCP not
+    /// registered) / `not_installed`.
     pub status: String,
     /// Copy-paste remediation when not `ready`; `null` when ready.
     pub hint: Option<String>,
@@ -224,8 +241,9 @@ fn mcp_registered(vendor: &str) -> bool {
 fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
     let bin = resolve_bin(spec);
     let probe = probe_bin(&bin, refresh);
-    let registered = mcp_registered(spec.vendor);
-    let status = classify_status(probe.installed, registered);
+    // A non-registrable vendor has no config-file seam → never "registered".
+    let registered = spec.mcp_registrable && mcp_registered(spec.vendor);
+    let status = classify_status(probe.installed, registered, spec.mcp_registrable);
     let hint: Option<String> = match status {
         "not_installed" => Some(format!(
             "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
@@ -244,6 +262,7 @@ fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
         version: probe.version,
         bin,
         mcp_registered: registered,
+        mcp_registrable: spec.mcp_registrable,
         status: status.to_string(),
         hint,
     }
@@ -251,12 +270,14 @@ fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
 
 /// The `ready | needs_config | not_installed` tri-state: `not_installed` when
 /// the binary isn't runnable; `ready` when it is AND the ccteam MCP is
-/// registered; `needs_config` when installed but the MCP isn't registered yet
-/// (the one thing `register-mcp` fixes).
-fn classify_status(installed: bool, registered: bool) -> &'static str {
+/// registered — OR the vendor has no config-file MCP seam (`!registrable`),
+/// where an installed binary is all there is to configure; `needs_config`
+/// when installed but the MCP isn't registered yet (the one thing
+/// `register-mcp` fixes).
+fn classify_status(installed: bool, registered: bool, registrable: bool) -> &'static str {
     if !installed {
         "not_installed"
-    } else if registered {
+    } else if registered || !registrable {
         "ready"
     } else {
         "needs_config"
@@ -409,6 +430,24 @@ pub(crate) async fn handle_register_mcp(
     }
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
+        // A valid vendor that has no config-file MCP seam (grok/ACP): reject
+        // explicitly rather than silently no-op, so the UI/API never presents
+        // a register action that does nothing.
+        Some(v)
+            if PROBE_SPECS
+                .iter()
+                .any(|s| s.vendor == v && !s.mcp_registrable) =>
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "vendor {v} has no config-file MCP registration (its MCP rides the session protocol)"
+                    )
+                })),
+            )
+                .into_response();
+        }
         Some(v) if PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
         Some(other) => {
             return (
@@ -493,12 +532,29 @@ mod tests {
     #[test]
     fn classify_status_covers_the_tri_state() {
         // not installed dominates regardless of registration.
-        assert_eq!(classify_status(false, false), "not_installed");
-        assert_eq!(classify_status(false, true), "not_installed");
+        assert_eq!(classify_status(false, false, true), "not_installed");
+        assert_eq!(classify_status(false, true, true), "not_installed");
         // installed but MCP not registered → needs_config (register-mcp fixes it).
-        assert_eq!(classify_status(true, false), "needs_config");
+        assert_eq!(classify_status(true, false, true), "needs_config");
         // installed + MCP registered → ready (the acceptance: claude ready).
-        assert_eq!(classify_status(true, true), "ready");
+        assert_eq!(classify_status(true, true, true), "ready");
+    }
+
+    #[test]
+    fn classify_status_non_registrable_vendor_is_ready_when_installed() {
+        // grok/ACP has no config-file MCP seam: an installed binary is all
+        // there is to configure, so it reads `ready` (never `needs_config`)
+        // and offers no register CTA.
+        assert_eq!(classify_status(true, false, false), "ready");
+        assert_eq!(classify_status(false, false, false), "not_installed");
+    }
+
+    #[test]
+    fn grok_spec_is_not_mcp_registrable() {
+        let grok = PROBE_SPECS.iter().find(|s| s.vendor == "grok").unwrap();
+        assert!(!grok.mcp_registrable);
+        let claude = PROBE_SPECS.iter().find(|s| s.vendor == "claude").unwrap();
+        assert!(claude.mcp_registrable);
     }
 
     #[test]
@@ -510,6 +566,7 @@ mod tests {
             // of the host's real claude install.
             bin_env: "CCTEAM_TEST_UNSET_BIN_ENV_ZZZ",
             default_bin: "/nonexistent/ccteam-fake-zzz",
+            mcp_registrable: true,
         };
         let h = agent_health(&spec, true);
         assert!(!h.installed);

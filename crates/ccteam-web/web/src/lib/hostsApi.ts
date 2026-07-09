@@ -14,6 +14,10 @@ export interface AgentHealth {
   version: string | null;
   bin: string;
   mcp_registered: boolean;
+  /** Whether config-file MCP registration applies to this vendor at all
+   *  (`false` for grok/ACP — MCP rides the session protocol). Gates the
+   *  register CTA. */
+  mcp_registrable: boolean;
   /** `ready` | `needs_config` | `not_installed`. */
   status: string;
   /** Copy-paste remediation when not ready; null when ready. */
