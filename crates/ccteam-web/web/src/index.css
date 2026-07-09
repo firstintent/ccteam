@@ -50,10 +50,11 @@
   --color-brand-dim: #7a5012;
 
   /* Vendor accents (v0.8.9) — the per-vendor badge colors from the prototype.
-     Claude = copper, Codex = teal-green. Used only on the vendor pills/badges
-     so the two agents read distinct at a glance. */
+     Claude = copper, Codex = teal-green, Grok = violet. Used only on the
+     vendor pills/badges so agents read distinct at a glance. */
   --color-vendor-claude: #d97757;
   --color-vendor-codex: #10a37f;
+  --color-vendor-grok: #8b5cf6;
 
   /* Accent -- Muted Teal (used sparingly) */
   --color-accent-500: #14b8a6;
@@ -151,6 +152,7 @@ body {
   --color-brand-dim: #fde9c8;
   --color-vendor-claude: #c2410c;
   --color-vendor-codex: #0f766e;
+  --color-vendor-grok: #7c3aed;
   --color-accent-500: #0d9488;
   --color-accent-600: #0f766e;
   --color-accent-700: #115e59;

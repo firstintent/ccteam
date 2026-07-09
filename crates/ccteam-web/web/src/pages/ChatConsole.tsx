@@ -457,7 +457,7 @@ export default function ChatConsole() {
       role: string,
       vendor: string,
       permissionMode: "skip" | "hitl",
-      protocol: "stream-json" | "terminal",
+      protocol: "stream-json" | "terminal" | "acp",
       newProjectPath?: string,
     ): Promise<boolean> => {
       // Frontend-only cap: block a new session once the caller already holds
@@ -699,7 +699,6 @@ export default function ChatConsole() {
                   <div className="space-y-0.5">
                     {items.map((s) => {
                       const active = s.sid === sid;
-                      const isClaude = s.vendor === "claude";
                       const editing = renamingSid === s.sid;
                       // Item 9/10 — attention badge + real-status dot. The
                       // dot no longer encodes "selected" (the row background
@@ -759,11 +758,7 @@ export default function ChatConsole() {
                                 className={`h-1.5 w-1.5 rounded-full shrink-0 ${sessionDotClass(s.status)}`}
                               />
                               <span
-                                className={`font-mono px-1 rounded text-[10px] ${
-                                  isClaude
-                                    ? "bg-vendor-claude/15 text-vendor-claude"
-                                    : "bg-vendor-codex/15 text-vendor-codex"
-                                }`}
+                                className={`font-mono px-1 rounded text-[10px] ${vendorBadgeClass(s.vendor)}`}
                               >
                                 {s.vendor}
                               </span>
@@ -1226,13 +1221,27 @@ const RUNTIME_OPTIONS = [
     vendor: "codex",
     protocol: "terminal",
   },
+  {
+    id: "grok-acp",
+    label: "Grok · ACP",
+    hint: "Grok Build agent stdio",
+    vendor: "grok",
+    protocol: "acp",
+  },
 ] as const satisfies readonly {
   id: string;
   label: string;
   hint: string;
-  vendor: "claude" | "codex";
-  protocol: "stream-json" | "terminal";
+  vendor: "claude" | "codex" | "grok";
+  protocol: "stream-json" | "terminal" | "acp";
 }[];
+
+/** Per-vendor badge classes (3-way; never paint grok as codex). */
+function vendorBadgeClass(vendor: string): string {
+  if (vendor === "claude") return "bg-vendor-claude/15 text-vendor-claude";
+  if (vendor === "grok") return "bg-vendor-grok/15 text-vendor-grok";
+  return "bg-vendor-codex/15 text-vendor-codex";
+}
 
 type RuntimeId = (typeof RUNTIME_OPTIONS)[number]["id"];
 
@@ -1266,7 +1275,7 @@ export function NewSessionModal({
     role: string,
     vendor: string,
     permissionMode: "skip" | "hitl",
-    protocol: "stream-json" | "terminal",
+    protocol: "stream-json" | "terminal" | "acp",
     newProjectPath?: string,
   ) => Promise<boolean>;
 }) {
@@ -1283,13 +1292,14 @@ export function NewSessionModal({
   const protocol = runtime.protocol;
 
   // v0.8.20 F4 — beta-gating (UI-level only): production-stable runtimes
-  // (claude/codex on stream-json) for everyone; the terminal/rmux protocol is
-  // an advanced surface shown ONLY to the admin. The default `runtimeId`
-  // (claude-stream-json) is in both sets, so a tenant never lands on a hidden
-  // option. NOT a security boundary — the backend create route is unchanged.
+  // (claude/codex stream-json + grok acp) for everyone; terminal/rmux is
+  // advanced (admin-only). Grok ACP is the stable chat main path (v0.8.23).
+  // NOT a security boundary — the backend create route is unchanged.
   const runtimeOptions = isAdmin
     ? RUNTIME_OPTIONS
-    : RUNTIME_OPTIONS.filter((option) => option.protocol === "stream-json");
+    : RUNTIME_OPTIONS.filter(
+        (option) => option.protocol === "stream-json" || option.protocol === "acp",
+      );
 
   const isNew = project === NEW_PROJECT;
 
@@ -1664,7 +1674,6 @@ function HistorySection({
           ) : null}
           {history.map((h) => {
             const isActive = h.sid === activeSid;
-            const isClaude = h.vendor === "claude";
             // Item 9 — a stopped session can never be waiting-approval or
             // "stuck" (both are live-only concepts), so history rows only
             // ever resolve to "unread" or nothing.
@@ -1689,11 +1698,7 @@ function HistorySection({
               >
                 <span className="h-1.5 w-1.5 rounded-full shrink-0 bg-surface-600" />
                 <span
-                  className={`font-mono px-1 rounded text-[10px] ${
-                    isClaude
-                      ? "bg-vendor-claude/15 text-vendor-claude"
-                      : "bg-vendor-codex/15 text-vendor-codex"
-                  }`}
+                  className={`font-mono px-1 rounded text-[10px] ${vendorBadgeClass(h.vendor)}`}
                 >
                   {h.vendor}
                 </span>

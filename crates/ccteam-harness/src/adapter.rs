@@ -68,6 +68,11 @@ pub const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
 /// requiring the real CLI on PATH.
 pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
 
+/// Environment override for the `grok` binary path. Tests set this to
+/// a fake ACP stdio script so harness tests stay hermetic (no real
+/// network / grok login).
+pub const GROK_BIN_ENV: &str = "CCTEAM_GROK_BIN";
+
 /// Environment override for the global ccteam root. Harness-owned
 /// adapters use this for per-session state sidecars without depending
 /// on `ccteam-core::paths::CcteamPaths`.
@@ -106,6 +111,7 @@ pub fn ccteam_root_from_env() -> Option<PathBuf> {
 pub enum AgentVendor {
     Claude,
     Codex,
+    Grok,
 }
 
 impl AgentVendor {
@@ -113,6 +119,7 @@ impl AgentVendor {
         match self {
             AgentVendor::Claude => ccteam_cost::Vendor::Claude,
             AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+            AgentVendor::Grok => ccteam_cost::Vendor::Grok,
         }
     }
 }
@@ -210,27 +217,32 @@ pub enum SessionProtocol {
     StreamJson,
     /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / screenshot).
     Terminal,
+    /// `acp` — Agent Client Protocol stdio (Grok Build). Honest meta value;
+    /// Claude has no ACP arm.
+    Acp,
 }
 
 impl SessionProtocol {
-    /// Parse an optional wire token (`"stream-json"` / `"terminal"`).
+    /// Parse an optional wire token (`"stream-json"` / `"terminal"` / `"acp"`).
     /// `None` / empty ⇒ [`SessionProtocol::StreamJson`] (the default).
     /// An unrecognized non-empty token is an `Err` so a typo surfaces.
     pub fn parse_opt(raw: Option<&str>) -> Result<Self, String> {
         match raw.map(str::trim).unwrap_or("") {
             "" | "stream-json" | "streamjson" | "stream_json" => Ok(SessionProtocol::StreamJson),
             "terminal" | "tmux" => Ok(SessionProtocol::Terminal),
+            "acp" => Ok(SessionProtocol::Acp),
             other => Err(format!(
-                "invalid protocol `{other}`: expected `stream-json` or `terminal`"
+                "invalid protocol `{other}`: expected `stream-json`, `terminal`, or `acp`"
             )),
         }
     }
 
-    /// Lowercase wire string (`"stream-json"` / `"terminal"`).
+    /// Lowercase wire string (`"stream-json"` / `"terminal"` / `"acp"`).
     pub fn as_str(self) -> &'static str {
         match self {
             SessionProtocol::StreamJson => "stream-json",
             SessionProtocol::Terminal => "terminal",
+            SessionProtocol::Acp => "acp",
         }
     }
 
@@ -242,6 +254,11 @@ impl SessionProtocol {
     /// True for the tmux/terminal (pane-backed) channel.
     pub fn is_terminal(self) -> bool {
         matches!(self, SessionProtocol::Terminal)
+    }
+
+    /// True for ACP stdio (Grok).
+    pub fn is_acp(self) -> bool {
+        matches!(self, SessionProtocol::Acp)
     }
 }
 
@@ -1065,6 +1082,7 @@ impl SessionHandle {
                 _ => "claude-tui",
             },
             AgentVendor::Codex => "codex",
+            AgentVendor::Grok => "grok",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

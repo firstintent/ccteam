@@ -100,11 +100,21 @@ pub fn default_adapter_factory_with_stream_json_handle(
     let claude_stream_json = Arc::new(ClaudeStreamJsonAdapter::new());
     let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> = claude_stream_json.clone();
     let codex: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(CodexAppServerAdapter::new());
+    let grok: Arc<dyn HarnessAdapter + Send + Sync> =
+        Arc::new(ccteam_harness::GrokAcpAdapter::new());
+    // Vendor-first factory (v0.8.23 §3.E): protocol is Claude-only; Grok
+    // always ACP; Codex ignores protocol. Avoids non-exhaustive
+    // (Claude, Acp) after SessionProtocol::Acp lands.
     let factory: AdapterFactory = Arc::new(
-        move |vendor: AgentVendor, protocol: SessionProtocol| match (vendor, protocol) {
-            (AgentVendor::Claude, SessionProtocol::StreamJson) => Arc::clone(&claude_stream),
-            (AgentVendor::Claude, SessionProtocol::Terminal) => Arc::clone(&claude_tui),
-            (AgentVendor::Codex, _) => Arc::clone(&codex),
+        move |vendor: AgentVendor, protocol: SessionProtocol| match vendor {
+            AgentVendor::Claude => match protocol {
+                SessionProtocol::StreamJson => Arc::clone(&claude_stream),
+                SessionProtocol::Terminal => Arc::clone(&claude_tui),
+                // Claude has no ACP arm — fall back to default stream-json.
+                SessionProtocol::Acp => Arc::clone(&claude_stream),
+            },
+            AgentVendor::Codex => Arc::clone(&codex),
+            AgentVendor::Grok => Arc::clone(&grok),
         },
     );
     (factory, claude_stream_json)

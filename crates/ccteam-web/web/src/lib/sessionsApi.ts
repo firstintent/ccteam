@@ -304,7 +304,7 @@ export interface CreateSessionOpts {
   /** Wire protocol for the new session. Omitted → server defaults to
    *  `"stream-json"` (the薄/default path); pass `"terminal"` for the advanced
    *  pane-backed session (terminal mirror / attach / screenshot). */
-  protocol?: "stream-json" | "terminal";
+  protocol?: "stream-json" | "terminal" | "acp";
 }
 
 export interface CreateSessionResult {

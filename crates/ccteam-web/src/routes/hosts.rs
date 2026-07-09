@@ -30,7 +30,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV};
+use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, GROK_BIN_ENV};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -70,6 +70,12 @@ pub(crate) const PROBE_SPECS: &[ProbeSpec] = &[
         harness_id: "codex",
         bin_env: CODEX_BIN_ENV,
         default_bin: "codex",
+    },
+    ProbeSpec {
+        vendor: "grok",
+        harness_id: "grok",
+        bin_env: GROK_BIN_ENV,
+        default_bin: "grok",
     },
 ];
 
@@ -208,6 +214,8 @@ fn mcp_registered(vendor: &str) -> bool {
         "codex" => ccteam_core::mcp_register::resolve_codex_config_path()
             .map(|p| ccteam_core::mcp_register::codex_mcp_registered(&p))
             .unwrap_or(false),
+        // Grok MCP registration not wired in MVP (L18: best-effort, non-blocking).
+        "grok" => false,
         _ => false,
     }
 }
@@ -515,6 +523,7 @@ mod tests {
         // check that gates the 400.
         assert!(PROBE_SPECS.iter().any(|s| s.vendor == "claude"));
         assert!(PROBE_SPECS.iter().any(|s| s.vendor == "codex"));
+        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "grok"));
         assert!(!PROBE_SPECS.iter().any(|s| s.vendor == "gemini"));
     }
 }

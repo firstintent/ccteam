@@ -303,7 +303,15 @@ export default function SessionView({
             <span className="text-status-running">●</span>
             <span className="font-semibold truncate">{session.project}</span>
             <span className="text-text-dim">/</span>
-            <span className={session.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"}>
+            <span
+              className={
+                session.vendor === "claude"
+                  ? "text-vendor-claude"
+                  : session.vendor === "grok"
+                    ? "text-vendor-grok"
+                    : "text-vendor-codex"
+              }
+            >
               {[session.vendor, session.role].filter(Boolean).join(" · ")}
             </span>
             <span className="font-mono text-text-dim">{session.sid}</span>

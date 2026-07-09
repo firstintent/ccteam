@@ -368,8 +368,9 @@ fn parse_vendor(args: &Value) -> Result<AgentVendor> {
     match lower.as_str() {
         "claude" => Ok(AgentVendor::Claude),
         "codex" => Ok(AgentVendor::Codex),
+        "grok" => Ok(AgentVendor::Grok),
         other => Err(anyhow!(
-            "invalid vendor `{other}`: expected one of `claude`, `codex`"
+            "invalid vendor `{other}`: expected one of `claude`, `codex`, `grok`"
         )),
     }
 }

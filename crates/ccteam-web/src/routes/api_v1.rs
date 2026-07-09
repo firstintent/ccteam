@@ -622,6 +622,7 @@ fn harness_label(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "claude",
         HarnessKind::Codex => "codex",
+        HarnessKind::Grok => "grok",
     }
 }
 
@@ -630,6 +631,7 @@ fn harness_class(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "harness-claude",
         HarnessKind::Codex => "harness-codex",
+        HarnessKind::Grok => "harness-grok",
     }
 }
 

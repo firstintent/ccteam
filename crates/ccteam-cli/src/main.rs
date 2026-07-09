@@ -3450,8 +3450,9 @@ fn parse_session_vendor(
         Some(raw) => match raw.to_lowercase().as_str() {
             "" | "claude" => Ok(ccteam_harness::AgentVendor::Claude),
             "codex" => Ok(ccteam_harness::AgentVendor::Codex),
+            "grok" => Ok(ccteam_harness::AgentVendor::Grok),
             other => Err(format!(
-                "session_spawn: invalid vendor `{other}`: expected `claude` or `codex`"
+                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, or `grok`"
             )),
         },
     }

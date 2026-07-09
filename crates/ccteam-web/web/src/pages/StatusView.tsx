@@ -290,7 +290,11 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
           <span className="flex items-center gap-2">
             <span
               className={
-                row.original.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex"
+                row.original.vendor === "claude"
+                  ? "text-vendor-claude"
+                  : row.original.vendor === "grok"
+                    ? "text-vendor-grok"
+                    : "text-vendor-codex"
               }
             >
               {[row.original.vendor, row.original.role].filter(Boolean).join(" · ")}

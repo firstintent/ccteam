@@ -58,6 +58,10 @@ const ANTHROPIC_TOML: &str = include_str!("../pricing/anthropic.toml");
 /// against `openai.com/api/pricing` on the `schema_version` date.
 const OPENAI_TOML: &str = include_str!("../pricing/openai.toml");
 
+/// xAI Grok price table. Empty models map is honest when no public
+/// USD rates are embedded — `estimate_cost` returns `None` → UI "—".
+const XAI_TOML: &str = include_str!("../pricing/xai.toml");
+
 /// Vendor discriminator. Defined here (not in `ccteam-core::harness`)
 /// so this crate has zero `ccteam-core` deps; `ccteam-core` re-exports
 /// `ccteam_cost::Vendor` from its `lib.rs` for downstream callers.
@@ -65,6 +69,7 @@ const OPENAI_TOML: &str = include_str!("../pricing/openai.toml");
 pub enum Vendor {
     Claude,
     Codex,
+    Grok,
 }
 
 /// Dual-vendor token usage shape — unified across Claude + Codex.
@@ -131,6 +136,7 @@ struct PricingTable {
 
 static ANTHROPIC_TABLE: OnceLock<PricingTable> = OnceLock::new();
 static OPENAI_TABLE: OnceLock<PricingTable> = OnceLock::new();
+static XAI_TABLE: OnceLock<PricingTable> = OnceLock::new();
 
 fn table_for(vendor: Vendor) -> &'static PricingTable {
     match vendor {
@@ -141,6 +147,9 @@ fn table_for(vendor: Vendor) -> &'static PricingTable {
         Vendor::Codex => OPENAI_TABLE.get_or_init(|| {
             toml::from_str(OPENAI_TOML)
                 .expect("ccteam openai.toml embedded at compile time must parse")
+        }),
+        Vendor::Grok => XAI_TABLE.get_or_init(|| {
+            toml::from_str(XAI_TOML).expect("ccteam xai.toml embedded at compile time must parse")
         }),
     }
 }

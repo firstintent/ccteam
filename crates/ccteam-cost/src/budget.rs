@@ -38,6 +38,8 @@ pub struct Budgets {
     pub claude: BudgetCap,
     #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
     pub codex: BudgetCap,
+    #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
+    pub grok: BudgetCap,
 }
 
 /// One vendor's cost + spawn caps.
@@ -67,22 +69,25 @@ impl Budgets {
         match vendor {
             Vendor::Claude => &self.claude,
             Vendor::Codex => &self.codex,
+            Vendor::Grok => &self.grok,
         }
     }
 
-    /// Sum of the two `max_cost_usd_per_24h` values. Used by the F84
-    /// watchdog when both vendors are configured — tripping the
-    /// aggregated cap is the worst-case "shut everything down" path.
-    /// Returns `None` only when **neither** vendor has a cap.
+    /// Sum of per-vendor `max_cost_usd_per_24h` values. Used by the F84
+    /// watchdog when vendors are configured — tripping the aggregated
+    /// cap is the worst-case "shut everything down" path.
+    /// Returns `None` only when **no** vendor has a cap.
     pub fn aggregated_cost_cap_24h(&self) -> Option<f64> {
-        match (
+        let caps = [
             self.claude.max_cost_usd_per_24h,
             self.codex.max_cost_usd_per_24h,
-        ) {
-            (Some(c), Some(d)) => Some(c + d),
-            (Some(c), None) => Some(c),
-            (None, Some(d)) => Some(d),
-            (None, None) => None,
+            self.grok.max_cost_usd_per_24h,
+        ];
+        let sum: f64 = caps.iter().filter_map(|c| *c).sum();
+        if caps.iter().any(|c| c.is_some()) {
+            Some(sum)
+        } else {
+            None
         }
     }
 }
@@ -213,6 +218,7 @@ mod vendor_wire {
         serializer.serialize_str(match vendor {
             Vendor::Claude => "claude",
             Vendor::Codex => "codex",
+            Vendor::Grok => "grok",
         })
     }
 
@@ -224,6 +230,7 @@ mod vendor_wire {
         match raw.to_ascii_lowercase().as_str() {
             "claude" => Ok(Vendor::Claude),
             "codex" => Ok(Vendor::Codex),
+            "grok" => Ok(Vendor::Grok),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }
@@ -244,6 +251,7 @@ mod tests {
                 max_cost_usd_per_24h: Some(2.0),
                 max_agent_spawns_per_hour: None,
             },
+            ..Default::default()
         };
         assert_eq!(b.aggregated_cost_cap_24h(), Some(7.0));
     }
@@ -256,6 +264,7 @@ mod tests {
                 ..Default::default()
             },
             codex: BudgetCap::default(),
+            ..Default::default()
         };
         assert_eq!(b.aggregated_cost_cap_24h(), Some(5.0));
     }
@@ -277,6 +286,7 @@ mod tests {
                 max_agent_spawns_per_hour: Some(100),
                 ..Default::default()
             },
+            ..Default::default()
         };
         assert_eq!(b.cap_for(Vendor::Claude).max_cost_usd_per_24h, Some(5.0));
         assert_eq!(

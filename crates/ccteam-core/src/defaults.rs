@@ -22,6 +22,10 @@ pub const CLAUDE_BIN_ENV: &str = "CCTEAM_CLAUDE_BIN";
 /// fake scripts for `codex exec --json` and app-server probes.
 pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
 
+/// Environment override for the `grok` binary path. Tests set this to
+/// a fake ACP stdio script so harness tests stay hermetic.
+pub const GROK_BIN_ENV: &str = "CCTEAM_GROK_BIN";
+
 /// V0.6.8 F195 — per-turn watchdog default (seconds).
 ///
 /// 90s leaves enough headroom for normal multi-tool turns to finish

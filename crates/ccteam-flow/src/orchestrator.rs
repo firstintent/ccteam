@@ -2114,6 +2114,7 @@ impl Orchestrator {
         let vendor_str = match vendor {
             AgentVendor::Claude => "claude",
             AgentVendor::Codex => "codex",
+            AgentVendor::Grok => "grok",
         };
         match evt {
             ThreadEvent::ThreadStarted { .. } => None,
@@ -2132,6 +2133,7 @@ impl Orchestrator {
                     match vendor {
                         AgentVendor::Claude => ccteam_cost::Vendor::Claude,
                         AgentVendor::Codex => ccteam_cost::Vendor::Codex,
+                        AgentVendor::Grok => ccteam_cost::Vendor::Grok,
                     },
                     priced_model,
                 );

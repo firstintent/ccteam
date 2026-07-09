@@ -1623,6 +1623,7 @@ impl Gateway {
                 // order-independent flags, so `/new claude` AND `/new claude hitl`
                 // are both roleless, while `/new claude reviewer hitl` is role
                 // `reviewer` + hitl. Defaults = skip + stream-json.
+                // Grok always uses ACP (v0.8.23) — ignore protocol flags for grok.
                 let mut role = String::new();
                 let mut role_set = false;
                 let mut permission_mode = PermissionMode::Skip;
@@ -1633,7 +1634,8 @@ impl Gateway {
                             permission_mode =
                                 PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
                         }
-                        "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json" => {
+                        "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json"
+                        | "acp" => {
                             protocol =
                                 SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
                         }
@@ -1643,10 +1645,13 @@ impl Gateway {
                         }
                         other => {
                             return Err(anyhow!(
-                                "/new: unexpected token `{other}` (give one role + optional hitl / terminal)"
+                                "/new: unexpected token `{other}` (give one role + optional hitl / terminal / acp)"
                             ));
                         }
                     }
+                }
+                if vendor == AgentVendor::Grok {
+                    protocol = SessionProtocol::Acp;
                 }
                 let project = self.current_project_for(chat);
                 let handle = role.clone();
@@ -5219,6 +5224,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
     match v {
         AgentVendor::Claude => "claude",
         AgentVendor::Codex => "codex",
+        AgentVendor::Grok => "grok",
     }
 }
 
@@ -6071,6 +6077,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
     match raw {
         "claude" => Ok(AgentVendor::Claude),
         "codex" => Ok(AgentVendor::Codex),
+        "grok" => Ok(AgentVendor::Grok),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -9699,6 +9706,7 @@ mod tests {
                     match vendor {
                         AgentVendor::Claude => claude.clone(),
                         AgentVendor::Codex => codex.clone(),
+                        AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
                     }
                 },
             )
@@ -9788,6 +9796,7 @@ mod tests {
                     match vendor {
                         AgentVendor::Claude => claude.clone(),
                         AgentVendor::Codex => codex.clone(),
+                        AgentVendor::Grok => codex.clone(),
                     }
                 },
             )

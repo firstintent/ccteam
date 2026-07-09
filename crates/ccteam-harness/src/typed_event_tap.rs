@@ -231,6 +231,8 @@ fn pattern_vendor(vendor: Vendor) -> PatternVendor {
     match vendor {
         Vendor::Claude => PatternVendor::Claude,
         Vendor::Codex => PatternVendor::Codex,
+        // Grok has no pane regex patterns; ACP events don't go through the tap.
+        Vendor::Grok => PatternVendor::Codex,
     }
 }
 

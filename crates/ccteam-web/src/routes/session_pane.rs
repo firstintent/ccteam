@@ -42,6 +42,8 @@ pub(crate) enum PaneResolveError {
 pub(crate) fn pane_name_for_vendor(vendor: &str, slug: &str, sid: &str) -> String {
     match vendor.trim().to_ascii_lowercase().as_str() {
         "claude" => ccteam_harness::chat_session_name(slug, sid),
+        // grok ACP is pane-less in MVP; keep a distinct name if terminal ever used.
+        "grok" => format!("ccteam-grok-{slug}-{sid}"),
         // codex(及未知 vendor 兜底)走 codex 容器 pane 命名权威。
         _ => ccteam_harness::codex_chat_session_name(slug, sid),
     }

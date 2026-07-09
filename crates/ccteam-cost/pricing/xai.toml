@@ -1,0 +1,6 @@
+# xAI Grok pricing — schema mirrors anthropic/openai.
+# Empty models: estimate_cost returns None → status/pill display "—"
+# (honest degradation; do not mis-bill at a fallback rate).
+schema_version = "2026-07-09"
+
+[models]

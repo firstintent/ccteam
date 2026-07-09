@@ -2829,6 +2829,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                 let key = match vendor {
                     "claude" => CostVendor::Claude,
                     "codex" => CostVendor::Codex,
+                    "grok" => CostVendor::Grok,
                     _ => continue, // unknown vendor — skip (forward-compat)
                 };
                 *counts.agent_done.entry(key).or_insert(0) += 1;
@@ -2845,6 +2846,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
             let key = match sample.vendor {
                 ccteam_core::Vendor::Claude => CostVendor::Claude,
                 ccteam_core::Vendor::Codex => CostVendor::Codex,
+                ccteam_core::Vendor::Grok => CostVendor::Grok,
             };
             *counts.ledger_rows.entry(key).or_insert(0) += 1;
         }
@@ -2855,7 +2857,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
     //    without progress.jsonl events) is expected — advise calls are
     //    not project-scoped, so they have no progress.jsonl footprint.
     let mut warnings = Vec::new();
-    for vendor in [CostVendor::Claude, CostVendor::Codex] {
+    for vendor in [CostVendor::Claude, CostVendor::Codex, CostVendor::Grok] {
         let done = counts.agent_done.get(&vendor).copied().unwrap_or(0);
         let rows = counts.ledger_rows.get(&vendor).copied().unwrap_or(0);
         if done > rows {
@@ -2888,6 +2890,7 @@ pub struct CostOrphanCounts {
 pub enum CostVendor {
     Claude,
     Codex,
+    Grok,
 }
 
 impl CostVendor {
@@ -2895,6 +2898,7 @@ impl CostVendor {
         match self {
             CostVendor::Claude => "claude",
             CostVendor::Codex => "codex",
+            CostVendor::Grok => "grok",
         }
     }
 }
@@ -4553,9 +4557,10 @@ pub fn run_admin_register_bot(
     let vendor = match vendor_raw.to_lowercase().as_str() {
         "claude" => AgentVendor::Claude,
         "codex" => AgentVendor::Codex,
+        "grok" => AgentVendor::Grok,
         other => {
             return Err(anyhow::anyhow!(
-                "invalid vendor `{other}`: expected one of `claude`, `codex`"
+                "invalid vendor `{other}`: expected one of `claude`, `codex`, `grok`"
             ))
         }
     };

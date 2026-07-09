@@ -118,6 +118,7 @@ fn budgets_aggregated_cap_uses_ccteam_cost_helper() {
             max_cost_usd_per_24h: Some(2.0),
             ..Default::default()
         },
+        ..Default::default()
     };
     assert_eq!(b.aggregated_cost_cap_24h(), Some(7.0));
 }

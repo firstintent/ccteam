@@ -109,6 +109,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "claude" => Ok(AgentVendor::Claude),
         "codex" => Ok(AgentVendor::Codex),
+        "grok" => Ok(AgentVendor::Grok),
         other => Err(format!("unknown vendor: {other} (expected claude|codex)")),
     }
 }
@@ -299,9 +300,15 @@ pub(crate) async fn handle_create_session(
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
     // v0.8.11 E2 — optional `protocol` body field; default stream-json.
+    // Grok always ACP (v0.8.23) — honest meta, ignore conflicting body.
     let protocol = match SessionProtocol::parse_opt(form.protocol.as_deref()) {
         Ok(p) => p,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
+    };
+    let protocol = if vendor == AgentVendor::Grok {
+        SessionProtocol::Acp
+    } else {
+        protocol
     };
 
     let created = {
@@ -1402,6 +1409,7 @@ mod tests {
     fn parse_vendor_accepts_both_case_insensitive() {
         assert_eq!(parse_vendor("claude").unwrap(), AgentVendor::Claude);
         assert_eq!(parse_vendor("Codex").unwrap(), AgentVendor::Codex);
+        assert_eq!(parse_vendor("grok").unwrap(), AgentVendor::Grok);
         assert_eq!(parse_vendor("  CLAUDE ").unwrap(), AgentVendor::Claude);
     }
 

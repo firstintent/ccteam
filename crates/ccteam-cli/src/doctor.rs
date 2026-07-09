@@ -102,6 +102,7 @@ pub fn is_bare_invocation(opts: &crate::commands::DoctorOptions) -> bool {
 pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let claude = check_claude_binary();
     let codex = check_codex_binary();
+    let grok = check_grok_binary();
     let codex_present = codex.status == CheckStatus::Pass;
     let tmux = check_tmux();
     let mcp_claude = check_mcp_claude();
@@ -111,7 +112,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let home = check_home_layout(paths);
 
     let checks = [
-        claude, codex, tmux, mcp_claude, mcp_codex, daemon, pricing, home,
+        claude, codex, grok, tmux, mcp_claude, mcp_codex, daemon, pricing, home,
     ];
 
     let mut pass = 0usize;
@@ -175,6 +176,17 @@ fn check_codex_binary() -> CheckLine {
         "codex",
         CheckStatus::Warn,
         "install the Codex CLI (optional), or point",
+    )
+}
+
+/// grok is optional (v0.8.23 third vendor) — missing binary WARNs only.
+fn check_grok_binary() -> CheckLine {
+    probe_binary(
+        "grok binary",
+        ccteam_core::GROK_BIN_ENV,
+        "grok",
+        CheckStatus::Warn,
+        "install the Grok Build CLI (optional), or point",
     )
 }
 

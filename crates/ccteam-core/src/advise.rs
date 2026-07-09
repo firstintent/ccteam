@@ -336,6 +336,14 @@ pub async fn advise_parallel(
                         (v, AnswerStatus::Error { reason: r }, String::new())
                     }
                 },
+                // MVP: headless `grok -p` advise path deferred; honest Unavailable.
+                AgentVendor::Grok => (
+                    v,
+                    AnswerStatus::Unavailable {
+                        reason: "grok advise (headless) not wired in v0.8.23 MVP".into(),
+                    },
+                    String::new(),
+                ),
             }
         });
     }

@@ -236,9 +236,10 @@ fn parse_vendors(args: &Value) -> Result<Vec<AgentVendor>> {
         match raw.to_lowercase().as_str() {
             "claude" => out.push(AgentVendor::Claude),
             "codex" => out.push(AgentVendor::Codex),
+            "grok" => out.push(AgentVendor::Grok),
             other => {
                 return Err(anyhow!(
-                    "invalid vendor `{other}`: expected `claude` or `codex`"
+                    "invalid vendor `{other}`: expected `claude`, `codex`, or `grok`"
                 ))
             }
         }

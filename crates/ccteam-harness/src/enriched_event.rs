@@ -111,6 +111,7 @@ pub enum EventKind {
 pub enum Vendor {
     Claude,
     Codex,
+    Grok,
 }
 
 /// Where the lossless (P1) enrichment for a `(kind, vendor)` pair comes
@@ -139,28 +140,37 @@ pub fn enrichment_source(kind: EventKind, vendor: Vendor) -> EnrichmentSource {
     match (kind, vendor) {
         (ToolCallStarted, Claude) => ClaudeHook("pre_tool_use"),
         (ToolCallStarted, Codex) => CodexJsonRpc("item/started"),
+        // Grok ACP: events come from JSON-RPC directly; no P1 enrichment grace.
+        (ToolCallStarted, Grok) => None,
 
         (ToolCallCompleted, Claude) => ClaudeHook("post_tool_use"),
         (ToolCallCompleted, Codex) => CodexJsonRpc("item/completed"),
+        (ToolCallCompleted, Grok) => None,
 
         (UserPromptSubmitted, Claude) => ClaudeHook("user_prompt_submit"),
         // Codex has no TUI user-prompt echo wired today; kept for parity.
         (UserPromptSubmitted, Codex) => CodexJsonRpc("turn/started"),
+        (UserPromptSubmitted, Grok) => None,
 
         (AssistantMessageComplete, Claude) => ClaudeHook("stop"),
         (AssistantMessageComplete, Codex) => CodexJsonRpc("item/agentMessage/delta"),
+        (AssistantMessageComplete, Grok) => None,
 
         (TurnDone, Claude) => ClaudeHook("stop"),
         (TurnDone, Codex) => CodexJsonRpc("turn/completed"),
+        (TurnDone, Grok) => None,
 
         (PlanPending, Claude) => ClaudeHook("pre_tool_use"),
         (PlanPending, Codex) => CodexJsonRpc("turn/plan/updated"),
+        (PlanPending, Grok) => None,
 
         (SessionReset, Claude) => ClaudeHook("session_start"),
         (SessionReset, Codex) => CodexJsonRpc("thread/started"),
+        (SessionReset, Grok) => None,
 
         (CompactDone, Claude) => ClaudeHook("stop"),
         (CompactDone, Codex) => CodexJsonRpc("thread/compacted"),
+        (CompactDone, Grok) => None,
 
         // P2 base / P3 process is sufficient — no grace window.
         (RateLimitHit, _) => None,

@@ -185,7 +185,7 @@ export function HostDetailCards({
         <EmptyState
           icon={ServerOff}
           title="这台主机没有探测到 agent"
-          description="未在 PATH 上发现 claude / codex。安装后点上方「重新探测」。"
+          description="未在 PATH 上发现 claude / codex / grok。安装后点上方「重新探测」。"
         />
       ) : (
         host.agents.map((agent) => (
@@ -214,7 +214,12 @@ function AgentCard({
   onRegister: () => void;
 }) {
   const sev = statusMeta(agent.status);
-  const vendorClass = agent.vendor === "claude" ? "text-vendor-claude" : "text-vendor-codex";
+  const vendorClass =
+    agent.vendor === "claude"
+      ? "text-vendor-claude"
+      : agent.vendor === "grok"
+        ? "text-vendor-grok"
+        : "text-vendor-codex";
   return (
     <Card data-testid={`agent-card-${agent.vendor}`}>
       <CardHeader>

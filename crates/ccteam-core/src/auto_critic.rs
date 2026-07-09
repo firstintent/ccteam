@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub enum Vendor {
     Claude,
     Codex,
+    Grok,
 }
 
 /// Codex probe outcome — what Phase 3.5's `codex --version &&

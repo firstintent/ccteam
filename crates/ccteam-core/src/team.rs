@@ -369,6 +369,8 @@ pub enum HarnessKind {
     /// shutdown lands in V0.3.2 (PRD §F47, see also
     /// `docs/research/ccteam-codex-integration.md`).
     Codex,
+    /// xAI Grok Build CLI via ACP stdio (`GrokAcpAdapter`).
+    Grok,
 }
 
 /// `team.yaml` — the team-level config. M3.1 shipped name /
