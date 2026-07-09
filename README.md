@@ -38,7 +38,7 @@ The base is deliberately unopinionated. On top of it, everyone shapes their own 
 
 > Install https://github.com/firstintent/ccteam for me.
 
-The agent clones the repo and follows its install guide (the steps below): `make install` brings the daemon up as a supervised service and prints a web console link where you register MCP and connect Telegram / Lark. Prefer to do it by hand? Same steps:
+The agent clones the repo and follows [`INSTALL.md`](INSTALL.md): `make install` brings the daemon up as a supervised service and prints a web console link where you register MCP and connect Telegram / Lark. Prefer to do it by hand? Same steps:
 
 ```bash
 # 0. Install Claude Code first: https://code.claude.com/docs/install
