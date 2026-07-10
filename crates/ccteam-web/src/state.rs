@@ -84,6 +84,16 @@ pub struct AppState {
     /// separate `Option`. The feeder task is spawned once, alongside the
     /// gateway, in [`Self::with_gateway`].
     pub(crate) session_ring: Arc<crate::ring::SessionEventRing>,
+    /// v0.9 T4 — MCP HTTP (`POST /mcp`) dispatch pieces. Built into a
+    /// [`ccteam_im::mcp::McpDispatch`] per request via [`Self::mcp_dispatch`].
+    /// `sink` / `pending` are `Some` when the daemon composition root hands
+    /// them in (`ccteam start` with IM on); standalone `ccteam web` leaves
+    /// them `None` so stateful tools return MCP `isError` (mirrors session
+    /// REST 503 when `gateway` is `None`).
+    pub mcp_sink: Option<ccteam_im::mcp::GatewayEventSink>,
+    /// Shared pending-interaction registry for MCP `interaction/ask` /
+    /// `permission/ask` (same Arc the gateway + mcp.sock hold).
+    pub mcp_pending: Option<ccteam_im::mcp::PendingRegistry>,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -157,6 +167,8 @@ impl AppState {
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
             session_ring: Arc::new(crate::ring::SessionEventRing::new()),
+            mcp_sink: None,
+            mcp_pending: None,
         }
     }
 
@@ -205,5 +217,33 @@ impl AppState {
     pub fn with_creds_path(mut self, path: PathBuf) -> Self {
         self.creds_path = Arc::new(path);
         self
+    }
+
+    /// v0.9 T4 — attach the MCP dispatch pieces the daemon composition root
+    /// already owns for `mcp.sock`. `ccteam start` clones the same sink /
+    /// pending into web (gateway is attached separately via
+    /// [`Self::with_gateway`]) so `POST /mcp` drives the live session map.
+    /// Standalone `ccteam web` never calls this — protocol-core tools
+    /// (`status` / `screenshot` / `tools/list`) still work; gateway-backed
+    /// tools return MCP `isError`.
+    pub fn with_mcp(
+        mut self,
+        sink: Option<ccteam_im::mcp::GatewayEventSink>,
+        pending: Option<ccteam_im::mcp::PendingRegistry>,
+    ) -> Self {
+        self.mcp_sink = sink;
+        self.mcp_pending = pending;
+        self
+    }
+
+    /// Build a per-request [`ccteam_im::mcp::McpDispatch`] from the pieces
+    /// stored on this state. Cheap (clones Arcs / Option senders).
+    pub fn mcp_dispatch(&self) -> ccteam_im::mcp::McpDispatch {
+        ccteam_im::mcp::McpDispatch {
+            paths: (*self.paths).clone(),
+            sink: self.mcp_sink.clone(),
+            pending: self.mcp_pending.clone(),
+            gateway: self.gateway.clone(),
+        }
     }
 }

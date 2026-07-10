@@ -1884,6 +1884,35 @@ fn run_start(
             let _ = shutdown_tx.send(true);
         });
 
+        // V0.8.4 P2b — shared gateway-event channel: the IM daemon
+        // consumes it; the mcp.sock handler + `POST /mcp` clone the sender so
+        // `chat_send_file` reuses the same outbound funnel. Only created
+        // when IM is enabled (no consumer ⇒ nothing to deliver to).
+        // Built BEFORE the web task so the web state factory can hand the
+        // same pieces into `AppState::with_mcp` (v0.9 T4).
+        let (gw_event_tx, gw_event_rx) = if imd.disabled {
+            (None, None)
+        } else {
+            let (t, r) =
+                tokio::sync::mpsc::unbounded_channel::<ccteam_im::gateway::GatewayEvent>();
+            (Some(t), Some(r))
+        };
+
+        // v0.8.5 D6 — one shared pending-interaction registry handed to BOTH
+        // the gateway (resolves inbound clicks) and the mcp.sock / `POST /mcp`
+        // handlers (registers External-origin `interaction/ask` prompts from the
+        // AskUserQuestion hook). The shared `Arc` is the bridge across the two
+        // scopes. Only when IM is enabled (no gateway ⇒ no one to resolve).
+        let pending_registry: Option<
+            std::sync::Arc<tokio::sync::Mutex<ccteam_im::pending::PendingInteractions>>,
+        > = if imd.disabled {
+            None
+        } else {
+            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                ccteam_im::pending::PendingInteractions::new(),
+            )))
+        };
+
         let web_handle = if web.disabled {
             None
         } else {
@@ -1909,6 +1938,10 @@ fn run_start(
             // factory so HTTP session endpoints drive the same session map the
             // daemon owns.
             let web_gateway = shared_gateway.clone();
+            // v0.9 T4 — same sink/pending the mcp.sock handler gets, so
+            // `POST /mcp` can drive session_* / chat_send_file / HITL.
+            let web_mcp_sink = gw_event_tx.clone();
+            let web_mcp_pending = pending_registry.clone();
             Some(tokio::spawn(async move {
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
@@ -1920,6 +1953,7 @@ fn run_start(
                         if let Some(gw) = web_gateway {
                             state = state.with_gateway(gw);
                         }
+                        state = state.with_mcp(web_mcp_sink, web_mcp_pending);
                         state
                     },
                     async move {
@@ -1928,33 +1962,6 @@ fn run_start(
                 )
                 .await
             }))
-        };
-
-        // V0.8.4 P2b — shared gateway-event channel: the IM daemon
-        // consumes it; the mcp.sock handler clones the sender so
-        // `chat_send_file` reuses the same outbound funnel. Only created
-        // when IM is enabled (no consumer ⇒ nothing to deliver to).
-        let (gw_event_tx, gw_event_rx) = if imd.disabled {
-            (None, None)
-        } else {
-            let (t, r) =
-                tokio::sync::mpsc::unbounded_channel::<ccteam_im::gateway::GatewayEvent>();
-            (Some(t), Some(r))
-        };
-
-        // v0.8.5 D6 — one shared pending-interaction registry handed to BOTH
-        // the gateway (resolves inbound clicks) and the mcp.sock handler
-        // (registers External-origin `interaction/ask` prompts from the
-        // AskUserQuestion hook). The shared `Arc` is the bridge across the two
-        // scopes. Only when IM is enabled (no gateway ⇒ no one to resolve).
-        let pending_registry: Option<
-            std::sync::Arc<tokio::sync::Mutex<ccteam_im::pending::PendingInteractions>>,
-        > = if imd.disabled {
-            None
-        } else {
-            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                ccteam_im::pending::PendingInteractions::new(),
-            )))
         };
 
         let imd_handle = if imd.disabled {

@@ -62,6 +62,8 @@ pub mod session_pane;
 pub mod sse;
 // v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
 pub mod users;
+// v0.9 T4 — streamable HTTP MCP (`POST /mcp`, admin bearer always required).
+pub mod mcp;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an
@@ -91,6 +93,10 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(openapi::api_v1_router())
         .merge(chat_ws::router())
         .merge(pty_ws::router())
+        // v0.9 T4 — MCP over HTTP (stateless JSON). Outside `/api/v1` so it is
+        // not OpenAPI-registered; still inside auth_layer. Bearer is enforced
+        // again inside the handler even when AuthState is disabled.
+        .merge(mcp::router())
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

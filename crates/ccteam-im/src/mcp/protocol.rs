@@ -70,7 +70,7 @@ pub async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
     let is_notification = id.is_none();
 
     let result = match method {
-        "initialize" => Ok(initialize_response()),
+        "initialize" => Ok(initialize_response(&params)),
         "notifications/initialized" => return None,
         "tools/list" => Ok(tools_list_response()),
         "tools/call" => match call_tool(paths, &params).await {
@@ -97,9 +97,16 @@ pub async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
     })
 }
 
-fn initialize_response() -> Value {
+/// Build the `initialize` result. Echo the client's
+/// `params.protocolVersion` when present (MCP negotiation); otherwise
+/// answer with [`MCP_PROTOCOL_VERSION`].
+fn initialize_response(params: &Value) -> Value {
+    let protocol_version = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or(MCP_PROTOCOL_VERSION);
     json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": {}
         },
@@ -531,6 +538,47 @@ mod tests {
         assert!(instructions.contains("file_path"));
         assert!(instructions.contains("Read"));
         assert!(instructions.contains("<channel"));
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_defaults_protocol_version_when_client_omits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+        let resp = handle_request(&paths, &req).await.unwrap();
+        assert_eq!(
+            resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION,
+            "missing client protocolVersion must fall back to the server const"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_echoes_client_protocol_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let client_ver = "2025-03-26";
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": client_ver }
+        });
+        let resp = handle_request(&paths, &req).await.unwrap();
+        assert_eq!(
+            resp["result"]["protocolVersion"], client_ver,
+            "initialize must echo the client's protocolVersion when present"
+        );
     }
 
     #[tokio::test]
