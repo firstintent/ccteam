@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -140,6 +140,10 @@ struct GatewaySession {
     /// the same cell the submit path set. PULL-only signal — nothing acts on it
     /// except the `/status` render.
     turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// v0.9 T5 — set when a user turn is mirrored while a prior turn is still
+    /// in flight (mid-turn steer). Cleared on `TurnCompleted` after the
+    /// experience writer reads it. Shared with `mirror_user_turn` + pump.
+    steered_this_turn: Arc<AtomicBool>,
     /// v0.8.19 — timestamp of the most recent pump event for this session
     /// (set next to the `activity_events` tick, on EVERY event). `/status`
     /// derives the 🔴 stuck state the same way the turn-timeout watchdog does:
@@ -1205,6 +1209,7 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(reply_to)),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                steered_this_turn: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -2498,6 +2503,7 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                steered_this_turn: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -2518,6 +2524,18 @@ impl Gateway {
                 .get(&id)
                 .map(|s| canonical_owner(&s.owner).identity())
                 .unwrap_or_default();
+            // v0.9 T5 — snapshot role/skill fingerprints at spawn (not rehashed
+            // mid-session).
+            let (role_sha, skills_sha) = self
+                .projects
+                .get(&meta_project)
+                .map(|cwd| {
+                    (
+                        ccteam_harness::execution::experience::role_fingerprint(cwd, &meta_role),
+                        ccteam_harness::execution::experience::skills_fingerprint(cwd),
+                    )
+                })
+                .unwrap_or((None, None));
             let meta = SessionMeta {
                 sid: id.clone(),
                 slug: meta_project.clone(),
@@ -2537,6 +2555,8 @@ impl Gateway {
                 title_source: None,
                 turn_count: 0,
                 cost_usd: None,
+                role_sha,
+                skills_sha,
             };
             if let Some(cwd) = self.projects.get(&meta_project) {
                 if let Err(e) = write_session_meta(cwd, &meta) {
@@ -2679,6 +2699,7 @@ impl Gateway {
                 reply_to: Arc::new(std::sync::Mutex::new(owner)),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
+                steered_this_turn: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -2693,8 +2714,12 @@ impl Gateway {
         // changed the role, so a daemon restart must rebuild at the NEW role.
         // The rest of the descriptor (vendor/uuid/owner/origin) is unchanged
         // (same sid ⇒ same deterministic vendor uuid). Best-effort.
+        // v0.9 T5 — re-snapshot role_sha for the new role (spawn-time semantics).
         if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
-            meta.role = meta_role;
+            meta.role = meta_role.clone();
+            meta.role_sha =
+                ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
+            meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
             meta.last_active = chrono::Utc::now().to_rfc3339();
             let _ = write_session_meta(&meta_dir, &meta);
         }
@@ -2769,6 +2794,13 @@ impl Gateway {
             .project_paths
             .as_ref()
             .map(|paths| paths.progress_jsonl(&session.project));
+        // v0.9 T5 — spawn-time fingerprints for experience.jsonl (do NOT re-read
+        // meta.json per turn). Missing meta → None digests.
+        let (pump_role_sha, pump_skills_sha) = project_dir
+            .as_ref()
+            .and_then(|dir| read_session_meta(dir, &session.id).ok())
+            .map(|m| (m.role_sha, m.skills_sha))
+            .unwrap_or((None, None));
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
@@ -2788,6 +2820,9 @@ impl Gateway {
             let mut dirty = false;
             let mut last_emit: Option<Instant> = None;
             let mut last_sent: Option<String> = None;
+            // v0.9 T5 — baseline activity_events at the start of each turn
+            // (approximation for signals.tool_calls).
+            let mut activity_at_turn_start: Option<u64> = None;
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog,
             // folded from a detached per-turn `tokio::spawn` into THIS
             // per-session pump's own `tokio::select!` loop (one fewer task per
@@ -2894,18 +2929,116 @@ impl Gateway {
                                 break;
                             }
                         }
+                        // v0.9 T5 — track activity baseline while a turn is in
+                        // flight (for experience signals.tool_calls). Snapshot
+                        // on the first event after turn_started_at becomes Some.
+                        {
+                            let in_flight = session
+                                .turn_started_at
+                                .lock()
+                                .map(|g| g.is_some())
+                                .unwrap_or(false);
+                            if in_flight && activity_at_turn_start.is_none() {
+                                // activity_events already includes this event.
+                                activity_at_turn_start = Some(
+                                    session
+                                        .activity_events
+                                        .load(Ordering::SeqCst)
+                                        .saturating_sub(1),
+                                );
+                            }
+                        }
                         // v0.8.19 `/status` — a completed turn ends the in-flight
                         // window: clear `turn_started_at` (→ 🟢 idle) and the
                         // activity summary. Protocol-INDEPENDENT (both tmux and
                         // stream-json adapters emit `TurnCompleted`), unlike the
                         // stream-json-only progress mirror just below. Mirrors the
                         // submit path's set, on the same shared cell.
-                        if matches!(&evt, ThreadEvent::TurnCompleted { .. }) {
+                        //
+                        // v0.9 T5 — BEFORE clearing, capture duration + signals
+                        // and append one kind:turn experience record (derived
+                        // index; failure never breaks the pump).
+                        if let ThreadEvent::TurnCompleted {
+                            turn_id,
+                            usage,
+                            model,
+                        } = &evt
+                        {
+                            let duration_ms = session
+                                .turn_started_at
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .map(|start| start.elapsed().as_millis() as u64);
+                            let steered = session
+                                .steered_this_turn
+                                .swap(false, Ordering::SeqCst);
+                            let activity_now =
+                                session.activity_events.load(Ordering::SeqCst);
+                            let tool_calls = activity_now.saturating_sub(
+                                activity_at_turn_start.unwrap_or(activity_now),
+                            );
+                            activity_at_turn_start = None;
+
                             if let Ok(mut started) = session.turn_started_at.lock() {
                                 *started = None;
                             }
                             if let Ok(mut act) = session.latest_activity.lock() {
                                 *act = None;
+                            }
+
+                            if let Some(dir) = project_dir.as_ref() {
+                                let model_owned = model.clone().filter(|m| !m.is_empty());
+                                let cost_usd = {
+                                    let m = model_owned.as_deref().unwrap_or("");
+                                    ccteam_cost::estimate_cost(
+                                        usage,
+                                        session.vendor.cost_vendor(),
+                                        m,
+                                    )
+                                };
+                                // Prefer the adapter turn_id (joins chat_turn_completed);
+                                // synthesize `{sid}-{seq+1}` when empty (matches the
+                                // upcoming ANSWER-side turns writer id shape).
+                                let exp_turn_id = if turn_id.is_empty() {
+                                    format!("{session_id}-{}", seq.saturating_add(1))
+                                } else {
+                                    turn_id.clone()
+                                };
+                                let usage_opt = if usage.total() == 0 && model_owned.is_none() {
+                                    None
+                                } else {
+                                    Some(*usage)
+                                };
+                                let record = ccteam_harness::execution::experience::ExperienceRecord::Turn(
+                                    ccteam_harness::execution::experience::TurnExperience {
+                                        sid: session_id.clone(),
+                                        turn_id: exp_turn_id,
+                                        ts: chrono::Utc::now(),
+                                        vendor: vendor_str(session.vendor).to_string(),
+                                        model: model_owned,
+                                        role: session.role.clone(),
+                                        usage: usage_opt,
+                                        cost_usd,
+                                        duration_ms,
+                                        role_sha: pump_role_sha.clone(),
+                                        skills_sha: pump_skills_sha.clone(),
+                                        signals: ccteam_harness::execution::experience::TurnSignals {
+                                            tool_calls,
+                                            steered,
+                                            error_recovered: None,
+                                        },
+                                    },
+                                );
+                                if let Err(err) = ccteam_harness::execution::experience::append_experience(
+                                    dir, &record,
+                                ) {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        error = %err,
+                                        "ccteam-im: failed to append experience.jsonl"
+                                    );
+                                }
                             }
                         }
                         // v0.8.11 E4 — for a stream-json session (no hooks), the
@@ -3347,6 +3480,18 @@ impl Gateway {
         if user_text.is_empty() {
             return;
         }
+        // v0.9 T5 — mid-turn steer: a user message mirrored while a prior turn
+        // is still in flight (agent has already produced events). The opening
+        // prompt of a turn is mirrored after submit, usually before the pump
+        // drains → activity still 0 → not steered.
+        let in_flight = session
+            .turn_started_at
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if in_flight && session.activity_events.load(Ordering::SeqCst) > 0 {
+            session.steered_this_turn.store(true, Ordering::SeqCst);
+        }
         let Some(project_dir) = self.projects.get(&session.project).cloned() else {
             return;
         };
@@ -3715,6 +3860,18 @@ impl Gateway {
         // unlike the IM-only 👀 ack below) so `/status` shows 🔵 working with the
         // elapsed time. Directives never reach here (they early-returned above),
         // so a `/model` switch is correctly NOT counted as a working turn.
+        // v0.9 T5 — if a prior turn was still in flight this is a mid-turn
+        // steer; otherwise clear the steered flag for a fresh turn.
+        let was_in_flight = session
+            .turn_started_at
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if was_in_flight {
+            session.steered_this_turn.store(true, Ordering::SeqCst);
+        } else {
+            session.steered_this_turn.store(false, Ordering::SeqCst);
+        }
         if let Ok(mut started) = session.turn_started_at.lock() {
             *started = Some(Instant::now());
         }
@@ -4970,6 +5127,9 @@ impl Gateway {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            // Roleless adoption → no role file; still snapshot project skills.
+            role_sha: None,
+            skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
         };
         // v0.8.22 P1 — adopt the vendor's own title (if any) as the session's
         // starting title. `TitleSource::Vendor` still yields to a later
@@ -6821,7 +6981,13 @@ mod tests {
                     h.identity.clone(),
                     ThreadEvent::TurnCompleted {
                         turn_id: format!("turn-{}", h.identity),
-                        usage: ccteam_harness::UnifiedTokenUsage::default(),
+                        // Non-zero usage so experience cost_usd prices > 0 for
+                        // known models (v0.9 T5 pump writer).
+                        usage: ccteam_harness::UnifiedTokenUsage {
+                            input_tokens: 1_000,
+                            output_tokens: 500,
+                            ..Default::default()
+                        },
                         // A real claude turn carries its canonical model; seed
                         // one so the pump's chat_turn_completed mirror exercises
                         // the per-turn model path.
@@ -7989,6 +8155,111 @@ mod tests {
             "web answers must not carry the IM-only context echo: {:?}",
             web_ev.content
         );
+    }
+
+    /// v0.9 T5 — completed turn appends one `kind:turn` row to the project's
+    /// experience.jsonl (derived index). Captures sid/turn_id/vendor + spawn
+    /// fingerprints; stream-json fake also carries usage/model so cost can
+    /// price when the model is known.
+    #[tokio::test]
+    async fn pump_appends_experience_turn_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        // Seed a role file so role_sha is non-None at spawn.
+        let agents = project_dir.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("reviewer.md"), b"you are reviewer").unwrap();
+        let skill = project_dir
+            .join(".claude")
+            .join("skills")
+            .join("ci-watcher");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), b"watch ci").unwrap();
+
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let created = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let sid = created.sid.clone();
+        // Fingerprints landed on meta at spawn.
+        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        assert!(
+            meta.role_sha.is_some(),
+            "spawn must snapshot role_sha: {:?}",
+            meta.role_sha
+        );
+        assert!(
+            meta.skills_sha
+                .as_ref()
+                .is_some_and(|m| m.contains_key("ci-watcher")),
+            "spawn must snapshot skills_sha: {:?}",
+            meta.skills_sha
+        );
+
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        let exp_path = ccteam_harness::execution::experience::experience_jsonl_path(&project_dir);
+        let mut found = None;
+        for _ in 0..100 {
+            if let Ok(recs) =
+                ccteam_harness::execution::experience::read_all_experience(&project_dir)
+            {
+                if let Some(r) = recs.into_iter().find(|r| {
+                    matches!(
+                        r,
+                        ccteam_harness::execution::experience::ExperienceRecord::Turn(t)
+                            if t.sid == sid
+                    )
+                }) {
+                    found = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let rec = found.unwrap_or_else(|| {
+            panic!(
+                "pump must append kind:turn experience to {}",
+                exp_path.display()
+            )
+        });
+        match rec {
+            ccteam_harness::execution::experience::ExperienceRecord::Turn(t) => {
+                assert_eq!(t.sid, sid);
+                assert!(!t.turn_id.is_empty());
+                assert_eq!(t.vendor, "claude");
+                assert_eq!(t.role, "reviewer");
+                assert_eq!(t.role_sha, meta.role_sha);
+                assert_eq!(t.skills_sha, meta.skills_sha);
+                // FakeAdapter emits usage + claude-sonnet-4-6 → priceable.
+                assert!(t.usage.is_some(), "stream-json TurnCompleted carries usage");
+                assert_eq!(t.model.as_deref(), Some("claude-sonnet-4-6"));
+                assert!(
+                    t.cost_usd.is_some(),
+                    "known model must price (got None); usage={:?}",
+                    t.usage
+                );
+            }
+            other => panic!("expected turn record, got {other:?}"),
+        }
     }
 
     /// v0.8.11 E4 — a stream-json session has no chat-progress hooks, so the
@@ -9486,6 +9757,8 @@ mod tests {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            role_sha: None,
+            skills_sha: None,
         };
         write_session_meta(alpha_dir.path(), &meta).unwrap();
 

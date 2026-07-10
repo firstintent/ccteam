@@ -862,6 +862,26 @@ enum InternalCommand {
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
     },
+    /// v0.9 T5 — derived experience.jsonl maintenance (offline / disaster
+    /// recovery). Regenerates `kind:turn` rows from turns + progress;
+    /// preserves `kind:verdict`. Not for concurrent use with a live
+    /// daemon writer.
+    Experience {
+        #[command(subcommand)]
+        cmd: ExperienceCommand,
+    },
+}
+
+/// v0.9 T5 — `ccteam internal experience <…>`.
+#[derive(Subcommand)]
+enum ExperienceCommand {
+    /// Rebuild `<project>/.ccteam/experience.jsonl` from turns.jsonl +
+    /// progress.jsonl + meta.json. Preserves existing verdict lines.
+    /// Offline / disaster recovery only.
+    Rebuild {
+        /// Project slug.
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1382,6 +1402,36 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
                 no_auth,
                 token_file,
             })
+        }
+        InternalCommand::Experience { cmd } => run_experience(cmd),
+    }
+}
+
+/// v0.9 T5 — `ccteam internal experience rebuild <slug>`.
+///
+/// Regenerates the derived experience index offline. A live daemon may
+/// still be appending concurrent turn rows — use only for disaster
+/// recovery / offline repair (acceptable pre-v1.0).
+fn run_experience(cmd: ExperienceCommand) -> Result<()> {
+    match cmd {
+        ExperienceCommand::Rebuild { slug } => {
+            let paths = CcteamPaths::from_env()?;
+            let project_dir = paths.project_dir(&slug);
+            if !project_dir.exists() {
+                anyhow::bail!("project not found: {slug} ({})", project_dir.display());
+            }
+            let progress = paths.progress_jsonl(&slug);
+            let progress_arg = progress.exists().then_some(progress.as_path());
+            let (turns, verdicts) = ccteam_harness::execution::experience::rebuild_experience(
+                &project_dir,
+                progress_arg,
+            )?;
+            println!(
+                "experience rebuild {slug}: {turns} turn(s), {verdicts} verdict(s) preserved → {}",
+                ccteam_harness::execution::experience::experience_jsonl_path(&project_dir)
+                    .display()
+            );
+            Ok(())
         }
     }
 }

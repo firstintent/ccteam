@@ -10,6 +10,7 @@
 //! monotonic sid counter (`state/sessions/next-sid`); on restart it cold-start
 //! rebuilds the live map from these `meta.json` files.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -152,6 +153,18 @@ pub struct SessionMeta {
     /// (never a faked `0.0`). `#[serde(default)]` for old metas.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// v0.9 T5 — first 12 hex of sha256(`.claude/agents/<role>.md`)
+    /// captured at (re)spawn. Snapshot semantics: mid-session role-file
+    /// edits are intentionally NOT re-hashed. `None` for roleless /
+    /// missing agent files. Legacy metas parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_sha: Option<String>,
+    /// v0.9 T5 — per-skill content digests under `.claude/skills/` at
+    /// (re)spawn (see [`super::experience::skills_fingerprint`]). Snapshot
+    /// at spawn; mid-session skill edits not re-hashed. Legacy metas
+    /// parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_sha: Option<BTreeMap<String, String>>,
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -412,6 +425,8 @@ mod title_tests {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            role_sha: None,
+            skills_sha: None,
         }
     }
 
@@ -579,5 +594,8 @@ mod title_tests {
         assert!(meta.title_source.is_none());
         assert_eq!(meta.turn_count, 0);
         assert!(meta.cost_usd.is_none());
+        // v0.9 T5 — pre-fingerprint metas must still load with None digests.
+        assert!(meta.role_sha.is_none());
+        assert!(meta.skills_sha.is_none());
     }
 }

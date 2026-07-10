@@ -199,6 +199,8 @@ async fn load_resume_filters_is_replay() {
         title_source: None,
         turn_count: 1,
         cost_usd: None,
+        role_sha: None,
+        skills_sha: None,
     };
     write_session_meta(project, &meta).unwrap();
 

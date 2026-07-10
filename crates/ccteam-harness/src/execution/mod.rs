@@ -8,6 +8,7 @@ pub mod codex_app_server;
 pub mod codex_exec;
 pub mod codex_jsonrpc;
 pub mod codex_typed_events;
+pub mod experience;
 pub mod fs_atomic;
 pub mod grok_acp;
 pub mod process_inspect;
