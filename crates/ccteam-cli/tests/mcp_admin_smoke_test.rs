@@ -1,20 +1,15 @@
-//! F150 — `mcp__ccteam__admin_*` MCP smoke tests.
+//! Smoke tests for `ccteam__status` (renamed from `admin_ls` in v0.9 T1).
 //!
-//! Verifies that `/ccteam-control` admin operations route correctly
-//! through the MCP wire layer.  Each test drives the real `ccteam
-//! mcp-serve` binary via stdin/stdout JSON-RPC (same harness as
-//! `mcp_e2e_test.rs`) and confirms the expected JSON response shapes
-//! and, where applicable, file-system side-effects.
+//! Verifies the status tool routes correctly through the MCP wire layer.
+//! Each test drives the real `ccteam mcp-serve` binary via stdin/stdout
+//! JSON-RPC (same harness as `mcp_e2e_test.rs`) and confirms the expected
+//! JSON response shapes.
 //!
 //! Operations covered (one test each):
-//!  1. `admin_list_workflows`    — `ccteam__admin_ls` returns project list
-//!  2. `admin_cost_today`        — `ccteam__admin_ls` response carries cost fields
-//!  3. `admin_change_persona`    — `ccteam__admin_change_persona` rewrites agent .md
+//!  1. `status` list projects — `ccteam__status` returns project list
+//!  2. `status` cost fields  — `ccteam__status` response carries cost fields
 //!
-//! Engine pause/resume is covered by the `actions::{pause,resume}` unit
-//! tests (`crates/ccteam-core`) and `run_resume` CLI coverage — the
-//! retired `workflow_pause` / `workflow_resume` MCP tools no longer have
-//! a wire surface to smoke-test here.
+//! `admin_change_persona` / `admin_add_tool` were culled in v0.9 T1.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -104,7 +99,7 @@ agents:
     output: .ccteam/output/
 "#;
 
-/// Minimal state.json so `admin_ls` can load each bootstrapped project
+/// Minimal state.json so `status` can load each bootstrapped project
 /// (ProjectState serde-defaults handle all optional fields).
 fn minimal_state_json(slug: &str) -> String {
     let now = chrono::Utc::now().to_rfc3339();
@@ -127,36 +122,18 @@ fn minimal_state_json(slug: &str) -> String {
     )
 }
 
-/// Write the minimal project layout the MCP admin tools need.
+/// Write the minimal project layout the status tool needs.
 ///
 /// Creates:
 /// - `projects/<slug>/.ccteam/workflow.yaml`
-/// - `projects/<slug>/.ccteam/state.json`       (so admin_ls can load it)
-/// - `projects/<slug>/.claude/agents/<bot>.md`  (for change-persona test)
-fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str, bot: Option<&str>) {
+/// - `projects/<slug>/.ccteam/state.json`       (so status can load it)
+fn bootstrap(home: &std::path::Path, projects: &std::path::Path, slug: &str) {
     std::fs::create_dir_all(home).unwrap();
     std::fs::create_dir_all(projects).unwrap();
     let ccteam_dir = projects.join(slug).join(".ccteam");
     std::fs::create_dir_all(&ccteam_dir).unwrap();
     std::fs::write(ccteam_dir.join("workflow.yaml"), FIXTURE_WF).unwrap();
     std::fs::write(ccteam_dir.join("state.json"), minimal_state_json(slug)).unwrap();
-
-    // Persona file for the change-persona smoke test.
-    if let Some(b) = bot {
-        let agents_dir = projects.join(slug).join(".claude").join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join(format!("{b}.md")),
-            format!("---\nname: {b}\ntools: Read\n---\nOriginal persona body.\n"),
-        )
-        .unwrap();
-    }
-}
-
-fn fake_daemon(home: &std::path::Path) -> std::os::unix::net::UnixListener {
-    let socket = home.join("run").join("mcp.sock");
-    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    std::os::unix::net::UnixListener::bind(socket).unwrap()
 }
 
 /// Call a tool and assert `isError=false`; return the parsed body JSON.
@@ -178,19 +155,18 @@ fn call_tool(srv: &mut McpServer, name: &str, args: Value) -> Value {
 
 // ─────────────────────────── 1. list workflows ─────────────────────
 
-/// F150 smoke 1 — `admin_list_workflows`:
-/// `ccteam__admin_ls` must enumerate existing projects and report them
+/// `ccteam__status` must enumerate existing projects and report them
 /// in a `projects` array with the correct slugs.
 #[test]
-fn admin_list_workflows() {
+fn status_list_projects() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-gamma", None);
-    bootstrap(&home, &projects, "dev-delta", None);
+    bootstrap(&home, &projects, "dev-gamma");
+    bootstrap(&home, &projects, "dev-delta");
 
     let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(&mut srv, "ccteam__admin_ls", json!({}));
+    let body = call_tool(&mut srv, "ccteam__status", json!({}));
     let arr = body["projects"]
         .as_array()
         .expect("projects must be an array");
@@ -213,19 +189,18 @@ fn admin_list_workflows() {
 
 // ─────────────────────────── 2. cost today ─────────────────────────
 
-/// F150 smoke 2 — `admin_cost_today`:
-/// `ccteam__admin_ls` response must carry `cost_24h_usd` on every
+/// `ccteam__status` response must carry `cost_24h_usd` on every
 /// project entry — that is the data backing the per-project cost
 /// surfaces (web cost pill, `/status`).
 #[test]
-fn admin_cost_today() {
+fn status_cost_today() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-epsilon", None);
+    bootstrap(&home, &projects, "dev-epsilon");
 
     let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(&mut srv, "ccteam__admin_ls", json!({}));
+    let body = call_tool(&mut srv, "ccteam__status", json!({}));
     let arr = body["projects"]
         .as_array()
         .expect("projects must be an array");
@@ -249,64 +224,6 @@ fn admin_cost_today() {
     assert!(
         cost >= 0.0,
         "cost_24h_usd must be non-negative for a fresh project; got {cost}"
-    );
-    srv.shutdown();
-}
-
-// ─────────────────────────── 3. change persona ─────────────────────
-
-/// F150 smoke 3 — `admin_change_persona`:
-/// `ccteam__admin_change_persona` must rewrite the bot's agent .md
-/// with the provided content and return `ok=true` + `bytes_written`.
-#[test]
-fn admin_change_persona() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    bootstrap(&home, &projects, "dev-eta", Some("worker"));
-    let _daemon = fake_daemon(&home);
-
-    let new_persona =
-        "---\nname: worker\ntools: Read, WebFetch\n---\nRevised persona: 专注于 web 研究。\n";
-
-    let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(
-        &mut srv,
-        "ccteam__admin_change_persona",
-        json!({
-            "slug":           "dev-eta",
-            "bot":            "worker",
-            "new_persona_md": new_persona,
-        }),
-    );
-    assert_eq!(body["ok"], true, "change_persona must return ok=true");
-    assert_eq!(body["slug"], "dev-eta");
-    assert_eq!(body["bot"], "worker");
-    let bytes = body["bytes_written"].as_u64().unwrap_or(0);
-    assert!(bytes > 0, "bytes_written must be positive; got {bytes}");
-
-    // Verify the agent .md was actually rewritten on disk.
-    let agent_md = projects
-        .join("dev-eta")
-        .join(".claude")
-        .join("agents")
-        .join("worker.md");
-    assert!(
-        agent_md.exists(),
-        "agent .md must exist after change_persona"
-    );
-    let on_disk = std::fs::read_to_string(&agent_md).unwrap();
-    assert!(
-        on_disk.contains("WebFetch"),
-        "agent .md must contain the new tools list; got: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("Revised persona"),
-        "agent .md must contain the new body; got: {on_disk}"
-    );
-    assert!(
-        !on_disk.contains("Original persona"),
-        "old persona body must be gone; got: {on_disk}"
     );
     srv.shutdown();
 }

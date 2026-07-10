@@ -1,30 +1,17 @@
-//! V0.6.6 F171 — `ccteam doctor --verify-mcp` end-to-end tests.
+//! `ccteam doctor --verify-mcp` end-to-end tests.
 //!
 //! `--verify-mcp` introspects the live MCP tool surface registered by
 //! `mcp_serve::tool_definitions()` and cross-checks the names against
-//! `mcp_tool_groups::STUB_TOOLS`. The flag is the automated form of
-//! V0.6.5 ship-gate item #9 ("MCP tool surface: N active, 0 stubs")
-//! and underpins the 0-STUB invariant chat/advise dispatch refactors
-//! must not regress.
+//! `mcp_tool_groups::STUB_TOOLS`.
 //!
 //! Tests cover:
-//!   - active tool count matches the spec (15, see
-//!     `mcp_serve::tool_definitions_count_matches_spec`)
-//!   - `STUB_TOOLS` is empty after V0.6.5 ship (asserted via the
-//!     `stub_count: 0` line + empty `unexpected_stubs` array)
+//!   - active tool count matches the v0.9 T1 spec (8)
+//!   - `STUB_TOOLS` is empty (asserted via `stub_count: 0`)
 //!   - human-readable output schema (header / per-group / verdict)
 //!   - JSON output mode (`--json`)
 //!   - exit code 0 on clean tree (no STUBs) — both modes
 //!   - per-group breakdown carries every shipped group with active
 //!     + stub keys
-//!
-//! The FAIL-path exit-1 dispatch lives in `main.rs::run_doctor` and
-//! trivially mirrors the F155 `--check-codex-auto-critic` exit-2
-//! short-circuit (covered by its own E2E suite). Synthesising a STUB
-//! tool just to test the FAIL path would defeat the purpose of the
-//! gate, so we leave that path covered by the inline render unit
-//! tests in `commands.rs` rather than spending a binary invocation on
-//! it.
 
 use serde_json::Value;
 use std::process::Command;
@@ -45,16 +32,14 @@ fn run_doctor_verify_mcp(extra_args: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
-fn active_count_is_15_and_stub_count_is_0_on_clean_tree() {
-    // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15. The
-    // STUB allow-list (`mcp_tool_groups::STUB_TOOLS`) is empty. F171 is the
-    // automated assertion.
+fn active_count_is_8_and_stub_count_is_0_on_clean_tree() {
+    // status 1 + screenshot 1 + chat 1 + session 5 = 8. STUB_TOOLS empty.
     let (stdout, stderr, code) = run_doctor_verify_mcp(&["--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(v["ok"], Value::Bool(true), "{v}");
-    assert_eq!(v["total_tools"], Value::Number(15.into()), "{v}");
-    assert_eq!(v["active_count"], Value::Number(15.into()), "{v}");
+    assert_eq!(v["total_tools"], Value::Number(8.into()), "{v}");
+    assert_eq!(v["active_count"], Value::Number(8.into()), "{v}");
     assert_eq!(v["stub_count"], Value::Number(0.into()), "{v}");
     assert!(v["unexpected_stubs"].as_array().unwrap().is_empty(), "{v}");
 }
@@ -77,19 +62,22 @@ fn json_output_schema_includes_per_group_and_tool_list() {
         assert!(v.get(key).is_some(), "missing top-level key `{key}` in {v}");
     }
     // Every shipped group with ≥1 tool is represented with `active` +
-    // `stub` keys. (The `workflow` group was retired — 0 members — so it
-    // no longer appears in `per_group`, which is built from live tools.)
-    for group in ["admin", "screenshot", "chat", "advise", "session"] {
+    // `stub` keys. Culled `advise` and retired `workflow` groups do not
+    // appear (per_group is built from live tools only).
+    for group in ["admin", "screenshot", "chat", "session"] {
         let g = v["per_group"].get(group).unwrap_or_else(|| {
             panic!("per_group missing `{group}` in {v}");
         });
         assert!(g.get("active").is_some(), "{g}");
         assert!(g.get("stub").is_some(), "{g}");
     }
-    // No retired workflow group leaks into the live per-group split.
     assert!(
         v["per_group"].get("workflow").is_none(),
         "retired workflow group must not appear in per_group: {v}"
+    );
+    assert!(
+        v["per_group"].get("advise").is_none(),
+        "culled advise group must not appear in per_group: {v}"
     );
     // Tool list length matches total_tools.
     let list = v["tool_list"].as_array().unwrap();
@@ -100,12 +88,14 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     sorted.sort();
     assert_eq!(names, sorted, "tool_list must be sorted for stable output");
     // Spot-check a known tool from each surviving group is present.
-    assert!(names.contains(&"ccteam__admin_ls"));
+    assert!(names.contains(&"ccteam__status"));
     assert!(names.contains(&"ccteam__screenshot"));
-    assert!(names.contains(&"ccteam__chat_register_bot"));
-    assert!(names.contains(&"ccteam__advise_vote"));
+    assert!(names.contains(&"ccteam__chat_send_file"));
     assert!(names.contains(&"ccteam__session_spawn"));
-    // The retired workflow tools are gone from the live surface.
+    // Culled / retired tools are gone from the live surface.
+    assert!(!names.contains(&"ccteam__admin_ls"));
+    assert!(!names.contains(&"ccteam__advise_vote"));
+    assert!(!names.contains(&"ccteam__chat_register_bot"));
     assert!(!names.contains(&"ccteam__workflow_show"));
 }
 
@@ -121,8 +111,8 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
         stdout.contains("V0.6.6 F171"),
         "header must carry F171 marker for traceability: {stdout}",
     );
-    assert!(stdout.contains("total tools:    15"), "got: {stdout}");
-    assert!(stdout.contains("active:         15"), "got: {stdout}");
+    assert!(stdout.contains("total tools:    8"), "got: {stdout}");
+    assert!(stdout.contains("active:         8"), "got: {stdout}");
     assert!(stdout.contains("stubs:          0"), "got: {stdout}");
     assert!(stdout.contains("per-group breakdown:"), "got: {stdout}");
     // Verdict line on clean tree.
@@ -140,8 +130,8 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
 
 #[test]
 fn exit_code_is_zero_when_no_unexpected_stubs() {
-    // V0.6.5 ship state: STUB_TOOLS is empty, so the gate must exit 0
-    // both with and without `--json`. Re-runs are idempotent.
+    // STUB_TOOLS is empty, so the gate must exit 0 both with and without
+    // `--json`. Re-runs are idempotent.
     let (_so, _se, code_text) = run_doctor_verify_mcp(&[]);
     assert_eq!(code_text, 0, "human mode should exit 0");
     let (_so, _se, code_json) = run_doctor_verify_mcp(&["--json"]);
@@ -182,10 +172,9 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
     let (stdout, _stderr, code) = run_doctor_verify_mcp(&[]);
     assert_eq!(code, 0);
     for (group, active) in [
-        ("admin:", 3),
+        ("admin:", 1),
         ("screenshot:", 1),
-        ("chat:", 4),
-        ("advise:", 2),
+        ("chat:", 1),
         ("session:", 5),
     ] {
         let needle = format!("{group}    {active} active / 0 stub");

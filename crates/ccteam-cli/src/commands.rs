@@ -4275,8 +4275,8 @@ fn run_config_lark_menu() -> Result<String> {
 // Both subcommands edit `<project>/.claude/agents/<bot>.md` and emit a
 // `persona_changed` / `tool_added` event to the project's
 // `progress.jsonl`. The same code path backs the MCP
-// `ccteam__admin_change_persona` / `ccteam__admin_add_tool` tools (see
-// `mcp_admin_tools.rs`).
+// CLI `session persona` / `session add-tool` commands (MCP surface
+// for these was culled in v0.9 T1; the CLI mutators remain).
 // -------------------------------------------------------------------------
 
 /// V0.6.1 F128 — replace `<project>/.claude/agents/<bot>.md` with
@@ -4670,7 +4670,7 @@ pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> 
 /// platform/chat_id, and live `running` status (from the per-bot
 /// heartbeat sidecar). Pairs with `register-bot` / `unregister-bot` so
 /// users can confirm what they wired up. Distinct from the MCP
-/// `admin_ls` tool, which enumerates *projects*, not bot registrations.
+/// `status` tool, which enumerates *projects*, not bot registrations.
 pub fn run_admin_list_bots(
     paths: &CcteamPaths,
     filter_slug: Option<&str>,
@@ -6979,7 +6979,7 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 15, "ships 15 tools");
+        assert_eq!(report.total_tools, 8, "ships 8 tools (v0.9 T1 cull)");
     }
 
     #[test]

@@ -1,20 +1,13 @@
-//! V0.6.0 Wave 1 (F111) — integration tests for the MCP sub-prefix
-//! rename + chat / advise stubs.
+//! Integration tests for the MCP tool naming surface.
 //!
 //! Each test spawns a real `ccteam mcp-serve` subprocess and drives it
-//! via stdin/stdout JSON-RPC to make sure the wire surface a V0.5
-//! user's `~/.claude.json` sees is what we expect:
+//! via stdin/stdout JSON-RPC:
 //!
 //! - server name still `ccteam` (V0.5 muscle memory preserved)
-//! - every tool carries a group sub-prefix (`admin_` / `workflow_` /
-//!   `chat_` / `advise_`) except `ccteam__screenshot` which is the
-//!   single-member screenshot group that keeps its V0.5 name
-//! - `chat_*` + `advise_*` stubs return `NotImplemented` graceful
-//!   bodies (so MCP clients don't see transport errors when poking
-//!   the Wave 2 / Wave 3 surface ahead of time)
-//! - V0.5 unprefixed names (`ccteam__ls`, `ccteam__show`, ...) are
+//! - every tool carries a group sub-prefix (`chat_` / `session_`) OR
+//!   is one of the single-member exceptions (`screenshot`, `status`)
+//! - V0.5 unprefixed names (`ccteam__ls`, …) and culled v0.9 tools are
 //!   GONE from `tools/list` — no compat alias preserved
-//!   (CLAUDE.md §五:pre-V1.0 no backwards-compat shims)
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -109,10 +102,9 @@ fn list_tool_names() -> Vec<String> {
 
 #[test]
 fn server_name_stays_ccteam_for_v05_muscle_memory() {
-    // V0.6 commitment: only TOOL names get sub-prefixed; the SERVER
-    // identity in `initialize` stays `ccteam` so V0.5 users'
-    // `~/.claude.json` `mcpServers.ccteam` entries continue to work
-    // without rename.
+    // Only TOOL names get sub-prefixed; the SERVER identity in
+    // `initialize` stays `ccteam` so users' `~/.claude.json`
+    // `mcpServers.ccteam` entries continue to work without rename.
     let (_tmp, home, projects) = tmp_paths();
     let mut srv = McpServer::spawn(&home, &projects);
     srv.send(&json!({
@@ -125,34 +117,33 @@ fn server_name_stays_ccteam_for_v05_muscle_memory() {
 }
 
 #[test]
-fn every_tool_carries_group_subprefix_or_is_screenshot() {
+fn every_tool_carries_group_subprefix_or_is_singleton() {
     let names = list_tool_names();
     assert!(!names.is_empty(), "tools/list returned empty");
     for n in &names {
         // Each tool name must start with `ccteam__` (server prefix),
-        // followed by either `<group>_<rest>` OR the special-cased
-        // single-member `screenshot` group whose member kept its
-        // pre-V0.6 name.
+        // followed by either `<group>_<rest>` OR a single-member
+        // exception (`screenshot`, `status`).
         let bare = n
             .strip_prefix("ccteam__")
             .unwrap_or_else(|| panic!("tool name {n:?} missing required `ccteam__` server prefix"));
         let ok = bare == "screenshot"
+            || bare == "status"
             || bare.starts_with("admin_")
             || bare.starts_with("workflow_")
             || bare.starts_with("chat_")
-            || bare.starts_with("advise_")
             || bare.starts_with("session_");
         assert!(
             ok,
-            "tool {n:?} is missing a group sub-prefix (admin_/workflow_/chat_/advise_/session_/screenshot)",
+            "tool {n:?} is missing a group sub-prefix (chat_/session_/screenshot/status)",
         );
     }
 }
 
 #[test]
 fn legacy_v05_unprefixed_names_are_gone() {
-    // Acceptance §F #4 — no compat shim. V0.5 names must NOT survive
-    // alongside the renamed V0.6 names.
+    // No compat shim. V0.5 names must NOT survive alongside the
+    // renamed V0.6 names.
     let names = list_tool_names();
     for legacy in [
         "ccteam__ls",
@@ -171,105 +162,66 @@ fn legacy_v05_unprefixed_names_are_gone() {
         "ccteam__set_parallelism",
         "ccteam__trigger_gate",
         "ccteam__get_artifact_summary",
+        // v0.9 T1 culled names (no alias).
+        "ccteam__admin_ls",
+        "ccteam__admin_change_persona",
+        "ccteam__admin_add_tool",
+        "ccteam__advise_vote",
+        "ccteam__advise_parallel",
+        "ccteam__chat_register_bot",
+        "ccteam__chat_unregister_bot",
+        "ccteam__chat_list_bots",
     ] {
         assert!(
             !names.contains(&legacy.to_string()),
-            "legacy unprefixed name {legacy:?} must NOT be in tools/list (no compat shim)",
+            "legacy/culled name {legacy:?} must NOT be in tools/list (no compat shim)",
         );
     }
 }
 
 #[test]
-fn chat_and_advise_real_tools_dispatch_through_server() {
-    // V0.6.5 F152 + F146 — both `advise_vote` (F152) and the chat
-    // lifecycle tools (F146) are real tools backed by per-vendor advisor
-    // calls + budget ledger (advise) / file-system control plane (chat).
-    // Spot-check both group shapes:
-    //
-    // - Schema is listed.
-    // - `tools/call advise_vote` with a pre-seeded budget-exceeded
-    //   ledger returns a structured `ok:false, error:budget_exceeded`
-    //   body without invoking any vendor subprocess (so the test is
-    //   hermetic — no `claude` / `codex` binary required on PATH).
-    // - `tools/call chat_list_bots` exercises the happy path so we
-    //   can be sure the chat dispatcher is still wired.
+fn status_and_session_tools_dispatch_through_server() {
+    // Spot-check remaining surface: status (local) + session_list
+    // (forwards to daemon — may error without daemon, but must land
+    // as a tools/call result shape rather than a transport failure).
     let names = list_tool_names();
-    assert!(names.contains(&"ccteam__chat_list_bots".to_string()));
-    assert!(names.contains(&"ccteam__advise_vote".to_string()));
-    assert!(names.contains(&"ccteam__advise_parallel".to_string()));
+    assert!(names.contains(&"ccteam__status".to_string()));
+    assert!(names.contains(&"ccteam__session_list".to_string()));
+    assert!(names.contains(&"ccteam__chat_send_file".to_string()));
 
     let (_tmp, home, projects) = tmp_paths();
-    // Pre-seed the advise budget ledger so the vote call refuses
-    // pre-spawn (no real `claude` / `codex` binary needed).
-    std::fs::create_dir_all(&home).unwrap();
-    for _ in 0..15 {
-        ccteam_core::advise::append_budget_sample(&home, ccteam_core::AgentVendor::Claude, 0.10)
-            .unwrap();
-    }
     let mut srv = McpServer::spawn(&home, &projects);
-    // advise_vote — budget gate triggers `ok:false` body.
     srv.send(&json!({
         "jsonrpc": "2.0", "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "ccteam__advise_vote",
-            "arguments": { "question": "Should I pick A or B?", "max_cost_usd": 0.50 }
-        }
-    }));
-    let resp = srv.recv();
-    assert_eq!(
-        resp["result"]["isError"], false,
-        "advise_vote with budget_exceeded should land as result, not isError"
-    );
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .expect("content[0].text");
-    assert!(
-        text.contains("budget_exceeded"),
-        "advise_vote body should report budget_exceeded; got: {text}"
-    );
-    assert!(
-        text.contains("\"ok\": false"),
-        "advise_vote body should carry ok:false; got: {text}"
-    );
-
-    // chat_list_bots — F146 real tool. Exercise the happy path so we
-    // can be sure the chat dispatcher is wired (file-system control
-    // plane, no daemon required). Empty registry → `ok:true, bots:[]`.
-    srv.send(&json!({
-        "jsonrpc": "2.0", "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "ccteam__chat_list_bots",
+            "name": "ccteam__status",
             "arguments": {}
         }
     }));
     let resp = srv.recv();
     assert_eq!(
         resp["result"]["isError"], false,
-        "real chat_list_bots should land as result not isError"
+        "status should land as result, not isError"
     );
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("content[0].text");
     assert!(
-        text.contains("\"ok\": true"),
-        "chat_list_bots body should report ok:true; got: {text}"
+        text.contains("projects"),
+        "status body should carry projects array; got: {text}"
     );
     srv.shutdown();
 }
 
 #[test]
-fn screenshot_keeps_v05_name_in_v06_listing() {
-    // README §九 / F111 decision: `screenshot` is the one single-
-    // member group whose tool name does NOT get a sub-prefix, to
-    // preserve V0.5 muscle memory for the one tool the user is
-    // statistically most likely to have wired up by name in a
-    // dashboard / script.
+fn screenshot_keeps_v05_name_in_listing() {
+    // `screenshot` is the one single-member group whose tool name does
+    // NOT get a sub-prefix, to preserve V0.5 muscle memory.
     let names = list_tool_names();
     assert!(
         names.contains(&"ccteam__screenshot".to_string()),
-        "ccteam__screenshot must survive the V0.6 rename without sub-prefix"
+        "ccteam__screenshot must survive without sub-prefix"
     );
     // Sanity: no `ccteam__screenshot_*` accidentally added.
     for n in &names {

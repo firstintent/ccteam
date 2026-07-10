@@ -1,11 +1,11 @@
 //! M2.5 end-to-end: spawn `ccteam mcp-serve` as a subprocess, drive it
 //! via stdin/stdout JSON-RPC, and confirm the protocol shape.
 //!
-//! Confirms the wire contract that interfaces.md §12 promises:
+//! Confirms the wire contract:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 15 tools, all `ccteam__*`
-//!   (admin 3 + screenshot 1 + chat 4 + advise 2 + session 5);
-//! - `tools/call ccteam__admin_ls` returns a JSON-encoded projects list as
+//! - `tools/list` enumerates exactly 8 tools, all `ccteam__*`
+//!   (status 1 + screenshot 1 + chat 1 + session 5);
+//! - `tools/call ccteam__status` returns a JSON-encoded projects list as
 //!   the first content[].text.
 
 use std::io::{BufRead, BufReader, Write};
@@ -112,8 +112,7 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 
 #[test]
 fn mcp_serve_tools_list_returns_full_tool_set() {
-    // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
-    // Bump this when a new tool lands.
+    // status 1 + screenshot 1 + chat 1 + session 5 = 8.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -131,68 +130,40 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        15,
-        "admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15"
+        8,
+        "status 1 + screenshot 1 + chat 1 + session 5 = 8"
     );
-    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for required in [
-        // Admin.
+    let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    names.sort();
+    let mut expected = vec![
+        "ccteam__chat_send_file",
+        "ccteam__screenshot",
+        "ccteam__session_collect",
+        "ccteam__session_dispatch",
+        "ccteam__session_list",
+        "ccteam__session_spawn",
+        "ccteam__session_stop",
+        "ccteam__status",
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+    // Culled tools must stay gone (no deprecated alias).
+    for gone in [
         "ccteam__admin_ls",
         "ccteam__admin_change_persona",
         "ccteam__admin_add_tool",
-        // Screenshot.
-        "ccteam__screenshot",
-        // Chat.
+        "ccteam__advise_vote",
+        "ccteam__advise_parallel",
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
         "ccteam__chat_list_bots",
-        "ccteam__chat_send_file",
-        // Advise.
-        "ccteam__advise_vote",
-        "ccteam__advise_parallel",
-        // Session (v0.8.7 W1 — cto scheduling).
-        "ccteam__session_spawn",
-        "ccteam__session_dispatch",
-        "ccteam__session_collect",
-        "ccteam__session_list",
-        "ccteam__session_stop",
-    ] {
-        assert!(names.contains(&required), "missing tool: {required}");
-    }
-    // Removed without alias (CLAUDE.md §五 #4).
-    assert!(
-        !names.contains(&"ccteam__chat_reset"),
-        "chat_reset was removed (no deprecated alias per CLAUDE.md §五 #4)"
-    );
-    assert!(
-        !names.contains(&"ccteam__chat_lifecycle"),
-        "chat_lifecycle was removed (no deprecated alias per CLAUDE.md §五 #4)"
-    );
-    // The entire workflow_* group was retired (no deprecated alias) —
-    // the 7 earlier F65 workflow-control tools plus the 8 read-only /
-    // lifecycle tools that survived until v0.8.6.
-    for gone in [
-        // Earlier F65 workflow-control removals.
-        "ccteam__workflow_spawn_agent",
-        "ccteam__workflow_stop_agent",
-        "ccteam__workflow_observe_agents",
-        "ccteam__workflow_signal",
-        "ccteam__workflow_set_parallelism",
-        "ccteam__workflow_trigger_gate",
-        "ccteam__workflow_get_artifact_summary",
-        // v0.8.6 retirement of the last 8 workflow tools.
+        "ccteam__chat_reset",
+        "ccteam__chat_lifecycle",
         "ccteam__workflow_show",
-        "ccteam__workflow_peek",
-        "ccteam__workflow_progress",
-        "ccteam__workflow_new",
-        "ccteam__workflow_pause",
-        "ccteam__workflow_resume",
-        "ccteam__workflow_send_to_session",
-        "ccteam__workflow_inject_decision",
     ] {
         assert!(
             !names.contains(&gone),
-            "retired workflow tool must be gone: {gone}"
+            "culled/retired tool must be gone: {gone}"
         );
     }
     // Schema sanity: every tool must declare `inputSchema.type=object`.
@@ -207,7 +178,7 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
 }
 
 #[test]
-fn mcp_serve_tools_call_ls_returns_empty_projects_for_fresh_root() {
+fn mcp_serve_tools_call_status_returns_empty_projects_for_fresh_root() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -219,7 +190,7 @@ fn mcp_serve_tools_call_ls_returns_empty_projects_for_fresh_root() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": { "name": "ccteam__admin_ls", "arguments": {} }
+        "params": { "name": "ccteam__status", "arguments": {} }
     }));
     let resp = srv.recv();
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();

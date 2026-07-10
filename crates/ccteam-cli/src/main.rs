@@ -3,20 +3,13 @@
 mod clipboard;
 mod commands;
 mod mcp_serve;
-// V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
-// ToolGroup enum + CCTEAM_DISABLE_TOOLS filter. Wave 2/3 fills the
-// chat / advise dispatch handlers.
-mod mcp_advise_tools;
+// ToolGroup enum + CCTEAM_DISABLE_TOOLS filter + chat send_file schema.
 mod mcp_chat_tools;
 // v0.8.7 W1 — `ccteam__session_*` tools (cto scheduling). Stdio side
 // forwards to the daemon over mcp.sock; the daemon-side handler
 // (`execute_session_tool`) holds the gateway + enforces the cto gate.
 mod mcp_session_tools;
 mod mcp_tool_groups;
-// V0.6.1 F128 — `ccteam__admin_change_persona` +
-// `ccteam__admin_add_tool` real implementations (mutate
-// `.claude/agents/<bot>.md` + emit progress events).
-mod mcp_admin_tools;
 mod web_chat_bridge;
 // v0.8.22 — bare `ccteam doctor` full readiness checkup (claude/codex/
 // tmux binaries, MCP registration, daemon health, pricing, home-layout

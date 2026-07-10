@@ -1,18 +1,14 @@
-//! V0.6.0 Wave 1 (F111) — integration tests for `CCTEAM_DISABLE_TOOLS`
-//! group-enum env filter.
+//! Integration tests for `CCTEAM_DISABLE_TOOLS` group-enum env filter.
 //!
 //! Each test spawns `ccteam mcp-serve` with a different
 //! `CCTEAM_DISABLE_TOOLS` value and confirms `tools/list` shrinks /
-//! grows as expected. Group enum (V0.6.0 README §A):
-//! `admin` / `workflow` / `screenshot` / `chat` / `advise`. The
-//! `workflow` token stays a valid enum value, but after the W5a EOL of
-//! the `workflow_*` tools it gates an empty set, so only four groups
-//! ever surface in `tools/list`.
+//! grows as expected. Group enum: `admin` / `workflow` / `screenshot`
+//! / `chat` / `session`. The `workflow` token stays a valid enum value,
+//! but gates an empty set. The `advise` group was dropped in v0.9 T1
+//! (token now silently ignored like any unknown).
 //!
-//! Unknown tokens are silently dropped (PRD F111 §B: the filter is
-//! best-effort UX, not a security boundary). The acceptance script
-//! at `docs/versions/v0-6-0/dev-plan.md` Wave 1 §F #6 invokes the matching
-//! test name.
+//! Unknown tokens are silently dropped. The filter is best-effort UX,
+//! not a security boundary.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -117,14 +113,12 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
         let bare = n.strip_prefix("ccteam__").expect("server prefix");
         if bare == "screenshot" {
             out.insert("screenshot");
-        } else if bare.starts_with("admin_") {
+        } else if bare == "status" || bare.starts_with("admin_") {
             out.insert("admin");
         } else if bare.starts_with("workflow_") {
             out.insert("workflow");
         } else if bare.starts_with("chat_") {
             out.insert("chat");
-        } else if bare.starts_with("advise_") {
-            out.insert("advise");
         } else if bare.starts_with("session_") {
             out.insert("session");
         }
@@ -134,13 +128,11 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
 
 #[test]
 fn disable_unset_returns_all_visible_groups() {
-    // W5a EOL — the 8 `workflow_*` tools were retired, so the `workflow`
-    // group surfaces no tools and never appears in `tools/list` (its
-    // enum token stays valid for the disable parser, but it gates an
-    // empty set). The visible surface is the four remaining groups.
+    // workflow gates an empty set (never appears). advise was culled.
+    // Visible surface: admin + screenshot + chat + session.
     let names = names_with_disable(None);
     let groups = group_set(&names);
-    for g in ["admin", "screenshot", "chat", "advise", "session"] {
+    for g in ["admin", "screenshot", "chat", "session"] {
         assert!(
             groups.contains(g),
             "default tools/list should contain group `{g}`; got groups {:?}",
@@ -149,9 +141,15 @@ fn disable_unset_returns_all_visible_groups() {
     }
     assert!(
         !groups.contains("workflow"),
-        "workflow group has no tools after W5a EOL; got groups {:?}",
+        "workflow group has no tools; got groups {:?}",
         groups
     );
+    assert!(
+        !groups.contains("advise"),
+        "advise group was culled in v0.9 T1; got groups {:?}",
+        groups
+    );
+    assert_eq!(names.len(), 8);
 }
 
 #[test]
@@ -159,38 +157,29 @@ fn disable_chat_hides_chat_keeps_others() {
     let names = names_with_disable(Some("chat"));
     let groups = group_set(&names);
     assert!(!groups.contains("chat"), "chat group should be hidden");
-    for g in ["admin", "screenshot", "advise"] {
+    for g in ["admin", "screenshot", "session"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
-    // Spot-check specific stubs.
     assert!(!names.iter().any(|n| n.starts_with("ccteam__chat_")));
-    assert!(names.contains(&"ccteam__advise_vote".to_string()));
+    assert!(names.contains(&"ccteam__status".to_string()));
 }
 
 #[test]
 fn disable_chat_and_screenshot_combines() {
-    // Acceptance §F #6 — the headline value from team-lead prompt.
     let names = names_with_disable(Some("chat,screenshot"));
     let groups = group_set(&names);
     assert!(!groups.contains("chat"));
     assert!(!groups.contains("screenshot"));
     assert!(!names.contains(&"ccteam__screenshot".to_string()));
     assert!(groups.contains("admin"));
-    assert!(groups.contains("advise"));
+    assert!(groups.contains("session"));
 }
 
 #[test]
 fn disable_each_group_individually() {
     // One spawn per group; confirms the enum parser covers every
     // documented value. (Cheap — each spawn is ~200ms.)
-    for g in [
-        "admin",
-        "workflow",
-        "screenshot",
-        "chat",
-        "advise",
-        "session",
-    ] {
+    for g in ["admin", "workflow", "screenshot", "chat", "session"] {
         let names = names_with_disable(Some(g));
         let groups = group_set(&names);
         assert!(
@@ -203,10 +192,10 @@ fn disable_each_group_individually() {
 
 #[test]
 fn disable_unknown_token_is_silently_ignored() {
-    // PRD F111 §B: unknown tokens dropped silently so a typo doesn't
-    // crash the MCP server at startup.
+    // Unknown tokens (including retired `advise`) dropped silently so a
+    // typo doesn't crash the MCP server at startup.
     let baseline = names_with_disable(None);
-    let with_typo = names_with_disable(Some("not-a-real-group,also-fake"));
+    let with_typo = names_with_disable(Some("not-a-real-group,also-fake,advise"));
     assert_eq!(
         baseline, with_typo,
         "unknown disable tokens must be a no-op",
@@ -215,7 +204,7 @@ fn disable_unknown_token_is_silently_ignored() {
 
 #[test]
 fn disable_all_groups_returns_empty_list() {
-    let names = names_with_disable(Some("admin,workflow,screenshot,chat,advise,session"));
+    let names = names_with_disable(Some("admin,workflow,screenshot,chat,session"));
     assert!(
         names.is_empty(),
         "disabling every group should hide the entire surface; got {:?}",

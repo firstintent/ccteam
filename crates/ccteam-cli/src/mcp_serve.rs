@@ -34,13 +34,9 @@ use ccteam_core::{
 use ccteam_flow::MAX_CONCURRENT_PROJECTS;
 
 use crate::commands::collect_projects;
-// V0.6.0 Wave 1 (F108 / F111 / F112) — chat / advise tool stubs +
-// CCTEAM_DISABLE_TOOLS group filter. Wave 2/3 fills the chat / advise
-// dispatch handlers; Wave 1 lands stubs so the tool surface shape +
-// group disable env are usable end-to-end.
-use crate::{
-    mcp_admin_tools, mcp_advise_tools, mcp_chat_tools, mcp_session_tools, mcp_tool_groups,
-};
+// v0.9 T1 — culled surface: status + screenshot + chat_send_file +
+// session_*(5) = 8 tools. CCTEAM_DISABLE_TOOLS group filter retained.
+use crate::{mcp_chat_tools, mcp_session_tools, mcp_tool_groups};
 
 /// Stable MCP protocol version this server speaks. Newer client versions
 /// downgrade gracefully because we never advertise capabilities we don't
@@ -331,31 +327,28 @@ fn initialize_response() -> Value {
 }
 
 fn tools_list_response() -> Value {
-    // V0.6.0 F111 — honour `CCTEAM_DISABLE_TOOLS` group enum
-    // (`workflow`, `chat`, `advise`, `screenshot`, `admin`). The
-    // filter runs on every `tools/list` so users can toggle groups
-    // without restarting `ccteam mcp-serve`.
+    // Honour `CCTEAM_DISABLE_TOOLS` group enum (`admin`, `workflow`,
+    // `chat`, `screenshot`, `session`). The filter runs on every
+    // `tools/list` so users can toggle groups without restarting
+    // `ccteam mcp-serve`.
     let disabled = mcp_tool_groups::disabled_groups_from_env();
     let tools = mcp_tool_groups::filter_by_disabled(tool_definitions(), &disabled);
     json!({ "tools": tools })
 }
 
-/// Single source of truth for the MCP tool surface. admin has 3 (`ls` +
-/// `change_persona` + `add_tool`); chat has 4; advise has 2; session has 5
-/// (v0.8.7 W1 cto scheduling); `ccteam__screenshot` is its own
-/// single-member group → **15 total**. All tools carry a group sub-prefix
-/// (`admin_`, `chat_`, `advise_`, `session_`) except `ccteam__screenshot`
-/// which keeps its single-member-group name for V0.5 muscle memory.
+/// Single source of truth for the MCP tool surface (v0.9 T1):
+/// `status` (1) + `screenshot` (1) + `chat_send_file` (1) +
+/// session (5) = **8 total**. `status` is the renamed `admin_ls`
+/// (same handler); `screenshot` keeps its single-member-group name.
 pub(crate) fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
-        // Read-only inspection.
+        // Read-only inspection (renamed from admin_ls in v0.9 T1).
         json!({
-            "name": "ccteam__admin_ls",
-            "description": "List every ccteam project under ~/projects/ with its current phase, state, cost, and stall level. Equivalent to `ccteam ls --format json`.",
+            "name": "ccteam__status",
+            "description": "daemon health + sessions + today's cost",
             "inputSchema": object_schema(&[]),
         }),
-        // V0.2.2 F38 — terminal screenshot. Read-only (no daemon
-        // requirement).
+        // Terminal screenshot. Read-only (no daemon requirement).
         json!({
             "name": "ccteam__screenshot",
             "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
@@ -372,24 +365,12 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
             }),
         }),
     ];
-    // V0.6.0 Wave 1 (F108 / F112) — append chat (4) + advise (2)
-    // tools. V0.6.5 F146 / F147 turned all chat stubs into real
-    // implementations; the dead `chat_send_input` / `chat_history` pair
-    // (defunct role-keyed control plane) was later dropped. V0.6.5
-    // F152 / F153 turned both advise stubs into real implementations
-    // against the `ccteam_core::advise` entry points (Claude + Codex
-    // parallel one-shot advisors + per-vendor budget ledger).
+    // chat group: send_file only (lifecycle bots culled in v0.9 T1).
     tools.extend(mcp_chat_tools::chat_tool_definitions());
-    tools.extend(mcp_advise_tools::advise_tool_definitions());
-    // v0.8.7 W1 — session group (5): spawn / dispatch / collect / list /
-    // stop. cto-only scheduling over the gateway session map; stdio side
+    // session group (5): spawn / dispatch / collect / list / stop.
+    // cto-only scheduling over the gateway session map; stdio side
     // forwards to the daemon.
     tools.extend(mcp_session_tools::session_tool_definitions());
-    // V0.6.1 F128 — `admin_change_persona` + `admin_add_tool` real
-    // tools land here. The pre-existing `admin_ls` stays inline above
-    // (it's the V0.5 read-only entry; the two F128 mutators move the
-    // admin group from 1 → 3 tools).
-    tools.extend(mcp_admin_tools::admin_tool_definitions());
     tools
 }
 
@@ -416,52 +397,23 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
-        "ccteam__admin_ls" => Ok(text_content(tool_ls(paths)?)),
+        // Renamed from admin_ls (v0.9 T1); same handler/behavior.
+        "ccteam__status" => Ok(text_content(tool_ls(paths)?)),
         "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
-        // V0.8.4 P2b — `chat_send_file` is a LIVE tool: it needs the
-        // daemon's gateway-event sink (which this stdio process doesn't
-        // have). Forward it over the existing `mcp.sock` to the daemon,
-        // injecting the agent's ambient identity. (The daemon-side socket
-        // handler intercepts it before `handle_request`, so it never loops
-        // back into this branch.)
+        // `chat_send_file` is a LIVE tool: it needs the daemon's
+        // gateway-event sink (which this stdio process doesn't have).
+        // Forward it over the existing `mcp.sock` to the daemon,
+        // injecting the agent's ambient identity. (The daemon-side
+        // socket handler intercepts it before `handle_request`, so it
+        // never loops back into this branch.)
         "ccteam__chat_send_file" => forward_chat_send_file(paths, &args).await,
-        // Route the remaining group tools (chat / advise / admin
-        // mutators) through their dedicated dispatchers.
         other => {
-            // V0.6.1 F128 — admin mutator tools (`change_persona` /
-            // `add_tool`) gate on a live daemon. `admin_ls` stays inline
-            // above and is read-only so it does not gate.
-            if mcp_admin_tools::requires_daemon(other) {
-                require_healthy_daemon(paths)?;
-            }
-            // V0.6.5 F146 — chat group: real register / unregister /
-            // list_bots dispatchers + 3 F147-pending stubs. The
-            // dispatcher returns Ok(None) for tools that aren't ours
-            // so the fall-through to `unknown tool` below is preserved
-            // for genuine typos. None of the chat tools currently gate
-            // on a live daemon (file-system control plane only).
-            if let Some(body) = mcp_chat_tools::dispatch(paths, other, &args)? {
-                return Ok(text_content(body));
-            }
-            // v0.8.7 W1 — session group (cto scheduling). The stdio
-            // dispatcher injects the ambient caller identity and forwards
-            // to the daemon over mcp.sock (the daemon owns the gateway +
+            // session group (cto scheduling). The stdio dispatcher
+            // injects the ambient caller identity and forwards to the
+            // daemon over mcp.sock (the daemon owns the gateway +
             // enforces the cto-only gate). Returns Ok(None) for foreign
             // tools so the fall-through is preserved.
             if let Some(body) = mcp_session_tools::dispatch(paths, other, &args).await? {
-                return Ok(text_content(body));
-            }
-            // V0.6.5 F152 + F153 — advise group: real `advise_vote` +
-            // `advise_parallel` (Claude + Codex parallel one-shot
-            // advisors + verdict synthesis / N-of-N). Async dispatch
-            // because the underlying advisor calls spawn tokio
-            // subprocesses; ledger gates the spend pre-fan-out.
-            if let Some(body) = mcp_advise_tools::dispatch(paths, other, &args).await? {
-                return Ok(text_content(body));
-            }
-            // V0.6.1 F128 — admin mutators (after the daemon gate
-            // above).
-            if let Some(body) = mcp_admin_tools::dispatch(paths, other, &args)? {
                 return Ok(text_content(body));
             }
             Err(anyhow!("unknown tool: {other}"))
@@ -554,15 +506,6 @@ pub(crate) async fn forward_to_socket(socket: &std::path::Path, req: &Value) -> 
 #[cfg(not(unix))]
 pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -> Result<Value> {
     Err(anyhow!("mcp.sock forwarding is unix-only"))
-}
-
-/// Fail-loud gate for action tools that need a reachable gateway daemon.
-fn require_healthy_daemon(paths: &CcteamPaths) -> Result<()> {
-    let health = check_daemon_health(paths);
-    if !health.is_healthy() {
-        return Err(anyhow!(health.describe()));
-    }
-    Ok(())
 }
 
 fn text_content(body: String) -> Vec<Value> {
@@ -763,11 +706,34 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
+    const EXPECTED_TOOL_NAMES: &[&str] = &[
+        "ccteam__chat_send_file",
+        "ccteam__screenshot",
+        "ccteam__session_collect",
+        "ccteam__session_dispatch",
+        "ccteam__session_list",
+        "ccteam__session_spawn",
+        "ccteam__session_stop",
+        "ccteam__status",
+    ];
+
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
-        // Bump this when a new tool lands.
-        assert_eq!(tool_definitions().len(), 15);
+        // status 1 + screenshot 1 + chat 1 + session 5 = 8.
+        assert_eq!(tool_definitions().len(), 8);
+        assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
+    }
+
+    #[test]
+    fn tool_definitions_exact_set() {
+        // Acceptance: tools/list returns exactly these 8 names.
+        let tools = tool_definitions();
+        let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        names.sort();
+        let mut expected: Vec<&str> = EXPECTED_TOOL_NAMES.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -776,7 +742,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 15, "tool names must be unique");
+        assert_eq!(names.len(), 8, "tool names must be unique");
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -1075,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // admin 3 + screenshot 1 + chat 4 + advise 2 + session 5 = 15.
+        // status 1 + screenshot 1 + chat 1 + session 5 = 8.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1089,39 +1055,26 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
-        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"ccteam__admin_ls"));
-        assert!(names.contains(&"ccteam__screenshot"));
-        assert!(names.contains(&"ccteam__chat_send_file"));
-        // V0.6.0 Wave 1 — chat / advise present.
-        assert!(names.contains(&"ccteam__advise_vote"));
-        // v0.8.7 W1 — session group (cto scheduling).
-        assert!(names.contains(&"ccteam__session_spawn"));
-        assert!(names.contains(&"ccteam__session_dispatch"));
-        assert!(names.contains(&"ccteam__session_collect"));
-        assert!(names.contains(&"ccteam__session_list"));
-        assert!(names.contains(&"ccteam__session_stop"));
-        // V0.6.5 F146 — chat register / unregister land here, and the
-        // old `chat_lifecycle` is gone (no deprecated alias).
-        assert!(names.contains(&"ccteam__chat_register_bot"));
-        assert!(names.contains(&"ccteam__chat_unregister_bot"));
-        assert!(!names.contains(&"ccteam__chat_lifecycle"));
-        // The 8 workflow_* tools were retired (no deprecated alias).
+        assert_eq!(tools.len(), 8);
+        let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        names.sort();
+        let mut expected = EXPECTED_TOOL_NAMES.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
+        // Culled tools must not reappear.
         for gone in [
+            "ccteam__admin_ls",
+            "ccteam__admin_change_persona",
+            "ccteam__admin_add_tool",
+            "ccteam__advise_vote",
+            "ccteam__advise_parallel",
+            "ccteam__chat_register_bot",
+            "ccteam__chat_unregister_bot",
+            "ccteam__chat_list_bots",
+            "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
-            "ccteam__workflow_peek",
-            "ccteam__workflow_progress",
-            "ccteam__workflow_new",
-            "ccteam__workflow_pause",
-            "ccteam__workflow_resume",
-            "ccteam__workflow_send_to_session",
-            "ccteam__workflow_inject_decision",
         ] {
-            assert!(
-                !names.contains(&gone),
-                "retired workflow tool present: {gone}"
-            );
+            assert!(!names.contains(&gone), "culled tool present: {gone}");
         }
     }
 
@@ -1180,7 +1133,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ccteam__admin_ls", "arguments": {} }
+            "params": { "name": "ccteam__status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1216,7 +1169,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 72,
             "method": "tools/call",
-            "params": { "name": "ccteam__admin_ls", "arguments": {} }
+            "params": { "name": "ccteam__status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
@@ -1224,7 +1177,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
             parsed["orchestrator"]["daemon_health"]["status"], "unreachable",
-            "ls must annotate daemon health when daemon is down"
+            "status must annotate daemon health when daemon is down"
         );
     }
 
