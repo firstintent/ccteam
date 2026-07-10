@@ -82,8 +82,14 @@ async fn handle_post(
         }
     };
 
+    // Bearer verified above → the owner's front door: session tools skip the
+    // ambient cto gate; internal-bus methods (interaction/permission ask) are
+    // refused on this transport.
     let dispatch = app.mcp_dispatch();
-    match dispatch.dispatch(req).await {
+    match dispatch
+        .dispatch_as(req, ccteam_im::mcp::McpCaller::Admin)
+        .await
+    {
         Some(response) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],

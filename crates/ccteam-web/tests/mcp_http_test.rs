@@ -309,3 +309,69 @@ async fn mcp_notification_returns_202_empty() {
         "notification body must be empty, got {body:?}"
     );
 }
+
+// ── ⑦ v0.9 review fix — admin front door: cto-gate bypass + internal-bus refusal ──
+
+/// The verified admin bearer must reach `session_*` WITHOUT ambient
+/// `_caller_role`/`_caller_secret` args: with no gateway attached the op
+/// reports gateway-down — proving the cto gate was bypassed (pre-fix this
+/// returned "permission denied").
+#[tokio::test]
+async fn mcp_session_list_admin_bearer_bypasses_cto_gate() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    seed_web_token(&paths, TOKEN_HEX);
+    let state = AppState::with_auth(paths, AuthState::disabled());
+    let addr = spawn(state).await;
+
+    let resp = post_mcp(
+        addr,
+        Some(&bearer(TOKEN_HEX)),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "ccteam__session_list", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("permission denied"),
+        "admin bearer must bypass the cto gate, got: {text}"
+    );
+    assert!(text.contains("gateway not running"), "got: {text}");
+}
+
+/// The internal-bus methods (`permission/ask`, `interaction/ask`) are NOT
+/// exposed on the HTTP front door — JSON-RPC `-32601` (they stay on
+/// mcp.sock; HITL rides vendor-native in-band channels).
+#[tokio::test]
+async fn mcp_internal_bus_methods_not_exposed_over_http() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    seed_web_token(&paths, TOKEN_HEX);
+    let state = AppState::with_auth(paths, AuthState::disabled());
+    let addr = spawn(state).await;
+
+    for method in ["permission/ask", "interaction/ask"] {
+        let resp = post_mcp(
+            addr,
+            Some(&bearer(TOKEN_HEX)),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": method,
+                "params": {}
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{method}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], -32601, "{method}: {body}");
+        assert_eq!(body["id"], 9, "{method}: id must round-trip");
+    }
+}

@@ -795,6 +795,13 @@ impl SpawnClaims {
     /// Acquire (waiting if necessary) the single-flight claim for `sid`.
     /// Same FIFO house pattern as [`Self::lock_for`], keyed by session id so
     /// two concurrent dead-child resumes of the same sid never double-spawn.
+    ///
+    /// LOCK ORDER INVARIANT (v0.9 T2 review fix): acquire this claim strictly
+    /// BEFORE the gateway lock; never await it while holding the gateway lock
+    /// (ABBA deadlock — the claim holder needs the gateway lock for its
+    /// plan/apply phases). Consequently only the shared lock-free resume
+    /// flavor takes it; the `&mut self` flavor (already under the caller's
+    /// gateway lock) relies on the apply-phase generation check instead.
     async fn lock_for_sid(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let entry = {
             let mut map = self.per_sid.lock().unwrap();
@@ -3582,12 +3589,18 @@ impl Gateway {
     /// [`Self::resume_dead_session_shared`] is the lock-free entry (claim sid →
     /// brief plan lock → spawn with no gateway lock → brief apply lock). This
     /// `&mut self` form still composes the three phases under whatever outer
-    /// caller lock is held (submit / directive paths today) but no longer
-    /// special-cases the await inside one monolithic blob; it also takes the
-    /// per-sid [`SpawnClaims`] single-flight so concurrent resumes serialize.
+    /// caller lock is held (submit / directive paths today).
+    ///
+    /// LOCK ORDER (v0.9 T2 review fix): the per-sid [`SpawnClaims`] claim is
+    /// acquired strictly BEFORE the gateway lock (see the shared flavor) and
+    /// must NEVER be awaited while holding it. This `&mut self` form runs
+    /// under the caller's gateway lock, so it takes NO claim — awaiting one
+    /// here ABBA-deadlocks against a shared-flavor resume that holds the claim
+    /// and is waiting for the gateway lock to plan/apply. Races with such a
+    /// concurrent resume are instead resolved by the generation check in
+    /// [`Self::apply_resume_dead_session`]: worst case one freshly spawned
+    /// thread loses and is discarded via `close_thread` (never a zombie).
     async fn resume_dead_session(&mut self, session_id: &str) -> Result<()> {
-        let claims = Arc::clone(&self.spawn_claims);
-        let _claim = claims.lock_for_sid(session_id).await;
         let Some(plan) = self.plan_resume_dead_session(session_id)? else {
             // Concurrent resume finished first; child is already live.
             return Ok(());
@@ -7335,6 +7348,76 @@ mod tests {
             fake.closes.load(Ordering::SeqCst) >= 2,
             "expected stop + discard closes, got {}",
             fake.closes.load(Ordering::SeqCst)
+        );
+    }
+
+    /// v0.9 T2 review fix — mixed flavors must not ABBA-deadlock: a shared
+    /// resume holds the per-sid claim and needs the gateway lock for its
+    /// plan/apply, while a caller already holding the gateway lock runs the
+    /// `&mut self` resume (which takes NO claim — the fix). The apply-phase
+    /// generation check settles the race; both calls return within the
+    /// timeout and the child ends live with no zombie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_flavor_resume_does_not_deadlock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_delay(std::time::Duration::from_millis(150)),
+        );
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+        let sid = gw
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        fake.live.store(false, Ordering::SeqCst);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        // Task A: shared flavor — owns the per-sid claim, spawns slowly.
+        let gw_a = Arc::clone(&gateway);
+        let sid_a = sid.clone();
+        let shared_task =
+            tokio::spawn(async move { Gateway::resume_dead_session_shared(gw_a, &sid_a).await });
+        for _ in 0..100 {
+            if fake.starts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            fake.starts.load(Ordering::SeqCst) >= 2,
+            "shared resume must be mid-spawn before the &mut-self resume runs"
+        );
+
+        // Task B: `&mut self` flavor under the gateway lock while A holds the
+        // claim. Pre-fix this awaited A's claim while blocking A's apply →
+        // ABBA deadlock; post-fix it must return within the timeout.
+        let mutself = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            gateway.lock().await.resume_dead_session(&sid).await
+        })
+        .await
+        .expect("&mut-self resume must not deadlock behind the shared claim");
+        let shared = tokio::time::timeout(std::time::Duration::from_secs(5), shared_task)
+            .await
+            .expect("shared resume must not hang")
+            .expect("shared resume must not panic");
+        assert!(
+            mutself.is_ok() || shared.is_ok(),
+            "one flavor must win the generation race: mutself={mutself:?} shared={shared:?}"
+        );
+        let views = gateway.lock().await.session_views();
+        assert_eq!(views.len(), 1, "exactly one session, no zombie: {views:?}");
+        assert!(
+            fake.live.load(Ordering::SeqCst),
+            "child must end live after the mixed resumes"
         );
     }
 

@@ -15,7 +15,7 @@ pub mod groups;
 /// Transport-agnostic JSON-RPC protocol core (local tools + schemas).
 pub mod protocol;
 
-pub use dispatch::{GatewayEventSink, GatewayHandle, McpDispatch, PendingRegistry};
+pub use dispatch::{GatewayEventSink, GatewayHandle, McpCaller, McpDispatch, PendingRegistry};
 pub use groups::{
     disabled_groups_from_env, filter_by_disabled, group_for_tool, parse_disable_env, ToolGroup,
     STUB_TOOLS,

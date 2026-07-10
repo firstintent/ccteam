@@ -41,13 +41,38 @@ pub struct McpDispatch {
     pub gateway: Option<GatewayHandle>,
 }
 
+/// Who is invoking the dispatch — decides how the privileged intercepts
+/// authenticate (v0.9 T4 review fix).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum McpCaller {
+    /// mcp.sock / stdio-forwarder path: `session_*` authenticates via the
+    /// env-injected `_caller_role`/`_caller_secret` args (cto gate); the
+    /// internal-bus methods (`interaction/ask`, `permission/ask`) are served.
+    Ambient,
+    /// HTTP `/mcp` behind a verified admin bearer — the owner's front door.
+    /// `session_*` skips the cto role/secret gate (that gate exists to stop
+    /// non-privileged *sessions*, not the authenticated owner); the
+    /// internal-bus methods are NOT exposed (in-band/daemon-internal
+    /// responsibility, not front-door API).
+    Admin,
+}
+
 impl McpDispatch {
-    /// Dispatch one JSON-RPC request. Order matches the historical
+    /// Dispatch one JSON-RPC request on the ambient (mcp.sock / stdio) path.
+    /// Wire-compatible with the historical `handle_mcp_socket_connection`.
+    pub async fn dispatch(&self, req: Value) -> Option<Value> {
+        self.dispatch_as(req, McpCaller::Ambient).await
+    }
+
+    /// Dispatch one JSON-RPC request as `caller`. Order matches the historical
     /// `handle_mcp_socket_connection` intercept chain exactly:
     /// `interaction/ask` → `permission/ask` → `chat_send_file` →
     /// `session_*` → `ccteam/reload` → protocol core.
-    pub async fn dispatch(&self, req: Value) -> Option<Value> {
+    pub async fn dispatch_as(&self, req: Value, caller: McpCaller) -> Option<Value> {
         if is_interaction_ask_call(&req) {
+            if caller == McpCaller::Admin {
+                return Some(internal_bus_not_exposed(&req));
+            }
             Some(
                 execute_interaction_ask(
                     &req,
@@ -58,6 +83,9 @@ impl McpDispatch {
                 .await,
             )
         } else if is_permission_ask_call(&req) {
+            if caller == McpCaller::Admin {
+                return Some(internal_bus_not_exposed(&req));
+            }
             Some(
                 execute_permission_ask(
                     &req,
@@ -70,7 +98,7 @@ impl McpDispatch {
         } else if is_chat_send_file_call(&req) {
             Some(execute_chat_send_file(&req, self.sink.as_ref(), self.gateway.as_ref()).await)
         } else if is_session_tool_call(&req) {
-            Some(execute_session_tool(&req, self.gateway.as_ref()).await)
+            Some(execute_session_tool(&req, self.gateway.as_ref(), caller).await)
         } else if is_reload_call(&req) {
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let ok = if let Some(gw) = self.gateway.as_ref() {
@@ -117,6 +145,23 @@ const INTERACTION_ASK_TIMEOUT_SECS: u64 = 600;
 /// protocol's `can_use_tool` resolver can never drift on the TTL.
 fn permission_prompt_timeout_secs() -> u64 {
     crate::hitl::permission_prompt_timeout_secs()
+}
+
+/// JSON-RPC `-32601` for the internal-bus methods (`interaction/ask`,
+/// `permission/ask`) on the HTTP front door: those are in-band / daemon-
+/// internal (mcp.sock) responsibilities, deliberately not front-door API
+/// (tech-design v0.9 §1.1 — HITL stays on vendor-native channels).
+fn internal_bus_not_exposed(req: &serde_json::Value) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!("method not available on this transport: {method}"),
+        },
+    })
 }
 
 /// Monotonic id source so each `chat_send_file` gets a distinct durable
@@ -805,6 +850,7 @@ fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) ->
 async fn execute_session_tool(
     req: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
+    caller: McpCaller,
 ) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let name = req
@@ -835,7 +881,12 @@ async fn execute_session_tool(
     // caller is denied even when the gateway is unavailable. This is NOT a
     // trust boundary on its own — a plaintext role arg is forgeable; the real
     // authentication is the layer-2 secret check below.
-    if !session_caller_authorized(caller_role) {
+    //
+    // v0.9 T4 review fix — `McpCaller::Admin` (HTTP `/mcp`, bearer already
+    // verified at the transport layer) skips BOTH layers: the cto gate exists
+    // to stop non-privileged *sessions* reaching the scheduling tools, not the
+    // authenticated owner on the front door.
+    if caller == McpCaller::Ambient && !session_caller_authorized(caller_role) {
         let who = if caller_role.is_empty() {
             "<unknown>"
         } else {
@@ -870,7 +921,8 @@ async fn execute_session_tool(
     // full-trust model this only RAISES THE BAR (a same-uid process can read
     // another pane's env and recover the secret); it is NOT a hard boundary.
     // Real isolation = per-agent OS user / sandbox (v0.8.8-deferred).
-    {
+    // `McpCaller::Admin` skips it (see the layer-1 note above).
+    if caller == McpCaller::Ambient {
         let gw = gateway.lock().await;
         if !gw.verify_session_caller(caller_role, caller_secret) {
             return session_tool_response(
@@ -883,7 +935,7 @@ async fn execute_session_tool(
         }
     }
 
-    match run_session_tool(&name, &args, gateway).await {
+    match run_session_tool(&name, &args, gateway, caller).await {
         Ok(text) => session_tool_response(id, text, false),
         Err(text) => session_tool_response(id, text, true),
     }
@@ -903,13 +955,14 @@ async fn run_session_tool(
     name: &str,
     args: &serde_json::Value,
     gateway: &GatewayHandle,
+    caller: McpCaller,
 ) -> std::result::Result<String, String> {
     match name {
-        "ccteam__session_spawn" => run_session_spawn(args, gateway).await,
-        "ccteam__session_dispatch" => run_session_dispatch(args, gateway).await,
-        "ccteam__session_collect" => run_session_collect(args, gateway).await,
+        "ccteam__session_spawn" => run_session_spawn(args, gateway, caller).await,
+        "ccteam__session_dispatch" => run_session_dispatch(args, gateway, caller).await,
+        "ccteam__session_collect" => run_session_collect(args, gateway, caller).await,
         "ccteam__session_list" => run_session_list(gateway).await,
-        "ccteam__session_stop" => run_session_stop(args, gateway).await,
+        "ccteam__session_stop" => run_session_stop(args, gateway, caller).await,
         other => Err(format!("unknown session tool: {other}")),
     }
 }
@@ -925,6 +978,7 @@ async fn run_session_tool(
 async fn run_session_spawn(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
+    caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let role = args
         .get("role")
@@ -934,12 +988,26 @@ async fn run_session_spawn(
         .to_string();
     // The session is always created in the cto's bound project (ambient slug),
     // never a caller-named project — project-scoping the gate (R-M3).
-    let project = args
-        .get("_caller_slug")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?;
+    //
+    // v0.9 T4 review fix — the HTTP front door's verified admin has no ambient
+    // slug; it names the target with an explicit `project` arg (fleet-wide
+    // semantics, same as the web admin Identity). Ambient callers keep the
+    // R-M3 pin: `project` is ignored, `_caller_slug` is the only source.
+    let project = match caller {
+        McpCaller::Ambient => args
+            .get("_caller_slug")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?,
+        McpCaller::Admin => args
+            .get("project")
+            .or_else(|| args.get("_caller_slug"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| "session_spawn: missing `project` (admin caller)".to_string())?,
+    };
     let vendor = parse_session_vendor(args)?;
     // v0.8.7 W2 (DB.1) — optional `permission_mode` arg (`skip` default /
     // `hitl`). Lets the cto spawn a supervised work-role whose non-allowlist
@@ -973,6 +1041,7 @@ async fn run_session_spawn(
 async fn run_session_dispatch(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
+    caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
     let task = args
@@ -982,7 +1051,7 @@ async fn run_session_dispatch(
         .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
         .to_string();
     // R-M3 — only operate sessions in the caller's own project.
-    assert_caller_owns_session("session_dispatch", args, gateway, &sid).await?;
+    assert_caller_owns_session("session_dispatch", args, gateway, &sid, caller).await?;
 
     let mut gw = gateway.lock().await;
     let turn_id = gw
@@ -1052,6 +1121,7 @@ fn page_collected_turns(
 async fn run_session_collect(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
+    caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
@@ -1061,7 +1131,7 @@ async fn run_session_collect(
         .map(|x| x as usize)
         .unwrap_or(SESSION_COLLECT_DEFAULT_N);
     // R-M3 — only collect from sessions in the caller's own project.
-    assert_caller_owns_session("session_collect", args, gateway, &sid).await?;
+    assert_caller_owns_session("session_collect", args, gateway, &sid, caller).await?;
 
     // Resolve under the lock (sync), then DROP the guard before the fs read.
     let resolved = {
@@ -1128,11 +1198,12 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
 async fn run_session_stop(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
+    caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
-    assert_caller_owns_session("session_stop", args, gateway, &sid).await?;
+    assert_caller_owns_session("session_stop", args, gateway, &sid, caller).await?;
     let mut gw = gateway.lock().await;
     gw.stop_session(&sid)
         .await
@@ -1168,7 +1239,14 @@ async fn assert_caller_owns_session(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     sid: &str,
+    caller: McpCaller,
 ) -> std::result::Result<(), String> {
+    // v0.9 T4 review fix — the HTTP front door's verified admin operates
+    // fleet-wide (same semantics as the web admin Identity): no ambient slug
+    // to bind to. Unknown sids still fail inside the op itself.
+    if caller == McpCaller::Admin {
+        return Ok(());
+    }
     let caller_slug = args
         .get("_caller_slug")
         .and_then(|v| v.as_str())
@@ -1496,7 +1574,7 @@ mod session_tool_tests {
                 "_caller_secret": "ffffffffffffffffffffffffffffffff",
             }),
         );
-        let resp = execute_session_tool(&req, Some(&gw)).await;
+        let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1519,7 +1597,7 @@ mod session_tool_tests {
                 "_caller_secret": cto_secret,
             }),
         );
-        let resp = execute_session_tool(&req, Some(&gw)).await;
+        let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], false, "correct secret passes");
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"sessions\""), "got: {text}");
@@ -1545,7 +1623,7 @@ mod session_tool_tests {
             if tool == "ccteam__session_dispatch" {
                 args["task"] = json!("do something");
             }
-            let resp = execute_session_tool(&call(tool, args), Some(&gw)).await;
+            let resp = execute_session_tool(&call(tool, args), Some(&gw), McpCaller::Ambient).await;
             assert_eq!(resp["result"]["isError"], true, "{tool} must reject");
             let text = resp["result"]["content"][0]["text"].as_str().unwrap();
             assert!(
@@ -1571,6 +1649,7 @@ mod session_tool_tests {
                 }),
             ),
             Some(&gw),
+            McpCaller::Ambient,
         )
         .await;
         assert_eq!(
@@ -1620,7 +1699,7 @@ mod session_tool_tests {
             "ccteam__session_spawn",
             json!({ "role": "reviewer", "_caller_role": "reviewer", "_caller_slug": "demo" }),
         );
-        let resp = execute_session_tool(&req, None).await;
+        let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1634,7 +1713,7 @@ mod session_tool_tests {
     #[tokio::test]
     async fn execute_session_tool_denies_when_caller_role_absent() {
         let req = call("ccteam__session_list", json!({}));
-        let resp = execute_session_tool(&req, None).await;
+        let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("permission denied"), "got: {text}");
@@ -1649,7 +1728,7 @@ mod session_tool_tests {
             "ccteam__session_list",
             json!({ "_caller_role": "cto", "_caller_slug": "demo" }),
         );
-        let resp = execute_session_tool(&req, None).await;
+        let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1660,6 +1739,71 @@ mod session_tool_tests {
             text.contains("gateway not running"),
             "expected gateway-down error after the gate, got: {text}"
         );
+    }
+
+    /// v0.9 T4 review fix — the HTTP front door's verified admin skips the cto
+    /// role/secret gate entirely: NO `_caller_*` args, straight to the op
+    /// (which then reports gateway-down here — proving the gate was passed).
+    #[tokio::test]
+    async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
+        let req = call("ccteam__session_list", json!({}));
+        let resp = execute_session_tool(&req, None, McpCaller::Admin).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("permission denied"),
+            "admin must skip the cto gate, got: {text}"
+        );
+        assert!(
+            text.contains("gateway not running"),
+            "expected gateway-down after the bypassed gate, got: {text}"
+        );
+    }
+
+    /// v0.9 T4 review fix — admin `session_list` works with NO ambient args
+    /// and reaches the live gateway (fleet-wide semantics, same as the web
+    /// admin Identity).
+    #[tokio::test]
+    async fn execute_session_tool_admin_lists_sessions_fleet_wide() {
+        let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
+        let resp = execute_session_tool(
+            &call("ccteam__session_list", json!({})),
+            Some(&gw),
+            McpCaller::Admin,
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "admin bypasses the cto gate: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"sessions\""), "got: {text}");
+    }
+
+    /// v0.9 T4 review fix — the internal-bus methods are refused on the admin
+    /// (HTTP) transport with JSON-RPC `-32601`; they remain mcp.sock-only
+    /// (HITL stays on vendor-native / in-band channels — tech-design §1.1).
+    #[tokio::test]
+    async fn dispatch_as_admin_refuses_internal_bus_methods() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatch = McpDispatch {
+            paths: ccteam_core::CcteamPaths {
+                root: tmp.path().join("home"),
+                projects_root: tmp.path().join("projects"),
+            },
+            sink: None,
+            pending: None,
+            gateway: None,
+        };
+        for method in ["permission/ask", "interaction/ask"] {
+            let req = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": {}});
+            let resp = dispatch
+                .dispatch_as(req, McpCaller::Admin)
+                .await
+                .expect("refusal is an error response, not a notification");
+            assert_eq!(resp["error"]["code"], -32601, "{method}: {resp}");
+            assert_eq!(resp["id"], 7, "{method}: id must round-trip");
+        }
     }
 
     #[test]
