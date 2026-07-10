@@ -43,6 +43,10 @@ pub mod hitl;
 // `core` half is just the base-URL constant + path utils in `ccteam_core::hub`).
 pub mod hub;
 pub mod latency;
+// v0.9 T3 — shared MCP protocol core + daemon-side `McpDispatch` so
+// `ccteam-web` can later mount `POST /mcp` without depending on
+// `ccteam-cli` (dependency direction: cli → web → im).
+pub mod mcp;
 // v0.8.6 Item 4 — Telegram bot-token onboarding (token validation +
 // owner chat_id capture). Wrapped by `ccteam config` (the IM-token menu
 // item); the former `ccteam-im-setup` skill's job moves into the CLI.

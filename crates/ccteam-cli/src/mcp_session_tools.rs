@@ -1,156 +1,15 @@
 //! `ccteam__session_*` MCP tools (v0.8.7 W1 — cto scheduling, B-tier).
 //!
-//! These let the privileged `cto` role drive the **gateway session map**:
-//! spawn a work-role session, dispatch a task to it, collect its result,
-//! list live sessions, and stop one. They are the "give the cto real
-//! scheduling" half of v0.8.7 Item A; v0.8.6 already shipped the `pub`
-//! gateway primitives (`create_session_api` / `submit_to_sid` /
-//! `session_views` / `stop_session`) this group wraps.
-//!
-//! Architecture (mirrors `chat_send_file`, `mcp_serve::forward_chat_send_file`):
-//!
-//! - The stdio MCP server (this module) does NOT own the gateway — the
-//!   long-lived daemon does. So every `session_*` call is **forwarded over
-//!   `~/.ccteam/run/mcp.sock`** to the daemon, which holds the
-//!   `Arc<Mutex<Gateway>>`, enforces the privilege gate, and drives the
-//!   session map. The daemon-side handler lives in `main.rs`
-//!   (`is_session_tool_call` / `execute_session_tool`).
-//! - The caller's identity is **ambient**: `CCTEAM_CHAT_SLUG` /
-//!   `CCTEAM_CHAT_ROLE` / `CCTEAM_CHAT_SECRET` are injected into the tmux pane
-//!   at spawn (`claude_tui::chat_spawn_env_owned`), inherited by this stdio
-//!   process, and re-injected into the forwarded args here as `_caller_slug` /
-//!   `_caller_role` / `_caller_secret` so the daemon can resolve "which
-//!   project" + authenticate "this is really the cto session" by matching the
-//!   secret. We overwrite any caller-supplied value (same plumbing as
-//!   `chat_send_file`).
-//!
-//! Permission model — the daemon `(role, secret)` gate is the SOLE real
-//! boundary (there is no meaningful per-agent frontmatter allow-list layer):
-//!   1. MCP tools are AMBIENT: every spawned session sees the full
-//!      `mcp__ccteam__ccteam__*` set via `.mcp.json`, and the `cto` role
-//!      template deliberately omits a frontmatter `tools:` line so it inherits
-//!      them. The per-agent allow-list is NOT used to gate these — and never
-//!      could have been: the real exposed names are double-`ccteam`
-//!      (`mcp__ccteam__ccteam__session_*` = server `ccteam` + the tool's own
-//!      `ccteam__` prefix), so the old single-`ccteam` grant matched nothing.
-//!      The cto's dependency on the scheduling tool SET is guarded instead by
-//!      the `cto_scheduling_tools_present_in_canonical_set` test below.
-//!   2. The daemon handler authenticates the forwarded `(role, secret)` pair
-//!      against its `sid -> {role, secret}` session map and returns an MCP
-//!      `isError` result on a non-cto role OR a missing/wrong secret. A cheap
-//!      role pre-filter runs first so an obvious non-cto is denied even with
-//!      the gateway down; the secret match is the security-relevant check —
-//!      this is the ONLY load-bearing gate.
-//!
-//! HONEST SCOPE (do not over-claim): under the current single-OS-uid
-//! full-trust model there is NO hard boundary between agents. A same-uid
-//! process can read another pane's `/proc/<pid>/environ`, its files, or ptrace
-//! it, and thereby recover `CCTEAM_CHAT_SECRET`. The secret therefore only
-//! RAISES THE BAR (stops the trivial "send `{_caller_role:"cto"}` over the
-//! socket" forgery); it does NOT close the hole. Real per-agent isolation
-//! requires a per-agent OS user or sandbox — tracked as v0.8.8-deferred.
-//!
-//! Red lines honored: this is the GATEWAY session map, NOT the deprecated
-//! registry/supervisor (`chat_*`) machinery — the two are never mixed.
-//! `dispatch`/`stop` are explicit cto commands (never proactive kill). No
-//! prompt injection: role behavior stays in `.claude/agents/*.md`; we only
-//! forward the task text as a user turn. `collect` is polled (MVP) — it tails
-//! the child's `turns.jsonl`; push-back-as-turn is v0.8.8.
+//! Tool **definitions** and the daemon-side gate live in [`ccteam_im::mcp`].
+//! This module owns the **stdio-side forwarder**: inject ambient caller
+//! identity and ship the call over `mcp.sock` to the daemon.
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
 use ccteam_core::paths::CcteamPaths;
 
-/// Full tool names in this group, in registration order. Used by the
-/// stdio dispatch + the daemon-side intercept predicate so both sides
-/// agree on membership without duplicating string literals.
-pub const SESSION_TOOL_NAMES: &[&str] = &[
-    "ccteam__session_spawn",
-    "ccteam__session_dispatch",
-    "ccteam__session_collect",
-    "ccteam__session_list",
-    "ccteam__session_stop",
-];
-
-/// True if `name` is one of the `ccteam__session_*` tools.
-pub fn is_session_tool(name: &str) -> bool {
-    SESSION_TOOL_NAMES.contains(&name)
-}
-
-/// Tool definitions for the session group (total 5): spawn / dispatch /
-/// collect / list / stop. Merged into the top-level `tool_definitions()`
-/// in `mcp_serve.rs`.
-pub fn session_tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "ccteam__session_spawn",
-            "description": "Spawn a work-role session in the gateway and return its `s{n}` id. Privileged: only the `cto` role may call this (the daemon authenticates the caller's per-session secret; the cto agent's tool allow-list is a secondary discouragement). The new session runs `<role>` from `.claude/agents/<role>.md` and is ALWAYS created in the caller's OWN bound project (there is no project parameter — a cto bound to project A cannot spawn into another project). `vendor` defaults to `claude`. Always mints a NEW sid: a second spawn of the same role creates a SEPARATE session (its own pane + sid + independent transcript), so you can run several instances of one role in parallel. After spawning, drive it with session_dispatch and read its answer with session_collect.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "role": { "type": "string", "description": "Work-role to spawn (must exist as `.claude/agents/<role>.md`)." },
-                    "vendor": {
-                        "type": "string",
-                        "enum": ["claude", "codex"],
-                        "description": "Harness vendor (lowercase). Default `claude`."
-                    },
-                    "permission_mode": {
-                        "type": "string",
-                        "enum": ["skip", "hitl"],
-                        "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) drops the skip flag at spawn so a non-allowlist tool call pops an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt. Use for a supervised work-role."
-                    }
-                },
-                "required": ["role"],
-            }),
-        }),
-        json!({
-            "name": "ccteam__session_dispatch",
-            "description": "Dispatch a task (a user-turn) to a gateway session addressed by `sid` (e.g. `s2` from session_spawn). Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project dispatch is rejected). The `task` text is forwarded verbatim as a user turn to the child session's agent (NO system prompt injection). Returns the submitted turn id. The child runs asynchronously; poll session_collect to read its answer once the turn completes. This is an explicit dispatch, never a proactive kill.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "sid": { "type": "string", "description": "Gateway session id (`s{n}`) from session_spawn / session_list." },
-                    "task": { "type": "string", "description": "Task / instruction text, forwarded verbatim as a user turn." }
-                },
-                "required": ["sid", "task"],
-            }),
-        }),
-        json!({
-            "name": "ccteam__session_collect",
-            "description": "Collect (poll) a child session's transcript by `sid`. Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror the child's answers are written to, keyed by sid so parallel same-role sessions never bleed) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for collecting incremental results. MVP = polled (push-back-as-turn, where the child's result is injected straight into cto's context, is v0.8.8). Returns an empty `turns` array when the child hasn't answered yet.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "sid": { "type": "string", "description": "Gateway session id (`s{n}`) to collect from." },
-                    "since": { "type": "string", "description": "Optional turn_id cursor — return only assistant turns recorded AFTER this id." },
-                    "n": { "type": "integer", "description": "Max turns to return (default 20). Applied after the `since` cursor filter." }
-                },
-                "required": ["sid"],
-            }),
-        }),
-        json!({
-            "name": "ccteam__session_list",
-            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Privileged: cto only. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`. Use this to find a `sid` to dispatch to or collect from.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }),
-        json!({
-            "name": "ccteam__session_stop",
-            "description": "Stop a gateway session by `sid` (deregister + close its pane). Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project stop is rejected). This is an EXPLICIT command (the cto deciding the work is done), NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-collected `turns.jsonl` still works until cleanup. An unknown sid is an error.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "sid": { "type": "string", "description": "Gateway session id (`s{n}`) to stop." }
-                },
-                "required": ["sid"],
-            }),
-        }),
-    ]
-}
+pub use ccteam_im::mcp::is_session_tool;
 
 /// Stdio-side dispatch for a `ccteam__session_*` tool: inject the ambient
 /// caller identity and forward to the daemon over `mcp.sock`. Returns
@@ -161,7 +20,8 @@ pub fn session_tool_definitions() -> Vec<Value> {
 /// original args plus `_caller_slug` / `_caller_role` / `_caller_secret`
 /// overwritten from the env (caller-supplied values are ignored). The secret
 /// is what the daemon authenticates; it only raises the bar (not a hard
-/// boundary under a single-uid model — see the module-level honest scope).
+/// boundary under a single-uid model — see the module-level honest scope in
+/// `ccteam_im::mcp::dispatch`).
 pub async fn dispatch(paths: &CcteamPaths, name: &str, args: &Value) -> Result<Option<String>> {
     if !is_session_tool(name) {
         return Ok(None);
@@ -232,6 +92,7 @@ async fn forward_session_tool(paths: &CcteamPaths, name: &str, args: &Value) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccteam_im::mcp::{is_session_tool, session_tool_definitions, SESSION_TOOL_NAMES};
 
     #[test]
     fn five_session_tools_registered_with_correct_names() {
@@ -245,14 +106,7 @@ mod tests {
         assert!(names.contains(&"ccteam__session_stop"));
     }
 
-    /// Tripwire for the cto scheduling surface (replaces the old `cto_role.md`
-    /// frontmatter `tools:` grant). The cto role template deliberately does NOT
-    /// enumerate these MCP tools — they are ambient to every session via
-    /// `.mcp.json`, and the cto's privilege is the daemon `(role, secret)` gate,
-    /// not a per-agent allow-list. So THIS is the single-source-of-truth guard
-    /// for the cto's dependency: if a `session_*` tool is removed or renamed it
-    /// fails loudly and names the cto, so the dependency can't be silently
-    /// dropped when the MCP tool set is trimmed.
+    /// Tripwire for the cto scheduling surface.
     #[test]
     fn cto_scheduling_tools_present_in_canonical_set() {
         for needed in [
@@ -294,7 +148,6 @@ mod tests {
                 "session tool name must start with ccteam__session_: {n}"
             );
         }
-        // Every tool def has an object inputSchema.
         for t in session_tool_definitions() {
             assert_eq!(t["inputSchema"]["type"], "object");
         }
@@ -302,8 +155,6 @@ mod tests {
 
     #[test]
     fn session_spawn_schema_carries_permission_mode_param() {
-        // v0.8.7 W2 (DB.1) — session_spawn gains an optional permission_mode
-        // param (a schema change to an EXISTING tool — tool count unchanged).
         let spawn = session_tool_definitions()
             .into_iter()
             .find(|t| t["name"] == "ccteam__session_spawn")
@@ -317,7 +168,6 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(en, vec!["skip", "hitl"]);
-        // It is NOT required (default skip), so old callers keep working.
         let required: Vec<&str> = spawn["inputSchema"]["required"]
             .as_array()
             .unwrap()
@@ -356,10 +206,6 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_without_ambient_identity_degrades_softly() {
-        // No CCTEAM_CHAT_SLUG/ROLE in this test process's env (and we do
-        // not set it — env-mutating cases live in integration tests). The
-        // stdio forwarder must NOT error; it returns a structured message
-        // so the agent sees a clear reason rather than a tool failure.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),

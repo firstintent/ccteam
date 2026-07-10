@@ -6,17 +6,10 @@
 //! red lines:
 //!
 //! - **Hand-rolled JSON-RPC 2.0** over stdio (line-delimited messages).
-//!   Per the M2.5 brief, `rmcp` was the alternative; the in-process
-//!   protocol surface is small enough that adding a crate dep buys
-//!   little — `initialize` / `tools/list` / `tools/call` is the whole
-//!   spec we exercise.
 //! - **No LLM in-process** (Symphony anti-pattern, tech-design §3.1).
-//!   The MCP server is a thin protocol adapter; every tool routes to
-//!   an existing `commands.rs` function.
-//! - Consumed by the user's daily-driver claude (`~/.claude.json`
-//!   `mcpServers` entry, written by `ccteam config` — the "register the
-//!   ccteam MCP server" menu item / `config mcp`) and any project-local
-//!   `.mcp.json`.
+//! - Protocol core + tool schemas live in [`ccteam_im::mcp`] (v0.9 T3);
+//!   this module owns the **stdio loop**, client-side socket forwards
+//!   for stateful tools, and `install_mcp` / `install_codex_mcp`.
 //!
 //! Wire format: each side sends one JSON object per line, terminated
 //! by `\n`. Notifications (no `id`) get no reply. Errors follow the
@@ -28,38 +21,24 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use ccteam_core::{
-    check_daemon_health, cost_summary, render_screenshot, CcteamPaths, DaemonHealth,
-};
-use ccteam_flow::MAX_CONCURRENT_PROJECTS;
+use ccteam_core::CcteamPaths;
 
-use crate::commands::collect_projects;
-// v0.9 T1 — culled surface: status + screenshot + chat_send_file +
-// session_*(5) = 8 tools. CCTEAM_DISABLE_TOOLS group filter retained.
-use crate::{mcp_chat_tools, mcp_session_tools, mcp_tool_groups};
+use crate::mcp_session_tools;
 
-/// Stable MCP protocol version this server speaks. Newer client versions
-/// downgrade gracefully because we never advertise capabilities we don't
-/// implement.
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Single source of truth for the registered tool surface — delegated to
+/// [`ccteam_im::mcp::tool_definitions`] (doctor `--verify-mcp` + tests).
+pub(crate) fn tool_definitions() -> Vec<Value> {
+    ccteam_im::mcp::tool_definitions()
+}
 
 /// How often to poll for orphan / idle-timeout shutdown conditions.
-/// Cheap (one `getppid()` + an `Instant::elapsed()`); 30s keeps the
-/// overhead negligible while still catching the parent-died case
-/// within one tick.
 const MCP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Idle timeout for mcp-serve, **disabled by default** (`None`).
 ///
-/// An MCP server's liveness is connection-based, not wall-clock: it lives
-/// exactly as long as the session and is reaped by stdin-EOF (session end) +
-/// the parent-death signals (SIGTERM / `PR_SET_PDEATHSIG`) + the orphan
-/// `getppid()` check (within one [`MCP_HEALTH_CHECK_INTERVAL`] tick). A timer
-/// would wrongly kill a live-but-idle session — you left a chat open and came
-/// back — so there is no default idle exit. `CCTEAM_MCP_IDLE_TIMEOUT_SECS=N`
-/// (N>0) re-enables an opt-in backstop for pathological spawn topologies where
-/// neither EOF nor the orphan check fires (an intermediate shell that outlives
-/// the parent and keeps the stdin pipe open). `0` / unset ⇒ never idle-exit.
+/// See module docs in git history / tech-design: connection-based liveness
+/// (EOF + PDEATHSIG + orphan check). `CCTEAM_MCP_IDLE_TIMEOUT_SECS=N` (N>0)
+/// is an opt-in backstop.
 fn mcp_idle_timeout() -> Option<Duration> {
     std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS")
         .ok()
@@ -70,8 +49,7 @@ fn mcp_idle_timeout() -> Option<Duration> {
 
 #[cfg(unix)]
 fn current_ppid() -> i32 {
-    // SAFETY: getppid is always-safe; returns this process's parent
-    // PID. Cast pid_t (i32 on Linux, i32 on macOS) to i32.
+    // SAFETY: getppid is always-safe; returns this process's parent PID.
     unsafe { libc::getppid() as i32 }
 }
 #[cfg(not(unix))]
@@ -79,53 +57,12 @@ fn current_ppid() -> i32 {
     0
 }
 
-/// Server identity advertised in `initialize`.
-const SERVER_NAME: &str = "ccteam";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// V0.8.4 P2a — server `instructions` surfaced to the agent on
-/// `initialize`. This is the **load-bearing** Read convention: a bare
-/// `claude` session does NOT auto-`Read` an attachment path — it must be
-/// told to. (The official telegram plugin teaches this exact convention
-/// via its own MCP server instructions; ccteam owns its channel, so it
-/// teaches its own.) Without this, inbound images are silently unseen.
-const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam routes IM (Telegram / web) chats to you and back. \
-An inbound chat message may arrive wrapped in a `<channel source=\"…\" chat_id=\"…\" user=\"…\" message_id=\"…\">` tag.\n\n\
-ATTACHMENTS (important): if a `<channel …>` tag carries an `image_path=\"/abs/path\"` attribute, immediately `Read` that file — \
-it is an image the user attached (often an error screenshot) and is essential context. If it carries a `file_path=\"/abs/path\"` \
-attribute, `Read` that file too. Further attachments may appear in the body as `[attachment image_path=\"…\"]` / \
-`[attachment file_path=\"…\"]` lines — `Read` each of those as well. Do this BEFORE you answer; the user expects you to have \
-looked at the file they sent.";
-
 /// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
 /// stdin; writes responses one per line to stdout.
 ///
-/// Exits the process when ANY of:
-/// - stdin closes (parent disconnect, normal MCP shutdown)
-/// - SIGTERM (kernel via [`set_pdeathsig_sigterm`] when parent dies, or
-///   explicit `kill -TERM`)
-/// - SIGINT (Ctrl-C in interactive testing)
-/// - parent reparented (getppid changed → original parent died but
-///   PR_SET_PDEATHSIG signal didn't reach us, e.g. when an
-///   intermediate shell shielded it)
-/// - idle, **only** when the opt-in `CCTEAM_MCP_IDLE_TIMEOUT_SECS` is set
-///   (default: no idle exit — see [`mcp_idle_timeout`])
-///
-/// Liveness is connection-based — stdin EOF (session end), `PR_SET_PDEATHSIG`,
-/// and the orphan `getppid()` check (the reliable belt-and-suspenders for the
-/// parent-died case, since on WSL / some claude-spawn paths EOF and PDEATHSIG
-/// don't fire reliably). The idle arm is **opt-in only**: a wall-clock timer
-/// would wrongly reap a live-but-idle session, so it is disabled by default.
-///
-/// Why `std::process::exit(0)` and not `return Ok(())`: returning
-/// drops the tokio runtime, which then tries to join every spawned
-/// task — including the `tokio::io::stdin()` reader, which sits on a
-/// blocking-thread-pool syscall that can't be cancelled. The result
-/// is the process parks in `futex_wait` and needs SIGKILL to die.
-/// `exit(0)` skips runtime drop and unwinds via libc, which is the
-/// idiomatic shutdown for a stateless protocol adapter that owns no
-/// reverse-side state. Originally caught in the V0.4.1 round-2
-/// deploy-verify (host SIGTERM left mcp-serve in Sl/Ssl).
+/// Exits via `std::process::exit(0)` on stdin EOF / signals / orphan /
+/// opt-in idle (see historical comments — runtime drop would hang on
+/// the blocking stdin reader).
 pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
     set_pdeathsig_sigterm();
     let original_ppid = current_ppid();
@@ -139,8 +76,6 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
 
     let mut health_ticker = tokio::time::interval(MCP_HEALTH_CHECK_INTERVAL);
     health_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // First tick fires immediately; swallow it so the orphan / idle
-    // checks don't run before we've had a chance to do any work.
     health_ticker.tick().await;
 
     let mut last_activity = Instant::now();
@@ -203,14 +138,6 @@ pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
     }
 }
 
-/// Returns true if our parent process has changed since startup —
-/// strong signal that the original parent died and we got reparented
-/// to init or a subreaper. On Unix we trust `getppid()`; on non-Unix
-/// we always return false (no equivalent).
-///
-/// `original_ppid == 0` (the non-unix default) short-circuits this
-/// check to off so the function is a no-op on platforms where we
-/// can't observe parent identity.
 fn should_exit_for_orphan(original_ppid: i32) -> bool {
     if original_ppid == 0 {
         return false;
@@ -219,16 +146,9 @@ fn should_exit_for_orphan(original_ppid: i32) -> bool {
     now != original_ppid || now == 1
 }
 
-/// On Linux ask the kernel to send us SIGTERM the moment our parent
-/// process exits. This guarantees mcp-serve doesn't get orphaned and
-/// pile up after a Claude Code session closes — even when stdin EOF
-/// isn't propagated (some daemon-spawn paths inherit /dev/null or a
-/// keep-alive descriptor). No-op on non-Linux platforms.
 #[cfg(target_os = "linux")]
 fn set_pdeathsig_sigterm() {
-    // SAFETY: prctl is a thin syscall wrapper; PR_SET_PDEATHSIG is
-    // documented to take a signal number in arg2 and ignore the rest.
-    // SIGTERM (15) is portable.
+    // SAFETY: prctl is a thin syscall wrapper; PR_SET_PDEATHSIG takes a signal.
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
     }
@@ -269,150 +189,44 @@ async fn signal_recv(s: &mut SigStream) {
 }
 #[cfg(not(unix))]
 async fn signal_recv(_: &mut SigStream) {
-    // On non-unix there's no signal arm; future never resolves.
     std::future::pending::<()>().await;
 }
 
-/// Dispatch a single JSON-RPC message. Returns `Some(response)` for
-/// requests (which carry an `id`) and `None` for notifications.
+/// Stdio JSON-RPC dispatch: forward stateful tools to the daemon socket,
+/// everything else → [`ccteam_im::mcp::handle_request`].
 pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
-    let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(json!({}));
-
-    // Notifications (no `id`) never get a reply.
-    let is_notification = id.is_none();
-
-    let result = match method {
-        "initialize" => Ok(initialize_response()),
-        "notifications/initialized" => return None,
-        "tools/list" => Ok(tools_list_response()),
-        "tools/call" => match call_tool(paths, &params).await {
-            Ok(content) => Ok(json!({ "content": content, "isError": false })),
-            Err(err) => {
-                // tools/call errors return as a result with isError=true,
-                // not as JSON-RPC error envelopes — that's the MCP
-                // convention so the client can surface to the LLM.
-                Ok(json!({
+    if method == "tools/call" {
+        let name = req
+            .pointer("/params/name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if name == "ccteam__chat_send_file" || mcp_session_tools::is_session_tool(name) {
+            let id = req.get("id").cloned()?;
+            let params = req.get("params").cloned().unwrap_or(json!({}));
+            let result = match call_tool_forward(paths, &params).await {
+                Ok(content) => json!({ "content": content, "isError": false }),
+                Err(err) => json!({
                     "content": [{ "type": "text", "text": format!("{err:#}") }],
                     "isError": true,
-                }))
-            }
-        },
-        other => Err(format!("method not found: {other}")),
-    };
-
-    if is_notification {
-        return None;
+                }),
+            };
+            return Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        }
     }
-    Some(match result {
-        Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
-        Err(msg) => json_rpc_error(id, -32601, &msg),
-    })
+    ccteam_im::mcp::handle_request(paths, req).await
 }
 
-fn initialize_response() -> Value {
-    json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {}
-        },
-        "serverInfo": {
-            "name": SERVER_NAME,
-            "version": SERVER_VERSION,
-        },
-        // P2a — teach the agent the inbound-attachment Read convention.
-        "instructions": CCTEAM_MCP_INSTRUCTIONS,
-    })
-}
-
-fn tools_list_response() -> Value {
-    // Honour `CCTEAM_DISABLE_TOOLS` group enum (`admin`, `workflow`,
-    // `chat`, `screenshot`, `session`). The filter runs on every
-    // `tools/list` so users can toggle groups without restarting
-    // `ccteam mcp-serve`.
-    let disabled = mcp_tool_groups::disabled_groups_from_env();
-    let tools = mcp_tool_groups::filter_by_disabled(tool_definitions(), &disabled);
-    json!({ "tools": tools })
-}
-
-/// Single source of truth for the MCP tool surface (v0.9 T1):
-/// `status` (1) + `screenshot` (1) + `chat_send_file` (1) +
-/// session (5) = **8 total**. `status` is the renamed `admin_ls`
-/// (same handler); `screenshot` keeps its single-member-group name.
-pub(crate) fn tool_definitions() -> Vec<Value> {
-    let mut tools: Vec<Value> = vec![
-        // Read-only inspection (renamed from admin_ls in v0.9 T1).
-        json!({
-            "name": "ccteam__status",
-            "description": "daemon health + sessions + today's cost",
-            "inputSchema": object_schema(&[]),
-        }),
-        // Terminal screenshot. Read-only (no daemon requirement).
-        json!({
-            "name": "ccteam__screenshot",
-            "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "Project slug." },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Scrollback depth to capture (default 50)."
-                    }
-                },
-                "required": ["slug"],
-            }),
-        }),
-    ];
-    // chat group: send_file only (lifecycle bots culled in v0.9 T1).
-    tools.extend(mcp_chat_tools::chat_tool_definitions());
-    // session group (5): spawn / dispatch / collect / list / stop.
-    // cto-only scheduling over the gateway session map; stdio side
-    // forwards to the daemon.
-    tools.extend(mcp_session_tools::session_tool_definitions());
-    tools
-}
-
-fn object_schema(props: &[(&str, &str, &str)]) -> Value {
-    let mut p = serde_json::Map::new();
-    let mut required = Vec::new();
-    for (name, ty, desc) in props {
-        p.insert((*name).into(), json!({ "type": ty, "description": desc }));
-        required.push(*name);
-    }
-    json!({
-        "type": "object",
-        "properties": Value::Object(p),
-        "required": required,
-    })
-}
-
-/// Dispatch `tools/call` to the right tool implementation, returning
-/// the MCP `content` array.
-async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
+/// Stdio-only: forward `chat_send_file` + `session_*` to the daemon.
+async fn call_tool_forward(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
-        // Renamed from admin_ls (v0.9 T1); same handler/behavior.
-        "ccteam__status" => Ok(text_content(tool_ls(paths)?)),
-        "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
-        // `chat_send_file` is a LIVE tool: it needs the daemon's
-        // gateway-event sink (which this stdio process doesn't have).
-        // Forward it over the existing `mcp.sock` to the daemon,
-        // injecting the agent's ambient identity. (The daemon-side
-        // socket handler intercepts it before `handle_request`, so it
-        // never loops back into this branch.)
         "ccteam__chat_send_file" => forward_chat_send_file(paths, &args).await,
         other => {
-            // session group (cto scheduling). The stdio dispatcher
-            // injects the ambient caller identity and forwards to the
-            // daemon over mcp.sock (the daemon owns the gateway +
-            // enforces the cto-only gate). Returns Ok(None) for foreign
-            // tools so the fall-through is preserved.
             if let Some(body) = mcp_session_tools::dispatch(paths, other, &args).await? {
                 return Ok(text_content(body));
             }
@@ -421,11 +235,7 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     }
 }
 
-/// V0.8.4 P2b — forward a `chat_send_file` call to the daemon's
-/// `mcp.sock`. The agent's identity is ambient (`CCTEAM_CHAT_SLUG` /
-/// `CCTEAM_CHAT_ROLE`, injected at spawn); we inject it into the args so
-/// the daemon can resolve the home chat. Returns a structured (non-fatal)
-/// error content if we're not in a chat session or the daemon is down.
+/// V0.8.4 P2b — forward a `chat_send_file` call to the daemon's `mcp.sock`.
 async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec<Value>> {
     let slug = std::env::var("CCTEAM_CHAT_SLUG").unwrap_or_default();
     let role = std::env::var("CCTEAM_CHAT_ROLE").unwrap_or_default();
@@ -435,11 +245,6 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
                 .to_string(),
         ));
     }
-    // v0.8.8 F1 — also forward the firing session's ccteam sid so the daemon
-    // can resolve the SPECIFIC session's reply target (`reply_target_for(sid)`);
-    // post-dedup `(slug, role)` no longer uniquely names a session. Empty when
-    // a pre-F1 / restored pane lacks the env → the daemon falls back to the
-    // on-disk registry.
     let sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
     let mut fwd_args = args.clone();
     if let Some(obj) = fwd_args.as_object_mut() {
@@ -462,10 +267,8 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
     }
 }
 
-/// V0.8.4 P2b (F2): map the daemon's tools/call response into the stdio
-/// tool result, **propagating `isError`** so a synchronous failure
-/// (missing / oversized / unregistered) surfaces to the agent as a tool
-/// error rather than a success carrying error text.
+/// Map the daemon's tools/call response into the stdio tool result,
+/// **propagating `isError`**.
 pub(crate) fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
     let text = resp
         .pointer("/result/content/0/text")
@@ -512,103 +315,6 @@ fn text_content(body: String) -> Vec<Value> {
     vec![json!({ "type": "text", "text": body })]
 }
 
-// -------------- Tool implementations --------------
-
-fn tool_ls(paths: &CcteamPaths) -> Result<String> {
-    let projects = collect_projects(paths)?;
-    // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
-    // with the phase state machine deleted F66 will recompute this from
-    // `state.sessions` (live agent count).
-    let active_count = 0usize;
-    let arr: Vec<Value> = projects
-        .iter()
-        .map(|p| {
-            // V0.4.6 F91 — cost_used_usd is now sourced from
-            // cost_summary (progress.jsonl-derived) rather than the
-            // frozen state field. F90 will surface the new
-            // cost_24h / cost_active fields here too; for now we
-            // keep the legacy `cost_used_usd` JSON key but populate
-            // it from `cost_total_usd` so the MCP shape is stable.
-            let cost = cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
-                .unwrap_or_default();
-            json!({
-                "slug": p.state.slug,
-                "team": p.state.team,
-                "current_phase": p.state.current_phase,
-                "phase_state": match p.state.phase_state {
-                    ccteam_core::PhaseState::Idle => "idle",
-                    ccteam_core::PhaseState::Done => "done",
-                },
-                "cost_used_usd": cost.cost_total_usd,
-                "cost_24h_usd": cost.cost_24h_usd,
-                "cost_active_usd": cost.cost_active_usd,
-                "tmux_session": p.state.tmux_session,
-                "age_seconds": p.age_seconds,
-            })
-        })
-        .collect();
-    let health = check_daemon_health(paths);
-    let body = json!({
-        "projects": arr,
-        "orchestrator": {
-            "active_count": active_count,
-            "max_concurrent": MAX_CONCURRENT_PROJECTS,
-            "daemon_health": daemon_health_json(&health),
-        },
-    });
-    Ok(serde_json::to_string_pretty(&body)?)
-}
-
-/// Stable JSON shape for daemon health: `status` is one of
-/// `healthy|unreachable`; `message` is the human-readable describe().
-fn daemon_health_json(health: &DaemonHealth) -> Value {
-    match health {
-        DaemonHealth::Healthy { socket } => json!({
-            "status": "healthy",
-            "socket": socket.display().to_string(),
-            "message": health.describe(),
-        }),
-        DaemonHealth::Unreachable { socket, reason } => json!({
-            "status": "unreachable",
-            "socket": socket.display().to_string(),
-            "reason": reason,
-            "message": health.describe(),
-        }),
-    }
-}
-
-/// V0.2.2 F38: render a PNG screenshot of the project's pane and
-/// return the absolute path. `lines` defaults to 50 when omitted.
-/// Returns `{ok:true, path}` on success and `{ok:false, reason}` on
-/// graceful degrade (tmux missing, font failed, etc.) — never
-/// `Err()` for those paths so callers can attach the reason in NL.
-fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    match render_screenshot(paths, &slug, None, lines)? {
-        Some(path) => Ok(serde_json::to_string_pretty(&json!({
-            "ok": true,
-            "slug": slug,
-            "path": path.to_string_lossy(),
-        }))?),
-        None => Ok(serde_json::to_string_pretty(&json!({
-            "ok": false,
-            "slug": slug,
-            "reason": "screenshot rendering degraded; check daemon stderr for warn details \
-                      (tmux missing, session not found, font failed, or IO failure)",
-        }))?),
-    }
-}
-
-// -------------- Helpers --------------
-
-fn arg_string(args: &Value, name: &str) -> Result<String> {
-    args.get(name)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("missing required argument `{name}`"))
-}
-
 fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -631,30 +337,12 @@ async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()
     Ok(())
 }
 
-/// `ccteam config` (the "register the ccteam MCP server" menu item /
-/// `config mcp`): register the ccteam MCP server in `~/.claude.json` so
-/// any new claude session can call ccteam tools without per-project setup.
-///
-/// Strategy: read `~/.claude.json`, ensure `mcpServers.ccteam` points
-/// at the running binary's absolute path, write back atomically. The
-/// trust-marking path in `projects::pre_trust_project` follows the same
-/// pattern, so the operator never sees a "Trust this folder?" prompt
-/// for the ccteam MCP server itself.
+/// `ccteam config` — register the ccteam MCP server in `~/.claude.json`.
 pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::Path) -> Result<()> {
-    // v0.8.18 柱1 — the canonical merge logic moved to
-    // `ccteam_core::mcp_register` so `ccteam-web`'s host-page `register-mcp`
-    // shares ONE impl; this stays as a thin delegating wrapper for the CLI's
-    // existing callers + tests.
     ccteam_core::mcp_register::install_mcp_into(claude_json, ccteam_bin)
 }
 
-/// Production path: locate `~/.claude.json` and the running binary,
-/// then call `install_mcp_into`.
-///
-/// V0.2.1 F26: honors `CLAUDE_CONFIG_HOME` via
-/// [`ccteam_core::projects::resolve_claude_json_path`] so e2e harnesses
-/// get the same redirection the `--install-memory-bridge` writer already
-/// honors through `user_claude_dir()`.
+/// Production path: locate `~/.claude.json` and the running binary.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let bin = ccteam_core::current_ccteam_bin()?;
@@ -662,35 +350,15 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
     Ok(claude_json)
 }
 
-/// Codex equivalent of [`install_mcp_into`]: register the ccteam MCP
-/// server in Codex's `config.toml` so any Codex session can call ccteam
-/// tools. ccteam is a pure CLI (not a vendor plugin), so `ccteam config`
-/// is the installer for BOTH vendors.
-///
-/// Schema (verified against `references/codex/codex-rs/config/` and
-/// `docs/research/ccteam-codex-integration.md`): a stdio MCP server is a
-/// `[mcp_servers.<name>]` table carrying flat `command = "<path>"` and
-/// `args = [...]` keys. We write `[mcp_servers.ccteam]` with the running
-/// binary path and the SHARED [`ccteam_core::CCTEAM_MCP_SERVE_ARGS`] const
-/// (the same `internal mcp-serve` argv `install_mcp_into` and the project
-/// `.mcp.json` template use) so the writers can't drift apart.
-///
-/// MERGE, never clobber: an existing `config.toml` is parsed and every
-/// other top-level key and every other `[mcp_servers.*]` entry is
-/// preserved; only `mcp_servers.ccteam` is set/replaced. The parent dir
-/// and file are created if absent. Idempotent.
+/// Codex equivalent of [`install_mcp_into`].
 pub fn install_codex_mcp_into(
     config_toml: &std::path::Path,
     ccteam_bin: &std::path::Path,
 ) -> Result<()> {
-    // v0.8.18 柱1 — canonical impl moved to `ccteam_core::mcp_register`.
     ccteam_core::mcp_register::install_codex_mcp_into(config_toml, ccteam_bin)
 }
 
-/// Production path: resolve `$CODEX_HOME/config.toml` (CODEX_HOME falling
-/// back to `~/.codex`, mirroring
-/// `ccteam_harness::execution::codex_app_server`'s resolution) and the
-/// running binary, then call [`install_codex_mcp_into`].
+/// Production path for Codex MCP install.
 pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
@@ -705,6 +373,7 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccteam_im::mcp::MCP_PROTOCOL_VERSION;
 
     /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
@@ -720,14 +389,12 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        // status 1 + screenshot 1 + chat 1 + session 5 = 8.
         assert_eq!(tool_definitions().len(), 8);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
     #[test]
     fn tool_definitions_exact_set() {
-        // Acceptance: tools/list returns exactly these 8 names.
         let tools = tool_definitions();
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
@@ -762,15 +429,12 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        // `slug` required, `lines` optional.
         assert_eq!(req, vec!["slug"]);
         assert_eq!(s["inputSchema"]["properties"]["lines"]["type"], "integer");
     }
 
     #[test]
     fn install_mcp_into_writes_command_args_env_for_ccteam_server() {
-        // MCP server name is `ccteam` (the binary name and the server
-        // name match again post-F44).
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
         let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
@@ -781,16 +445,10 @@ mod tests {
             v["mcpServers"]["ccteam"]["command"],
             "/usr/local/bin/ccteam"
         );
-        // Canonical argv: `ccteam internal mcp-serve` (not the deprecated bare
-        // `mcp-serve` alias that warns on every startup). v0.8.5 review fix.
         assert_eq!(
             v["mcpServers"]["ccteam"]["args"],
             serde_json::json!(["internal", "mcp-serve"])
         );
-        // Invariant (previously also guarded by the now-removed
-        // plugin_manifest_version_test): every MCP install path emits the
-        // SHARED `ccteam_core::CCTEAM_MCP_SERVE_ARGS` const, so the Claude
-        // writer can't drift from the project `.mcp.json` / Codex writers.
         let shared: Vec<&str> = ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec();
         assert_eq!(
             v["mcpServers"]["ccteam"]["args"],
@@ -818,8 +476,6 @@ mod tests {
 
     #[test]
     fn install_codex_mcp_into_writes_command_and_shared_args() {
-        // Fresh config.toml → `[mcp_servers.ccteam]` with command + the
-        // shared `CCTEAM_MCP_SERVE_ARGS` const (NOT a hardcoded argv).
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
         let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
@@ -836,15 +492,11 @@ mod tests {
             .iter()
             .map(|x| x.as_str().unwrap())
             .collect();
-        // Must equal the shared const, not a literal copy.
         assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
     }
 
     #[test]
     fn install_codex_mcp_into_merges_preserving_other_keys_and_servers() {
-        // Pre-existing config with an unrelated top-level key AND another
-        // `[mcp_servers.foo]`. MERGE must preserve both and only set
-        // `mcp_servers.ccteam`.
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
         std::fs::write(
@@ -855,9 +507,7 @@ mod tests {
         install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
-        // Unrelated top-level key preserved.
         assert_eq!(v["model"].as_str().unwrap(), "gpt-5");
-        // Pre-existing sibling server preserved untouched.
         assert_eq!(
             v["mcp_servers"]["foo"]["command"].as_str().unwrap(),
             "foo-server"
@@ -866,7 +516,6 @@ mod tests {
             v["mcp_servers"]["foo"]["args"][0].as_str().unwrap(),
             "--flag"
         );
-        // Our entry set.
         assert_eq!(
             v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
             "/x/ccteam"
@@ -884,7 +533,6 @@ mod tests {
     fn install_codex_mcp_into_is_idempotent_and_replaces_only_ccteam() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        // Stale ccteam entry pointing at an old binary + a sibling server.
         std::fs::write(
             &config_toml,
             "[mcp_servers.ccteam]\ncommand = \"/old/bin/ccteam\"\nargs = [\"mcp-serve\"]\n\n[mcp_servers.playwright]\ncommand = \"npx\"\n",
@@ -897,7 +545,6 @@ mod tests {
         .unwrap();
         let first = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&first).unwrap();
-        // ccteam entry replaced with the new binary + canonical args.
         assert_eq!(
             v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
             "/usr/local/bin/ccteam"
@@ -909,12 +556,10 @@ mod tests {
             .map(|x| x.as_str().unwrap())
             .collect();
         assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
-        // Sibling untouched.
         assert_eq!(
             v["mcp_servers"]["playwright"]["command"].as_str().unwrap(),
             "npx"
         );
-        // Rerunning with the same binary is byte-identical.
         install_codex_mcp_into(
             &config_toml,
             &std::path::PathBuf::from("/usr/local/bin/ccteam"),
@@ -927,7 +572,6 @@ mod tests {
     #[test]
     fn install_codex_mcp_into_creates_missing_file_and_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // Nested, not-yet-created CODEX_HOME dir.
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
         assert!(!config_toml.exists());
         install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
@@ -939,10 +583,6 @@ mod tests {
             "/x/ccteam"
         );
     }
-
-    // V0.3 M5.0: `next_inbox_seq` body lives in
-    // `ccteam_core::actions::next_inbox_seq`; coverage moved with it
-    // (see `crates/ccteam-core/src/actions.rs` test module).
 
     #[test]
     fn json_rpc_error_includes_id_and_envelope() {
@@ -971,9 +611,7 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(resp["result"]["capabilities"]["tools"].is_object());
-        assert_eq!(resp["result"]["serverInfo"]["name"], SERVER_NAME);
-        // P2a — the inbound-attachment Read convention must be taught via
-        // the server `instructions`, or a bare claude won't Read images.
+        assert_eq!(resp["result"]["serverInfo"]["name"], "ccteam");
         let instructions = resp["result"]["instructions"].as_str().unwrap();
         assert!(
             instructions.contains("image_path"),
@@ -984,8 +622,6 @@ mod tests {
         assert!(instructions.contains("<channel"));
     }
 
-    /// V0.8.4 P2b — the stdio→daemon bridge: `forward_to_socket` writes one
-    /// JSON-RPC line to a unix socket and reads one line back.
     #[cfg(unix)]
     #[tokio::test]
     async fn forward_to_socket_round_trips_one_line() {
@@ -997,7 +633,6 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
             let mut lines = tokio::io::BufReader::new(reader).lines();
-            // Confirm the forwarded request shape, then canned-respond.
             let req_line = lines.next_line().await.unwrap().unwrap();
             let req: Value = serde_json::from_str(&req_line).unwrap();
             assert_eq!(req["params"]["name"], "ccteam__chat_send_file");
@@ -1026,8 +661,6 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// V0.8.4 P2b (F2): the daemon's `isError:true` must propagate to a
-    /// tool error (not a success carrying error text).
     #[test]
     fn forward_outcome_propagates_is_error() {
         let ok =
@@ -1041,7 +674,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
-        // status 1 + screenshot 1 + chat 1 + session 5 = 8.
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1061,7 +693,6 @@ mod tests {
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();
         expected.sort();
         assert_eq!(names, expected);
-        // Culled tools must not reappear.
         for gone in [
             "ccteam__admin_ls",
             "ccteam__admin_change_persona",
@@ -1080,8 +711,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tools_call_screenshot_degrades_when_session_missing() {
-        // No tmux session for this slug → the tool returns ok=false
-        // with a reason, NOT isError=true (read-only, daemon-independent).
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -1097,7 +726,6 @@ mod tests {
             }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
-        // Graceful degrade lands as a normal result (not isError).
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1118,7 +746,6 @@ mod tests {
             "method": "notifications/initialized",
             "params": {}
         });
-        // Notifications carry no `id`, must not produce a response.
         assert!(handle_request(&paths, &req).await.is_none());
     }
 
@@ -1183,16 +810,11 @@ mod tests {
 
     #[test]
     fn should_exit_for_orphan_returns_true_on_ppid_change() {
-        // Simulate "we started under ppid=12345; now getppid() returns
-        // something else" by passing an impossible original ppid.
-        // current_ppid() returns this test process's real ppid, which
-        // will never equal 12345 → orphan.
         assert!(should_exit_for_orphan(12345));
     }
 
     #[test]
     fn should_exit_for_orphan_is_noop_when_original_ppid_zero() {
-        // Non-unix builds set original_ppid=0 ⇒ orphan check disabled.
         assert!(!should_exit_for_orphan(0));
     }
 
@@ -1200,13 +822,9 @@ mod tests {
     fn should_exit_for_orphan_returns_false_when_ppid_unchanged() {
         let ppid = current_ppid();
         if ppid == 0 {
-            // Non-unix path; nothing to assert.
             return;
         }
-        // current ppid == original ppid AND not 1 ⇒ still attached.
         if ppid == 1 {
-            // Test process happens to be PID 1 (e.g. inside a minimal
-            // container); orphan check correctly reports orphan.
             assert!(should_exit_for_orphan(ppid));
         } else {
             assert!(!should_exit_for_orphan(ppid));
@@ -1215,17 +833,11 @@ mod tests {
 
     #[test]
     fn mcp_idle_timeout_opt_in_only_default_disabled() {
-        // Single test exercises the env-override, the explicit-0-disables, and
-        // the default-disabled paths so they don't race against each other
-        // under `cargo test`'s parallel runner. No other test touches
-        // CCTEAM_MCP_IDLE_TIMEOUT_SECS so this is the only user of the var.
         let prev = std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS").ok();
         std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "7");
         assert_eq!(mcp_idle_timeout(), Some(Duration::from_secs(7)));
-        // `0` means disabled, not a 0-second timeout.
         std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "0");
         assert_eq!(mcp_idle_timeout(), None);
-        // Unset ⇒ disabled by default (liveness is EOF + orphan + PDEATHSIG).
         std::env::remove_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS");
         assert_eq!(mcp_idle_timeout(), None);
         if let Some(v) = prev {
@@ -1233,7 +845,3 @@ mod tests {
         }
     }
 }
-
-// silence unused import in some test configurations
-#[cfg(not(test))]
-const _: fn() = || {};

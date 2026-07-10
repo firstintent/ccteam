@@ -1,43 +1,16 @@
 //! `ccteam__chat_*` MCP tools.
 //!
 //! After v0.9 T1 the chat group is a single tool: `chat_send_file`.
-//! The lifecycle trio (`chat_register_bot` / `chat_unregister_bot` /
-//! `chat_list_bots`) was culled with the rest of the dead MCP surface.
-//! (`chat_send_input` and `chat_history` were already removed earlier —
-//! both addressed a defunct role-keyed control plane.)
-//!
-//! `chat_send_file` is a LIVE tool: the stdio mcp-serve process forwards
-//! it over `mcp.sock` to the daemon (which owns the gateway event sink).
-//! This module owns the tool **definition** for `tools/list`, plus the
-//! shared slug/handle validators the CLI `admin register-bot` path still
-//! reuses.
+//! Tool **definitions** live in [`ccteam_im::mcp`]; this module keeps the
+//! slug/handle validators the CLI `admin register-bot` path still reuses,
+//! and re-exports the definition for local callers.
 
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
 
 use ccteam_core::agent_naming::pick_unused_bot_name;
 use ccteam_im::list_bots_in;
-
-/// Tool definitions for the chat group (total 1 after v0.9 T1):
-/// `send_file`. Merged into the top-level `tool_definitions()` in
-/// `mcp_serve.rs`.
-pub fn chat_tool_definitions() -> Vec<Value> {
-    vec![json!({
-        "name": "ccteam__chat_send_file",
-        "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
-        "inputSchema": json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Absolute path to the file on the daemon's filesystem." },
-                "caption": { "type": "string", "description": "Optional caption sent with the file." },
-                "kind": { "type": "string", "enum": ["photo", "document"], "description": "photo → sendPhoto (compressed image); document → sendDocument (any file). Inferred from the extension when omitted." }
-            },
-            "required": ["path"],
-        }),
-    })]
-}
 
 /// Auto-mint an unused scientist nickname from the current registry.
 /// Used by the CLI `admin register-bot` path (MCP register was culled).
@@ -96,6 +69,7 @@ pub(crate) fn validate_slug(s: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccteam_im::mcp::chat_tool_definitions;
 
     #[test]
     fn one_chat_tool_registered_send_file() {

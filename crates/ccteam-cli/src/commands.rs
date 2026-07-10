@@ -3156,10 +3156,11 @@ impl VerifyMcpReport {
 }
 
 /// V0.6.6 F171 — compute the report by introspecting
-/// `mcp_serve::tool_definitions()` (single source of truth for the
+/// `ccteam_im::mcp::tool_definitions()` (single source of truth for the
 /// registered MCP tool surface) and cross-checking against
-/// `mcp_tool_groups::STUB_TOOLS`.
+/// `ccteam_im::mcp::STUB_TOOLS`.
 pub fn run_verify_mcp() -> VerifyMcpReport {
+    // SoT after v0.9 T3: `ccteam_im::mcp::tool_definitions` (via thin cli wrap).
     let tools = crate::mcp_serve::tool_definitions();
     let mut names: Vec<String> = tools
         .iter()
