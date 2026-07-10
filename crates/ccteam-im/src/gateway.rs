@@ -710,6 +710,28 @@ struct NewSessionPlan {
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
 }
 
+/// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
+/// Same three-phase split as [`NewSessionPlan`]: plan (under lock) → spawn
+/// (no lock) → apply (re-lock + generation check). `generation` is a race
+/// marker from the OLD thread (`identity@started_at`); apply discards the
+/// freshly spawned thread if the session vanished or was replaced meanwhile.
+struct ResumeDeadPlan {
+    session_id: String,
+    project: String,
+    role: String,
+    vendor: AgentVendor,
+    protocol: SessionProtocol,
+    permission_mode: PermissionMode,
+    secret: String,
+    cwd: PathBuf,
+    model_id: Option<String>,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// Race marker: `format!("{identity}@{started_at}")` of the thread that
+    /// was live when we planned. Apply aborts if the map's thread no longer
+    /// matches (someone else resumed/replaced) or the sid is gone (stop).
+    generation: String,
+}
+
 /// What [`Gateway::plan_ensure_current_session`] decided: either the chat
 /// already has a session (nothing to do), or a brand-new one must be spawned
 /// (the caller runs [`Gateway::spawn_for_new_session_plan`] + applies it).
@@ -738,9 +760,15 @@ enum EnsureSessionOutcome {
 /// hit the implicit-spawn path, bounded exactly like the gateway's own
 /// `current_project`/`current_session` maps (a chat is permanent once first
 /// seen).
+///
+/// v0.9 T2 — also per-sid single-flight for dead-child resume
+/// ([`Gateway::resume_dead_session_shared`] / [`Gateway::resume_dead_session`]):
+/// concurrent resumes of the SAME sid serialize so the second waiter re-plans
+/// after the first finishes (and may find the session already live or gone).
 #[derive(Default)]
 struct SpawnClaims {
     per_chat: std::sync::Mutex<BTreeMap<ChatKey, Arc<tokio::sync::Mutex<()>>>>,
+    per_sid: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SpawnClaims {
@@ -754,6 +782,20 @@ impl SpawnClaims {
             let mut map = self.per_chat.lock().unwrap();
             Arc::clone(
                 map.entry(chat.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        entry.lock_owned().await
+    }
+
+    /// Acquire (waiting if necessary) the single-flight claim for `sid`.
+    /// Same FIFO house pattern as [`Self::lock_for`], keyed by session id so
+    /// two concurrent dead-child resumes of the same sid never double-spawn.
+    async fn lock_for_sid(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let entry = {
+            let mut map = self.per_sid.lock().unwrap();
+            Arc::clone(
+                map.entry(sid.to_string())
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
@@ -3389,25 +3431,71 @@ impl Gateway {
     /// bound to the resumed transport. NOT a `/new`: same sid, same identity, no
     /// fresh context.
     ///
-    /// LOCK SCOPE: like `start_session` / `switch_current_role`, this awaits the
-    /// spawn while holding the coarse gateway lock, so a slow resume briefly
-    /// stalls other gateway ops. Acceptable (one on-demand spawn, same as `/new`
-    /// / `/role`); finer per-session locking is a deferred concurrency refactor.
+    /// LOCK SCOPE (v0.9 T2): three-phase plan → spawn → apply, same shape as
+    /// [`Self::start_session`] / [`Self::handle_message_shared`]. The slow
+    /// `start_thread` await does **not** need the gateway lock structurally —
+    /// [`Self::resume_dead_session_shared`] is the lock-free entry (claim sid →
+    /// brief plan lock → spawn with no gateway lock → brief apply lock). This
+    /// `&mut self` form still composes the three phases under whatever outer
+    /// caller lock is held (submit / directive paths today) but no longer
+    /// special-cases the await inside one monolithic blob; it also takes the
+    /// per-sid [`SpawnClaims`] single-flight so concurrent resumes serialize.
     async fn resume_dead_session(&mut self, session_id: &str) -> Result<()> {
-        let (project, role, vendor, protocol, permission_mode, secret) = {
-            let s = self
-                .sessions
-                .get(session_id)
-                .ok_or_else(|| anyhow!("session vanished: {session_id}"))?;
-            (
-                s.project.clone(),
-                s.role.clone(),
-                s.vendor,
-                s.protocol,
-                s.permission_mode,
-                s.secret.clone(),
-            )
+        let claims = Arc::clone(&self.spawn_claims);
+        let _claim = claims.lock_for_sid(session_id).await;
+        let Some(plan) = self.plan_resume_dead_session(session_id)? else {
+            // Concurrent resume finished first; child is already live.
+            return Ok(());
         };
+        let thread = Self::spawn_for_resume_plan(&plan).await?;
+        self.apply_resume_dead_session(plan, thread).await
+    }
+
+    /// v0.9 T2 — shared-handle flavor of dead-child resume: holds the gateway
+    /// lock only across plan + apply; the slow `start_thread` runs with **no**
+    /// gateway lock. Per-sid single-flight via [`SpawnClaims::lock_for_sid`].
+    pub async fn resume_dead_session_shared(
+        gateway: Arc<tokio::sync::Mutex<Gateway>>,
+        session_id: &str,
+    ) -> Result<()> {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _claim = claims.lock_for_sid(session_id).await;
+        let plan = {
+            let mut g = gateway.lock().await;
+            g.plan_resume_dead_session(session_id)?
+        };
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        // Slow part — deliberately NO gateway lock held here.
+        let thread = Self::spawn_for_resume_plan(&plan).await?;
+        gateway
+            .lock()
+            .await
+            .apply_resume_dead_session(plan, thread)
+            .await
+    }
+
+    /// v0.9 T2 — sync plan half of dead-child resume. Snapshots spawn inputs +
+    /// a generation marker from the current thread. Returns `Ok(None)` when the
+    /// child is already live (a concurrent resume already finished). Does **not**
+    /// claim the sid (claim is async; the shared/`&mut self` wrappers own it).
+    fn plan_resume_dead_session(&mut self, session_id: &str) -> Result<Option<ResumeDeadPlan>> {
+        let s = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session vanished: {session_id}"))?;
+        // Second waiter after a concurrent resume: re-plan finds the child live.
+        if s.adapter.thread_is_live(&s.thread) {
+            return Ok(None);
+        }
+        let project = s.project.clone();
+        let role = s.role.clone();
+        let vendor = s.vendor;
+        let protocol = s.protocol;
+        let permission_mode = s.permission_mode;
+        let secret = s.secret.clone();
+        let generation = format!("{}@{}", s.thread.identity, s.thread.started_at);
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
         self.ensure_project_loaded(&project);
@@ -3420,40 +3508,108 @@ impl Gateway {
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
         // no stored-secret update).
-        let (adapter, thread) = self
-            .spawn_session_thread(
-                vendor,
-                protocol,
-                &role,
-                &project,
-                session_id,
-                cwd,
-                model_id,
-                permission_mode,
-                secret,
+        let adapter = (self.adapter_factory)(vendor, protocol);
+        Ok(Some(ResumeDeadPlan {
+            session_id: session_id.to_string(),
+            project,
+            role,
+            vendor,
+            protocol,
+            permission_mode,
+            secret,
+            cwd,
+            model_id,
+            adapter,
+            generation,
+        }))
+    }
+
+    /// v0.9 T2 — the SLOW await for a [`ResumeDeadPlan`]. Self-less so a caller
+    /// can run it with NO gateway lock held — same SpawnCtx assembly as the
+    /// resume path of [`Self::spawn_session_thread`].
+    async fn spawn_for_resume_plan(plan: &ResumeDeadPlan) -> Result<ThreadHandle, HarnessError> {
+        plan.adapter
+            .start_thread(
+                &AgentSpecBrief {
+                    role: plan.role.clone(),
+                },
+                &SpawnCtx {
+                    slug: plan.project.clone(),
+                    sid: plan.session_id.clone(),
+                    cwd: plan.cwd.clone(),
+                    project_dir: plan.cwd.clone(),
+                    extra_args: vec![],
+                    model_id: plan.model_id.clone(),
+                    permission_mode: plan.permission_mode,
+                    secret: plan.secret.clone(),
+                },
             )
-            .await?;
+            .await
+    }
+
+    /// v0.9 T2 — re-lock apply after a dead-child spawn. Verifies the session
+    /// still exists and the generation marker still matches; if not (stopped /
+    /// replaced meanwhile) closes the freshly spawned thread and returns Err
+    /// without inserting a zombie. On match: swap thread/adapter in place and
+    /// abort + respawn the event pump.
+    async fn apply_resume_dead_session(
+        &mut self,
+        plan: ResumeDeadPlan,
+        thread: ThreadHandle,
+    ) -> Result<()> {
+        let ResumeDeadPlan {
+            session_id,
+            project,
+            role,
+            vendor,
+            protocol,
+            permission_mode: _,
+            secret: _,
+            cwd: _,
+            model_id: _,
+            adapter,
+            generation,
+        } = plan;
+        let still_matches = self.sessions.get(&session_id).is_some_and(|s| {
+            format!("{}@{}", s.thread.identity, s.thread.started_at) == generation
+        });
+        if !still_matches {
+            // Session was stopped or its thread was replaced while we spawned —
+            // do NOT insert a zombie; close the fresh thread gracefully.
+            let _ = adapter.close_thread(&thread).await;
+            tracing::warn!(
+                session_id = %session_id,
+                vendor = ?vendor,
+                protocol = ?protocol,
+                "ccteam-im: discarded resumed thread (session gone or replaced during spawn)"
+            );
+            return Err(anyhow!(
+                "session vanished or replaced during resume: {session_id}"
+            ));
+        }
         // Swap the fresh handle/adapter into the existing GatewaySession in
         // place — every Arc-shared cell (owner / reply_to / counters) survives.
         // Turn lifecycle (turn_started_at / latest_activity) is owned by the
         // submit flow + the pump, so resume leaves it ALONE: the turn path
         // re-stamps turn_started_at itself, and clearing it here would race the
         // in-flight reactive retry (a turn IS running when that path resumes).
-        if let Some(s) = self.sessions.get_mut(session_id) {
+        if let Some(s) = self.sessions.get_mut(&session_id) {
             s.thread = thread;
             s.adapter = adapter;
         }
         // Drop the stale pump (its task is already ending — it was bound to the
         // now-closed transport) so spawn_event_pump installs a fresh one on the
         // resumed transport (it early-returns while a handle is still keyed).
-        if let Some(old) = self.event_pumps.remove(session_id) {
+        if let Some(old) = self.event_pumps.remove(&session_id) {
             old.abort();
         }
-        self.spawn_event_pump(session_id);
+        self.spawn_event_pump(&session_id);
         tracing::info!(
-            session_id,
+            session_id = %session_id,
             project = %project,
             role = %role,
+            vendor = ?vendor,
+            protocol = ?protocol,
             "ccteam-im: resumed dead session in place (child had exited)"
         );
         Ok(())
@@ -6529,6 +6685,9 @@ mod tests {
         /// OOM / long idle); `start_thread` flips it back `true` so a resume
         /// "revives" it — exactly the stream-json dead-child → resume case.
         live: Arc<std::sync::atomic::AtomicBool>,
+        /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
+        /// resume both close).
+        closes: AtomicUsize,
     }
 
     impl Default for FakeAdapter {
@@ -6557,6 +6716,7 @@ mod tests {
                 emit_turn_boundary: false,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                closes: AtomicUsize::new(0),
             }
         }
 
@@ -6717,6 +6877,7 @@ mod tests {
         }
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -6877,6 +7038,137 @@ mod tests {
         assert!(
             !gateway.session_views()[0].waiting_approval,
             "resolved pending clears the flag"
+        );
+    }
+
+    /// v0.9 T2 — plan → spawn → apply round-trip matches the old monolithic
+    /// resume: same sid, one extra start_thread, child revived, no new session.
+    #[tokio::test]
+    async fn resume_dead_session_three_phase_round_trip() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        fake.live.store(false, Ordering::SeqCst);
+        let plan = gateway
+            .plan_resume_dead_session(&sid)
+            .unwrap()
+            .expect("dead child needs a resume plan");
+        assert_eq!(plan.session_id, "s1");
+        assert_eq!(plan.project, "alpha");
+        assert_eq!(plan.role, "reviewer");
+        assert!(!plan.generation.is_empty());
+
+        let thread = Gateway::spawn_for_resume_plan(&plan).await.unwrap();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
+        assert!(
+            fake.live.load(Ordering::SeqCst),
+            "start_thread revived live"
+        );
+
+        gateway
+            .apply_resume_dead_session(plan, thread)
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_views().len(), 1);
+        assert_eq!(gateway.session_views()[0].sid, "s1");
+        // Apply path does not close (the dead child was already gone).
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 0);
+    }
+
+    /// v0.9 T2 — concurrent `stop_session` during the lock-free resume spawn
+    /// window must not deadlock and must not leave a zombie session in the map.
+    /// Prefer stop-wins: apply sees generation mismatch / missing session and
+    /// discards the freshly spawned thread via `close_thread`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_stop_during_resume_spawn_does_not_deadlock_or_leave_zombie() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_delay(std::time::Duration::from_millis(200)),
+        );
+        let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+
+        let sid = gw
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // Child dies; resume will cold-start with the 200ms delay.
+        fake.live.store(false, Ordering::SeqCst);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+
+        let gw_a = Arc::clone(&gateway);
+        let sid_a = sid.clone();
+        let resume_task =
+            tokio::spawn(async move { Gateway::resume_dead_session_shared(gw_a, &sid_a).await });
+
+        // Wait until the resume spawn is mid-flight (2nd start_thread entered).
+        for _ in 0..100 {
+            if fake.starts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            fake.starts.load(Ordering::SeqCst) >= 2,
+            "resume spawn must be in flight before concurrent stop"
+        );
+
+        // Concurrent stop while resume holds NO gateway lock across spawn.
+        let stop_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            gateway.lock().await.stop_session(&sid).await
+        })
+        .await
+        .expect("stop_session must not hang behind resume spawn");
+        assert!(
+            stop_result.is_ok(),
+            "stop_session must succeed: {stop_result:?}"
+        );
+
+        let resume_join = tokio::time::timeout(std::time::Duration::from_secs(5), resume_task)
+            .await
+            .expect("resume task must not hang");
+        let resume_result = resume_join.expect("resume task must not panic");
+        // Stop removed the session → apply discards the fresh thread.
+        assert!(
+            resume_result.is_err(),
+            "resume apply must fail after concurrent stop (no zombie insert): {resume_result:?}"
+        );
+
+        // Preferred race outcome: session gone, no zombie in the map.
+        let views = gateway.lock().await.session_views();
+        assert!(
+            views.is_empty(),
+            "sessions map must not keep a zombie after stop-during-resume: {views:?}"
+        );
+        // stop closes the old thread; apply closes the discarded resume thread.
+        assert!(
+            fake.closes.load(Ordering::SeqCst) >= 2,
+            "expected stop + discard closes, got {}",
+            fake.closes.load(Ordering::SeqCst)
         );
     }
 

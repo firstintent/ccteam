@@ -1194,8 +1194,10 @@ fn spawn_inbound_consumer(
             // pass — `inbound_may_spawn` returns `false` for them, so they
             // still run inline, holding the gateway lock across their own
             // spawn exactly as before (a pre-existing, documented tradeoff —
-            // see `resume_dead_session`'s LOCK SCOPE note in gateway.rs). A
-            // scoped, incremental step, not a full fix.
+            // same as `start_session`'s inline compose). Dead-child resume
+            // is three-phase (v0.9 T2); `resume_dead_session_shared` is the
+            // lock-free form when a shared handle is available. A scoped,
+            // incremental step, not a full fix.
             let may_spawn = {
                 let g = gateway.lock().await;
                 g.inbound_may_spawn(
