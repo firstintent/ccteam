@@ -3,19 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
     <title>ccteam web</title>
-    <meta name="theme-color" content="#18181b" />
+    <meta name="theme-color" content="#f4f4f5" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <!-- v0.8.19 — apply the stored light/dark choice BEFORE first paint so the
-         theme never flashes. Default (unset) = dark (ccteam's identity). -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <!-- v0.8.24 — light is the product default. Apply stored theme BEFORE first
+         paint (no flash). Unset / missing → light; only `theme:"dark"` omits .light. -->
     <script>
       try {
         var s = JSON.parse(localStorage.getItem("aoe-web-settings") || "{}");
-        if (s.theme === "light") document.documentElement.classList.add("light");
+        if (s.theme !== "dark") document.documentElement.classList.add("light");
       } catch (e) {
-        /* ignore */
+        document.documentElement.classList.add("light");
       }
     </script>
   </head>

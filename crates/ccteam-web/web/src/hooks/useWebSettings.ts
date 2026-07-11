@@ -17,7 +17,7 @@ export interface WebSettings {
   displayName: string;
   /** Avatar color (a hex from a small fixed palette). */
   avatar: string;
-  /** Color theme. `dark` (default — ccteam's identity) | `light`. */
+  /** Color theme. `light` (v0.8.24 product default) | `dark` (Settings toggle). */
   theme: "dark" | "light";
 }
 
@@ -31,7 +31,8 @@ function getDefaults(): WebSettings {
     language: "zh",
     displayName: "",
     avatar: "#f59e0b",
-    theme: "dark",
+    // v0.8.24 Track A — owner-decided light default; dark stays switchable.
+    theme: "light",
   };
 }
 

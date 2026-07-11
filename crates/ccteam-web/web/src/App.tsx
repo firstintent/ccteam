@@ -77,6 +77,7 @@ export default function App() {
           <Route path="/status" element={<ChatConsole />} />
           <Route path="/hosts" element={<ChatConsole />} />
           <Route path="/settings" element={<ChatConsole />} />
+          <Route path="/workflow" element={<ChatConsole />} />
           {/* Unknown routes fall back to the empty shell. */}
           <Route path="*" element={<ChatConsole />} />
         </Routes>

@@ -14,8 +14,10 @@
 //   - RAIL   the cross-project session list (listSessions fanned over
 //            /api/v1/projects) + the registered-project union (config.yaml SoT,
 //            so a session-less project still lists) — the sidebar + switcher.
-//   - CHROME the app bar + CostPill + bottom global-nav + the NewSessionModal
-//            (create a session / a brand-new project inline).
+//   - CHROME v0.8.24 A1 — no top bar; collapsible sidebar (search ⌘K +
+//            新建/工作流/会话/设置) + CostPill/Avatar in the rail bottom;
+//            NewSessionModal (create a session / brand-new project inline).
+//            Home empty state replaces the old "选一个 session" stub.
 //
 // What moved OUT to SessionView (per-sid): the transcript rows + localStorage
 // seed/persist, `useSessionEvents(sid)` + its fold, the draft + submitTurn, the
@@ -25,15 +27,19 @@
 // new-session form defaults to ROLELESS (v0.8.20 F4 — a bare-claude session),
 // and the role picker + terminal runtimes are admin-only (UI-level beta-gate).
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   Activity,
-  MessageSquare,
+  ChevronLeft,
+  ChevronRight,
+  LayoutGrid,
   Menu,
+  MessageSquare,
   Pencil,
   Plus,
   Puzzle,
+  Search,
   Server,
   Settings,
   Trash2,
@@ -223,13 +229,14 @@ const MAX_ACTIVE_SESSIONS = 10;
 /** The three bottom-nav global views — each is a full route the shell hosts
  *  in its main area (sidebar persists, Chat|终端 tabs hide). `null` = a
  *  session-chat surface (a selected session or the empty state). */
-type GlobalView = "marketplace" | "status" | "hosts" | "settings" | null;
+type GlobalView = "marketplace" | "status" | "hosts" | "settings" | "workflow" | null;
 
 function globalViewFor(pathname: string): GlobalView {
   if (pathname.startsWith("/marketplace")) return "marketplace";
   if (pathname.startsWith("/status")) return "status";
   if (pathname.startsWith("/hosts")) return "hosts";
   if (pathname.startsWith("/settings")) return "settings";
+  if (pathname.startsWith("/workflow")) return "workflow";
   return null;
 }
 
@@ -246,18 +253,25 @@ function SidebarNavLink({
   icon,
   label,
   onNavigate,
+  collapsed,
+  title,
 }: {
   to: string;
   icon: React.ReactNode;
   label: string;
   onNavigate?: () => void;
+  collapsed?: boolean;
+  title?: string;
 }) {
   return (
     <NavLink
       to={to}
       onClick={onNavigate}
+      title={title ?? label}
       className={({ isActive }) =>
-        `flex items-center gap-2.5 px-2.5 py-2 rounded-md text-xs transition-colors ${
+        `flex items-center rounded-md text-xs transition-colors ${
+          collapsed ? "justify-center h-9 w-full" : "gap-2.5 px-2.5 py-2"
+        } ${
           isActive
             ? "bg-surface-800 text-brand-400"
             : "text-text-secondary hover:bg-surface-800/70 hover:text-text-primary"
@@ -267,7 +281,7 @@ function SidebarNavLink({
       <span className="grid w-4 place-items-center" aria-hidden>
         {icon}
       </span>
-      {label}
+      {collapsed || !label ? null : label}
     </NavLink>
   );
 }
@@ -313,10 +327,43 @@ export default function ChatConsole() {
   // session" hint, pre-select that project; `null` falls back to the active
   // session's project / the first project (the header ＋ button path).
   const [modalProject, setModalProject] = useState<string | null>(null);
-  // Mobile sidebar drawer (the fixed `w-60` rail is off-canvas under `md`; a
-  // hamburger toggles it). Closed by default; auto-closed on a session switch
-  // / global-nav pick so the chosen surface is visible without a manual close.
+  // Mobile sidebar drawer (the rail is off-canvas under `md`; a hamburger
+  // toggles it). Closed by default; auto-closed on a session switch /
+  // global-nav pick so the chosen surface is visible without a manual close.
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // v0.8.24 A1 — desktop collapsible rail (296px expanded / 64px icons).
+  // Persisted so a reload keeps the operator's preference.
+  const [sideCollapsed, setSideCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("ccteam-side-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [sideSearch, setSideSearch] = useState("");
+  const sideSearchRef = useRef<HTMLInputElement | null>(null);
+  // ⌘K / Ctrl+K focuses the sidebar search (and expands if collapsed).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        if (sideCollapsed) {
+          setSideCollapsed(false);
+          try {
+            localStorage.setItem("ccteam-side-collapsed", "0");
+          } catch {
+            /* ignore */
+          }
+        }
+        window.setTimeout(() => {
+          sideSearchRef.current?.focus();
+          sideSearchRef.current?.select();
+        }, 50);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sideCollapsed]);
   // Deregister-project confirm dialog. `null` = closed; else the target slug,
   // whether it's an orphan, and how many live sessions get stopped (so the
   // copy is honest about the side effect).
@@ -516,6 +563,20 @@ export default function ChatConsole() {
     () => mergeProjectSlugs(registeredProjects, railSessions),
     [registeredProjects, railSessions],
   );
+  // v0.8.24 A1 — filter sessions/projects by the sidebar search box.
+  const q = sideSearch.trim().toLowerCase();
+  const filteredRailSessions = useMemo(() => {
+    if (!q) return railSessions;
+    return railSessions.filter((s) => {
+      const hay = `${s.sid} ${s.project} ${s.role} ${s.vendor} ${s.title ?? ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [railSessions, q]);
+  const filteredProjects = useMemo(() => {
+    if (!q) return projects;
+    const withHits = new Set(filteredRailSessions.map((s) => s.project));
+    return projects.filter((p) => p.toLowerCase().includes(q) || withHits.has(p));
+  }, [projects, filteredRailSessions, q]);
   const roleOptions = useMemo(() => {
     const seen = new Set(ROLE_SUGGESTIONS);
     railSessions.forEach((s) => s.role && seen.add(s.role));
@@ -543,111 +604,213 @@ export default function ChatConsole() {
     [navigate],
   );
 
+  const toggleSideCollapsed = () => {
+    setSideCollapsed((c) => {
+      const next = !c;
+      try {
+        localStorage.setItem("ccteam-side-collapsed", next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  };
+
   return (
     <div className="h-full min-h-0 flex flex-col bg-surface-900 text-text-primary">
-      {/* standalone app bar */}
-      <header className="h-12 shrink-0 border-b border-surface-700/40 px-3 sm:px-4 flex items-center gap-2 sm:gap-3">
-        {/* mobile drawer toggle — hidden on md+ where the rail is always shown.
-            Item 9 — the global attention count overlays it (visible whether
-            or not the drawer/sidebar is currently open). */}
-        <button
-          type="button"
-          onClick={() => setSidebarOpen(true)}
-          aria-label="打开会话列表"
-          className="md:hidden relative h-8 w-8 -ml-1 grid place-items-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-800"
-        >
-          <Menu className="h-4 w-4" />
-          {totalAttention > 0 ? (
-            <span
-              className="absolute top-0.5 right-0.5 min-w-[14px] h-[14px] px-[3px] rounded-full bg-status-error text-surface-950 text-[9px] font-mono leading-[14px] text-center"
-              title={`${totalAttention} 个 session 需要关注`}
-            >
-              {totalAttention > 9 ? "9+" : totalAttention}
-            </span>
-          ) : null}
-        </button>
-        <MessageSquare className="h-4 w-4 text-brand-400 shrink-0" />
-        <span className="text-sm font-semibold">
-          ccteam <span className="text-brand-400">chat</span>
-        </span>
-        <span className="flex-1" />
-        {/* Cost pill — today's daily-spend / 24h-budget rollup; click → /status. */}
-        <CostPill />
-        <AvatarMenu />
-      </header>
+      {/* v0.8.24 A1 — no top bar. Mobile hamburger floats over the main area. */}
+      <button
+        type="button"
+        onClick={() => setSidebarOpen(true)}
+        aria-label="打开会话列表"
+        className="md:hidden fixed top-3 left-3 z-20 relative h-9 w-9 grid place-items-center rounded-lg border border-surface-700/50 bg-surface-950/90 text-text-secondary shadow-sm hover:text-text-primary"
+      >
+        <Menu className="h-4 w-4" />
+        {totalAttention > 0 ? (
+          <span
+            className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-[3px] rounded-full bg-status-error text-surface-950 text-[9px] font-mono leading-[14px] text-center"
+            title={`${totalAttention} 个 session 需要关注`}
+          >
+            {totalAttention > 9 ? "9+" : totalAttention}
+          </span>
+        ) : null}
+      </button>
 
       <div className="flex flex-1 min-h-0">
-        {/* mobile drawer backdrop — only when open + below md. Click to close. */}
         {sidebarOpen ? (
           <button
             type="button"
             aria-label="关闭会话列表"
             onClick={() => setSidebarOpen(false)}
-            className="md:hidden fixed inset-0 top-12 z-30 bg-black/50"
+            className="md:hidden fixed inset-0 z-30 bg-black/50"
           />
         ) : null}
-        {/* left rail — every project's gateway sessions, grouped. On md+ it is
-            a static `w-60` column; below md it is an off-canvas drawer toggled
-            by the header hamburger (slides in over the backdrop). */}
+        {/* left rail — logo + collapse + ⌘K search + 新建/工作流 + sessions + 设置 */}
         <aside
-          className={`w-60 shrink-0 border-r border-surface-700/60 flex flex-col bg-surface-950 ${
-            sidebarOpen
-              ? "fixed inset-y-0 top-12 left-0 z-40 md:static md:top-0"
-              : "hidden md:flex"
+          className={`${
+            sideCollapsed ? "md:w-16" : "md:w-[296px]"
+          } w-[296px] shrink-0 border-r border-surface-700/60 flex flex-col bg-surface-950 transition-[width] duration-150 ${
+            sidebarOpen ? "fixed inset-y-0 left-0 z-40 md:static" : "hidden md:flex"
           }`}
         >
-          <div className="h-10 shrink-0 px-3 flex items-center justify-between border-b border-surface-700/30">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span className="text-xs font-mono uppercase text-text-secondary">所有 session</span>
-              {/* Item 9 — same global attention count as the header badge,
-                  shown here too so it's visible on desktop (no hamburger). */}
-              {totalAttention > 0 ? (
-                <span
-                  className="shrink-0 min-w-[16px] h-4 px-1 rounded-full bg-status-error/15 text-status-error text-[10px] font-mono leading-4 text-center"
-                  title={`${totalAttention} 个 session 需要关注`}
-                >
-                  {totalAttention}
-                </span>
-              ) : null}
-            </div>
-            <div className="flex items-center gap-1">
+          {/* logo row */}
+          <div
+            className={`h-12 shrink-0 px-3 flex items-center border-b border-surface-700/30 ${
+              sideCollapsed ? "justify-center" : "justify-between gap-2"
+            }`}
+          >
+            {sideCollapsed ? (
               <button
                 type="button"
-                disabled={atSessionCap}
-                onClick={() => {
-                  // bug5 — refetch so a project created out-of-band (CLI
-                  // `ccteam init`) is in the list when the modal opens.
-                  void refreshSessions();
-                  setModalProject(null);
-                  setModalOpen(true);
-                }}
-                className="h-6 px-2 rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-brand-500/90"
-                title={
-                  atSessionCap
-                    ? tr(
-                        lang,
-                        "最多 10 个活跃 session,请先结束其他 session",
-                        "Max 10 active sessions — please end others first",
-                      )
-                    : "新建 session"
-                }
+                onClick={toggleSideCollapsed}
+                className="h-8 w-8 grid place-items-center rounded-md text-brand-400 hover:bg-surface-800"
+                title={tr(lang, "展开侧栏", "Expand sidebar")}
+                aria-label={tr(lang, "展开侧栏", "Expand sidebar")}
               >
-                <Plus className="h-3.5 w-3.5" /> 新建
+                <MessageSquare className="h-4 w-4" />
               </button>
-              {/* close affordance inside the drawer (mobile only) */}
-              <button
-                type="button"
-                onClick={() => setSidebarOpen(false)}
-                aria-label="关闭"
-                className="md:hidden h-6 w-6 grid place-items-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-800"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 min-w-0">
+                  <MessageSquare className="h-4 w-4 text-brand-400 shrink-0" />
+                  <span className="text-sm font-semibold truncate">
+                    ccteam <span className="text-brand-400">chat</span>
+                  </span>
+                  {totalAttention > 0 ? (
+                    <span
+                      className="shrink-0 min-w-[16px] h-4 px-1 rounded-full bg-status-error/15 text-status-error text-[10px] font-mono leading-4 text-center"
+                      title={`${totalAttention} 个 session 需要关注`}
+                    >
+                      {totalAttention}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-0.5">
+                  <button
+                    type="button"
+                    onClick={toggleSideCollapsed}
+                    className="hidden md:grid h-7 w-7 place-items-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-800"
+                    title={tr(lang, "折叠侧栏", "Collapse sidebar")}
+                    aria-label={tr(lang, "折叠侧栏", "Collapse sidebar")}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSidebarOpen(false)}
+                    aria-label="关闭"
+                    className="md:hidden h-7 w-7 grid place-items-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-800"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </>
+            )}
           </div>
+
+          {/* search + primary actions (hidden labels when collapsed) */}
+          <div className={`shrink-0 border-b border-surface-700/30 ${sideCollapsed ? "p-1.5" : "p-2"} space-y-1.5`}>
+            {sideCollapsed ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setSideCollapsed(false);
+                  try {
+                    localStorage.setItem("ccteam-side-collapsed", "0");
+                  } catch {
+                    /* ignore */
+                  }
+                  window.setTimeout(() => sideSearchRef.current?.focus(), 50);
+                }}
+                className="w-full h-9 grid place-items-center rounded-md text-text-secondary hover:bg-surface-800"
+                title={`${tr(lang, "搜索", "Search")} (⌘K)`}
+              >
+                <Search className="h-4 w-4" />
+              </button>
+            ) : (
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-text-muted pointer-events-none" />
+                <input
+                  id="side-search"
+                  ref={sideSearchRef}
+                  value={sideSearch}
+                  onChange={(e) => setSideSearch(e.target.value)}
+                  placeholder={tr(lang, "搜索会话 / 项目", "Search sessions / projects")}
+                  className="w-full h-9 pl-8 pr-12 rounded-md bg-surface-900 border border-surface-700/40 text-xs text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-brand-500/50"
+                />
+                <kbd className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-text-muted border border-surface-700/50 rounded px-1 py-0.5">
+                  ⌘K
+                </kbd>
+              </div>
+            )}
+            <button
+              type="button"
+              disabled={atSessionCap}
+              onClick={() => {
+                void refreshSessions();
+                // Home = empty shell path; modal still creates immediately.
+                navigate("/chat");
+                setModalProject(null);
+                setModalOpen(true);
+                setSidebarOpen(false);
+              }}
+              className={`w-full rounded-md bg-brand-500/90 text-surface-950 hover:bg-brand-400 text-xs font-medium flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+                sideCollapsed ? "h-9 justify-center" : "h-9 px-3"
+              }`}
+              title={
+                atSessionCap
+                  ? tr(
+                      lang,
+                      "最多 10 个活跃 session,请先结束其他 session",
+                      "Max 10 active sessions — please end others first",
+                    )
+                  : tr(lang, "新建会话", "New session")
+              }
+            >
+              <Plus className="h-3.5 w-3.5 shrink-0" />
+              {sideCollapsed ? null : <span>{tr(lang, "新建会话", "New session")}</span>}
+            </button>
+            <SidebarNavLink
+              to="/workflow"
+              icon={<LayoutGrid className="h-4 w-4" />}
+              label={sideCollapsed ? "" : tr(lang, "工作流", "Workflow")}
+              onNavigate={() => setSidebarOpen(false)}
+              collapsed={sideCollapsed}
+              title={tr(lang, "工作流", "Workflow")}
+            />
+          </div>
+
           <div className="flex-1 overflow-y-auto p-2 space-y-2">
-            {projects.map((project) => {
-              const items = railSessions.filter((s) => s.project === project);
+            {sideCollapsed ? (
+              <div className="flex flex-col items-center gap-1 py-1">
+                {filteredRailSessions.slice(0, 12).map((s) => (
+                  <button
+                    key={s.sid}
+                    type="button"
+                    onClick={() => switchTo(s)}
+                    title={`${railSessionLabel(s)} · ${s.sid}`}
+                    className={`h-9 w-9 grid place-items-center rounded-md text-[10px] font-mono ${
+                      s.sid === sid
+                        ? "bg-surface-700 text-text-primary"
+                        : "text-text-secondary hover:bg-surface-800/70"
+                    } ${vendorBadgeClass(s.vendor)}`}
+                  >
+                    {(s.vendor || "?").slice(0, 1).toUpperCase()}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={toggleSideCollapsed}
+                  className="h-8 w-8 grid place-items-center rounded-md text-text-muted hover:bg-surface-800"
+                  title={tr(lang, "展开侧栏", "Expand sidebar")}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            ) : (
+              <>
+            {filteredProjects.map((project) => {
+              const items = filteredRailSessions.filter((s) => s.project === project);
               const projectPath = projectPaths[project];
               const broken = brokenProjects.has(project);
               return (
@@ -885,51 +1048,69 @@ export default function ChatConsole() {
                 </div>
               );
             })}
-            {projects.length === 0 ? (
+            {filteredProjects.length === 0 ? (
               <div className="px-2 py-3 text-xs text-text-secondary leading-5">
-                {railError ? `加载失败: ${railError}` : "还没有 session。点「＋ 新建」创建。"}
+                {railError
+                  ? `加载失败: ${railError}`
+                  : q
+                    ? tr(lang, "没有匹配的会话", "No matching sessions")
+                    : tr(lang, "还没有 session。点「新建会话」创建。", "No sessions yet — create one.")}
               </div>
             ) : null}
+              </>
+            )}
           </div>
 
-          {/* bottom global-nav (prototype `.nav` / `.navhint`): the session
-              list above IS the chat navigation (click a session = its chat),
-              so there's NO "Chat" item — only the 3 global views. */}
-          <nav className="border-t border-surface-700/40 p-2">
+          {/* bottom: CostPill + Settings (+ admin Status/主机 until Settings tabs land) */}
+          <nav className="border-t border-surface-700/40 p-2 space-y-1">
+            {sideCollapsed ? null : (
+              <div className="px-1 pb-1">
+                <CostPill />
+              </div>
+            )}
             <div className="space-y-0.5">
               <SidebarNavLink
                 to="/marketplace"
                 icon={<Puzzle className="h-4 w-4" />}
-                label={navLabel("marketplace", lang)}
+                label={sideCollapsed ? "" : navLabel("marketplace", lang)}
                 onNavigate={() => setSidebarOpen(false)}
+                collapsed={sideCollapsed}
+                title={navLabel("marketplace", lang)}
               />
-              {/* v0.8.18 档1 — Status / 主机 are operator/admin surfaces. */}
               {isAdmin && (
                 <>
                   <SidebarNavLink
                     to="/status"
                     icon={<Activity className="h-4 w-4" />}
-                    label={navLabel("status", lang)}
+                    label={sideCollapsed ? "" : navLabel("status", lang)}
                     onNavigate={() => setSidebarOpen(false)}
+                    collapsed={sideCollapsed}
+                    title={navLabel("status", lang)}
                   />
                   <SidebarNavLink
                     to="/hosts"
                     icon={<Server className="h-4 w-4" />}
-                    label={navLabel("hosts", lang)}
+                    label={sideCollapsed ? "" : navLabel("hosts", lang)}
                     onNavigate={() => setSidebarOpen(false)}
+                    collapsed={sideCollapsed}
+                    title={navLabel("hosts", lang)}
                   />
                 </>
               )}
-              {/* v0.8.20 F2 — Settings is visible to tenants too (their
-                  self-serve "我的 IM bot"); the page itself shows admin-only
-                  sections only to the admin. */}
               <SidebarNavLink
                 to="/settings"
                 icon={<Settings className="h-4 w-4" />}
-                label={navLabel("settings", lang)}
+                label={sideCollapsed ? "" : navLabel("settings", lang)}
                 onNavigate={() => setSidebarOpen(false)}
+                collapsed={sideCollapsed}
+                title={navLabel("settings", lang)}
               />
             </div>
+            {sideCollapsed ? null : (
+              <div className="pt-1 border-t border-surface-700/30">
+                <AvatarMenu />
+              </div>
+            )}
           </nav>
         </aside>
 
@@ -941,7 +1122,9 @@ export default function ChatConsole() {
             <>
               <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
                 <span className="text-xs font-semibold text-text-primary">
-                  {navLabel(globalView, lang)}
+                  {globalView === "workflow"
+                    ? tr(lang, "工作流", "Workflow")
+                    : navLabel(globalView, lang)}
                 </span>
               </div>
               <div className="flex-1 min-h-0 overflow-y-auto">
@@ -951,6 +1134,19 @@ export default function ChatConsole() {
                   <MarketplaceView />
                 ) : globalView === "hosts" ? (
                   <HostsView />
+                ) : globalView === "workflow" ? (
+                  <div className="p-6 max-w-2xl">
+                    <h2 className="text-lg font-semibold text-text-primary">
+                      {tr(lang, "工作流", "Workflow")}
+                    </h2>
+                    <p className="mt-2 text-sm text-text-secondary leading-6">
+                      {tr(
+                        lang,
+                        "Skills / Roles / MCP Servers / 自进化 / Compare — A3 接线中。",
+                        "Skills / Roles / MCP Servers / Evolution / Compare — wiring in A3.",
+                      )}
+                    </p>
+                  </div>
                 ) : (
                   <StatusView rail={railSessions} />
                 )}
@@ -962,15 +1158,34 @@ export default function ChatConsole() {
             // / scroll / HITL) resets atomically — no state survives a switch.
             <SessionView key={sid} sid={sid} session={activeView} onSessionChanged={refreshSessions} />
           ) : (
-            <>
-              <div className="h-10 shrink-0 px-4 flex items-center gap-3 border-b border-surface-700/30">
-                <span className="text-xs text-text-dim shrink-0">会话 →</span>
-                <span className="text-xs text-text-dim">从左侧选一个 session</span>
-              </div>
-              <div className="flex-1 min-h-0 grid place-items-center text-xs text-text-dim">
-                选一个 session 或点「＋ 新建」开始。
-              </div>
-            </>
+            /* v0.8.24 A1 Home — empty landing; first message path still uses modal for now. */
+            <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-6 text-center">
+              <h1 className="text-2xl font-semibold text-text-primary tracking-tight">
+                {tr(lang, "开工吧!", "Let's go!")}
+              </h1>
+              <p className="mt-2 max-w-md text-sm text-text-secondary leading-6">
+                {tr(
+                  lang,
+                  "从左侧选会话，或点「新建会话」开始 —— 会话在创建时绑定项目与模型。",
+                  "Pick a session on the left, or New session — project and model bind at create time.",
+                )}
+              </p>
+              <button
+                type="button"
+                disabled={atSessionCap}
+                onClick={() => {
+                  void refreshSessions();
+                  setModalProject(null);
+                  setModalOpen(true);
+                }}
+                className="mt-6 h-10 px-5 rounded-lg bg-brand-500 text-surface-950 text-sm font-medium hover:bg-brand-400 disabled:opacity-50"
+              >
+                {tr(lang, "新建会话", "New session")}
+              </button>
+              <p className="mt-4 text-[11px] text-text-muted font-mono">
+                {tr(lang, "提示: ⌘K 搜索会话", "Tip: ⌘K to search sessions")}
+              </p>
+            </div>
           )}
         </main>
       </div>

@@ -60,14 +60,22 @@ describe("ChatConsole shell delegates the per-sid view to SessionView", () => {
     // The composer placeholder is emitted ONLY by SessionView — its presence
     // proves the shell rendered <SessionView sid="s9"> in its main area.
     expect(html).toContain("发消息 / 命令");
-    // The shell chrome is still there (it's the persistent shell).
-    expect(html).toContain("所有 session");
+    // The shell chrome is still there (sidebar search + brand).
+    expect(html).toContain("side-search");
+    expect(html).toContain("ccteam");
   });
 
-  it("renders the no-session empty state (NOT the composer) at /chat", () => {
+  it("renders the no-session Home empty state (NOT the composer) at /chat", () => {
     const html = routed("/chat");
-    // No sid → empty state, and the SessionView composer must be absent.
-    expect(html).toContain("从左侧选一个 session");
+    // v0.8.24 A1 — Home landing; SessionView composer must be absent.
+    expect(html).toMatch(/开工吧|Let's go/);
     expect(html).not.toContain("发消息 / 命令");
+  });
+
+  it("keeps shell chrome without a top app bar", () => {
+    const html = routed("/chat");
+    // A1: search affordance + new-session CTA live in the sidebar, not a top bar.
+    expect(html).toMatch(/新建会话|New session/);
+    expect(html).toContain("side-search");
   });
 });
