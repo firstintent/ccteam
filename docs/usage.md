@@ -1,6 +1,6 @@
 # ccteam User Manual
 
-**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build on your own machine from the web console, Telegram, or Lark/Feishu.**
+**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build / OpenCode on your own machine from the web console, Telegram, or Lark/Feishu.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
@@ -64,7 +64,7 @@ Open that link to enter the console.
 
 ## 1. Web Console (Recommended)
 
-Open the link printed by `ccteam start`. The console is a chat-style UI. The top bar shows the current location, connection state, and **live cost** for today and the budget. The bottom navigation has **Marketplace / Status / Hosts / Settings**. The avatar menu lets you switch the UI language, theme, and sign out.
+Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / MCP / Evolution (read-only) / Compare. **Settings** links Hosts, Marketplace, Status, and IM credentials (admin). Theme defaults to **light** (dark remains available).
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
@@ -78,7 +78,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok) and a role. Roles come from the project's `.claude/agents/` directory, plus a roleless bare-Claude option. If you do not choose, ccteam defaults to `cto`. The session gets a handle like `s1`. Grok sessions run roleless in this release (the role picker applies to Claude/Codex).
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok and OpenCode), optional effort and host, and HITL at spawn time. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. Grok and OpenCode first-ship roleless (no persona injection). The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex and Grok are chat-only (Grok runs over ACP, with no terminal mirror).
@@ -111,7 +111,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- Cost is tracked separately by vendor (Claude / Codex / Grok). Grok reports token usage per turn; its USD amount shows as "—" until public pricing is configured.
+- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode uses only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table).
 
 ### Standard Resource API
 
@@ -176,7 +176,8 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 # Sessions
 /new [vendor] [role] [hitl]  Create a session and return handle s<N>.
-                             vendor = claude (default) | codex | grok
+                             vendor = claude (default) | codex | grok | opencode
+/compare <question>          Fan the same question across available vendors
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
                              grok = roleless ACP session (role/hitl args ignored)
                              add hitl = approve tools in IM; default skip runs directly
@@ -315,7 +316,8 @@ Environment variables:
 ```bash
 CCTEAM_HOME=~/.ccteam2          # Isolate a full state/config/session tree; pairs with ccteam --home.
 CCTEAM_PROJECTS_ROOT=...        # Default project root; default ~/projects.
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=...   # Override vendor CLI paths.
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=...
+# Override vendor CLI paths (tests / non-PATH installs).
 ```
 
 ---

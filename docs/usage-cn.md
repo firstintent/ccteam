@@ -1,6 +1,6 @@
 # ccteam 使用手册
 
-**ccteam —— 自托管、7×24 常驻的后台智能体团队:从网页端、Telegram、飞书远程驱动你机器上的 Claude Code / Codex / Grok Build。**
+**ccteam —— 自托管、7×24 常驻的后台智能体团队:从网页端、Telegram、飞书远程驱动你机器上的 Claude Code / Codex / Grok Build / OpenCode。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
@@ -43,6 +43,7 @@ ccteam --version
 claude --version   # 必需,需要时按提示登录
 codex --version    # 可选,用 Codex 会话才需要
 grok --version     # 可选,用 Grok Build 会话才需要
+opencode --version  # 可选,用 OpenCode 会话才需要
 ```
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
@@ -63,7 +64,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ## 一、Web 控制台(推荐)
 
-打开 `ccteam start` 给出的链接即可。控制台是一个聊天风格的界面:顶栏有当前位置、连接状态和**实时成本**(今日花费/预算);底部四个全局页 = **插件市场 / Status / 主机 / Settings**。左上头像里可切**中英文界面**、**明暗主题**和登出。
+打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / MCP / 自进化(只读) / Compare。**设置**收编主机 / 插件市场 / Status / IM 凭据。主题**默认浅色**(可切深色)。
 
 > **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
 
@@ -77,7 +78,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok)和角色。角色是从项目 `.claude/agents/` 读出的真实下拉列表,另有「(无角色 / 裸 Claude)」选项;不选则默认 `cto`。建好回一个句柄 `s<N>`。Grok 本版为无角色 ACP 会话(角色选择仅对 Claude/Codex 生效)。
+- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode)、可选力度与主机、spawn 前 HITL 开关。角色列表来自项目 `.claude/agents/`(管理员可选);租户默认 roleless。Grok / OpenCode 首版 roleless(不注入 persona)。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
@@ -108,7 +109,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ### Status / 成本
 
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
-- 成本按 vendor(Claude / Codex / Grok)分别记账。Grok 每回合上报 token 用量;未配置公开价前 USD 金额显示为「—」。
+- 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表)。
 
 ### 标准资源 API(给集成方)
 
@@ -173,7 +174,8 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 # 会话
 /new [vendor] [role] [hitl]  新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex | grok
+                             · vendor = claude(默认)| codex | grok | opencode
+/compare <问题>              多 vendor 同题并行对比
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
                              · grok = 无角色 ACP 会话(忽略 role/hitl 参数)
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
@@ -312,7 +314,8 @@ cat <project>/.ccteam/progress.jsonl             # 项目业务事件(状态权�
 ```bash
 CCTEAM_HOME=~/.ccteam2          # 隔离一整套状态/配置/会话(配合 ccteam --home 跑多实例)
 CCTEAM_PROJECTS_ROOT=...        # 默认项目根(默认 ~/projects)
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=...   # 覆盖 vendor CLI 路径
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=...
+# 覆盖 vendor CLI 路径
 ```
 
 ---

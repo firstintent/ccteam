@@ -29,10 +29,10 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.8.23` |
-| 测试 baseline | `2048/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;v0.9-T1~T5 前置落 dev 后计数有净变动 —— T1 删死工具测试、T5 增经验底座 —— 起手按 §二 命令在干净环境重记);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时);**跑着 live daemon 的宿主上 `daemon_*`/`im_progress` 集成测试也会环境挂**(端口/环境竞争,基线提交同样挂)—— 均非回归,干净环境必过 |
+| Workspace version | `0.8.24` |
+| 测试 baseline | `2155/4`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;4 = env-flake:`resume_*`/`daemon_restart_*`/`web_chat_ws_*`,与 live daemon 竞争时环境挂,非回归);`ccteam-web` ~299;vitest 259(SPA);Playwright 4。干净无 live daemon 宿主应全绿 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.23 Grok(第三 vendor,ACP stdio)+ v0.9 确定性前置 T1~T5 均已落 dev(未 tag、未部署)**:MCP cull **15→8**(`admin_ls`→`status`)· `POST /mcp` streamable HTTP(admin bearer 必带)· 共享 `McpDispatch` 抽取 · `resume_dead_session` 三段锁拆分 · 经验底座(turn records + role/skill 指纹,`experience.jsonl`)。**下一版 v0.8.24 doc-first 进行中**(`docs-local/versions/v0-8-24/`):web UI 改版(最大需求,`ui-prototype.html`)+ OpenCode 第四 vendor(ACP stdio,复用 grok_acp 轨,**无 tmux/rmux**)+ v0.9 剩余确定项前置(curated per-session MCP、/compare)+ 多机管理起步。**逐版改动史 = `git log` + `docs-local/versions/v0-X-Y/README.md`(冻结归档,不入库);协议/实现一律以代码为准,本表只留当前标题。** |
+| 当前在做 | **v0.8.24 已落 dev(未 tag、未部署)**:web UI 改版(A1–A4:无顶栏折叠侧栏/⌘K/Home、composer 4-way 含 OpenCode、工作流五子页、设置收编+i18n 字典、浅色默认)+ **OpenCode 第四 vendor**(ACP stdio,共享 `execution/acp/`)+ curated per-session MCP + `/compare` + 进化只读 + 多机 host join/registry/remote spawn 门(stdio only)+ Track E pending turns / trigger / doctor auth。**tag/部署 HELD**。**逐版改动史 = `git log` + `docs-local/versions/v0-X-Y/`(gitignored);协议/实现一律以代码为准。** |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 
