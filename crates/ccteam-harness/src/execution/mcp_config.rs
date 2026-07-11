@@ -147,6 +147,10 @@ pub fn write_session_mcp_config(
 
 /// Best-effort OpenCode ACP `mcpServers` array entry for session/new.
 /// Empty vec when secret missing (caller still gets a valid session).
+///
+/// OpenCode 1.17.x validates MCP entries strictly: `headers` must be an
+/// **array** of `{name, value}` (not a map). Wrong shape → jsonrpc -32602
+/// Invalid params on `session/new` (smoke 2026-07-11).
 pub fn opencode_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
     if sid.is_empty() || secret.is_empty() {
         return Vec::new();
@@ -157,9 +161,12 @@ pub fn opencode_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
         "name": "ccteam",
         "type": "http",
         "url": url,
-        "headers": {
-            "Authorization": format!("Bearer {bearer}"),
-        }
+        "headers": [
+            {
+                "name": "Authorization",
+                "value": format!("Bearer {bearer}"),
+            }
+        ]
     })]
 }
 
@@ -233,5 +240,16 @@ mod tests {
     #[test]
     fn session_bearer_format() {
         assert_eq!(session_mcp_bearer("s2", "tok"), "ccteam-sid:s2:tok");
+    }
+
+    #[test]
+    fn opencode_mcp_headers_are_name_value_array() {
+        let v = opencode_mcp_servers_http("s3", "sekret");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["type"], "http");
+        assert!(v[0]["headers"].is_array(), "OpenCode requires headers[]");
+        assert_eq!(v[0]["headers"][0]["name"], "Authorization");
+        assert_eq!(v[0]["headers"][0]["value"], "Bearer ccteam-sid:s3:sekret");
+        assert!(opencode_mcp_servers_http("", "x").is_empty());
     }
 }
