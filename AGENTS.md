@@ -2,7 +2,7 @@
 
 > 本仓库实现导引的**权威文件 = `AGENTS.md`**;`CLAUDE.md` 是指向它的软链(symlink)。
 > 面向**下一次接手 ccteam 实现的 agent session**:Claude Code 读 `CLAUDE.md`(→ 本文)、Codex 读 `AGENTS.md`(本文)—— 文中 Claude Code 特定机制,Codex 自行映射到等价工作流。每次起手必读。
-> 历史里程碑 + 升级 migration 见 `docs/versions/v0-X-Y/README.md`,本文描述**当前状态 + 红线 + 纪律**。
+> 历史里程碑 + 升级 migration 见 `docs-local/versions/v0-X-Y/README.md`(**gitignored 本机文档区** —— 版本归档 + 研究笔记已从 `docs/` 迁出、不入库),本文描述**当前状态 + 红线 + 纪律**。
 
 ---
 
@@ -15,7 +15,7 @@
 - **roleless session 合法**:空 role → spawn **不加** `--agent`(裸 claude 自读项目 `CLAUDE.md`/`AGENTS.md` 当 brain);非注入(ccteam 本就不注入 system prompt,省略 `--agent` 不违反 No-prompt-injection)。
 - **No prompt injection 由 `--agent` 兑现**:role 行为住 `.claude/agents/<role>.md`,vendor 原生 `--agent` 让它**自读**,ccteam **不**注入 system prompt —— 这条红线现在是**被满足**,不是被违反。
 - **daemon = IM gateway + web + MCP Unix socket**(一个进程,**不 tick、无 orchestrator 循环**);会话 = resume-by-session-id(spawn-on-demand + 空闲释放 + 按 sid resume,**非**常驻吊着;chat 复用 context 是 feature)。`ccteam-flow` orchestrator **存在但 daemon 不跑**(deferred)。
-- **harness × provider × protocol facet**:`harness` = agentic CLI adapter(本版 claude-code 跑通;codex best-effort;gemini-cli/grok-cli/其余 = future,**可扩展 `AgentVendor` enum**);`provider` = 子 facet(model);**`protocol` = Claude 第三轴(v0.8.11)= `stream-json`(默认)| `terminal`**:`stream-json` = 长驻 `claude` 子进程 + 双向 NDJSON 管道(`ClaudeStreamJsonAdapter`,无 PTY/pane/hook 链,chat-only 主路);`terminal` = tmux PTY + TUI(`ClaudeTuiAdapter`,要逐字节终端镜像/attach/screenshot 时选)。`default_adapter_factory` 按 `(vendor, protocol)` 三路由(`crates/ccteam-im/src/daemon.rs`),两个 Claude adapter emit **同一 `CanonicalEvent`** → gateway `spawn_event_pump` 零改动消费。命名 `protocol` 非 `backend`(`backend` 留给 v0.9 host 轴);session schema 预留 `host` 字段(默认 `local`)。都是 session 属性、非顶层资源;`GET /capabilities` 按 PATH probe 动态列当前可用 harness(×provider)。
+- **harness × provider × protocol facet**:`harness` = agentic CLI adapter(本版 claude-code 跑通;codex best-effort;gemini-cli/grok-cli/其余 = future,**可扩展 `AgentVendor` enum**);`provider` = 子 facet(model);**`protocol` = Claude 第三轴(v0.8.11)= `stream-json`(默认)| `terminal`**:`stream-json` = 长驻 `claude` 子进程 + 双向 NDJSON 管道(`ClaudeStreamJsonAdapter`,无 PTY/pane/hook 链,chat-only 主路);`terminal` = tmux PTY + TUI(`ClaudeTuiAdapter`,要逐字节终端镜像/attach/screenshot 时选)。`default_adapter_factory` 按 `(vendor, protocol)` 三路由(`crates/ccteam-im/src/daemon.rs`),两个 Claude adapter emit **同一 `CanonicalEvent`** → gateway `spawn_event_pump` 零改动消费。**`terminal` 协议(tmux/rmux/PTY)已进维护期,规划淘汰:不再为新 vendor / 新功能扩 terminal 路径**(仅维持既有 Claude terminal 会话);新 harness 一律长驻 stdio 协议(stream-json / ACP / app-server)。命名 `protocol` 非 `backend`(`backend` 留给 host 轴);session schema 预留 `host` 字段(默认 `local`)。都是 session 属性、非顶层资源;`GET /capabilities` 按 PATH probe 动态列当前可用 harness(×provider)。
 - **插件市场(ccteam ↔ ccteam-hub ↔ project,v0.8.12 = track-upstream)**:role/agent/skill/workflow 的**内容**全不进 ccteam repo(唯一例外 `cto_role.md`),而住 **`firstintent/ccteam-hub`**。v0.8.12 起 hub 从「vendor 拷贝每个文件」改成**跟踪 upstream 仓库**:`index.json` 只存**元数据 + 每条 `upstream`(可直接 raw 拉取的 URL @pinned-sha)**,**零 vendored body**(`sources.json` 声明整仓 @sha + glob,`scripts/sync.py` 幂等重建 index;**skill id 从目录名取**;**多文件 skill** 带 `manifest`(每文件 `relpath`+sha256);**第一方** `source=ccteam`(pk/autoloop)内容仍住 hub,`upstream` 指向 hub 自己的 raw tree)。ccteam 读 hub `index.json`(HTTPS github-raw + 本地缓存 `~/.ccteam/hub-cache/`),安装时从各条 `upstream` 拉内容 → **host 白名单**(只 `raw.githubusercontent.com` + loopback)+ **sha256 校验** → 装进用户项目:单文件复用 `write_role`/`write_skill`,**多文件 skill 落 `.claude/skills/<id>/<relpath>`**(整批 fetch+verify 后再落盘,失败不留半成品)。CLI `ccteam role search/add` 读 hub;backend = `ccteam-{im,core}/src/hub.rs` + `ccteam-web/src/routes/marketplace.rs`。**v0.8.14 加第四 type `plugin`(vendor-native Claude Code plugin,委托安装)**:hub 条目退化成**纯指针**(`sources.json` 顶层 `plugins[]` → index `{type:"plugin", marketplace:{name,source}, plugin_id}`,**无 upstream/content_sha/manifest**);安装**不 fetch/不拷贝/不执行**,改写项目 `.claude/settings.local.json` 两键(`extraKnownMarketplaces[name].source` + `enabledPlugins["<plugin>@<name>"]=true`,vendor settings schema 兜底,见 `ccteam_core::enable_marketplace_plugin`)→ Claude Code 下次启动自己 fetch/装原生依赖/跑 install.sh,**ccteam execute nothing**(红线「verbatim-copy、never execute」不破;sha 对 plugin 是 advisory,vendor 跟 live ref)。`installed_status` 对 plugin = 读 `enabledPlugins` 的二态(无 update_available);仅 Claude 轴(Codex 无 plugin 市场)。
 - **标准资源 API `/api/v1`**(web-token 鉴权):**project**(GET/POST `/projects`,GET/DELETE `/projects/{slug}` —— DELETE = 注销 + 停 session,**file-purge 留 CLI**)· **role**(GET `/projects/{slug}/roles`,GET/PUT `…/roles/{role}`)· **session**(GET/POST `/projects/{slug}/sessions`,GET `/sessions/{sid}`,POST `…/turn`,GET `…/events` SSE,POST `…/stop`)· **marketplace**(GET `/marketplace` + `…/{id}/body` 预览 + GET `/projects/{slug}/marketplace`(带 installed_status)+ POST `…/marketplace/install`)· **hosts**(v0.8.18,GET `/hosts` + `/{host}` host-keyed agent 报告;POST `…/register-mcp` 唯一可写、幂等)· **status**(GET `/status` daemon 健康 + sessions live/idle + 今日 cost/budget + **per-session 成本**)· **config/im**(web-token 门后:GET masked 状态 + PUT telegram/lark + telegram chat_id 异步轮询,**REST 路由非 MCP 工具**)· GET `/capabilities` + OpenAPI(`GET /api/docs` Scalar UI、`GET /api/v1/openapi.json`,单源 `OpenApiRouter`,同 web-token 门)。session-id = gateway `s{n}`。
 - **统一 chat-shell web UI + 逐字节保真终端**:两套分叉 SPA 布局收敛成**一个** chat 壳(`ChatConsole`;删旧 operator UI:Dashboard/ProjectDetail/SessionDetail/SessionsList/Teams*/WorkflowView + 侧栏/顶栏);底部全局导航 = **插件市场 / Status / 主机 / Settings**(v0.8.18 加主机页 + 界面语言中/英 + 头像个人设置),per-session Chat|终端 tab,顶栏 cost pill,轻量 Status view(backed by `GET /api/v1/status`);Roles 页被插件市场浏览器取代。终端:rmux backend 改流**裸 pane 字节**(`output_stream()`/`PaneOutputChunk::Bytes`,`capture` 排 `Oldest` backlog)→ 默认 rmux 即逐字节保真(修 v0.8.8 连上空白 + 换行歪);rmux pin **0.5**(byte API 自 0.3.1 起就有 → 保真**不依赖** 0.5;升 0.5 取 tmux-compat / window APIs,call-site 0.3→0.5 byte-identical),tmux backend 不变。
@@ -30,18 +30,18 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.8.23` |
-| 测试 baseline | `2048/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;v0.8.21 删 @ccteam/nl_admin 遗留管线时净删 ~58 个死测试);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时);**跑着 live daemon 的宿主上 `daemon_*`/`im_progress` 集成测试也会环境挂**(端口/环境竞争,基线提交同样挂)—— 均非回归,干净环境必过 |
+| 测试 baseline | `2048/0`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;v0.9-T1~T5 前置落 dev 后计数有净变动 —— T1 删死工具测试、T5 增经验底座 —— 起手按 §二 命令在干净环境重记);`ccteam-web` 264;vitest 218(SPA);Playwright 4。`resume_*`/`ws_*`/👀-reaction = env-flake(tmux/sandbox 计时);**跑着 live daemon 的宿主上 `daemon_*`/`im_progress` 集成测试也会环境挂**(端口/环境竞争,基线提交同样挂)—— 均非回归,干净环境必过 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.23 Grok Build 接成第三 harness vendor(ACP stdio)已落地 dev(未 tag、未部署)** —— `AgentVendor::Grok` + `SessionProtocol::Acp` + `GrokAcpAdapter`(`crates/ccteam-harness/src/execution/grok_acp/`:每 session 一 `grok agent stdio` child = Claude stream-json 拓扑;JSON-RPC 2.0 transport 仿 codex_jsonrpc;`initialize` client caps `fs/terminal:false`;buffer `agent_message_chunk` 出 final,drop thoughts;**turn-end + token 认 `session/prompt` response**,并用 dispatcher 的 turn-boundary(`turn_completed`/`prompt_complete`)信号做 finalize barrier 防丢尾块;`session/load` resume + 过滤 `isReplay`;skip→`--always-approve`,HITL/W5 deferred)。多端改全:工厂 vendor-first、IM/web `parse_vendor`、cost `Vendor::Grok`(空 `xai.toml`→"—")、`PROBE_SPECS`、doctor WARN、SPA runtime picker + 3-way vendor 配色。MVP roleless。**逐版改动史 = `git log` + `docs/versions/v0-X-Y/README.md`(冻结归档);协议/实现一律以代码为准,本表只留当前标题。** |
+| 当前在做 | **v0.8.23 Grok(第三 vendor,ACP stdio)+ v0.9 确定性前置 T1~T5 均已落 dev(未 tag、未部署)**:MCP cull **15→8**(`admin_ls`→`status`)· `POST /mcp` streamable HTTP(admin bearer 必带)· 共享 `McpDispatch` 抽取 · `resume_dead_session` 三段锁拆分 · 经验底座(turn records + role/skill 指纹,`experience.jsonl`)。**下一版 v0.8.24 doc-first 进行中**(`docs-local/versions/v0-8-24/`):web UI 改版(最大需求,`ui-prototype.html`)+ OpenCode 第四 vendor(ACP stdio,复用 grok_acp 轨,**无 tmux/rmux**)+ v0.9 剩余确定项前置(curated per-session MCP、/compare)+ 多机管理起步。**逐版改动史 = `git log` + `docs-local/versions/v0-X-Y/README.md`(冻结归档,不入库);协议/实现一律以代码为准,本表只留当前标题。** |
 
-> 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs/versions/v0-X-Y/README.md`(冻结归档)。
+> 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 
 - **配置**:role 行为 = 项目级 `.claude/agents/<role>.md`(`ccteam init` 种默认 `cto`)。**项目知识层(`CLAUDE.md`/`AGENTS.md`)归 vendor + 项目自己,ccteam 不改写已有内容**(v0.8.9 owner 决策:仅对**真空项目** scaffold 占位 `AGENTS.md` + `CLAUDE.md`=`@AGENTS.md`,绝不覆盖;详见 §三红线)。**多-agent 编排已推迟**:`ccteam init` 仍 scaffold 一份 `workflow.yaml` 占位,但其声明的 agent 拓扑(trigger/并发/vendor)**当前不被驱动**(daemon 不 tick、不 orchestrate;`ccteam-flow` 未接);编排方式仍在探索 —— 倾向 **prompt 层 skill over `session_*` 工具**,非 Rust 特性。
 - **执行**:resident daemon = IM/web⇄session 路由网关(**不 tick、无 orchestrator 循环**)→ 按需 spawn / resume session(按持久 sid):Claude **默认 `stream-json`**(长驻子进程 + 双向 NDJSON,无 pane/hook),`terminal` 协议才走 tmux 长 session(send-keys + transcript + hook);空 role = roleless 裸 claude,Codex best-effort;两 vendor 归一成中立 `CanonicalEvent`。
 - **状态 SoT**:`progress.jsonl` 业务事件(`harness/progress_bridge` 单一权威);chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(按 sid;不依赖 Anthropic 内部 `~/.claude/projects/`)。
-- **接口**:15 个 MCP 工具 `mcp__ccteam__{admin_,chat_,advise_,session_,screenshot}*`(代码 `STUB_TOOLS` + `ccteam doctor --verify-mcp` 自检)+ 标准资源 API `/api/v1`(含 `marketplace` + `status` + `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/cd /use /new /role /status /sessions @handle`;`@` 只指会话,无 meta-handle,确定性控制=斜杠面)+ 统一 chat-shell web(per-session `/chat/s/:sid` Chat|终端 + 底部导航 插件市场/Status/Settings)。
+- **接口**:**8 个 MCP 工具** `mcp__ccteam__{status,chat_send_file,screenshot,session_*}`(v0.9-T1 cull 15→8;`ccteam doctor --verify-mcp` 自检)+ `POST /mcp` streamable HTTP(v0.9-T4,admin bearer 必带)+ 标准资源 API `/api/v1`(含 `marketplace` + `status` + `config/im` + OpenAPI `/api/docs`)+ IM 命令面(`/cd /use /new /role /status /sessions @handle`;`@` 只指会话,无 meta-handle,确定性控制=斜杠面)+ 统一 chat-shell web(per-session `/chat/s/:sid` Chat|终端 + 底部导航 插件市场/Status/Settings)。
 - **安装**:`curl install.sh | sh`(prebuilt binary,linux + macOS,Windows 走 WSL2)→ `ccteam config` 注册 MCP server(给 Claude `~/.claude.json` + Codex `~/.codex/config.toml` 都写)。**ccteam 是纯 CLI、不是 vendor 插件**,无 `/plugin` 步;`cargo install --git …` 是 fallback。
 
 详 `docs/dev/tech-design.md`。
@@ -56,11 +56,11 @@
 | `docs/dev/requirements.md` | 原始需求(核心痛点 = 验收基准) | 验收基准 / PR 痛点映射 |
 | `docs/usage.md` | 用户命令手册(install→start→use→运维,纯命令) | 看怎么用 |
 
-历史版本归档 `docs/versions/v0-X-Y/README.md`(冻结、按需);探索研究 `docs/research/`(不更新、按需)。这些都**不**自动进上下文。
+历史版本归档 `docs-local/versions/v0-X-Y/README.md`(冻结、按需)+ 探索研究 `docs-local/research/`(不更新、按需)—— **均在 gitignored `docs-local/`,不入库不推送**(owner 决策:版本档案 + 研究笔记本机留存,仓库瘦身);进行中的版本 PRD/dev-plan 也落 `docs-local/versions/v0-x-y/`。这些都**不**自动进上下文。
 
 **起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace --exclude ccteam-web --no-fail-fast 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 记基线 → 读用户诉求 → 干。
 
-**对照参考**(`references/` gitignore 不入库):`references/claude-code/` + `references/codex/codex-rs/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
+**对照参考**(`references/` gitignore 不入库):`references/claude-code/` + `references/codex/codex-rs/` + `references/opencode/`(OpenCode ACP)+ `references/OpenHands/`(同层竞品)+ `references/rmux/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 
 ## 三、不可触碰的架构红线
 
@@ -73,6 +73,7 @@
 | **session = 独立一等实体;role 是属性** | session 有持久 `sid`(`s<N>`,单调、扛重启、不复用);**同一 role 可并存多 session**(去掉 `(project,role)` dedup);turns/marker 全按 sid;**terminal 协议**额外:pane=`ccteam-chat-<slug>-<sid>` + `CCTEAM_CHAT_SID` pane env(hook/forwarder 据此报 sid,daemon HTTP 加 `X-Ccteam-Sid`);**stream-json 默认路无 pane/hook**,sid 在 adapter 内直传 |
 | **session ACL = 多用户软分区(档0 IM own/web 池 + 档1 web 项目归属)** | `chat_can_access`(`chat_owner_visible`):own = `owner == canonical_owner(chat)` \|\| 运维池 `owner.channel == "user"` —— 一个 chat 见/可 `/use`·`/stop`·`/screen`·`/sessions` **自己的** session **+ 所有 web 控制台创建的** session(web 是单一共享操作台,到档1 才 per-user;支撑「web 建、手机驱动」单用户流)。**IM 之间各自建的 session 互相隔离**(两个 telegram `chat_id` 看不到对方 IM 建的;`web` 作 QUERIER 也不看 IM session —— IM session 只匹配 `owner==chat`)。删了「同-current-project 互看」(**反转 v0.8.13 跨前端按项目共享**,勿再加回)。`ProjectState.owner: Option<String>`(`channel:chat_id`,IM `/newproject` 时记;**显式字段、非路径派生**)。**诚实范围**:同 OS uid 下是**软隔离(UX)、非安全边界**(同 uid 仍可读他人文件/`/proc/<pid>/environ`);真隔离 = per-user OS user/sandbox(deferred)。**档1(per-user web)= 项目归属模型**(owner 拍板「项目绑定用户、会话属于项目→属于用户」):**project 是归属单元**(`ProjectState.owner`,web 建项目盖 `user:<tenant>`),**session 继承其 project 的归属**(不再单独记 owner 做 ACL;session.owner 只留作回信路由)。web REST 全按 project 鉴权 —— **单一 choke point = `auth::project_acl_layer` 中间件**(层在 `auth_layer` 内,从路径抽 slug → `can_see_project` 兜底**所有** `/api/v1/projects/{slug}/*`,任何 project 面都漏不了、新路由自动覆盖);`/projects` 集合面按身份过滤(`build_projects`);`/sessions/{sid}/*`(非 `/projects` 下)由 `gate_sid` 按其 project 门(history/status/turn/resolve/events/stop)。`can_see_project(identity,slug)` = admin 见全部 / tenant 只见自己 owner 的。全局·运维面(IM 凭据 `config/im*`、主机 `hosts`+`register-mcp`、`status`、用户 `users`)= **仅 admin**(`auth::deny_non_admin`→403);`GET /api/v1/me` 给 SPA 按身份显示(对 tenant 隐藏 Status/主机/Settings nav + IM 凭据段,fail-closed `useMe`)。共享核 `Identity::{owner_tag,can_see_owner}`(owner 轴 = 合成身份 `user:`,**非投递 channel**;v0.8.20 follow-up 从 `web:` 改名去歧义 —— owner 见 `owner=web` 误以为「web 前端」)。**IM 的 `chat_can_access` 不动**(owner 的 telegram 仍 own+web 池 = 运维视角)。web↔IM 同一人复联(`linked_chat`)deferred,tenant 当前 web-only|
 | **不解析终端输出** | 读 transcript jsonl + 官方 hooks fast event;**不 scrape pane**(`tmux capture-pane` 仅 dev 调试 + screenshot tool 只读)|
+| **terminal 协议(tmux/rmux)冻结 = 维护-only,规划淘汰** | 新 vendor / 新功能**不得**新增 tmux/rmux/PTY 依赖(OpenCode 起新 harness 一律长驻 stdio:stream-json / ACP / app-server);既有 Claude `terminal` 协议只修不扩;逐字节终端镜像不再作为新功能的验收条件 |
 | **永不主动 kill 长 session** | `budgets.{claude,codex}.max_cost_usd_per_24h` 触顶 auto-disable 是预算例外;`project stop` / `project rm --force` 是**用户显式命令**(非主动 kill,合法);`/compact /new` 是合法 turn;**去 dedup 后 `/new` 总铸新 sid、不再撞 `(project,role)` 复用而 close 旧 pane** |
 | **HITL 批准边界 = vendor 原生批准门**(per-session,默认 `skip`) | 批准门走 vendor 原生通道(**stream-json 默认**:`can_use_tool` 反向 RPC control_request / **terminal**:`PermissionRequest` hook;两者皆**不**注入 system prompt/不 scrape)→ daemon `permission/ask`(转发 **ccteam sid**,非 Anthropic session UUID)→ IM `[同意][拒绝]`;hitl spawn 走 `--permission-mode default`(**绝不** skip,否则白嫖批准),skip session 仍 `--dangerously-skip-permissions`;deny **只挡该次工具、不 kill turn**(守「永不主动 kill」) |
 | **cto 调度门 = daemon 校验 per-session secret(best-effort,非硬边界)** | 5 个 `session_*` 工具(spawn/dispatch/collect/list/stop)的特权由 daemon 校验:spawn 时 mint per-session secret 注入 pane env(`CCTEAM_CHAT_SECRET`),daemon 存 `sid→{role,secret}`,forwarder 转发,门校验 `(role,secret)` 对(**非**信明文 role)+ project 维度(只能操作自己 slug 的 sid);`session_*` 只用 gateway session map,**不**碰 deprecated registry/supervisor;`dispatch`/`stop` 是显式调度(非主动 kill 长 session)。**诚实范围**:单 OS-uid 全信任模型下 agent 之间**无硬边界**(同 uid 可读他进程 `/proc/<pid>/environ`/文件/ptrace → 拿到 secret),secret 只**抬高门槛**(defense-in-depth),**不 close**;真隔离 = per-agent OS user / sandbox(v0.8.8 deferred) |
@@ -100,7 +101,7 @@
 | **role 库**(`.claude/agents/<role>.md`)| ccteam 唯一管的**项目级**指令面;`ccteam init` 种默认 `cto`(管家);work-role 用户自建 / 从 **ccteam-hub 插件市场**装(含 agency-agents 等开源 Claude 原生 .md)—— `ccteam role search/add/list` 读 hub `index.json`(`role add` sha256 校验后 verbatim 写 `.claude/agents/`)或 web 插件市场浏览器一键装,或手动丢入,`/role <role>` 原地换(daemon 内存态) |
 | **插件市场(ccteam-hub)**(`firstintent/ccteam-hub`)| ccteam repo 之外的**内容**源:curated `index.json` + `agents/`/`skills/`/`workflows/`;幂等 ingestion verbatim vendor 开源插件(agency-agents 192,MIT pinned-sha);ccteam 经 HTTPS + `~/.ccteam/hub-cache/` 读 + sha256 校验 + 装进项目 `.claude/{agents,skills}/`;REST `GET /api/v1/marketplace(/{id}/body)` + `…/projects/{slug}/marketplace(/install)` |
 | **CLAUDE.md / AGENTS.md** | 项目 / 用户级持久指令,**vendor 原生**(ccteam 只读,不生成)|
-| **MCP** | `ccteam` **15 工具**,0 STUB(`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):admin 3(`ls`/`change_persona`/`add_tool`)· chat 4(`register_bot`/`unregister_bot`/`list_bots`/`send_file`;`send_input`/`history` 已删 —— 死写入/死读取路径)· advise 2(`vote`/`parallel`)· **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon 校验 per-session secret + project 维度)· screenshot 1;前缀 `mcp__ccteam__*`;wire 纪律:`mcp-serve` stdout 纯 JSON-RPC、tracing→stderr |
+| **MCP** | `ccteam` **8 工具**,0 STUB(v0.9-T1 cull 15→8,删 advise 2 / admin_change_persona+add_tool / chat bot 3,`admin_ls`→`status`;`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检,drift exit 1):`status` · `chat_send_file` · `screenshot` · **session 5**(cto 调度:`session_spawn`/`dispatch`/`collect`/`list`/`stop`,daemon 校验 per-session secret + project 维度);前缀 `mcp__ccteam__*`;入口 = stdio `mcp-serve`(stdout 纯 JSON-RPC、tracing→stderr)+ `POST /mcp` streamable HTTP(admin bearer)|
 | **Skills** | **0 个 ccteam repo 自带**(repo 根 `skills/` 已删;原 skill 功能落 MCP 工具 + cto role + work-role + `config` CLI)。可从 **ccteam-hub 插件市场**装 skill 到项目 `.claude/skills/`(同 role 路径);项目自有 skill 仍可直接放各项目 `.claude/skills/`(vendor 原生,ccteam 不管)|
 | **Subagents** | agent 内 `Task(subagent_type=...)` ad-hoc 节流(work-role 可自带)|
 | **Hooks** | `ccteam internal hook progress-append / load-context` 等(隐藏);写 `.claude/settings.local.json` 的 ccteam hook 段 |
@@ -117,9 +118,9 @@
 5. **优先编辑现有文件,不轻易新建**
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning
 7. **版本发布同步文档(ship gate)** — 每次 `vX.Y.Z` ship 必须同步:
-   - **内部 SoT**:CLAUDE.md §一(只更 version + baseline 数 + 当前标题 —— **不写逐版 changelog**,那进 `git log` + `docs/versions/`)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
+   - **内部 SoT**:CLAUDE.md §一(只更 version + baseline 数 + 当前标题 —— **不写逐版 changelog**,那进 `git log` + `docs-local/versions/`)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
    - **用户面**:root `README.md`(英文,不含版本进展)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞
-   - **版本归档**:`docs/versions/v0-X-Y/README.md` + handoff doc 落地
+   - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
 
 ### 多 session 并行编辑同一仓库
@@ -128,7 +129,7 @@
 
 ### 版本开发流程
 
-- **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs/versions/v0-x-y/` 待 owner review 后动代码;owner `/goal` 直驱的小/中改可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(briefing 含 PRD section + 验收条目)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ CLAUDE.md §一 + docs/versions 回填。
+- **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review 后动代码;owner `/goal` 直驱的小/中改可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(briefing 含 PRD section + 验收条目)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ CLAUDE.md §一 + docs-local/versions 回填。
 - **推送 = direct-on-dev no-PR 是常态**(`gh` 不能开 firstintent PR,见 §六 → SSH push `<branch>:dev`);PR 仅当远端支持时。**tag + 部署 HELD,等 owner 显式「部署」**(push 到 dev 不等于发布)。
 - **wave 范式**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 commit;subagent briefing 必含 wave acceptance gate + 上 wave handoff link。**红线:每 wave baseline ≥ 上 wave**(test pass count + clippy 0 warnings),否则不推。架构级大改可把 tier-1 文档**全量重写**放最后一 wave(docs 反映已落地代码)。
 
@@ -147,7 +148,7 @@
 - **`cargo fmt --all` 已是 required**(`.github/workflows/check.yml` CI gate 守)── commit 前一律跑,CI `cargo fmt --all -- --check` 不过 PR 不能 merge
 - **本文件 ≤200 行** — 越长 cache 越贵,Claude 越忽略
 
-历史版本升级 migration 详各 `docs/versions/v0-X-Y/README.md`,不在此重复。
+历史版本升级 migration 详各 `docs-local/versions/v0-X-Y/README.md`,不在此重复。
 
 ## 七、Rust 代码格式化约定
 
