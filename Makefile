@@ -279,7 +279,8 @@ Type=exec
 ExecStart=$(BIN_LINK) start --web-bind $(WEB_BIND)
 WorkingDirectory=$(HOME)
 # Daemon discovers claude/codex via PATH — user-local bins must be visible.
-Environment=PATH=$(BIN_DIR):/usr/local/bin:/usr/bin:/bin
+# User-local bins (claude/codex/grok) + OpenCode's default install prefix.
+Environment=PATH=$(BIN_DIR):$(HOME)/.opencode/bin:/usr/local/bin:/usr/bin:/bin
 # Graceful: SIGTERM -> the daemon's own clean shutdown path. Give it room
 # before systemd escalates to SIGKILL (CLI `stop` waits ~35s).
 KillSignal=SIGTERM
