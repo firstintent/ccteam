@@ -305,6 +305,8 @@ export interface CreateSessionOpts {
    *  `"stream-json"` (the薄/default path); pass `"terminal"` for the advanced
    *  pane-backed session (terminal mirror / attach / screenshot). */
   protocol?: "stream-json" | "terminal" | "acp";
+  /** v0.8.24 multi-host — `local` (default) or a registered satellite id. */
+  host?: string;
 }
 
 export interface CreateSessionResult {
@@ -322,6 +324,7 @@ export function createSession(
   if (opts.vendor) body.vendor = opts.vendor;
   if (opts.permission_mode) body.permission_mode = opts.permission_mode;
   if (opts.protocol) body.protocol = opts.protocol;
+  if (opts.host && opts.host !== "local") body.host = opts.host;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }
 

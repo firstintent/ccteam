@@ -288,11 +288,16 @@ describe("NewSessionModal project dropdown", () => {
       />,
     );
 
-    expect(html).toContain("运行时");
+    expect(html).toContain("模型 · 协议");
     expect(html).toContain("Claude · stream-json");
     expect(html).toContain("Claude · terminal");
     expect(html).toContain("Codex · app-server");
     expect(html).toContain("Codex · terminal");
+    expect(html).toContain("Grok · ACP");
+    expect(html).toContain("OpenCode · ACP");
+    expect(html).toContain("effort-select");
+    expect(html).toContain("host-select");
+    expect(html).toContain("hitl-toggle");
     // The admin gets the role picker (the `<label>Role</label>` renders).
     expect(html).toContain(">Role<");
     expect(html).toContain("permission=");
@@ -314,9 +319,11 @@ describe("NewSessionModal project dropdown", () => {
       />,
     );
 
-    // Production-stable runtimes (claude + codex, both stream-json).
+    // Production-stable runtimes (stream-json + acp).
     expect(html).toContain("Claude · stream-json");
     expect(html).toContain("Codex · app-server");
+    expect(html).toContain("Grok · ACP");
+    expect(html).toContain("OpenCode · ACP");
     // Terminal/rmux runtimes are admin-only.
     expect(html).not.toContain("Claude · terminal");
     expect(html).not.toContain("Codex · terminal");

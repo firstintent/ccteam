@@ -49,12 +49,12 @@
      (prototype `--amber-dim`). Sits between surface and brand on a dark bg. */
   --color-brand-dim: #7a5012;
 
-  /* Vendor accents (v0.8.9) — the per-vendor badge colors from the prototype.
-     Claude = copper, Codex = teal-green, Grok = violet. Used only on the
-     vendor pills/badges so agents read distinct at a glance. */
+  /* Vendor accents — Claude copper, Codex teal-green, Grok violet,
+     OpenCode sky (distinct from codex green / grok purple). */
   --color-vendor-claude: #d97757;
   --color-vendor-codex: #10a37f;
   --color-vendor-grok: #8b5cf6;
+  --color-vendor-opencode: #0ea5e9;
 
   /* Accent -- Muted Teal (used sparingly) */
   --color-accent-500: #14b8a6;
@@ -153,6 +153,7 @@ body {
   --color-vendor-claude: #c2410c;
   --color-vendor-codex: #0f766e;
   --color-vendor-grok: #7c3aed;
+  --color-vendor-opencode: #0284c7;
   --color-accent-500: #0d9488;
   --color-accent-600: #0f766e;
   --color-accent-700: #115e59;

@@ -506,6 +506,7 @@ export default function ChatConsole() {
       permissionMode: "skip" | "hitl",
       protocol: "stream-json" | "terminal" | "acp",
       newProjectPath?: string,
+      host?: string,
     ): Promise<boolean> => {
       // Frontend-only cap: block a new session once the caller already holds
       // MAX_ACTIVE_SESSIONS. `railSessions` is the caller's own (ACL-scoped)
@@ -534,6 +535,7 @@ export default function ChatConsole() {
           vendor,
           permission_mode: permissionMode,
           protocol,
+          host: host && host !== "local" ? host : undefined,
         });
         if (modelWarning) toastBus.handler?.info(modelWarning);
         await refreshSessions();
@@ -1443,19 +1445,36 @@ const RUNTIME_OPTIONS = [
     vendor: "grok",
     protocol: "acp",
   },
+  {
+    id: "opencode-acp",
+    label: "OpenCode · ACP",
+    hint: "OpenCode agent stdio",
+    vendor: "opencode",
+    protocol: "acp",
+  },
 ] as const satisfies readonly {
   id: string;
   label: string;
   hint: string;
-  vendor: "claude" | "codex" | "grok";
+  vendor: "claude" | "codex" | "grok" | "opencode";
   protocol: "stream-json" | "terminal" | "acp";
 }[];
 
-/** Per-vendor badge classes (3-way; never paint grok as codex). */
+/** Effort levels offered at spawn (advisory UI; OpenCode set_config later). */
+const EFFORT_OPTIONS = [
+  { id: "low", label: "低" },
+  { id: "medium", label: "中" },
+  { id: "high", label: "高" },
+  { id: "max", label: "极高" },
+] as const;
+
+/** Per-vendor badge classes (4-way; never collapse opencode into codex/grok). */
 function vendorBadgeClass(vendor: string): string {
   if (vendor === "claude") return "bg-vendor-claude/15 text-vendor-claude";
+  if (vendor === "codex") return "bg-vendor-codex/15 text-vendor-codex";
   if (vendor === "grok") return "bg-vendor-grok/15 text-vendor-grok";
-  return "bg-vendor-codex/15 text-vendor-codex";
+  if (vendor === "opencode") return "bg-vendor-opencode/15 text-vendor-opencode";
+  return "bg-surface-700 text-text-secondary";
 }
 
 type RuntimeId = (typeof RUNTIME_OPTIONS)[number]["id"];
@@ -1492,6 +1511,7 @@ export function NewSessionModal({
     permissionMode: "skip" | "hitl",
     protocol: "stream-json" | "terminal" | "acp",
     newProjectPath?: string,
+    host?: string,
   ) => Promise<boolean>;
 }) {
   const [project, setProject] = useState(defaultProject);
@@ -1500,16 +1520,16 @@ export function NewSessionModal({
   const [runtimeId, setRuntimeId] = useState<RuntimeId>("claude-stream-json");
   const [role, setRole] = useState("");
   const [hitl, setHitl] = useState(false);
+  const [effort, setEffort] = useState<(typeof EFFORT_OPTIONS)[number]["id"]>("medium");
+  const [host, setHost] = useState("local");
   const [pending, setPending] = useState(false);
   const [roleState, setRoleState] = useState<RoleFetchState>({ kind: "idle" });
   const runtime = RUNTIME_OPTIONS.find((item) => item.id === runtimeId) ?? RUNTIME_OPTIONS[0];
   const vendor = runtime.vendor;
   const protocol = runtime.protocol;
 
-  // v0.8.20 F4 — beta-gating (UI-level only): production-stable runtimes
-  // (claude/codex stream-json + grok acp) for everyone; terminal/rmux is
-  // advanced (admin-only). Grok ACP is the stable chat main path (v0.8.23).
-  // NOT a security boundary — the backend create route is unchanged.
+  // v0.8.20 F4 + v0.8.24 — stable: claude/codex stream-json + grok/opencode acp;
+  // terminal is admin-only (frozen). NOT a security boundary.
   const runtimeOptions = isAdmin
     ? RUNTIME_OPTIONS
     : RUNTIME_OPTIONS.filter(
@@ -1629,6 +1649,7 @@ export function NewSessionModal({
       hitl ? "hitl" : "skip",
       protocol,
       isNew ? newPath.trim() : undefined,
+      host,
     )
       .then((ok) => {
         // On success the parent navigates away & unmounts us. On failure it
@@ -1708,7 +1729,8 @@ export function NewSessionModal({
             </div>
           ) : null}
 
-          <label className="block text-xs text-text-dim">运行时</label>
+          {/* v0.8.24 A2 — model + protocol (grouped by vendor) */}
+          <label className="block text-xs text-text-dim">模型 · 协议</label>
           <div className="grid grid-cols-2 gap-1 rounded-md bg-surface-800 p-0.5">
             {runtimeOptions.map((option) => (
               <button
@@ -1716,18 +1738,67 @@ export function NewSessionModal({
                 type="button"
                 disabled={pending}
                 onClick={() => setRuntimeId(option.id)}
+                data-testid={`runtime-${option.id}`}
                 className={`min-h-10 rounded px-2 py-1 text-left disabled:opacity-40 ${
                   runtimeId === option.id ? "bg-surface-700 text-text-primary" : "text-text-dim"
                 }`}
               >
-                <span className="block text-xs font-medium leading-4">{option.label}</span>
-                <span className="block text-[10px] leading-3 text-text-dim">{option.hint}</span>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full shrink-0 ${vendorBadgeClass(option.vendor).split(" ")[0].replace("/15", "")}`}
+                    style={{
+                      background:
+                        option.vendor === "claude"
+                          ? "var(--color-vendor-claude)"
+                          : option.vendor === "codex"
+                            ? "var(--color-vendor-codex)"
+                            : option.vendor === "grok"
+                              ? "var(--color-vendor-grok)"
+                              : "var(--color-vendor-opencode)",
+                    }}
+                  />
+                  <span className="block text-xs font-medium leading-4">{option.label}</span>
+                </span>
+                <span className="block text-[10px] leading-3 text-text-dim pl-3">{option.hint}</span>
               </button>
             ))}
           </div>
-          <p className="text-[10px] text-text-dim leading-4">
-            {runtime.label} → vendor={vendor} · protocol={protocol}
-          </p>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-xs text-text-dim mb-1">力度 (effort)</label>
+              <select
+                value={effort}
+                disabled={pending}
+                onChange={(e) =>
+                  setEffort(e.target.value as (typeof EFFORT_OPTIONS)[number]["id"])
+                }
+                data-testid="effort-select"
+                className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-2 text-xs outline-none focus:border-brand-500 disabled:opacity-40"
+              >
+                {EFFORT_OPTIONS.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-text-dim mb-1">主机</label>
+              <select
+                value={host}
+                disabled={pending}
+                onChange={(e) => setHost(e.target.value)}
+                data-testid="host-select"
+                className="w-full h-9 rounded-md bg-surface-800 border border-surface-700 px-2 text-xs outline-none focus:border-brand-500 disabled:opacity-40"
+              >
+                <option value="local">local（本机）</option>
+              </select>
+              <p className="mt-0.5 text-[10px] text-text-muted">
+                分支：显示用（本版不切换 worktree）
+              </p>
+            </div>
+          </div>
 
           {/* v0.8.20 F4 — role picker is an admin-only (beta) surface; a tenant
               always creates a roleless session (selectedRole stays ROLELESS). */}
@@ -1751,38 +1822,43 @@ export function NewSessionModal({
             </>
           ) : null}
 
-          <label className="flex items-center gap-2 text-xs text-text-secondary">
-            <input
-              type="checkbox"
-              checked={hitl}
-              disabled={pending}
-              onChange={(event) => setHitl(event.target.checked)}
-              className="accent-brand-500"
+          {/* HITL pre-spawn toggle — spawn-time only (mid-session deferred). */}
+          <button
+            type="button"
+            disabled={pending}
+            data-testid="hitl-toggle"
+            onClick={() => setHitl((v) => !v)}
+            className={`w-full h-9 rounded-md border text-xs font-medium flex items-center justify-center gap-2 transition-colors disabled:opacity-40 ${
+              hitl
+                ? "border-brand-500/60 bg-brand-500/15 text-brand-400"
+                : "border-surface-700 bg-surface-800 text-text-secondary hover:border-surface-600"
+            }`}
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${hitl ? "bg-brand-400" : "bg-surface-600"}`}
             />
-            HITL 批准（非 allowlist 工具需在此点同意/拒绝）
-          </label>
+            {hitl ? "请求批准 · 已开" : "请求批准 · 关闭（skip）"}
+          </button>
+          <p className="text-[10px] text-text-muted leading-4 -mt-1">
+            影响 spawn 参数（skip vs default）。会话中途切换本版不支持。
+          </p>
 
           <div className="text-[11px] font-mono text-text-dim leading-5">
-            {isNew ? (
-              <>
-                → <span className="text-text-secondary">POST /api/v1/projects</span> slug=
-                <span className="text-text-secondary">{newSlug.trim() || "<slug>"}</span>
-                <br />
-              </>
-            ) : null}
-            → <span className="text-text-secondary">
-              POST /api/v1/projects/{(isNew ? newSlug.trim() : project) || "<project>"}/sessions
-            </span>
-            <br />
-            → role=
-            <span className="text-text-secondary">
-              {effectiveRole || "(无角色 / 裸 claude)"}
-            </span>{" "}
             vendor=
-            <span className="text-text-secondary">{vendor}</span> permission=
-            <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>{" "}
+            <span className={`text-text-secondary ${vendorBadgeClass(vendor)}`}>{vendor}</span>{" "}
             protocol=
-            <span className="text-text-secondary">{protocol}</span>
+            <span className="text-text-secondary">{protocol}</span> effort=
+            <span className="text-text-secondary">{effort}</span> host=
+            <span className="text-text-secondary">{host}</span> permission=
+            <span className="text-text-secondary">{hitl ? "hitl" : "skip"}</span>
+            {effectiveRole ? (
+              <>
+                {" "}
+                role=<span className="text-text-secondary">{effectiveRole}</span>
+              </>
+            ) : (
+              <> role=<span className="text-text-secondary">(roleless)</span></>
+            )}
           </div>
         </div>
         <div className="px-4 py-3 flex justify-end gap-2 border-t border-surface-700/50">
