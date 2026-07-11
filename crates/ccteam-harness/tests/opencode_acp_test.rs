@@ -61,6 +61,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     }
@@ -283,6 +284,82 @@ async fn skip_auto_allows_permission_request() {
         ok,
         "skip session must complete turn (auto-allow permission)"
     );
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// v0.8.24 gap-fix (PRD A7) — a HITL opencode session must survive a
+/// `session/request_permission` round: the transport now FAIL-CLOSED
+/// declines it (never the old silent auto-allow = approval bypass), the
+/// rejected tool call does not kill the turn, and nothing panics.
+#[tokio::test]
+#[serial]
+async fn hitl_declines_permission_without_panic_or_kill() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = OpencodeAcpAdapter::new();
+    let mut ctx = spawn_ctx(&tmp, "s-hitl");
+    ctx.permission_mode = PermissionMode::Hitl;
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("hitl start must not fail");
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ThreadEvent::TurnCompleted { .. }) {
+                return true;
+            }
+            if matches!(ev, ThreadEvent::TurnFailed { .. }) {
+                return false;
+            }
+        }
+        false
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("need-tool".into()))
+        .await
+        .expect("submit must not panic");
+    let ok = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("hitl turn must not hang on a pending permission")
+        .expect("join");
+    assert!(ok, "declined tool must not kill the turn");
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// v0.8.24 A-U3 — an explicit spawn-time model/effort choice rides
+/// `session/set_config_option` (the fake acks it) and is reflected in
+/// `thread_status`. A missing choice keeps opencode's self-selected default
+/// (covered by `handshake_prompt_final_only_on_fake`).
+#[tokio::test]
+#[serial]
+async fn spawn_time_model_effort_set_via_config_option() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = OpencodeAcpAdapter::new();
+    let mut ctx = spawn_ctx(&tmp, "s-tune");
+    ctx.model_id = Some("tokenopen/gpt-5.5-mini".into());
+    ctx.effort = Some("high".into());
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("start ok");
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("tokenopen/gpt-5.5-mini"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();
 }

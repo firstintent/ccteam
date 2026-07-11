@@ -310,6 +310,13 @@ export interface CreateSessionOpts {
   protocol?: "stream-json" | "terminal" | "acp";
   /** v0.8.24 multi-host — `local` (default) or a registered satellite id. */
   host?: string;
+  /** v0.8.24 A-U3 — explicit model id (overrides the role's `model:`
+   *  frontmatter); omit for the vendor default. */
+  model?: string;
+  /** v0.8.24 A-U3 — explicit reasoning-effort token (vendor value set; see
+   *  `wireEffort`); omit for the vendor default. Ignored server-side for
+   *  grok. */
+  effort?: string;
 }
 
 export interface CreateSessionResult {
@@ -328,6 +335,8 @@ export function createSession(
   if (opts.permission_mode) body.permission_mode = opts.permission_mode;
   if (opts.protocol) body.protocol = opts.protocol;
   if (opts.host && opts.host !== "local") body.host = opts.host;
+  if (opts.model) body.model = opts.model;
+  if (opts.effort) body.effort = opts.effort;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }
 

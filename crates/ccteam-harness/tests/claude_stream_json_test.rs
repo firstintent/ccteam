@@ -189,6 +189,7 @@ fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
         project_dir: tmp.to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     }

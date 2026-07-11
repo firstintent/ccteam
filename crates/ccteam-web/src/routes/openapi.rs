@@ -146,8 +146,12 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
         .routes(routes!(super::hosts::handle_register_mcp))
-        // v0.8.24 Track D — multi-host join / heartbeat / mint
-        .routes(routes!(super::hosts::handle_mint_join_token))
+        // v0.8.24 Track D — multi-host join / heartbeat / mint.
+        // GET (read newest valid) + POST (mint) share `/hosts/join-token`.
+        .routes(routes!(
+            super::hosts::handle_mint_join_token,
+            super::hosts::handle_get_join_token
+        ))
         .routes(routes!(super::hosts::handle_host_join))
         .routes(routes!(super::hosts::handle_host_heartbeat))
         // v0.8.18 档1 — per-user web tenant management (admin-gated)
@@ -168,6 +172,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
         .routes(routes!(super::api_v1::handle_me))
+        // v0.8.24 — admin self-serve web-token rotation (live, atomic).
+        .routes(routes!(super::api_v1::handle_reset_token))
         // projects — GET list + POST create share `/api/v1/projects`;
         // GET detail + DELETE share `/api/v1/projects/{slug}`.
         .routes(routes!(
@@ -187,6 +193,12 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::api_v1::handle_active_sessions))
         .routes(routes!(super::api_v1::handle_job_log))
         .routes(routes!(super::api_v1::handle_active_sessions_aggregate))
+        // v0.8.24 F1.12 — project third-party MCP servers (GET list shares
+        // the path with the admin-only POST register).
+        .routes(routes!(
+            super::mcp_servers::handle_list_mcp_servers,
+            super::mcp_servers::handle_register_mcp_server
+        ))
         // roles
         .routes(routes!(super::roles::handle_list_roles))
         .routes(routes!(
@@ -199,6 +211,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_create_session
         ))
         .routes(routes!(super::compare::handle_compare))
+        .routes(routes!(super::compare::handle_compare_history))
         .routes(routes!(super::evolution::handle_evolution))
         // v0.8.22 P1 — GET history + PATCH rename share `/api/v1/sessions/{sid}`.
         .routes(routes!(

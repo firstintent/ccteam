@@ -102,6 +102,32 @@ async fn get_api_v1_projects_returns_dashboard_row_array() {
     // Redline: token must not leak to the list endpoint.
     assert!(row.get("wire_token").is_none());
     assert!(row.get("auth_wire_token").is_none());
+    // v0.8.24 Q7 — non-git project dir → current_branch absent (None is
+    // skip-serialized), so the SPA hides the branch dimension.
+    assert!(row.get("current_branch").is_none());
+}
+
+#[tokio::test]
+async fn get_api_v1_projects_reports_current_branch_for_git_dirs() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    // Fabricate a git working tree on branch `dev` (no git binary needed).
+    let git_dir = paths.project_dir("demo").join(".git");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/dev\n").unwrap();
+
+    let addr = spawn(AppState::new(paths)).await;
+    let body: Value = client()
+        .get(format!("http://{addr}/api/v1/projects"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = &body.as_array().unwrap()[0];
+    assert_eq!(row["current_branch"], "dev");
 }
 
 #[tokio::test]

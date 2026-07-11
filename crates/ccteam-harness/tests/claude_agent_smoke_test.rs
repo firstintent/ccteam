@@ -176,6 +176,7 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
         project_dir: cwd.to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     }
@@ -497,6 +498,7 @@ fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
         project_dir: cwd.to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
         secret: String::new(),
     }
@@ -631,6 +633,7 @@ async fn run_hitl_decision_turn(allow: bool, tag: &str) -> (bool, bool) {
         project_dir: project.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
         secret: String::new(),
     };

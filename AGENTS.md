@@ -30,9 +30,9 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.8.24` |
-| 测试 baseline | `2155/4`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;4 = env-flake:`resume_*`/`daemon_restart_*`/`web_chat_ws_*`,与 live daemon 竞争时环境挂,非回归);`ccteam-web` ~299;vitest 259(SPA);Playwright 4。干净无 live daemon 宿主应全绿 |
+| 测试 baseline | `2155+/4`(`cargo test --workspace --exclude ccteam-web --no-fail-fast`;gap-close wave 后 rust 侧净增测试,live-daemon 宿主未全量重测,干净环境起手重记;4 = env-flake:`resume_*`/`daemon_restart_*`/`web_chat_ws_*`,与 live daemon 竞争时环境挂,非回归);`ccteam-web` 314/3(3 = `ws_*` pipe-pane env-flake);vitest 323(SPA);Playwright 6。干净无 live daemon 宿主应全绿 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.8.24 已落 dev(未 tag、未部署)**:web UI 改版(A1–A4:无顶栏折叠侧栏/⌘K/Home、composer 4-way 含 OpenCode、工作流五子页、设置收编+i18n 字典、浅色默认)+ **OpenCode 第四 vendor**(ACP stdio,共享 `execution/acp/`)+ curated per-session MCP + `/compare` + 进化只读 + 多机 host join/registry/remote spawn 门(stdio only)+ Track E pending turns / trigger / doctor auth。**tag/部署 HELD**。**逐版改动史 = `git log` + `docs-local/versions/v0-X-Y/`(gitignored);协议/实现一律以代码为准。** |
+| 当前在做 | **v0.8.24 已落 dev(未 tag、未部署)**:web UI 改版(SPA shell 按 `ui-prototype.html` 全量重写:无顶栏折叠侧栏/⌘K/Home lazy-create、composer 4-way 含 OpenCode + model/effort 菜单、工作流五子页、设置六子页、浅色默认、自托管 Outfit/IBM Plex Mono、全站 i18n)+ **OpenCode 第四 vendor**(ACP stdio,共享 `execution/acp/`;skip=auto-allow / hitl=fail-closed decline)+ curated per-session MCP + `/compare`(含历史面)+ 进化只读(含 7 天趋势)+ 多机 host join/registry/remote spawn 门(stdio only;join-token 读写面)+ 项目级第三方 MCP 注册(写 `.mcp.json`)+ model/effort 进 spawn(per-vendor wire 核实)+ admin token 自助轮换 + Track E pending turns / trigger / doctor auth。**tag/部署 HELD**。**逐版改动史 = `git log` + `docs-local/versions/v0-X-Y/`(gitignored);协议/实现一律以代码为准。** |
 
 > 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 

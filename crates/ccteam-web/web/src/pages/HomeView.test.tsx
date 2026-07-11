@@ -73,14 +73,37 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain("会话在第一条消息发出时创建");
   });
 
-  it("ctx-bar: 项目 + 角色 render; 主机 hidden before host data; 分支 never mocked", () => {
+  it("ctx-bar: 项目 + 角色 render; 主机 hidden before host data; 分支 hidden without data", () => {
     const html = render();
     expect(html).toContain('data-testid="ctx-project"');
     expect(html).toContain('data-testid="ctx-role"');
     // getHosts() hasn't resolved (never-resolving fetch) → dimension hidden.
     expect(html).not.toContain('data-testid="ctx-host"');
-    // 分支 has no backend data this version — must not render a mock.
-    expect(html).not.toContain("分支");
+    // v0.8.24 Q7 — 分支 renders ONLY from real backend data (current_branch);
+    // without it the dimension stays hidden (never mocked).
+    expect(html).not.toContain('data-testid="ctx-branch"');
+  });
+
+  it("ctx-bar: 分支 shows READ-ONLY when the project reports current_branch", () => {
+    const html = renderToString(
+      <HomeView
+        lang="zh"
+        isAdmin
+        projects={["ccteam"]}
+        projectPaths={{ ccteam: "~/rob/ccteam" }}
+        projectBranches={{ ccteam: "dev" }}
+        liveCount={0}
+        recents={[]}
+        onLaunched={() => {}}
+        onOpenRecent={() => {}}
+        onOpenSettings={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="ctx-branch"');
+    const seg = html.slice(html.indexOf('data-testid="ctx-branch"'));
+    expect(seg).toContain("dev");
+    // Display-only: a <span>, not a dropdown trigger button.
+    expect(seg.slice(0, 200)).not.toContain("<button");
   });
 
   it("角色 picker is an admin-only beta surface (tenant launches roleless)", () => {

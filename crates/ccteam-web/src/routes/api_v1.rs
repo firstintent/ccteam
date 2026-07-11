@@ -23,7 +23,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use ccteam_core::{
@@ -173,11 +173,12 @@ fn build_projects(
         )
         .map(|c| c.cost_total_usd)
         .unwrap_or(0.0);
+        let project_dir = app.paths.project_dir(&s.state.slug);
         rows.push(DashboardRow {
             slug: s.state.slug.clone(),
             // The real working-tree dir (config-registry resolved) so the SPA can
             // show it next to the slug — disambiguates an auto-appended slug.
-            path: app.paths.project_dir(&s.state.slug).display().to_string(),
+            path: project_dir.display().to_string(),
             team: s.state.team.clone(),
             kind: team_kind_label(s.state.team_kind).to_string(),
             last_event_label,
@@ -185,6 +186,8 @@ fn build_projects(
             badge_label: badge.label(),
             cost_label: format!("{:.2}", cost_total),
             broken: false,
+            // v0.8.24 Q7 — read-only branch dimension (None hides it).
+            current_branch: ccteam_core::read_current_branch(&project_dir),
         });
     }
     // Admin-only: surface ORPHANED registrations — slugs in `config.yaml` whose
@@ -216,6 +219,7 @@ fn build_projects(
                     badge_label: "broken",
                     cost_label: "0.00".to_string(),
                     broken: true,
+                    current_branch: None,
                 });
             }
         }
@@ -259,6 +263,66 @@ pub(crate) async fn handle_me(
         handle,
         is_admin: identity.is_admin,
     })
+}
+
+/// `POST /api/v1/me/reset-token` — v0.8.24: the ADMIN self-serve rotation of
+/// the bootstrap web token (`~/.ccteam/secrets/web-token`). Atomic write
+/// (tmp + rename, 0600) THEN a live in-memory rotate
+/// ([`crate::auth::AuthState::rotate`] — shared cell, no restart), so the
+/// response's new token is immediately valid and the old one immediately
+/// dead. Admin-only: a tenant's token lives in the user registry and is
+/// re-issued by the admin (`GET /users/{id}/link`), not here. 400 when auth
+/// is disabled (loopback — there is no token in use).
+#[utoipa::path(
+    post,
+    path = "/api/v1/me/reset-token",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Rotated; `{wire_token: \"ccteam:<hex>\"}` — the ONLY reveal of the new token", body = AuthToken),
+        (status = 400, description = "Auth disabled (no token in use)"),
+        (status = 403, description = "Non-admin"),
+    ),
+)]
+pub(crate) async fn handle_reset_token(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+) -> Response {
+    if let Some(deny) = crate::auth::deny_non_admin(&identity) {
+        return deny;
+    }
+    if !app.auth.enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "auth is disabled (loopback / --no-auth) — no web token in use"
+            })),
+        )
+            .into_response();
+    }
+    // Mint a fresh 32-byte token + atomic overwrite of the token file
+    // (`token::rotate_token` — same generator/mode as the bootstrap file).
+    let path = app.paths.web_token_path();
+    let write = tokio::task::spawn_blocking(move || crate::token::rotate_token(&path)).await;
+    match write {
+        Ok(Ok(new_hex)) => {
+            // Persisted — now flip the live gate (old token dies here).
+            app.auth.rotate(new_hex.clone());
+            Json(AuthToken {
+                wire_token: Some(format!("{}{new_hex}", crate::auth::TOKEN_PREFIX)),
+            })
+            .into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("persist web-token: {err}")})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("worker: {err}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// v0.8.18 档1 — whether `identity` may see project `slug`. Project is the unit

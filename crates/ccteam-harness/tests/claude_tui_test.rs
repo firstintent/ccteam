@@ -62,6 +62,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     };
@@ -109,6 +110,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     };
@@ -171,6 +173,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     };
@@ -453,6 +456,7 @@ async fn claude_directive_bare_model_passes_through_to_native_picker() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
     };

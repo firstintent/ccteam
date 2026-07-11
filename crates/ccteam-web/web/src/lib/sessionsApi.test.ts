@@ -245,6 +245,19 @@ describe("sessionsApi", () => {
     expect(got.model_warning).toContain("deepseek");
   });
 
+  it("createSession carries explicit model/effort in the body (A-U3)", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, { sid: "s6" }));
+    await createSession("dex-ui", {
+      role: "",
+      vendor: "codex",
+      model: "gpt-5.1",
+      effort: "xhigh",
+    });
+    const body = JSON.parse(vi.mocked(globalThis.fetch).mock.calls[0][1]!.body as string);
+    expect(body).toEqual({ role: "", vendor: "codex", model: "gpt-5.1", effort: "xhigh" });
+  });
+
   it("createSession omits optional fields when not given", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse(201, { sid: "s5" }));

@@ -68,9 +68,39 @@ export function vendorSpec(id: string): VendorSpec {
   return VENDORS.find((v) => v.id === id) ?? VENDORS[0]!;
 }
 
-/** Effort levels (advisory UI; no create-session wire field yet). */
-export const EFFORT_KEYS = ["effLow", "effMid", "effHigh", "effMax"] as const;
+/** Effort levels. `effDefault` (first) wires nothing — the vendor's own
+ *  default holds; an explicit pick rides the create form's `effort` field
+ *  (see {@link wireEffort} for the per-vendor token map). */
+export const EFFORT_KEYS = ["effDefault", "effLow", "effMid", "effHigh", "effMax"] as const;
 export type EffortKey = (typeof EFFORT_KEYS)[number];
+
+/** Per-vendor effort token for `POST .../sessions` (`effort` field), or null
+ *  when nothing should be sent:
+ *  - `effDefault` → null for every vendor (vendor default, honest);
+ *  - claude: `low|medium|high|max` (verified `--effort` levels);
+ *  - codex: `low|medium|high|xhigh` (its `ReasoningEffort` set has no `max`);
+ *  - grok: never (its `--reasoning-effort` value set is undocumented — the
+ *    backend drops it too);
+ *  - opencode: never from the UI (effort values are per-model "variants" we
+ *    cannot enumerate; the adapter seam exists for API callers). */
+export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): string | null {
+  if (draft.effortKey === "effDefault") return null;
+  const claude: Record<string, string> = {
+    effLow: "low",
+    effMid: "medium",
+    effHigh: "high",
+    effMax: "max",
+  };
+  const codex: Record<string, string> = { ...claude, effMax: "xhigh" };
+  switch (draft.vendor) {
+    case "claude":
+      return claude[draft.effortKey] ?? null;
+    case "codex":
+      return codex[draft.effortKey] ?? null;
+    default:
+      return null;
+  }
+}
 
 /** Protocols a caller may pick for `vendor` — the claude `terminal` protocol
  *  is frozen (maintenance-only) and admin-gated in the UI (beta-gate; not a
@@ -93,7 +123,10 @@ export function defaultDraft(): ComposerDraft {
   return {
     vendor: "claude",
     model: VENDORS[0]!.models[0]!,
-    effortKey: "effMax",
+    // Default = vendor default (wires nothing); the old "effMax" default
+    // displayed 极高 while sending nothing — dishonest either way once the
+    // effort field is really wired.
+    effortKey: "effDefault",
     protocol: VENDORS[0]!.protocols[0]!.id,
     hitl: false,
   };
@@ -107,9 +140,12 @@ export function wireProtocol(draft: Pick<ComposerDraft, "vendor" | "protocol">):
   return (found ?? spec.protocols[0]!).wire;
 }
 
-/** Whether launching should follow the spawn with a `/model <model>` control
- *  turn: only when a NON-default model was picked (the backend create route
- *  carries no model field; `/model` is the supported switch surface). */
+/** The model to send on the create form (`model` field), or null for the
+ *  vendor default: only a NON-default pick wires anything (v0.8.24 A-U3 —
+ *  this used to drive a post-spawn `/model` control turn; it now rides
+ *  `POST .../sessions` directly and the vendor-native spawn seam applies it:
+ *  claude `--model`, codex turn/start override, grok `-m`, opencode
+ *  `set_config_option`). Opencode stays null — it self-selects. */
 export function modelSwitchFor(draft: Pick<ComposerDraft, "vendor" | "model">): string | null {
   const spec = vendorSpec(draft.vendor);
   if (spec.id === "opencode") return null; // opencode self-selects

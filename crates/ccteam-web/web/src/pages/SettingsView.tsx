@@ -24,7 +24,8 @@ import SettingsPage, { MyImSection } from "./SettingsPage";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
-import { clearToken, getToken } from "../lib/token";
+import { clearToken, getToken, saveToken } from "../lib/token";
+import { resetToken } from "../lib/meApi";
 import { toastBus } from "../lib/toastBus";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
@@ -241,6 +242,39 @@ export function AccountPanel({
 }) {
   const t = makeT(lang);
   const initial = ((displayName || "").trim() || handle || "C").slice(0, 1).toUpperCase();
+  // v0.8.24 — admin self-serve web-token reset: two-step inline confirm
+  // (arm → confirm), then store the NEW token locally at once (the old one
+  // is already dead server-side; the fetch interceptor picks the new Bearer
+  // up on the next request — session uninterrupted, no re-login).
+  const [resetArmed, setResetArmed] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [, setTokenBump] = useState(0);
+  const doReset = async () => {
+    if (!resetArmed) {
+      setResetArmed(true);
+      return;
+    }
+    setResetBusy(true);
+    try {
+      const { wire_token } = await resetToken();
+      saveToken(wire_token);
+      setTokenBump((n) => n + 1); // re-render the masked token field
+      toastBus.handler?.info(
+        lang === "en"
+          ? "Web token rotated — this browser already uses the new one."
+          : "web token 已重置 —— 本浏览器已自动换用新 token,无需重登。",
+      );
+    } catch (e) {
+      if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
+        toastBus.handler?.error(
+          `${lang === "en" ? "Reset failed" : "重置失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+        );
+      }
+    } finally {
+      setResetBusy(false);
+      setResetArmed(false);
+    }
+  };
   const logout = () => {
     clearToken();
     if (typeof window !== "undefined") window.location.reload();
@@ -312,10 +346,41 @@ export function AccountPanel({
           <label>{t("accToken")}</label>
           <input type="password" readOnly value={maskToken(getToken())} data-testid="account-token" />
           <span className="hint">{t("accTokenHint")}</span>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <button type="button" className="btn ghost mini" onClick={copyToken}>
               {lang === "en" ? "Copy token" : "复制 token"}
             </button>
+            {isAdmin ? (
+              <button
+                type="button"
+                className={`btn mini ${resetArmed ? "primary" : "ghost"}`}
+                data-testid="account-reset-token"
+                disabled={resetBusy}
+                onClick={() => void doReset()}
+              >
+                {resetBusy
+                  ? lang === "en"
+                    ? "Rotating…"
+                    : "重置中…"
+                  : resetArmed
+                    ? lang === "en"
+                      ? "Confirm reset? (old token dies at once)"
+                      : "确认重置?(旧 token 立即失效)"
+                    : lang === "en"
+                      ? "Reset token"
+                      : "重置 web token"}
+              </button>
+            ) : null}
+            {resetArmed && !resetBusy ? (
+              <button
+                type="button"
+                className="btn ghost mini"
+                data-testid="account-reset-cancel"
+                onClick={() => setResetArmed(false)}
+              >
+                {lang === "en" ? "Cancel" : "取消"}
+              </button>
+            ) : null}
           </div>
         </div>
         <div>

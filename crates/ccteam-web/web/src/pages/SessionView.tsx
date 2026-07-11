@@ -266,7 +266,8 @@ export default function SessionView({
           : "claude") as ComposerDraft["vendor"],
         model: statusModel ?? "",
         hitl: session?.permission_mode === "hitl",
-        effortKey: effortKeyOf(statusEffort) ?? "effMid",
+        // Unknown/unreported effort reads 默认 (honest), not a made-up 中.
+        effortKey: effortKeyOf(statusEffort) ?? "effDefault",
       }),
     [vendor, statusModel, statusEffort, session?.permission_mode],
   );

@@ -73,6 +73,8 @@ export default function ChatConsole() {
   );
   const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
   const [projectPaths, setProjectPaths] = useState<Record<string, string>>({});
+  // v0.8.24 Q7 — read-only branch per project (absent = not a git repo).
+  const [projectBranches, setProjectBranches] = useState<Record<string, string>>({});
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -80,6 +82,13 @@ export default function ChatConsole() {
       const slugs = projects.map((p) => p.slug);
       setRegisteredProjects(slugs);
       setProjectPaths(Object.fromEntries(projects.map((p) => [p.slug, p.path])));
+      setProjectBranches(
+        Object.fromEntries(
+          projects
+            .filter((p) => p.current_branch)
+            .map((p) => [p.slug, p.current_branch as string]),
+        ),
+      );
       const lists = await Promise.all(
         slugs.map((slug) => listSessions(slug).catch(() => [] as SessionSummary[])),
       );
@@ -329,6 +338,7 @@ export default function ChatConsole() {
             onNav={(t) => navigate(`/flow/${t}`)}
             onOpenMarket={() => navigate("/settings/market")}
             lang={lang}
+            isAdmin={isAdmin}
           />
         ) : view === "settings" ? (
           <SettingsView
@@ -342,6 +352,7 @@ export default function ChatConsole() {
             isAdmin={isAdmin}
             projects={projects}
             projectPaths={projectPaths}
+            projectBranches={projectBranches}
             liveCount={railSessions.length}
             recents={recents}
             initialProject={homeProject}

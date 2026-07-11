@@ -13,9 +13,12 @@ import { useCallback, useEffect, useState } from "react";
 import {
   getHostDetail,
   getHosts,
+  getJoinToken,
+  mintJoinToken,
   registerMcp,
   type HostDetail,
   type HostSummary,
+  type JoinTokenInfo,
 } from "../lib/hostsApi";
 import { makeT, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
@@ -107,9 +110,6 @@ export default function HostsView({ lang = "zh" }: { lang?: Lang } = {}) {
     }
   };
 
-  const origin =
-    typeof window !== "undefined" && window.location ? window.location.origin : "https://<daemon>";
-
   return (
     <div data-testid="hosts-view" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <header style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
@@ -189,12 +189,103 @@ export default function HostsView({ lang = "zh" }: { lang?: Lang } = {}) {
         )
       )}
 
-      <div className="join-card">
-        <h4>{t("joinTitle")}</h4>
-        <p>{t("joinDesc")}</p>
-        <pre>{`curl -fsSL https://ccteam.dev/install.sh | sh
-ccteam host join --daemon ${origin} --token <join-token>`}</pre>
-      </div>
+      <JoinCard lang={lang} />
+    </div>
+  );
+}
+
+/** The 「连接新主机(卫星节点)」 card: shows the REAL join command (daemon
+ *  origin + newest valid join token from `GET /hosts/join-token`) with a
+ *  copy button; offers minting when no valid token exists yet. Admin-only
+ *  data — a 403 (tenant) keeps the placeholder command and hides actions. */
+export function JoinCard({ lang = "zh" }: { lang?: Lang } = {}) {
+  const t = makeT(lang);
+  const [info, setInfo] = useState<JoinTokenInfo | null>(null);
+  const [allowed, setAllowed] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getJoinToken()
+      .then((i) => {
+        if (!cancelled) setInfo(i);
+      })
+      .catch(() => {
+        // Non-admin (403) or transient failure: keep the placeholder, no CTA.
+        if (!cancelled) setAllowed(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const origin =
+    typeof window !== "undefined" && window.location ? window.location.origin : "https://<daemon>";
+  const token = info?.token ?? null;
+  const command = `curl -fsSL https://ccteam.dev/install.sh | sh
+ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
+
+  const onMint = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setInfo(await mintJoinToken());
+    } catch (e) {
+      if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
+        setError(e instanceof Error ? e.message : "mint failed");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable — the <pre> stays selectable */
+    }
+  };
+
+  return (
+    <div className="join-card" data-testid="join-card">
+      <h4>{t("joinTitle")}</h4>
+      <p>{t("joinDesc")}</p>
+      <pre data-testid="join-command">{command}</pre>
+      {allowed ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
+          {token ? (
+            <button
+              type="button"
+              className="btn ghost mini"
+              data-testid="join-copy"
+              onClick={() => void onCopy()}
+            >
+              {copied ? t("joinTokenCopied") : t("joinTokenCopy")}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn primary mini"
+              data-testid="join-mint"
+              disabled={busy}
+              onClick={() => void onMint()}
+            >
+              {busy ? t("joinTokenGenBusy") : t("joinTokenGen")}
+            </button>
+          )}
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{t("joinTokenHint")}</span>
+        </div>
+      ) : null}
+      {error ? (
+        <div role="alert" data-testid="join-error" className="badge warn" style={{ marginTop: 8 }}>
+          {error}
+        </div>
+      ) : null}
     </div>
   );
 }

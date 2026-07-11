@@ -580,6 +580,32 @@ pub struct StartOutcome {
     pub model_warning: Option<String>,
 }
 
+/// v0.8.24 A-U3 — optional explicit model / reasoning-effort chosen at
+/// spawn (the composer's three-way menu). `None` fields keep the existing
+/// defaults (role frontmatter `model:` for the model, vendor default for
+/// effort). Passed by value through `create_session_api_on_host` →
+/// `start_session` → `plan_new_session`; IM paths pass
+/// `SpawnTuning::default()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpawnTuning {
+    /// Explicit model id; overrides the role's `model:` frontmatter.
+    pub model: Option<String>,
+    /// Explicit reasoning-effort token (vendor-specific value set; only
+    /// wired where the vendor verifiably supports it — see `SpawnCtx::effort`).
+    pub effort: Option<String>,
+}
+
+impl SpawnTuning {
+    /// Normalize: trim + drop empty strings so `Some("")` never leaks.
+    fn normalized(self) -> Self {
+        let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Self {
+            model: clean(self.model),
+            effort: clean(self.effort),
+        }
+    }
+}
+
 /// Result returned by the web/resource session creation path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSessionOutcome {
@@ -721,6 +747,10 @@ struct NewSessionPlan {
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
+    /// v0.8.24 A-U3 — explicit reasoning effort (spawn-time only; not
+    /// persisted in meta, so a daemon-restart rebuild reverts to vendor
+    /// default — same lifetime as an explicit web model choice).
+    effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// v0.8.24 C2 — optional `/compare` group id written to session meta.
     compare_group: Option<String>,
@@ -1212,6 +1242,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
+                    effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                 },
@@ -1758,6 +1789,7 @@ impl Gateway {
                         permission_mode,
                         protocol,
                         "local".to_string(),
+                        SpawnTuning::default(),
                     )
                     .await?;
                 Ok(Some(Self::new_session_receipt(&outcome)))
@@ -2235,6 +2267,7 @@ impl Gateway {
                     // Template sessions default to the stream-json protocol.
                     SessionProtocol::StreamJson,
                     "local".to_string(),
+                    SpawnTuning::default(),
                 )?;
                 return Ok(EnsureSessionOutcome::Spawn(Box::new(plan)));
             }
@@ -2259,6 +2292,7 @@ impl Gateway {
             // chat role with no terminal needs).
             SessionProtocol::StreamJson,
             "local".to_string(),
+            SpawnTuning::default(),
         )?;
         Ok(EnsureSessionOutcome::Spawn(Box::new(plan)))
     }
@@ -2327,6 +2361,7 @@ impl Gateway {
                 permission_mode,
                 protocol,
                 "local".to_string(),
+                SpawnTuning::default(),
             )
             .await?;
         let new_sid = outcome.id.clone();
@@ -2367,6 +2402,7 @@ impl Gateway {
             // Template sessions default to the stream-json protocol.
             SessionProtocol::StreamJson,
             "local".to_string(),
+            SpawnTuning::default(),
         )
         .await
         .map(|o| o.id)
@@ -2387,6 +2423,7 @@ impl Gateway {
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
         host: String,
+        tuning: SpawnTuning,
     ) -> Result<StartOutcome> {
         // v0.8.24 Track D — remote-host gate BEFORE minting a sid: offline /
         // terminal-on-remote / unknown host all fail without creating a
@@ -2416,6 +2453,7 @@ impl Gateway {
             permission_mode,
             protocol,
             host,
+            tuning,
         )?;
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
         let outcome = self.apply_new_session(plan, thread)?;
@@ -2439,6 +2477,7 @@ impl Gateway {
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
         host: String,
+        tuning: SpawnTuning,
     ) -> Result<NewSessionPlan> {
         // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
         // pane/--name/turns/marker all key on `s<N>`, so one (project, role) can
@@ -2474,7 +2513,11 @@ impl Gateway {
         // (switch_current_role) already applies; here it guards creation. See
         // `ensure_role_exists` for the test-dir exemption.
         let role_detail = ensure_role_exists(&cwd, &role)?;
-        let model_id = role_model_id(role_detail.as_ref());
+        // v0.8.24 A-U3 — an explicit composer choice beats the role's
+        // `model:` frontmatter; effort has no role-level default.
+        let tuning = tuning.normalized();
+        let model_id = tuning.model.or_else(|| role_model_id(role_detail.as_ref()));
+        let effort = tuning.effort;
         self.next_session += 1;
         // Make the counter durable BEFORE the sid is used (a later spawn failure
         // then leaves a harmless gap, never a reused sid — red line: monotonic).
@@ -2508,6 +2551,7 @@ impl Gateway {
             secret,
             cwd,
             model_id,
+            effort,
             adapter,
             compare_group: None,
             trigger_override: None,
@@ -2561,6 +2605,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
+                    effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                 },
@@ -2589,6 +2634,7 @@ impl Gateway {
             secret,
             cwd: _,
             model_id,
+            effort: _,
             adapter,
             compare_group,
             trigger_override,
@@ -3906,6 +3952,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
+                    effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                 },
@@ -4016,6 +4063,10 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id,
+                    // Explicit effort is spawn-time only (not persisted in
+                    // meta) — a role-switch / dead-child re-spawn reverts to
+                    // the vendor default, same lifetime as a web model pick.
+                    effort: None,
                     permission_mode,
                     secret,
                 },
@@ -5614,6 +5665,7 @@ impl Gateway {
             protocol,
             owner_id,
             "local".to_string(),
+            SpawnTuning::default(),
         )
         .await
     }
@@ -5632,6 +5684,7 @@ impl Gateway {
         protocol: SessionProtocol,
         owner_id: String,
         host: String,
+        tuning: SpawnTuning,
     ) -> Result<CreateSessionOutcome> {
         // v0.8.20 web↔IM convergence — a web session is OWNED by the caller's
         // identity (`user:<tenant>`, or `user:web-api` for the admin/owner): we
@@ -5653,6 +5706,7 @@ impl Gateway {
             permission_mode,
             protocol,
             host,
+            tuning,
         )
         .await
         .map(|o| CreateSessionOutcome {
@@ -5746,6 +5800,7 @@ impl Gateway {
                 PermissionMode::Skip,
                 protocol,
                 "local".to_string(),
+                SpawnTuning::default(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -7184,6 +7239,80 @@ mod tests {
         assert_eq!(second.model_warning, None);
     }
 
+    /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)
+    /// reaches the adapter's `SpawnCtx`, and the explicit model beats the
+    /// role's `model:` frontmatter; without tuning the role default holds
+    /// and effort stays `None`.
+    #[tokio::test]
+    async fn create_session_api_threads_model_and_effort_into_spawn_ctx() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", Some("sonnet"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        // Explicit tuning wins over the role frontmatter.
+        let created = gateway
+            .create_session_api_on_host(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning {
+                    model: Some("opus-4.8".into()),
+                    effort: Some("max".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.sid, "s1");
+
+        // No tuning → role frontmatter model, no effort.
+        gateway
+            .create_session_api_on_host(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+            )
+            .await
+            .unwrap();
+
+        // Whitespace-only tuning normalizes to None (role default holds).
+        gateway
+            .create_session_api_on_host(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning {
+                    model: Some("  ".into()),
+                    effort: Some("".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let tunings = fake.spawn_tunings.lock().await.clone();
+        assert_eq!(
+            tunings,
+            vec![
+                (Some("opus-4.8".into()), Some("max".into())),
+                (Some("sonnet".into()), None),
+                (Some("sonnet".into()), None),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn claude_family_role_models_do_not_warn() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7289,6 +7418,9 @@ mod tests {
         assert!(turn.contains("[attachment file_path=\"/abs/b.log\"]"));
     }
 
+    /// `(model_id, effort)` captured from a `SpawnCtx` (clippy type_complexity).
+    type CapturedTuning = (Option<String>, Option<String>);
+
     #[derive(Debug)]
     struct FakeAdapter {
         vendor: AgentVendor,
@@ -7322,6 +7454,9 @@ mod tests {
         /// start_thread so a test can assert the minted per-session secret was
         /// threaded into the spawn env.
         spawn_secrets: Arc<Mutex<Vec<String>>>,
+        /// v0.8.24 A-U3 — `(model_id, effort)` captured per start_thread so a
+        /// test can assert an explicit composer choice reached the SpawnCtx.
+        spawn_tunings: Arc<Mutex<Vec<CapturedTuning>>>,
         /// v0.8.11 E4 — when set, `submit_turn` ALSO enqueues a `TurnCompleted`
         /// after the `AgentMessage` (mirrors a real adapter's turn boundary).
         /// Off by default so the sync-drain tests (which only take the first
@@ -7364,6 +7499,7 @@ mod tests {
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
+                spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -7417,6 +7553,10 @@ mod tests {
             }
             self.spawn_modes.lock().await.push(ctx.permission_mode);
             self.spawn_secrets.lock().await.push(ctx.secret.clone());
+            self.spawn_tunings
+                .lock()
+                .await
+                .push((ctx.model_id.clone(), ctx.effort.clone()));
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
             Ok(ThreadHandle {
@@ -7950,6 +8090,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 "sat-lab".into(),
+                SpawnTuning::default(),
             )
             .await
             .expect("online fake remote create");

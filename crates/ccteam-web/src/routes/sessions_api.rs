@@ -250,6 +250,40 @@ pub struct CreateSessionForm {
     /// a stdio protocol (stream-json / acp); terminal is rejected.
     #[serde(default)]
     pub host: Option<String>,
+    /// v0.8.24 A-U3 — explicit model id for the new session; overrides the
+    /// role's `model:` frontmatter. Omitted/empty → vendor default. Wired
+    /// vendor-natively: claude `--model`, codex `turn/start` override,
+    /// grok `-m`, opencode `session/set_config_option` (best-effort).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// v0.8.24 A-U3 — explicit reasoning-effort token. Vendor value sets:
+    /// claude `low|medium|high|xhigh|max`; codex
+    /// `none|minimal|low|medium|high|xhigh`; opencode = a model variant
+    /// (best-effort). Grok is NOT wired (its `--reasoning-effort` value set
+    /// is undocumented; an invalid value would fail the spawn) — the field
+    /// is ignored for grok.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// v0.8.24 A-U3 — map the create form's model/effort into a [`SpawnTuning`].
+/// Grok effort is dropped (see [`CreateSessionForm::effort`]): the flag
+/// exists but its value set is undocumented, so passing one through could
+/// fail the spawn; model still rides `-m`. Empty strings normalize to `None`
+/// downstream (`SpawnTuning::normalized`).
+fn spawn_tuning_from_form(
+    vendor: AgentVendor,
+    model: Option<String>,
+    effort: Option<String>,
+) -> ccteam_im::gateway::SpawnTuning {
+    ccteam_im::gateway::SpawnTuning {
+        model,
+        effort: if vendor == AgentVendor::Grok {
+            None
+        } else {
+            effort
+        },
+    }
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -324,6 +358,8 @@ pub(crate) async fn handle_create_session(
         .filter(|s| !s.is_empty())
         .unwrap_or("local")
         .to_string();
+    // v0.8.24 A-U3 — explicit model/effort from the composer menu.
+    let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
     let created = {
         let mut guard = gw.lock().await;
         guard
@@ -338,6 +374,7 @@ pub(crate) async fn handle_create_session(
                 // IM bot sees it too.
                 identity.web_chat_id(),
                 host,
+                tuning,
             )
             .await
     };
@@ -2201,5 +2238,33 @@ mod tests {
 
         let entries = build_catchup_entries(&app, "s1", None).await;
         assert!(entries.is_empty());
+    }
+
+    /// v0.8.24 A-U3 — the form → SpawnTuning map: model/effort pass through
+    /// for claude/codex/opencode; grok drops effort (undocumented value set,
+    /// an invalid value would fail the spawn) but keeps model.
+    #[test]
+    fn spawn_tuning_from_form_drops_grok_effort_only() {
+        let t = spawn_tuning_from_form(
+            AgentVendor::Claude,
+            Some("opus-4.8".into()),
+            Some("max".into()),
+        );
+        assert_eq!(t.model.as_deref(), Some("opus-4.8"));
+        assert_eq!(t.effort.as_deref(), Some("max"));
+
+        let t = spawn_tuning_from_form(AgentVendor::Codex, None, Some("xhigh".into()));
+        assert_eq!(t.effort.as_deref(), Some("xhigh"));
+
+        let t = spawn_tuning_from_form(
+            AgentVendor::Grok,
+            Some("grok-code".into()),
+            Some("high".into()),
+        );
+        assert_eq!(t.model.as_deref(), Some("grok-code"), "grok keeps -m");
+        assert_eq!(t.effort, None, "grok effort must be dropped");
+
+        let t = spawn_tuning_from_form(AgentVendor::Opencode, None, Some("high".into()));
+        assert_eq!(t.effort.as_deref(), Some("high"));
     }
 }

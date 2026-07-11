@@ -244,8 +244,8 @@ pub use progress::{
 };
 pub use projects::{
     bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,
-    pre_trust_project, refuses_active_session, slugify, slugify_brief, validate_slug_format,
-    ActiveSessionRefusal,
+    pre_trust_project, read_current_branch, refuses_active_session, slugify, slugify_brief,
+    validate_slug_format, ActiveSessionRefusal,
 };
 // v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{
@@ -292,12 +292,12 @@ pub use team_resolver::{
 };
 pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
-    merge_project_mcp_json, probe_project, render_project_mcp_json, render_project_settings,
-    render_workflow_agents_block, render_workflow_template, write_global_helper_templates,
-    write_project_settings, EnabledPluginsSetting, Language, ProjectKind, ProjectProbe,
-    SettingsEnv, WorkflowAgentEntry, WorkflowPreset, WorkflowTemplateCtx,
-    WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD,
-    HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
+    merge_named_mcp_server, merge_project_mcp_json, probe_project, render_project_mcp_json,
+    render_project_settings, render_workflow_agents_block, render_workflow_template,
+    validate_mcp_server_name, write_global_helper_templates, write_project_settings,
+    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
+    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
+    CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

@@ -62,6 +62,20 @@ async fn join_registers_host_and_heartbeat_online_offline() {
     let c = client();
     let auth = format!("Bearer ccteam:{ADMIN_HEX}");
 
+    // GET before any mint → token: null (read-only, never mints).
+    let empty: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty["token"].is_null(), "no token minted yet: {empty}");
+
     // Mint join token (admin).
     let mint: serde_json::Value = c
         .post(format!("http://{addr}/api/v1/hosts/join-token"))
@@ -80,6 +94,22 @@ async fn join_registers_host_and_heartbeat_online_offline() {
         .as_str()
         .unwrap()
         .contains("ccteam host join"));
+
+    // GET after mint → the newest valid token round-trips (the SPA join
+    // card composes the full command from this).
+    let read: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["token"].as_str(), Some(join_tok.as_str()));
+    assert!(read["command"].as_str().unwrap().contains(&join_tok));
 
     // Join with join-token bearer (not admin).
     let join: serde_json::Value = c
@@ -208,6 +238,15 @@ async fn non_admin_403_on_hosts_and_join() {
         };
         assert_eq!(r.status(), 403, "tenant must be 403 on {path}");
     }
+    // GET join-token (read) is equally admin-only — a tenant must never see
+    // a join token (fail-closed).
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &tauth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "tenant must be 403 on GET join-token");
     // Join: tenant is neither admin nor join-token identity → 403 (after a
     // well-formed body so the extractor does not 422 first).
     let r = c
@@ -383,6 +422,7 @@ async fn gateway_create_on_offline_host_fails_clean() {
             SessionProtocol::StreamJson,
             "web-api".into(),
             "sat1".into(),
+            ccteam_im::gateway::SpawnTuning::default(),
         )
         .await
         .unwrap_err();

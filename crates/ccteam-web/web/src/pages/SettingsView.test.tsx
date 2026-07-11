@@ -134,6 +134,36 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
     expect(html).toContain('type="password"');
   });
 
+  it("admin sees the web-token 重置 button; tenant does not (own token = admin-managed)", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const admin = renderToString(
+      <AccountPanel
+        lang="zh"
+        isAdmin
+        handle="owner"
+        displayName=""
+        avatar="#f59e0b"
+        onName={() => {}}
+        onAvatar={() => {}}
+      />,
+    );
+    expect(admin).toContain('data-testid="account-reset-token"');
+    expect(admin).toContain("重置 web token");
+
+    const tenant = renderToString(
+      <AccountPanel
+        lang="zh"
+        isAdmin={false}
+        handle="alice"
+        displayName=""
+        avatar="#3b82f6"
+        onName={() => {}}
+        onAvatar={() => {}}
+      />,
+    );
+    expect(tenant).not.toContain('data-testid="account-reset-token"');
+  });
+
   it("tenant account panel embeds the self-serve 我的 IM bot section", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(

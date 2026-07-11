@@ -153,6 +153,7 @@ fn make_ctx_sid(slug: &str, sid: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     }
@@ -168,6 +169,7 @@ fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
         secret: String::new(),
     }

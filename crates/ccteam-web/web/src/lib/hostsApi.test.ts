@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getHostDetail, getHosts, registerMcp } from "./hostsApi";
+import { getHostDetail, getHosts, getJoinToken, mintJoinToken, registerMcp } from "./hostsApi";
 
 const realFetch = globalThis.fetch;
 
@@ -101,6 +101,43 @@ describe("hostsApi", () => {
       "/api/v1/hosts/local/register-mcp",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("getJoinToken GETs /api/v1/hosts/join-token (token may be null)", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { token: null }));
+    const got = await getJoinToken();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/hosts/join-token",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(got.token).toBeNull();
+  });
+
+  it("mintJoinToken POSTs a JSON body and returns the minted token", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(201, {
+        token: "deadbeef",
+        label: "lab",
+        command: "ccteam host join --daemon <daemon-url> --token deadbeef",
+      }),
+    );
+    const got = await mintJoinToken("lab");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/hosts/join-token",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ label: "lab" }),
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(got.token).toBe("deadbeef");
+  });
+
+  it("getJoinToken maps 403 → HTTP 403 (tenant fail-closed)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(403, {}));
+    await expect(getJoinToken()).rejects.toThrow("HTTP 403");
   });
 
   it("maps 401 → UNAUTHENTICATED and a 500 → HTTP 500", async () => {

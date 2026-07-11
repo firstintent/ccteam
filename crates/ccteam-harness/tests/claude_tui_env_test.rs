@@ -45,6 +45,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     }

@@ -66,6 +66,7 @@ pub mod sse;
 pub mod users;
 // v0.9 T4 — streamable HTTP MCP (`POST /mcp`, admin bearer always required).
 pub mod mcp;
+pub mod mcp_servers;
 
 /// Compose every M5.x sub-router available at the current ship state.
 /// `health` is state-less (M5.0 contract) so it merges in without an

@@ -13,7 +13,7 @@ vi.hoisted(() => {
 });
 
 import WorkflowView from "./WorkflowView";
-import { compareUrl, evolutionUrl } from "../lib/workflowApi";
+import { compareUrl, evolutionUrl, mcpServersUrl } from "../lib/workflowApi";
 
 describe("WorkflowView", () => {
   it("renders five tabs and compare affordances", () => {
@@ -26,11 +26,34 @@ describe("WorkflowView", () => {
     expect(html).toContain("workflow-tab-evolution");
     expect(html).toContain("workflow-tab-compare");
   });
+
+  it("MCP tab: admin sees the register form + prefill templates; tenant does not", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const admin = renderToString(<WorkflowView tab="mcp" isAdmin />);
+    expect(admin).toContain('data-testid="mcp-register-form"');
+    expect(admin).toContain('data-testid="mcp-tpl-context7"');
+    expect(admin).toContain('data-testid="mcp-tpl-playwright"');
+    expect(admin).toContain('data-testid="mcp-rows"');
+    // Templates prefill only — nothing auto-executes (copy says so).
+    expect(admin).toContain("不执行");
+
+    const tenant = renderToString(<WorkflowView tab="mcp" />);
+    expect(tenant).not.toContain('data-testid="mcp-register-form"');
+    expect(tenant).toContain("仅 admin");
+  });
+
+  it("Compare tab: renders the history section (empty state before any run)", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(<WorkflowView tab="compare" />);
+    expect(html).toContain("历史对比");
+    expect(html).toContain('data-testid="compare-history-empty"');
+  });
 });
 
 describe("workflowApi urls", () => {
   it("builds compare and evolution paths", () => {
     expect(compareUrl("demo")).toBe("/api/v1/projects/demo/compare");
     expect(evolutionUrl("my-app")).toBe("/api/v1/projects/my-app/evolution");
+    expect(mcpServersUrl("demo")).toBe("/api/v1/projects/demo/mcp-servers");
   });
 });

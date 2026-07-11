@@ -1642,6 +1642,28 @@ impl HarnessAdapter for CodexAppServerAdapter {
             })
             .await;
         }
+        // v0.8.24 A-U3 — an explicit spawn-time model / effort choice becomes
+        // a sticky `turn/start` override (the SAME machinery the `/model`
+        // directive uses — `apply_overrides` folds `model:114` / `effort:126`
+        // into every turn/start). Without this the ctx choice was
+        // display-only (tracker seeding below); now it actually reaches
+        // codex. Effort values are codex's `ReasoningEffort` set
+        // (`none|minimal|low|medium|high|xhigh`).
+        {
+            let model = ctx.model_id.clone().filter(|m| !m.trim().is_empty());
+            let effort = ctx.effort.clone().filter(|e| !e.trim().is_empty());
+            if model.is_some() || effort.is_some() {
+                self.set_override(&thread_id, move |o| {
+                    if let Some(m) = model {
+                        o.model = Some(m);
+                    }
+                    if let Some(e) = effort {
+                        o.effort = Some(e);
+                    }
+                })
+                .await;
+            }
+        }
         // v0.8.5 D2.4 / v0.8.19 — seed the tracker's model + effort for this
         // thread so `/status` + `thread_status` can report them before the
         // first tokenUsage notification arrives. DETERMINISTIC precedence:
@@ -1653,7 +1675,13 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // it; `result.reasoningEffort`).
         {
             let model = ctx.model_id.clone().or_else(|| pluck_model(&result));
-            let effort = pluck_effort(&result);
+            // v0.8.24 A-U3 — an explicit ctx effort wins (it is now also an
+            // override, so it is what codex will run); else the response echo.
+            let effort = ctx
+                .effort
+                .clone()
+                .filter(|e| !e.trim().is_empty())
+                .or_else(|| pluck_effort(&result));
             let mut tracker = self.tracker.lock().await;
             let entry = tracker.entry(&thread_id);
             if model.is_some() {

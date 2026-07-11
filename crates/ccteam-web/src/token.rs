@@ -91,6 +91,42 @@ pub fn generate_or_load_token(path: &Path) -> Result<String> {
     Ok(hex)
 }
 
+/// v0.8.24 — mint a FRESH 32-byte token and atomically overwrite `path`
+/// (tmp + rename, 0600). The self-serve reset seam: unlike
+/// [`generate_or_load_token`] this deliberately replaces an existing file.
+/// Returns the new bare-hex token.
+pub fn rotate_token(path: &Path) -> Result<String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent of {}", path.display()))?;
+    }
+    let mut buf = [0u8; TOKEN_BYTES];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let hex = hex_encode(&buf);
+
+    let tmp = path.with_extension("tmp");
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("create token tmp {}", tmp.display()))?;
+    f.write_all(hex.as_bytes())
+        .with_context(|| format!("write token tmp {}", tmp.display()))?;
+    f.flush().ok();
+    drop(f);
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename token into place {}", path.display()))?;
+    Ok(hex)
+}
+
 /// Load an existing token file. Caller must have already verified
 /// `path.exists()`.
 pub fn load_existing(path: &Path) -> Result<String> {

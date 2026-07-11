@@ -7,13 +7,18 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Activity, GitCompareArrows, Package, Server, User } from "lucide-react";
-import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
+import { getHistory, listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
 import {
+  getCompareHistory,
   getEvolution,
+  getMcpServers,
+  registerMcpServer,
   runCompare,
+  type CompareHistoryGroup,
   type CompareResult,
   type EvolutionSummary,
+  type McpServersResponse,
 } from "../lib/workflowApi";
 import { fetchDashboard } from "../lib/dashboardApi";
 import { makeT, tr, type Lang } from "../lib/i18n";
@@ -41,11 +46,14 @@ export default function WorkflowView({
   onNav,
   onOpenMarket,
   lang: langProp,
+  isAdmin = false,
 }: {
   tab?: string;
   onNav?: (tab: TabId) => void;
   onOpenMarket?: () => void;
   lang?: Lang;
+  /** Gates the MCP register form (backend POST is admin-only regardless). */
+  isAdmin?: boolean;
 } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
@@ -67,6 +75,14 @@ export default function WorkflowView({
   const [compareVendors, setCompareVendors] = useState<string[]>(["claude", "codex"]);
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
   const [compareBusy, setCompareBusy] = useState(false);
+  // v0.8.24 gap-fill — MCP servers page + compare history.
+  const [mcp, setMcp] = useState<McpServersResponse | null>(null);
+  const [mcpForm, setMcpForm] = useState({ name: "", url: "", command: "", args: "" });
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [compareGroups, setCompareGroups] = useState<CompareHistoryGroup[]>([]);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
+  /** Per-sid replayed answer for the expanded group (existing history pipeline). */
+  const [groupAnswers, setGroupAnswers] = useState<Record<string, string>>({});
 
   useEffect(() => {
     void fetchDashboard()
@@ -89,6 +105,10 @@ export default function WorkflowView({
         setSkills((idx.plugins ?? []).filter((p) => p.type === "skill"));
       } else if (tab === "evolution") {
         setEvolution(await getEvolution(slug));
+      } else if (tab === "mcp") {
+        setMcp(await getMcpServers(slug));
+      } else if (tab === "compare") {
+        setCompareGroups((await getCompareHistory(slug)).groups);
       }
     } catch (e) {
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
@@ -117,10 +137,72 @@ export default function WorkflowView({
     try {
       const res = await runCompare(slug, comparePrompt.trim(), compareVendors);
       setCompareResult(res);
+      // The fresh group is now in session meta — refresh the history list.
+      void getCompareHistory(slug)
+        .then((h) => setCompareGroups(h.groups))
+        .catch(() => {});
     } catch (e) {
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
     } finally {
       setCompareBusy(false);
+    }
+  };
+
+  // v0.8.24 F1.12 — register a third-party MCP server (idempotent config
+  // write server-side; ccteam never executes/downloads it). Templates below
+  // only PREFILL this form — nothing runs until 注册 is clicked, and even
+  // then only the project `.mcp.json` is written.
+  const onRegisterMcp = async () => {
+    const name = mcpForm.name.trim();
+    const url = mcpForm.url.trim();
+    const command = mcpForm.command.trim();
+    if (!slug || !name || (!url && !command)) {
+      toastBus.handler?.error(
+        tr(lang, "填写 name + url(或 command)", "Fill name + url (or command)"),
+      );
+      return;
+    }
+    setMcpBusy(true);
+    try {
+      await registerMcpServer(slug, {
+        name,
+        url: url || undefined,
+        command: command || undefined,
+        args: mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : undefined,
+      });
+      setMcpForm({ name: "", url: "", command: "", args: "" });
+      setMcp(await getMcpServers(slug));
+      toastBus.handler?.info(
+        tr(lang, `已写入 .mcp.json:${name}(vendor 下次启动生效)`, `Wrote .mcp.json: ${name}`),
+      );
+    } catch (e) {
+      toastBus.handler?.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  // v0.8.24 — expand one history group: replay each member's answer via the
+  // EXISTING per-sid history pipeline (GET /api/v1/sessions/{sid}).
+  const onOpenGroup = async (g: CompareHistoryGroup) => {
+    if (openGroup === g.group) {
+      setOpenGroup(null);
+      return;
+    }
+    setOpenGroup(g.group);
+    for (const m of g.members) {
+      if (groupAnswers[m.sid] !== undefined) continue;
+      void getHistory(m.sid)
+        .then((h) => {
+          const last = [...h.events].reverse().find((e) => e.assistant.trim());
+          setGroupAnswers((prev) => ({
+            ...prev,
+            [m.sid]: last ? last.assistant : "",
+          }));
+        })
+        .catch(() => {
+          setGroupAnswers((prev) => ({ ...prev, [m.sid]: "" }));
+        });
     }
   };
 
@@ -297,21 +379,130 @@ export default function WorkflowView({
                   </>
                 ),
               )}
-              <div className="flow-rows">
+              <div className="flow-rows" data-testid="mcp-rows">
                 {flowRow(
                   "ccteam",
                   zh
                     ? "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp 自检"
                     : "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp",
-                  <span className="badge ok">{t("mcpOk")}</span>,
+                  mcp?.ccteam_registered ? (
+                    <span className="badge ok">{t("mcpOk")}</span>
+                  ) : (
+                    <span className="badge" title={zh ? "默认 stream-json 会话经 curated mcp-config 注入,不依赖项目 .mcp.json" : "curated mcp-config injects it per session"}>
+                      {zh ? "随会话注入" : "per-session"}
+                    </span>
+                  ),
                   "ccteam",
                 )}
+                {(mcp?.servers ?? [])
+                  .filter((sv) => !sv.is_ccteam)
+                  .map((sv) =>
+                    flowRow(
+                      sv.name,
+                      sv.url
+                        ? `${sv.kind} · ${sv.url}`
+                        : `${sv.kind} · ${sv.command ?? ""} ${(sv.args ?? []).join(" ")}`.trim(),
+                      <span className="badge ok">{zh ? "已注册" : "registered"}</span>,
+                      sv.name,
+                    ),
+                  )}
               </div>
-              <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>
-                {zh
-                  ? "第三方 MCP server 注册走 设置→主机 的 register-mcp(幂等写 vendor 配置);本页只读展示。"
-                  : "Third-party MCP registration lives under Settings → Hosts (idempotent register-mcp); this page is read-only."}
-              </p>
+              {isAdmin ? (
+                <div className="form" data-testid="mcp-register-form">
+                  <label style={{ fontSize: 13, fontWeight: 600 }}>
+                    {zh ? "注册第三方 MCP server" : "Register a third-party MCP server"}
+                  </label>
+                  <p style={{ fontSize: 12.5, color: "var(--text-faint)", margin: 0 }}>
+                    {zh
+                      ? "幂等写入项目根 .mcp.json(vendor 原生配置,Claude Code 下次启动读取);ccteam 不下载、不执行任何内容。"
+                      : "Idempotently writes the project .mcp.json (vendor-native; Claude Code reads it on next start); ccteam downloads/executes nothing."}
+                  </p>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <input
+                      type="text"
+                      data-testid="mcp-name"
+                      placeholder="name"
+                      value={mcpForm.name}
+                      onChange={(e) => setMcpForm((f) => ({ ...f, name: e.target.value }))}
+                      style={{ width: 140 }}
+                    />
+                    <input
+                      type="text"
+                      data-testid="mcp-url"
+                      placeholder={zh ? "url(http 型)" : "url (http)"}
+                      value={mcpForm.url}
+                      onChange={(e) => setMcpForm((f) => ({ ...f, url: e.target.value }))}
+                      style={{ width: 240 }}
+                    />
+                    <input
+                      type="text"
+                      data-testid="mcp-command"
+                      placeholder={zh ? "command(stdio 型)" : "command (stdio)"}
+                      value={mcpForm.command}
+                      onChange={(e) => setMcpForm((f) => ({ ...f, command: e.target.value }))}
+                      style={{ width: 160 }}
+                    />
+                    <input
+                      type="text"
+                      data-testid="mcp-args"
+                      placeholder="args…"
+                      value={mcpForm.args}
+                      onChange={(e) => setMcpForm((f) => ({ ...f, args: e.target.value }))}
+                      style={{ width: 200 }}
+                    />
+                    <button
+                      type="button"
+                      className="btn primary mini"
+                      data-testid="mcp-register"
+                      disabled={mcpBusy}
+                      onClick={() => void onRegisterMcp()}
+                    >
+                      {mcpBusy ? (zh ? "写入中…" : "Writing…") : zh ? "注册" : "Register"}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 12, color: "var(--text-faint)" }}>
+                      {zh ? "建议模板(仅填表,不执行):" : "Templates (prefill only):"}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn ghost mini"
+                      data-testid="mcp-tpl-context7"
+                      onClick={() =>
+                        setMcpForm({
+                          name: "context7",
+                          url: "https://mcp.context7.com/mcp",
+                          command: "",
+                          args: "",
+                        })
+                      }
+                    >
+                      context7
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost mini"
+                      data-testid="mcp-tpl-playwright"
+                      onClick={() =>
+                        setMcpForm({
+                          name: "playwright",
+                          url: "",
+                          command: "npx",
+                          args: "@playwright/mcp@latest",
+                        })
+                      }
+                    >
+                      playwright
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>
+                  {zh
+                    ? "第三方 MCP server 注册(写项目 .mcp.json)仅 admin 可操作。"
+                    : "Registering a third-party MCP server (project .mcp.json write) is admin-only."}
+                </p>
+              )}
             </>
           ) : null}
 
@@ -335,7 +526,8 @@ export default function WorkflowView({
                     <div className="stat">
                       <span className="k">turn records</span>
                       <span className="v">{evolution.turn_records}</span>
-                      <span className="k">
+                      <span className="k" data-testid="evolution-7d">
+                        {zh ? "近 7 天" : "last 7 days"} +{evolution.turn_records_7d} ·{" "}
                         {zh ? "verdicts" : "verdicts"} {evolution.verdict_records}
                       </span>
                     </div>
@@ -428,6 +620,69 @@ export default function WorkflowView({
                   </button>
                 </div>
               </div>
+              <h2 style={{ fontSize: 14, margin: "10px 0 0" }}>{tr(lang, "历史对比", "History")}</h2>
+              {compareGroups.length === 0 && !loading ? (
+                <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="compare-history-empty">
+                  {tr(lang, "还没有对比记录。", "No compare runs yet.")}
+                </p>
+              ) : (
+                <div className="flow-rows" data-testid="compare-history">
+                  {compareGroups.map((g) => (
+                    <div key={g.group}>
+                      <div className="flow-row">
+                        <span className="n" title={g.group}>
+                          {g.prompt || g.group}
+                        </span>
+                        <span className="d">
+                          {g.created_at.slice(0, 16).replace("T", " ")} ·{" "}
+                          {g.members.map((m) => `${m.vendor}(${m.sid})`).join(" vs ")} · Σ{" "}
+                          {g.cost_subtotal_usd != null ? `$${g.cost_subtotal_usd.toFixed(4)}` : "—"}
+                        </span>
+                        <span className="end">
+                          <button
+                            type="button"
+                            className="btn ghost mini"
+                            data-testid={`compare-open-${g.group}`}
+                            onClick={() => void onOpenGroup(g)}
+                          >
+                            {openGroup === g.group ? tr(lang, "收起", "Close") : tr(lang, "并排查看", "Open")}
+                          </button>
+                        </span>
+                      </div>
+                      {openGroup === g.group ? (
+                        <div
+                          data-testid={`compare-group-${g.group}`}
+                          style={{ display: "flex", gap: 10, padding: "10px 0", flexWrap: "wrap" }}
+                        >
+                          {g.members.map((m) => (
+                            <div
+                              key={m.sid}
+                              style={{
+                                flex: "1 1 260px",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-card)",
+                                padding: "10px 14px",
+                                background: "var(--bg-card)",
+                              }}
+                            >
+                              <div className="mono" style={{ fontSize: 12, marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
+                                <span className={vendorDotClass(m.vendor)} />
+                                {m.vendor} · {m.sid}
+                                {m.cost_usd != null ? ` · $${m.cost_usd.toFixed(4)}` : ""}
+                              </div>
+                              <pre style={{ whiteSpace: "pre-wrap", fontSize: 13, fontFamily: "inherit", color: "var(--text-muted)", margin: 0 }}>
+                                {groupAnswers[m.sid] === undefined
+                                  ? t("loading")
+                                  : groupAnswers[m.sid] || tr(lang, "(无回放内容)", "(no replay)")}
+                              </pre>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
               {compareResult ? (
                 <div className="form" data-testid="compare-result">
                   <p className="mono" style={{ fontSize: 11.5, color: "var(--text-faint)" }}>

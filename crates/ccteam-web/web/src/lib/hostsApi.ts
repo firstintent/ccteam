@@ -55,6 +55,28 @@ export interface RegisterMcpResult {
   paths: Record<string, string>;
 }
 
+/** `GET`/`POST /api/v1/hosts/join-token` response (admin-only). `token` is
+ *  null when none has been minted / all are spent (GET only). */
+export interface JoinTokenInfo {
+  token: string | null;
+  label?: string | null;
+  minted_at?: string;
+  max_uses?: number | null;
+  uses?: number;
+  command?: string;
+}
+
+/** `GET /api/v1/hosts/join-token` — newest still-valid join token (or
+ *  `{token: null}`). Admin-only; a tenant gets HTTP 403. */
+export function getJoinToken(): Promise<JoinTokenInfo> {
+  return getJson<JoinTokenInfo>("/api/v1/hosts/join-token");
+}
+
+/** `POST /api/v1/hosts/join-token` — mint a fresh join token (admin-only). */
+export function mintJoinToken(label?: string): Promise<JoinTokenInfo> {
+  return postJson<JoinTokenInfo>("/api/v1/hosts/join-token", { label: label ?? null });
+}
+
 /** `GET /api/v1/hosts` — list every host (today just `local`). */
 export function getHosts(): Promise<HostsResponse> {
   return getJson<HostsResponse>("/api/v1/hosts");
@@ -89,12 +111,16 @@ async function getJson<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function postJson<T>(url: string): Promise<T> {
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { Accept: "application/json" },
+      headers:
+        body === undefined
+          ? { Accept: "application/json" }
+          : { Accept: "application/json", "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
       credentials: "same-origin",
     });
   } catch (e) {

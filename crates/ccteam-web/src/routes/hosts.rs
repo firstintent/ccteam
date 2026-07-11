@@ -640,6 +640,57 @@ pub(crate) async fn handle_mint_join_token(
         .into_response()
 }
 
+/// `GET /api/v1/hosts/join-token` — admin reads the newest still-valid join
+/// token (unrevoked, not exhausted). `token: null` when none exists — the UI
+/// then offers the mint action (`POST` on this path). **Read-only**: never
+/// mints. Admin-only (`deny_non_admin`): a join token lets a machine register
+/// itself, so tenants must never see one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/hosts/join-token",
+    tag = "hosts",
+    responses(
+        (status = 200, description = "Newest valid token or `{token: null}`; `{token, label?, minted_at?, max_uses?, uses, command}`", body = serde_json::Value),
+        (status = 403, description = "Non-admin"),
+    ),
+)]
+pub(crate) async fn handle_get_join_token(
+    State(app): State<crate::state::AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
+    let path = app.paths.host_join_tokens_path();
+    let store = match ccteam_core::JoinTokenStore::load(&path) {
+        Ok(s) => s,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err}")})),
+            )
+                .into_response();
+        }
+    };
+    let newest_valid = store
+        .tokens
+        .iter()
+        .rev()
+        .find(|t| !t.revoked && t.max_uses.map(|m| t.uses < m).unwrap_or(true));
+    match newest_valid {
+        Some(t) => Json(serde_json::json!({
+            "token": t.token,
+            "label": t.label,
+            "minted_at": t.minted_at,
+            "max_uses": t.max_uses,
+            "uses": t.uses,
+            "command": format!("ccteam host join --daemon <daemon-url> --token {}", t.token),
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({ "token": serde_json::Value::Null })).into_response(),
+    }
+}
+
 /// `POST /api/v1/hosts/join` — satellite registers with a join token.
 #[utoipa::path(
     post,

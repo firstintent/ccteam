@@ -39,6 +39,10 @@ export interface DashboardRow {
    *  the admin). The rail flags them and offers a deregister action. Absent ⇒
    *  a healthy project. */
   broken?: boolean;
+  /** v0.8.24 Q7 — current git branch of the working tree (read-only,
+   *  best-effort from `.git/HEAD`). Absent ⇒ not a git repo → the composer
+   *  hides the branch dimension. */
+  current_branch?: string | null;
 }
 
 /** GET `/api/v1/projects`. Returns the parsed array on 2xx.

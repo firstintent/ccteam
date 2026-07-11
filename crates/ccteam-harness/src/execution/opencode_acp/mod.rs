@@ -75,11 +75,20 @@ impl OpencodeAcpAdapter {
     }
 
     fn inbound_policy(mode: PermissionMode) -> InboundPolicy {
-        // Skip (default): auto-allow every permission request.
-        // Hitl: still auto-allow for MVP until IM bridge lands; refuse to
-        // default-decline (would reject all tools). HITL bridge is W5.
-        let _ = mode;
-        InboundPolicy::AutoAllowPermission
+        // Skip (default): auto-allow every permission request (client not
+        // implementing the method would make opencode auto-REJECT tools).
+        //
+        // Hitl (v0.8.24 gap-fix): **fail-closed decline**, same posture as
+        // grok hitl (no --always-approve + transport default-decline). The
+        // former MVP auto-allow made a hitl session behave exactly like
+        // skip — an approval bypass (红线: hitl must never silently allow).
+        // Decline only blocks THAT tool call (opencode rejects it and the
+        // turn continues — never a kill, never a panic); the full IM
+        // [同意][拒绝] bridge remains the v0.9-W5 work item.
+        match mode {
+            PermissionMode::Hitl => InboundPolicy::DefaultDecline,
+            _ => InboundPolicy::AutoAllowPermission,
+        }
     }
 
     async fn handshake_initialize(transport: &AcpTransport) -> Result<(), HarnessError> {
@@ -386,6 +395,50 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             info,
             ctx.permission_mode,
         );
+        // v0.8.24 A-U3 — best-effort spawn-time model/effort via the SAME
+        // vendor-native seam the `/model` directive uses
+        // (`session/set_config_option`; opencode's `session/new` takes no
+        // model). A failure must never fail the spawn — the session then
+        // runs on opencode's self-selected default (honest degrade, warn
+        // only). Model value shape is opencode's `provider/model[/variant]`;
+        // effort must be one of the model's variants.
+        for (config_id, value) in [
+            ("model", ctx.model_id.as_deref()),
+            ("effort", ctx.effort.as_deref()),
+        ] {
+            let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            match live
+                .transport
+                .call(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": live.session_id,
+                        "configId": config_id,
+                        "value": value,
+                    }),
+                )
+                .await
+            {
+                Ok(_) => {
+                    if let Ok(mut st) = live.state.lock() {
+                        if config_id == "model" {
+                            st.model = Some(value.to_string());
+                        } else {
+                            st.effort = Some(value.to_string());
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    sid = %ctx.sid,
+                    config_id,
+                    value,
+                    error = %e,
+                    "opencode spawn-time set_config_option failed; continuing with vendor default"
+                ),
+            }
+        }
         let mut handle = Self::make_handle(&live);
         if let Ok(st) = live.state.lock() {
             if let Some(m) = &st.model {

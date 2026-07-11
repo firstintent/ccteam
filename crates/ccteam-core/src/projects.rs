@@ -418,6 +418,42 @@ pub fn bootstrap_project_at_dir(
 /// real `~/.claude.json`, eventually bloating the file enough to break
 /// Claude login (regression observed 2026-05-06).
 ///
+/// v0.8.24 Q7(默认:仅展示)— best-effort current git branch of a project
+/// working tree. `None` when the dir is not a git repo (or unreadable) —
+/// the UI then hides the branch dimension. Handles both a `.git` DIRECTORY
+/// and a worktree `.git` FILE (`gitdir: <path>`, one hop). A detached HEAD
+/// reads as the short 12-hex commit id (still honest/renderable). Read-only:
+/// never shells out to `git`, never mutates.
+pub fn read_current_branch(project_dir: &Path) -> Option<String> {
+    let dot_git = project_dir.join(".git");
+    let head_path = if dot_git.is_dir() {
+        dot_git.join("HEAD")
+    } else if dot_git.is_file() {
+        let raw = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
+        let base = Path::new(gitdir);
+        let resolved = if base.is_absolute() {
+            base.to_path_buf()
+        } else {
+            project_dir.join(base)
+        };
+        resolved.join("HEAD")
+    } else {
+        return None;
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    let head = head.trim();
+    if let Some(r) = head.strip_prefix("ref:") {
+        let r = r.trim();
+        return Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if head.len() >= 12 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(head[..12].to_string());
+    }
+    None
+}
+
 /// No-ops gracefully if the resolved `.claude.json` is unwritable.
 pub fn pre_trust_project(project_dir: &Path) -> Result<()> {
     if std::env::var("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP")
@@ -1331,6 +1367,42 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&hook_sh).unwrap(),
             crate::HOOK_DISPATCHER_SH,
+        );
+    }
+
+    #[test]
+    fn read_current_branch_ref_detached_worktree_and_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Not a repo → None.
+        assert_eq!(super::read_current_branch(tmp.path()), None);
+
+        // Normal repo on a branch.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/dev\n").unwrap();
+        assert_eq!(super::read_current_branch(&repo).as_deref(), Some("dev"));
+
+        // Detached HEAD → short 12-hex.
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_current_branch(&repo).as_deref(),
+            Some("0123456789ab")
+        );
+
+        // Worktree: `.git` FILE pointing at a gitdir.
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let gitdir = tmp.path().join("gitdir-wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature-x\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        assert_eq!(
+            super::read_current_branch(&wt).as_deref(),
+            Some("feature-x")
         );
     }
 }

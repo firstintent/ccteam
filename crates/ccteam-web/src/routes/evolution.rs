@@ -45,6 +45,8 @@ pub struct EvolutionSummary {
     pub turn_records: u64,
     /// Total verdict records (v0.9 will fill; may be 0 now).
     pub verdict_records: u64,
+    /// v0.8.24 — turn records written in the last 7 days (trend stat).
+    pub turn_records_7d: u64,
     pub roles: Vec<EvolutionBucket>,
     pub skills: Vec<EvolutionBucket>,
     /// True when the experience file is missing or empty.
@@ -78,6 +80,7 @@ pub(crate) async fn handle_evolution(
             slug,
             turn_records: 0,
             verdict_records: 0,
+            turn_records_7d: 0,
             roles: vec![],
             skills: vec![],
             empty: true,
@@ -95,6 +98,8 @@ pub(crate) async fn handle_evolution(
 
     let mut turn_records = 0u64;
     let mut verdict_records = 0u64;
+    let mut turn_records_7d = 0u64;
+    let week_ago = chrono::Utc::now() - chrono::Duration::days(7);
     // key = (kind, id, sha)
     let mut role_acc: BTreeMap<(String, String), Acc> = BTreeMap::new();
     let mut skill_acc: BTreeMap<(String, String), Acc> = BTreeMap::new();
@@ -103,6 +108,9 @@ pub(crate) async fn handle_evolution(
         match rec {
             ExperienceRecord::Turn(t) => {
                 turn_records += 1;
+                if t.ts >= week_ago {
+                    turn_records_7d += 1;
+                }
                 accumulate_turn(t, &mut role_acc, &mut skill_acc);
             }
             ExperienceRecord::Verdict(_) => {
@@ -119,6 +127,7 @@ pub(crate) async fn handle_evolution(
         slug,
         turn_records,
         verdict_records,
+        turn_records_7d,
         roles,
         skills,
         empty,

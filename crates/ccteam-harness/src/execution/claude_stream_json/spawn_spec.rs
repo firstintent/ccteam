@@ -41,6 +41,10 @@ pub struct StreamJsonSpawnInput<'a> {
     pub resume: bool,
     /// Concrete model id (`--model`); `None`/empty = vendor default.
     pub model_id: Option<&'a str>,
+    /// v0.8.24 A-U3 — reasoning effort (`--effort low|medium|high|xhigh|max`,
+    /// verified against claude 2.1.207 `--help`); `None`/empty = vendor
+    /// default (flag omitted).
+    pub effort: Option<&'a str>,
     /// Per-session permission posture.
     pub permission_mode: PermissionMode,
     /// Path to curated per-session `--mcp-config` JSON (only ccteam MCP).
@@ -121,6 +125,13 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     // 1M window is re-requested post-init via `set_model`.
     claude_common::push_agent_arg(&mut argv, input.role);
     claude_common::push_model_arg(&mut argv, input.model_id, true);
+
+    // Explicit reasoning effort (v0.8.24 A-U3). Only when the caller picked
+    // one — `None`/empty keeps claude's own default (no flag).
+    if let Some(effort) = input.effort.map(str::trim).filter(|e| !e.is_empty()) {
+        argv.push("--effort".into());
+        argv.push(effort.to_string());
+    }
 
     // Permission posture. The Skip flag / `--permission-mode default` core is
     // shared (`claude_common::permission_args`). Stream-json ADDITIONALLY routes
@@ -279,6 +290,7 @@ mod tests {
             session_uuid: uuid,
             resume,
             model_id: None,
+            effort: None,
             permission_mode: PermissionMode::Skip,
             mcp_config_path: None,
         }
@@ -367,6 +379,23 @@ mod tests {
             !argv.iter().any(|a| a.contains("[1m]")),
             "no [1m] anywhere in argv: {argv:?}"
         );
+    }
+
+    #[test]
+    fn effort_flag_only_when_picked() {
+        // Default: no --effort (vendor default preserved).
+        let argv = build_argv("claude", &input("alice", "u-1", false));
+        assert!(!argv.iter().any(|a| a == "--effort"), "{argv:?}");
+        // Explicit pick → `--effort <level>` verbatim.
+        let mut inp = input("alice", "u-1", false);
+        inp.effort = Some("max");
+        let argv = build_argv("claude", &inp);
+        let i = argv.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(argv[i + 1], "max");
+        // Whitespace-only = not picked.
+        let mut inp = input("alice", "u-1", false);
+        inp.effort = Some("  ");
+        assert!(!build_argv("claude", &inp).iter().any(|a| a == "--effort"));
     }
 
     #[test]

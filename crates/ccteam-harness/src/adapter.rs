@@ -765,6 +765,16 @@ pub struct SpawnCtx {
     /// deterministic per-model pricing; a model absent from the pricing
     /// table prices to `None` (exposed as "—"), never a fallback rate.
     pub model_id: Option<String>,
+    /// v0.8.24 A-U3 — explicit reasoning-effort token for this thread.
+    /// `None` = vendor default (no flag / no override emitted). Wired only
+    /// where the vendor verifiably supports it: Claude stream-json
+    /// (`--effort low|medium|high|xhigh|max`), Codex app-server (the
+    /// `effort` turn/start override, `none|minimal|low|medium|high|xhigh`),
+    /// OpenCode ACP (`session/set_config_option {configId:"effort"}`,
+    /// value = a model variant). Grok's `--reasoning-effort` value set is
+    /// undocumented, so it is NOT wired (an invalid value would fail the
+    /// spawn). Terminal protocol is frozen — never extended with this.
+    pub effort: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
     /// that flag, spawns `--permission-mode default`, and installs the

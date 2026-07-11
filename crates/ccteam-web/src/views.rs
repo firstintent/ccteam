@@ -44,6 +44,11 @@ pub struct DashboardRow {
     /// are `false`.
     #[serde(default)]
     pub broken: bool,
+    /// v0.8.24 Q7 — current git branch of the working tree (read-only,
+    /// best-effort from `.git/HEAD`); `None` when not a git repo → the SPA
+    /// hides the branch dimension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_branch: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]

@@ -169,8 +169,17 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
       status: 200,
       json: {
         hosts: [
-          { host: "local", hostname: "dev01", is_local: true, agent_count: 1, agents_ready: 1 },
+          { host: "local", hostname: "dev01", is_local: true, agent_count: 4, agents_ready: 4 },
         ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/hosts/join-token", (route) =>
+    route.fulfill({
+      status: 200,
+      json: {
+        token: "e2e-join-token",
+        command: "ccteam host join --daemon <daemon-url> --token e2e-join-token",
       },
     }),
   );
@@ -193,6 +202,39 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
             bin: "~/.local/bin/claude",
             mcp_registered: true,
             mcp_registrable: true,
+            status: "ready",
+            hint: null,
+          },
+          {
+            vendor: "codex",
+            harness_id: "codex",
+            installed: true,
+            version: "codex 0.48.0",
+            bin: "codex",
+            mcp_registered: true,
+            mcp_registrable: true,
+            status: "ready",
+            hint: null,
+          },
+          {
+            vendor: "grok",
+            harness_id: "grok",
+            installed: true,
+            version: "grok 0.2.93",
+            bin: "grok",
+            mcp_registered: false,
+            mcp_registrable: false,
+            status: "ready",
+            hint: null,
+          },
+          {
+            vendor: "opencode",
+            harness_id: "opencode",
+            installed: true,
+            version: "opencode 0.6.4",
+            bin: "opencode",
+            mcp_registered: false,
+            mcp_registrable: false,
             status: "ready",
             hint: null,
           },

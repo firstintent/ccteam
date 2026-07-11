@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getMe } from "./meApi";
+import { getMe, resetToken } from "./meApi";
 
 const realFetch = globalThis.fetch;
 
@@ -40,5 +40,24 @@ describe("meApi", () => {
     await expect(getMe()).rejects.toThrow("UNAUTHENTICATED");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(500, {}));
     await expect(getMe()).rejects.toThrow("HTTP 500");
+  });
+
+  it("resetToken POSTs /api/v1/me/reset-token and returns the NEW wire token", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(200, { wire_token: "ccteam:deadbeef" }),
+    );
+    const got = await resetToken();
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "/api/v1/me/reset-token",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
+    );
+    expect(got.wire_token).toBe("ccteam:deadbeef");
+  });
+
+  it("resetToken lifts the server error body (tenant 403 / auth-off 400)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(400, { error: "auth is disabled (loopback / --no-auth) — no web token in use" }),
+    );
+    await expect(resetToken()).rejects.toThrow("auth is disabled");
   });
 });

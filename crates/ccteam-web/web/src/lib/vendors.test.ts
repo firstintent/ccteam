@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   defaultDraft,
   modelSwitchFor,
+  wireEffort,
   normalizeDraft,
   slugFromPath,
   statusDotClass,
@@ -86,6 +87,36 @@ describe("modelSwitchFor (lazy-create /model follow-up)", () => {
 
   it("is null for a model the vendor doesn't list", () => {
     expect(modelSwitchFor({ vendor: "codex", model: "made-up" })).toBeNull();
+  });
+});
+
+describe("wireEffort (A-U3 create-form effort field)", () => {
+  it("effDefault wires nothing for every vendor (vendor default holds)", () => {
+    for (const vendor of ["claude", "codex", "grok", "opencode"] as const) {
+      expect(wireEffort({ vendor, effortKey: "effDefault" })).toBeNull();
+    }
+  });
+
+  it("maps claude to its verified --effort levels (max stays max)", () => {
+    expect(wireEffort({ vendor: "claude", effortKey: "effLow" })).toBe("low");
+    expect(wireEffort({ vendor: "claude", effortKey: "effMid" })).toBe("medium");
+    expect(wireEffort({ vendor: "claude", effortKey: "effHigh" })).toBe("high");
+    expect(wireEffort({ vendor: "claude", effortKey: "effMax" })).toBe("max");
+  });
+
+  it("maps codex 极高 to xhigh (its ReasoningEffort set has no max)", () => {
+    expect(wireEffort({ vendor: "codex", effortKey: "effMax" })).toBe("xhigh");
+    expect(wireEffort({ vendor: "codex", effortKey: "effLow" })).toBe("low");
+  });
+
+  it("never wires grok/opencode effort (undocumented / per-model value sets)", () => {
+    expect(wireEffort({ vendor: "grok", effortKey: "effMax" })).toBeNull();
+    expect(wireEffort({ vendor: "opencode", effortKey: "effHigh" })).toBeNull();
+  });
+
+  it("defaultDraft starts at effDefault (nothing wired until picked)", () => {
+    expect(defaultDraft().effortKey).toBe("effDefault");
+    expect(wireEffort(defaultDraft())).toBeNull();
   });
 });
 

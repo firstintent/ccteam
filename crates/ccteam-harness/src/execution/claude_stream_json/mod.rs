@@ -921,6 +921,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     session_uuid: &uuid,
                     resume,
                     model_id: ctx.model_id.as_deref(),
+                    effort: ctx.effort.as_deref(),
                     permission_mode: ctx.permission_mode,
                     mcp_config_path: mcp_config_path.as_deref(),
                 },

@@ -1,19 +1,19 @@
 // v0.8.24 Track A — the Home landing page (prototype `#view-home`), replacing
 // the retired NewSessionModal.
 //
-// 「开工吧!」 + ctx-bar (项目 · 主机 · 角色 — 分支 has no backend data yet so
-// that dimension is hidden, never mocked) sitting flush on the composer, and
+// 「开工吧!」 + ctx-bar (项目 · 主机 · 分支(只读, v0.8.24 Q7 — hidden for
+// non-git projects, never mocked) · 角色) sitting flush on the composer, and
 // the 最近会话 two-column card grid.
 //
 // LAZY-CREATE: the session is created when the FIRST message is sent —
 // POST /projects (only for an inline 「＋ 新建项目…」 path) → POST
-// /projects/{slug}/sessions (vendor/protocol/host/hitl/role) → optional
-// `/model <m>` control turn (create carries no model field; /model is the
-// supported switch surface) → POST the user's text as the first turn →
-// navigate to the Conversation view.
+// /projects/{slug}/sessions (vendor/protocol/host/hitl/role + v0.8.24 A-U3
+// model/effort — the create form now carries them vendor-natively, replacing
+// the old post-spawn `/model` control turn) → POST the user's text as the
+// first turn → navigate to the Conversation view.
 
 import { useEffect, useRef, useState } from "react";
-import { Folder, Globe } from "lucide-react";
+import { Folder, GitBranch, Globe } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import { toastBus } from "../lib/toastBus";
 import { makeT, type Lang } from "../lib/i18n";
@@ -24,6 +24,7 @@ import {
   slugFromPath,
   statusDotClass,
   vendorChipClass,
+  wireEffort,
   wireProtocol,
   type ComposerDraft,
 } from "../lib/vendors";
@@ -115,6 +116,7 @@ export default function HomeView({
   isAdmin,
   projects,
   projectPaths,
+  projectBranches = {},
   liveCount,
   recents,
   initialProject,
@@ -126,6 +128,8 @@ export default function HomeView({
   isAdmin: boolean;
   projects: string[];
   projectPaths: Record<string, string>;
+  /** v0.8.24 Q7 — current git branch per slug (absent ⇒ hide the dimension). */
+  projectBranches?: Record<string, string>;
   /** Caller's live session count (soft cap gate). */
   liveCount: number;
   recents: RecentEntry[];
@@ -238,20 +242,19 @@ export default function HomeView({
         const created = await apiCreateProject(derived, newProjectPath.trim());
         slug = created.slug;
       }
+      // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
+      // (vendor-native spawn seam), replacing the old post-spawn `/model`
+      // control turn.
       const { sid, model_warning: warning } = await apiCreateSession(slug, {
         role,
         vendor: draft.vendor,
         permission_mode: draft.hitl ? "hitl" : "skip",
         protocol: wireProtocol(draft),
         host,
+        model: modelSwitchFor(draft) ?? undefined,
+        effort: wireEffort(draft) ?? undefined,
       });
       if (warning) toastBus.handler?.info(warning);
-      const modelSwitch = modelSwitchFor(draft);
-      if (modelSwitch) {
-        await submitTurn(sid, `/model ${modelSwitch}`).catch(() => {
-          /* best-effort — the default model still answers */
-        });
-      }
       await submitTurn(sid, text);
       return sid;
     };
@@ -371,7 +374,20 @@ export default function HomeView({
               </CtxSelect>
             ) : null}
 
-            {/* 分支 dimension: no backend data this version → hidden (not mocked). */}
+            {/* v0.8.24 Q7 — 分支 dimension: READ-ONLY display of the project's
+                current git branch (.git/HEAD, server-side best-effort); hidden
+                for non-git projects and for a not-yet-created project. */}
+            {!newProjectPath && project && projectBranches[project] ? (
+              <span
+                className="ctx-btn"
+                data-testid="ctx-branch"
+                title={t("branch")}
+                style={{ cursor: "default" }}
+              >
+                <GitBranch />
+                <span className="v">{projectBranches[project]}</span>
+              </span>
+            ) : null}
 
             {/* 角色 — admin-only beta surface (v0.8.20 F4, AGENTS.md §五.8):
                 a tenant always launches roleless. */}

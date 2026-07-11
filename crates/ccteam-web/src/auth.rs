@@ -86,13 +86,18 @@ pub const COOKIE_NAME: &str = "ccteam_token";
 pub const QUERY_PARAM: &str = "token";
 
 /// Auth state attached to [`AppState`].
+///
+/// v0.8.24 — the admin token lives behind a shared `Arc<RwLock<…>>` so the
+/// self-serve reset (`POST /api/v1/me/reset-token`) can rotate it LIVE:
+/// every `AppState` clone (one per request) shares the same cell, so the
+/// new token is accepted immediately, without a daemon restart.
 #[derive(Debug, Clone)]
 pub struct AuthState {
     /// If false, the middleware passes every request through (the
     /// loopback default + explicit `--no-auth`).
     pub enabled: bool,
     /// Hex-encoded token (no `ccteam:` prefix). `None` when disabled.
-    pub token: Option<String>,
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl AuthState {
@@ -100,7 +105,7 @@ impl AuthState {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            token: None,
+            token: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -108,14 +113,28 @@ impl AuthState {
     pub fn enabled(token: String) -> Self {
         Self {
             enabled: true,
-            token: Some(token),
+            token: std::sync::Arc::new(std::sync::RwLock::new(Some(token))),
+        }
+    }
+
+    /// The current bare-hex admin token; `None` when disabled.
+    pub fn current_token(&self) -> Option<String> {
+        self.token.read().ok().and_then(|t| t.clone())
+    }
+
+    /// v0.8.24 — rotate the in-memory admin token (the caller has already
+    /// persisted the new value to `~/.ccteam/secrets/web-token`). Takes
+    /// effect for the NEXT request on every AppState clone (shared cell).
+    pub fn rotate(&self, new_hex: String) {
+        if let Ok(mut guard) = self.token.write() {
+            *guard = Some(new_hex);
         }
     }
 
     /// Wire-format token (`ccteam:<hex>`) for templates / docs. Returns
     /// `None` when auth is disabled.
     pub fn wire_token(&self) -> Option<String> {
-        self.token.as_ref().map(|t| format!("{TOKEN_PREFIX}{t}"))
+        self.current_token().map(|t| format!("{TOKEN_PREFIX}{t}"))
     }
 }
 
@@ -409,10 +428,11 @@ pub async fn auth_layer(
         req.extensions_mut().insert(Identity::admin());
         return next.run(req).await;
     }
-    let Some(expected) = auth.token.as_deref() else {
+    let Some(expected) = auth.current_token() else {
         // Defensive: enabled=true but no token loaded → fail closed.
         return (StatusCode::INTERNAL_SERVER_ERROR, "auth misconfigured").into_response();
     };
+    let expected = expected.as_str();
     // v0.8.18 档1 — the bootstrap token → admin; per-user tokens → their tenant.
     let tenants = app.paths.users_dir();
 

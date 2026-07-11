@@ -1995,6 +1995,7 @@ impl Orchestrator {
             // price against the actual model instead of the vendor
             // fallback. `None` = vendor default.
             model_id: agent.model.clone(),
+            effort: None,
             // v0.8.7 W2 — workflow/bg spawn is not the gateway chat ask-path;
             // HITL is a gateway-chat feature, so this stays skip.
             permission_mode: ccteam_harness::PermissionMode::Skip,

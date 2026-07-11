@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
-import HostsView, { HostDetailCards } from "./HostsView";
+import HostsView, { HostDetailCards, JoinCard } from "./HostsView";
 import type { HostDetail } from "../lib/hostsApi";
 
 const realFetch = globalThis.fetch;
@@ -58,6 +58,18 @@ const HOST: HostDetail = {
       status: "ready",
       hint: null,
     },
+    {
+      // opencode/ACP (4th vendor): same protocol-borne MCP as grok.
+      vendor: "opencode",
+      harness_id: "opencode",
+      installed: true,
+      version: "opencode 0.6.4",
+      bin: "opencode",
+      mcp_registered: false,
+      mcp_registrable: false,
+      status: "ready",
+      hint: null,
+    },
   ],
 };
 
@@ -86,6 +98,8 @@ describe("HostDetailCards (seeded)", () => {
     expect(visibleText(html)).toContain("linux/x86_64");
     expect(html).toContain('data-testid="agent-card-claude"');
     expect(html).toContain('data-testid="agent-card-codex"');
+    expect(html).toContain('data-testid="agent-card-grok"');
+    expect(html).toContain('data-testid="agent-card-opencode"');
     expect(html).toContain("需配置"); // claude needs_config
     expect(html).toContain("未安装"); // codex not_installed
     expect(html).toContain("claude 1.2.3"); // captured version string
@@ -122,5 +136,30 @@ describe("HostDetailCards (seeded)", () => {
     const html = renderToString(<HostDetailCards host={ready} busy={null} onRegister={() => {}} />);
     expect(html).toContain("就绪");
     expect(html).not.toContain('data-testid="register-mcp-claude"');
+  });
+});
+
+describe("JoinCard", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("renders the join command with a placeholder token + mint CTA before the token loads", () => {
+    const html = renderToString(<JoinCard />);
+    expect(html).toContain('data-testid="join-card"');
+    expect(html).toContain("ccteam host join --daemon");
+    expect(html).toContain("&lt;join-token&gt;");
+    expect(html).toContain('data-testid="join-mint"');
+    expect(html).not.toContain('data-testid="join-copy"');
+  });
+
+  it("HostsView embeds the join card", () => {
+    const html = renderToString(<HostsView />);
+    expect(html).toContain('data-testid="join-card"');
+    expect(html).toContain('data-testid="join-command"');
   });
 });

@@ -60,6 +60,7 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/hosts/{host}"),
         ("POST", "/api/v1/hosts/{host}/register-mcp"),
         ("POST", "/api/v1/hosts/join-token"),
+        ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),
         ("POST", "/api/v1/hosts/{host}/heartbeat"),
         // v0.8.18 档1 — per-user web tenant management (admin-gated).
@@ -77,6 +78,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/status"),
         // v0.8.18 档1 — caller identity (SPA branches admin-only surfaces).
         ("GET", "/api/v1/me"),
+        // v0.8.24 — admin self-serve web-token rotation.
+        ("POST", "/api/v1/me/reset-token"),
         // projects
         ("GET", "/api/v1/projects"),
         ("POST", "/api/v1/projects"),
@@ -92,6 +95,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/projects/{slug}/sessions/active"),
         ("GET", "/api/v1/projects/{slug}/jobs/{job_id}/log"),
         ("GET", "/api/v1/sessions/active"),
+        // v0.8.24 F1.12 — project third-party MCP servers.
+        ("GET", "/api/v1/projects/{slug}/mcp-servers"),
+        ("POST", "/api/v1/projects/{slug}/mcp-servers"),
         // roles
         ("GET", "/api/v1/projects/{slug}/roles"),
         ("GET", "/api/v1/projects/{slug}/roles/{role}"),
@@ -116,8 +122,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/projects/{slug}/sessions/{sid}/resume"),
         ("GET", "/api/v1/projects/{slug}/external-sessions"),
         ("POST", "/api/v1/projects/{slug}/sessions/import"),
-        // v0.8.24 C2 — multi-vendor /compare
+        // v0.8.24 C2 — multi-vendor /compare (+ history from session meta)
         ("POST", "/api/v1/projects/{slug}/compare"),
+        ("GET", "/api/v1/projects/{slug}/compare/history"),
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
         ("GET", "/api/v1/config/im"),
         ("PUT", "/api/v1/config/im/telegram"),

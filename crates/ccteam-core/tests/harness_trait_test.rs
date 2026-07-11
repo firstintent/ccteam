@@ -127,6 +127,7 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["initial prompt".into()],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     };
@@ -159,6 +160,7 @@ async fn claude_bg_start_thread_rejects_empty_role() {
         project_dir: std::env::temp_dir(),
         extra_args: vec![],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     };
@@ -277,6 +279,7 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["do the thing".into()],
         model_id: None,
+        effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
     };
@@ -459,6 +462,7 @@ mod codex_tmux {
             project_dir: tmp.path().to_path_buf(),
             extra_args: vec![],
             model_id: None,
+            effort: None,
             permission_mode: ccteam_harness::PermissionMode::Skip,
             secret: String::new(),
         };
