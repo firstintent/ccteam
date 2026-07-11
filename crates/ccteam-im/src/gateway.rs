@@ -7899,6 +7899,125 @@ mod tests {
         );
     }
 
+    /// v0.8.24 Track D — FakeRemoteHostProxy simulates a colocated satellite:
+    /// online host → create session stamped with host id → one Q&A turn →
+    /// dead-child resume keeps the same sid/host. Production
+    /// HttpRemoteHostProxy fails closed instead (see remote_host tests).
+    #[tokio::test]
+    async fn remote_fake_host_one_turn_resume_and_host_stamp() {
+        use ccteam_core::host_registry::{now_unix, HostRecord, HostRegistry};
+        use ccteam_core::CcteamPaths;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ccteam_root = tmp.path().join(".ccteam");
+        let project_dir = tmp.path().join("projects/alpha");
+        std::fs::create_dir_all(&ccteam_root).unwrap();
+        std::fs::create_dir_all(ccteam_root.join("hosts")).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let paths = CcteamPaths {
+            root: ccteam_root.clone(),
+            projects_root: tmp.path().join("projects"),
+        };
+
+        let mut reg = HostRegistry::default();
+        reg.upsert(HostRecord {
+            id: "sat-lab".into(),
+            hostname: "sat-lab".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ccteam_version: "0.8.24".into(),
+            agent_url: Some("http://127.0.0.1:9".into()),
+            agent_token: "t".into(),
+            last_heartbeat_unix: now_unix(),
+            agents: vec![],
+            joined_at: chrono::Utc::now().to_rfc3339(),
+        });
+        reg.save(&ccteam_core::host_registry::registry_path_in(&ccteam_root))
+            .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let proxy = Arc::new(crate::remote_host::FakeRemoteHostProxy::default());
+        gateway.set_remote_host_proxy(proxy.clone());
+
+        let outcome = gateway
+            .create_session_api_on_host(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "sat-lab".into(),
+            )
+            .await
+            .expect("online fake remote create");
+        assert_eq!(outcome.sid, "s1");
+        assert_eq!(
+            proxy.last_host.lock().unwrap().as_deref(),
+            Some("sat-lab"),
+            "proxy must be consulted before spawn"
+        );
+
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].host, "sat-lab", "session view stamps host");
+        let meta = read_session_meta(&project_dir, "s1").unwrap();
+        assert_eq!(meta.host, "sat-lab", "meta.json stamps host");
+        assert_eq!(
+            meta.trigger.as_deref(),
+            Some("web"),
+            "web create → trigger=web"
+        );
+
+        // One Q&A round.
+        let turn = gateway
+            .submit_to_sid("s1", "hello-remote".into())
+            .await
+            .unwrap();
+        assert!(turn.starts_with("turn-"), "got {turn}");
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[("alpha-reviewer-s1".to_string(), "hello-remote".to_string())]
+        );
+
+        // Stop+resume: dead child + next turn keeps sid and host.
+        fake.live.store(false, Ordering::SeqCst);
+        gateway
+            .submit_to_sid("s1", "after-resume".into())
+            .await
+            .unwrap();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2, "resume restarted");
+        let views = gateway.session_views();
+        assert_eq!(views[0].sid, "s1");
+        assert_eq!(views[0].host, "sat-lab", "host attribution survives resume");
+        assert_eq!(
+            fake.submissions.lock().await.last().map(|p| p.1.as_str()),
+            Some("after-resume")
+        );
+    }
+
+    /// v0.8.24 F5 — web API spawn writes `trigger=web` on meta.json.
+    #[tokio::test]
+    async fn web_create_session_meta_records_trigger_web() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "cto".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let meta = read_session_meta(tmp.path(), &sid).unwrap();
+        assert_eq!(meta.trigger.as_deref(), Some("web"));
+        assert!(meta.compare_group.is_none());
+    }
+
     /// v0.8.24 F5 — when `thread_is_live` is false, `submit_resolved` must
     /// **enqueue** the user text (production path calls `enqueue_pending_turn`)
     /// before resume, then drain FIFO after the child is live. Pre-seeded
