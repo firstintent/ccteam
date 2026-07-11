@@ -13,10 +13,9 @@ pub mod actions;
 // change-persona` + `add-tool` MCP admin tools. Pure IO over a chat
 // bot's `.claude/agents/<bot>.md` definition file.
 pub mod admin_actions;
-// V0.6.5 F152 + F153 — `mcp__ccteam__advise_vote` /
-// `mcp__ccteam__advise_parallel` real implementations. Spawns Claude +
-// Codex one-shot advisors in parallel, optional verdict synthesis,
-// per-vendor budget ledger under `<ccteam_root>/cost-budget.json`.
+// Budget-ledger helpers only (v0.8.24 C2 — advise product surface removed;
+// multi-vendor `/compare` replaces advise_vote / advise_parallel). Ledger
+// file still used by codex critic + doctor cost-orphan rollups.
 pub mod advise;
 // V0.6.0 Wave 2 F114 — scientist nickname pool used when minting bot
 // handles for new chat workflows.
@@ -132,16 +131,13 @@ pub use admin_actions::{
     agent_md_path, change_persona, skill_dir_path, skill_md_path, write_role, write_skill,
     write_skill_file, AddToolResult,
 };
-// V0.6.5 F152 + F153 — advise_vote / advise_parallel entry points
-// (used by the `mcp__ccteam__advise_*` MCP dispatch in ccteam-cli).
+// Ledger-only re-exports (product vote/parallel APIs deleted in v0.8.24 C2).
 pub use advise::{
-    advise_parallel, advise_vote, append_budget_ledger_row,
-    append_budget_sample as append_advise_budget_sample,
-    budget_ledger_path as advise_budget_ledger_path, load_budget_ledger as load_advise_budget,
-    sum_advise_today, sum_advise_today_by_vendor, AdviseBudgetLedger, AdviseError, Agreement,
-    AnswerStatus, BudgetSample, BudgetSnapshot, CodexStatus, ParallelResult, VendorAnswer,
-    VoteResult, APPROX_COST_PER_CALL_USD as APPROX_ADVISE_COST_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
-    DEFAULT_CODEX_TIMEOUT_SECS,
+    append_budget_ledger_row, append_budget_sample as append_advise_budget_sample,
+    append_budget_sample_for_vendor, budget_ledger_path as advise_budget_ledger_path,
+    load_budget_ledger as load_advise_budget, sum_advise_today, sum_advise_today_by_agent_vendor,
+    sum_advise_today_by_vendor, AdviseBudgetLedger, BudgetSample,
+    APPROX_COST_PER_CALL_USD as APPROX_ADVISE_COST_USD, DEFAULT_ADVISE_BUDGET_USD_24H,
 };
 pub use auto_loop::{AutoLoopDecision, AutoLoopFrontMatter, AutoLoopState};
 pub use claude_job::{

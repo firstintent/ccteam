@@ -2918,10 +2918,12 @@ impl Gateway {
 
     /// v0.8.24 F5 — after a session becomes live, drain any cold-start
     /// pending turns (FIFO) and re-submit them through the normal path.
-    async fn drain_and_dispatch_pending_turns(&mut self, session_id: &str) {
+    /// Returns the turn ids of successfully submitted drained turns (order
+    /// preserved) so a not-live submit can surface a real id to callers.
+    async fn drain_and_dispatch_pending_turns(&mut self, session_id: &str) -> Vec<String> {
         let (project, chat, owner) = {
             let Some(session) = self.sessions.get(session_id) else {
-                return;
+                return Vec::new();
             };
             let chat = session
                 .reply_to
@@ -2933,27 +2935,36 @@ impl Gateway {
         };
         let _ = owner;
         let Some(cwd) = self.projects.get(&project).cloned() else {
-            return;
+            return Vec::new();
         };
         let pending = match crate::pending_turns::drain_pending_turns(&cwd, session_id) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(sid = %session_id, error = %e, "drain pending_turns failed");
-                return;
+                return Vec::new();
             }
         };
         if pending.is_empty() {
-            return;
+            return Vec::new();
         }
+        let mut ids = Vec::new();
         for turn in pending {
-            if let Err(e) = self.submit_resolved(&chat, session_id, "", turn.text).await {
-                tracing::warn!(
-                    sid = %session_id,
-                    error = %e,
-                    "dispatch pending turn failed"
-                );
+            // Box::pin: drain ↔ submit_resolved are mutually recursive when
+            // a not-live submit enqueues then drains (async recursion needs
+            // indirection for a finite future type).
+            match Box::pin(self.submit_resolved(&chat, session_id, "", turn.text)).await {
+                Ok(SubmitResult::Turn { id, .. }) => ids.push(id),
+                Ok(SubmitResult::Directive(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        sid = %session_id,
+                        error = %e,
+                        "dispatch pending turn failed"
+                    );
+                }
             }
         }
+        ids
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
@@ -4060,6 +4071,53 @@ impl Gateway {
             let replies = self.dispatch_directive(chat, session_id, directive).await?;
             return Ok(SubmitResult::Directive(replies));
         }
+
+        // v0.8.24 F5 — if the child is not live (starting/resuming/dead),
+        // enqueue the user text (FIFO, file-backed) and revive; drain after
+        // live so turns are not lost. Gateway remains the sole turns writer
+        // (drain re-enters submit_resolved once live). Callers get the real
+        // drained turn id when resume+submit succeeds.
+        let not_live = match self.sessions.get(session_id) {
+            Some(s) => !s.adapter.thread_is_live(&s.thread),
+            None => {
+                return Err(anyhow!("current session missing: {session_id}"));
+            }
+        };
+        if not_live {
+            let (project, origin) = {
+                let s = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+                if let Ok(mut target) = s.reply_to.lock() {
+                    *target = chat.clone();
+                }
+                (s.project.clone(), chat.channel.clone())
+            };
+            let cwd = self
+                .projects
+                .get(&project)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+            crate::pending_turns::enqueue_pending_turn(
+                &cwd,
+                session_id,
+                payload.clone(),
+                Some(origin),
+            )?;
+            self.resume_dead_session(session_id).await?;
+            let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
+            let id = drained_ids
+                .into_iter()
+                .last()
+                .unwrap_or_else(|| format!("pending-drain:{session_id}"));
+            return Ok(SubmitResult::Turn {
+                id,
+                // Answers stream via the pump after drain re-submits.
+                drained: Vec::new(),
+            });
+        }
+
         let session = self
             .sessions
             .get(session_id)
@@ -7841,6 +7899,73 @@ mod tests {
         );
     }
 
+    /// v0.8.24 F5 — when `thread_is_live` is false, `submit_resolved` must
+    /// **enqueue** the user text (production path calls `enqueue_pending_turn`)
+    /// before resume, then drain FIFO after the child is live. Pre-seeded
+    /// pending turns + the just-enqueued one both land, in order.
+    #[tokio::test]
+    async fn submit_while_not_live_enqueues_then_drains_fifo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sid, "s1");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // Cold-start queue already has one turn (e.g. concurrent web POST
+        // while the child was still spawning).
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            &sid,
+            "queued-first",
+            Some("web".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            1
+        );
+
+        // Child dies; next user turn must enqueue (not drop) then revive + drain.
+        fake.live.store(false, Ordering::SeqCst);
+        let turn = gateway
+            .submit_to_sid(&sid, "queued-second".into())
+            .await
+            .unwrap();
+        assert!(
+            turn.starts_with("turn-alpha-reviewer-s1"),
+            "drain surfaces the real turn id, got {turn}"
+        );
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "resume re-started the dead child"
+        );
+        assert!(fake.live.load(Ordering::SeqCst));
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            0,
+            "queue drained after live"
+        );
+        assert_eq!(
+            fake.submissions.lock().await.as_slice(),
+            &[
+                ("alpha-reviewer-s1".to_string(), "queued-first".to_string()),
+                ("alpha-reviewer-s1".to_string(), "queued-second".to_string()),
+            ],
+            "FIFO: pre-queued then just-enqueued"
+        );
+    }
+
     /// Dead-child recovery on the TURN path (reactive): when a session's child
     /// has exited out from under the held handle, `submit_turn` returns the
     /// recoverable `HarnessError::ThreadDied`, and the gateway transparently
@@ -7850,6 +7975,9 @@ mod tests {
     /// double-submit. Killed twice to prove it's repeatable, not a one-shot, and
     /// that a LIVE session never re-spawns (3 starts for 3 deaths — no spurious
     /// resume on the healthy first turn).
+    ///
+    /// With v0.8.24 F5, a known-dead child (`thread_is_live` false) takes the
+    /// enqueue→resume→drain path (same end state: turn lands, sid stable).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));

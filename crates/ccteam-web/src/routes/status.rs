@@ -96,8 +96,10 @@ pub struct SessionCostRow {
     pub project: String,
     /// Agent role (empty for a roleless session).
     pub role: String,
-    /// Vendor (`claude` / `codex`).
+    /// Vendor (`claude` / `codex` / `grok` / `opencode`).
     pub vendor: String,
+    /// Host axis (`local` or satellite id) — multi-host cost attribution.
+    pub host: String,
     /// Cheap liveness label from the gateway (`live`).
     pub status: String,
     /// Deterministic per-turn accrued cost (USD), or `null` when nothing
@@ -275,7 +277,7 @@ fn build_session_cost_rows(
                 .copied()
                 .unwrap_or(ccteam_cost::Vendor::Claude);
             let acc = priced_by_sid.entry(sid.to_string()).or_default();
-            match ccteam_cost::estimate_cost(&usage, vendor, model) {
+            match ccteam_cost::resolve_turn_cost(&usage, vendor, model) {
                 Some(cost) => {
                     acc.cost_usd += cost;
                     acc.priced_turns += 1;
@@ -289,13 +291,19 @@ fn build_session_cost_rows(
         .iter()
         .map(|v| {
             let acc = priced_by_sid.get(&v.sid).copied().unwrap_or_default();
-            // `Some` only when a real, table-matched model priced a turn.
+            // `Some` only when a real, table-matched model priced a turn
+            // (or OpenCode reported a non-zero USD).
             let cost_usd = (acc.priced_turns > 0).then_some(acc.cost_usd);
             SessionCostRow {
                 sid: v.sid.clone(),
                 project: v.project.clone(),
                 role: v.role.clone(),
                 vendor: v.vendor.clone(),
+                host: if v.host.is_empty() {
+                    "local".into()
+                } else {
+                    v.host.clone()
+                },
                 status: v.status.clone(),
                 cost_usd,
                 unpriced_turns: acc.unpriced_turns,
@@ -430,5 +438,20 @@ mod tests {
         let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
         assert!(rows[0].cost_usd.is_none(), "unknown model must not price");
         assert_eq!(rows[0].unpriced_turns, 1, "the synthetic turn is exposed");
+    }
+
+    #[test]
+    fn build_session_cost_rows_stamps_host_axis() {
+        // v0.8.24 multi-host: cost rows must surface the session host so the
+        // Status view can attribute spend (satellite vs local), never drop it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let mut remote = view("s2", "demo", "claude");
+        remote.host = "sat-east".into();
+        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude"), remote]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].host, "local");
+        assert_eq!(rows[1].sid, "s2");
+        assert_eq!(rows[1].host, "sat-east");
     }
 }

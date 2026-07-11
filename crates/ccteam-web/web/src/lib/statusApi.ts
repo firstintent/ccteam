@@ -19,6 +19,8 @@ export interface SessionCostRow {
   project: string;
   role: string;
   vendor: string;
+  /** Host axis (`local` or satellite id) — multi-host cost attribution. */
+  host?: string;
   status: string;
   cost_usd: number | null;
   unpriced_turns?: number;

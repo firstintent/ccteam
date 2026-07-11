@@ -87,7 +87,18 @@ impl RemoteHostProxy for HttpRemoteHostProxy {
             .build()
             .map_err(|e| anyhow::anyhow!("remote host http client: {e}"))?;
         match client.get(&health).send().await {
-            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) if resp.status().is_success() => {
+                // Honest scope (v0.8.24): health proves the satellite is up,
+                // but ccteam does **not** yet stream ACP/stream-json to a
+                // remote agent. Failing closed prevents silently running on
+                // the main daemon while stamping a remote host id. Tests use
+                // [`FakeRemoteHostProxy`] for colocated satellite simulation.
+                bail!(
+                    "host `{host_id}` is online at {url}, but remote stdio \
+                     session proxy is not implemented in this build; session \
+                     was not created (use host=local, or a test FakeRemoteHostProxy)"
+                )
+            }
             Ok(resp) => bail!(
                 "host `{host_id}` agent at {url} returned HTTP {}; session was not created",
                 resp.status()
@@ -264,5 +275,43 @@ mod tests {
         .unwrap();
         assert_eq!(host, "sat");
         assert_eq!(fake.last_host.lock().unwrap().as_deref(), Some("sat"));
+    }
+
+    /// Production [`HttpRemoteHostProxy`] must **not** silently fall through to
+    /// a local spawn after a healthy satellite probe — fail closed with a
+    /// readable "not implemented" error (prd §4.3 honest remote).
+    #[tokio::test]
+    async fn http_proxy_healthy_satellite_fails_closed_not_local() {
+        // Tiny health server: 200 on /health.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let url = format!("http://{addr}");
+        let err = HttpRemoteHostProxy
+            .ensure_remote_spawn("sat", SessionProtocol::StreamJson, Some(&url))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not implemented") || err.contains("session was not created"),
+            "expected honest fail-closed, got: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("local spawn"),
+            "must not imply a silent local fallback"
+        );
+        server.abort();
     }
 }
