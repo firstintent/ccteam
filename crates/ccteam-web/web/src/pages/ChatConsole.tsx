@@ -53,6 +53,7 @@ import StatusView from "./StatusView";
 import HostsView from "./HostsView";
 import SettingsPage from "./SettingsPage";
 import SessionView from "./SessionView";
+import WorkflowView from "./WorkflowView";
 import {
   createProject as apiCreateProject,
   deleteProject,
@@ -1137,18 +1138,7 @@ export default function ChatConsole() {
                 ) : globalView === "hosts" ? (
                   <HostsView />
                 ) : globalView === "workflow" ? (
-                  <div className="p-6 max-w-2xl">
-                    <h2 className="text-lg font-semibold text-text-primary">
-                      {tr(lang, "工作流", "Workflow")}
-                    </h2>
-                    <p className="mt-2 text-sm text-text-secondary leading-6">
-                      {tr(
-                        lang,
-                        "Skills / Roles / MCP Servers / 自进化 / Compare — A3 接线中。",
-                        "Skills / Roles / MCP Servers / Evolution / Compare — wiring in A3.",
-                      )}
-                    </p>
-                  </div>
+                  <WorkflowView />
                 ) : (
                   <StatusView rail={railSessions} />
                 )}
