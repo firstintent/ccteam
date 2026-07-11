@@ -12,13 +12,25 @@ export function tr(lang: Lang, zh: string, en: string): string {
   return lang === "en" ? en : zh;
 }
 
-/** The bottom global-nav labels, per language. Keyed by the `GlobalView`
- *  route key the ChatConsole shell uses. */
+/** Shell / nav labels, keyed by route or shell surface. */
 export const NAV_LABELS: Record<string, { zh: string; en: string }> = {
   marketplace: { zh: "插件市场", en: "Plugins" },
   status: { zh: "Status", en: "Status" },
   hosts: { zh: "主机", en: "Hosts" },
-  settings: { zh: "Settings", en: "Settings" },
+  settings: { zh: "设置", en: "Settings" },
+  workflow: { zh: "工作流", en: "Workflow" },
+  home: { zh: "开工吧!", en: "Let's go!" },
+  newSession: { zh: "新建会话", en: "New session" },
+  search: { zh: "搜索会话 / 项目", en: "Search sessions / projects" },
+  collapse: { zh: "折叠侧栏", en: "Collapse sidebar" },
+  expand: { zh: "展开侧栏", en: "Expand sidebar" },
+  general: { zh: "通用", en: "General" },
+  account: { zh: "账号", en: "Account" },
+  im: { zh: "IM 接入", en: "IM" },
+  theme: { zh: "主题", en: "Theme" },
+  language: { zh: "界面语言", en: "Language" },
+  light: { zh: "浅色", en: "Light" },
+  dark: { zh: "深色", en: "Dark" },
 };
 
 /** Resolve a nav label for the active language. Falls back to the key. */

@@ -162,7 +162,7 @@ export default function SettingsPage() {
         <MyImSection />
         <p className="text-[11px] font-mono text-text-dim leading-relaxed">
           你的个人设置(显示名 / 头像 / 界面语言 / 登出)在
-          <b className="text-text-secondary">右上角头像菜单</b>里。
+          <b className="text-text-secondary">侧栏底部头像菜单</b>里（设置→账号将收编同一入口）。
         </p>
       </div>
     );
@@ -187,7 +187,40 @@ export default function SettingsPage() {
   }
 
   return (
-    <div data-testid="settings-page" className="p-4 sm:p-6 max-w-3xl mx-auto flex flex-col gap-8">
+    <div data-testid="settings-page" className="p-4 sm:p-6 max-w-3xl mx-auto flex flex-col gap-6">
+      {/* v0.8.24 A4 — Settings secondary nav (六子页收编：主机/市场/Status/IM/通用/账号). */}
+      <nav
+        data-testid="settings-tabs"
+        className="flex flex-wrap gap-1 border-b border-surface-700/40 pb-2"
+      >
+        {[
+          { href: "/settings", label: "IM 接入" },
+          { href: "/hosts", label: "主机" },
+          { href: "/marketplace", label: "插件市场" },
+          { href: "/status", label: "Status" },
+        ].map((t) => (
+          <a
+            key={t.href}
+            href={t.href}
+            className={`h-8 px-3 rounded-md text-xs font-medium ${
+              t.href === "/settings"
+                ? "bg-surface-700 text-text-primary"
+                : "text-text-secondary hover:bg-surface-800"
+            }`}
+          >
+            {t.label}
+          </a>
+        ))}
+      </nav>
+
+      <section className="flex flex-col gap-3 rounded-lg border border-surface-700/50 p-4">
+        <SectionHeading
+          title="通用 · 账号"
+          badge="侧栏头像"
+          subtitle="语言 / 主题 / 头像 / 昵称 / 登出 — 使用侧栏底部头像菜单（与原型设置→通用/账号同入口）。"
+        />
+      </section>
+
       <section className="flex flex-col gap-4">
         <SectionHeading
           title="IM 凭据 · Credentials"

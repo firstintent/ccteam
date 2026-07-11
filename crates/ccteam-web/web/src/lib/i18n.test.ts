@@ -17,6 +17,9 @@ describe("i18n", () => {
     expect(navLabel("marketplace", "en")).toBe("Plugins");
     expect(navLabel("status", "zh")).toBe("Status");
     expect(navLabel("settings", "en")).toBe("Settings");
+    expect(navLabel("settings", "zh")).toBe("设置");
+    expect(navLabel("workflow", "zh")).toBe("工作流");
+    expect(navLabel("workflow", "en")).toBe("Workflow");
   });
 
   it("navLabel falls back to the key for an unknown view", () => {
