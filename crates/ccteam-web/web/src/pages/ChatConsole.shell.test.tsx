@@ -1,22 +1,12 @@
-// v0.8.9 — ChatConsole is now the persistent SHELL: it keeps the sidebar /
-// bottom-nav / cost pill / new-session modal / cross-project rail, and renders
-// the per-SID view as a KEYED child — `<SessionView key={sid} sid={sid} />`.
-// The key is THE structural fix: React remounts a fresh SessionView on every
-// session switch, so no per-sid state survives a switch.
-//
-// `key` isn't serialized into SSR HTML, so we prove the delegation behaviorally:
-// routed to `/chat/s/<sid>`, the shell renders SessionView's distinctive
-// surface (the composer placeholder, which ONLY SessionView emits) for that
-// sid; routed to `/chat` (no sid) it renders the no-session empty state and NOT
-// the composer. (The atomic-remount guarantee itself is unit-proved by
-// SessionView.test.tsx's mount-empty invariant.)
+// v0.8.24 Track A — the prototype shell (`.app` = sidebar + main, NO
+// full-width top bar; four mutually-exclusive views). SSR smoke via
+// renderToString (no DOM harness in this repo): route → the right view, and
+// the sidebar carries the prototype structure (logo → search → 新建 → 工作流 →
+// 工作区 → 设置 → user), including the collapsed icon-rail whose ORDER matches
+// the expanded column (the prototype CSS comment is the acceptance).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// ChatConsole's import chain reaches useWebSettings, which reads
-// `window.innerWidth` / `localStorage` at runtime. Node env (no DOM) → stub a
-// minimal window + localStorage BEFORE the static imports. `vi.hoisted` runs
-// above imports.
 vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const g = globalThis as any;
@@ -31,51 +21,112 @@ vi.hoisted(() => {
 import { renderToString } from "react-dom/server";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
-import ChatConsole from "./ChatConsole";
+import ChatConsole, { shellViewFor } from "./ChatConsole";
 
-// Mirror App.tsx's routing so `useParams` inside ChatConsole resolves `:sid`.
 function routed(path: string) {
   return renderToString(
     <MemoryRouter initialEntries={[path]}>
       <Routes>
-        <Route path="/chat" element={<ChatConsole />} />
+        <Route path="/" element={<ChatConsole />} />
         <Route path="/chat/s/:sid" element={<ChatConsole />} />
+        <Route path="/flow" element={<ChatConsole />} />
+        <Route path="/flow/:tab" element={<ChatConsole />} />
+        <Route path="/settings" element={<ChatConsole />} />
+        <Route path="/settings/:tab" element={<ChatConsole />} />
       </Routes>
     </MemoryRouter>,
   );
 }
 
-describe("ChatConsole shell delegates the per-sid view to SessionView", () => {
+describe("shellViewFor routes the four views", () => {
+  it("maps paths to home / conv / flow / settings", () => {
+    expect(shellViewFor("/")).toBe("home");
+    expect(shellViewFor("/chat/s/s9")).toBe("conv");
+    expect(shellViewFor("/flow")).toBe("flow");
+    expect(shellViewFor("/flow/compare")).toBe("flow");
+    expect(shellViewFor("/settings")).toBe("settings");
+    expect(shellViewFor("/settings/market")).toBe("settings");
+    expect(shellViewFor("/anything-else")).toBe("home");
+  });
+});
+
+describe("ChatConsole shell (prototype .app layout)", () => {
   beforeEach(() => {
-    // refreshSessions + getHistory fetch in effects (don't run under SSR), but
-    // stub fetch to a never-resolving promise so nothing fires a real request.
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
   });
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("mounts the SessionView surface (composer) when routed to /chat/s/:sid", () => {
+  it("renders the Home landing at / (lazy-create composer, no modal)", () => {
+    const html = routed("/");
+    expect(html).toContain('data-testid="app-shell"');
+    expect(html).toContain('data-testid="home-view"');
+    // 开工吧! + the ctx-bar + the composer's 随心输入 placeholder.
+    expect(html).toMatch(/开工吧|Let's build/);
+    expect(html).toContain('data-testid="ctx-bar"');
+    expect(html).toContain("随心输入");
+    // The retired NewSessionModal must be gone.
+    expect(html).not.toContain("创建并切过去");
+    expect(html).not.toContain("新建 session");
+  });
+
+  it("mounts the Conversation view (keyed SessionView) at /chat/s/:sid", () => {
     const html = routed("/chat/s/s9");
-    // The composer placeholder is emitted ONLY by SessionView — its presence
-    // proves the shell rendered <SessionView sid="s9"> in its main area.
-    expect(html).toContain("发消息 / 命令");
-    // The shell chrome is still there (sidebar search + brand).
-    expect(html).toContain("side-search");
-    expect(html).toContain("ccteam");
+    expect(html).toContain('data-testid="conversation-view"');
+    // conv composer placeholder (only the conversation view emits it).
+    expect(html).toContain("Enter 发送");
+    // sid chip in the conv-head meta.
+    expect(html).toContain(">s9<");
+    // Home's landing is NOT rendered simultaneously (views are exclusive).
+    expect(html).not.toContain('data-testid="home-view"');
   });
 
-  it("renders the no-session Home empty state (NOT the composer) at /chat", () => {
-    const html = routed("/chat");
-    // v0.8.24 A1 — Home landing; SessionView composer must be absent.
-    expect(html).toMatch(/开工吧|Let's go/);
-    expect(html).not.toContain("发消息 / 命令");
+  it("mounts 工作流 at /flow and 设置 at /settings (set-nav second column)", () => {
+    const flow = routed("/flow");
+    expect(flow).toContain('data-testid="workflow-view"');
+    expect(flow).toContain('data-testid="workflow-tab-skills"');
+    const settings = routed("/settings");
+    expect(settings).toContain('data-testid="settings-view"');
+    expect(settings).toContain('data-testid="set-item-market"');
   });
 
-  it("keeps shell chrome without a top app bar", () => {
-    const html = routed("/chat");
-    // A1: search affordance + new-session CTA live in the sidebar, not a top bar.
-    expect(html).toMatch(/新建会话|New session/);
-    expect(html).toContain("side-search");
+  it("has NO full-width top bar — nav lives in the sidebar", () => {
+    const html = routed("/");
+    expect(html).toContain('data-testid="sidebar"');
+    expect(html).toContain('id="side-search"');
+    expect(html).toContain("⌘K");
+    expect(html).toContain('data-testid="side-new"');
+    expect(html).toContain('data-testid="side-flow"');
+    expect(html).toContain('data-testid="side-settings"');
+    // Old top-bar remnants must not exist.
+    expect(html).not.toContain("ccteam chat");
+  });
+
+  it("renders the mobile drawer chrome (hamburger + backdrop)", () => {
+    const html = routed("/");
+    expect(html).toContain('data-testid="hamb"');
+    expect(html).toContain('data-testid="side-backdrop"');
+  });
+
+  it("collapsed icon rail keeps the expanded order: logo→expand→search→new→flow→blank→settings→avatar", () => {
+    const html = routed("/");
+    const mini = html.slice(html.indexOf('data-testid="side-mini"'));
+    expect(mini.length).toBeGreaterThan(0);
+    const order = [
+      'data-testid="side-expand"',
+      "搜索会话",
+      "新建会话",
+      "工作流",
+      "mini-blank",
+      "设置",
+      'class="avatar"',
+    ];
+    let cursor = 0;
+    for (const needle of order) {
+      const at = mini.indexOf(needle, cursor);
+      expect(at, `expected ${needle} in rail order`).toBeGreaterThan(-1);
+      cursor = at;
+    }
   });
 });

@@ -68,13 +68,13 @@ export function CostPillButton({
   const severity = snap ? budgetSeverity(snap.cost_24h_usd, snap.budget_cap_24h) : "ok";
   const cap = snap?.budget_cap_24h ?? null;
 
-  // Border/text severity color. `ok` = neutral dim; warn = amber; over = red.
+  // Prototype `.cost-pill` (green pill); warn/over override the text tone.
   const tone =
     severity === "over"
-      ? "border-status-error/60 text-status-error"
+      ? { color: "var(--red-text)", background: "var(--red-soft)" }
       : severity === "warn"
-        ? "border-brand-500/60 text-brand-400"
-        : "border-surface-700/60 text-text-dim";
+        ? { color: "#B45309", background: "#FDF3E1" }
+        : undefined;
 
   return (
     <button
@@ -82,12 +82,10 @@ export function CostPillButton({
       data-testid="cost-pill"
       onClick={onOpenStatus}
       title="今日花费 / 24h 预算（点开看 per-vendor）"
-      className={`text-[11px] font-mono px-2.5 py-1 rounded-full bg-surface-800 border ${tone} hover:bg-surface-700 transition-colors cursor-pointer`}
+      className="cost-pill"
+      style={{ ...tone, cursor: "pointer" }}
     >
-      今日{" "}
-      <span className={severity === "ok" ? "text-text-secondary" : undefined}>
-        {snap ? formatUsd(snap.cost_24h_usd) : "$—"}
-      </span>
+      今日 {snap ? formatUsd(snap.cost_24h_usd) : "$—"}
       {snap ? (cap !== null ? ` / ${formatUsd(cap)}` : "") : " / $—"}
     </button>
   );

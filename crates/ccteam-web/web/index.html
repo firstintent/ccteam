@@ -1,21 +1,22 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
     <title>ccteam web</title>
-    <meta name="theme-color" content="#f4f4f5" />
+    <meta name="theme-color" content="#fafafb" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-    <!-- v0.8.24 — light is the product default. Apply stored theme BEFORE first
-         paint (no flash). Unset / missing → light; only `theme:"dark"` omits .light. -->
+    <!-- v0.8.24 — light is the product default (:root tokens). Apply the
+         stored dark choice BEFORE first paint (no flash): only theme:"dark"
+         adds html.dark; anything else stays light. -->
     <script>
       try {
         var s = JSON.parse(localStorage.getItem("aoe-web-settings") || "{}");
-        if (s.theme !== "dark") document.documentElement.classList.add("light");
+        if (s.theme === "dark") document.documentElement.classList.add("dark");
       } catch (e) {
-        document.documentElement.classList.add("light");
+        /* default light */
       }
     </script>
   </head>

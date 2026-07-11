@@ -92,6 +92,9 @@ export interface SessionContext {
 export interface SessionStatus {
   sid: string;
   model: string | null;
+  /** Reasoning-effort token (`low`/`medium`/`high`/`max`), `null` on models/
+   *  builds with no effort axis. */
+  effort?: string | null;
   context: SessionContext | null;
   status_line: string | null;
 }

@@ -63,7 +63,7 @@ type LoadState =
 
 const SRC_ALL = "__all";
 
-export default function MarketplaceView() {
+export default function MarketplaceView({ embedded = false }: { embedded?: boolean } = {}) {
   // ---- install-target project picker -------------------------------------
   const [projects, setProjects] = useState<string[]>([]);
   const [project, setProject] = useState<string>("");
@@ -229,15 +229,19 @@ export default function MarketplaceView() {
   );
 
   return (
-    <div data-testid="marketplace-view" className="p-6 max-w-[1000px] mx-auto">
+    <div data-testid="marketplace-view" className={embedded ? "" : "p-6 max-w-[1000px] mx-auto"}>
       <div className="flex items-start gap-3">
-        <div className="flex-1 min-w-0">
-          <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
-          <p className="mt-1 text-sm text-text-secondary">
-            浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents
-            等开源。装到所选项目。
-          </p>
-        </div>
+        {embedded ? (
+          <div className="flex-1 min-w-0" />
+        ) : (
+          <div className="flex-1 min-w-0">
+            <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
+            <p className="mt-1 text-sm text-text-secondary">
+              浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents
+              等开源。装到所选项目。
+            </p>
+          </div>
+        )}
         <button
           type="button"
           onClick={() => reload(true)}

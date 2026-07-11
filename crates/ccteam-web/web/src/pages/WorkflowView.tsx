@@ -1,7 +1,12 @@
-// v0.8.24 A3 — Workflow top-level surface (Skills / Roles / MCP / 自进化 / Compare).
-// Read-only where data exists; Compare can fan out via POST …/compare.
+// v0.8.24 Track A — 工作流 top-level view (prototype `#view-flow`):
+// a set-nav second column (232px, 「工作流」) with five sub-pages —
+// Skills / Roles / MCP Servers / 自进化 / Compare — each a prototype-styled
+// detail page (flow-rows lists, stat cards, compare launcher). Data wiring
+// unchanged: listProjectRoles / getProjectMarketplace / getEvolution /
+// runCompare (lib/workflowApi).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Activity, GitCompareArrows, Package, Server, User } from "lucide-react";
 import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
 import {
@@ -11,26 +16,47 @@ import {
   type EvolutionSummary,
 } from "../lib/workflowApi";
 import { fetchDashboard } from "../lib/dashboardApi";
-import { tr } from "../lib/i18n";
-import { useWebSettings } from "../hooks/useWebSettings";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
+import { vendorDotClass } from "../lib/vendors";
 
 type TabId = "skills" | "roles" | "mcp" | "evolution" | "compare";
 
-const TABS: { id: TabId; zh: string; en: string }[] = [
-  { id: "skills", zh: "Skills", en: "Skills" },
-  { id: "roles", zh: "Roles", en: "Roles" },
-  { id: "mcp", zh: "MCP Servers", en: "MCP Servers" },
-  { id: "evolution", zh: "自进化", en: "Evolution" },
-  { id: "compare", zh: "Compare", en: "Compare" },
+const TABS: { id: TabId; label: string; labelKey?: string; subKey: string; icon: React.ReactNode }[] = [
+  { id: "skills", label: "Skills", subKey: "skillsSub", icon: <Package /> },
+  { id: "roles", label: "Roles", subKey: "rolesSub", icon: <User /> },
+  { id: "mcp", label: "MCP Servers", subKey: "mcpSub", icon: <Server /> },
+  { id: "evolution", label: "自进化", labelKey: "evolve", subKey: "evolveSub", icon: <Activity /> },
+  { id: "compare", label: "Compare", subKey: "compareSub", icon: <GitCompareArrows /> },
 ];
 
 const COMPARE_VENDORS = ["claude", "codex", "grok", "opencode"] as const;
 
-export default function WorkflowView() {
-  const { settings } = useWebSettings();
-  const lang = settings.language;
-  const [tab, setTab] = useState<TabId>("skills");
+function isTab(v: string | undefined): v is TabId {
+  return !!v && TABS.some((t) => t.id === v);
+}
+
+export default function WorkflowView({
+  tab: routeTab,
+  onNav,
+  onOpenMarket,
+  lang: langProp,
+}: {
+  tab?: string;
+  onNav?: (tab: TabId) => void;
+  onOpenMarket?: () => void;
+  lang?: Lang;
+} = {}) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  const zh = lang !== "en";
+  const [localTab, setLocalTab] = useState<TabId>("skills");
+  const tab: TabId = isTab(routeTab) ? routeTab : localTab;
+  const setTab = (next: TabId) => {
+    setLocalTab(next);
+    onNav?.(next);
+  };
+
   const [projects, setProjects] = useState<string[]>([]);
   const [slug, setSlug] = useState("");
   const [roles, setRoles] = useState<RoleSummary[]>([]);
@@ -44,8 +70,8 @@ export default function WorkflowView() {
 
   useEffect(() => {
     void fetchDashboard()
-      .then((rows) => {
-        const slugs = rows.map((p) => p.slug).filter(Boolean);
+      .then((rowsRes) => {
+        const slugs = rowsRes.map((p) => p.slug).filter(Boolean);
         setProjects(slugs);
         setSlug((cur) => cur || slugs[0] || "");
       })
@@ -76,9 +102,7 @@ export default function WorkflowView() {
   }, [refreshTab]);
 
   const toggleVendor = (v: string) => {
-    setCompareVendors((prev) =>
-      prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v],
-    );
+    setCompareVendors((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
   };
 
   const onCompare = async () => {
@@ -106,9 +130,10 @@ export default function WorkflowView() {
         value={slug}
         onChange={(e) => setSlug(e.target.value)}
         data-testid="workflow-project"
-        className="h-8 rounded-md bg-surface-800 border border-surface-700 px-2 text-xs"
+        className="btn ghost"
+        style={{ padding: "6px 10px", fontSize: 12.5 }}
       >
-        {projects.length === 0 ? <option value="">(no projects)</option> : null}
+        {projects.length === 0 ? <option value="">{tr(lang, "(无项目)", "(no projects)")}</option> : null}
         {projects.map((p) => (
           <option key={p} value={p}>
             {p}
@@ -116,226 +141,323 @@ export default function WorkflowView() {
         ))}
       </select>
     ),
-    [projects, slug],
+    [projects, slug, lang],
+  );
+
+  const detailHeader = (title: React.ReactNode, desc: React.ReactNode) => (
+    <header style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+      <div style={{ flex: 1 }}>
+        <h1>{title}</h1>
+        <p>{desc}</p>
+      </div>
+      {projectSelect}
+    </header>
+  );
+
+  const flowRow = (name: React.ReactNode, desc: React.ReactNode, end: React.ReactNode, key: string) => (
+    <div className="flow-row" key={key}>
+      <span className="n">{name}</span>
+      <span className="d">{desc}</span>
+      <span className="end">{end}</span>
+    </div>
   );
 
   return (
-    <div className="h-full flex flex-col" data-testid="workflow-view">
-      <div className="shrink-0 px-4 pt-3 pb-2 border-b border-surface-700/40 flex flex-wrap items-center gap-2">
-        <div className="flex gap-1 flex-wrap">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              data-testid={`workflow-tab-${t.id}`}
-              onClick={() => setTab(t.id)}
-              className={`h-8 px-3 rounded-md text-xs font-medium ${
-                tab === t.id
-                  ? "bg-surface-700 text-text-primary"
-                  : "text-text-secondary hover:bg-surface-800"
-              }`}
-            >
-              {lang === "en" ? t.en : t.zh}
-            </button>
-          ))}
-        </div>
-        <span className="flex-1" />
-        <span className="text-[11px] text-text-muted">{tr(lang, "项目", "Project")}</span>
-        {projectSelect}
+    <section className="view active row" data-testid="workflow-view">
+      <div className="set-nav" data-testid="flow-nav">
+        <h2>{t("flowTitle")}</h2>
+        {TABS.map((it) => (
+          <button
+            key={it.id}
+            type="button"
+            data-testid={`workflow-tab-${it.id}`}
+            className={`set-item ${tab === it.id ? "active" : ""}`}
+            onClick={() => setTab(it.id)}
+          >
+            {it.icon}
+            {it.labelKey ? t(it.labelKey) : it.label}
+            <span className="sub">{t(it.subKey)}</span>
+          </button>
+        ))}
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto p-4">
-        {loading ? (
-          <p className="text-xs text-text-muted">{tr(lang, "加载中…", "Loading…")}</p>
-        ) : null}
+      <div className="set-detail">
+        <div className="set-detail-inner fade-in" key={tab}>
+          {loading ? <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p> : null}
 
-        {tab === "skills" ? (
-          <section>
-            <h3 className="text-sm font-semibold mb-2">
-              {tr(lang, "本项目 Skills", "Project skills")}
-            </h3>
-            {skills.length === 0 ? (
-              <p className="text-xs text-text-muted">
-                {tr(
-                  lang,
-                  "暂无已装 skill（可从设置→插件市场安装）。",
-                  "No installed skills (install from Settings → Marketplace).",
-                )}
-              </p>
-            ) : (
-              <ul className="space-y-1">
-                {skills.map((s) => (
-                  <li
-                    key={s.id}
-                    className="rounded-md border border-surface-700/50 px-3 py-2 text-xs"
-                  >
-                    <span className="font-mono text-brand-400">{s.id}</span>
-                    {s.name ? (
-                      <span className="text-text-secondary ml-2">{s.name}</span>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        ) : null}
-
-        {tab === "roles" ? (
-          <section>
-            <h3 className="text-sm font-semibold mb-2">
-              {tr(lang, "本项目 Roles", "Project roles")}
-            </h3>
-            {roles.length === 0 ? (
-              <p className="text-xs text-text-muted">
-                {tr(lang, "暂无 role 文件。", "No role files.")}
-              </p>
-            ) : (
-              <ul className="space-y-1">
-                {roles.map((r) => (
-                  <li
-                    key={r.role}
-                    className="rounded-md border border-surface-700/50 px-3 py-2 text-xs"
-                  >
-                    <span className="font-mono text-brand-400">{r.role}</span>
-                    {r.description ? (
-                      <span className="text-text-secondary ml-2">{r.description}</span>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        ) : null}
-
-        {tab === "mcp" ? (
-          <section className="space-y-3 max-w-xl">
-            <h3 className="text-sm font-semibold">MCP Servers</h3>
-            <div className="rounded-md border border-surface-700/50 p-3 text-xs space-y-1">
-              <div className="font-mono text-brand-400">ccteam</div>
-              <p className="text-text-secondary">
-                {tr(
-                  lang,
-                  "本进程 8 工具（status / chat_send_file / screenshot / session_*）。默认 stream-json 会话可经 curated mcp-config 注入。",
-                  "In-process 8 tools (status / chat_send_file / screenshot / session_*). Default stream-json sessions inject curated mcp-config.",
-                )}
-              </p>
-            </div>
-            <p className="text-[11px] text-text-muted">
-              {tr(
-                lang,
-                "第三方 MCP 注册入口见设置→主机 / register-mcp（本页只读展示）。",
-                "Third-party MCP registration lives under Settings → Hosts / register-mcp.",
+          {tab === "skills" ? (
+            <>
+              {detailHeader(
+                "Skills",
+                zh ? (
+                  <>
+                    当前项目的技能库(<code>.claude/skills/</code>)—— 会话内按触发词自动调用;可从插件市场安装。
+                  </>
+                ) : (
+                  <>
+                    This project&apos;s skill library (<code>.claude/skills/</code>) — auto-triggered in
+                    sessions; installable from the marketplace.
+                  </>
+                ),
               )}
-            </p>
-          </section>
-        ) : null}
+              {skills.length === 0 && !loading ? (
+                <p style={{ fontSize: 13, color: "var(--text-faint)" }}>
+                  {zh
+                    ? "暂无已装 skill(可从设置→插件市场安装)。"
+                    : "No installed skills (install from Settings → Marketplace)."}
+                </p>
+              ) : (
+                <div className="flow-rows">
+                  {skills.map((s) =>
+                    flowRow(
+                      s.id,
+                      s.name || s.description || "",
+                      s.installed_status === "installed" ? (
+                        <span className="badge ok">{t("installed")}</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn primary mini"
+                          onClick={() => onOpenMarket?.()}
+                        >
+                          {t("goMarket")}
+                        </button>
+                      ),
+                      s.id,
+                    ),
+                  )}
+                </div>
+              )}
+              <div>
+                <button type="button" className="btn ghost" onClick={() => onOpenMarket?.()}>
+                  {t("browseMarket")}
+                </button>
+              </div>
+            </>
+          ) : null}
 
-        {tab === "evolution" ? (
-          <section>
-            <h3 className="text-sm font-semibold mb-2">
-              {tr(lang, "自进化（只读）", "Evolution (read-only)")}
-            </h3>
-            {!evolution || evolution.empty ? (
-              <p className="text-xs text-text-muted">
-                {tr(
-                  lang,
-                  "尚无 experience 数据（诚实空态）。",
-                  "No experience data yet (honest empty state).",
+          {tab === "roles" ? (
+            <>
+              {detailHeader(
+                "Roles",
+                zh ? (
+                  <>
+                    角色库(<code>.claude/agents/&lt;role&gt;.md</code>)—— spawn 时绑 <code>--agent</code>
+                    ,会话内 <code>/role</code> 原地切换。
+                  </>
+                ) : (
+                  <>
+                    Role library (<code>.claude/agents/&lt;role&gt;.md</code>) — bound at spawn via{" "}
+                    <code>--agent</code>; switch in-session with <code>/role</code>.
+                  </>
+                ),
+              )}
+              {roles.length === 0 && !loading ? (
+                <p style={{ fontSize: 13, color: "var(--text-faint)" }}>
+                  {zh ? "暂无 role 文件。" : "No role files."}
+                </p>
+              ) : (
+                <div className="flow-rows">
+                  {roles.map((r) =>
+                    flowRow(
+                      r.role,
+                      r.description || "",
+                      r.role === "cto" ? (
+                        <span className="badge brand">built-in</span>
+                      ) : (
+                        <span className="badge ok">{t("installed")}</span>
+                      ),
+                      r.role,
+                    ),
+                  )}
+                </div>
+              )}
+              <div>
+                <button type="button" className="btn ghost" onClick={() => onOpenMarket?.()}>
+                  {t("installMarket")}
+                </button>
+              </div>
+            </>
+          ) : null}
+
+          {tab === "mcp" ? (
+            <>
+              {detailHeader(
+                "MCP Servers",
+                zh ? (
+                  <>
+                    注册进各 vendor 配置的工具服务器;ccteam 自身 = 8 个 <code>mcp__ccteam__*</code> 工具,默认
+                    stream-json 会话经 curated mcp-config 注入。
+                  </>
+                ) : (
+                  <>
+                    Tool servers registered into each vendor&apos;s config; ccteam itself = 8{" "}
+                    <code>mcp__ccteam__*</code> tools, injected into stream-json sessions via the curated
+                    mcp-config.
+                  </>
+                ),
+              )}
+              <div className="flow-rows">
+                {flowRow(
+                  "ccteam",
+                  zh
+                    ? "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp 自检"
+                    : "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp",
+                  <span className="badge ok">{t("mcpOk")}</span>,
+                  "ccteam",
                 )}
+              </div>
+              <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>
+                {zh
+                  ? "第三方 MCP server 注册走 设置→主机 的 register-mcp(幂等写 vendor 配置);本页只读展示。"
+                  : "Third-party MCP registration lives under Settings → Hosts (idempotent register-mcp); this page is read-only."}
               </p>
-            ) : (
-              <div className="space-y-3 text-xs">
-                <p className="text-text-secondary">
-                  turn records:{" "}
-                  <span className="font-mono">{evolution.turn_records}</span>
-                </p>
-                <div>
-                  <div className="text-text-muted mb-1">roles</div>
-                  <ul className="space-y-1">
-                    {evolution.roles.map((b) => (
-                      <li key={`${b.id}-${b.sha}`} className="font-mono">
-                        {b.id} · turns={b.turn_count}
-                        {b.sha ? ` · ${b.sha}` : ""}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div>
-                  <div className="text-text-muted mb-1">skills</div>
-                  <ul className="space-y-1">
-                    {evolution.skills.map((b) => (
-                      <li key={`${b.id}-${b.sha}`} className="font-mono">
-                        {b.id} · turns={b.turn_count}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            )}
-          </section>
-        ) : null}
+            </>
+          ) : null}
 
-        {tab === "compare" ? (
-          <section className="max-w-3xl space-y-3">
-            <h3 className="text-sm font-semibold">Compare</h3>
-            <textarea
-              value={comparePrompt}
-              onChange={(e) => setComparePrompt(e.target.value)}
-              rows={3}
-              data-testid="compare-prompt"
-              placeholder={tr(lang, "同一问题投递给多个 agent…", "Same prompt to multiple agents…")}
-              className="w-full rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm outline-none focus:border-brand-500"
-            />
-            <div className="flex flex-wrap gap-2">
-              {COMPARE_VENDORS.map((v) => (
-                <label
-                  key={v}
-                  className="flex items-center gap-1.5 text-xs text-text-secondary cursor-pointer"
-                >
-                  <input
-                    type="checkbox"
-                    checked={compareVendors.includes(v)}
-                    onChange={() => toggleVendor(v)}
-                  />
-                  {v}
-                </label>
-              ))}
-            </div>
-            <button
-              type="button"
-              disabled={compareBusy}
-              data-testid="compare-run"
-              onClick={() => void onCompare()}
-              className="h-9 px-4 rounded-md bg-brand-500 text-surface-950 text-xs font-medium hover:bg-brand-400 disabled:opacity-50"
-            >
-              {compareBusy
-                ? tr(lang, "对比中…", "Comparing…")
-                : tr(lang, "发起对比", "Run compare")}
-            </button>
-            {compareResult ? (
-              <div className="space-y-3" data-testid="compare-result">
-                <p className="text-[11px] font-mono text-text-muted">
-                  group={compareResult.compare_group} · cost=
-                  {compareResult.cost_subtotal_usd ?? "—"}
-                </p>
-                {compareResult.slots.map((s) => (
-                  <div
-                    key={s.sid}
-                    className="rounded-md border border-surface-700/50 p-3 text-xs space-y-1"
-                  >
-                    <div className="font-mono text-brand-400">
-                      {s.vendor} · {s.sid} · {s.status}
+          {tab === "evolution" ? (
+            <>
+              {detailHeader(
+                t("evolve"),
+                zh
+                  ? "v0.9 经验底座:每个 turn 落 turn record,role / skill 指纹随使用进化,后续 spawn 自动携带 —— 团队越用越懂你的项目。本版只读。"
+                  : "v0.9 experience substrate: every turn writes a turn record; role / skill fingerprints evolve with use. Read-only this version.",
+              )}
+              {!evolution || evolution.empty ? (
+                !loading ? (
+                  <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="evolution-empty">
+                    {zh ? "尚无 experience 数据(诚实空态)。" : "No experience data yet (honest empty state)."}
+                  </p>
+                ) : null
+              ) : (
+                <>
+                  <div className="stat-grid">
+                    <div className="stat">
+                      <span className="k">turn records</span>
+                      <span className="v">{evolution.turn_records}</span>
+                      <span className="k">
+                        {zh ? "verdicts" : "verdicts"} {evolution.verdict_records}
+                      </span>
                     </div>
-                    <pre className="whitespace-pre-wrap text-text-secondary font-sans">
-                      {s.answer || s.error || "(empty)"}
-                    </pre>
+                    <div className="stat">
+                      <span className="k">role {zh ? "指纹" : "fingerprints"}</span>
+                      <span className="v">{evolution.roles.length}</span>
+                      <span className="k">{evolution.roles.map((b) => b.id).join(" · ") || "—"}</span>
+                    </div>
+                    <div className="stat">
+                      <span className="k">skill {zh ? "指纹" : "fingerprints"}</span>
+                      <span className="v">{evolution.skills.length}</span>
+                      <span className="k">{evolution.skills.map((b) => b.id).join(" · ") || "—"}</span>
+                    </div>
                   </div>
-                ))}
+                  <div className="flow-rows">
+                    {[...evolution.roles, ...evolution.skills].map((b) =>
+                      flowRow(
+                        `${b.kind}:${b.id}`,
+                        `turns=${b.turn_count}${b.sha ? ` · ${b.sha.slice(0, 10)}` : ""}`,
+                        <span className="badge ok">{zh ? "只读" : "read-only"}</span>,
+                        `${b.kind}-${b.id}-${b.sha}`,
+                      ),
+                    )}
+                  </div>
+                </>
+              )}
+            </>
+          ) : null}
+
+          {tab === "compare" ? (
+            <>
+              {detailHeader(
+                "Compare",
+                zh
+                  ? "同一道题多 agent 并行(/compare),对比产出并给结论 —— 选型、方案评审用。"
+                  : "Run the same task across agents in parallel (/compare), compare outputs.",
+              )}
+              <div className="form">
+                <textarea
+                  value={comparePrompt}
+                  onChange={(e) => setComparePrompt(e.target.value)}
+                  rows={3}
+                  data-testid="compare-prompt"
+                  placeholder={zh ? "同一问题投递给多个 agent…" : "Same prompt to multiple agents…"}
+                  style={{
+                    border: "1px solid var(--border)",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 14,
+                    fontFamily: "inherit",
+                    color: "var(--text)",
+                    background: "var(--bg-card)",
+                    outline: "none",
+                    resize: "vertical",
+                  }}
+                />
+                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                  {COMPARE_VENDORS.map((v) => (
+                    <label
+                      key={v}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 13,
+                        color: "var(--text-muted)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={compareVendors.includes(v)}
+                        onChange={() => toggleVendor(v)}
+                      />
+                      <span className={vendorDotClass(v)} />
+                      {v}
+                    </label>
+                  ))}
+                </div>
+                <div>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={compareBusy}
+                    data-testid="compare-run"
+                    style={compareBusy ? { opacity: 0.5 } : undefined}
+                    onClick={() => void onCompare()}
+                  >
+                    {compareBusy ? (zh ? "对比中…" : "Comparing…") : t("newCompare")}
+                  </button>
+                </div>
               </div>
-            ) : null}
-          </section>
-        ) : null}
+              {compareResult ? (
+                <div className="form" data-testid="compare-result">
+                  <p className="mono" style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
+                    group={compareResult.compare_group} · cost={compareResult.cost_subtotal_usd ?? "—"}
+                  </p>
+                  {compareResult.slots.map((s) => (
+                    <div
+                      key={s.sid}
+                      style={{
+                        border: "1px solid var(--border)",
+                        borderRadius: "var(--radius-card)",
+                        padding: "12px 16px",
+                        background: "var(--bg-card)",
+                      }}
+                    >
+                      <div className="mono" style={{ fontSize: 12, marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
+                        <span className={vendorDotClass(s.vendor)} />
+                        {s.vendor} · {s.sid} · {s.status}
+                      </div>
+                      <pre style={{ whiteSpace: "pre-wrap", fontSize: 13, fontFamily: "inherit", color: "var(--text-muted)" }}>
+                        {s.answer || s.error || "(empty)"}
+                      </pre>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </div>
       </div>
-    </div>
+    </section>
   );
 }

@@ -1,0 +1,139 @@
+// v0.8.24 Track A — the 4-way vendor registry driving the composer's
+// model+effort+protocol menu (prototype VENDORS + the opencode extension).
+
+import { describe, expect, it } from "vitest";
+
+import {
+  defaultDraft,
+  modelSwitchFor,
+  normalizeDraft,
+  slugFromPath,
+  statusDotClass,
+  vendorChipClass,
+  vendorDotClass,
+  vendorSpec,
+  visibleProtocols,
+  wireProtocol,
+  VENDORS,
+} from "./vendors";
+
+describe("VENDORS registry (4-way)", () => {
+  it("lists exactly claude / codex / grok / opencode — opencode never collapses", () => {
+    expect(VENDORS.map((v) => v.id)).toEqual(["claude", "codex", "grok", "opencode"]);
+  });
+
+  it("claude offers stream-json (default) + terminal (admin-only, frozen)", () => {
+    const claude = vendorSpec("claude");
+    expect(claude.protocols.map((p) => p.id)).toEqual(["stream-json", "terminal"]);
+    expect(claude.protocols[1]?.adminOnly).toBe(true);
+  });
+
+  it("codex = app-server (wire stream-json); grok/opencode = acp", () => {
+    expect(vendorSpec("codex").protocols.map((p) => `${p.id}:${p.wire}`)).toEqual([
+      "app-server:stream-json",
+    ]);
+    expect(vendorSpec("grok").protocols.map((p) => p.wire)).toEqual(["acp"]);
+    expect(vendorSpec("opencode").protocols.map((p) => p.wire)).toEqual(["acp"]);
+  });
+
+  it("falls back to claude for an unknown vendor", () => {
+    expect(vendorSpec("nope").id).toBe("claude");
+  });
+});
+
+describe("visibleProtocols (terminal is admin-gated in the UI)", () => {
+  it("hides claude terminal from a tenant", () => {
+    expect(visibleProtocols("claude", false).map((p) => p.id)).toEqual(["stream-json"]);
+  });
+
+  it("shows claude terminal to the admin", () => {
+    expect(visibleProtocols("claude", true).map((p) => p.id)).toEqual([
+      "stream-json",
+      "terminal",
+    ]);
+  });
+
+  it("is a no-op for vendors without gated protocols", () => {
+    expect(visibleProtocols("opencode", false).map((p) => p.id)).toEqual(["acp"]);
+  });
+});
+
+describe("wireProtocol", () => {
+  it("resolves the menu id to the wire value (app-server → stream-json)", () => {
+    expect(wireProtocol({ vendor: "codex", protocol: "app-server" })).toBe("stream-json");
+    expect(wireProtocol({ vendor: "claude", protocol: "terminal" })).toBe("terminal");
+    expect(wireProtocol({ vendor: "grok", protocol: "acp" })).toBe("acp");
+  });
+
+  it("falls back to the vendor's first protocol for an unknown id", () => {
+    expect(wireProtocol({ vendor: "claude", protocol: "acp" })).toBe("stream-json");
+  });
+});
+
+describe("modelSwitchFor (lazy-create /model follow-up)", () => {
+  it("is null for the vendor-default model (no /model turn)", () => {
+    const d = defaultDraft();
+    expect(modelSwitchFor(d)).toBeNull();
+  });
+
+  it("returns the model for a non-default pick", () => {
+    expect(modelSwitchFor({ vendor: "claude", model: "sonnet-5" })).toBe("sonnet-5");
+  });
+
+  it("never switches for opencode (self-selects its model)", () => {
+    expect(modelSwitchFor({ vendor: "opencode", model: "anything" })).toBeNull();
+  });
+
+  it("is null for a model the vendor doesn't list", () => {
+    expect(modelSwitchFor({ vendor: "codex", model: "made-up" })).toBeNull();
+  });
+});
+
+describe("normalizeDraft", () => {
+  it("repairs a cross-vendor model/protocol after a vendor switch", () => {
+    const next = normalizeDraft({
+      vendor: "codex",
+      model: "fable-5", // claude model — invalid for codex
+      effortKey: "effMax",
+      protocol: "terminal", // claude protocol — invalid for codex
+      hitl: false,
+    });
+    expect(next.model).toBe("gpt-5.2-codex");
+    expect(next.protocol).toBe("app-server");
+  });
+});
+
+describe("dot / chip classes", () => {
+  it("emits prototype vendor classes for all four vendors", () => {
+    expect(vendorDotClass("claude")).toBe("dot claude");
+    expect(vendorDotClass("opencode")).toBe("dot opencode");
+    expect(vendorChipClass("grok")).toBe("chip grok");
+    expect(vendorChipClass("codex")).toBe("chip codex");
+  });
+
+  it("maps live status to prototype dot states", () => {
+    expect(statusDotClass("working")).toBe("dot busy");
+    expect(statusDotClass("stale")).toBe("dot busy");
+    expect(statusDotClass("stuck")).toBe("dot err");
+    expect(statusDotClass("idle")).toBe("dot on");
+    expect(statusDotClass(undefined)).toBe("dot on");
+    expect(statusDotClass("live", { off: true })).toBe("dot off");
+  });
+});
+
+describe("slugFromPath (inline 新建项目 — slug derives from the basename)", () => {
+  it("slugifies the path basename", () => {
+    expect(slugFromPath("~/work/My App")).toBe("my-app");
+    expect(slugFromPath("/srv/demo_shop/")).toBe("demo-shop");
+    expect(slugFromPath("~/work/my-app")).toBe("my-app");
+  });
+
+  it("strips leading/trailing hyphens and collapses runs", () => {
+    expect(slugFromPath("/x/--Weird---Name--")).toBe("weird-name");
+  });
+
+  it("returns empty for an unusable path", () => {
+    expect(slugFromPath("")).toBe("");
+    expect(slugFromPath("///")).toBe("");
+  });
+});

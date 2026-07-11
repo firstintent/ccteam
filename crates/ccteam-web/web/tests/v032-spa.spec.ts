@@ -1,11 +1,15 @@
 import { expect, test, type Page } from "@playwright/test";
 
-// Browser smoke for the current unified chat shell. It intentionally stays on
-// existing surfaces only: `/api/v1/projects`, per-project sessions,
-// per-session history/turn/stop, Status, and the token-entry gate.
+// v0.8.24 Track A — browser smoke for the prototype shell:
+//   `.app` = sidebar + main, four views (Home / Conversation / 工作流 / 设置),
+//   Home lazy-create (session minted on the FIRST message), sidebar
+//   project-grouped sessions with hover-stop, the ≤820px drawer, and the
+//   token-entry gate. All backend traffic is mocked at the /api/v1 seam.
+
 const dashboardRows = [
   {
     slug: "dev-team",
+    path: "/home/u/dev-team",
     team: "dev",
     kind: "workflow",
     last_event_label: "idle",
@@ -25,6 +29,8 @@ const sessionRows = [
     current: true,
     status: "live",
     last_activity_seconds: 12,
+    protocol: "stream-json",
+    title: "评审登录页",
   },
 ];
 
@@ -48,6 +54,7 @@ const statusSnapshot = {
   cost_24h_usd: 0.42,
   cost_24h_by_vendor: { claude: 0.42 },
   budget_cap_24h: 3,
+  sessions: [],
 };
 
 type CapturedRequest = {
@@ -151,20 +158,87 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
   await page.route("**/api/v1/auth/token", (route) =>
     route.fulfill({ status: 200, json: { wire_token: null } }),
   );
+  await page.route("**/api/v1/me", (route) =>
+    route.fulfill({ status: 200, json: { id: "admin", handle: "owner", is_admin: true } }),
+  );
   await page.route("**/api/v1/status", (route) =>
     route.fulfill({ status: 200, json: statusSnapshot }),
   );
-  await page.route("**/api/v1/projects", (route) =>
-    route.fulfill({ status: 200, json: dashboardRows }),
+  await page.route("**/api/v1/hosts", (route) =>
+    route.fulfill({
+      status: 200,
+      json: {
+        hosts: [
+          { host: "local", hostname: "dev01", is_local: true, agent_count: 1, agents_ready: 1 },
+        ],
+      },
+    }),
   );
-  await page.route("**/api/v1/projects/dev-team/sessions", (route) =>
-    route.fulfill({ status: 200, json: sessionRows }),
+  await page.route("**/api/v1/hosts/local*", (route) =>
+    route.fulfill({
+      status: 200,
+      json: {
+        host: "local",
+        hostname: "dev01",
+        is_local: true,
+        os: "linux",
+        arch: "x86_64",
+        ccteam_version: "0.8.24",
+        agents: [
+          {
+            vendor: "claude",
+            harness_id: "claude-code",
+            installed: true,
+            version: "claude 2.0.35",
+            bin: "~/.local/bin/claude",
+            mcp_registered: true,
+            mcp_registrable: true,
+            status: "ready",
+            hint: null,
+          },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/projects", (route) => {
+    if (route.request().method() === "POST") {
+      return route.fulfill({ status: 201, json: { slug: "new-proj", path: "/tmp/new-proj" } });
+    }
+    return route.fulfill({ status: 200, json: dashboardRows });
+  });
+  await page.route("**/api/v1/projects/dev-team/roles", (route) =>
+    route.fulfill({ status: 200, json: [{ role: "cto", description: "默认管家", model: "" }] }),
+  );
+  await page.route("**/api/v1/projects/dev-team/sessions", (route) => {
+    if (route.request().method() === "POST") {
+      captured.push({
+        url: route.request().url(),
+        method: "POST",
+        body: route.request().postDataJSON(),
+      });
+      return route.fulfill({ status: 201, json: { sid: "s2" } });
+    }
+    return route.fulfill({ status: 200, json: sessionRows });
+  });
+  await page.route("**/api/v1/projects/dev-team/sessions/history", (route) =>
+    route.fulfill({ status: 200, json: [] }),
   );
   await page.route("**/api/v1/sessions/s1", (route) =>
     route.fulfill({ status: 200, json: sessionHistory }),
   );
+  await page.route("**/api/v1/sessions/s2", (route) =>
+    route.fulfill({ status: 200, json: { sid: "s2", events: [] } }),
+  );
+  await page.route("**/api/v1/sessions/*/status", (route) =>
+    route.fulfill({
+      status: 200,
+      json: { sid: "s1", model: null, effort: null, context: null, status_line: null },
+    }),
+  );
 
-  async function captureJson(route: Parameters<Page["route"]>[1] extends (route: infer R) => unknown ? R : never) {
+  async function captureJson(
+    route: Parameters<Page["route"]>[1] extends (route: infer R) => unknown ? R : never,
+  ) {
     const req = route.request();
     captured.push({
       url: req.url(),
@@ -175,48 +249,50 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
   }
 
   await page.route("**/api/v1/sessions/s1/turn", captureJson);
+  await page.route("**/api/v1/sessions/s2/turn", captureJson);
   await page.route("**/api/v1/sessions/s1/stop", captureJson);
   await page.route("**/api/v1/sessions/s1/interrupt", captureJson);
 
   return captured;
 }
 
-test("chat shell lists projects and opens a sid-scoped session", async ({
+test("desktop shell: sidebar groups sessions by project and opens a sid conversation", async ({
   page,
 }) => {
   await mockCcteamApi(page);
   await page.goto("/app/");
 
-  await expect(page.getByText("ccteam").first()).toBeVisible();
-  await expect(page.getByText("dev-team").first()).toBeVisible();
-  await expect(page.getByText("reviewer").first()).toBeVisible();
-  await expect(page.getByText("s1").first()).toBeVisible();
+  // Prototype shell chrome: sidebar brand + 新建会话 + 工作流 + 设置, no top bar.
+  await expect(page.getByTestId("sidebar")).toBeVisible();
+  await expect(page.getByTestId("side-new")).toBeVisible();
+  await expect(page.getByTestId("side-flow")).toBeVisible();
+  await expect(page.getByTestId("side-settings")).toBeVisible();
+  // Home landing is the default view.
+  await expect(page.getByTestId("home-view")).toBeVisible();
+  await expect(page.getByText("开工吧!")).toBeVisible();
 
-  await page.getByRole("button", { name: /claude.*reviewer.*s1/ }).click();
+  // The project group + its session row (title from the session-title system).
+  await expect(page.getByText("dev-team").first()).toBeVisible();
+  await page.getByText("评审登录页").first().click();
+
   await expect(page).toHaveURL(/\/app\/chat\/s\/s1$/);
-  await expect(
-    page.getByText("hi from history"),
-  ).toBeVisible();
+  await expect(page.getByTestId("conversation-view")).toBeVisible();
+  await expect(page.getByText("hi from history")).toBeVisible();
 });
 
-test("session view posts turn and stop through the sid resource API", async ({
-  page,
-}) => {
+test("conversation posts a turn; sidebar hover-stop stops the session", async ({ page }) => {
   const captured = await mockCcteamApi(page);
   await page.goto("/app/chat/s/s1");
 
-  await page.getByPlaceholder(/发消息/).fill("ship gate note");
-  await page.getByTitle("发送").click();
+  await page.getByTestId("composer-textarea").fill("ship gate note");
+  await page.getByTestId("composer-send").click();
   await expect
     .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/turn")))
     .toBe(true);
 
-  // The sub-bar "停止" (title 停止会话) DESTROYS the session → /stop. Target it by
-  // title to disambiguate from the composer's busy-state Stop button (title
-  // 停止当前回合), which instead INTERRUPTS the running turn → /interrupt
-  // (its busy-only visibility depends on SSE timing, so the interrupt wiring is
-  // covered by the deterministic unit test `interruptSession POSTs …`, not here).
-  await page.getByTitle("停止会话").click();
+  // The sidebar row's hover stop (prototype `.srow .stop`) → POST /stop.
+  await page.getByText("评审登录页").first().hover();
+  await page.getByRole("button", { name: "停止(状态保留,可 resume) s1", exact: true }).click();
   await expect
     .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s1/stop")))
     .toBe(true);
@@ -235,29 +311,90 @@ test("session view posts turn and stop through the sid resource API", async ({
   );
 });
 
-test("status route renders inside the unified shell", async ({
+test("home lazy-create: first message POSTs session (vendor/protocol/hitl/host) then the turn", async ({
+  page,
+}) => {
+  const captured = await mockCcteamApi(page);
+  await page.goto("/app/");
+
+  await expect(page.getByTestId("home-view")).toBeVisible();
+  // Arm HITL from the composer pill.
+  await page.getByTestId("hitl-toggle").click();
+  await page.getByTestId("composer-textarea").fill("修复登录页布局");
+  await page.getByTestId("home-send").click();
+
+  await expect
+    .poll(() =>
+      captured.some(
+        (r) => r.url.endsWith("/api/v1/projects/dev-team/sessions") && r.method === "POST",
+      ),
+    )
+    .toBe(true);
+  const create = captured.find((r) => r.url.endsWith("/projects/dev-team/sessions"));
+  expect(create?.body).toMatchObject({
+    vendor: "claude",
+    protocol: "stream-json",
+    permission_mode: "hitl",
+  });
+
+  // The first message rides as the new session's first turn → Conversation.
+  await expect
+    .poll(() => captured.some((r) => r.url.endsWith("/api/v1/sessions/s2/turn")))
+    .toBe(true);
+  const turn = captured.find((r) => r.url.endsWith("/api/v1/sessions/s2/turn"));
+  expect(turn?.body).toEqual({ text: "修复登录页布局" });
+  await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
+});
+
+test("工作流 and 设置 render as set-nav views; Status keeps its cards", async ({ page }) => {
+  await mockCcteamApi(page);
+  await page.goto("/app/flow");
+  await expect(page.getByTestId("workflow-view")).toBeVisible();
+  await expect(page.getByTestId("workflow-tab-compare")).toBeVisible();
+
+  await page.goto("/app/settings/status");
+  await expect(page.getByTestId("settings-view")).toBeVisible();
+  await expect(page.getByTestId("status-view")).toBeVisible();
+  await expect(page.getByText(/1 .*live/).first()).toBeVisible();
+
+  // legacy flat route still lands on the new IA.
+  await page.goto("/app/status");
+  await expect(page).toHaveURL(/\/app\/settings\/status$/);
+});
+
+test("mobile ≤820px: sidebar is a drawer behind the hamburger with a backdrop", async ({
   page,
 }) => {
   await mockCcteamApi(page);
-  await page.goto("/app/status");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/app/");
 
-  await expect(page.getByText("Status").first()).toBeVisible();
-  await expect(page.getByTestId("status-sessions")).toBeVisible();
-  await expect(page.getByText(/1 live · 0 idle/).first()).toBeVisible();
+  // Drawer closed: the fixed sidebar sits off-canvas (translateX(-100%)).
+  const sidebar = page.getByTestId("sidebar");
+  await expect(page.getByTestId("hamb")).toBeVisible();
+  await expect(sidebar).not.toBeInViewport();
+
+  // Hamburger slides it in + shows the backdrop.
+  await page.getByTestId("hamb").click();
+  await expect(sidebar).toBeInViewport();
+  await expect(page.getByTestId("side-backdrop")).toBeVisible();
+
+  // Backdrop click closes it again.
+  await page.getByTestId("side-backdrop").click({ position: { x: 350, y: 400 } });
+  await expect(sidebar).not.toBeInViewport();
 });
 
-test("401 after auth-required bootstrap shows the token entry flow", async ({
-  page,
-}) => {
+test("401 after auth-required bootstrap shows the token entry flow", async ({ page }) => {
   await page.route("**/api/v1/auth/token", (route) =>
     route.fulfill({ status: 200, json: { wire_token: "ccteam:deadbeef" } }),
   );
   await page.route("**/api/v1/projects", (route) =>
     route.fulfill({ status: 401, json: { error: "auth required" } }),
   );
-  await page.route("**/sse/**", (route) =>
-    route.fulfill({ status: 200, body: "\n" }),
+  await page.route("**/api/v1/me", (route) =>
+    route.fulfill({ status: 401, json: { error: "auth required" } }),
   );
+  await page.route("**/sse/**", (route) => route.fulfill({ status: 200, body: "\n" }));
 
   await page.goto("/app/");
   await expect(page.getByLabel("Token or URL")).toBeVisible();

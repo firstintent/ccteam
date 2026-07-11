@@ -3,7 +3,7 @@
 // candidate must NOT send a half-typed message).
 
 import { describe, expect, it } from "vitest";
-import { shouldSubmitOnEnter } from "./Composer";
+import { shouldSubmitOnEnter } from "./ChatComposer";
 
 const base = { key: "Enter", shiftKey: false, isComposing: false, keyCode: 13 };
 

@@ -1,9 +1,9 @@
-// v0.8.18 柱2/UI — minimal interface-language helper.
+// v0.8.24 Track A — table-driven, whole-app i18n dictionary.
 //
-// Honest scope: this is NOT full UI i18n (every string translated). It drives
-// the NAV labels + a handful of key labels by the user's chosen language
-// (中文 default / English). Full i18n — a framework + every string extracted —
-// is a separate later version; this is the seam it grows from.
+// Modeled on the prototype's `I18N` object (ui-prototype.html): one zh/en
+// table + `t(lang, key)`, plus parameterized helpers for count/sid phrases.
+// The older `tr(lang, zh, en)` inline helper and `navLabel` stay for the
+// long-tail of embedded panels that still carry their strings inline.
 
 export type Lang = "zh" | "en";
 
@@ -12,7 +12,237 @@ export function tr(lang: Lang, zh: string, en: string): string {
   return lang === "en" ? en : zh;
 }
 
-/** Shell / nav labels, keyed by route or shell surface. */
+/** Whole-shell dictionary — keys follow the prototype's `I18N` object. */
+export const I18N: Record<Lang, Record<string, string>> = {
+  zh: {
+    search: "搜索会话",
+    newSession: "新建会话",
+    workflow: "工作流",
+    workspaces: "工作区",
+    newWorkspace: "新建工作区",
+    settings: "设置",
+    collapse: "收起",
+    expand: "展开",
+    newWsToast: "新建工作区 = 用「＋ 新建项目…」在新目录 ccteam init",
+    homeTitle: "开工吧!",
+    homeSub: "选好项目和机器,直接开聊 —— 会话在第一条消息发出时创建。",
+    inputPh: "随心输入",
+    convPh: "随心输入(Enter 发送,Shift+Enter 换行)",
+    approve: "请求批准",
+    recent: "最近会话",
+    terminal: "终端",
+    chatTab: "Chat",
+    project: "项目",
+    host: "主机",
+    branch: "分支",
+    role: "角色",
+    localTag: "本机",
+    newProjLabel: "新建项目路径",
+    newProject: "＋ 新建项目…",
+    connectHost: "＋ 连接新主机…",
+    installFromMarket: "从插件市场安装…",
+    offline: "离线",
+    offlineNoPick: "离线,不可选",
+    noRole: "无 role",
+    ctoSub: "默认管家",
+    effort: "力度",
+    protocol: "协议",
+    effLow: "低",
+    effMid: "中",
+    effHigh: "高",
+    effMax: "极高",
+    emptyInput: "先随心输入一句",
+    noSessions: "无会话",
+    noMatch: "没有匹配的会话",
+    stopTip: "停止(状态保留,可 resume)",
+    newInWs: "在此工作区新建会话",
+    hitlOn: "敏感操作将请求你批准(--permission-mode default)",
+    hitlOff: "跳过批准(--dangerously-skip-permissions)",
+    flowTitle: "工作流",
+    skillsSub: "技能库",
+    rolesSub: "角色库",
+    mcpSub: "工具",
+    evolveSub: "v0.9",
+    compareSub: "pk",
+    evolve: "自进化",
+    setHosts: "主机",
+    setMarket: "插件市场",
+    setStatus: "Status",
+    setIm: "IM 接入",
+    setGeneral: "通用",
+    setAccount: "账号",
+    hostsDesc:
+      "每台机器上 agent CLI 的安装 / MCP 注册状态;新建对话时可在「主机」选择器里指定在哪台上跑。",
+    localBadge: "本机 local",
+    remoteBadge: "远程",
+    reprobe: "重新探测",
+    reconnect: "重连",
+    probing: "探测中…",
+    registerMcp: "注册 MCP",
+    mcpOk: "MCP 已注册",
+    notInstalled: "未安装",
+    offlineRow: "离线 —— 无法探测 agent。",
+    joinTitle: "连接新主机(卫星节点)",
+    joinDesc: "在目标机器上安装 ccteam 并加入本 daemon —— 加入后即出现在上方列表。",
+    hostsUnit: "台",
+    marketDesc:
+      "来自 ccteam-hub 的 role / skill / workflow / plugin,sha256 校验后装进当前项目的 .claude/。",
+    install: "安装",
+    installed: "已安装",
+    statusDesc: "daemon 健康 · 会话 · 今日成本 / 预算。",
+    running: "运行中",
+    sessionsK: "会话",
+    todayCost: "今日成本",
+    total: "共",
+    imDesc: "Telegram / 飞书 bot 凭据(存 ~/.ccteam,仅 admin 可见)。",
+    save: "保存",
+    language: "界面语言",
+    theme: "主题",
+    light: "浅色",
+    dark: "深色",
+    accAvatar: "头像 / 昵称",
+    accToken: "web token",
+    accTokenHint: "用于 /api/v1 鉴权;个人链接 ?token=… 首次打开时已存入本浏览器。",
+    logout: "登出(清除本浏览器 token)",
+    goMarket: "去安装",
+    browseMarket: "插件市场浏览更多 →",
+    installMarket: "从插件市场安装 →",
+    newCompare: "发起对比",
+    protoToast: "协议:",
+    sendTip: "发送 (Enter)",
+    stopTurnTip: "停止当前回合(会话保留)",
+    resumeTip: "点击恢复(精确 resume / 按记录重放)",
+    historySec: "历史",
+    loading: "加载中…",
+    starting: "创建会话中…",
+  },
+  en: {
+    search: "Search sessions",
+    newSession: "New session",
+    workflow: "Workflows",
+    workspaces: "Workspaces",
+    newWorkspace: "New workspace",
+    settings: "Settings",
+    collapse: "Collapse",
+    expand: "Expand",
+    newWsToast: "New workspace = ccteam init in a new directory (use ＋ New project…)",
+    homeTitle: "Let's build!",
+    homeSub: "Pick a project and a machine, then just chat — the session is created on your first message.",
+    inputPh: "Type anything",
+    convPh: "Type anything (Enter to send, Shift+Enter for newline)",
+    approve: "Ask approval",
+    recent: "Recent sessions",
+    terminal: "Terminal",
+    chatTab: "Chat",
+    project: "Project",
+    host: "Host",
+    branch: "Branch",
+    role: "Role",
+    localTag: "local",
+    newProjLabel: "New project path",
+    newProject: "＋ New project…",
+    connectHost: "＋ Connect a host…",
+    installFromMarket: "Install from marketplace…",
+    offline: "offline",
+    offlineNoPick: "offline, unavailable",
+    noRole: "no role",
+    ctoSub: "default butler",
+    effort: "Effort",
+    protocol: "Protocol",
+    effLow: "Low",
+    effMid: "Medium",
+    effHigh: "High",
+    effMax: "Max",
+    emptyInput: "Type something first",
+    noSessions: "No sessions",
+    noMatch: "No matching sessions",
+    stopTip: "Stop (state kept, resume anytime)",
+    newInWs: "New session in this workspace",
+    hitlOn: "Sensitive ops will ask your approval (--permission-mode default)",
+    hitlOff: "Skipping approvals (--dangerously-skip-permissions)",
+    flowTitle: "Workflows",
+    skillsSub: "skills",
+    rolesSub: "roles",
+    mcpSub: "tools",
+    evolveSub: "v0.9",
+    compareSub: "pk",
+    evolve: "Self-evolve",
+    setHosts: "Hosts",
+    setMarket: "Marketplace",
+    setStatus: "Status",
+    setIm: "IM",
+    setGeneral: "General",
+    setAccount: "Account",
+    hostsDesc:
+      "Agent CLI install / MCP registration per machine; pick which host a new session runs on from the composer.",
+    localBadge: "local",
+    remoteBadge: "remote",
+    reprobe: "Re-probe",
+    reconnect: "Reconnect",
+    probing: "Probing…",
+    registerMcp: "Register MCP",
+    mcpOk: "MCP registered",
+    notInstalled: "not installed",
+    offlineRow: "Offline — cannot probe agents.",
+    joinTitle: "Connect a new host (satellite)",
+    joinDesc: "Install ccteam on the target machine and join this daemon — it then appears above.",
+    hostsUnit: "",
+    marketDesc:
+      "Roles / skills / workflows / plugins from ccteam-hub, sha256-verified into this project's .claude/.",
+    install: "Install",
+    installed: "Installed",
+    statusDesc: "Daemon health · sessions · today's cost / budget.",
+    running: "running",
+    sessionsK: "Sessions",
+    todayCost: "Today's cost",
+    total: "total",
+    imDesc: "Telegram / Lark bot credentials (stored in ~/.ccteam, admin only).",
+    save: "Save",
+    language: "Language",
+    theme: "Theme",
+    light: "Light",
+    dark: "Dark",
+    accAvatar: "Avatar / name",
+    accToken: "web token",
+    accTokenHint: "Used for /api/v1 auth; your personal ?token=… link stored it in this browser.",
+    logout: "Log out (clears this browser's token)",
+    goMarket: "Install",
+    browseMarket: "Browse marketplace →",
+    installMarket: "Install from marketplace →",
+    newCompare: "Run compare",
+    protoToast: "Protocol: ",
+    sendTip: "Send (Enter)",
+    stopTurnTip: "Stop the running turn (session kept)",
+    resumeTip: "Click to resume (precise resume / replay)",
+    historySec: "history",
+    loading: "Loading…",
+    starting: "Creating session…",
+  },
+};
+
+/** Dictionary lookup; falls back zh → key so a missing entry is visible, not
+ *  a crash. */
+export function t(lang: Lang, key: string): string {
+  return I18N[lang][key] ?? I18N.zh[key] ?? key;
+}
+
+/** Curry `t` for components: `const tt = makeT(lang); tt("recent")`. */
+export function makeT(lang: Lang): (key: string) => string {
+  return (key) => t(lang, key);
+}
+
+/** Parameterized phrases (the prototype's function-valued entries). */
+export function tShowMore(lang: Lang, n: number): string {
+  return lang === "en" ? `Show more (${n} more)` : `展开显示(还有 ${n} 个)`;
+}
+export function tStopped(lang: Lang, sid: string): string {
+  return lang === "en"
+    ? `Stopped ${sid} (state kept, resume anytime)`
+    : `已停止 ${sid}(状态保留,随时 resume)`;
+}
+
+/** Shell / nav labels, keyed by route or shell surface (pre-dictionary seam;
+ *  kept for panels that still call it). */
 export const NAV_LABELS: Record<string, { zh: string; en: string }> = {
   marketplace: { zh: "插件市场", en: "Plugins" },
   status: { zh: "Status", en: "Status" },

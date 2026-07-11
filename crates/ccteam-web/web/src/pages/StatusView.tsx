@@ -86,13 +86,13 @@ export default function StatusView({ rail }: { rail: SessionView[] }) {
   }, []);
 
   return (
-    <div data-testid="status-view" className="p-6 max-w-[880px] mx-auto">
-      <h2 className="text-base font-semibold text-text-primary">Status · 运维总览</h2>
-      <p className="mt-1 text-sm text-text-secondary">
-        轻量运维视图（daemon 健康 + 各 session 状态 + 今日成本），取代旧 operator dashboard。
-      </p>
+    <div data-testid="status-view" className="flex flex-col gap-5">
+      <header>
+        <h1>Status · 运维总览</h1>
+        <p>daemon 健康 · 会话 · 今日成本 / 预算。</p>
+      </header>
 
-      <div className="mt-4 space-y-3">
+      <div className="space-y-3">
         {state.kind === "loading" ? (
           <div data-testid="status-loading">
             <SkeletonRows rows={3} />
@@ -165,37 +165,77 @@ export function StatusCards({
 
   return (
     <>
-      {/* daemon health */}
-      <div
-        data-testid="status-daemon"
-        className="rounded-lg bg-surface-900 border border-surface-700/60 px-4 py-3 flex items-center gap-2.5"
-      >
-        <span
-          className={`h-2.5 w-2.5 rounded-full ${
-            status.daemon_healthy ? "bg-status-running" : "bg-status-error"
-          }`}
-          aria-hidden
-        />
-        <span className="text-sm font-medium text-text-primary">
-          {status.daemon_healthy ? "daemon healthy" : "daemon down"}
-        </span>
-        <span
-          className={`ml-auto text-[11px] font-medium px-2 py-0.5 rounded-full ${
-            status.daemon_healthy
-              ? "bg-status-running/15 text-status-running"
-              : "bg-status-error/15 text-status-error"
-          }`}
-        >
-          {status.daemon_healthy ? "MCP sock OK" : "MCP sock unreachable"}
-        </span>
+      {/* prototype stat-grid: daemon · sessions · today's cost */}
+      <div className="stat-grid">
+        <div className="stat" data-testid="status-daemon">
+          <span className="k">daemon</span>
+          <span
+            className="v"
+            style={{ color: status.daemon_healthy ? "var(--green-text)" : "var(--red-text)" }}
+          >
+            {status.daemon_healthy ? "daemon healthy" : "daemon down"}
+          </span>
+          <span className="k">
+            {status.daemon_healthy ? "MCP sock OK" : "MCP sock unreachable"}
+          </span>
+        </div>
+        <div className="stat">
+          <span className="k">会话</span>
+          <span className="v">
+            {status.sessions_live} <span className="u">live ·</span> {status.sessions_idle}{" "}
+            <span className="u">idle</span>
+          </span>
+          <span className="k">共 {rows.length}</span>
+        </div>
+        <div className="stat" data-testid="status-cost">
+          <span className="k">今日成本</span>
+          <span
+            className="v"
+            style={{
+              color:
+                severity === "over"
+                  ? "var(--red-text)"
+                  : severity === "warn"
+                    ? "#B45309"
+                    : undefined,
+            }}
+          >
+            {formatCostBudget(status.cost_24h_usd, status.budget_cap_24h)}
+          </span>
+          <span className="k">
+            {vendorSplit.length > 0 ? vendorSplit.join(" · ") : "本窗口暂无计费记录。"}
+          </span>
+        </div>
       </div>
 
-      {/* sessions */}
+      {status.budget_cap_24h !== null && severity !== "ok" ? (
+        <div
+          data-testid="status-budget-warn"
+          role="status"
+          className={`badge ${severity === "over" ? "warn" : ""}`}
+          style={{ padding: "8px 12px", borderRadius: 10, fontSize: 12 }}
+        >
+          {severity === "over"
+            ? `已达/超 24h 预算（${formatUsd(status.cost_24h_usd)} / ${formatUsd(
+                status.budget_cap_24h,
+              )}）— 接近上限会自停（红线）。`
+            : `接近 24h 预算（${formatUsd(status.cost_24h_usd)} / ${formatUsd(
+                status.budget_cap_24h,
+              )}）。`}
+        </div>
+      ) : null}
+
+      {/* per-session fleet table (sortable — kept, 红线 §1.6-6) */}
       <div
         data-testid="status-sessions"
-        className="rounded-lg bg-surface-900 border border-surface-700/60 px-4 py-3"
+        style={{
+          border: "1px solid var(--border)",
+          borderRadius: "var(--radius-card)",
+          background: "var(--bg-card)",
+          padding: "12px 16px",
+        }}
       >
-        <div className="text-sm font-medium text-text-primary mb-1.5">
+        <div style={{ fontSize: 13.5, fontWeight: 500, marginBottom: 6 }}>
           会话（{status.sessions_live} live · {status.sessions_idle} idle）
         </div>
         {rows.length === 0 ? (
@@ -208,51 +248,6 @@ export function StatusCards({
         ) : (
           <FleetTable rows={rows} />
         )}
-      </div>
-
-      {/* today's cost */}
-      <div
-        data-testid="status-cost"
-        className="rounded-lg bg-surface-900 border border-surface-700/60 px-4 py-3"
-      >
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-text-primary">今日成本</span>
-          <b
-            className={`ml-auto font-mono text-sm ${
-              severity === "over"
-                ? "text-status-error"
-                : severity === "warn"
-                  ? "text-brand-400"
-                  : "text-text-primary"
-            }`}
-          >
-            {formatCostBudget(status.cost_24h_usd, status.budget_cap_24h)}
-          </b>
-        </div>
-        {vendorSplit.length > 0 ? (
-          <div className="mt-1.5 text-xs text-text-secondary">{vendorSplit.join(" · ")}</div>
-        ) : (
-          <div className="mt-1.5 text-xs text-text-dim">本窗口暂无计费记录。</div>
-        )}
-        {status.budget_cap_24h !== null && severity !== "ok" ? (
-          <div
-            data-testid="status-budget-warn"
-            role="status"
-            className={`mt-2 text-[11px] rounded-md px-2.5 py-1.5 ${
-              severity === "over"
-                ? "bg-status-error/10 text-status-error border border-status-error/30"
-                : "bg-brand-500/10 text-brand-400 border border-brand-500/30"
-            }`}
-          >
-            {severity === "over"
-              ? `已达/超 24h 预算（${formatUsd(status.cost_24h_usd)} / ${formatUsd(
-                  status.budget_cap_24h,
-                )}）— 接近上限会自停（红线）。`
-              : `接近 24h 预算（${formatUsd(status.cost_24h_usd)} / ${formatUsd(
-                  status.budget_cap_24h,
-                )}）。`}
-          </div>
-        ) : null}
       </div>
     </>
   );
@@ -288,15 +283,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
         ),
         cell: ({ row }) => (
           <span className="flex items-center gap-2">
-            <span
-              className={
-                row.original.vendor === "claude"
-                  ? "text-vendor-claude"
-                  : row.original.vendor === "grok"
-                    ? "text-vendor-grok"
-                    : "text-vendor-codex"
-              }
-            >
+            <span className={vendorTextClass(row.original.vendor)}>
               {[row.original.vendor, row.original.role].filter(Boolean).join(" · ")}
             </span>
             <span className="font-mono text-text-dim">{row.original.sid}</span>
@@ -407,6 +394,20 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
       </TableBody>
     </Table>
   );
+}
+
+/** 4-way vendor text color (never collapse opencode into codex/grok). */
+function vendorTextClass(vendor: string): string {
+  switch (vendor) {
+    case "claude":
+      return "text-vendor-claude";
+    case "grok":
+      return "text-vendor-grok";
+    case "opencode":
+      return "text-vendor-opencode";
+    default:
+      return "text-vendor-codex";
+  }
 }
 
 function formatActivityAge(seconds: number): string {

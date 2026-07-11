@@ -58,21 +58,32 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm">
+      {/* v0.8.24 Track A — prototype `#toast`: bottom-center ink pill.
+          Errors keep a red wash so failures stay distinguishable. */}
+      <div
+        className="fixed bottom-[26px] left-1/2 -translate-x-1/2 z-[200] flex flex-col items-center gap-2 max-w-[90vw]"
+        style={{ pointerEvents: "none" }}
+      >
         {toasts.map((t) => (
           <div
             key={t.id}
             role={t.kind === "error" ? "alert" : "status"}
-            className={`flex items-start gap-2 px-3 py-2 rounded-md border shadow-lg animate-slide-up text-sm ${
-              t.kind === "error"
-                ? "bg-status-error/10 border-status-error/40 text-status-error"
-                : "bg-surface-800 border-surface-700 text-text-primary"
-            }`}
+            className="flex items-start gap-2 animate-slide-up"
+            style={{
+              pointerEvents: "auto",
+              background: t.kind === "error" ? "var(--red)" : "var(--ink)",
+              color: t.kind === "error" ? "#fff" : "var(--on-ink)",
+              padding: "10px 18px",
+              borderRadius: 10,
+              fontSize: 13.5,
+              boxShadow: "var(--shadow-menu)",
+              maxWidth: "90vw",
+            }}
           >
             <span className="flex-1 break-words">{t.message}</span>
             <button
               onClick={() => dismiss(t.id)}
-              className="text-text-dim hover:text-text-secondary cursor-pointer"
+              className="cursor-pointer opacity-70 hover:opacity-100"
               aria-label="Dismiss"
             >
               &times;
