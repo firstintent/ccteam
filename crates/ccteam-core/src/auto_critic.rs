@@ -32,6 +32,7 @@ pub enum Vendor {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
 /// Codex probe outcome — what Phase 3.5's `codex --version &&

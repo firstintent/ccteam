@@ -43,6 +43,9 @@ pub struct StreamJsonSpawnInput<'a> {
     pub model_id: Option<&'a str>,
     /// Per-session permission posture.
     pub permission_mode: PermissionMode,
+    /// Path to curated per-session `--mcp-config` JSON (only ccteam MCP).
+    /// `None` keeps historical strip-all behavior (`--strict-mcp-config` alone).
+    pub mcp_config_path: Option<&'a Path>,
 }
 
 /// Build the `claude` argv for a long-running stream-json session.
@@ -84,7 +87,8 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // never arrives → timeout. The chat-only adapter reads stdout directly
         // and needs no in-pane MCP, so strip them all (also drops unrelated
         // ambient servers like a VS Code extension that would only add init
-        // latency). Per-session curated MCP is a future enhancement.
+        // latency). When `mcp_config_path` is set, `--mcp-config` + this flag
+        // loads ONLY that curated file (ccteam MCP + per-session secret).
         "--strict-mcp-config".into(),
         // Include ALL three settings layers — crucially `local`
         // (`settings.local.json`), where a marketplace-enabled vendor plugin
@@ -101,6 +105,13 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // below.
         "--setting-sources=user,project,local".into(),
     ];
+
+    // Curated per-session MCP (v0.8.24 C1): only load this config under
+    // --strict-mcp-config (empty path = strip ambient, historical behavior).
+    if let Some(path) = input.mcp_config_path {
+        argv.push("--mcp-config".into());
+        argv.push(path.display().to_string());
+    }
 
     // Role persona (`--agent <role>`, omitted when roleless) + `--model`.
     // Shared with the tmux path via `claude_common`. `strip_1m = true`: the
@@ -269,6 +280,7 @@ mod tests {
             resume,
             model_id: None,
             permission_mode: PermissionMode::Skip,
+            mcp_config_path: None,
         }
     }
 
@@ -437,5 +449,26 @@ mod tests {
         // Different sid / slug → different uuid.
         assert_ne!(a1, deterministic_session_uuid("demo", "s2"));
         assert_ne!(a1, deterministic_session_uuid("other", "s1"));
+    }
+
+    #[test]
+    fn argv_includes_mcp_config_when_path_set() {
+        let path = PathBuf::from("/tmp/demo/.ccteam/chat/s1/mcp.json");
+        let mut inp = input("cto", "u-1", false);
+        inp.mcp_config_path = Some(path.as_path());
+        let argv = build_argv("claude", &inp);
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+        let i = argv
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present");
+        assert_eq!(argv[i + 1], path.display().to_string());
+    }
+
+    #[test]
+    fn argv_omits_mcp_config_when_none() {
+        let argv = build_argv("claude", &input("cto", "u-1", false));
+        assert!(!argv.iter().any(|a| a == "--mcp-config"));
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
     }
 }

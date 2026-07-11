@@ -252,6 +252,14 @@ pub struct Gateway {
     /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
     /// never held under the gateway's own mutex for longer than a map lookup.
     spawn_claims: Arc<SpawnClaims>,
+    /// v0.8.24 Track D — optional satellite agent proxy for remote-host
+    /// stdio spawn. `None` ⇒ production [`crate::remote_host::HttpRemoteHostProxy`].
+    remote_host_proxy: Option<std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>>,
+    /// v0.8.24 C2 — sid → answer tap for /compare (pump steals ANSWER).
+    compare_taps: std::collections::HashMap<
+        String,
+        tokio::sync::mpsc::UnboundedSender<crate::compare::CompareAnswer>,
+    >,
 }
 
 /// One structured step of session activity (v0.8.19). Carried by
@@ -708,10 +716,16 @@ struct NewSessionPlan {
     handle: String,
     permission_mode: PermissionMode,
     protocol: SessionProtocol,
+    /// v0.8.24 Track D — host axis (`local` or registered satellite id).
+    host: String,
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// v0.8.24 C2 — optional `/compare` group id written to session meta.
+    compare_group: Option<String>,
+    /// Override meta `trigger` (e.g. `"compare"`); None → derive from owner.
+    trigger_override: Option<String>,
 }
 
 /// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
@@ -915,6 +929,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/compare",
+        arg_hint: Some("<question>"),
+        help: "ask all available vendors the same question (roleless one-shot sessions)",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/help",
         arg_hint: None,
         help: "show gateway commands",
@@ -1016,6 +1036,8 @@ impl Gateway {
             model_warned: HashSet::new(),
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
+            remote_host_proxy: None,
+            compare_taps: std::collections::HashMap::new(),
         }
     }
 
@@ -1026,6 +1048,16 @@ impl Gateway {
     /// `request_im_reload` stays a safe no-op there.
     pub fn set_im_reload_trigger(&mut self, tx: tokio::sync::mpsc::Sender<()>) {
         self.im_reload_tx = Some(tx);
+    }
+
+    /// v0.8.24 Track D — install a remote-host proxy (tests use
+    /// [`crate::remote_host::FakeRemoteHostProxy`]; production leaves this
+    /// `None` and falls through to the HTTP probe default).
+    pub fn set_remote_host_proxy(
+        &mut self,
+        proxy: std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>,
+    ) {
+        self.remote_host_proxy = Some(proxy);
     }
 
     /// Signal the daemon to reload IM channels from `credentials.json`. Returns
@@ -1641,7 +1673,14 @@ impl Gateway {
             if let EnsureSessionOutcome::Spawn(plan) = outcome {
                 // The slow part — deliberately NO gateway lock held here.
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
-                gateway.lock().await.apply_new_session(*plan, thread)?;
+                let sid = {
+                    let mut g = gateway.lock().await;
+                    let outcome = g.apply_new_session(*plan, thread)?;
+                    let sid = outcome.id.clone();
+                    g.drain_and_dispatch_pending_turns(&sid).await;
+                    sid
+                };
+                let _ = sid;
             }
             // `_claim` (and thus the per-chat single-flight) releases here,
             // waking any waiter for this same chat.
@@ -1704,7 +1743,7 @@ impl Gateway {
                         }
                     }
                 }
-                if vendor == AgentVendor::Grok {
+                if vendor == AgentVendor::Grok || vendor == AgentVendor::Opencode {
                     protocol = SessionProtocol::Acp;
                 }
                 let project = self.current_project_for(chat);
@@ -1718,6 +1757,7 @@ impl Gateway {
                         handle,
                         permission_mode,
                         protocol,
+                        "local".to_string(),
                     )
                     .await?;
                 Ok(Some(Self::new_session_receipt(&outcome)))
@@ -2038,6 +2078,28 @@ impl Gateway {
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
             "/projects" => Ok(Some(self.render_projects())),
+            "/compare" => {
+                // Remainder after the command (question may contain spaces).
+                let mut it = trimmed.splitn(2, char::is_whitespace);
+                let _cmd = it.next();
+                let question = it.next().unwrap_or("").trim();
+                if question.is_empty() {
+                    return Err(anyhow!(
+                        "用法: /compare <问题>(并发问 claude/codex/grok/opencode)"
+                    ));
+                }
+                let project = self.current_project_for(chat);
+                let result = self
+                    .run_compare(
+                        chat.clone(),
+                        project,
+                        question.to_string(),
+                        crate::compare::default_compare_vendors(),
+                        crate::compare::DEFAULT_COMPARE_TIMEOUT,
+                    )
+                    .await?;
+                Ok(Some(crate::compare::render_compare_markdown(&result)))
+            }
             "/help" => Ok(Some(format!(
                 "📁 当前项目: {}\n\n{}",
                 self.current_project_for(chat),
@@ -2122,7 +2184,8 @@ impl Gateway {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
             EnsureSessionOutcome::Spawn(plan) => {
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
-                self.apply_new_session(*plan, thread)?;
+                let outcome = self.apply_new_session(*plan, thread)?;
+                self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
         }
@@ -2171,6 +2234,7 @@ impl Gateway {
                     PermissionMode::Skip,
                     // Template sessions default to the stream-json protocol.
                     SessionProtocol::StreamJson,
+                    "local".to_string(),
                 )?;
                 return Ok(EnsureSessionOutcome::Spawn(Box::new(plan)));
             }
@@ -2194,6 +2258,7 @@ impl Gateway {
             // v0.8.11 E2 — cto defaults to the stream-json protocol (a pure
             // chat role with no terminal needs).
             SessionProtocol::StreamJson,
+            "local".to_string(),
         )?;
         Ok(EnsureSessionOutcome::Spawn(Box::new(plan)))
     }
@@ -2261,6 +2326,7 @@ impl Gateway {
                 handle,
                 permission_mode,
                 protocol,
+                "local".to_string(),
             )
             .await?;
         let new_sid = outcome.id.clone();
@@ -2300,6 +2366,7 @@ impl Gateway {
             PermissionMode::Skip,
             // Template sessions default to the stream-json protocol.
             SessionProtocol::StreamJson,
+            "local".to_string(),
         )
         .await
         .map(|o| o.id)
@@ -2319,7 +2386,18 @@ impl Gateway {
         handle: String,
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
+        host: String,
     ) -> Result<StartOutcome> {
+        // v0.8.24 Track D — remote-host gate BEFORE minting a sid: offline /
+        // terminal-on-remote / unknown host all fail without creating a
+        // session (red line: never kill / never half-create).
+        let host = crate::remote_host::prepare_host_for_spawn(
+            self.project_paths.as_ref().map(|p| p.root.as_path()),
+            &host,
+            protocol,
+            self.remote_host_proxy.as_ref(),
+        )
+        .await?;
         // v0.8.x (concurrency review §4.1 P1) — split into plan (sync) / spawn
         // (the slow `start_thread` await) / apply (sync), same shape as the
         // meta-rebuild trio (`plan_session_rebuild` / `spawn_for_plan` /
@@ -2337,9 +2415,12 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
+            host,
         )?;
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
-        self.apply_new_session(plan, thread)
+        let outcome = self.apply_new_session(plan, thread)?;
+        self.drain_and_dispatch_pending_turns(&outcome.id).await;
+        Ok(outcome)
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — the sync half of `start_session`:
@@ -2357,6 +2438,7 @@ impl Gateway {
         handle: String,
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
+        host: String,
     ) -> Result<NewSessionPlan> {
         // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
         // pane/--name/turns/marker all key on `s<N>`, so one (project, role) can
@@ -2422,10 +2504,13 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
+            host,
             secret,
             cwd,
             model_id,
             adapter,
+            compare_group: None,
+            trigger_override: None,
         })
     }
 
@@ -2435,6 +2520,35 @@ impl Gateway {
     async fn spawn_for_new_session_plan(
         plan: &NewSessionPlan,
     ) -> Result<ThreadHandle, HarnessError> {
+        // v0.8.24 C1 — curated per-session MCP for Claude stream-json only.
+        // File path is well-known (chat/<sid>/mcp.json); the adapter attaches
+        // --mcp-config when the file exists. Best-effort: spawn still proceeds
+        // if write fails (session runs without in-agent ccteam tools).
+        if plan.vendor == AgentVendor::Claude
+            && plan.protocol == SessionProtocol::StreamJson
+            && !plan.secret.is_empty()
+        {
+            let bin = ccteam_core::current_ccteam_bin()
+                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
+            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
+                sid: &plan.id,
+                secret: &plan.secret,
+                role: &plan.role,
+                slug: &plan.project,
+                ccteam_bin: &bin,
+                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
+                http_url: None,
+            };
+            if let Err(e) =
+                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+            {
+                tracing::warn!(
+                    sid = %plan.id,
+                    error = %e,
+                    "curated mcp.json write failed; stream-json continues without MCP"
+                );
+            }
+        }
         plan.adapter
             .start_thread(
                 &AgentSpecBrief {
@@ -2471,10 +2585,13 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
+            host,
             secret,
             cwd: _,
             model_id,
             adapter,
+            compare_group,
+            trigger_override,
         } = plan;
         // Capture before the session insert moves these.
         let meta_vendor_uuid = thread
@@ -2485,6 +2602,8 @@ impl Gateway {
             .to_string();
         let meta_project = project.clone();
         let meta_role = role.clone();
+        let owner_channel = owner.channel.clone();
+        let owner_for_reply = owner.clone();
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -2499,7 +2618,7 @@ impl Gateway {
                 role,
                 vendor,
                 protocol,
-                host: "local".to_string(),
+                host: host.clone(),
                 permission_mode,
                 secret,
                 handle,
@@ -2507,7 +2626,7 @@ impl Gateway {
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(owner.clone())),
+                reply_to: Arc::new(std::sync::Mutex::new(owner_for_reply)),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
@@ -2543,6 +2662,20 @@ impl Gateway {
                     )
                 })
                 .unwrap_or((None, None));
+            // v0.8.24 F5 — surface attribution from owner channel
+            // (or explicit override, e.g. compare fan-out).
+            let trigger = if let Some(t) = trigger_override.as_deref() {
+                t.to_string()
+            } else {
+                let ch = owner_channel.as_str();
+                if ch == "web" || ch == "user" {
+                    "web".to_string()
+                } else if ch == "mcp" || ch == "session" {
+                    "mcp".to_string()
+                } else {
+                    "im".to_string()
+                }
+            };
             let meta = SessionMeta {
                 sid: id.clone(),
                 slug: meta_project.clone(),
@@ -2552,7 +2685,7 @@ impl Gateway {
                 permission_mode,
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
-                host: "local".to_string(),
+                host: host.clone(),
                 created_at: now.clone(),
                 last_active: now,
                 origin: SessionOrigin::Ccteam,
@@ -2564,6 +2697,8 @@ impl Gateway {
                 cost_usd: None,
                 role_sha,
                 skills_sha,
+                trigger: Some(trigger),
+                compare_group: compare_group.clone(),
             };
             if let Some(cwd) = self.projects.get(&meta_project) {
                 if let Err(e) = write_session_meta(cwd, &meta) {
@@ -2572,6 +2707,9 @@ impl Gateway {
             }
         }
         self.spawn_event_pump(&id);
+        // Pending-turn drain is async (re-enters submit_resolved); the
+        // async caller of apply_new_session must invoke
+        // `drain_and_dispatch_pending_turns` after this returns.
         Ok(StartOutcome {
             id,
             // Fresh spawn ran with exactly the requested posture.
@@ -2778,6 +2916,46 @@ impl Gateway {
         }
     }
 
+    /// v0.8.24 F5 — after a session becomes live, drain any cold-start
+    /// pending turns (FIFO) and re-submit them through the normal path.
+    async fn drain_and_dispatch_pending_turns(&mut self, session_id: &str) {
+        let (project, chat, owner) = {
+            let Some(session) = self.sessions.get(session_id) else {
+                return;
+            };
+            let chat = session
+                .reply_to
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_else(|| session.owner.clone());
+            (session.project.clone(), chat, session.owner.clone())
+        };
+        let _ = owner;
+        let Some(cwd) = self.projects.get(&project).cloned() else {
+            return;
+        };
+        let pending = match crate::pending_turns::drain_pending_turns(&cwd, session_id) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(sid = %session_id, error = %e, "drain pending_turns failed");
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        for turn in pending {
+            if let Err(e) = self.submit_resolved(&chat, session_id, "", turn.text).await {
+                tracing::warn!(
+                    sid = %session_id,
+                    error = %e,
+                    "dispatch pending turn failed"
+                );
+            }
+        }
+    }
+
     fn spawn_event_pump(&mut self, session_id: &str) {
         if self.event_pumps.contains_key(session_id) {
             return;
@@ -2810,6 +2988,9 @@ impl Gateway {
             .unwrap_or((None, None));
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
+        // v0.8.24 C2 — optional /compare tap: steal this sid's ANSWER off the
+        // IM stream (coordinator aggregates into one card).
+        let compare_tap = self.compare_taps.remove(&session_id);
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
         // detached pump can label out-of-band answers/errors (events from a
         // session that is no longer the chat's current focus).
@@ -3144,6 +3325,22 @@ impl Gateway {
                                     session.vendor,
                                     progress_path.as_deref(),
                                 );
+                            }
+                            // v0.8.24 C2 — compare coordinator tap: deliver answer
+                            // and SKIP user-level Answer emit (aggregated card
+                            // comes from run_compare). turns.jsonl already wrote.
+                            if let Some(ref tap) = compare_tap {
+                                let cost_usd = project_dir
+                                    .as_ref()
+                                    .and_then(|dir| read_session_meta(dir, &session_id).ok())
+                                    .and_then(|m| m.cost_usd);
+                                let _ = tap.send(crate::compare::CompareAnswer {
+                                    sid: session_id.clone(),
+                                    vendor: session.vendor,
+                                    text: text.clone(),
+                                    cost_usd,
+                                });
+                                continue;
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
                             // fallback, same as pump_target) and reuse it for the
@@ -3762,6 +3959,9 @@ impl Gateway {
             old.abort();
         }
         self.spawn_event_pump(&session_id);
+        // Note: do NOT drain pending turns here — apply_resume is often
+        // called from inside submit_resolved (ThreadDied retry). Draining
+        // would recurse. Fresh-start path drains after spawn_event_pump.
         tracing::info!(
             session_id = %session_id,
             project = %project,
@@ -5143,6 +5343,8 @@ impl Gateway {
             // Roleless adoption → no role file; still snapshot project skills.
             role_sha: None,
             skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
+            trigger: None,
+            compare_group: None,
         };
         // v0.8.22 P1 — adopt the vendor's own title (if any) as the session's
         // starting title. `TitleSource::Vendor` still yields to a later
@@ -5233,6 +5435,22 @@ impl Gateway {
                 && !s.secret.is_empty()
                 && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret)
         })
+    }
+
+    /// v0.8.24 C1 — for curated MCP HTTP bearer `ccteam-sid:<sid>:<secret>`:
+    /// return `(role, true)` when the live session's secret matches.
+    pub fn session_role_if_secret_matches(
+        &self,
+        sid: &str,
+        presented_secret: &str,
+    ) -> Option<(String, bool)> {
+        if presented_secret.is_empty() {
+            return None;
+        }
+        let s = self.sessions.get(sid)?;
+        let ok =
+            !s.secret.is_empty() && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret);
+        Some((s.role.clone(), ok))
     }
 
     /// v0.8.8 F1 — confirm a HITL-firing `sid` maps to a live tracked session,
@@ -5330,6 +5548,33 @@ impl Gateway {
         protocol: SessionProtocol,
         owner_id: String,
     ) -> Result<CreateSessionOutcome> {
+        self.create_session_api_on_host(
+            project,
+            role,
+            vendor,
+            permission_mode,
+            protocol,
+            owner_id,
+            "local".to_string(),
+        )
+        .await
+    }
+
+    /// v0.8.24 Track D — like [`Self::create_session_api_proto`] with an
+    /// explicit `host` (`local` or a registered satellite id). Remote hosts
+    /// are gated (online + stdio-only); offline returns a readable error and
+    /// does **not** create a session.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_api_on_host(
+        &mut self,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+        owner_id: String,
+        host: String,
+    ) -> Result<CreateSessionOutcome> {
         // v0.8.20 web↔IM convergence — a web session is OWNED by the caller's
         // identity (`user:<tenant>`, or `user:web-api` for the admin/owner): we
         // pass the web frontend chat (channel "web") here as `reply_to`, and
@@ -5349,6 +5594,7 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
+            host,
         )
         .await
         .map(|o| CreateSessionOutcome {
@@ -5386,6 +5632,178 @@ impl Gateway {
                 Ok(format!("directive:{sid}"))
             }
         }
+    }
+
+    /// v0.8.24 C2 — multi-vendor compare: roleless one-shot sessions, same
+    /// prompt, wait up to `timeout` (default 300s), return aggregated result
+    /// with real sids + cost subtotal. Partial failures are labeled, not fatal.
+    async fn run_compare(
+        &mut self,
+        owner: ChatKey,
+        project: String,
+        prompt: String,
+        vendors: Vec<AgentVendor>,
+        timeout: std::time::Duration,
+    ) -> Result<crate::compare::CompareResult> {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(anyhow!("compare prompt must not be empty"));
+        }
+        let vendors = if vendors.is_empty() {
+            crate::compare::default_compare_vendors()
+        } else {
+            vendors
+        };
+        let compare_group = crate::compare::mint_compare_group();
+        let title_snip = {
+            let chars: Vec<char> = prompt.chars().take(40).collect();
+            let s: String = chars.into_iter().collect();
+            format!("compare: {s}")
+        };
+
+        // Ensure event pump can start (compare taps live in the pump).
+        // When no sink is wired (some unit tests), register a throwaway
+        // consumer so the channel stays open for the duration.
+        if self.event_sink.is_none() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            self.set_event_sink(tx);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        }
+
+        let mut slots_meta: Vec<(
+            AgentVendor,
+            String,
+            tokio::sync::mpsc::UnboundedReceiver<crate::compare::CompareAnswer>,
+        )> = Vec::new();
+        let mut spawn_errors: Vec<(AgentVendor, String)> = Vec::new();
+
+        for vendor in vendors {
+            let protocol = crate::compare::protocol_for_vendor(vendor);
+            let plan = match self.plan_new_session(
+                owner.clone(),
+                project.clone(),
+                vendor,
+                String::new(), // roleless
+                String::new(),
+                PermissionMode::Skip,
+                protocol,
+                "local".to_string(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    spawn_errors.push((vendor, e.to_string()));
+                    continue;
+                }
+            };
+            let mut plan = plan;
+            plan.compare_group = Some(compare_group.clone());
+            plan.trigger_override = Some("compare".into());
+            let sid = plan.id.clone();
+            let (tap_tx, tap_rx) = tokio::sync::mpsc::unbounded_channel();
+            self.compare_taps.insert(sid.clone(), tap_tx);
+            match Self::spawn_for_new_session_plan(&plan).await {
+                Ok(thread) => {
+                    if let Err(e) = self.apply_new_session(plan, thread) {
+                        self.compare_taps.remove(&sid);
+                        spawn_errors.push((vendor, e.to_string()));
+                        continue;
+                    }
+                    // Best-effort auto title so /sessions shows the question.
+                    if let Some(cwd) = self.projects.get(&project).cloned() {
+                        if let Ok(mut meta) = read_session_meta(&cwd, &sid) {
+                            let _ = apply_title(&mut meta, title_snip.clone(), TitleSource::Auto);
+                            let _ = write_session_meta(&cwd, &meta);
+                        }
+                    }
+                    if let Err(e) = self.submit_resolved(&owner, &sid, "", prompt.clone()).await {
+                        spawn_errors.push((vendor, format!("submit failed: {e}")));
+                        // keep session + wait may still yield nothing
+                    }
+                    slots_meta.push((vendor, sid, tap_rx));
+                }
+                Err(e) => {
+                    self.compare_taps.remove(&sid);
+                    spawn_errors.push((vendor, e.to_string()));
+                }
+            }
+        }
+
+        // Collect answers with timeout.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut slots: Vec<crate::compare::CompareSlot> = Vec::new();
+
+        for (vendor, sid, mut rx) in slots_meta {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let got = tokio::time::timeout(remaining, rx.recv()).await;
+            match got {
+                Ok(Some(ans)) => {
+                    slots.push(crate::compare::CompareSlot {
+                        vendor: crate::compare::vendor_label(vendor).to_string(),
+                        sid,
+                        answer: ans.text,
+                        cost_usd: ans.cost_usd,
+                        status: "ok".into(),
+                        error: None,
+                    });
+                }
+                Ok(None) => {
+                    slots.push(crate::compare::CompareSlot {
+                        vendor: crate::compare::vendor_label(vendor).to_string(),
+                        sid,
+                        answer: String::new(),
+                        cost_usd: None,
+                        status: "error".into(),
+                        error: Some("answer channel closed".into()),
+                    });
+                }
+                Err(_) => {
+                    // drop tap registration if still present
+                    self.compare_taps.remove(&sid);
+                    slots.push(crate::compare::CompareSlot {
+                        vendor: crate::compare::vendor_label(vendor).to_string(),
+                        sid,
+                        answer: String::new(),
+                        cost_usd: None,
+                        status: "timeout".into(),
+                        error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    });
+                }
+            }
+        }
+
+        for (vendor, err) in spawn_errors {
+            slots.push(crate::compare::CompareSlot {
+                vendor: crate::compare::vendor_label(vendor).to_string(),
+                sid: String::new(),
+                answer: String::new(),
+                cost_usd: None,
+                status: "error".into(),
+                error: Some(err),
+            });
+        }
+
+        let cost_subtotal_usd = crate::compare::cost_subtotal(&slots);
+        Ok(crate::compare::CompareResult {
+            compare_group,
+            prompt,
+            slots,
+            cost_subtotal_usd,
+            timeout_secs: timeout.as_secs(),
+        })
+    }
+
+    /// Web/REST entry for [`Self::run_compare`] (ChatKey is private).
+    pub async fn run_compare_for_web(
+        &mut self,
+        owner_id: String,
+        project: String,
+        prompt: String,
+        vendors: Vec<AgentVendor>,
+        timeout: std::time::Duration,
+    ) -> Result<crate::compare::CompareResult> {
+        let owner = ChatKey::new("web", &owner_id, &owner_id);
+        self.run_compare(owner, project, prompt, vendors, timeout)
+            .await
     }
 
     /// Deliver one synchronous directive receipt to a web session's SSE stream
@@ -5554,6 +5972,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Claude => "claude",
         AgentVendor::Codex => "codex",
         AgentVendor::Grok => "grok",
+        AgentVendor::Opencode => "opencode",
     }
 }
 
@@ -6407,6 +6826,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "claude" => Ok(AgentVendor::Claude),
         "codex" => Ok(AgentVendor::Codex),
         "grok" => Ok(AgentVendor::Grok),
+        "opencode" => Ok(AgentVendor::Opencode),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -7702,6 +8122,88 @@ mod tests {
         assert!(
             envs.contains(&sec1) && envs.contains(&sec2),
             "both minted secrets must have been injected into the spawn ctx: {envs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_compare_fans_out_roleless_sessions_and_aggregates() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gw = Gateway::new(fake.clone(), "demo", tmp.path());
+        let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_event_sink(tx);
+        // Single-vendor compare via explicit list (factory is one fake for all).
+        let result = gw
+            .run_compare(
+                ChatKey::new("web", "u1", "u1"),
+                "demo".into(),
+                "why is this flaky?".into(),
+                vec![AgentVendor::Claude, AgentVendor::Codex],
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("compare ok");
+        assert_eq!(result.slots.len(), 2, "{result:?}");
+        assert!(
+            result
+                .slots
+                .iter()
+                .all(|s| !s.sid.is_empty() || s.status == "error"),
+            "sids present or error: {result:?}"
+        );
+        // At least the first vendor should succeed with FakeAdapter echo.
+        let ok = result.slots.iter().filter(|s| s.status == "ok").count();
+        assert!(ok >= 1, "expected at least one ok slot: {result:?}");
+        // meta has compare_group
+        let sid = result
+            .slots
+            .iter()
+            .find(|s| s.status == "ok")
+            .unwrap()
+            .sid
+            .clone();
+        let meta = read_session_meta(tmp.path(), &sid).unwrap();
+        assert_eq!(
+            meta.compare_group.as_deref(),
+            Some(result.compare_group.as_str())
+        );
+        assert_eq!(meta.trigger.as_deref(), Some("compare"));
+        assert!(meta.role.is_empty(), "roleless");
+    }
+
+    #[tokio::test]
+    async fn curated_mcp_json_written_on_claude_stream_json_spawn() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gw = Gateway::new(fake.clone(), "demo", tmp.path());
+        let sid = gw
+            .create_session_api(
+                "demo".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let mcp_path =
+            ccteam_harness::execution::mcp_config::session_mcp_config_path(tmp.path(), &sid);
+        assert!(
+            mcp_path.exists(),
+            "expected curated mcp.json at {}",
+            mcp_path.display()
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        assert!(body["mcpServers"]["ccteam"].is_object());
+        // HTTP form by default
+        assert_eq!(body["mcpServers"]["ccteam"]["type"], "http");
+        let auth = body["mcpServers"]["ccteam"]["headers"]["Authorization"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            auth.starts_with(&format!("Bearer ccteam-sid:{sid}:")),
+            "auth={auth}"
         );
     }
 
@@ -9842,6 +10344,8 @@ mod tests {
             cost_usd: None,
             role_sha: None,
             skills_sha: None,
+            trigger: None,
+            compare_group: None,
         };
         write_session_meta(alpha_dir.path(), &meta).unwrap();
 
@@ -10355,6 +10859,7 @@ mod tests {
                         AgentVendor::Claude => claude.clone(),
                         AgentVendor::Codex => codex.clone(),
                         AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
+                        AgentVendor::Opencode => codex.clone(),
                     }
                 },
             )
@@ -10445,6 +10950,7 @@ mod tests {
                         AgentVendor::Claude => claude.clone(),
                         AgentVendor::Codex => codex.clone(),
                         AgentVendor::Grok => codex.clone(),
+                        AgentVendor::Opencode => codex.clone(),
                     }
                 },
             )

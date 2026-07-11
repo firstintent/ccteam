@@ -121,7 +121,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
-        (name = "hosts", description = "Host-keyed agent report (per machine: hostname/specs + per-vendor install/MCP status; register-mcp is the only write)"),
+        (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join/heartbeat; register-mcp; admin-only list)"),
         (name = "users", description = "档1 per-user web tenant management (admin-gated; web-first, no CLI — mint personal links, list, delete)"),
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
         (name = "projects", description = "Project lifecycle + detail"),
@@ -146,6 +146,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
         .routes(routes!(super::hosts::handle_register_mcp))
+        // v0.8.24 Track D — multi-host join / heartbeat / mint
+        .routes(routes!(super::hosts::handle_mint_join_token))
+        .routes(routes!(super::hosts::handle_host_join))
+        .routes(routes!(super::hosts::handle_host_heartbeat))
         // v0.8.18 档1 — per-user web tenant management (admin-gated)
         .routes(routes!(
             super::users::handle_create_user,
@@ -194,6 +198,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_list_sessions,
             super::sessions_api::handle_create_session
         ))
+        .routes(routes!(super::compare::handle_compare))
+        .routes(routes!(super::evolution::handle_evolution))
         // v0.8.22 P1 — GET history + PATCH rename share `/api/v1/sessions/{sid}`.
         .routes(routes!(
             super::sessions_api::handle_session_history,

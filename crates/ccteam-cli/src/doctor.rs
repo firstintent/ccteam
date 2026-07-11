@@ -103,6 +103,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let claude = check_claude_binary();
     let codex = check_codex_binary();
     let grok = check_grok_binary();
+    let opencode = check_opencode_binary();
     let codex_present = codex.status == CheckStatus::Pass;
     let tmux = check_tmux();
     let mcp_claude = check_mcp_claude();
@@ -110,9 +111,26 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let daemon = check_daemon(paths);
     let pricing = check_pricing();
     let home = check_home_layout(paths);
+    let auth_claude = check_vendor_auth_claude();
+    let auth_codex = check_vendor_auth_codex();
+    let auth_grok = check_vendor_auth_grok();
+    let auth_opencode = check_vendor_auth_opencode();
 
     let checks = [
-        claude, codex, grok, tmux, mcp_claude, mcp_codex, daemon, pricing, home,
+        claude,
+        codex,
+        grok,
+        opencode,
+        tmux,
+        mcp_claude,
+        mcp_codex,
+        daemon,
+        pricing,
+        home,
+        auth_claude,
+        auth_codex,
+        auth_grok,
+        auth_opencode,
     ];
 
     let mut pass = 0usize;
@@ -190,6 +208,17 @@ fn check_grok_binary() -> CheckLine {
     )
 }
 
+/// opencode is optional (v0.8.24 fourth vendor) — missing binary WARNs only.
+fn check_opencode_binary() -> CheckLine {
+    probe_binary(
+        "opencode binary",
+        ccteam_core::OPENCODE_BIN_ENV,
+        "opencode",
+        CheckStatus::Warn,
+        "install the OpenCode CLI (optional), or point",
+    )
+}
+
 /// Shared `<bin> --version` probe. `missing_status` lets the two callers
 /// above pick FAIL (claude, required) vs WARN (codex, optional) for the
 /// same "binary not resolvable" outcome.
@@ -216,6 +245,102 @@ fn probe_binary(
             name,
             format!("`{bin}` not resolvable ({err}) — {fix_hint} {env_var} at its path"),
         ),
+    }
+}
+
+/// v0.8.24 F5 — per-vendor auth status at WARN level (missing credentials).
+fn check_vendor_auth_claude() -> CheckLine {
+    // Claude Code stores OAuth/API key under ~/.claude or CLAUDE_CONFIG_HOME.
+    let home = std::env::var("CLAUDE_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let ok = home
+        .as_ref()
+        .map(|h| {
+            h.join(".credentials.json").exists()
+                || h.join("credentials.json").exists()
+                || std::env::var("ANTHROPIC_API_KEY").is_ok()
+        })
+        .unwrap_or_else(|| std::env::var("ANTHROPIC_API_KEY").is_ok());
+    if ok {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "claude auth",
+            "credentials present (file or ANTHROPIC_API_KEY)",
+        )
+    } else {
+        CheckLine::new(
+            CheckStatus::Warn,
+            "claude auth",
+            "no credentials found — run `claude auth login` or set ANTHROPIC_API_KEY",
+        )
+    }
+}
+
+fn check_vendor_auth_codex() -> CheckLine {
+    let home = dirs::home_dir().map(|h| h.join(".codex"));
+    let ok = home
+        .as_ref()
+        .map(|h| h.join("auth.json").exists() || h.join("config.toml").exists())
+        .unwrap_or(false)
+        || std::env::var("OPENAI_API_KEY").is_ok();
+    if ok {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "codex auth",
+            "credentials present (file or OPENAI_API_KEY)",
+        )
+    } else {
+        CheckLine::new(
+            CheckStatus::Warn,
+            "codex auth",
+            "no credentials found — run `codex login` or set OPENAI_API_KEY",
+        )
+    }
+}
+
+fn check_vendor_auth_grok() -> CheckLine {
+    let ok = std::env::var("XAI_API_KEY").is_ok()
+        || dirs::home_dir()
+            .map(|h| h.join(".grok").exists() || h.join(".config/grok").exists())
+            .unwrap_or(false);
+    if ok {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "grok auth",
+            "credentials present (env or config dir)",
+        )
+    } else {
+        CheckLine::new(
+            CheckStatus::Warn,
+            "grok auth",
+            "no credentials found — set XAI_API_KEY or log in via grok CLI",
+        )
+    }
+}
+
+fn check_vendor_auth_opencode() -> CheckLine {
+    let ok = std::env::var("OPENAI_API_KEY").is_ok()
+        || dirs::home_dir()
+            .map(|h| {
+                h.join(".local/share/opencode").exists()
+                    || h.join(".config/opencode").exists()
+                    || h.join(".opencode").exists()
+            })
+            .unwrap_or(false);
+    if ok {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "opencode auth",
+            "credentials present (provider config or env)",
+        )
+    } else {
+        CheckLine::new(
+            CheckStatus::Warn,
+            "opencode auth",
+            "no credentials found — run `opencode auth login` for a provider",
+        )
     }
 }
 
@@ -326,7 +451,7 @@ fn check_pricing() -> CheckLine {
     const WARN_DAYS: i64 = 180;
     let today = chrono::Utc::now().date_naive();
     let mut worst: Option<i64> = None;
-    for vendor in [Vendor::Claude, Vendor::Codex] {
+    for &vendor in Vendor::ALL {
         let raw = ccteam_core::pricing_schema_version_for(vendor);
         if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
             let age = (today - d).num_days();

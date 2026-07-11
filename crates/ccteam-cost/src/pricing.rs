@@ -70,6 +70,19 @@ pub enum Vendor {
     Claude,
     Codex,
     Grok,
+    /// OpenCode ACP — no static price table; cost is vendor-reported USD only.
+    Opencode,
+}
+
+impl Vendor {
+    /// Every known pricing vendor — single source of truth for iteration.
+    /// Prefer `for v in Vendor::ALL` over listing arms at call sites.
+    pub const ALL: &'static [Vendor] = &[
+        Vendor::Claude,
+        Vendor::Codex,
+        Vendor::Grok,
+        Vendor::Opencode,
+    ];
 }
 
 /// Dual-vendor token usage shape — unified across Claude + Codex.
@@ -95,6 +108,11 @@ pub struct UnifiedTokenUsage {
     /// output rate (o-series). `None` for Claude.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
+    /// Vendor-reported USD for this turn (OpenCode `usage_update` delta).
+    /// When set (and > 0), preferred over [`estimate_cost`]. Zero/missing
+    /// means "—" for OpenCode — never fall back to another vendor's table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
 }
 
 impl UnifiedTokenUsage {
@@ -138,23 +156,41 @@ static ANTHROPIC_TABLE: OnceLock<PricingTable> = OnceLock::new();
 static OPENAI_TABLE: OnceLock<PricingTable> = OnceLock::new();
 static XAI_TABLE: OnceLock<PricingTable> = OnceLock::new();
 
-fn table_for(vendor: Vendor) -> &'static PricingTable {
+fn table_for(vendor: Vendor) -> Option<&'static PricingTable> {
     match vendor {
-        Vendor::Claude => ANTHROPIC_TABLE.get_or_init(|| {
+        Vendor::Claude => Some(ANTHROPIC_TABLE.get_or_init(|| {
             toml::from_str(ANTHROPIC_TOML)
                 .expect("ccteam anthropic.toml embedded at compile time must parse")
-        }),
-        Vendor::Codex => OPENAI_TABLE.get_or_init(|| {
+        })),
+        Vendor::Codex => Some(OPENAI_TABLE.get_or_init(|| {
             toml::from_str(OPENAI_TOML)
                 .expect("ccteam openai.toml embedded at compile time must parse")
-        }),
-        Vendor::Grok => XAI_TABLE.get_or_init(|| {
+        })),
+        Vendor::Grok => Some(XAI_TABLE.get_or_init(|| {
             toml::from_str(XAI_TOML).expect("ccteam xai.toml embedded at compile time must parse")
-        }),
+        })),
+        // OpenCode: never use a static table; cost is reported_cost_usd only.
+        Vendor::Opencode => None,
     }
 }
 
-/// Compute the dollar cost of one usage block.
+/// Prefer vendor-reported USD (when > 0), else fall back to the price table.
+/// OpenCode has no table — only non-zero `reported_cost_usd` produces a value
+/// (zero/missing → `None` → UI "—").
+pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
+    if let Some(c) = usage.reported_cost_usd {
+        if c > 0.0 {
+            return Some(c);
+        }
+        // Reported zero: honest "—" for OpenCode; other vendors may still estimate.
+        if matches!(vendor, Vendor::Opencode) {
+            return None;
+        }
+    }
+    estimate_cost(usage, vendor, model)
+}
+
+/// Compute the dollar cost of one usage block from the static price table.
 ///
 /// Returns `None` when `model` (after stripping the optional `[1m]`
 /// 1M-context suffix Anthropic attaches) is **not** a key in the vendor
@@ -163,7 +199,11 @@ fn table_for(vendor: Vendor) -> &'static PricingTable {
 /// id surfaces in the logs; the caller renders the absent cost as "—" /
 /// excludes it from a sum. The matcher is permissive only on the `[1m]`
 /// suffix (so `claude-opus-4-8[1m]` resolves to `claude-opus-4-8`).
+/// OpenCode always returns `None` (no table).
 pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
+    if matches!(vendor, Vendor::Opencode) {
+        return None;
+    }
     let prices = resolve(vendor, model)?;
     let from_input = usage.input_tokens as f64 * prices.input_per_1m;
     let from_cached = usage.cached_input_tokens as f64 * prices.cached_input_per_1m;
@@ -193,8 +233,12 @@ pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> 
 /// `ccteam doctor --check-pricing-version` to surface a staleness WARN
 /// when the in-binary tables outrun their useful life.
 pub fn pricing_schema_version() -> &'static str {
-    let a = table_for(Vendor::Claude).schema_version.as_str();
-    let o = table_for(Vendor::Codex).schema_version.as_str();
+    let a = table_for(Vendor::Claude)
+        .map(|t| t.schema_version.as_str())
+        .unwrap_or("");
+    let o = table_for(Vendor::Codex)
+        .map(|t| t.schema_version.as_str())
+        .unwrap_or("");
     // Lexicographic compare works for YYYY-MM-DD; pick the newer.
     if o > a {
         o
@@ -206,7 +250,9 @@ pub fn pricing_schema_version() -> &'static str {
 /// Per-vendor `schema_version`. Lets `doctor` print both rows when
 /// emitting staleness diagnostics.
 pub fn pricing_schema_version_for(vendor: Vendor) -> &'static str {
-    table_for(vendor).schema_version.as_str()
+    table_for(vendor)
+        .map(|t| t.schema_version.as_str())
+        .unwrap_or("n/a")
 }
 
 /// Look up `model` in the vendor table. Strips the `[1m]` suffix and
@@ -214,7 +260,7 @@ pub fn pricing_schema_version_for(vendor: Vendor) -> &'static str {
 /// to another model's rate.
 fn resolve(vendor: Vendor, model: &str) -> Option<ModelPrices> {
     let normalized = normalize_model_id(model);
-    let tbl = table_for(vendor);
+    let tbl = table_for(vendor)?;
     if let Some(p) = tbl.models.get(&normalized) {
         return Some(*p);
     }
@@ -455,6 +501,7 @@ mod tests {
             output_tokens: 200,
             cache_creation_input_tokens: Some(25),
             reasoning_output_tokens: Some(75),
+            reported_cost_usd: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: UnifiedTokenUsage = serde_json::from_str(&json).expect("deserialize");
@@ -500,6 +547,7 @@ mod tests {
             output_tokens: 4,
             cache_creation_input_tokens: Some(8),
             reasoning_output_tokens: Some(16),
+            reported_cost_usd: None,
         };
         assert_eq!(u.total(), 1 + 2 + 4 + 8 + 16);
     }

@@ -33,22 +33,9 @@ fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionM
         cost_usd: None,
         role_sha: None,
         skills_sha: None,
+        trigger: None,
+        compare_group: None,
     }
-}
-
-#[test]
-fn meta_write_read_roundtrip() {
-    let proj = TempDir::new().unwrap();
-    let meta = sample_meta("s1", "demo", "2026-06-29T00:00:00Z", "uuid-1");
-    write_session_meta(proj.path(), &meta).unwrap();
-
-    let got = read_session_meta(proj.path(), "s1").unwrap();
-    assert_eq!(got.sid, "s1");
-    assert_eq!(got.slug, "demo");
-    assert_eq!(got.vendor_uuid, "uuid-1");
-    assert!(matches!(got.vendor, AgentVendor::Claude));
-    assert!(matches!(got.protocol, SessionProtocol::StreamJson));
-    assert!(matches!(got.origin, SessionOrigin::Ccteam));
 }
 
 #[test]

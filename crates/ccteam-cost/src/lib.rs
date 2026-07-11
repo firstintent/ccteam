@@ -33,6 +33,6 @@ pub use budget::{
 };
 pub use level::{classify, CostLevel, COST_MID_WARN_USD};
 pub use pricing::{
-    estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,
-    UnifiedTokenUsage, Vendor,
+    estimate_cost, pricing_schema_version, pricing_schema_version_for, resolve_turn_cost,
+    ModelPrices, UnifiedTokenUsage, Vendor,
 };

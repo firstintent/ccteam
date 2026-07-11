@@ -73,6 +73,10 @@ pub const CODEX_BIN_ENV: &str = "CCTEAM_CODEX_BIN";
 /// network / grok login).
 pub const GROK_BIN_ENV: &str = "CCTEAM_GROK_BIN";
 
+/// Environment override for the `opencode` binary path. Tests set this
+/// to the hermetic fake (`tests/fixtures/opencode_acp/fake_opencode_acp.py`).
+pub const OPENCODE_BIN_ENV: &str = "CCTEAM_OPENCODE_BIN";
+
 /// Environment override for the global ccteam root. Harness-owned
 /// adapters use this for per-session state sidecars without depending
 /// on `ccteam-core::paths::CcteamPaths`.
@@ -112,14 +116,25 @@ pub enum AgentVendor {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
 impl AgentVendor {
+    /// Every known harness vendor — single source of truth for iteration.
+    /// Prefer `for v in AgentVendor::ALL` over listing arms at call sites.
+    pub const ALL: &'static [AgentVendor] = &[
+        AgentVendor::Claude,
+        AgentVendor::Codex,
+        AgentVendor::Grok,
+        AgentVendor::Opencode,
+    ];
+
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
         match self {
             AgentVendor::Claude => ccteam_cost::Vendor::Claude,
             AgentVendor::Codex => ccteam_cost::Vendor::Codex,
             AgentVendor::Grok => ccteam_cost::Vendor::Grok,
+            AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
         }
     }
 }
@@ -1083,6 +1098,7 @@ impl SessionHandle {
             },
             AgentVendor::Codex => "codex",
             AgentVendor::Grok => "grok",
+            AgentVendor::Opencode => "opencode",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

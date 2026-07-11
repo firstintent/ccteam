@@ -1,5 +1,6 @@
 //! Execution support modules shared by concrete harness adapters.
 //!
+pub mod acp;
 pub mod claude_bg;
 pub mod claude_common;
 pub mod claude_stream_json;
@@ -11,6 +12,8 @@ pub mod codex_typed_events;
 pub mod experience;
 pub mod fs_atomic;
 pub mod grok_acp;
+pub mod mcp_config;
+pub mod opencode_acp;
 pub mod process_inspect;
 pub mod progress_bridge;
 pub mod session_meta;
@@ -25,3 +28,4 @@ pub use claude_tui::ClaudeTuiAdapter;
 pub use codex_app_server::CodexAppServerAdapter;
 pub use codex_exec::CodexExecAdapter;
 pub use grok_acp::GrokAcpAdapter;
+pub use opencode_acp::OpencodeAcpAdapter;

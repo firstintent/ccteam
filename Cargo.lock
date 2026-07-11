@@ -382,6 +382,7 @@ dependencies = [
  "dirs",
  "futures",
  "libc",
+ "reqwest",
  "rmux-client",
  "rmux-proto",
  "serde_json",

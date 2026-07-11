@@ -310,6 +310,7 @@ fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
     match vendor.trim().to_ascii_lowercase().as_str() {
         "codex" => ccteam_cost::Vendor::Codex,
         "grok" => ccteam_cost::Vendor::Grok,
+        "opencode" => ccteam_cost::Vendor::Opencode,
         _ => ccteam_cost::Vendor::Claude,
     }
 }
@@ -351,6 +352,7 @@ mod tests {
         assert_eq!(vendor_from_str("claude"), ccteam_cost::Vendor::Claude);
         assert_eq!(vendor_from_str("Codex"), ccteam_cost::Vendor::Codex);
         assert_eq!(vendor_from_str("grok"), ccteam_cost::Vendor::Grok);
+        assert_eq!(vendor_from_str("opencode"), ccteam_cost::Vendor::Opencode);
         assert_eq!(vendor_from_str("weird"), ccteam_cost::Vendor::Claude);
     }
 

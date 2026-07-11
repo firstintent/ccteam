@@ -54,7 +54,7 @@ pub use adapter::{
     SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
     ThreadItemDetails, ThreadStatus, TurnId, TurnInput, UnifiedTokenUsage, CCTEAM_HOME_ENV,
     CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -65,6 +65,7 @@ pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT
 pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};
+pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
 pub use execution::session_meta::{
     apply_title, discover_external_claude_sessions, list_session_metas, read_session_meta,
     touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,

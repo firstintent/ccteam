@@ -371,6 +371,7 @@ pub enum HarnessKind {
     Codex,
     /// xAI Grok Build CLI via ACP stdio (`GrokAcpAdapter`).
     Grok,
+    Opencode,
 }
 
 /// `team.yaml` — the team-level config. M3.1 shipped name /

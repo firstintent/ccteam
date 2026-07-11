@@ -280,6 +280,34 @@ pub fn resolve_identity(bare: &str, admin_hex: &str, tenants_path: &Path) -> Opt
         .map(|t| Identity::tenant(t.id.clone()))
 }
 
+/// v0.8.24 Track D — resolve a join-token or satellite agent-token to a
+/// non-admin identity. Join tokens map to `host-join` (only useful for
+/// `POST /hosts/join`); agent tokens map to `host:<id>` (heartbeat).
+pub fn resolve_host_token(bare: &str, ccteam_root: &Path) -> Option<Identity> {
+    use ccteam_core::host_registry::{
+        join_tokens_path_in, registry_path_in, HostRegistry, JoinTokenStore,
+    };
+    let tok_path = join_tokens_path_in(ccteam_root);
+    if let Ok(store) = JoinTokenStore::load(&tok_path) {
+        if store.contains_valid(bare) {
+            return Some(Identity {
+                id: "host-join".to_string(),
+                is_admin: false,
+            });
+        }
+    }
+    let reg_path = registry_path_in(ccteam_root);
+    if let Ok(reg) = HostRegistry::load(&reg_path) {
+        if let Some(h) = reg.by_agent_token(bare) {
+            return Some(Identity {
+                id: format!("host:{}", h.id),
+                is_admin: false,
+            });
+        }
+    }
+    None
+}
+
 /// Decide whether a `SocketAddr` is loopback (auth defaults off) or
 /// non-loopback (auth defaults on).
 pub fn is_loopback(addr: &SocketAddr) -> bool {
@@ -432,6 +460,16 @@ pub async fn auth_layer(
             if let Some(bare) = bare_hex(presented) {
                 if let Some(id) = resolve_identity(bare, expected, &tenants) {
                     // Own the token before the &mut borrow (it borrows req.headers).
+                    let presented = presented.to_string();
+                    req.extensions_mut().insert(id);
+                    req.extensions_mut().insert(PresentedToken(presented));
+                    return next.run(req).await;
+                }
+                // v0.8.24 Track D — join-token / satellite agent-token may
+                // authenticate only the host-join + heartbeat surfaces (not
+                // admin). Identity is NOT admin so deny_non_admin still gates
+                // list/mint/register-mcp.
+                if let Some(id) = resolve_host_token(bare, &app.paths.root) {
                     let presented = presented.to_string();
                     req.extensions_mut().insert(id);
                     req.extensions_mut().insert(PresentedToken(presented));

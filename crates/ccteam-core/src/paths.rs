@@ -236,6 +236,22 @@ impl CcteamPaths {
         self.state_dir().join("harness")
     }
 
+    /// `~/.ccteam/state/hosts/` — v0.8.24 multi-host registry (registered
+    /// satellites + satellite-side `self.json` after `ccteam host join`).
+    pub fn hosts_dir(&self) -> PathBuf {
+        self.state_dir().join("hosts")
+    }
+
+    /// `~/.ccteam/state/hosts/registry.json` — main-daemon host registry SoT.
+    pub fn host_registry_path(&self) -> PathBuf {
+        self.hosts_dir().join("registry.json")
+    }
+
+    /// `~/.ccteam/secrets/host-join-tokens.json` — admin-minted join tokens.
+    pub fn host_join_tokens_path(&self) -> PathBuf {
+        self.secrets_dir().join("host-join-tokens.json")
+    }
+
     /// `~/.ccteam/teams-progress.jsonl` — V0.5.0 F95 global progress
     /// stream for Anthropic Agent Teams events (`team_member_joined`
     /// / `team_member_left` / `team_message_sent` / `team_task_created`

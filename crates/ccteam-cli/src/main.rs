@@ -263,6 +263,15 @@ enum Command {
         #[command(subcommand)]
         cmd: RoleCommand,
     },
+    /// Multi-host group: `ccteam host <join|mint-token|heartbeat|ls>`.
+    ///
+    /// Register a satellite with the main daemon (`join`), mint a join
+    /// token on the main daemon (`mint-token`, admin web-token), send a
+    /// keepalive (`heartbeat`), or list the local self credentials (`ls`).
+    Host {
+        #[command(subcommand)]
+        cmd: HostCommand,
+    },
     /// Bare `ccteam doctor` (no flags) runs a full readiness checkup:
     /// claude/codex binaries, tmux, MCP registration (Claude + Codex),
     /// daemon health, pricing staleness, and `~/.ccteam` home-layout
@@ -735,6 +744,43 @@ enum RoleCommand {
     },
 }
 
+/// v0.8.24 Track D — `ccteam host` multi-host ops.
+#[derive(Subcommand)]
+enum HostCommand {
+    /// Register this machine as a satellite of a main daemon.
+    Join {
+        /// Main daemon base URL (e.g. `http://192.168.1.10:7331`).
+        #[arg(long)]
+        daemon: String,
+        /// Join token minted by the main daemon admin.
+        #[arg(long)]
+        token: String,
+        /// Optional preferred host id (default = hostname slug).
+        #[arg(long)]
+        host_id: Option<String>,
+        /// Optional satellite agent callback base URL for remote spawn.
+        #[arg(long)]
+        agent_url: Option<String>,
+    },
+    /// Mint a join token via the main daemon REST API (admin web-token).
+    MintToken {
+        /// Main daemon base URL.
+        #[arg(long)]
+        daemon: String,
+        /// Admin web token hex (or `ccteam:<hex>`). Env `CCTEAM_WEB_TOKEN` fallback.
+        #[arg(long)]
+        web_token: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        max_uses: Option<u32>,
+    },
+    /// Send one heartbeat using the local `state/hosts/self.json` credentials.
+    Heartbeat,
+    /// Show the local satellite credentials (if joined).
+    Ls,
+}
+
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
 /// server, low-level session utilities (peek / progress / send / spawn /
 /// resume / attach), the mux hook-emit client, the project probe, and the
@@ -1103,6 +1149,7 @@ fn main() -> Result<()> {
         Command::Session { cmd } => run_session(cmd),
         // v0.8.7 W3 — `ccteam role <search|add|list>` group.
         Command::Role { cmd } => run_role(cmd),
+        Command::Host { cmd } => run_host(cmd),
         Command::Doctor {
             dry_run,
             tool_surface,
@@ -1303,6 +1350,161 @@ fn run_session_role(slug: &str, sid: &str, role: &str) -> Result<()> {
          Use the IM `/role {role}` command in the chat that owns session \
          `{sid}` (project `{slug}`) — it switches the current session in place.",
     )
+}
+
+/// v0.8.24 Track D — multi-host CLI surface.
+fn run_host(cmd: HostCommand) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    match cmd {
+        HostCommand::Join {
+            daemon,
+            token,
+            host_id,
+            agent_url,
+        } => rt.block_on(host_join(&paths, daemon, token, host_id, agent_url)),
+        HostCommand::MintToken {
+            daemon,
+            web_token,
+            label,
+            max_uses,
+        } => rt.block_on(host_mint_token(daemon, web_token, label, max_uses)),
+        HostCommand::Heartbeat => rt.block_on(host_heartbeat(&paths)),
+        HostCommand::Ls => host_ls(&paths),
+    }
+}
+
+async fn host_join(
+    paths: &CcteamPaths,
+    daemon: String,
+    token: String,
+    host_id: Option<String>,
+    agent_url: Option<String>,
+) -> Result<()> {
+    let hostname = ccteam_core::read_hostname().unwrap_or_else(|| "satellite".into());
+    let body = ccteam_core::HostJoinRequest {
+        token: token.clone(),
+        host_id,
+        hostname: hostname.clone(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        ccteam_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_url,
+        agents: vec![],
+    };
+    let url = format!("{}/api/v1/hosts/join", daemon.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header(
+            "Authorization",
+            format!("Bearer ccteam:{}", token.trim_start_matches("ccteam:")),
+        )
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("join failed HTTP {status}: {text}");
+    }
+    let join: ccteam_core::HostJoinResponse =
+        serde_json::from_str(&text).with_context(|| format!("parse join response: {text}"))?;
+    let self_rec = ccteam_core::SatelliteSelf {
+        daemon_url: daemon.trim_end_matches('/').to_string(),
+        host: join.host.clone(),
+        agent_token: join.agent_token.clone(),
+        heartbeat_ttl_secs: join.heartbeat_ttl_secs,
+        joined_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
+    self_rec.save(&self_path)?;
+    println!(
+        "joined as host `{}` (agent token saved to {})",
+        join.host,
+        self_path.display()
+    );
+    println!("heartbeat_ttl_secs={}", join.heartbeat_ttl_secs);
+    Ok(())
+}
+
+async fn host_mint_token(
+    daemon: String,
+    web_token: Option<String>,
+    label: Option<String>,
+    max_uses: Option<u32>,
+) -> Result<()> {
+    let tok = web_token
+        .or_else(|| std::env::var("CCTEAM_WEB_TOKEN").ok())
+        .ok_or_else(|| anyhow::anyhow!("--web-token or CCTEAM_WEB_TOKEN required"))?;
+    let bare = tok.trim().trim_start_matches("ccteam:");
+    let url = format!("{}/api/v1/hosts/join-token", daemon.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer ccteam:{bare}"))
+        .json(&serde_json::json!({"label": label, "max_uses": max_uses}))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("mint-token failed HTTP {status}: {text}");
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn host_heartbeat(paths: &CcteamPaths) -> Result<()> {
+    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
+    let me = ccteam_core::SatelliteSelf::load(&self_path)
+        .with_context(|| format!("not joined? missing {}", self_path.display()))?;
+    let url = format!(
+        "{}/api/v1/hosts/{}/heartbeat",
+        me.daemon_url.trim_end_matches('/'),
+        me.host
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer ccteam:{}", me.agent_token))
+        .json(&serde_json::json!({
+            "agent_token": me.agent_token,
+            "ccteam_version": env!("CARGO_PKG_VERSION"),
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("heartbeat failed HTTP {status}: {text}");
+    }
+    println!("{text}");
+    Ok(())
+}
+
+fn host_ls(paths: &CcteamPaths) -> Result<()> {
+    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
+    if !self_path.exists() {
+        println!("(not joined — no {})", self_path.display());
+        return Ok(());
+    }
+    let me = ccteam_core::SatelliteSelf::load(&self_path)?;
+    println!("host:          {}", me.host);
+    println!("daemon:        {}", me.daemon_url);
+    println!("joined_at:     {}", me.joined_at);
+    println!("heartbeat_ttl: {}s", me.heartbeat_ttl_secs);
+    println!(
+        "agent_token:   {}…",
+        &me.agent_token[..8.min(me.agent_token.len())]
+    );
+    Ok(())
 }
 
 /// v0.8.7 W3 — `ccteam role <search|add|list>` dispatcher. `search` is

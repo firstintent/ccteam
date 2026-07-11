@@ -83,7 +83,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 503 body for the no-gateway (standalone internal-web) path. Returned
 /// by every session endpoint when [`AppState::gateway`] is `None`.
-fn no_gateway() -> Response {
+pub(crate) fn no_gateway() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({"error": "no live gateway: session API unavailable on standalone web"})),
@@ -110,6 +110,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
         "claude" => Ok(AgentVendor::Claude),
         "codex" => Ok(AgentVendor::Codex),
         "grok" => Ok(AgentVendor::Grok),
+        "opencode" => Ok(AgentVendor::Opencode),
         other => Err(format!("unknown vendor: {other} (expected claude|codex)")),
     }
 }
@@ -159,7 +160,7 @@ pub(crate) async fn handle_list_sessions(
 
 /// 404 for a project the caller can't see (per-user isolation; 404 not 403 so
 /// an unowned slug's existence isn't revealed).
-fn project_not_visible(slug: &str) -> Response {
+pub(crate) fn project_not_visible(slug: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({"error": format!("project not found: {slug}")})),
@@ -244,6 +245,11 @@ pub struct CreateSessionForm {
     /// session channel; omitted → the daemon default (stream-json).
     #[serde(default)]
     pub protocol: Option<String>,
+    /// v0.8.24 Track D — host axis (`local` default, or a registered
+    /// satellite id). Remote hosts require an online registry entry and
+    /// a stdio protocol (stream-json / acp); terminal is rejected.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -305,16 +311,23 @@ pub(crate) async fn handle_create_session(
         Ok(p) => p,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
-    let protocol = if vendor == AgentVendor::Grok {
+    let protocol = if vendor == AgentVendor::Grok || vendor == AgentVendor::Opencode {
         SessionProtocol::Acp
     } else {
         protocol
     };
 
+    let host = form
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("local")
+        .to_string();
     let created = {
         let mut guard = gw.lock().await;
         guard
-            .create_session_api_proto(
+            .create_session_api_on_host(
                 slug.clone(),
                 role.clone(),
                 vendor,
@@ -324,6 +337,7 @@ pub(crate) async fn handle_create_session(
                 // identity (`user:<tenant>` / `user:web-api`) so the tenant's own
                 // IM bot sees it too.
                 identity.web_chat_id(),
+                host,
             )
             .await
     };
@@ -1410,6 +1424,7 @@ mod tests {
         assert_eq!(parse_vendor("claude").unwrap(), AgentVendor::Claude);
         assert_eq!(parse_vendor("Codex").unwrap(), AgentVendor::Codex);
         assert_eq!(parse_vendor("grok").unwrap(), AgentVendor::Grok);
+        assert_eq!(parse_vendor("opencode").unwrap(), AgentVendor::Opencode);
         assert_eq!(parse_vendor("  CLAUDE ").unwrap(), AgentVendor::Claude);
     }
 

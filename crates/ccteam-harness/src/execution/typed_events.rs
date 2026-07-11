@@ -201,6 +201,7 @@ fn vendor_str(vendor: Vendor) -> &'static str {
         Vendor::Claude => "claude",
         Vendor::Codex => "codex",
         Vendor::Grok => "grok",
+        Vendor::Opencode => "opencode",
     }
 }
 

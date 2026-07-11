@@ -48,7 +48,7 @@ fn t01_help_user_facing_only() {
     // `probe-project` under the hidden `internal` group.
     // v0.8.7 W3 added the top-level `role` group (catalog search/add/list).
     for required in [
-        "init", "start", "stop", "status", "project", "session", "role", "doctor", "config",
+        "init", "start", "stop", "status", "project", "session", "role", "host", "doctor", "config",
     ] {
         assert!(
             stdout.contains(required),

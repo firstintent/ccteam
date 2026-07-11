@@ -40,6 +40,8 @@ pub struct Budgets {
     pub codex: BudgetCap,
     #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
     pub grok: BudgetCap,
+    #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
+    pub opencode: BudgetCap,
 }
 
 /// One vendor's cost + spawn caps.
@@ -70,6 +72,7 @@ impl Budgets {
             Vendor::Claude => &self.claude,
             Vendor::Codex => &self.codex,
             Vendor::Grok => &self.grok,
+            Vendor::Opencode => &self.opencode,
         }
     }
 
@@ -78,11 +81,10 @@ impl Budgets {
     /// cap is the worst-case "shut everything down" path.
     /// Returns `None` only when **no** vendor has a cap.
     pub fn aggregated_cost_cap_24h(&self) -> Option<f64> {
-        let caps = [
-            self.claude.max_cost_usd_per_24h,
-            self.codex.max_cost_usd_per_24h,
-            self.grok.max_cost_usd_per_24h,
-        ];
+        let caps: Vec<Option<f64>> = Vendor::ALL
+            .iter()
+            .map(|v| self.cap_for(*v).max_cost_usd_per_24h)
+            .collect();
         let sum: f64 = caps.iter().filter_map(|c| *c).sum();
         if caps.iter().any(|c| c.is_some()) {
             Some(sum)
@@ -219,6 +221,7 @@ mod vendor_wire {
             Vendor::Claude => "claude",
             Vendor::Codex => "codex",
             Vendor::Grok => "grok",
+            Vendor::Opencode => "opencode",
         })
     }
 
@@ -231,6 +234,7 @@ mod vendor_wire {
             "claude" => Ok(Vendor::Claude),
             "codex" => Ok(Vendor::Codex),
             "grok" => Ok(Vendor::Grok),
+            "opencode" => Ok(Vendor::Opencode),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }

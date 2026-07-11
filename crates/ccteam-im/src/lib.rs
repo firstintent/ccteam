@@ -27,6 +27,7 @@
 #![warn(missing_docs)]
 
 pub mod acl;
+pub mod compare;
 pub mod credentials;
 pub mod daemon;
 pub mod gateway;
@@ -53,8 +54,11 @@ pub mod mcp;
 pub mod onboarding;
 pub mod outbound_format;
 pub mod pending;
+pub mod pending_turns;
 pub mod progress;
 pub mod rate_limit;
+// v0.8.24 Track D — multi-host remote spawn gate + satellite proxy seam.
+pub mod remote_host;
 pub mod router;
 pub mod sanitize;
 pub mod three_layer_sec;

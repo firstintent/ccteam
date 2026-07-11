@@ -1,30 +1,32 @@
-//! Grok ACP adapter tests against the hermetic fake (`fixtures/grok_acp/fake_grok_acp.py`).
+//! OpenCode ACP adapter tests against the hermetic fake
+//! (`fixtures/opencode_acp/fake_opencode_acp.py`).
 //!
-//! Gate: no real grok / network. Set `CCTEAM_GROK_BIN` to the fake.
+//! Gate: no real opencode / network. Set `CCTEAM_OPENCODE_BIN` to the fake.
+//! Wire pin: OpenCode release 1.17.17 (W0).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ccteam_harness::execution::grok_acp::spawn_spec::{build_argv, GrokSpawnInput};
+use ccteam_harness::execution::opencode_acp::spawn_spec::{build_argv, OpencodeSpawnInput};
 use ccteam_harness::{
-    write_session_meta, AgentSpecBrief, AgentVendor, ExecutionMode, GrokAcpAdapter, HarnessAdapter,
-    PermissionMode, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx, ThreadEvent,
-    ThreadItemDetails, TurnInput, GROK_BIN_ENV,
+    write_session_meta, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
+    OpencodeAcpAdapter, PermissionMode, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx,
+    ThreadEvent, ThreadItemDetails, TurnInput, OPENCODE_BIN_ENV,
 };
 use futures::StreamExt;
 use serial_test::serial;
 use tempfile::TempDir;
 
 fn fake_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok_acp/fake_grok_acp.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/opencode_acp/fake_opencode_acp.py")
 }
 
 fn install_fake() {
     let bin = fake_bin();
     assert!(bin.is_file(), "missing fake at {}", bin.display());
-    // Prefer python3 runner wrapper so the fake is executable without +x issues.
     let wrapper = std::env::temp_dir().join(format!(
-        "ccteam-fake-grok-{}-{}",
+        "ccteam-fake-opencode-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -40,15 +42,14 @@ fn install_fake() {
         perms.set_mode(0o755);
         std::fs::set_permissions(&wrapper, perms).unwrap();
     }
-    // SAFETY: tests are serial for GROK_BIN_ENV.
     unsafe {
-        std::env::set_var(GROK_BIN_ENV, &wrapper);
+        std::env::set_var(OPENCODE_BIN_ENV, &wrapper);
     }
 }
 
 fn clear_fake() {
     unsafe {
-        std::env::remove_var(GROK_BIN_ENV);
+        std::env::remove_var(OPENCODE_BIN_ENV);
     }
 }
 
@@ -66,25 +67,12 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
 }
 
 #[test]
-fn spawn_spec_always_approve_before_stdio() {
-    let argv = build_argv(
-        "grok",
-        &GrokSpawnInput {
-            permission_mode: PermissionMode::Skip,
-            model_id: Some("grok-4.5"),
-        },
-    );
-    assert_eq!(
-        argv,
-        vec![
-            "grok",
-            "agent",
-            "--always-approve",
-            "-m",
-            "grok-4.5",
-            "stdio"
-        ]
-    );
+fn spawn_spec_is_acp_only_no_pty_flags() {
+    let argv = build_argv("opencode", &OpencodeSpawnInput::default());
+    assert_eq!(argv, vec!["opencode", "acp"]);
+    assert!(!argv
+        .iter()
+        .any(|a| a.contains("tmux") || a.contains("rmux")));
 }
 
 #[tokio::test]
@@ -92,7 +80,7 @@ fn spawn_spec_always_approve_before_stdio() {
 async fn handshake_prompt_final_only_on_fake() {
     install_fake();
     let tmp = TempDir::new().unwrap();
-    let adapter = GrokAcpAdapter::new();
+    let adapter = OpencodeAcpAdapter::new();
     let handle = tokio::time::timeout(
         Duration::from_secs(10),
         adapter.start_thread(
@@ -106,7 +94,7 @@ async fn handshake_prompt_final_only_on_fake() {
     .expect("start timeout")
     .expect("start ok");
 
-    assert_eq!(handle.vendor, AgentVendor::Grok);
+    assert_eq!(handle.vendor, AgentVendor::Opencode);
     assert_eq!(handle.mode, ExecutionMode::Chat);
     assert!(!handle.identity.is_empty());
     assert_eq!(
@@ -125,7 +113,7 @@ async fn handshake_prompt_final_only_on_fake() {
     let collector = tokio::spawn(async move {
         let mut finals = Vec::new();
         let mut usage_in = None;
-        let mut model = None;
+        let mut reported = None;
         while let Some(ev) = stream.next().await {
             match ev {
                 ThreadEvent::ItemCompleted { item } => {
@@ -133,11 +121,9 @@ async fn handshake_prompt_final_only_on_fake() {
                         finals.push(t);
                     }
                 }
-                ThreadEvent::TurnCompleted {
-                    usage, model: m, ..
-                } => {
+                ThreadEvent::TurnCompleted { usage, .. } => {
                     usage_in = Some(usage.input_tokens);
-                    model = m;
+                    reported = usage.reported_cost_usd;
                     break;
                 }
                 ThreadEvent::TurnFailed { err, .. } => {
@@ -146,7 +132,7 @@ async fn handshake_prompt_final_only_on_fake() {
                 _ => {}
             }
         }
-        (finals, usage_in, model)
+        (finals, usage_in, reported)
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -155,7 +141,7 @@ async fn handshake_prompt_final_only_on_fake() {
         .await
         .expect("submit");
 
-    let (finals, usage_in, model) = tokio::time::timeout(Duration::from_secs(10), collector)
+    let (finals, usage_in, reported) = tokio::time::timeout(Duration::from_secs(10), collector)
         .await
         .expect("collector timeout")
         .expect("collector join");
@@ -165,10 +151,15 @@ async fn handshake_prompt_final_only_on_fake() {
     assert!(!finals[0].contains("thinking"), "thoughts not in final");
     assert!(!finals[0].contains("REPLAY"), "no replay text");
     assert_eq!(usage_in, Some(100));
-    assert_eq!(model.as_deref(), Some("grok-4.5"));
+    // cost amount 0 on pin → reported None ("—"), never Claude table.
+    assert!(reported.is_none(), "zero cost must not report 0.0");
 
     let status = adapter.thread_status(&handle).await.unwrap();
-    assert_eq!(status.model.as_deref(), Some("grok-4.5"));
+    assert_eq!(status.model.as_deref(), Some("tokenopen/gpt-5.5"));
+    // usage_update size → window
+    if let Some(ctx) = status.context {
+        assert_eq!(ctx.window_tokens, 128000);
+    }
 
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();
@@ -176,21 +167,20 @@ async fn handshake_prompt_final_only_on_fake() {
 
 #[tokio::test]
 #[serial]
-async fn load_resume_filters_is_replay() {
+async fn resume_prefers_session_resume_no_replay() {
     install_fake();
     let tmp = TempDir::new().unwrap();
     let project = tmp.path();
     let sid = "s-resume";
-    // Seed meta as if a prior session existed with known ACP sessionId.
     let meta = SessionMeta {
         sid: sid.into(),
         slug: "demo".into(),
-        vendor: AgentVendor::Grok,
+        vendor: AgentVendor::Opencode,
         protocol: SessionProtocol::Acp,
         role: String::new(),
         permission_mode: PermissionMode::Skip,
         owner: "user:test".into(),
-        vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
+        vendor_uuid: "ses_fake_opencode_0017cafe".into(),
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_active: chrono::Utc::now().to_rfc3339(),
@@ -206,7 +196,7 @@ async fn load_resume_filters_is_replay() {
     };
     write_session_meta(project, &meta).unwrap();
 
-    let adapter = GrokAcpAdapter::new();
+    let adapter = OpencodeAcpAdapter::new();
     let handle = adapter
         .start_thread(
             &AgentSpecBrief {
@@ -216,9 +206,8 @@ async fn load_resume_filters_is_replay() {
         )
         .await
         .expect("resume start");
-    assert_eq!(handle.identity, "019f4547-0000-7000-8000-00000000cafe");
+    assert_eq!(handle.identity, "ses_fake_opencode_0017cafe");
 
-    // Subscribe and send a turn — final must not include REPLAY_MUST_DROP.
     let mut stream = adapter.events(&handle);
     let collector = tokio::spawn(async move {
         let mut finals = Vec::new();
@@ -237,14 +226,14 @@ async fn load_resume_filters_is_replay() {
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
     adapter
-        .submit_turn(&handle, TurnInput::UserText("after-load".into()))
+        .submit_turn(&handle, TurnInput::UserText("after-resume".into()))
         .await
         .unwrap();
     let finals = tokio::time::timeout(Duration::from_secs(10), collector)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(finals, vec!["echo:after-load".to_string()]);
+    assert_eq!(finals, vec!["echo:after-resume".to_string()]);
     assert!(finals.iter().all(|t| !t.contains("REPLAY")));
 
     adapter.close_thread(&handle).await.unwrap();
@@ -253,36 +242,75 @@ async fn load_resume_filters_is_replay() {
 
 #[tokio::test]
 #[serial]
-async fn unknown_directive_rejected() {
+async fn skip_auto_allows_permission_request() {
+    // The fake emits session/request_permission on first prompt.
+    // With InboundPolicy::AutoAllowPermission the transport must reply
+    // allow — verified by turn completing (not stalling/rejecting).
     install_fake();
     let tmp = TempDir::new().unwrap();
-    let adapter = GrokAcpAdapter::new();
+    let adapter = OpencodeAcpAdapter::new();
     let handle = adapter
         .start_thread(
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-dir"),
+            &spawn_ctx(&tmp, "s-perm"),
         )
         .await
         .unwrap();
-    let out = adapter
-        .handle_directive(
-            &handle,
-            ccteam_harness::Directive {
-                name: "bogus".into(),
-                args: String::new(),
-                choice: None,
-            },
-        )
-        .await
-        .unwrap();
-    match out {
-        ccteam_harness::DirectiveOutcome::Rejected { reason } => {
-            assert!(reason.contains("does not support") || reason.contains("bogus"));
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ThreadEvent::TurnCompleted { .. }) {
+                return true;
+            }
+            if matches!(ev, ThreadEvent::TurnFailed { .. }) {
+                return false;
+            }
         }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+        false
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("need-tool".into()))
+        .await
+        .unwrap();
+    let ok = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("timeout")
+        .expect("join");
+    assert!(
+        ok,
+        "skip session must complete turn (auto-allow permission)"
+    );
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();
+}
+
+#[test]
+fn no_tmux_rmux_imports_in_opencode_module_sources() {
+    // Structural red-line: opencode path must not import tmux/rmux crates/modules.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/execution/opencode_acp");
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(entry.path()).unwrap();
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("use crate::tmux")
+                    && !trimmed.contains("use crate::rmux")
+                    && !trimmed.contains("tmux_backend")
+                    && !trimmed.contains("rmux_backend")
+                    && !trimmed.contains("tmux_ops"),
+                "{} must not import tmux/rmux: {trimmed}",
+                entry.path().display()
+            );
+        }
+    }
 }

@@ -2830,6 +2830,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                     "claude" => CostVendor::Claude,
                     "codex" => CostVendor::Codex,
                     "grok" => CostVendor::Grok,
+                    "opencode" => CostVendor::Opencode,
                     _ => continue, // unknown vendor — skip (forward-compat)
                 };
                 *counts.agent_done.entry(key).or_insert(0) += 1;
@@ -2847,6 +2848,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                 ccteam_core::Vendor::Claude => CostVendor::Claude,
                 ccteam_core::Vendor::Codex => CostVendor::Codex,
                 ccteam_core::Vendor::Grok => CostVendor::Grok,
+                ccteam_core::Vendor::Opencode => CostVendor::Opencode,
             };
             *counts.ledger_rows.entry(key).or_insert(0) += 1;
         }
@@ -2857,7 +2859,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
     //    without progress.jsonl events) is expected — advise calls are
     //    not project-scoped, so they have no progress.jsonl footprint.
     let mut warnings = Vec::new();
-    for vendor in [CostVendor::Claude, CostVendor::Codex, CostVendor::Grok] {
+    for &vendor in CostVendor::ALL {
         let done = counts.agent_done.get(&vendor).copied().unwrap_or(0);
         let rows = counts.ledger_rows.get(&vendor).copied().unwrap_or(0);
         if done > rows {
@@ -2891,14 +2893,25 @@ pub enum CostVendor {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
 impl CostVendor {
+    /// Every known cost-vendor variant — single source of truth for
+    /// iteration. Add a new arm here (and only here) when a vendor lands.
+    pub const ALL: &'static [CostVendor] = &[
+        CostVendor::Claude,
+        CostVendor::Codex,
+        CostVendor::Grok,
+        CostVendor::Opencode,
+    ];
+
     fn label(self) -> &'static str {
         match self {
             CostVendor::Claude => "claude",
             CostVendor::Codex => "codex",
             CostVendor::Grok => "grok",
+            CostVendor::Opencode => "opencode",
         }
     }
 }
@@ -4559,6 +4572,7 @@ pub fn run_admin_register_bot(
         "claude" => AgentVendor::Claude,
         "codex" => AgentVendor::Codex,
         "grok" => AgentVendor::Grok,
+        "opencode" => AgentVendor::Opencode,
         other => {
             return Err(anyhow::anyhow!(
                 "invalid vendor `{other}`: expected one of `claude`, `codex`, `grok`"

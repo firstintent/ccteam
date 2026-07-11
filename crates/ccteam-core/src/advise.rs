@@ -1,3 +1,8 @@
+//! **DEPRECATED (v0.8.24 C2)** — superseded by multi-vendor `/compare`
+//! (true sessions via `Gateway::run_compare`). MCP tools were culled in
+//! v0.9-T1; this module remains only for ledger helpers used by doctor /
+//! cost rollups until a later wave deletes the advise ledger entirely.
+//!
 //! V0.6.5 F152 + F153 — `advise_vote` / `advise_parallel` real impls.
 //!
 //! Replaces the V0.6.0 Wave 1 STUB dispatch in
@@ -341,6 +346,13 @@ pub async fn advise_parallel(
                     v,
                     AnswerStatus::Unavailable {
                         reason: "grok advise (headless) not wired in v0.8.23 MVP".into(),
+                    },
+                    String::new(),
+                ),
+                AgentVendor::Opencode => (
+                    v,
+                    AnswerStatus::Unavailable {
+                        reason: "opencode advise (headless) not wired in v0.8.24 MVP".into(),
                     },
                     String::new(),
                 ),

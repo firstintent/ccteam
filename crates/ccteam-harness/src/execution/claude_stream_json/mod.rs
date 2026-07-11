@@ -905,6 +905,14 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);
         let resume = Self::session_jsonl_exists(&ctx.cwd, &uuid);
 
+        // v0.8.24 C1 — curated per-session MCP written by the gateway at
+        // spawn (chat/<sid>/mcp.json). Present → --mcp-config + strict;
+        // missing → strict alone (strip ambient), same as pre-C1.
+        let mcp_config_path = {
+            let p =
+                crate::execution::mcp_config::session_mcp_config_path(&ctx.project_dir, &ctx.sid);
+            p.exists().then_some(p)
+        };
         let make_argv = |resume: bool| {
             spawn_spec::build_argv(
                 &bin,
@@ -914,6 +922,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     resume,
                     model_id: ctx.model_id.as_deref(),
                     permission_mode: ctx.permission_mode,
+                    mcp_config_path: mcp_config_path.as_deref(),
                 },
             )
         };

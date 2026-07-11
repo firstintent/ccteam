@@ -94,6 +94,8 @@ fn write_one_tracked_session(root: &std::path::Path) {
             cost_usd: None,
             role_sha: None,
             skills_sha: None,
+            trigger: None,
+            compare_group: None,
         },
     )
     .unwrap();

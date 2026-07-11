@@ -1278,6 +1278,7 @@ fn parse_session_vendor(
             "" | "claude" => Ok(ccteam_harness::AgentVendor::Claude),
             "codex" => Ok(ccteam_harness::AgentVendor::Codex),
             "grok" => Ok(ccteam_harness::AgentVendor::Grok),
+            "opencode" => Ok(ccteam_harness::AgentVendor::Opencode),
             other => Err(format!(
                 "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, or `grok`"
             )),

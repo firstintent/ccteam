@@ -261,13 +261,21 @@ async fn get_capabilities_lists_both_vendors() {
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = resp.json().await.unwrap();
     let harnesses = v.get("harnesses").unwrap().as_array().unwrap();
-    assert_eq!(harnesses.len(), 2);
+    // v0.8.24 — 4-way (claude / codex / grok / opencode); availability is
+    // PATH-probe dynamic, but the list always surfaces every known harness.
+    assert!(
+        harnesses.len() >= 4,
+        "expected ≥4 harnesses (claude/codex/grok/opencode), got {}",
+        harnesses.len()
+    );
     let ids: Vec<&str> = harnesses
         .iter()
         .map(|h| h.get("id").unwrap().as_str().unwrap())
         .collect();
     assert!(ids.contains(&"claude-code"));
     assert!(ids.contains(&"codex"));
+    assert!(ids.iter().any(|id| id.contains("grok")));
+    assert!(ids.iter().any(|id| id.contains("opencode")));
     // `available` is a bool; `providers` is an array (empty for now).
     for h in harnesses {
         assert!(h.get("available").unwrap().is_boolean());

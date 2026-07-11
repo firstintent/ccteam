@@ -59,6 +59,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/hosts"),
         ("GET", "/api/v1/hosts/{host}"),
         ("POST", "/api/v1/hosts/{host}/register-mcp"),
+        ("POST", "/api/v1/hosts/join-token"),
+        ("POST", "/api/v1/hosts/join"),
+        ("POST", "/api/v1/hosts/{host}/heartbeat"),
         // v0.8.18 档1 — per-user web tenant management (admin-gated).
         ("POST", "/api/v1/users"),
         ("GET", "/api/v1/users"),
@@ -85,6 +88,7 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/projects/{slug}/artifact_queue"),
         ("GET", "/api/v1/projects/{slug}/artifact_status"),
         ("GET", "/api/v1/projects/{slug}/cost_history"),
+        ("GET", "/api/v1/projects/{slug}/evolution"),
         ("GET", "/api/v1/projects/{slug}/sessions/active"),
         ("GET", "/api/v1/projects/{slug}/jobs/{job_id}/log"),
         ("GET", "/api/v1/sessions/active"),
@@ -112,6 +116,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/projects/{slug}/sessions/{sid}/resume"),
         ("GET", "/api/v1/projects/{slug}/external-sessions"),
         ("POST", "/api/v1/projects/{slug}/sessions/import"),
+        // v0.8.24 C2 — multi-vendor /compare
+        ("POST", "/api/v1/projects/{slug}/compare"),
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
         ("GET", "/api/v1/config/im"),
         ("PUT", "/api/v1/config/im/telegram"),

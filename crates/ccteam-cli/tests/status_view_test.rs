@@ -93,6 +93,8 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             cost_usd: None,
             role_sha: None,
             skills_sha: None,
+            trigger: None,
+            compare_group: None,
         };
         ccteam_harness::write_session_meta(&project_dir, &meta).unwrap();
     };

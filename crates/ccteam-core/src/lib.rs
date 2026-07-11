@@ -41,6 +41,8 @@ pub mod execution;
 pub mod handoff;
 // v0.8.18 柱1 — OS host identity (hostname) for the `GET /api/v1/hosts` report.
 pub mod host;
+// v0.8.24 Track D — multi-host registry (join-token / heartbeat / online gate).
+pub mod host_registry;
 // v0.8.9 Phase 2 — ccteam-hub (curated plugin marketplace) raw-content base
 // URL + the pure path/filename utils the installer reuses. Leaf-crate part
 // only: the async fetch + sha256-verify + install backend lives in
@@ -171,7 +173,7 @@ pub use daemon::{
 pub use defaults::{
     claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,
     CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
-    GROK_BIN_ENV,
+    GROK_BIN_ENV, OPENCODE_BIN_ENV,
 };
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via
@@ -258,6 +260,14 @@ pub use queries::{
     WorkflowSummary,
 };
 pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
+// v0.8.24 Track D — multi-host registry.
+pub use host::read_hostname;
+pub use host_registry::{
+    apply_heartbeat, apply_join, gate_remote_spawn, join_tokens_path_in, normalize_host_id,
+    now_unix, registry_path_in, HostAgentReport, HostHeartbeatRequest, HostJoinRequest,
+    HostJoinResponse, HostRecord, HostRegistry, JoinToken, JoinTokenStore, SatelliteSelf,
+    DEFAULT_HEARTBEAT_TTL_SECS, LOCAL_HOST as REGISTRY_LOCAL_HOST,
+};
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
     FONT_ENV as SCREENSHOT_FONT_ENV,

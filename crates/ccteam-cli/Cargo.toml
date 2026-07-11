@@ -46,6 +46,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+# v0.8.24 Track D — `ccteam host join|heartbeat|join-token` HTTP client.
+reqwest = { workspace = true, features = ["json"] }
 
 # V0.6.0 Wave 3 F112 §C — `ccteam prefs show` pretty-prints the
 # Preferences struct via `toml::to_string_pretty`. Aligned with the

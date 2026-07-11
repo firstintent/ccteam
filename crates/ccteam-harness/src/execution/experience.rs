@@ -419,6 +419,7 @@ fn vendor_label(v: crate::AgentVendor) -> &'static str {
         crate::AgentVendor::Claude => "claude",
         crate::AgentVendor::Codex => "codex",
         crate::AgentVendor::Grok => "grok",
+        crate::AgentVendor::Opencode => "opencode",
     }
 }
 
@@ -600,6 +601,8 @@ mod tests {
             cost_usd: None,
             role_sha: Some("deadbeef0001".into()),
             skills_sha: None,
+            trigger: None,
+            compare_group: None,
         };
         super::super::session_meta::write_session_meta(project, &meta).unwrap();
         super::super::turns_mirror::append_turn(

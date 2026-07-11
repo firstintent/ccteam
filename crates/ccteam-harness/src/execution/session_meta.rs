@@ -165,6 +165,16 @@ pub struct SessionMeta {
     /// parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
+    /// v0.8.24 F5 — which surface triggered session creation:
+    /// `im` | `web` | `mcp` | `session_spawn` | `compare`. Legacy metas
+    /// parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// v0.8.24 C2 — multi-vendor `/compare` group id. Sessions spawned by
+    /// one compare share the same id so `/sessions` can fold them. Legacy
+    /// metas parse as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare_group: Option<String>,
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -427,6 +437,8 @@ mod title_tests {
             cost_usd: None,
             role_sha: None,
             skills_sha: None,
+            trigger: None,
+            compare_group: None,
         }
     }
 
