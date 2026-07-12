@@ -261,9 +261,9 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
     out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
     out.push_str(
-        "  5. cd: send `/cd <project>`; the first message starts the default cto session\n",
+        "  5. cd: send `/cd <project>`; the first message starts a roleless session (reads the project CLAUDE.md/AGENTS.md)\n",
     );
-    out.push_str("  role tip: roleless uses project CLAUDE.md, cto is the default guide, work roles live in .claude/agents/<role>.md\n");
+    out.push_str("  role tip: sessions are roleless by default (read project CLAUDE.md/AGENTS.md); install or author work-roles in .claude/agents/<role>.md\n");
     out.push_str("  guide: docs/usage.md\n");
     Ok(out)
 }
@@ -394,14 +394,12 @@ fn install_project_at(
             team,
         )?;
         scaffold_workflow_yaml(target, false)?;
-        let agent_count = scaffold_default_agents(target, false)?;
         state_action = "created";
         workflow_action = "scaffolded";
-        agents_action = if agent_count > 0 {
-            "scaffolded"
-        } else {
-            "scaffolded (0 — bug?)"
-        };
+        // v0.9.0 W2 (F6.1) — engine neutralization: init seeds NO role. The
+        // default session is roleless (bare vendor reads project CLAUDE.md /
+        // AGENTS.md); `.claude/agents/` is left untouched.
+        agents_action = "none (roleless default)";
         final_team = team.to_string();
         // Fresh state.json was written with owner = None; stamp it when asked.
         if let Some(owner) = &requested_owner {
@@ -437,13 +435,11 @@ fn install_project_at(
             "preserved"
         };
 
+        // v0.9.0 W2 (F6.1) — ccteam seeds no roles, so there is nothing to
+        // (re)scaffold or reset; `--force` / `--reset-agents` no longer touch
+        // `.claude/agents/` (user files there survive untouched).
         agents_action = if opts.force || opts.reset_agents {
-            scaffold_default_agents(target, true)?;
-            if opts.force {
-                "overwritten (--force)"
-            } else {
-                "overwritten (--reset-agents)"
-            }
+            "none (roleless default)"
         } else {
             "preserved"
         };
@@ -498,23 +494,6 @@ fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
 /// the count of files written. With `force=false`, existing files are
 /// preserved; with `force=true`, the shipped scaffolds always
 /// overwrite.
-///
-fn scaffold_default_agents(target: &std::path::Path, force: bool) -> Result<usize> {
-    let agents_dir = target.join(".claude").join("agents");
-    std::fs::create_dir_all(&agents_dir)
-        .with_context(|| format!("create {}", agents_dir.display()))?;
-    let mut written = 0usize;
-    for (name, body) in DEFAULT_AGENT_SCAFFOLDS {
-        let path = agents_dir.join(name);
-        if path.exists() && !force {
-            continue;
-        }
-        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-        written += 1;
-    }
-    Ok(written)
-}
-
 const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
 # Edit this file to declare your project's agent topology. Each agent
 # is a role (filename of .claude/agents/<role>.md) with a trigger that
@@ -527,32 +506,12 @@ const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
 #   watch:.ccteam/issues/         # spawn one session per new file under the path
 name: default-workflow
 description: |
-  Minimal starter workflow. Edit me — the manual `cto` is a safe
-  default that won't spawn until you call `ccteam spawn <slug> cto`.
+  Minimal starter workflow. Edit me — declare your own agents below.
+  (v0.9.0: ccteam seeds no default role; sessions are roleless unless
+  you author `.claude/agents/<role>.md` or install one from the hub.)
 
-agents:
-  cto:
-    trigger: manual
-    executor: claude
+agents: {}
 "#;
-
-/// Default `.claude/agents/<role>.md` scaffolds written by `ccteam init`.
-///
-/// v8.3 session=role: the default seed is the `cto` persona, sourced from
-/// [`ccteam_core::CTO_ROLE_MD`] (single source — the same const core
-/// `bootstrap_project_at_dir` seeds, so the CLI + IM/gateway create paths
-/// agree). IM/chat sessions launch `claude --agent cto` by default, so
-/// `cto.md` must exist in every project. Embedded `include_str!` agent
-/// `.md` files (with Anthropic frontmatter + system prompt body) keep the
-/// binary self-contained while staying editable as proper agent files.
-///
-/// To change the default agent scaffold:
-/// 1. Edit the persona body (core `templates/cto_role.md` for `cto`)
-/// 2. Adjust the `(filename, body)` row here if the role changes
-/// 3. Update `DEFAULT_WORKFLOW_YAML` to declare the role if it's a
-///    default-shipped agent
-/// 4. `cargo build --workspace` + `cargo test --workspace`
-pub(crate) const DEFAULT_AGENT_SCAFFOLDS: &[(&str, &str)] = &[("cto.md", ccteam_core::CTO_ROLE_MD)];
 
 /// Prompt the user `<question> [Y/n]: ` and return their answer. With
 /// `yes_to_all = true`, skips the prompt and answers `true` (the
@@ -4794,14 +4753,14 @@ fn truncate_col(s: &str, width: usize) -> String {
 ///    (or flex `~/.ccteam/progress/<slug>/` dir), then any
 ///    `~/.ccteam/inbox/<slug>/` and `~/.ccteam/control/<slug>/`
 ///    sub-trees that exist.
-/// 6. `--purge`: delete exactly ccteam's project footprint (v0.8.6 W2
-///    layout) — `rm -rf <project>/.ccteam/`, the seeded
-///    `<project>/.claude/agents/cto.md` (NOT the whole agents dir), and
-///    ccteam's hook section inside `<project>/.claude/settings.local.json`
-///    (surgically; file deleted only if it collapses to empty). See
-///    [`purge_project_managed_paths`] for the full KEEP/DELETE contract.
-///    Never touches `<project>/.env`, user work-roles, `CLAUDE.md` /
-///    `AGENTS.md`, or the user's `settings.json` (CLAUDE.md §三 red line).
+/// 6. `--purge`: delete exactly ccteam's project footprint —
+///    `rm -rf <project>/.ccteam/` and ccteam's hook section inside
+///    `<project>/.claude/settings.local.json` (surgically; file deleted
+///    only if it collapses to empty). See [`purge_project_managed_paths`]
+///    for the full KEEP/DELETE contract. Never touches `<project>/.env`,
+///    ANY `.claude/agents/*.md` (all user files since v0.9.0 — ccteam
+///    seeds no role), `CLAUDE.md` / `AGENTS.md`, or the user's
+///    `settings.json` (CLAUDE.md §三 red line).
 ///
 /// This is the reusable remove engine: the flat `ccteam remove` and the
 /// grouped `ccteam project rm` both route here (the structured
@@ -5186,23 +5145,21 @@ fn purge_imd_registry_for_slug(
 
 /// Helper for `run_remove --purge` — deletes exactly ccteam's own
 /// footprint inside `<project>/` (or, under `--dry-run`, just records
-/// the planned step). Aligned to the v0.8.6 W2 layout: a project's
-/// on-disk ccteam footprint is `.ccteam/` (state.json + workflow.yaml),
-/// the seeded `.claude/agents/cto.md` persona, and ccteam's hook section
-/// inside `.claude/settings.local.json`.
+/// the planned step). A project's on-disk ccteam footprint is `.ccteam/`
+/// (state.json + workflow.yaml) plus ccteam's hook section inside
+/// `.claude/settings.local.json`. (v0.9.0 W2: ccteam seeds NO role, so
+/// there is no ccteam-owned persona to purge.)
 ///
 /// **DELETE** (ccteam-managed only):
 /// - `<project>/.ccteam/` — state.json + workflow.yaml live here (W2).
-/// - `<project>/.claude/agents/cto.md` — the ccteam-seeded chat persona.
-///   The `.claude/agents/` dir itself is left in place so user-authored
-///   work-roles beside `cto.md` survive (only `cto.md` is ours).
 /// - ccteam's chat-progress + AskUserQuestion hook entries inside
 ///   `<project>/.claude/settings.local.json` (surgically, via
 ///   [`ccteam_core::remove_chat_hooks`]). If stripping them leaves the
 ///   file an empty object, the now-vestigial file is deleted.
 ///
 /// **KEEP (never touched):**
-/// - User work-roles `<project>/.claude/agents/*.md` other than `cto.md`.
+/// - ALL of `<project>/.claude/agents/*.md` — every role file is a user
+///   file (including a legacy ccteam-seeded `cto.md`).
 /// - `<project>/CLAUDE.md` / `AGENTS.md` (project knowledge = vendor-native).
 /// - `<project>/.env` (user-controlled secrets — CLAUDE.md §三 red line).
 /// - The user's `<project>/.claude/settings.json` (ccteam manages only
@@ -5232,24 +5189,9 @@ fn purge_project_managed_paths(
         }
     }
 
-    // 2. The ccteam-seeded `cto.md` persona ONLY — never the whole
-    // `.claude/agents/` dir (user work-roles live beside it and must
-    // survive).
-    let cto_md = project_dir.join(".claude").join("agents").join("cto.md");
-    if cto_md.is_file() {
-        if dry_run {
-            report.steps.push(format!(
-                "would purge .claude/agents/cto.md ({})",
-                cto_md.display()
-            ));
-        } else {
-            std::fs::remove_file(&cto_md).with_context(|| format!("rm {}", cto_md.display()))?;
-            report.steps.push(format!(
-                "purged .claude/agents/cto.md ({})",
-                cto_md.display()
-            ));
-        }
-    }
+    // 2. v0.9.0 W2 (F6.1) — ccteam no longer seeds any role, and a project's
+    // `.claude/agents/*.md` (including a legacy `cto.md`) are USER files:
+    // `remove` never deletes them.
 
     // 3. ccteam's hook section inside `.claude/settings.local.json`,
     // removed surgically so any operator-authored keys/hooks survive.
@@ -6013,11 +5955,16 @@ mod tests {
             !target.join("workflow.yaml").exists(),
             "V0.4.6 F83: workflow.yaml must NOT be at the project root after fresh init",
         );
-        assert!(target
-            .join(".claude")
-            .join("agents")
-            .join("cto.md")
-            .is_file());
+        // v0.9.0 (engine neutralization): fresh init seeds NO role — the default
+        // session is roleless (bare vendor reads the project CLAUDE.md/AGENTS.md).
+        assert!(
+            !target
+                .join(".claude")
+                .join("agents")
+                .join("cto.md")
+                .exists(),
+            "v0.9.0: init seeds no cto.md (roleless default)"
+        );
         // v0.8.6: init no longer writes the `.ccteam/agents` neutral copy
         // nor the `.ccteam/skills` placeholder layout — `.ccteam/` holds
         // only state.json + workflow.yaml.
@@ -6056,9 +6003,8 @@ mod tests {
             "3. config:",
             "4. start:",
             "5. cd:",
-            "roleless uses project CLAUDE.md",
-            "cto is the default guide",
-            "work roles live in .claude/agents/<role>.md",
+            "sessions are roleless by default",
+            "install or author work-roles in .claude/agents/<role>.md",
             "docs/usage.md",
         ] {
             assert!(
@@ -6240,6 +6186,8 @@ mod tests {
         .unwrap();
         let wf_path = target.join(".ccteam").join("workflow.yaml");
         std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
+        // v0.9.0: init no longer creates `.claude/agents/`; the user authors it.
+        std::fs::create_dir_all(target.join(".claude").join("agents")).unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("cto.md"),
             "USER AGENT\n",
@@ -6297,11 +6245,12 @@ mod tests {
         );
     }
 
-    /// V0.4.2 F72: `--reset-agents` rewrites agents but keeps
-    /// workflow.yaml untouched.
+    /// V0.4.2 F72 / v0.9.0: `--reset-agents` keeps workflow.yaml untouched and,
+    /// after engine neutralization, no longer rewrites user agents — ccteam
+    /// seeds none, so `.claude/agents/*.md` are user files that survive.
     /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
     #[test]
-    fn run_init_reset_agents_only_overwrites_agents() {
+    fn run_init_reset_agents_preserves_user_agents() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let target = tmp.path().join("f72-reset");
@@ -6315,6 +6264,8 @@ mod tests {
         .unwrap();
         let wf_path = target.join(".ccteam").join("workflow.yaml");
         std::fs::write(&wf_path, "USER WORKFLOW\n").unwrap();
+        // v0.9.0: init no longer creates `.claude/agents/`; the user authors it.
+        std::fs::create_dir_all(target.join(".claude").join("agents")).unwrap();
         std::fs::write(
             target.join(".claude").join("agents").join("cto.md"),
             "USER AGENT\n",
@@ -6334,10 +6285,10 @@ mod tests {
             "USER WORKFLOW\n",
             "workflow must survive --reset-agents",
         );
-        assert_ne!(
+        assert_eq!(
             std::fs::read_to_string(target.join(".claude").join("agents").join("cto.md")).unwrap(),
             "USER AGENT\n",
-            "agents must be overwritten by --reset-agents",
+            "v0.9.0: --reset-agents no longer overwrites user agents (engine seeds none)",
         );
     }
 

@@ -76,6 +76,9 @@ fn meta(
         skills_sha: None,
         trigger: Some("compare".into()),
         compare_group: group.map(str::to_string),
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     }
 }
 

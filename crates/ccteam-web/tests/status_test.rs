@@ -96,6 +96,9 @@ fn write_one_tracked_session(root: &std::path::Path) {
             skills_sha: None,
             trigger: None,
             compare_group: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
         },
     )
     .unwrap();
@@ -171,6 +174,13 @@ async fn t01_status_empty_install_is_zeroed_snapshot() {
     assert!(
         body["budget_cap_24h"].is_null(),
         "no project configures a budget → null cap"
+    );
+    // v0.9.0 W2 (F2/F7) — the delegations block is present + zeroed on an
+    // empty install.
+    assert_eq!(
+        body["delegations"],
+        json!({ "active_watches": 0, "notified_24h": 0, "denied_24h": 0 }),
+        "empty install → zeroed delegation counters"
     );
 }
 

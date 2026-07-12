@@ -200,26 +200,31 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "enum": ["skip", "hitl"],
                         "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) makes a non-allowlist tool call pop an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt."
                     },
-                    "title": { "type": "string", "description": "Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt." }
+                    "title": { "type": "string", "description": "Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt." },
+                    "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-project, within ~1h) replays the ORIGINAL spawn (same sid, zero side effects) instead of creating a second session — safe against MCP-client timeouts. In-memory only: a daemon restart forgets keys." }
                 },
                 "required": [],
             }),
         }),
         json!({
             "name": "ccteam__session_dispatch",
-            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). Returns the submitted turn id. The target runs asynchronously; read its answer with session_collect once the turn completes. This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when it completes, ccteam delivers a completion notification back to you as a new turn (set `notify:false` to opt out and poll session_collect yourself). Pass `wait_seconds>0` to block inline for the answer: returns `{status:\"completed\", result_text, cost_usd?}` on completion or `{status:\"pending\"}` on timeout (the child keeps running — never cancelled). A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "sid": { "type": "string", "description": "Gateway session id (`s{n}`) from session_spawn / session_list." },
-                    "task": { "type": "string", "description": "Task / instruction text, forwarded verbatim as a user turn." }
+                    "task": { "type": "string", "description": "Task / instruction text, forwarded verbatim as a user turn." },
+                    "wait_seconds": { "type": "integer", "description": "Block up to this many seconds (0–600, default 0 = async) for the child's answer. On completion returns it inline (`status:completed`); on timeout returns `status:pending` and the child keeps running." },
+                    "notify": { "type": "boolean", "description": "When true (default), ccteam wakes you with a completion-notification turn once the child's turn completes. Set false for ledger-only (you poll session_collect yourself)." },
+                    "title": { "type": "string", "description": "Optional short label (≤80 chars) for the notification / ledger only — NEVER concatenated into the task or any prompt." },
+                    "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-target-child, within ~1h) replays the ORIGINAL dispatch (same turn) instead of double-dispatching. In-memory only: a daemon restart forgets keys." }
                 },
                 "required": ["sid", "task"],
             }),
         }),
         json!({
             "name": "ccteam__session_collect",
-            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Returns an empty `turns` array when the target hasn't answered yet.",
+            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns plus the child's `vendor_session_id` (native resume key), `status` (live/idle/stopped), and accrued `cost_usd`. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Returns an empty `turns` array when the target hasn't answered yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -232,7 +237,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_list",
-            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`. Use this to find a `sid` to dispatch to or collect from.",
+            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`, plus the delegation `parent_sid` (null for a root), `host`, `cost_usd`, and `title`. The response also includes a `tree` field (roots → children by `parent_sid`) so you can see the delegation topology. Use this to find a `sid` to dispatch to or collect from.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {},
@@ -466,7 +471,7 @@ mod tests {
         ] {
             assert!(
                 SESSION_TOOL_NAMES.contains(&needed),
-                "the cto role depends on the `{needed}` scheduling tool"
+                "the session_* scheduling tools depend on the `{needed}` tool"
             );
         }
     }

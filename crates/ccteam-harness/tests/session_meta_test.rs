@@ -35,6 +35,9 @@ fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionM
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     }
 }
 

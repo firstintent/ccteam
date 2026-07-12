@@ -68,6 +68,59 @@ pub struct CcteamConfig {
     /// hosts where ccteam shouldn't touch sibling tools' state.
     #[serde(default = "default_claude_jobs_retention_days")]
     pub claude_jobs_retention_days: u32,
+
+    /// v0.9.0 W2 (F5) — delegation guardrails. Absent → all documented
+    /// defaults (zero-config runs safely). Global engine policy the gateway
+    /// enforces on every agent-initiated (Ambient) spawn/dispatch.
+    #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
+    pub delegation: DelegationConfig,
+}
+
+/// v0.9.0 W2 (F5) — delegation guardrail knobs. Every field defaults, so an
+/// absent `delegation:` section (or absent individual keys) yields the
+/// documented anti-runaway posture without any config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DelegationConfig {
+    /// Max delegation depth. A delegated child's depth is `parent.depth + 1`
+    /// (a human-created session is depth 0); a spawn that would exceed this is
+    /// rejected.
+    #[serde(default = "default_delegation_max_depth")]
+    pub max_depth: u32,
+    /// Max active (non-stopped) DIRECT children a single parent may hold.
+    #[serde(default = "default_delegation_max_children")]
+    pub max_children: u32,
+    /// Max active delegated sessions (any `parent_sid`) in one project — the
+    /// runaway-minting ceiling.
+    #[serde(default = "default_delegation_max_delegated")]
+    pub max_delegated: u32,
+}
+
+pub fn default_delegation_max_depth() -> u32 {
+    2
+}
+pub fn default_delegation_max_children() -> u32 {
+    5
+}
+pub fn default_delegation_max_delegated() -> u32 {
+    16
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: default_delegation_max_depth(),
+            max_children: default_delegation_max_children(),
+            max_delegated: default_delegation_max_delegated(),
+        }
+    }
+}
+
+impl DelegationConfig {
+    /// True when this equals the built-in default posture — lets the config
+    /// writer omit the section so an untouched `config.yaml` stays byte-stable.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default value for `claude_jobs_retention_days` when the field is
@@ -84,6 +137,7 @@ impl Default for CcteamConfig {
             projects: Vec::new(),
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
+            delegation: DelegationConfig::default(),
         }
     }
 }
@@ -243,6 +297,7 @@ mod tests {
             projects: vec![entry.clone()],
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
+            delegation: DelegationConfig::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path()).unwrap();

@@ -194,6 +194,9 @@ async fn resume_prefers_session_resume_no_replay() {
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     };
     write_session_meta(project, &meta).unwrap();
 
@@ -280,6 +283,9 @@ async fn resume_carries_mcp_servers() {
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     };
     write_session_meta(project, &meta).unwrap();
 

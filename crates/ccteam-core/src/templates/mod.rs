@@ -81,13 +81,6 @@ pub use project_probe::{probe as probe_project, Language, ProjectKind, ProjectPr
 /// the new shape.
 pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 
-/// v8.3 session=role: the default `cto` persona seeded into every
-/// project's `.claude/agents/cto.md` by `ccteam init` + core
-/// `bootstrap_project_at_dir`. IM/chat sessions launch
-/// `claude --agent cto` by default, so this file must exist in every
-/// ccteam-created project. Single source for both seed paths.
-pub const CTO_ROLE_MD: &str = include_str!("cto_role.md");
-
 /// M2.4: helper templates that user-authored agent / workflow markdown
 /// can `@`-reference. Shipped inside the binary so a fresh install (or
 /// `ccteam doctor`) can stamp them into `~/.ccteam/templates/` without
@@ -597,70 +590,5 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map["pr-review-toolkit@claude-plugins-official"], true);
         assert_eq!(map["feature-dev@claude-plugins-official"], true);
-    }
-
-    /// The seeded `cto` role MUST NOT restrict its tools via a frontmatter
-    /// `tools:` line. Omitting it makes the spawned session inherit ALL tools
-    /// (Claude Code treats a missing `tools:` as the wildcard), so every
-    /// `mcp__ccteam__ccteam__*` tool is available ambiently via `.mcp.json` —
-    /// the cto needs no per-agent enumeration. (The earlier template DID carry
-    /// such a line, but listed the handles as single-`ccteam`
-    /// `mcp__ccteam__session_*`, which never matched the real double-`ccteam`
-    /// names and so granted nothing.) The cto's scheduling PRIVILEGE is
-    /// enforced by the daemon `(role, secret)` gate, and the scheduling tool
-    /// SET is guarded by `cto_scheduling_tools_present_in_canonical_set` in
-    /// `mcp_session_tools` — neither lives in this fragile frontmatter.
-    #[test]
-    fn cto_role_template_does_not_restrict_tools() {
-        // Frontmatter is the block between the first two `---` fences.
-        let after = CTO_ROLE_MD
-            .strip_prefix("---")
-            .expect("cto_role.md starts with frontmatter fence");
-        let end = after.find("---").expect("frontmatter closing fence");
-        let frontmatter = &after[..end];
-        assert!(
-            !frontmatter
-                .lines()
-                .any(|l| l.trim_start().starts_with("tools:")),
-            "cto_role.md frontmatter must NOT carry a restrictive `tools:` line \
-             (omit it so the session inherits all tools, incl. ambient \
-             mcp__ccteam__ccteam__* via .mcp.json); the cto's scheduling \
-             privilege is enforced by the daemon (role, secret) gate, not by a \
-             per-agent allow-list"
-        );
-    }
-
-    #[test]
-    fn cto_role_template_has_fresh_user_guidance() {
-        // Whitespace-normalized so the assertions check for the GUIDANCE, not the
-        // prose line-wrapping (a needle must not silently fail when a sentence
-        // happens to wrap across two lines).
-        let body = CTO_ROLE_MD.split_whitespace().collect::<Vec<_>>().join(" ");
-        for needle in [
-            "New user asking",
-            "ccteam config",
-            "ccteam start",
-            "/cd <project>",
-            "roleless = bare Claude",
-            "`cto` = the default steward",
-            "work-role = a specialist in `.claude/agents/<role>.md`",
-        ] {
-            assert!(
-                body.contains(needle),
-                "cto_role.md missing fresh-user guidance {needle:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cto_role_template_describes_session_spawn_as_fresh_sid() {
-        assert!(
-            CTO_ROLE_MD.contains("mints a NEW sid"),
-            "cto_role.md must say session_spawn mints a fresh sid"
-        );
-        assert!(
-            !CTO_ROLE_MD.contains("(project, role) dedup") && !CTO_ROLE_MD.contains("idempotent"),
-            "cto_role.md must not describe removed (project, role) dedup"
-        );
     }
 }

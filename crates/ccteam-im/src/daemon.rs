@@ -370,6 +370,11 @@ where
     // (caller-supplied or daemon-built); on the standalone path with no mcp.sock
     // the trigger simply never fires.
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    // v0.9.0 W2 (F2) — the delegation notifier channel is created OUTSIDE the
+    // locked setup block (its receiver is moved into the notifier task after
+    // setup); the sender is wired in BEFORE `set_event_sink` so every pump it
+    // spawns captures it.
+    let (delegation_tx, delegation_rx) = tokio::sync::mpsc::unbounded_channel();
     {
         // Hold the gateway lock only for synchronous setup. Restored-session
         // resume can wait on vendor startup (stream-json `system:init`), and
@@ -385,6 +390,7 @@ where
             g.set_pending(pending);
         }
         log_orphan_chat_sessions(&g).await;
+        g.set_delegation_notifier_tx(delegation_tx);
         g.set_event_sink(gateway_event_tx.clone());
         g.set_im_reload_trigger(reload_tx);
         // v0.8.22 P0-2 — wire the production HITL resolver onto the
@@ -413,6 +419,14 @@ where
     let restore_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {
         Gateway::resume_restored_sessions_shared(restore_gateway).await;
+    });
+    // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
+    // notifications missed while the daemon was down) + live delivery of every
+    // completed watched child turn. Owns its own gateway handle + the pump
+    // signal receiver.
+    let notifier_gateway = Arc::clone(&gateway);
+    tokio::spawn(async move {
+        Gateway::run_delegation_notifier(notifier_gateway, delegation_rx).await;
     });
 
     // V0.6.1 F132 — spawn one `Channel::listen` task per active

@@ -73,6 +73,25 @@ pub struct StatusResponse {
     /// path. The loop version grows this same row with oracle/gate columns.
     #[serde(default)]
     pub sessions: Vec<SessionCostRow>,
+    /// v0.9.0 W2 (F2/F7) — delegation observability: current durable watches +
+    /// the trailing-24h notification / denial counts.
+    #[serde(default)]
+    pub delegations: DelegationSummary,
+}
+
+/// v0.9.0 W2 (F2/F7) — the `delegations` block of `GET /status`: the A2A
+/// delegation runtime's observability counters.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct DelegationSummary {
+    /// Durable completion watches currently armed on disk (`delegation.json`
+    /// across every project's `.ccteam/chat/*/`).
+    pub active_watches: u32,
+    /// Completion notifications delivered in the trailing 24h
+    /// (`delegation_notified` progress events).
+    pub notified_24h: u32,
+    /// Delegations denied by a guardrail in the trailing 24h
+    /// (`delegation_denied` progress events).
+    pub denied_24h: u32,
 }
 
 /// v0.8.18 柱1 — one live session's fleet-view row. `cost_usd` is priced
@@ -207,6 +226,11 @@ pub(crate) async fn handle_status(
         }
     }
 
+    // v0.9.0 W2 (F2/F7) — delegation counters (shared aggregation in ccteam-im,
+    // `web → im`; active watches on disk + trailing-24h notify/deny counts).
+    let (active_watches, notified_24h, denied_24h) =
+        ccteam_im::delegation::fleet_delegations(&app.paths);
+
     Json(StatusResponse {
         daemon_healthy,
         sessions_live,
@@ -215,6 +239,11 @@ pub(crate) async fn handle_status(
         cost_24h_by_vendor,
         budget_cap_24h,
         sessions: session_rows,
+        delegations: DelegationSummary {
+            active_watches,
+            notified_24h,
+            denied_24h,
+        },
     })
     .into_response()
 }
@@ -352,6 +381,8 @@ mod tests {
             turn_count: 0,
             cost_usd: None,
             waiting_approval: false,
+            parent_sid: None,
+            delegation_depth: 0,
         }
     }
 

@@ -32,6 +32,17 @@ pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
 /// prompt is outstanding so an operator (status / dashboard / `progress`)
 /// sees the agent is blocked, not stuck.
 pub const CHAT_PERMISSION_PROMPT_OUTSTANDING: &str = "chat_permission_prompt_outstanding";
+// v0.9.0 W2 (F2/F5) — delegation lifecycle events. Schema authority for the
+// `delegation_*` family lives HERE (progress_bridge); the gateway/dispatch
+// layer only calls [`build_delegation_event`] at the corresponding points.
+pub const DELEGATION_SPAWNED: &str = "delegation_spawned";
+pub const DELEGATION_DISPATCHED: &str = "delegation_dispatched";
+pub const DELEGATION_COMPLETED: &str = "delegation_completed";
+pub const DELEGATION_NOTIFIED: &str = "delegation_notified";
+pub const DELEGATION_COLLECTED: &str = "delegation_collected";
+pub const DELEGATION_STOPPED: &str = "delegation_stopped";
+pub const DELEGATION_DENIED: &str = "delegation_denied";
+
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
 pub const CODEX_THREAD_STATUS: &str = "codex_thread_status";
@@ -322,6 +333,43 @@ pub fn build_merger_lossy_partial_event(
         "session": session,
         "ts": Utc::now().to_rfc3339(),
     })
+}
+
+/// v0.9.0 W2 — build one `delegation_*` progress event. `event` is one of the
+/// `DELEGATION_*` consts. The unified payload is `{parent_sid, child_sid,
+/// vendor, host, turn?, title?, reason?}` — optional fields are omitted when
+/// `None`/empty so a `delegation_denied{reason}` and a `delegation_spawned`
+/// share one shape without null noise.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delegation_event(
+    event: &str,
+    parent_sid: &str,
+    child_sid: &str,
+    vendor: &str,
+    host: &str,
+    turn: Option<&str>,
+    title: Option<&str>,
+    reason: Option<&str>,
+) -> Value {
+    let mut ev = json!({
+        "event": event,
+        "parent_sid": parent_sid,
+        "child_sid": child_sid,
+        "vendor": vendor,
+        "host": host,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    let obj = ev.as_object_mut().expect("json object");
+    if let Some(turn) = turn.filter(|t| !t.is_empty()) {
+        obj.insert("turn".to_string(), Value::String(turn.to_string()));
+    }
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
+        obj.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+        obj.insert("reason".to_string(), Value::String(reason.to_string()));
+    }
+    ev
 }
 
 pub fn build_codex_plan_updated_event(

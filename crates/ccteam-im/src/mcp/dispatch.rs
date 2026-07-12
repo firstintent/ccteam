@@ -912,6 +912,10 @@ async fn execute_session_tool(
             obj.insert("_caller_slug".to_string(), serde_json::json!(ctx.slug));
             obj.insert("_caller_sid".to_string(), serde_json::json!(ctx.sid));
             obj.insert("_caller_role".to_string(), serde_json::json!(ctx.role));
+            // v0.9.0 W2 (F2/F5) — the caller's delegation depth (server-resolved
+            // from CallerCtx, never caller-supplied): a child's depth = this + 1,
+            // the input to the `delegation.max_depth` guardrail.
+            obj.insert("_caller_depth".to_string(), serde_json::json!(ctx.depth));
         }
     }
 
@@ -1045,40 +1049,115 @@ async fn run_session_spawn(
         }
     }
     // Owner = the shared ops pool (`web-api`): MCP-spawned children stay visible
-    // to the owner's console + IM (owner is not inherited from the caller; the
-    // parent link is a meta property that lands in W2).
+    // to the owner's console + IM. Owner is NOT inherited from the caller — the
+    // parent link is a `meta.parent_sid` property (v0.9.0 W2), not an owner change.
     let owner_id = "web-api".to_string();
-
-    let (sid, model_warning, resolved) = {
-        let mut gw = gateway.lock().await;
-        let created = gw
-            .create_session_api_on_host(
-                project.clone(),
-                role.clone(),
-                vendor,
-                permission_mode,
-                protocol,
-                owner_id,
-                host.clone(),
-                tuning,
-            )
-            .await
-            .map_err(|e| format!("session_spawn failed: {e}"))?;
-        let sid = created.sid.clone();
-        // Resolve the child's project_dir under the SAME lock (sync) so we can
-        // read its vendor resume key off-lock.
-        let resolved = gw.session_resolve(&sid);
-        (sid, created.model_warning, resolved)
+    // v0.9.0 W2 (F7) — optional idempotency key: a client retry with the same
+    // key replays the original spawn (same sid) with zero side effects.
+    let idem_key = args
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // v0.9.0 W2 (F2/F5) — the delegation parent. Ambient = the caller's
+    // server-resolved principal (sid/depth/role, injected in `execute_session_tool`
+    // from CallerCtx — never caller-supplied). Admin (HTTP front door) = a
+    // human/root spawn (no parent, unrestricted). Guardrails apply only when a
+    // real parent is present.
+    let parent = match caller {
+        McpCaller::Ambient => {
+            let caller_sid = args
+                .get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if caller_sid.is_empty() {
+                None
+            } else {
+                Some(crate::gateway::DelegationParent {
+                    sid: caller_sid,
+                    depth: args
+                        .get("_caller_depth")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    role: args
+                        .get("_caller_role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            }
+        }
+        McpCaller::Admin => None,
     };
+
+    // Check idempotency + create under ONE lock so a concurrent same-key retry
+    // can never race past the replay into a second spawn.
+    let (sid, model_warning, resolved, replay) = {
+        let mut gw = gateway.lock().await;
+        if let Some(key) = idem_key.as_deref() {
+            if let Some(body) = gw.spawn_idem_replay(&project, key) {
+                (String::new(), None, None, Some(body))
+            } else {
+                let created = gw
+                    .create_delegated_session(
+                        project.clone(),
+                        role.clone(),
+                        vendor,
+                        permission_mode,
+                        protocol,
+                        owner_id,
+                        host.clone(),
+                        tuning,
+                        parent,
+                        title.clone(),
+                    )
+                    .await
+                    .map_err(|e| format!("session_spawn: {e}"))?;
+                let sid = created.sid.clone();
+                let resolved = gw.session_resolve(&sid);
+                (sid, created.model_warning, resolved, None)
+            }
+        } else {
+            let created = gw
+                .create_delegated_session(
+                    project.clone(),
+                    role.clone(),
+                    vendor,
+                    permission_mode,
+                    protocol,
+                    owner_id,
+                    host.clone(),
+                    tuning,
+                    parent,
+                    title.clone(),
+                )
+                .await
+                .map_err(|e| format!("session_spawn: {e}"))?;
+            let sid = created.sid.clone();
+            let resolved = gw.session_resolve(&sid);
+            (sid, created.model_warning, resolved, None)
+        }
+    };
+    // Idempotent replay: return the ORIGINAL body verbatim (+ a replay flag).
+    if let Some(body) = replay {
+        return Ok(mark_idempotent_replay(&body));
+    }
+    // Read the child meta once for the vendor resume key + the delegation
+    // lineage (parent_sid/depth) the ledger just persisted.
     // vendor_session_id = the vendor's native resume key (`meta.vendor_uuid`).
     // May be empty for some vendors at spawn time — return "" honestly (the
     // codex-plugin-cc lesson: always surface the resume key when we have it).
-    let vendor_session_id = resolved
-        .and_then(|r| {
-            ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &sid).ok()
-        })
-        .map(|m| m.vendor_uuid)
+    let child_meta = resolved.and_then(|r| {
+        ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &sid).ok()
+    });
+    let vendor_session_id = child_meta
+        .as_ref()
+        .map(|m| m.vendor_uuid.clone())
         .unwrap_or_default();
+    let parent_sid = child_meta.as_ref().and_then(|m| m.parent_sid.clone());
+    let delegation_depth = child_meta.as_ref().map(|m| m.delegation_depth).unwrap_or(0);
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -1090,6 +1169,8 @@ async fn run_session_spawn(
         "host": host,
         "vendor_session_id": vendor_session_id,
         "permission_mode": permission_mode.as_str(),
+        "parent_sid": parent_sid,
+        "delegation_depth": delegation_depth,
         "hint": "dispatch a task with session_dispatch{sid, task}, then read the result with session_collect{sid}.",
     });
     if let Some(t) = title {
@@ -1098,7 +1179,28 @@ async fn run_session_spawn(
     if let Some(model_warning) = model_warning {
         body["model_warning"] = serde_json::json!(model_warning);
     }
-    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
+    let out = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string());
+    // v0.9.0 W2 (F7) — record for idempotent replay (the exact body a retry
+    // returns, with a replay flag added). Keyed per-project by the client key.
+    if let Some(key) = idem_key.as_deref() {
+        gateway.lock().await.spawn_idem_record(&project, key, &out);
+    }
+    Ok(out)
+}
+
+/// v0.9.0 W2 (F7) — mark a recorded idempotency body as a replay: parse it,
+/// insert `"idempotent_replay": true`, re-serialize. On a parse miss (should
+/// never happen — we only store our own bodies) return the stored body as-is.
+fn mark_idempotent_replay(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("idempotent_replay".to_string(), serde_json::json!(true));
+            }
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.to_string())
+        }
+        Err(_) => body.to_string(),
+    }
 }
 
 /// Parse the optional `protocol` arg for `session_spawn`. Agents may select
@@ -1132,6 +1234,13 @@ fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
 }
 
 /// `session_dispatch` — forward a task as a user turn to a session by sid.
+/// v0.9.0 W2 (F2/F5/F7): an Ambient (agent) dispatch (a) rejects a cycle
+/// (target == caller or an ancestor), (b) arms a durable completion watch on
+/// the child (parent = the dispatcher) so its next turn notifies the parent,
+/// (c) emits `delegation_dispatched`, and (d) optionally blocks up to
+/// `wait_seconds` for the child's answer inline. `idempotency_key` makes a
+/// client retry replay the original turn (never double-dispatch). `title` is
+/// ledger/notification only — NEVER concatenated into the task.
 async fn run_session_dispatch(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -1147,19 +1256,258 @@ async fn run_session_dispatch(
     // R-M3 — only operate sessions in the caller's own project.
     assert_caller_owns_session("session_dispatch", args, gateway, &sid, caller).await?;
 
-    let mut gw = gateway.lock().await;
-    let turn_id = gw
-        .submit_to_sid(&sid, task)
-        .await
-        .map_err(|e| format!("session_dispatch failed: {e}"))?;
-    drop(gw);
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(600);
+    let notify = args.get("notify").and_then(|v| v.as_bool()).unwrap_or(true);
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if let Some(t) = &title {
+        let n = t.chars().count();
+        if n > 80 {
+            return Err(format!(
+                "session_dispatch: `title` too long ({n} chars; max 80)"
+            ));
+        }
+    }
+    let idem_key = args
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // The dispatcher's server-resolved principal (Ambient only; injected in
+    // `execute_session_tool`). A delegation is armed only for an agent caller.
+    let caller_sid = match caller {
+        McpCaller::Ambient => args
+            .get("_caller_sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        McpCaller::Admin => String::new(),
+    };
+    let caller_slug = args
+        .get("_caller_slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_delegation = !caller_sid.is_empty();
+
+    // ---- Scope 1: idempotent replay + cycle guard (fast, no submit) ----
+    {
+        let mut gw = gateway.lock().await;
+        if let Some(key) = idem_key.as_deref() {
+            if let Some(body) = gw.dispatch_idem_replay(&sid, key) {
+                return Ok(mark_idempotent_replay(&body));
+            }
+        }
+        if is_delegation {
+            let emit_cycle = |gw: &crate::gateway::Gateway| {
+                if let Some((vendor, host, _)) = gw.session_vendor_host_slug(&sid) {
+                    gw.emit_delegation_progress(
+                        &caller_slug,
+                        ccteam_harness::execution::progress_bridge::DELEGATION_DENIED,
+                        &caller_sid,
+                        &sid,
+                        vendor,
+                        &host,
+                        None,
+                        title.as_deref(),
+                        Some("cycle"),
+                    );
+                }
+            };
+            if sid == caller_sid {
+                emit_cycle(&gw);
+                return Err(
+                    "session_dispatch: delegation denied: cannot dispatch a session to itself (cycle)"
+                        .to_string(),
+                );
+            }
+            if gw.ancestor_chain(&caller_sid).contains(&sid) {
+                emit_cycle(&gw);
+                return Err(format!(
+                    "session_dispatch: delegation denied: target {sid} is an ancestor of the caller {caller_sid} (cycle)"
+                ));
+            }
+            // Budget gate: the CHILD's vendor accrues the cost of the task.
+            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(&sid) {
+                if gw.delegation_budget_exceeded(&slug, vendor) {
+                    gw.emit_delegation_progress(
+                        &slug,
+                        ccteam_harness::execution::progress_bridge::DELEGATION_DENIED,
+                        &caller_sid,
+                        &sid,
+                        vendor,
+                        &host,
+                        None,
+                        title.as_deref(),
+                        Some("budget"),
+                    );
+                    return Err(format!(
+                        "session_dispatch: delegation denied: vendor `{}` has reached its 24h budget for project `{slug}` (adjust budgets or wait for the window to slide)",
+                        crate::delegation::vendor_key(vendor)
+                    ));
+                }
+            }
+        }
+    }
+
+    // ---- Scope 2: subscribe (if waiting) → submit → arm watch → emit ----
+    let (turn_id, rx) = {
+        let mut gw = gateway.lock().await;
+        // Subscribe BEFORE submitting so a fast child can't answer before we
+        // start listening (the wait races the child's own turn).
+        let rx = if wait_seconds > 0 {
+            Some(gw.subscribe_events())
+        } else {
+            None
+        };
+        let turn_id = gw
+            .submit_to_sid(&sid, task)
+            .await
+            .map_err(|e| format!("session_dispatch failed: {e}"))?;
+        if is_delegation {
+            gw.arm_delegation_watch(
+                &sid,
+                &caller_sid,
+                notify,
+                title.clone(),
+                Some(turn_id.clone()),
+            );
+            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(&sid) {
+                gw.emit_delegation_progress(
+                    &slug,
+                    ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
+                    &caller_sid,
+                    &sid,
+                    vendor,
+                    &host,
+                    Some(&turn_id),
+                    title.as_deref(),
+                    None,
+                );
+            }
+        }
+        (turn_id, rx)
+    };
+
+    // ---- wait branch (OFF the gateway lock) ----
+    let out = if let Some(rx) = rx {
+        dispatch_wait_for_completion(gateway, &sid, &turn_id, wait_seconds, rx, is_delegation).await
+    } else {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "sid": sid,
+            "turn_id": turn_id,
+            "status": "dispatched",
+            "hint": "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid}).",
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    };
+    // v0.9.0 W2 (F7) — record for idempotent replay.
+    if let Some(key) = idem_key.as_deref() {
+        gateway.lock().await.dispatch_idem_record(&sid, key, &out);
+    }
+    Ok(out)
+}
+
+/// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits an
+/// `Answer` for `child_sid` on the gateway broadcast until the deadline. NEVER
+/// holds the gateway lock across the await (lock discipline). On completion it
+/// reads the child's freshly-appended turn (clean text) + cost from meta and,
+/// for a delegation, disarms the watch (the caller already has the result
+/// inline — suppress the redundant notification). On timeout it returns
+/// `pending` and leaves the watch armed (the child is not cancelled).
+async fn dispatch_wait_for_completion(
+    gateway: &GatewayHandle,
+    child_sid: &str,
+    turn_id: &str,
+    wait_seconds: u64,
+    mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
+    is_delegation: bool,
+) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
+    let completed = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(ev)) => {
+                let hit = ev.sid.as_deref() == Some(child_sid)
+                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer);
+                if hit {
+                    break true;
+                }
+            }
+            // Broadcast lag → keep waiting (we may have missed unrelated frames).
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            // Sender gone (daemon shutdown) or deadline → pending.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break false,
+            Err(_) => break false,
+        }
+    };
+
+    if !completed {
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "sid": child_sid,
+            "turn_id": turn_id,
+            "status": "pending",
+            "hint": "still running; you will be notified on completion, or poll session_collect{sid}.",
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+    }
+
+    // Resolve the child (sync) under a brief lock, then read its transcript
+    // tail OFF the lock for a clean, unprefixed result.
+    let resolved = {
+        let gw = gateway.lock().await;
+        gw.session_resolve(child_sid)
+    };
+    let (result_text, result_turn, cost_usd) = resolved
+        .as_ref()
+        .map(|r| {
+            let last =
+                ccteam_harness::execution::turns_mirror::read_all_turns(&r.project_dir, &r.sid)
+                    .ok()
+                    .and_then(|all| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
+            let cost =
+                ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &r.sid)
+                    .ok()
+                    .and_then(|m| m.cost_usd);
+            match last {
+                Some(t) => (t.assistant, Some(t.turn_id), cost),
+                None => (String::new(), None, cost),
+            }
+        })
+        .unwrap_or((String::new(), None, None));
+
+    // Inline completion: the caller already holds the result → disarm the watch
+    // so a delegation doesn't ALSO wake the parent with a redundant turn.
+    if is_delegation {
+        gateway.lock().await.disarm_delegation_watch(child_sid);
+    }
+
+    let mut body = serde_json::json!({
         "ok": true,
-        "sid": sid,
+        "sid": child_sid,
         "turn_id": turn_id,
-        "hint": "the child runs asynchronously; poll session_collect{sid, since: turn_id} for its answer.",
-    }))
-    .unwrap_or_else(|_| "{}".to_string()))
+        "status": "completed",
+        "result_text": result_text,
+        "result_turn": result_turn,
+    });
+    if let Some(c) = cost_usd {
+        body["cost_usd"] = serde_json::json!(c);
+    }
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// v0.8.7 review-fix (R-L3) — pure paging core of [`run_session_collect`],
@@ -1233,6 +1581,10 @@ async fn run_session_collect(
         gw.session_resolve(&sid)
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
+    // A collectable session is one the gateway still tracks → "live" (the same
+    // cheap liveness hint `session_list` reports; a fully-stopped session is no
+    // longer resolvable so it errors above).
+    let status = "live";
 
     // Tail the ccteam-owned transcript mirror.
     // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
@@ -1243,14 +1595,28 @@ async fn run_session_collect(
     )
     .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
 
+    // v0.9.0 W2 (F2) — surface the vendor resume key + accrued cost from meta.
+    let meta = ccteam_harness::execution::session_meta::read_session_meta(
+        &resolved.project_dir,
+        &resolved.sid,
+    )
+    .ok();
+    let vendor_session_id = meta
+        .as_ref()
+        .map(|m| m.vendor_uuid.clone())
+        .unwrap_or_default();
+    let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
+
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst). Pure logic in `page_collected_turns`.
     let (rows, last_turn_id, truncated) = page_collected_turns(&all, since.as_deref(), n);
 
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    let mut body = serde_json::json!({
         "ok": true,
         "sid": sid,
         "role": resolved.role,
+        "vendor_session_id": vendor_session_id,
+        "status": status,
         "turns": rows,
         // Cursor to pass as `since` on the next poll (None when no turns yet).
         // On truncation this is the boundary turn → poll again to get the rest.
@@ -1258,8 +1624,33 @@ async fn run_session_collect(
         // True when more turns than `n` were available after `since`; the caller
         // should poll again with `cursor` to page through the remainder.
         "truncated": truncated,
-    }))
-    .unwrap_or_else(|_| "{}".to_string()))
+    });
+    if let Some(c) = cost_usd {
+        body["cost_usd"] = serde_json::json!(c);
+    }
+    // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
+    if caller == McpCaller::Ambient && !rows.is_empty() {
+        if let (Some(m), Some(caller_sid)) = (
+            meta.as_ref(),
+            args.get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
+        ) {
+            let gw = gateway.lock().await;
+            gw.emit_delegation_progress(
+                &resolved.project,
+                ccteam_harness::execution::progress_bridge::DELEGATION_COLLECTED,
+                caller_sid,
+                &resolved.sid,
+                m.vendor,
+                &m.host,
+                last_turn_id.as_deref(),
+                None,
+                None,
+            );
+        }
+    }
+    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// `session_list` — snapshot the gateway's live sessions.
@@ -1278,14 +1669,57 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
                 "vendor": v.vendor,
                 "current": v.current,
                 "status": v.status,
+                // v0.9.0 W2 (F2) — delegation topology + attribution.
+                "parent_sid": v.parent_sid,
+                "delegation_depth": v.delegation_depth,
+                "host": v.host,
+                "cost_usd": v.cost_usd,
+                "title": v.title,
             })
         })
+        .collect();
+    // v0.9.0 W2 (F2) — a `tree` view (roots → children by `parent_sid`) so a
+    // caller sees the delegation topology without recomputing it. Roots =
+    // sessions whose parent isn't in this list (a true root, or a parent in
+    // another project the caller can't see).
+    let sids: std::collections::HashSet<&str> = views.iter().map(|v| v.sid.as_str()).collect();
+    let tree: Vec<serde_json::Value> = views
+        .iter()
+        .filter(|v| {
+            v.parent_sid
+                .as_deref()
+                .map(|p| !sids.contains(p))
+                .unwrap_or(true)
+        })
+        .map(|v| session_tree_node(v, &views))
         .collect();
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "sessions": rows,
+        "tree": tree,
     }))
     .unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// v0.9.0 W2 (F2) — build one node of the `session_list` delegation tree:
+/// `{sid, role, vendor, children:[...]}` recursively (children = sessions whose
+/// `parent_sid` is this sid). Depth is bounded by the live set, so the
+/// recursion terminates.
+fn session_tree_node(
+    v: &crate::gateway::SessionView,
+    all: &[crate::gateway::SessionView],
+) -> serde_json::Value {
+    let children: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|c| c.parent_sid.as_deref() == Some(v.sid.as_str()) && c.sid != v.sid)
+        .map(|c| session_tree_node(c, all))
+        .collect();
+    serde_json::json!({
+        "sid": v.sid,
+        "role": v.role,
+        "vendor": v.vendor,
+        "children": children,
+    })
 }
 
 /// `session_stop` — deregister + close a session by sid (explicit command).
@@ -1298,10 +1732,47 @@ async fn run_session_stop(
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
     assert_caller_owns_session("session_stop", args, gateway, &sid, caller).await?;
+    // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
+    // descendants (walk the target's parent chain; it must reach the caller).
+    // Admin/human callers are unrestricted (fleet-wide).
+    let caller_sid = match caller {
+        McpCaller::Ambient => args
+            .get("_caller_sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        McpCaller::Admin => String::new(),
+    };
     let mut gw = gateway.lock().await;
+    if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
+        return Err(format!(
+            "session_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
+        ));
+    }
+    // Capture the delegation event fields + drop the child's own watch BEFORE
+    // the stop removes it from the live map.
+    let stopped_meta = gw.session_vendor_host_slug(&sid);
+    if !caller_sid.is_empty() {
+        gw.disarm_delegation_watch(&sid);
+    }
     gw.stop_session(&sid)
         .await
         .map_err(|e| format!("session_stop failed: {e}"))?;
+    if !caller_sid.is_empty() {
+        if let Some((vendor, host, slug)) = stopped_meta {
+            gw.emit_delegation_progress(
+                &slug,
+                ccteam_harness::execution::progress_bridge::DELEGATION_STOPPED,
+                &caller_sid,
+                &sid,
+                vendor,
+                &host,
+                None,
+                None,
+                None,
+            );
+        }
+    }
     drop(gw);
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
@@ -1520,6 +1991,16 @@ mod session_tool_tests {
     #[derive(Clone, Default)]
     struct StubAdapter {
         spawns: std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        /// v0.9.0 W2 — when true, `submit_turn` enqueues an echo AgentMessage
+        /// the pump folds into an `Answer` (for the dispatch-wait tests).
+        /// Default false = empty event stream (existing principal tests).
+        answer: bool,
+        /// Delay (ms) before `events()` yields — forces a `wait` timeout.
+        event_delay_ms: u64,
+        events: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::VecDeque<(String, ccteam_harness::ThreadEvent)>>,
+        >,
+        notify: std::sync::Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
@@ -1551,15 +2032,58 @@ mod session_tool_tests {
         async fn submit_turn(
             &self,
             h: &ccteam_harness::ThreadHandle,
-            _input: ccteam_harness::TurnInput,
+            input: ccteam_harness::TurnInput,
         ) -> std::result::Result<ccteam_harness::TurnId, ccteam_harness::HarnessError> {
+            if self.answer {
+                let text = match input {
+                    ccteam_harness::TurnInput::UserText(t) => t,
+                    _ => String::new(),
+                };
+                self.events.lock().await.push_back((
+                    h.identity.clone(),
+                    ccteam_harness::ThreadEvent::ItemCompleted {
+                        item: ccteam_harness::ThreadItem {
+                            id: "msg-1".into(),
+                            details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
+                                "echo: {text}"
+                            )),
+                        },
+                    },
+                ));
+                self.notify.notify_one();
+            }
             Ok(ccteam_harness::TurnId::new(format!("turn-{}", h.identity)))
         }
         fn events(
             &self,
-            _h: &ccteam_harness::ThreadHandle,
+            h: &ccteam_harness::ThreadHandle,
         ) -> futures::stream::BoxStream<'static, ccteam_harness::ThreadEvent> {
-            Box::pin(futures::stream::empty())
+            if !self.answer {
+                return Box::pin(futures::stream::empty());
+            }
+            let events = std::sync::Arc::clone(&self.events);
+            let notify = std::sync::Arc::clone(&self.notify);
+            let wanted = h.identity.clone();
+            let delay = self.event_delay_ms;
+            Box::pin(futures::stream::unfold((), move |_| {
+                let events = std::sync::Arc::clone(&events);
+                let notify = std::sync::Arc::clone(&notify);
+                let wanted = wanted.clone();
+                async move {
+                    loop {
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        let mut guard = events.lock().await;
+                        if let Some(idx) = guard.iter().position(|(t, _)| t == &wanted) {
+                            let (_, evt) = guard.remove(idx).unwrap();
+                            return Some((evt, ()));
+                        }
+                        drop(guard);
+                        notify.notified().await;
+                    }
+                }
+            }))
         }
         async fn resume_thread(
             &self,
@@ -2113,5 +2637,336 @@ mod session_tool_tests {
         let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20);
         assert_eq!(rows_u.len(), 3);
         assert!(!trunc_u);
+    }
+
+    // ========================================================================
+    // v0.9.0 W2 (F2/F7) — dispatch-handler: idempotency, cycle, stop, wait.
+    // The handlers are called directly with the `_caller_*` context that
+    // `execute_session_tool` injects (so no secret dance).
+    // ========================================================================
+
+    /// Inject the server-resolved caller identity `execute_session_tool` sets.
+    fn ambient(caller_sid: &str, slug: &str, mut args: serde_json::Value) -> serde_json::Value {
+        let o = args.as_object_mut().unwrap();
+        o.insert("_caller_sid".into(), json!(caller_sid));
+        o.insert("_caller_slug".into(), json!(slug));
+        o.insert("_caller_role".into(), json!(""));
+        o.insert("_caller_depth".into(), json!(0));
+        args
+    }
+
+    /// A delegation-wired gateway (fresh stub per spawn — own event stream;
+    /// `answer`/`delay_ms` control the wait tests). Returns (handle, principal).
+    async fn dispatch_gateway(
+        answer: bool,
+        delay_ms: u64,
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String) {
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter {
+                answer,
+                event_delay_ms: delay_ms,
+                ..Default::default()
+            }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_delegation_notifier_tx(dtx);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+        let principal = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let handle = std::sync::Arc::new(tokio::sync::Mutex::new(gw));
+        tokio::spawn(Gateway::run_delegation_notifier(
+            std::sync::Arc::clone(&handle),
+            drx,
+        ));
+        (handle, principal)
+    }
+
+    fn parse(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_idempotency_replay_returns_same_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let a = ambient(
+            &principal,
+            "alpha",
+            json!({ "idempotency_key": "k1", "vendor": "claude" }),
+        );
+        let r1 = parse(
+            &run_session_spawn(&a, &gw, McpCaller::Ambient)
+                .await
+                .unwrap(),
+        );
+        let r2 = parse(
+            &run_session_spawn(&a, &gw, McpCaller::Ambient)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(r1["sid"], r2["sid"], "replay returns the original sid");
+        assert_eq!(r2["idempotent_replay"], json!(true));
+        assert!(
+            r1.get("idempotent_replay").is_none(),
+            "first is not a replay"
+        );
+        // Exactly ONE child was created (principal + 1 child = 2 sessions).
+        let list = parse(&run_session_list(&gw).await.unwrap());
+        let children = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["parent_sid"] == json!(principal))
+            .count();
+        assert_eq!(children, 1, "no double-spawn: {list}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_idempotency_replay_returns_same_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let d = ambient(
+            &principal,
+            "alpha",
+            json!({ "sid": child, "task": "go", "idempotency_key": "d1" }),
+        );
+        let t1 = parse(
+            &run_session_dispatch(&d, &gw, McpCaller::Ambient)
+                .await
+                .unwrap(),
+        );
+        let t2 = parse(
+            &run_session_dispatch(&d, &gw, McpCaller::Ambient)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(t1["turn_id"], t2["turn_id"], "replay returns the same turn");
+        assert_eq!(t2["idempotent_replay"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_cycle_self_and_ancestor_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        // self-dispatch.
+        let e = run_session_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": principal, "task": "x" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("itself"), "self cycle: {e}");
+        // child dispatching to its ancestor (principal).
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let e2 = run_session_dispatch(
+            &ambient(&child, "alpha", json!({ "sid": principal, "task": "x" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(e2.contains("ancestor"), "ancestor cycle: {e2}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_descendant_ok_nondescendant_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A sibling root (not a descendant of principal).
+        let sibling = {
+            let mut g = gw.lock().await;
+            g.create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let e = run_session_stop(
+            &ambient(&principal, "alpha", json!({ "sid": sibling })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("not a descendant"), "non-descendant stop: {e}");
+        // The real descendant stops fine.
+        let ok = run_session_stop(
+            &ambient(&principal, "alpha", json!({ "sid": child })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&ok)["stopped"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn dispatch_wait_inline_completed_and_timeout_pending() {
+        // inline completed (child answers immediately).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": child, "task": "go", "wait_seconds": 6 }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r["status"], json!("completed"), "inline: {r}");
+        assert!(
+            r["result_text"].as_str().unwrap().contains("echo: go"),
+            "inline result: {r}"
+        );
+
+        // timeout pending (child's answer is delayed past the wait).
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let (gw2, p2) = dispatch_gateway(true, 10_000, tmp2.path()).await;
+        let child2 = parse(
+            &run_session_spawn(
+                &ambient(&p2, "alpha", json!({ "vendor": "claude" })),
+                &gw2,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r2 = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &p2,
+                    "alpha",
+                    json!({ "sid": child2, "task": "go", "wait_seconds": 1 }),
+                ),
+                &gw2,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r2["status"], json!("pending"), "timeout: {r2}");
+    }
+
+    /// LOCK DISCIPLINE: the gateway lock is acquirable while a dispatch `wait`
+    /// is parked (the wait awaits OFF the lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn dispatch_wait_does_not_hold_gateway_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 3_000, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Park a dispatch wait in a task.
+        let gw_w = std::sync::Arc::clone(&gw);
+        let d = ambient(
+            &principal,
+            "alpha",
+            json!({ "sid": child, "task": "go", "wait_seconds": 5 }),
+        );
+        let waiter =
+            tokio::spawn(async move { run_session_dispatch(&d, &gw_w, McpCaller::Ambient).await });
+        // Give the wait time to submit + park.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // The gateway lock must be acquirable NOW (the wait is off-lock).
+        let locked = tokio::time::timeout(std::time::Duration::from_millis(500), gw.lock()).await;
+        assert!(
+            locked.is_ok(),
+            "gateway lock must be free while a dispatch wait is parked"
+        );
+        drop(locked);
+        let _ = waiter.await;
     }
 }

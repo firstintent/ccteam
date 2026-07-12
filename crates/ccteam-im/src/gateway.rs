@@ -169,6 +169,15 @@ struct GatewaySession {
     /// never touch that field, but DID get a watchdog before this fold — this
     /// preserves that).
     watched_turn: Arc<std::sync::Mutex<Option<(String, u64)>>>,
+    /// v0.9.0 W2 (F2) — delegation parent sid (the spawner's principal). `None`
+    /// for a human-created (root) session. Mirrors `meta.parent_sid`, kept
+    /// in-memory so the guardrail child/delegated counts + the stop-descendant
+    /// walk are pure live-map scans (no per-session meta read).
+    parent_sid: Option<String>,
+    /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0; child = parent + 1).
+    /// Mirrors `meta.delegation_depth`; the source for a child's depth on its
+    /// next spawn and the `delegation.max_depth` guardrail.
+    delegation_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +270,52 @@ pub struct Gateway {
         String,
         tokio::sync::mpsc::UnboundedSender<crate::compare::CompareAnswer>,
     >,
+    /// v0.9.0 W2 (F2/F7) — in-memory mirror of the durable delegation watches
+    /// (`child_sid → mirror`). The SoT is each child's
+    /// `<project>/.ccteam/chat/<child_sid>/delegation.json`; this mirror keeps
+    /// the completion-notification hot path (checked on every watched child
+    /// turn) off the filesystem. Rebuilt from disk by the startup reconcile.
+    delegations: std::collections::HashMap<String, DelegationMirror>,
+    /// v0.9.0 W2 (F7) — idempotency cache for `session_spawn` (per-project
+    /// `key → response body`). In-memory only (honest: a daemon restart forgets
+    /// keys); within one lifetime a replay returns the original body + zero
+    /// side effects.
+    spawn_idem: crate::delegation::IdemCache,
+    /// v0.9.0 W2 (F7) — idempotency cache for `session_dispatch` (per-child
+    /// `key → response body`). Same honest in-memory scope as `spawn_idem`.
+    dispatch_idem: crate::delegation::IdemCache,
+    /// v0.9.0 W2 (F2) — sender the detached event pumps use to signal a
+    /// completed child turn to the delegation notifier task (which owns a
+    /// gateway handle and delivers the completion notification off the pump).
+    /// `None` until [`Gateway::set_delegation_notifier_tx`] wires it.
+    delegation_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::delegation::DelegationSignal>>,
+    /// v0.9.0 W2 (F5) — optional programmatic override of the delegation
+    /// guardrail posture. `None` (production) → read `config.yaml` (else
+    /// defaults). Set by [`Gateway::set_delegation_config`] (tests use it to
+    /// exercise the guardrails without spawning up-to-the-limit sessions).
+    delegation_config_override: Option<ccteam_core::DelegationConfig>,
+}
+
+/// v0.9.0 W2 (F2/F7) — in-memory mirror of one child's durable delegation
+/// watch, for the hot completion-notification path (avoids a filesystem read
+/// per completed child turn). The durable SoT is the child's
+/// `delegation.json`; this is rebuilt from it on startup and updated in
+/// lockstep with every durable write.
+#[derive(Debug, Clone)]
+struct DelegationMirror {
+    /// sid of the session to notify on a watched turn (the dispatcher).
+    parent_sid: String,
+    /// Whether completion delivers a notification turn (`false` = ledger-only).
+    notify: bool,
+    /// Optional dispatch label (ledger/notification only — never a prompt).
+    title: Option<String>,
+    /// Project slug hosting the child's `delegation.json` + `turns.jsonl`.
+    slug: String,
+    /// Project dir hosting the child's `delegation.json` + `turns.jsonl`.
+    project_dir: PathBuf,
+    /// Child turns already notified — the at-least-once dedup set (mirrors the
+    /// durable `DelegationWatch.notified_turns`).
+    notified_turns: Vec<String>,
 }
 
 /// One structured step of session activity (v0.8.19). Carried by
@@ -558,6 +613,14 @@ pub struct SessionView {
     /// panics/blocks). `#[serde(default)]` keeps older clients tolerant.
     #[serde(default)]
     pub waiting_approval: bool,
+    /// v0.9.0 W2 (F2) — delegation parent sid (the spawner's principal), or
+    /// `None` for a human/root session. Drives the `/sessions` + team-view
+    /// tree. `#[serde(default)]` keeps older clients tolerant.
+    #[serde(default)]
+    pub parent_sid: Option<String>,
+    /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0). `#[serde(default)]`.
+    #[serde(default)]
+    pub delegation_depth: u32,
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -697,6 +760,23 @@ pub struct CallerCtx {
     pub slug: String,
     /// The caller session's role — audit/display label only (not authorization).
     pub role: String,
+    /// v0.9.0 W2 (F2/F5) — the caller session's delegation depth (root = 0),
+    /// read from the live map. The child's depth = this + 1; the
+    /// `delegation.max_depth` guardrail caps it.
+    pub depth: u32,
+}
+
+/// v0.9.0 W2 (F2/F5) — the resolved delegation parent for a `session_spawn`.
+/// `Some` for an Ambient (agent-initiated) spawn — the child links to it and
+/// the F5 guardrails apply; `None` for an Admin/human spawn (root, unrestricted).
+#[derive(Debug, Clone)]
+pub struct DelegationParent {
+    /// The spawning principal's sid (the child's `parent_sid`).
+    pub sid: String,
+    /// The spawning principal's delegation depth (child depth = this + 1).
+    pub depth: u32,
+    /// The spawning principal's role at delegation time (audit label).
+    pub role: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -779,6 +859,18 @@ struct NewSessionPlan {
     compare_group: Option<String>,
     /// Override meta `trigger` (e.g. `"compare"`); None → derive from owner.
     trigger_override: Option<String>,
+    /// v0.9.0 W2 (F2) — delegation parent sid (the spawning principal). `None`
+    /// for a human/root spawn. Threaded into `meta.parent_sid` + the live
+    /// `GatewaySession.parent_sid`.
+    parent_sid: Option<String>,
+    /// v0.9.0 W2 (F2) — the spawning principal's role at delegation time (audit
+    /// label; `None` for a root spawn).
+    spawned_by_role: Option<String>,
+    /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0; child = parent + 1).
+    delegation_depth: u32,
+    /// v0.9.0 W2 (F2) — explicit session title from `session_spawn` (ledger /
+    /// display). `None` → auto-titled from the first message. Never a prompt.
+    title: Option<String>,
 }
 
 /// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
@@ -1091,6 +1183,11 @@ impl Gateway {
             spawn_claims: Arc::new(SpawnClaims::new()),
             remote_host_proxy: None,
             compare_taps: std::collections::HashMap::new(),
+            delegations: std::collections::HashMap::new(),
+            spawn_idem: crate::delegation::IdemCache::default(),
+            dispatch_idem: crate::delegation::IdemCache::default(),
+            delegation_tx: None,
+            delegation_config_override: None,
         }
     }
 
@@ -1141,6 +1238,18 @@ impl Gateway {
         for id in ids {
             self.spawn_event_pump(&id);
         }
+    }
+
+    /// v0.9.0 W2 (F2) — wire the sender the detached event pumps use to signal a
+    /// completed child turn to the delegation notifier task. MUST be called
+    /// BEFORE [`set_event_sink`](Self::set_event_sink) (which spawns the pumps)
+    /// so every pump captures the sender. The matching [`run_delegation_notifier`]
+    /// owns the receiver + a gateway handle and delivers off the pump.
+    pub fn set_delegation_notifier_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::delegation::DelegationSignal>,
+    ) {
+        self.delegation_tx = Some(tx);
     }
 
     /// Subscribe to the broadcast tee of every [`GatewayEvent`] this gateway
@@ -1282,6 +1391,13 @@ impl Gateway {
         reply_to: ChatKey,
     ) {
         let sid = plan.sid.clone();
+        // v0.9.0 W2 — restore the delegation link from meta (the SoT), so a
+        // remote-restart rebuild keeps parent/depth for the guardrails + the
+        // stop-descendant walk.
+        let (parent_sid, delegation_depth) =
+            ccteam_harness::execution::session_meta::read_session_meta(&plan.cwd, &plan.sid)
+                .map(|m| (m.parent_sid, m.delegation_depth))
+                .unwrap_or((None, 0));
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -1306,6 +1422,8 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                parent_sid,
+                delegation_depth,
             },
         );
         self.spawn_event_pump(&sid);
@@ -2229,7 +2347,7 @@ impl Gateway {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
         }
         Ok(format!(
-            "✅ 已创建并切换到 {slug}\n   📁 {}\n   发条消息即在此开 cto 会话(或 /new)",
+            "✅ 已创建并切换到 {slug}\n   📁 {}\n   发条消息即在此开一个会话(或 /new)",
             abs.display()
         ))
     }
@@ -2306,13 +2424,17 @@ impl Gateway {
             chat.clone(),
             project,
             AgentVendor::Claude,
-            "cto".to_string(),
-            "cto".to_string(),
-            // Implicit default-cto spawn (first message, no `/new`) stays
-            // skip — HITL is opt-in via `/new … hitl` / API / cto tool.
+            // v0.9.0 W2 (F6.1) — engine neutralization: the implicit
+            // first-message spawn is ROLELESS (empty role omits `--agent`; the
+            // bare vendor reads the project CLAUDE.md/AGENTS.md as its brain).
+            // ccteam seeds no persona; orchestration lives in user space / hub.
+            String::new(),
+            String::new(),
+            // Implicit first-message spawn stays skip — HITL is opt-in via
+            // `/new … hitl` / API / session_spawn.
             PermissionMode::Skip,
-            // v0.8.11 E2 — cto defaults to the stream-json protocol (a pure
-            // chat role with no terminal needs).
+            // v0.8.11 E2 — defaults to the stream-json protocol (a pure chat
+            // session with no terminal needs).
             SessionProtocol::StreamJson,
             "local".to_string(),
             SpawnTuning::default(),
@@ -2578,6 +2700,10 @@ impl Gateway {
             adapter,
             compare_group: None,
             trigger_override: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
+            title: None,
         })
     }
 
@@ -2661,6 +2787,10 @@ impl Gateway {
             adapter,
             compare_group,
             trigger_override,
+            parent_sid,
+            spawned_by_role,
+            delegation_depth,
+            title: spawn_title,
         } = plan;
         // Capture before the session insert moves these.
         let meta_vendor_uuid = thread
@@ -2702,6 +2832,8 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                parent_sid: parent_sid.clone(),
+                delegation_depth,
             },
         );
         let model_warning =
@@ -2768,7 +2900,21 @@ impl Gateway {
                 skills_sha,
                 trigger: Some(trigger),
                 compare_group: compare_group.clone(),
+                parent_sid: parent_sid.clone(),
+                spawned_by_role: spawned_by_role.clone(),
+                delegation_depth,
             };
+            // v0.9.0 W2 (F2) — an explicit `session_spawn` title is a
+            // user-authored label (highest precedence: it survives the
+            // first-message auto-title). Ledger/display only — never a prompt.
+            let mut meta = meta;
+            if let Some(t) = spawn_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                apply_title(&mut meta, t.to_string(), TitleSource::User);
+            }
             if let Some(cwd) = self.projects.get(&meta_project) {
                 if let Err(e) = write_session_meta(cwd, &meta) {
                     tracing::warn!(sid = %id, err = %e, "failed to write session meta.json");
@@ -2829,6 +2975,11 @@ impl Gateway {
         let protocol = old.protocol;
         let host = old.host.clone();
         let owner = old.owner.clone();
+        // v0.9.0 W2 (F2) — a `/role` switch re-spawns the SAME sid, so it keeps
+        // its delegation lineage (parent + depth are a property of the session,
+        // not its persona). meta.json already carries them; mirror them here.
+        let parent_sid = old.parent_sid.clone();
+        let delegation_depth = old.delegation_depth;
         let old_thread = old.thread.clone();
         let old_adapter = Arc::clone(&old.adapter);
         // (v0.8.8 bug-fix) sync a possibly-registered-after-start project from
@@ -2917,6 +3068,8 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                parent_sid,
+                delegation_depth,
             },
         );
         self.current_session
@@ -3075,6 +3228,12 @@ impl Gateway {
         // detached pump can label out-of-band answers/errors (events from a
         // session that is no longer the chat's current focus).
         let current_session = Arc::clone(&self.current_session);
+        // v0.9.0 W2 (F2) — signal completed child turns to the delegation
+        // notifier (the pump is detached + holds no gateway lock, so it can't
+        // deliver the notification itself). `None` when no notifier is wired.
+        let delegation_tx = self.delegation_tx.clone();
+        let pump_vendor = session.vendor;
+        let pump_host = session.host.clone();
         let handle = tokio::spawn(async move {
             use std::time::Instant;
             // V0.8.4 P1: split the event stream into ANSWER (new message)
@@ -3386,16 +3545,36 @@ impl Gateway {
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
                                 };
-                                if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                match ccteam_harness::execution::turns_mirror::append_turn(
                                     dir,
                                     &session_id,
                                     &record,
                                 ) {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %err,
-                                        "ccteam-im: failed to mirror turn to turns.jsonl"
-                                    );
+                                    Ok(_) => {
+                                        // v0.9.0 W2 (F2/F7) — ORDERING CONTRACT:
+                                        // the child turn is now DURABLY on disk, so
+                                        // signal the notifier (which then submits the
+                                        // completion turn to the parent). collect
+                                        // after a notification is guaranteed to see
+                                        // this turn. Fire-and-forget; the notifier
+                                        // filters non-watched sids.
+                                        if let Some(dtx) = delegation_tx.as_ref() {
+                                            let _ = dtx.send(crate::delegation::DelegationSignal {
+                                                child_sid: session_id.clone(),
+                                                turn_id: record.turn_id.clone(),
+                                                tail: text.clone(),
+                                                vendor: pump_vendor,
+                                                host: pump_host.clone(),
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to mirror turn to turns.jsonl"
+                                        );
+                                    }
                                 }
                                 // Refresh last_active/turn_count/cost_usd in
                                 // meta.json on turn completion (v0.8.22 P1).
@@ -4810,8 +4989,12 @@ impl Gateway {
             };
             return Self::append_history_section(head, &history);
         }
-        let mut rows: Vec<String> = Vec::with_capacity(visible.len());
-        for s in visible {
+        // Render each visible session's row (async `thread_status`) once,
+        // keyed by sid for the IM tree; web keeps the flat bare-row feed.
+        let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
+        let mut rendered: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(visible.len());
+        for s in &visible {
             // P3 — append model + ctx from the owning adapter's
             // `thread_status`. Statusless adapters (bg / default) report
             // `ThreadStatus::default()` → `status_suffix() == None` → the
@@ -4826,27 +5009,93 @@ impl Gateway {
                 Some(sfx) => format!("{base} — {sfx}"),
                 None => base,
             };
-            // v0.8.22 P1 — the IM `/sessions` row carries the session's title
-            // when it has one (fallback: the bare row above, unchanged). Web
-            // rows stay untouched (`parse_sessions_reply` splits on exactly
+            // Web rows stay untouched (`parse_sessions_reply` splits on exactly
             // 4 colon fields and must not see extra content appended).
-            if !is_web {
-                if let Some(title) = self.session_title(s) {
-                    row.push_str(&format!(" 「{title}」"));
-                }
-                // v0.8.23 review item 9 — ⏳ marks a session pinned to the
-                // top for an outstanding HITL approval (see the reorder
-                // above). Prefixed last so it stays the leftmost glance cue.
-                if waiting_sids.contains(&s.id) {
-                    row = format!("⏳ {row}");
-                }
+            if is_web {
+                web_rows.push(row);
+                continue;
             }
-            rows.push(row);
+            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host…
+            if !s.host.is_empty() && s.host != "local" {
+                row.push_str(&format!(" @{}", s.host));
+            }
+            // v0.8.22 P1 — …and the session's title when it has one.
+            if let Some(title) = self.session_title(s) {
+                row.push_str(&format!(" 「{title}」"));
+            }
+            // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
+            // an outstanding HITL approval. Prefixed last so it stays the
+            // leftmost glance cue.
+            if waiting_sids.contains(&s.id) {
+                row = format!("⏳ {row}");
+            }
+            rendered.insert(s.id.clone(), row);
         }
         if is_web {
-            return rows.join("\n");
+            return web_rows.join("\n");
         }
-        let mut out = format!("📁 当前项目: {cur}\n{}", rows.join("\n"));
+        // v0.9.0 W2 (F2) — IM tree: roots (a session with no VISIBLE parent —
+        // a true root, or a parent in another project) sorted by sid, each
+        // followed by its children indented `└─ ` (recursively). A parent-chain
+        // cycle can never orphan a session: any unvisited row is appended flat.
+        let visible_sids: std::collections::HashSet<&str> =
+            visible.iter().map(|s| s.id.as_str()).collect();
+        let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for s in &visible {
+            if let Some(p) = s.parent_sid.as_deref() {
+                if visible_sids.contains(p) {
+                    children_of.entry(p).or_default().push(s.id.as_str());
+                }
+            }
+        }
+        // Roots + children keep the ALREADY-computed `visible` order (recency +
+        // waiting-approval pin); the tree only adds indentation, never reorders
+        // (so the ⏳ pin + recency sort above are preserved).
+        let roots: Vec<&str> = visible
+            .iter()
+            .filter(|s| {
+                s.parent_sid
+                    .as_deref()
+                    .map(|p| !visible_sids.contains(p))
+                    .unwrap_or(true)
+            })
+            .map(|s| s.id.as_str())
+            .collect();
+        let mut tree_rows: Vec<String> = Vec::with_capacity(visible.len());
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|r| (*r, 0usize)).collect();
+        while let Some((sid, depth)) = stack.pop() {
+            if !visited.insert(sid) {
+                continue;
+            }
+            if let Some(row) = rendered.get(sid) {
+                let prefix = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("{}└─ ", "   ".repeat(depth - 1))
+                };
+                tree_rows.push(format!("{prefix}{row}"));
+            }
+            if let Some(kids) = children_of.get(sid) {
+                for k in kids.iter().rev() {
+                    stack.push((k, depth + 1));
+                }
+            }
+        }
+        // Cycle-orphaned leftovers → flat, sorted by sid (never drop a row).
+        let mut leftovers: Vec<&str> = visible
+            .iter()
+            .map(|s| s.id.as_str())
+            .filter(|sid| !visited.contains(sid))
+            .collect();
+        leftovers.sort_by_key(|sid| session_index(sid));
+        for sid in leftovers {
+            if let Some(row) = rendered.get(sid) {
+                tree_rows.push(row.clone());
+            }
+        }
+        let mut out = format!("📁 当前项目: {cur}\n{}", tree_rows.join("\n"));
         if elsewhere > 0 {
             out.push_str(&format!(
                 "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
@@ -4987,7 +5236,7 @@ impl Gateway {
                     "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
                 )
             } else {
-                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开 cto(或 /new)")
+                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开一个(或 /new)")
             };
         };
 
@@ -5321,6 +5570,8 @@ impl Gateway {
                     turn_count,
                     cost_usd,
                     waiting_approval,
+                    parent_sid: s.parent_sid.clone(),
+                    delegation_depth: s.delegation_depth,
                 }
             })
             .collect();
@@ -5477,6 +5728,10 @@ impl Gateway {
             skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
             trigger: None,
             compare_group: None,
+            // Adopting an external vendor session = a human/root session.
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
         };
         // v0.8.22 P1 — adopt the vendor's own title (if any) as the session's
         // starting title. `TitleSource::Vendor` still yields to a later
@@ -5574,6 +5829,7 @@ impl Gateway {
             sid: s.id.clone(),
             slug: s.project.clone(),
             role: s.role.clone(),
+            depth: s.delegation_depth,
         })
     }
 
@@ -5728,6 +5984,538 @@ impl Gateway {
             sid: o.id,
             model_warning: o.model_warning,
         })
+    }
+
+    // ── delegation (v0.9.0 W2 — F2/F5/F7) ──────────────────────────────────
+
+    /// The active delegation guardrail posture (hot-reloaded config, else the
+    /// documented defaults). Zero-config runs safely.
+    fn delegation_config(&self) -> ccteam_core::DelegationConfig {
+        if let Some(cfg) = &self.delegation_config_override {
+            return cfg.clone();
+        }
+        self.config
+            .as_ref()
+            .and_then(|c| c.get().ok())
+            .map(|cfg| cfg.delegation.clone())
+            .unwrap_or_default()
+    }
+
+    /// v0.9.0 W2 (F5) — set the delegation guardrail posture programmatically
+    /// (overrides `config.yaml`). Prod leaves this unset; tests use it to
+    /// exercise the guardrails with tiny limits.
+    pub fn set_delegation_config(&mut self, cfg: ccteam_core::DelegationConfig) {
+        self.delegation_config_override = Some(cfg);
+    }
+
+    /// v0.9.0 W2 (F5) — true when the vendor's trailing-24h project cost has
+    /// reached its configured budget cap (the Ambient delegation budget gate,
+    /// applied on both spawn + dispatch). No `project_paths` / no cap configured
+    /// / a vendor with no price table (grok/opencode) → `false` (inert), so the
+    /// count guardrails are those vendors' only ceiling.
+    pub(crate) fn delegation_budget_exceeded(&self, slug: &str, vendor: AgentVendor) -> bool {
+        self.project_paths
+            .as_ref()
+            .map(|p| crate::delegation::budget_exceeded(p, slug, vendor))
+            .unwrap_or(false)
+    }
+
+    /// v0.9.0 W2 (F5) — count a parent's ACTIVE (live-map) direct children.
+    /// Pure live-map scan (no meta read): a stopped child is already out of the
+    /// map, so this is exactly the "active direct children" the `max_children`
+    /// guardrail caps. Honest scope: an idle-released child is also out of the
+    /// map, so this can under-count — an anti-runaway ceiling, not an exact
+    /// census.
+    fn count_active_children(&self, parent_sid: &str) -> u32 {
+        self.sessions
+            .values()
+            .filter(|s| s.parent_sid.as_deref() == Some(parent_sid))
+            .count() as u32
+    }
+
+    /// v0.9.0 W2 (F5) — count ALL active (live-map) delegated sessions in one
+    /// project (any non-`None` `parent_sid`) — the `max_delegated` runaway
+    /// ceiling. Same honest live-map scope as [`Self::count_active_children`].
+    fn count_active_delegated(&self, project: &str) -> u32 {
+        self.sessions
+            .values()
+            .filter(|s| s.project == project && s.parent_sid.is_some())
+            .count() as u32
+    }
+
+    /// v0.9.0 W2 (F2) — walk `sid`'s ancestor chain (via the live map's
+    /// `parent_sid`) up to `delegation.max_depth + 1` steps, returning the set
+    /// of ancestor sids (INCLUDING `sid` itself). Used by the dispatch cycle
+    /// guard (target ∈ ancestors → reject) and the stop-descendant check.
+    pub(crate) fn ancestor_chain(&self, sid: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let mut cur = Some(sid.to_string());
+        // Bound the walk so a corrupt cycle in the map can never spin forever.
+        let cap = (self.delegation_config().max_depth as usize)
+            .saturating_add(2)
+            .min(64);
+        for _ in 0..=cap {
+            let Some(c) = cur else { break };
+            if !out.insert(c.clone()) {
+                break;
+            }
+            cur = self.sessions.get(&c).and_then(|s| s.parent_sid.clone());
+        }
+        out
+    }
+
+    /// v0.9.0 W2 (F2) — append one `delegation_*` event to the project's
+    /// `progress.jsonl` (the state SoT; schema owned by `progress_bridge`).
+    /// Best-effort: a write failure only warns, never blocks the delegation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_delegation_progress(
+        &self,
+        slug: &str,
+        event: &str,
+        parent_sid: &str,
+        child_sid: &str,
+        vendor: AgentVendor,
+        host: &str,
+        turn: Option<&str>,
+        title: Option<&str>,
+        reason: Option<&str>,
+    ) {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let ev = ccteam_harness::execution::progress_bridge::build_delegation_event(
+            event,
+            parent_sid,
+            child_sid,
+            crate::delegation::vendor_key(vendor),
+            host,
+            turn,
+            title,
+            reason,
+        );
+        let path = paths.progress_jsonl(slug);
+        if let Err(e) = ccteam_core::progress::append_event(&path, &ev) {
+            tracing::warn!(slug = %slug, event = %event, err = %e,
+                "ccteam-im: failed to append delegation progress event");
+        }
+    }
+
+    /// v0.9.0 W2 (F2/F5) — the delegation-aware spawn `session_spawn` routes
+    /// through. Mirrors [`Self::create_session_api_on_host`] but (a) links the
+    /// child to its `parent` (parent_sid/depth/spawned_by_role/title +
+    /// `trigger="session_spawn"`), (b) enforces the F5 guardrails on an Ambient
+    /// (agent-initiated) spawn BEFORE any side effect — emitting
+    /// `delegation_denied{reason}` + a readable error on rejection, and (c)
+    /// emits `delegation_spawned` on success. `parent = None` (Admin/human) is
+    /// unrestricted (still tagged `trigger="session_spawn"`, still a root:
+    /// depth 0, no parent link). Called UNDER the gateway lock (like every
+    /// `create_session_*`) so the guardrail counts + insert are consistent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_delegated_session(
+        &mut self,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+        owner_id: String,
+        host: String,
+        tuning: SpawnTuning,
+        parent: Option<DelegationParent>,
+        title: Option<String>,
+    ) -> Result<CreateSessionOutcome> {
+        // ---- F5 guardrails (Ambient spawn with a real parent only) ----
+        let (parent_sid, spawned_by_role, child_depth) = if let Some(p) = &parent {
+            let cfg = self.delegation_config();
+            let child_depth = p.depth.saturating_add(1);
+            let deny = |me: &Self, reason: crate::delegation::DenyReason, msg: String| {
+                me.emit_delegation_progress(
+                    &project,
+                    ccteam_harness::execution::progress_bridge::DELEGATION_DENIED,
+                    &p.sid,
+                    "",
+                    vendor,
+                    &host,
+                    None,
+                    title.as_deref(),
+                    Some(reason.tag()),
+                );
+                anyhow!("{msg}")
+            };
+            if child_depth > cfg.max_depth {
+                return Err(deny(
+                    self,
+                    crate::delegation::DenyReason::Depth,
+                    format!(
+                        "delegation denied: depth limit reached (child would be depth {child_depth} > delegation.max_depth {})",
+                        cfg.max_depth
+                    ),
+                ));
+            }
+            let children = self.count_active_children(&p.sid);
+            if children >= cfg.max_children {
+                return Err(deny(
+                    self,
+                    crate::delegation::DenyReason::Children,
+                    format!(
+                        "delegation denied: fan-out limit reached (parent {} already has {children} active children ≥ delegation.max_children {})",
+                        p.sid, cfg.max_children
+                    ),
+                ));
+            }
+            let delegated = self.count_active_delegated(&project);
+            if delegated >= cfg.max_delegated {
+                return Err(deny(
+                    self,
+                    crate::delegation::DenyReason::Delegated,
+                    format!(
+                        "delegation denied: project delegation ceiling reached ({delegated} active delegated sessions ≥ delegation.max_delegated {})",
+                        cfg.max_delegated
+                    ),
+                ));
+            }
+            {
+                if self.delegation_budget_exceeded(&project, vendor) {
+                    return Err(deny(
+                        self,
+                        crate::delegation::DenyReason::Budget,
+                        format!(
+                            "delegation denied: vendor `{}` has reached its 24h budget for project `{project}` (adjust budgets or wait for the window to slide / choose another vendor)",
+                            crate::delegation::vendor_key(vendor)
+                        ),
+                    ));
+                }
+            }
+            (Some(p.sid.clone()), Some(p.role.clone()), child_depth)
+        } else {
+            (None, None, 0)
+        };
+
+        // ---- spawn (mirrors start_session: gate host → plan → spawn → apply) ----
+        let host = crate::remote_host::prepare_host_for_spawn(
+            self.project_paths.as_ref().map(|p| p.root.as_path()),
+            &host,
+            protocol,
+            self.remote_host_proxy.as_ref(),
+        )
+        .await?;
+        let owner = ChatKey::new("web", &owner_id, &owner_id);
+        let handle = role.clone();
+        let mut plan = self.plan_new_session(
+            owner,
+            project.clone(),
+            vendor,
+            role,
+            handle,
+            permission_mode,
+            protocol,
+            host.clone(),
+            tuning,
+        )?;
+        plan.trigger_override = Some("session_spawn".into());
+        plan.parent_sid = parent_sid.clone();
+        plan.spawned_by_role = spawned_by_role;
+        plan.delegation_depth = child_depth;
+        plan.title = title.clone();
+        let child_sid = plan.id.clone();
+        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        let outcome = self.apply_new_session(plan, thread)?;
+        self.drain_and_dispatch_pending_turns(&outcome.id).await;
+
+        // ---- delegation_spawned (only when it IS a delegation) ----
+        if let Some(psid) = &parent_sid {
+            self.emit_delegation_progress(
+                &project,
+                ccteam_harness::execution::progress_bridge::DELEGATION_SPAWNED,
+                psid,
+                &child_sid,
+                vendor,
+                &host,
+                None,
+                title.as_deref(),
+                None,
+            );
+        }
+        Ok(CreateSessionOutcome {
+            sid: outcome.id,
+            model_warning: outcome.model_warning,
+        })
+    }
+
+    /// v0.9.0 W2 (F7) — idempotent-spawn replay: return the recorded response
+    /// body for `(project, key)` if this key already spawned within the TTL
+    /// (zero side effects), else `None`.
+    pub fn spawn_idem_replay(&mut self, project: &str, key: &str) -> Option<String> {
+        self.spawn_idem
+            .get(&crate::delegation::IdemCache::scoped(project, key))
+    }
+
+    /// v0.9.0 W2 (F7) — record a successful spawn's response body under
+    /// `(project, key)` so a client retry replays it instead of double-spawning.
+    pub fn spawn_idem_record(&mut self, project: &str, key: &str, body: &str) {
+        self.spawn_idem.put(
+            crate::delegation::IdemCache::scoped(project, key),
+            body.to_string(),
+        );
+    }
+
+    /// v0.9.0 W2 (F7) — idempotent-dispatch replay for `(child_sid, key)`.
+    pub fn dispatch_idem_replay(&mut self, child_sid: &str, key: &str) -> Option<String> {
+        self.dispatch_idem
+            .get(&crate::delegation::IdemCache::scoped(child_sid, key))
+    }
+
+    /// v0.9.0 W2 (F7) — record a successful dispatch's response body under
+    /// `(child_sid, key)` so a client retry replays it instead of double-dispatching.
+    pub fn dispatch_idem_record(&mut self, child_sid: &str, key: &str, body: &str) {
+        self.dispatch_idem.put(
+            crate::delegation::IdemCache::scoped(child_sid, key),
+            body.to_string(),
+        );
+    }
+
+    /// v0.9.0 W2 (F2) — `(vendor, host, slug)` for a live sid (for the
+    /// `delegation_*` event fields). `None` when the sid isn't tracked.
+    pub fn session_vendor_host_slug(&self, sid: &str) -> Option<(AgentVendor, String, String)> {
+        self.sessions
+            .get(sid)
+            .map(|s| (s.vendor, s.host.clone(), s.project.clone()))
+    }
+
+    /// v0.9.0 W2 (F2/F7) — arm/refresh the durable completion watch for a child
+    /// after a dispatch: writes `<project>/.ccteam/chat/<child>/delegation.json`
+    /// (atomic-durable) + the in-memory mirror. A re-dispatch UPDATES
+    /// parent/notify/title/dispatched_turn but PRESERVES `notified_turns` (never
+    /// re-notifies an already-delivered turn). Returns false (no watch) when the
+    /// child's project can't be resolved. `parent_sid` is the DISPATCHER's
+    /// principal (usually the spawner, but not necessarily).
+    pub fn arm_delegation_watch(
+        &mut self,
+        child_sid: &str,
+        parent_sid: &str,
+        notify: bool,
+        title: Option<String>,
+        dispatched_turn: Option<String>,
+    ) -> bool {
+        let Some(resolved) = self.session_resolve(child_sid) else {
+            return false;
+        };
+        let project_dir = resolved.project_dir;
+        let slug = resolved.project;
+        let notified_turns = ccteam_harness::read_delegation_watch(&project_dir, child_sid)
+            .map(|w| w.notified_turns)
+            .unwrap_or_default();
+        let mut watch = ccteam_harness::DelegationWatch::armed(
+            parent_sid,
+            notify,
+            title.clone(),
+            dispatched_turn,
+        );
+        watch.notified_turns = notified_turns.clone();
+        if let Err(e) = ccteam_harness::write_delegation_watch(&project_dir, child_sid, &watch) {
+            tracing::warn!(child = %child_sid, err = %e, "ccteam-im: failed to write delegation.json");
+            return false;
+        }
+        self.delegations.insert(
+            child_sid.to_string(),
+            DelegationMirror {
+                parent_sid: parent_sid.to_string(),
+                notify,
+                title,
+                slug,
+                project_dir,
+                notified_turns,
+            },
+        );
+        true
+    }
+
+    /// v0.9.0 W2 (F2) — drop a child's completion watch (mirror + durable
+    /// `delegation.json`). Used on an inline `wait` completion (suppress the
+    /// redundant notification) and by the reconcile when the parent is gone.
+    pub fn disarm_delegation_watch(&mut self, child_sid: &str) {
+        if let Some(m) = self.delegations.remove(child_sid) {
+            ccteam_harness::execution::delegation::remove_delegation_watch(
+                &m.project_dir,
+                child_sid,
+            );
+        } else if let Some(resolved) = self.session_resolve(child_sid) {
+            ccteam_harness::execution::delegation::remove_delegation_watch(
+                &resolved.project_dir,
+                child_sid,
+            );
+        }
+    }
+
+    /// v0.9.0 W2 (F2/F7) — deliver one completed child turn to its watching
+    /// parent. The in-memory `delegations` mirror is the HOT-PATH GATE: a turn
+    /// from a session with no mirror entry (the vast majority) is a cheap
+    /// no-op (no fs read). For a watched, not-yet-notified turn it (a) emits
+    /// `delegation_completed`, (b) — when `notify` — builds the English
+    /// notification and submits it to the parent via the ordinary submit path
+    /// (live=steer / dead=pending-turns FIFO), emitting `delegation_notified`,
+    /// and (c) records the turn in `notified_turns` (mirror + durable
+    /// `delegation.json`) so it is delivered AT-MOST-once per turn. A parent
+    /// that no longer exists drops the watch (+ a warn). Called under the
+    /// gateway lock by the notifier task / reconcile (submit is a gateway
+    /// method — the same lock scope every submit uses).
+    pub(crate) async fn deliver_delegation_signal(
+        &mut self,
+        signal: crate::delegation::DelegationSignal,
+    ) {
+        let child = signal.child_sid.clone();
+        // Hot-path gate: no mirror entry ⇒ not a watched child ⇒ nothing to do.
+        let Some(mirror) = self.delegations.get(&child).cloned() else {
+            return;
+        };
+        // Dedup: this exact turn was already handled (crash-safe at-most-once).
+        if mirror.notified_turns.iter().any(|t| t == &signal.turn_id) {
+            return;
+        }
+        // A watched turn completed (regardless of notify).
+        self.emit_delegation_progress(
+            &mirror.slug,
+            ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
+            &mirror.parent_sid,
+            &child,
+            signal.vendor,
+            &signal.host,
+            Some(&signal.turn_id),
+            mirror.title.as_deref(),
+            None,
+        );
+        if mirror.notify {
+            let text = crate::delegation::build_notification_text(
+                &child,
+                signal.vendor,
+                mirror.title.as_deref(),
+                &signal.turn_id,
+                &signal.tail,
+            );
+            match self.submit_to_sid(&mirror.parent_sid, text).await {
+                Ok(_) => {
+                    self.emit_delegation_progress(
+                        &mirror.slug,
+                        ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED,
+                        &mirror.parent_sid,
+                        &child,
+                        signal.vendor,
+                        &signal.host,
+                        Some(&signal.turn_id),
+                        mirror.title.as_deref(),
+                        None,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(parent = %mirror.parent_sid, child = %child, err = %e,
+                        "ccteam-im: delegation notify failed (parent gone); dropping watch");
+                    self.disarm_delegation_watch(&child);
+                    return;
+                }
+            }
+        }
+        // Record the turn as handled — mirror (hot path) + durable delegation.json.
+        if let Some(m) = self.delegations.get_mut(&child) {
+            m.notified_turns.push(signal.turn_id.clone());
+        }
+        let mut watch = ccteam_harness::read_delegation_watch(&mirror.project_dir, &child)
+            .unwrap_or_else(|| {
+                ccteam_harness::DelegationWatch::armed(
+                    &mirror.parent_sid,
+                    mirror.notify,
+                    mirror.title.clone(),
+                    None,
+                )
+            });
+        if !watch.notified_turns.iter().any(|t| t == &signal.turn_id) {
+            watch.notified_turns.push(signal.turn_id.clone());
+        }
+        if let Err(e) = ccteam_harness::write_delegation_watch(&mirror.project_dir, &child, &watch)
+        {
+            tracing::warn!(child = %child, err = %e,
+                "ccteam-im: failed to persist delegation.json notified_turns");
+        }
+    }
+
+    /// v0.9.0 W2 (F2) — the delegation notifier task: run once on the passed
+    /// gateway handle. Startup reconcile delivers notifications missed while the
+    /// daemon was down, then it drains the pump signal channel for the daemon's
+    /// lifetime, delivering each completed watched child turn off the pump.
+    pub async fn run_delegation_notifier(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
+    ) {
+        Self::reconcile_delegations(Arc::clone(&gateway)).await;
+        while let Some(signal) = rx.recv().await {
+            let mut gw = gateway.lock().await;
+            gw.deliver_delegation_signal(signal).await;
+        }
+    }
+
+    /// v0.9.0 W2 (F7) — startup (or on-demand) reconcile of the durable
+    /// delegation watches: deliver every completed child turn that was NOT yet
+    /// notified while the daemon was down, exactly once (deduped by
+    /// `notified_turns`). LOCK DISCIPLINE: snapshot the project set under the
+    /// lock, do all fs IO (scan `delegation.json` + read `turns.jsonl`) OFF the
+    /// lock, then seed the mirror + deliver UNDER the lock. A second reconcile
+    /// over the same state delivers nothing (the turns are now recorded).
+    pub async fn reconcile_delegations(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        // snapshot-under-lock: the project (slug → dir) set.
+        let projects: Vec<(String, PathBuf)> = {
+            let gw = gateway.lock().await;
+            gw.projects
+                .iter()
+                .map(|(s, p)| (s.clone(), p.clone()))
+                .collect()
+        };
+        // IO-off-lock: scan every project's watches + transcripts.
+        let mut seeds: Vec<(String, DelegationMirror)> = Vec::new();
+        let mut pending: Vec<crate::delegation::DelegationSignal> = Vec::new();
+        for (slug, dir) in &projects {
+            for (child_sid, watch) in ccteam_harness::scan_delegation_watches(dir) {
+                let (vendor, host) =
+                    ccteam_harness::execution::session_meta::read_session_meta(dir, &child_sid)
+                        .map(|m| (m.vendor, m.host))
+                        .unwrap_or((AgentVendor::Claude, "local".to_string()));
+                seeds.push((
+                    child_sid.clone(),
+                    DelegationMirror {
+                        parent_sid: watch.parent_sid.clone(),
+                        notify: watch.notify,
+                        title: watch.title.clone(),
+                        slug: slug.clone(),
+                        project_dir: dir.clone(),
+                        notified_turns: watch.notified_turns.clone(),
+                    },
+                ));
+                let turns =
+                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &child_sid)
+                        .unwrap_or_default();
+                for t in turns.into_iter().filter(|t| !t.assistant.is_empty()) {
+                    if !watch.notified_turns.iter().any(|n| n == &t.turn_id) {
+                        pending.push(crate::delegation::DelegationSignal {
+                            child_sid: child_sid.clone(),
+                            turn_id: t.turn_id,
+                            tail: t.assistant,
+                            vendor,
+                            host: host.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // apply-under-lock: seed the mirror (never clobber a fresher live entry),
+        // then deliver each missed turn (deliver re-checks notified_turns).
+        {
+            let mut gw = gateway.lock().await;
+            for (child, mirror) in seeds {
+                gw.delegations.entry(child).or_insert(mirror);
+            }
+        }
+        for signal in pending {
+            let mut gw = gateway.lock().await;
+            gw.deliver_delegation_signal(signal).await;
+        }
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
@@ -10776,6 +11564,9 @@ mod tests {
             skills_sha: None,
             trigger: None,
             compare_group: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
         };
         write_session_meta(alpha_dir.path(), &meta).unwrap();
 
@@ -12264,11 +13055,12 @@ mod tests {
         );
 
         // The next plain message must route into a beta session, not back s1.
+        // v0.9.0 neutralization — the implicit spawn is roleless (`beta--s2`).
         let reply = gateway
             .handle_text("mock", "chat-1", "alice", "where am i")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-cto-s2 echo: where am i"]);
+        assert_eq!(reply, vec!["beta--s2 echo: where am i"]);
 
         // `all` shows both projects (default `/sessions` now scopes to `beta`).
         // v0.8.22 P0-3 — ordered by last_active desc: s2 (just spawned) sorts
@@ -12280,9 +13072,11 @@ mod tests {
         // v0.8.22 P1 — s2's first plain message ("where am i") auto-titles it
         // (rule-based truncation, no LLM); s1 never sent a plain message
         // (only the `/new` directive), so it stays untitled/bare.
+        // v0.9.0 neutralization — s2 is roleless, so its `/sessions` row has an
+        // empty role field (`s2:beta:Claude:` + title).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns2:beta:Claude:cto 「where am i」\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude: 「where am i」\ns1:alpha:Claude:reviewer"]
         );
     }
 
@@ -12341,7 +13135,10 @@ mod tests {
         );
 
         // /cd to a different project than the bot's: the explicit target wins,
-        // so the next message spawns a default `cto` agent in beta, not the bot.
+        // so the next message spawns a ROLELESS agent in beta (v0.9.0
+        // neutralization — the implicit first-message spawn seeds no role), not
+        // the bot. Fake echo format is `{project}-{role}-{sid}`, so an empty
+        // role renders as `beta--s1`.
         gateway
             .handle_text("mock", "chat-1", "alice", "/cd beta")
             .await
@@ -12350,7 +13147,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "hello")
             .await
             .unwrap();
-        assert_eq!(reply, vec!["beta-cto-s1 echo: hello"]);
+        assert_eq!(reply, vec!["beta--s1 echo: hello"]);
     }
 
     #[tokio::test]
@@ -13129,6 +13926,519 @@ mod tests {
         assert!(
             shared.lock().await.is_empty(),
             "lapsed pending drained, not resolved"
+        );
+    }
+
+    // ========================================================================
+    // v0.9.0 W2 (F2/F5/F7) — delegation semantics, guardrails, reliability.
+    // ========================================================================
+
+    /// Build a delegation-wired gateway behind an `Arc<Mutex>`: event sink
+    /// (drained) + delegation notifier tx + the notifier task. Mirrors the
+    /// daemon startup order (delegation_tx BEFORE set_event_sink so pumps
+    /// capture it). Returns the shared handle.
+    async fn delegation_gateway(project_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<Gateway>> {
+        // A FRESH fake per spawn so each session's pump has its OWN
+        // `events_notify` — a single shared fake's `notify_one` could wake the
+        // wrong pump when two sessions (parent + child) run concurrently.
+        let factory: Arc<
+            dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        gw.register_project("alpha", project_dir);
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_delegation_notifier_tx(dtx);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+        tokio::spawn(Gateway::run_delegation_notifier(Arc::clone(&gateway), drx));
+        gateway
+    }
+
+    /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
+    /// notifying dispatch wakes the parent with a `[ccteam]` turn; the child's
+    /// turn is durably on disk by the time the notification lands (ordering).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_e2e_spawn_dispatch_notifies_parent_and_ordering() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_delegated_session(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent_sid.clone(),
+                    depth: 0,
+                    role: String::new(),
+                }),
+                Some("research task".into()),
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        // Child meta records the delegation lineage + spawn trigger + title.
+        let cmeta = read_session_meta(&project_dir, &child_sid).unwrap();
+        assert_eq!(cmeta.parent_sid.as_deref(), Some(parent_sid.as_str()));
+        assert_eq!(cmeta.delegation_depth, 1);
+        assert_eq!(cmeta.trigger.as_deref(), Some("session_spawn"));
+        assert_eq!(cmeta.title.as_deref(), Some("research task"));
+
+        // Dispatch (arm the watch + drive the child's turn).
+        {
+            let mut gw = gateway.lock().await;
+            gw.arm_delegation_watch(
+                &child_sid,
+                &parent_sid,
+                true,
+                Some("research task".into()),
+                None,
+            );
+            gw.submit_to_sid(&child_sid, "do the research".into())
+                .await
+                .unwrap();
+        }
+
+        // The notifier delivers a completion turn to the parent (poll off-lock).
+        let mut notified = false;
+        for _ in 0..200 {
+            let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
+            if turns.iter().any(|t| {
+                t.user.contains("[ccteam] delegated session")
+                    || t.assistant.contains("[ccteam] delegated session")
+            }) {
+                notified = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            notified,
+            "parent must receive the `[ccteam]` completion notification"
+        );
+        // ORDERING: the child's turn is durably on disk (collect sees it).
+        let child_turns = read_all_turns(&project_dir, &child_sid).unwrap_or_default();
+        assert!(
+            child_turns
+                .iter()
+                .any(|t| t.assistant.contains("echo: do the research")),
+            "child turn is durably appended BEFORE the notification (read-your-writes)"
+        );
+    }
+
+    /// Spawn a claude child in `alpha` under `parent` (test helper — a named fn
+    /// so the borrowed future's lifetime is well-formed, unlike an async closure).
+    async fn spawn_child(
+        gw: &mut Gateway,
+        parent: DelegationParent,
+    ) -> Result<CreateSessionOutcome> {
+        gw.create_delegated_session(
+            "alpha".into(),
+            String::new(),
+            AgentVendor::Claude,
+            PermissionMode::Skip,
+            SessionProtocol::StreamJson,
+            "web-api".into(),
+            "local".into(),
+            SpawnTuning::default(),
+            Some(parent),
+            None,
+        )
+        .await
+    }
+
+    /// Each count guardrail (depth / children / delegated) rejects one spawn
+    /// with a readable error AND emits a `delegation_denied{reason}` event.
+    #[tokio::test]
+    async fn delegation_count_guardrails_deny_and_emit_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ccteam_root = tmp.path().join(".ccteam");
+        let projects_root = tmp.path().join("projects");
+        let project_dir = projects_root.join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(ccteam_root.join("state")).unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: ccteam_root.clone(),
+            projects_root: projects_root.clone(),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        gw.enable_project_creation(paths.clone());
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        let mk = |depth: u32| DelegationParent {
+            sid: "sPARENT".into(),
+            depth,
+            role: String::new(),
+        };
+
+        // depth: parent at depth 1 → child depth 2 > max_depth 1.
+        gw.set_delegation_config(ccteam_core::DelegationConfig {
+            max_depth: 1,
+            max_children: 99,
+            max_delegated: 99,
+        });
+        let e = spawn_child(&mut gw, mk(1)).await.unwrap_err();
+        assert!(e.to_string().contains("depth"), "depth: {e}");
+
+        // children: a real parent with 1 child → 2nd child denied.
+        gw.set_delegation_config(ccteam_core::DelegationConfig {
+            max_depth: 9,
+            max_children: 1,
+            max_delegated: 99,
+        });
+        let parent = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let pctx = DelegationParent {
+            sid: parent.clone(),
+            depth: 0,
+            role: String::new(),
+        };
+        spawn_child(&mut gw, pctx.clone()).await.unwrap(); // 1st child ok
+        let e2 = spawn_child(&mut gw, pctx.clone()).await.unwrap_err();
+        assert!(
+            e2.to_string().contains("fan-out"),
+            "children (fan-out): {e2}"
+        );
+
+        // delegated: 1 delegated child now lives → ceiling 1 → next denied.
+        gw.set_delegation_config(ccteam_core::DelegationConfig {
+            max_depth: 9,
+            max_children: 9,
+            max_delegated: 1,
+        });
+        let parent2 = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let e3 = spawn_child(
+            &mut gw,
+            DelegationParent {
+                sid: parent2,
+                depth: 0,
+                role: String::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(e3.to_string().contains("ceiling"), "delegated: {e3}");
+
+        // All three emitted a `delegation_denied` with the right reason.
+        let events =
+            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
+        let reasons: Vec<&str> = events
+            .iter()
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied"))
+            .filter_map(|e| e.get("reason").and_then(|v| v.as_str()))
+            .collect();
+        assert!(reasons.contains(&"depth"), "reasons: {reasons:?}");
+        assert!(reasons.contains(&"children"), "reasons: {reasons:?}");
+        assert!(reasons.contains(&"delegated"), "reasons: {reasons:?}");
+    }
+
+    /// The Ambient budget gate denies a spawn when the vendor's 24h project
+    /// cost has reached its cap (a `0.0` cap = no spend allowed) + emits
+    /// `delegation_denied{reason:"budget"}`.
+    #[tokio::test]
+    async fn delegation_budget_gate_denies_and_emits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ccteam_root = tmp.path().join(".ccteam");
+        let projects_root = tmp.path().join("projects");
+        let project_dir = projects_root.join("alpha");
+        std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
+        std::fs::create_dir_all(ccteam_root.join("state")).unwrap();
+        // A zero claude cap → any cost (incl. 0) is "reached" → deny.
+        std::fs::write(
+            project_dir.join(".ccteam").join("workflow.yaml"),
+            "budgets_v060:\n  claude:\n    max_cost_usd_per_24h: 0.0\n",
+        )
+        .unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: ccteam_root.clone(),
+            projects_root: projects_root.clone(),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        gw.enable_project_creation(paths.clone());
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        let e = gw
+            .create_delegated_session(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "sP".into(),
+                    depth: 0,
+                    role: String::new(),
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("budget"), "budget: {e}");
+        let events =
+            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
+        assert!(events.iter().any(|e| {
+            e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied")
+                && e.get("reason").and_then(|v| v.as_str()) == Some("budget")
+        }));
+    }
+
+    /// Chaos: a durable watch + a completed child turn on disk, loaded by a
+    /// FRESH gateway (daemon-restart), delivers the missed notification EXACTLY
+    /// once; a second reconcile over the same state delivers none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_reconcile_delivers_missed_notification_exactly_once() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        // A live parent to receive the notification.
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        // Simulate a child that completed a turn while the daemon was down: its
+        // turns.jsonl has one assistant turn + an armed, un-notified watch.
+        let child_sid = "s99";
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "the research is done".into(),
+                usage: serde_json::Value::Null,
+                tool_calls: vec![],
+            },
+        )
+        .unwrap();
+        ccteam_harness::write_delegation_watch(
+            &project_dir,
+            child_sid,
+            &ccteam_harness::DelegationWatch::armed(
+                &parent_sid,
+                true,
+                Some("research".into()),
+                Some(format!("{child_sid}-1")),
+            ),
+        )
+        .unwrap();
+
+        // Reconcile #1 delivers the missed notification.
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        // Count the DELIVERED notifications = the mirrored USER turns (the
+        // parent's own echo of it is a separate assistant turn — don't
+        // double-count one notification).
+        let count_notifications = |dir: &std::path::Path, psid: &str| {
+            read_all_turns(dir, psid)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .count()
+        };
+        let mut delivered = 0;
+        for _ in 0..200 {
+            delivered = count_notifications(&project_dir, &parent_sid);
+            if delivered >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            delivered, 1,
+            "reconcile delivers the missed notification once"
+        );
+
+        // Reconcile #2 delivers nothing new (deduped by notified_turns).
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            count_notifications(&project_dir, &parent_sid),
+            1,
+            "a second reconcile is a no-op (exactly-once)"
+        );
+    }
+
+    /// `/sessions` renders a delegation tree: children indented `└─ ` under
+    /// their parent; a non-local host + title annotate the row.
+    #[tokio::test]
+    async fn delegation_sessions_tree_indents_children() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        let parent = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = gw
+            .create_delegated_session(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent.clone(),
+                    depth: 0,
+                    role: String::new(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Web chat drives the fleet (`all` scope, own-pool visibility).
+        let out = gw
+            .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
+            .await;
+        // Parent row precedes the indented child row.
+        let pline = format!("{parent}:alpha:Claude:");
+        let cline = format!("└─ {child}:alpha:Claude:");
+        let pi = out
+            .find(&pline)
+            .unwrap_or_else(|| panic!("parent row: {out}"));
+        let ci = out
+            .find(&cline)
+            .unwrap_or_else(|| panic!("indented child row: {out}"));
+        assert!(pi < ci, "child indented under parent:\n{out}");
+    }
+
+    /// `ancestor_chain` (the stop-descendant + cycle basis): a child's chain
+    /// includes its parent; a sibling's does not.
+    #[tokio::test]
+    async fn delegation_ancestor_chain_walks_parent_links() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        let parent = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = gw
+            .create_delegated_session(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent.clone(),
+                    depth: 0,
+                    role: String::new(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let sibling = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let chain = gw.ancestor_chain(&child);
+        assert!(chain.contains(&parent), "child's chain reaches its parent");
+        assert!(chain.contains(&child), "chain includes self");
+        assert!(
+            !chain.contains(&sibling),
+            "an unrelated sibling is NOT an ancestor"
         );
     }
 }

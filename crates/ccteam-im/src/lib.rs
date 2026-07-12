@@ -30,6 +30,7 @@ pub mod acl;
 pub mod compare;
 pub mod credentials;
 pub mod daemon;
+pub mod delegation;
 pub mod gateway;
 // v0.8.22 P0-2 — the shared "ask the user to approve/deny a tool call" HITL
 // core. Both Claude HITL surfaces (terminal `permission/ask` over mcp.sock,

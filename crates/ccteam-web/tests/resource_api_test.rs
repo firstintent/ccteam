@@ -52,7 +52,7 @@ async fn get_roles_lists_agent_md_files() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     fixture_project(&paths, "demo");
-    // bootstrap seeds cto.md; add a second role with frontmatter.
+    // v0.9.0 (engine neutralization): bootstrap seeds no role; author one with frontmatter.
     write_role(
         &paths.project_dir("demo"),
         "reviewer",
@@ -67,7 +67,7 @@ async fn get_roles_lists_agent_md_files() {
     assert_eq!(resp.status(), 200);
     let arr: serde_json::Value = resp.json().await.unwrap();
     let roles = arr.as_array().unwrap();
-    // cto (seeded) + reviewer; sorted by role name.
+    // only the authored `reviewer` role is listed (v0.9.0: no seeded cto).
     let names: Vec<&str> = roles
         .iter()
         .map(|r| r.get("role").unwrap().as_str().unwrap())
@@ -140,6 +140,10 @@ async fn get_single_role_rejects_path_traversal() {
     let paths = fake_paths(tmp.path());
     fixture_project(&paths, "demo");
     let project_dir = paths.project_dir("demo");
+    // v0.9.0 (engine neutralization): bootstrap seeds no role. Author a real
+    // `cto` role as a USER file so the positive control below (a normal role
+    // reads 200) and the no-clobber existence check have a real file.
+    write_role(&project_dir, "cto", "---\nname: cto\n---\nGuide.\n").unwrap();
     // Plant a real secret OUTSIDE the project's agents/ dir that a working
     // traversal would surface (sibling .md so even `<evil>.md` resolves).
     let secret_dir = tmp.path().join("outside");
@@ -148,7 +152,7 @@ async fn get_single_role_rejects_path_traversal() {
     let addr = spawn(AppState::new(paths)).await;
     let client = reqwest::Client::new();
 
-    // A normal seeded role still reads fine (guard is not a blanket deny).
+    // A normal role still reads fine (guard is not a blanket deny).
     let ok = client
         .get(format!("http://{addr}/api/v1/projects/demo/roles/cto"))
         .send()

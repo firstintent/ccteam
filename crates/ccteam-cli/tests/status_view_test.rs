@@ -95,6 +95,9 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             skills_sha: None,
             trigger: None,
             compare_group: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
         };
         ccteam_harness::write_session_meta(&project_dir, &meta).unwrap();
     };

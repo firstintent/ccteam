@@ -204,6 +204,9 @@ async fn load_resume_filters_is_replay() {
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     };
     write_session_meta(project, &meta).unwrap();
 
@@ -352,6 +355,9 @@ async fn session_new_and_load_carry_mcp_servers() {
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     };
     write_session_meta(tmp.path(), &meta).unwrap();
     let loaded = adapter

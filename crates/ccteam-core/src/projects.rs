@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{write_project_settings, EnabledPluginsSetting, CTO_ROLE_MD};
+use crate::templates::{write_project_settings, EnabledPluginsSetting};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -334,18 +334,10 @@ pub fn bootstrap_project_at_dir(
         );
     }
 
-    // v8.3 session=role: IM/chat sessions launch `claude --agent cto`
-    // by default, so the `cto` persona must exist in every project this
-    // path creates (IM `/newproject` + gateway create_project). Write
-    // only when absent so a user-edited persona survives.
-    let claude_agents_dir = project_dir.join(".claude").join("agents");
-    std::fs::create_dir_all(&claude_agents_dir)
-        .with_context(|| format!("create {}", claude_agents_dir.display()))?;
-    let cto_md = claude_agents_dir.join("cto.md");
-    if !cto_md.exists() {
-        std::fs::write(&cto_md, CTO_ROLE_MD)
-            .with_context(|| format!("write {}", cto_md.display()))?;
-    }
+    // v0.9.0 W2 (F6.1) — engine neutralization: ccteam seeds NO role. A fresh
+    // project's `.claude/agents/` is left untouched (not even created); the
+    // default session is roleless (bare vendor reads the project CLAUDE.md /
+    // AGENTS.md). Orchestration personas live 100% in user space / the hub.
 
     // v0.8.9 (owner decision) — scaffold a minimal project brain for an EMPTY
     // project so a roleless / bare-claude session asks the user to initialize

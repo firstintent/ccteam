@@ -151,7 +151,7 @@ pub use config::{
     default_claude_jobs_retention_days, load as load_ccteam_config,
     lookup_project as lookup_project_in_config, remove_project as remove_project_from_config,
     save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
-    ProjectEntry, CONFIG_FILENAME,
+    DelegationConfig, ProjectEntry, CONFIG_FILENAME,
 };
 // V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};
@@ -297,7 +297,7 @@ pub use templates::{
     validate_mcp_server_name, write_global_helper_templates, write_project_settings,
     EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
     WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
-    CCTEAM_MCP_SERVE_ARGS, CTO_ROLE_MD, HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
+    CCTEAM_MCP_SERVE_ARGS, HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

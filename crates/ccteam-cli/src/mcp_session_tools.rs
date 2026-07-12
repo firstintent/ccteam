@@ -122,9 +122,9 @@ mod tests {
         ] {
             assert!(
                 SESSION_TOOL_NAMES.contains(&needed),
-                "the cto role depends on the `{needed}` scheduling tool (exposed \
+                "the session_* scheduling tools depend on the `{needed}` tool (exposed \
                  to agents as `mcp__ccteam__{needed}`); if you removed or renamed \
-                 it, update the daemon session handler + cto role — do not \
+                 it, update the daemon session handler — do not \
                  silently drop it"
             );
         }

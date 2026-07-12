@@ -2892,6 +2892,9 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         skills_sha: None,
         trigger: None,
         compare_group: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
     };
     ccteam_harness::write_session_meta(tmp.path(), &meta).unwrap();
 
