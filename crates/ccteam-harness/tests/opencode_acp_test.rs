@@ -241,6 +241,90 @@ async fn resume_prefers_session_resume_no_replay() {
     clear_fake();
 }
 
+/// v0.9.0 W1 (G2) — the resume path MUST carry the ccteam `mcpServers` (the
+/// pre-fix bug hardcoded `[]` on session/resume, so any cold-resume / daemon
+/// rebuild dropped the in-agent tool face). With a non-empty secret the adapter
+/// builds a non-empty `mcpServers`; the fake records the count per session/*
+/// method → assert session/resume received it.
+#[tokio::test]
+#[serial]
+async fn resume_carries_mcp_servers() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    let sid = "s-resume-mcp";
+    let dump = tmp.path().join("acp_mcp_dump.tsv");
+    let prior_dump = std::env::var_os("CCTEAM_ACP_MCP_DUMP");
+    unsafe {
+        std::env::set_var("CCTEAM_ACP_MCP_DUMP", &dump);
+    }
+
+    let meta = SessionMeta {
+        sid: sid.into(),
+        slug: "demo".into(),
+        vendor: AgentVendor::Opencode,
+        protocol: SessionProtocol::Acp,
+        role: String::new(),
+        permission_mode: PermissionMode::Skip,
+        owner: "user:test".into(),
+        vendor_uuid: "ses_fake_opencode_0017cafe".into(),
+        host: "local".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        last_active: chrono::Utc::now().to_rfc3339(),
+        origin: SessionOrigin::Ccteam,
+        title: None,
+        title_source: None,
+        turn_count: 1,
+        cost_usd: None,
+        role_sha: None,
+        skills_sha: None,
+        trigger: None,
+        compare_group: None,
+    };
+    write_session_meta(project, &meta).unwrap();
+
+    // A SpawnCtx WITH a secret → `acp_mcp_servers_http` yields a non-empty array.
+    let ctx = SpawnCtx {
+        slug: "demo".into(),
+        sid: sid.into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        effort: None,
+        permission_mode: PermissionMode::Skip,
+        secret: "seKret1234".into(),
+    };
+    let adapter = OpencodeAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("resume start");
+    assert_eq!(handle.identity, "ses_fake_opencode_0017cafe");
+
+    let recorded = std::fs::read_to_string(&dump).unwrap_or_default();
+    let resume_line = recorded
+        .lines()
+        .find(|l| l.starts_with("session/resume\t"))
+        .unwrap_or_else(|| panic!("fake must record a session/resume, got: {recorded:?}"));
+    let count: usize = resume_line.split('\t').nth(1).unwrap().parse().unwrap();
+    assert!(
+        count >= 1,
+        "session/resume must carry a non-empty mcpServers (G2 fix), got: {recorded:?}"
+    );
+
+    match prior_dump {
+        Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_MCP_DUMP", v) },
+        None => unsafe { std::env::remove_var("CCTEAM_ACP_MCP_DUMP") },
+    }
+    clear_fake();
+}
+
 #[tokio::test]
 #[serial]
 async fn skip_auto_allows_permission_request() {

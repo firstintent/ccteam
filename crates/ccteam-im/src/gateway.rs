@@ -95,10 +95,11 @@ struct GatewaySession {
     /// re-apply the same mode (and the same hook install).
     permission_mode: PermissionMode,
     /// v0.8.7 review-fix (R-M1) — per-session secret minted at first spawn and
-    /// injected into the pane env as `CCTEAM_CHAT_SECRET`. The cto-gate
-    /// authenticates a forwarded `session_*` caller by matching the secret it
-    /// presents against this stored value (see [`Gateway::verify_session_caller`]).
-    /// Persisted across daemon restarts so the live pane's env still matches.
+    /// injected into the session's MCP env as `CCTEAM_CHAT_SECRET`. The session
+    /// gate authenticates a forwarded `session_*` caller by matching the secret
+    /// it presents (with its sid) against this stored value (see
+    /// [`Gateway::verify_session_principal`]).
+    /// Persisted across daemon restarts so the live session's env still matches.
     /// HONEST SCOPE: only raises the bar under the single-uid full-trust model
     /// — not a hard boundary (see `ccteam_core::session_secret`).
     secret: String,
@@ -674,6 +675,28 @@ pub struct SessionResolve {
     pub project: String,
     /// Absolute working dir hosting `.ccteam/chat/<sid>/turns.jsonl`.
     pub project_dir: PathBuf,
+}
+
+/// v0.9.0 W1 (F1) — the authenticated identity of a `session_*` MCP caller,
+/// resolved by [`Gateway::verify_session_principal`] from the `(sid, secret)`
+/// PRINCIPAL the caller presents. Generalizes the retired cto-only
+/// `(role, secret)` gate: authorization is now "any live session that holds
+/// this secret", with `role` demoted to an audit/display label. The gate reads
+/// `slug` from the resolved session (never the caller-supplied `_caller_slug`)
+/// so a caller can only operate its OWN project.
+///
+/// HONEST SCOPE unchanged: under the single-OS-uid full-trust model this only
+/// RAISES THE BAR (a same-uid process can read another's env / files and
+/// recover the secret); it is NOT a hard boundary. Real isolation = per-agent
+/// OS user / sandbox (deferred). See `ccteam_core::session_secret`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerCtx {
+    /// The caller session's own gateway sid (`s{n}`).
+    pub sid: String,
+    /// The caller session's project slug — the authoritative project scope.
+    pub slug: String,
+    /// The caller session's role — audit/display label only (not authorization).
+    pub role: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5522,44 +5545,36 @@ impl Gateway {
             .map(|s| (Arc::clone(&s.adapter), s.thread.clone()))
     }
 
-    /// v0.8.7 review-fix (R-M1) — authenticate a forwarded `session_*` caller
-    /// by matching the `(role, secret)` PAIR it presents against a tracked
-    /// session, instead of trusting a plaintext `_caller_role` arg. Returns
-    /// `true` iff some live session both runs `claimed_role` AND holds a secret
-    /// equal (constant-time) to `presented_secret`. An empty secret is always
-    /// `false` (fail-closed): a pre-secret restored session or a forger with no
-    /// secret can never authenticate. Read-only, holds no `.await`.
+    /// v0.9.0 W1 (F1) — authenticate a `session_*` caller by its `(sid, secret)`
+    /// PRINCIPAL and return the resolved [`CallerCtx`] (sid + project slug +
+    /// role). Generalizes the retired cto-only `(role, secret)` gate: a caller
+    /// is authorized iff the live session named `sid` holds a secret equal
+    /// (constant-time) to `presented_secret` — role plays no part in
+    /// authorization (audit label only). The returned `slug` is the SERVER's
+    /// view of the caller's project, so the gate overwrites any caller-supplied
+    /// `_caller_slug` with it (a caller can only operate its OWN project). An
+    /// empty secret always returns `None` (fail-closed): a pre-secret restored
+    /// session or a forger with no secret can never authenticate. Read-only,
+    /// holds no `.await`.
     ///
     /// HONEST SCOPE: this only RAISES THE BAR. Under the single-OS-uid
     /// full-trust model any agent can read another's `/proc/<pid>/environ`,
     /// files, or ptrace it and recover the secret, so this is best-effort
     /// defense-in-depth, NOT a hard boundary. Real isolation = per-agent OS
-    /// user / sandbox (v0.8.8-deferred). See `ccteam_core::session_secret`.
-    pub fn verify_session_caller(&self, claimed_role: &str, presented_secret: &str) -> bool {
-        if presented_secret.is_empty() {
-            return false;
-        }
-        self.sessions.values().any(|s| {
-            s.role == claimed_role
-                && !s.secret.is_empty()
-                && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret)
-        })
-    }
-
-    /// v0.8.24 C1 — for curated MCP HTTP bearer `ccteam-sid:<sid>:<secret>`:
-    /// return `(role, true)` when the live session's secret matches.
-    pub fn session_role_if_secret_matches(
-        &self,
-        sid: &str,
-        presented_secret: &str,
-    ) -> Option<(String, bool)> {
+    /// user / sandbox (deferred). See `ccteam_core::session_secret`.
+    pub fn verify_session_principal(&self, sid: &str, presented_secret: &str) -> Option<CallerCtx> {
         if presented_secret.is_empty() {
             return None;
         }
         let s = self.sessions.get(sid)?;
-        let ok =
-            !s.secret.is_empty() && ccteam_core::session_secret::ct_eq(&s.secret, presented_secret);
-        Some((s.role.clone(), ok))
+        if s.secret.is_empty() || !ccteam_core::session_secret::ct_eq(&s.secret, presented_secret) {
+            return None;
+        }
+        Some(CallerCtx {
+            sid: s.id.clone(),
+            slug: s.project.clone(),
+            role: s.role.clone(),
+        })
     }
 
     /// v0.8.8 F1 — confirm a HITL-firing `sid` maps to a live tracked session,
@@ -8595,11 +8610,12 @@ mod tests {
         );
     }
 
-    /// v0.8.7 review-fix (R-M1) — the gate authenticates the `(role, secret)`
-    /// PAIR, not a plaintext role. Right pair → ok; wrong/empty secret, or the
-    /// right secret with a non-cto claimed role, → reject (fail-closed).
+    /// v0.9.0 W1 (F1) — the gate authenticates the `(sid, secret)` PRINCIPAL and
+    /// returns the resolved [`CallerCtx`] (server-side slug + role). Right
+    /// principal → Some; wrong/empty secret or an unknown sid → None
+    /// (fail-closed). Role is NOT part of authorization (audit label only).
     #[tokio::test]
-    async fn verify_session_caller_requires_matching_role_and_secret() {
+    async fn verify_session_principal_authenticates_by_sid_and_secret() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify");
         let sid = gateway
@@ -8613,26 +8629,29 @@ mod tests {
             .unwrap();
         let secret = gateway.sessions.get(sid.as_str()).unwrap().secret.clone();
 
-        // Correct (role, secret) pair authenticates.
-        assert!(gateway.verify_session_caller("cto", &secret));
-        // Wrong secret → reject.
-        assert!(!gateway.verify_session_caller("cto", "deadbeefdeadbeefdeadbeefdeadbeef"));
-        // Empty secret → reject (fail-closed; never fall-open).
-        assert!(!gateway.verify_session_caller("cto", ""));
-        // Right secret but a role no session runs → reject (pair must match).
-        assert!(!gateway.verify_session_caller("reviewer", &secret));
-        // A role that is not even spawned → reject.
-        assert!(!gateway.verify_session_caller("ghost", &secret));
+        // Correct (sid, secret) principal → CallerCtx with server-side slug+role.
+        let ctx = gateway
+            .verify_session_principal(sid.as_str(), &secret)
+            .expect("principal ok");
+        assert_eq!(ctx.sid.as_str(), sid.as_str());
+        assert_eq!(ctx.slug, "alpha");
+        assert_eq!(ctx.role, "cto");
+        // Wrong secret → None.
+        assert!(gateway
+            .verify_session_principal(sid.as_str(), "deadbeefdeadbeefdeadbeefdeadbeef")
+            .is_none());
+        // Empty secret → None (fail-closed; never fall-open).
+        assert!(gateway.verify_session_principal(sid.as_str(), "").is_none());
+        // Unknown sid (even with a real secret) → None.
+        assert!(gateway.verify_session_principal("s999", &secret).is_none());
     }
 
-    /// v0.8.8 F1 — with the (project, role) dedup removed, two sessions can run
-    /// the SAME role; each is minted its own per-session secret. The gate's
-    /// `(role, secret)` pair STILL isolates correctly: each session's secret
-    /// authenticates as that role, and a bogus secret is rejected even though
-    /// the role is live (twice). This proves verify_session_caller stays sound
-    /// — it was NOT weakened to role-only when dedup was dropped.
+    /// v0.9.0 W1 (F1) — two sessions can run the SAME role; each mints its own
+    /// per-session secret. The `(sid, secret)` principal STILL isolates: each
+    /// secret authenticates ONLY under its OWN sid (resolving to that session's
+    /// CallerCtx); the same secret presented under the WRONG sid is rejected.
     #[tokio::test]
-    async fn verify_session_caller_isolates_two_same_role_secrets() {
+    async fn verify_session_principal_isolates_two_same_role_sessions() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify2");
         let sid1 = gateway
@@ -8658,11 +8677,34 @@ mod tests {
         let secret2 = gateway.sessions.get(sid2.as_str()).unwrap().secret.clone();
         assert_ne!(secret1, secret2, "each session mints its own secret");
 
-        // Each session's secret authenticates as the (live) cto role.
-        assert!(gateway.verify_session_caller("cto", &secret1));
-        assert!(gateway.verify_session_caller("cto", &secret2));
-        // A bogus secret is rejected even though cto is live (twice).
-        assert!(!gateway.verify_session_caller("cto", "deadbeefdeadbeefdeadbeefdeadbeef"));
+        // Each secret authenticates ONLY under its own sid.
+        assert_eq!(
+            gateway
+                .verify_session_principal(sid1.as_str(), &secret1)
+                .unwrap()
+                .sid
+                .as_str(),
+            sid1.as_str()
+        );
+        assert_eq!(
+            gateway
+                .verify_session_principal(sid2.as_str(), &secret2)
+                .unwrap()
+                .sid
+                .as_str(),
+            sid2.as_str()
+        );
+        // A secret presented under the WRONG sid → None (principal is per-sid).
+        assert!(gateway
+            .verify_session_principal(sid1.as_str(), &secret2)
+            .is_none());
+        assert!(gateway
+            .verify_session_principal(sid2.as_str(), &secret1)
+            .is_none());
+        // Bogus secret → None even though the sid is live.
+        assert!(gateway
+            .verify_session_principal(sid1.as_str(), "deadbeefdeadbeefdeadbeefdeadbeef")
+            .is_none());
     }
 
     /// v0.8.8 F1 (acceptance a) — two same-role `create_session_api` calls yield

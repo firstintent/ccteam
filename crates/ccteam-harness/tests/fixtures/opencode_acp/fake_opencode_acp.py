@@ -13,6 +13,7 @@ without isReplay; session/resume does not.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import uuid
 
@@ -112,6 +113,15 @@ def main() -> None:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") or {}
+
+        # v0.9.0 W1 (G2) — record the mcpServers count per session/* method to
+        # $CCTEAM_ACP_MCP_DUMP so a test can assert resume/load carry the ccteam
+        # tool face (the pre-fix bug hardcoded `[]` on resume).
+        if method and method.startswith("session/"):
+            dump = os.environ.get("CCTEAM_ACP_MCP_DUMP")
+            if dump:
+                with open(dump, "a") as f:
+                    f.write(f"{method}\t{len(params.get('mcpServers') or [])}\n")
 
         # Inbound responses from client (permission allow).
         if method is None and req_id is not None and ("result" in msg or "error" in msg):

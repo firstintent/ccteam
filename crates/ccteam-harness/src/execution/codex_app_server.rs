@@ -52,13 +52,15 @@ use tokio::sync::Mutex;
 
 use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, JsonRpcError, Notification};
 use crate::execution::progress_bridge::{
-    append_event, build_codex_plan_updated_event, build_codex_rate_limit_event,
-    build_codex_thread_status_event, build_codex_token_usage_event, progress_jsonl_from_env,
+    append_event, build_chat_session_reset_event_with_reason, build_codex_plan_updated_event,
+    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
+    progress_jsonl_from_env,
 };
 #[cfg(test)]
 use crate::execution::progress_bridge::{
     CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
+use crate::execution::session_meta::read_session_meta;
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
     SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
@@ -1602,7 +1604,24 @@ impl HarnessAdapter for CodexAppServerAdapter {
         self.reload_app_server_if_config_changed().await;
         let client = self.client().await?;
         let cwd_str = ctx.cwd.to_string_lossy().to_string();
-        let params = json!({
+        // v0.9.0 W1 (G2, spike-verified codex 0.144.1) — inject the ccteam MCP
+        // server for THIS thread via `config.mcp_servers.ccteam` (snake_case,
+        // stdio form + identity env). The per-thread entry REPLACES a
+        // same-named global config entry (spike: one spawn, per-thread env
+        // wins), so the thread's ccteam server carries this session's
+        // sid/secret — caller identity intact. `None` (no secret) → fall
+        // through to the daemon's global config (identity-less). NOT a
+        // system-prompt injection; the developerInstructions line is unchanged.
+        let ccteam_bin =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
+        let mcp_config = crate::execution::mcp_config::codex_thread_mcp_config(
+            &ctx.sid,
+            &ctx.secret,
+            &spec.role,
+            &ctx.slug,
+            &ccteam_bin,
+        );
+        let mut start_params = json!({
             "cwd": cwd_str,
             "threadSource": "user",
             "sessionStartSource": "startup",
@@ -1612,16 +1631,80 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 spec.role, ctx.slug, ctx.sid
             ),
         });
-        let result = self
-            .call_or_drop_dead(&client, "thread/start", params)
-            .await
-            .map_err(|e| HarnessError::SpawnFailed(format!("thread/start: {e:#}")))?;
-        let thread_id = pluck_thread_id(&result).ok_or_else(|| {
-            HarnessError::SpawnFailed(format!(
-                "thread/start response missing thread.thread_id: {result}"
-            ))
-        })?;
-        // The freshly started thread is now resident + subscribed on this
+        if let Some(cfg) = mcp_config.clone() {
+            start_params["config"] = cfg;
+        }
+        // v0.9.0 W1 (G5) — resume-first. codex `vendor_uuid` is now persisted
+        // (raw_extras below), so a daemon rebuild reads the prior thread id from
+        // meta and `thread/resume`s it (context preserved) instead of silently
+        // starting fresh and dropping the conversation. On resume failure, fall
+        // back to a fresh `thread/start` and emit a `chat_session_reset`
+        // progress event (the honest context-loss signal), mirroring the
+        // claude / opencode ladders.
+        let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)
+            .ok()
+            .map(|m| m.vendor_uuid)
+            .filter(|u| !u.trim().is_empty());
+        let (thread_id, result) = match prior_uuid {
+            Some(uuid) => {
+                let mut resume_params = json!({ "threadId": uuid });
+                if let Some(cfg) = mcp_config.clone() {
+                    resume_params["config"] = cfg;
+                }
+                match self
+                    .call_or_drop_dead(&client, "thread/resume", resume_params)
+                    .await
+                {
+                    Ok(result) => {
+                        let tid = pluck_thread_id(&result).unwrap_or(uuid);
+                        (tid, result)
+                    }
+                    Err(resume_err) => {
+                        tracing::warn!(
+                            sid = %ctx.sid,
+                            slug = %ctx.slug,
+                            error = %resume_err,
+                            "codex thread/resume failed; falling back to fresh thread/start"
+                        );
+                        if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
+                            let ev = build_chat_session_reset_event_with_reason(
+                                &spec.role,
+                                &ctx.sid,
+                                "resume_failed_fallback_to_fresh",
+                            );
+                            if let Err(err) = append_event(&progress_path, &ev) {
+                                tracing::warn!(error = %err, "codex: append reset event failed");
+                            }
+                        }
+                        let result = self
+                            .call_or_drop_dead(&client, "thread/start", start_params.clone())
+                            .await
+                            .map_err(|e| {
+                                HarnessError::SpawnFailed(format!("thread/start: {e:#}"))
+                            })?;
+                        let tid = pluck_thread_id(&result).ok_or_else(|| {
+                            HarnessError::SpawnFailed(format!(
+                                "thread/start response missing thread.thread_id: {result}"
+                            ))
+                        })?;
+                        (tid, result)
+                    }
+                }
+            }
+            None => {
+                let result = self
+                    .call_or_drop_dead(&client, "thread/start", start_params.clone())
+                    .await
+                    .map_err(|e| HarnessError::SpawnFailed(format!("thread/start: {e:#}")))?;
+                let tid = pluck_thread_id(&result).ok_or_else(|| {
+                    HarnessError::SpawnFailed(format!(
+                        "thread/start response missing thread.thread_id: {result}"
+                    ))
+                })?;
+                (tid, result)
+            }
+        };
+        // The started / resumed thread is now resident + subscribed on this
         // connection — record it so subsequent turns skip the resume.
         self.mark_loaded(&thread_id).await;
         // v0.8.10 — make codex sessions writable by default. Codex's server
@@ -1725,6 +1808,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
             started_at: Utc::now(),
             raw_extras: json!({
                 "thread_id": thread_id,
+                // v0.9.0 W1 (G5) — persist the codex thread id as the vendor
+                // resume key. `apply_new_session` reads `raw_extras.vendor_uuid`
+                // into meta.json, so a daemon rebuild `thread/resume`s this
+                // exact thread (see the resume-first ladder above) instead of
+                // silently starting fresh.
+                "vendor_uuid": thread_id,
                 // F10: the RESOLVED transport, not an env echo —
                 // "stdio" (default child-spawn) or "socket" (UDS override).
                 "transport": self.transport_tag(),
@@ -1975,7 +2064,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
             mode: ExecutionMode::Chat,
             identity: thread_id.clone(),
             started_at: Utc::now(),
-            raw_extras: json!({ "thread_id": thread_id, "resumed": true }),
+            raw_extras: json!({ "thread_id": thread_id, "vendor_uuid": thread_id, "resumed": true }),
         })
     }
 

@@ -287,3 +287,104 @@ async fn unknown_directive_rejected() {
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();
 }
+
+/// v0.9.0 W1 (G2) — grok wires the ccteam `mcpServers` on BOTH session/new and
+/// session/load (was hardcoded `[]`, dropping `ctx.secret`, so grok children
+/// had no ccteam tool face). With a non-empty secret the adapter builds a
+/// non-empty `mcpServers`; the fake records the count per session/* method →
+/// assert both the fresh (session/new) and cold-resume (session/load) paths.
+#[tokio::test]
+#[serial]
+async fn session_new_and_load_carry_mcp_servers() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let dump = tmp.path().join("acp_mcp_dump.tsv");
+    let prior_dump = std::env::var_os("CCTEAM_ACP_MCP_DUMP");
+    unsafe {
+        std::env::set_var("CCTEAM_ACP_MCP_DUMP", &dump);
+    }
+
+    let ctx_with_secret = |sid: &str| SpawnCtx {
+        slug: "demo".into(),
+        sid: sid.into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        effort: None,
+        permission_mode: PermissionMode::Skip,
+        secret: "seKret1234".into(),
+    };
+
+    // Phase A — fresh session/new (no prior meta).
+    let adapter = GrokAcpAdapter::new();
+    let fresh = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx_with_secret("s-new-mcp"),
+        )
+        .await
+        .expect("fresh start");
+    adapter.close_thread(&fresh).await.ok();
+
+    // Phase B — cold resume via session/load (meta carries the vendor_uuid).
+    let sid_load = "s-load-mcp";
+    let meta = SessionMeta {
+        sid: sid_load.into(),
+        slug: "demo".into(),
+        vendor: AgentVendor::Grok,
+        protocol: SessionProtocol::Acp,
+        role: String::new(),
+        permission_mode: PermissionMode::Skip,
+        owner: "user:test".into(),
+        vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
+        host: "local".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        last_active: chrono::Utc::now().to_rfc3339(),
+        origin: SessionOrigin::Ccteam,
+        title: None,
+        title_source: None,
+        turn_count: 1,
+        cost_usd: None,
+        role_sha: None,
+        skills_sha: None,
+        trigger: None,
+        compare_group: None,
+    };
+    write_session_meta(tmp.path(), &meta).unwrap();
+    let loaded = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx_with_secret(sid_load),
+        )
+        .await
+        .expect("load start");
+    adapter.close_thread(&loaded).await.ok();
+
+    let recorded = std::fs::read_to_string(&dump).unwrap_or_default();
+    let count_for = |method: &str| -> Option<usize> {
+        recorded
+            .lines()
+            .find(|l| l.starts_with(&format!("{method}\t")))
+            .and_then(|l| l.split('\t').nth(1))
+            .and_then(|n| n.parse().ok())
+    };
+    assert!(
+        count_for("session/new").is_some_and(|n| n >= 1),
+        "session/new must carry a non-empty mcpServers, got: {recorded:?}"
+    );
+    assert!(
+        count_for("session/load").is_some_and(|n| n >= 1),
+        "session/load must carry a non-empty mcpServers (G2 fix), got: {recorded:?}"
+    );
+
+    match prior_dump {
+        Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_MCP_DUMP", v) },
+        None => unsafe { std::env::remove_var("CCTEAM_ACP_MCP_DUMP") },
+    }
+    clear_fake();
+}

@@ -81,6 +81,7 @@ impl GrokAcpAdapter {
     async fn handshake_and_new(
         transport: &AcpTransport,
         cwd: &std::path::Path,
+        mcp_servers: Vec<Value>,
     ) -> Result<(String, ModelInfo), HarnessError> {
         let _init = transport
             .call(
@@ -107,12 +108,14 @@ impl GrokAcpAdapter {
                 HarnessError::SpawnFailed(format!("grok notifications/initialized failed: {e}"))
             })?;
 
+        // v0.9.0 W1 (G2) — wire the ccteam MCP tool face onto session/new
+        // (was hardcoded `[]`, so grok children had no ccteam tools).
         let new_result = transport
             .call(
                 "session/new",
                 json!({
                     "cwd": cwd.to_string_lossy(),
-                    "mcpServers": []
+                    "mcpServers": mcp_servers
                 }),
             )
             .await
@@ -128,6 +131,7 @@ impl GrokAcpAdapter {
         transport: &AcpTransport,
         cwd: &std::path::Path,
         session_id: &str,
+        mcp_servers: Vec<Value>,
     ) -> Result<ModelInfo, HarnessError> {
         let _init = transport
             .call(
@@ -158,13 +162,15 @@ impl GrokAcpAdapter {
                 ))
             })?;
 
+        // v0.9.0 W1 (G2) — resume/load carries the SAME mcpServers as fresh so
+        // a cold-resumed grok child keeps the ccteam tool face.
         let load_result = transport
             .call(
                 "session/load",
                 json!({
                     "sessionId": session_id,
                     "cwd": cwd.to_string_lossy(),
-                    "mcpServers": []
+                    "mcpServers": mcp_servers
                 }),
             )
             .await
@@ -319,6 +325,11 @@ impl HarnessAdapter for GrokAcpAdapter {
         } else {
             ctx.cwd.clone()
         };
+        // v0.9.0 W1 (G2) — the ccteam MCP tool face (HTTP + session bearer),
+        // passed identically to session/new and session/load (shared ACP
+        // helper). Empty when sid/secret missing (roleless still gets tools;
+        // secret is the gate). `ctx.secret` was previously dropped.
+        let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         // Cold-resume ladder: if meta.json already has a Grok ACP sessionId
         // (vendor_uuid), `session/load` instead of `session/new` so daemon
@@ -343,7 +354,7 @@ impl HarnessAdapter for GrokAcpAdapter {
                         HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}"))
                     })?;
                 let transport = Arc::new(transport);
-                match Self::handshake_and_load(&transport, &cwd, &uuid).await {
+                match Self::handshake_and_load(&transport, &cwd, &uuid, mcp_servers.clone()).await {
                     Ok(info) => (transport, uuid, info),
                     Err(load_err) => {
                         tracing::warn!(
@@ -359,7 +370,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                                 ))
                             })?;
                         let transport = Arc::new(transport);
-                        let (sid, info) = Self::handshake_and_new(&transport, &cwd).await?;
+                        let (sid, info) =
+                            Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
                         (transport, sid, info)
                     }
                 }
@@ -371,7 +383,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                         HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}"))
                     })?;
                 let transport = Arc::new(transport);
-                let (sid, info) = Self::handshake_and_new(&transport, &cwd).await?;
+                let (sid, info) =
+                    Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
                 (transport, sid, info)
             }
         };

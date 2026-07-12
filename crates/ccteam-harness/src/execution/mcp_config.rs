@@ -145,13 +145,15 @@ pub fn write_session_mcp_config(
     Ok(path)
 }
 
-/// Best-effort OpenCode ACP `mcpServers` array entry for session/new.
-/// Empty vec when secret missing (caller still gets a valid session).
+/// Best-effort ACP `mcpServers` array entry (the ccteam MCP over HTTP),
+/// **shared by both ACP vendors** (OpenCode + Grok) on `session/new`,
+/// `session/resume`, and `session/load`. Empty vec when sid/secret missing
+/// (caller still gets a valid session, just without the in-agent tool face).
 ///
-/// OpenCode 1.17.x validates MCP entries strictly: `headers` must be an
-/// **array** of `{name, value}` (not a map). Wrong shape → jsonrpc -32602
-/// Invalid params on `session/new` (smoke 2026-07-11).
-pub fn opencode_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
+/// ACP (OpenCode 1.17.x / Grok 0.2.x) validates MCP entries strictly:
+/// `headers` must be an **array** of `{name, value}` (not a map). Wrong shape
+/// → jsonrpc -32602 Invalid params on `session/new` (smoke 2026-07-11).
+pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
     if sid.is_empty() || secret.is_empty() {
         return Vec::new();
     }
@@ -168,6 +170,43 @@ pub fn opencode_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
             }
         ]
     })]
+}
+
+/// Codex `thread/start` / `thread/resume` `config` override injecting the
+/// ccteam MCP server for THIS thread only (verified on codex 0.144.1, W1
+/// spike): `{"mcp_servers": {"ccteam": {command, args, env}}}` (snake_case,
+/// mirroring `~/.codex/config.toml`). The per-thread entry REPLACES a
+/// same-named global entry (spike: one spawn, per-thread env wins), so the
+/// thread's ccteam server carries the caller's identity env. stdio form (the
+/// spawned `ccteam internal mcp-serve` bridges to the daemon socket + forwards
+/// the identity); the daemon-singleton app-server topology is unchanged.
+/// `None` when sid/secret is empty (fall through to the daemon's global config,
+/// identity-less) — never an empty override that would strip tools.
+pub fn codex_thread_mcp_config(
+    sid: &str,
+    secret: &str,
+    role: &str,
+    slug: &str,
+    ccteam_bin: &Path,
+) -> Option<Value> {
+    if sid.is_empty() || secret.is_empty() {
+        return None;
+    }
+    let bin = ccteam_bin.to_string_lossy();
+    Some(json!({
+        "mcp_servers": {
+            "ccteam": {
+                "command": bin,
+                "args": ["internal", "mcp-serve"],
+                "env": {
+                    "CCTEAM_CHAT_SID": sid,
+                    "CCTEAM_CHAT_SECRET": secret,
+                    "CCTEAM_CHAT_ROLE": role,
+                    "CCTEAM_CHAT_SLUG": slug,
+                }
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -243,13 +282,33 @@ mod tests {
     }
 
     #[test]
-    fn opencode_mcp_headers_are_name_value_array() {
-        let v = opencode_mcp_servers_http("s3", "sekret");
+    fn acp_mcp_headers_are_name_value_array() {
+        let v = acp_mcp_servers_http("s3", "sekret");
         assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["name"], "ccteam");
         assert_eq!(v[0]["type"], "http");
-        assert!(v[0]["headers"].is_array(), "OpenCode requires headers[]");
+        assert!(v[0]["headers"].is_array(), "ACP requires headers[]");
         assert_eq!(v[0]["headers"][0]["name"], "Authorization");
         assert_eq!(v[0]["headers"][0]["value"], "Bearer ccteam-sid:s3:sekret");
-        assert!(opencode_mcp_servers_http("", "x").is_empty());
+        assert!(acp_mcp_servers_http("", "x").is_empty());
+        assert!(acp_mcp_servers_http("s1", "").is_empty());
+    }
+
+    #[test]
+    fn codex_thread_config_snake_case_stdio_with_identity_env() {
+        let v = codex_thread_mcp_config("s7", "sek", "reviewer", "demo", Path::new("/opt/ccteam"))
+            .expect("non-empty secret -> Some config");
+        // snake_case `mcp_servers` (codex config.toml schema), stdio form.
+        let srv = &v["mcp_servers"]["ccteam"];
+        assert_eq!(srv["command"], "/opt/ccteam");
+        assert_eq!(srv["args"][0], "internal");
+        assert_eq!(srv["args"][1], "mcp-serve");
+        assert_eq!(srv["env"]["CCTEAM_CHAT_SID"], "s7");
+        assert_eq!(srv["env"]["CCTEAM_CHAT_SECRET"], "sek");
+        assert_eq!(srv["env"]["CCTEAM_CHAT_ROLE"], "reviewer");
+        assert_eq!(srv["env"]["CCTEAM_CHAT_SLUG"], "demo");
+        // Empty secret / sid -> None (no override; daemon global config used).
+        assert!(codex_thread_mcp_config("s7", "", "r", "d", Path::new("/x")).is_none());
+        assert!(codex_thread_mcp_config("", "sek", "r", "d", Path::new("/x")).is_none());
     }
 }

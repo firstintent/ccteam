@@ -117,12 +117,6 @@ impl McpDispatch {
     }
 }
 
-/// v0.8.7 W1 — roles allowed to call the `session_*` scheduling tools. The
-/// cto is the chat-first manager; work-roles are blocked (defense-in-depth
-/// behind the per-agent tool allow-list). A hard daemon gate so a work-role
-/// with a hand-edited allow-list still can't drive the session map.
-const SESSION_TOOL_PRIVILEGED_ROLES: &[&str] = &["cto"];
-
 /// v0.8.7 W1 — cap on how many child turns `session_collect` returns when the
 /// caller doesn't pass `n`. Keeps a runaway transcript from flooding the
 /// cto's context in one poll.
@@ -808,12 +802,16 @@ fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> Stri
 }
 
 // =====================================================================
-// v0.8.7 W1 — cto scheduling: daemon-side `session_*` tool handlers.
+// v0.9.0 W1 (F1) — session scheduling: daemon-side `session_*` tool handlers.
 //
-// The stdio MCP server forwards `ccteam__session_*` calls here (it doesn't
-// own the gateway). This is where we (a) enforce the cto-only privilege
-// gate on the ambient `_caller_role`, and (b) drive the gateway session map
-// (spawn / dispatch / list / stop) or tail a child's transcript (collect).
+// The stdio MCP server (or HTTP `/mcp` session bearer) forwards
+// `ccteam__session_*` calls here (it doesn't own the gateway). This is where
+// we (a) authenticate the caller by its `(sid, secret)` PRINCIPAL — any live
+// session that holds the secret, role-agnostic; the retired cto-only gate is
+// gone — and (b) drive the gateway session map (spawn / dispatch / list /
+// stop) or tail a child's transcript (collect). The project scope is the
+// SERVER's view of the caller's session (`CallerCtx.slug`), never the
+// caller-supplied `_caller_slug`.
 //
 // Lock discipline (CLAUDE.md §6): spawn/dispatch/list/stop call the
 // gateway's own async methods, so we hold the gateway lock across their
@@ -844,9 +842,10 @@ fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) ->
     })
 }
 
-/// v0.8.7 W1 — handle one forwarded `ccteam__session_*` call. Enforces the
-/// privilege gate, then dispatches to the gateway. Returns a JSON-RPC
-/// response (the stdio side propagates `isError` to the agent).
+/// v0.9.0 W1 (F1) — handle one forwarded `ccteam__session_*` call. Authenticates
+/// the caller by its `(sid, secret)` PRINCIPAL (Ambient path), then dispatches
+/// to the gateway. Returns a JSON-RPC response (the caller side propagates
+/// `isError` to the agent).
 async fn execute_session_tool(
     req: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
@@ -858,54 +857,16 @@ async fn execute_session_tool(
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
-    let args = req
+    let mut args = req
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // The stdio forwarder injects `_caller_role` / `_caller_secret` from the
-    // spawn-time pane env (`CCTEAM_CHAT_ROLE` / `CCTEAM_CHAT_SECRET`), not from
-    // caller-supplied tool args. We treat both as UNTRUSTED until the secret is
-    // checked against the gateway's `sid -> {role, secret}` map below.
-    let caller_role = args
-        .get("_caller_role")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let caller_secret = args
-        .get("_caller_secret")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Layer 1 (CHEAP PRE-FILTER, *not* the security boundary): reject an
-    // obviously non-privileged role before touching any state, so a non-cto
-    // caller is denied even when the gateway is unavailable. This is NOT a
-    // trust boundary on its own — a plaintext role arg is forgeable; the real
-    // authentication is the layer-2 secret check below.
-    //
-    // v0.9 T4 review fix — `McpCaller::Admin` (HTTP `/mcp`, bearer already
-    // verified at the transport layer) skips BOTH layers: the cto gate exists
-    // to stop non-privileged *sessions* reaching the scheduling tools, not the
-    // authenticated owner on the front door.
-    if caller == McpCaller::Ambient && !session_caller_authorized(caller_role) {
-        let who = if caller_role.is_empty() {
-            "<unknown>"
-        } else {
-            caller_role
-        };
-        return session_tool_response(
-            id,
-            format!(
-                "{name}: permission denied — session scheduling tools are restricted to the {SESSION_TOOL_PRIVILEGED_ROLES:?} role(s); caller role is `{who}`"
-            ),
-            true,
-        );
-    }
-
     // The gateway must be running (web + IM both up). Mirror chat_send_file's
-    // "IM gateway not running" structured error rather than panicking. It is
-    // also REQUIRED to authenticate the caller (the secret map lives there), so
-    // a missing gateway is a hard stop — never a fall-through that would skip
-    // the secret check.
+    // "gateway not running" structured error rather than panicking. It is also
+    // REQUIRED to authenticate the caller (the secret map lives there), so a
+    // missing gateway is a HARD STOP for every session_* call — fail-closed,
+    // never a fall-through that would skip the principal check.
     let Some(gateway) = gateway else {
         return session_tool_response(
             id,
@@ -914,24 +875,43 @@ async fn execute_session_tool(
         );
     };
 
-    // Layer 2 (THE SECURITY-RELEVANT CHECK, best-effort defense-in-depth):
-    // authenticate the caller by matching the `(role, secret)` PAIR it presents
-    // against a tracked session, instead of trusting the plaintext role. A
-    // missing / wrong secret fails closed. HONEST SCOPE: under the single-uid
-    // full-trust model this only RAISES THE BAR (a same-uid process can read
-    // another pane's env and recover the secret); it is NOT a hard boundary.
-    // Real isolation = per-agent OS user / sandbox (v0.8.8-deferred).
-    // `McpCaller::Admin` skips it (see the layer-1 note above).
+    // Authenticate the Ambient caller by its `(sid, secret)` PRINCIPAL and
+    // resolve its CallerCtx (server-side sid + slug + role). This is the sole
+    // security-relevant check (best-effort defense-in-depth; single-uid honest
+    // scope in `verify_session_principal`). Role plays NO part — the retired
+    // cto-only pre-filter is gone. A missing/wrong secret or unknown sid fails
+    // closed. We then OVERWRITE the identity args from CallerCtx so nothing
+    // downstream trusts a caller-supplied `_caller_slug`/`_caller_sid`/role.
+    //
+    // `McpCaller::Admin` (HTTP `/mcp`, admin bearer already verified at the
+    // transport layer) skips the principal gate: it names its target with an
+    // explicit `project` arg (fleet-wide, same as the web admin Identity).
     if caller == McpCaller::Ambient {
-        let gw = gateway.lock().await;
-        if !gw.verify_session_caller(caller_role, caller_secret) {
+        let caller_sid = args
+            .get("_caller_sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let caller_secret = args
+            .get("_caller_secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ctx = {
+            let gw = gateway.lock().await;
+            gw.verify_session_principal(caller_sid, caller_secret)
+        };
+        let Some(ctx) = ctx else {
             return session_tool_response(
                 id,
                 format!(
-                    "{name}: permission denied — caller could not be authenticated (no live `{caller_role}` session holds the presented secret)"
+                    "{name}: permission denied — caller could not be authenticated (no live session holds the presented (sid, secret) principal)"
                 ),
                 true,
             );
+        };
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("_caller_slug".to_string(), serde_json::json!(ctx.slug));
+            obj.insert("_caller_sid".to_string(), serde_json::json!(ctx.sid));
+            obj.insert("_caller_role".to_string(), serde_json::json!(ctx.role));
         }
     }
 
@@ -939,14 +919,6 @@ async fn execute_session_tool(
         Ok(text) => session_tool_response(id, text, false),
         Err(text) => session_tool_response(id, text, true),
     }
-}
-
-/// v0.8.7 W1 — layer-1 privilege PRE-FILTER (not the security boundary): is
-/// `caller_role` in the privileged set? Cheap + unit-testable without a
-/// gateway. The authoritative check is [`Gateway::verify_session_caller`],
-/// which matches the secret; this only short-circuits the obvious non-cto case.
-fn session_caller_authorized(caller_role: &str) -> bool {
-    SESSION_TOOL_PRIVILEGED_ROLES.contains(&caller_role)
 }
 
 /// Dispatch a privileged `session_*` call to the gateway. Returns `Ok(body)`
@@ -967,39 +939,39 @@ async fn run_session_tool(
     }
 }
 
-/// `session_spawn` — create (or reuse) a work-role session in the caller's
-/// bound project. The project is ALWAYS the ambient `_caller_slug` (the cto's
-/// project); `vendor` is honored where it makes sense.
+/// `session_spawn` — create a session in the caller's own project and return
+/// its `s{n}` id + vendor resume key + host. v0.9.0 W1 (F1/G1): the caller is
+/// authenticated by its `(sid, secret)` PRINCIPAL (see [`execute_session_tool`]),
+/// so `_caller_slug` here is the SERVER's view of the caller's project — an
+/// Ambient caller can only spawn into that project. Admin (HTTP front door)
+/// names the target with an explicit `project` (fleet-wide).
 ///
-/// v0.8.7 review-fix (R-M3) — the spawnable project is pinned to the caller's
-/// own slug, so a cto bound to project A can never spawn into project B. The
-/// previously-informational `project` arg is gone (it was a cross-project
-/// foot-gun); the gateway resolves the slug → cwd from its own project map.
+/// Facets mirror the REST `CreateSessionForm`: `{role?, vendor?, model?,
+/// effort?, protocol?, host?, permission_mode?, title?}`. `role` empty/absent =
+/// roleless (bare vendor reads the project CLAUDE.md/AGENTS.md). `title` is
+/// metadata/ledger only — NEVER concatenated into any prompt.
 async fn run_session_spawn(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
+    // Roleless is a first-class form; absent or "" both mean roleless.
     let role = args
         .get("role")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "session_spawn: missing `role`".to_string())?
+        .unwrap_or("")
+        .trim()
         .to_string();
-    // The session is always created in the cto's bound project (ambient slug),
-    // never a caller-named project — project-scoping the gate (R-M3).
-    //
-    // v0.9 T4 review fix — the HTTP front door's verified admin has no ambient
-    // slug; it names the target with an explicit `project` arg (fleet-wide
-    // semantics, same as the web admin Identity). Ambient callers keep the
-    // R-M3 pin: `project` is ignored, `_caller_slug` is the only source.
+    // Project scope: Ambient = the caller's server-resolved slug (overwritten
+    // in `execute_session_tool` from CallerCtx — never caller-supplied); Admin
+    // = explicit `project` (fleet-wide).
     let project = match caller {
         McpCaller::Ambient => args
             .get("_caller_slug")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .ok_or_else(|| "session_spawn: no project (ambient slug unset)".to_string())?,
+            .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
         McpCaller::Admin => args
             .get("project")
             .or_else(|| args.get("_caller_slug"))
@@ -1009,32 +981,154 @@ async fn run_session_spawn(
             .ok_or_else(|| "session_spawn: missing `project` (admin caller)".to_string())?,
     };
     let vendor = parse_session_vendor(args)?;
-    // v0.8.7 W2 (DB.1) — optional `permission_mode` arg (`skip` default /
-    // `hitl`). Lets the cto spawn a supervised work-role whose non-allowlist
-    // tools require IM approval.
+    // Optional `permission_mode` (`skip` default / `hitl`).
     let permission_mode = ccteam_harness::PermissionMode::parse_opt(
         args.get("permission_mode").and_then(|v| v.as_str()),
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
+    // Protocol: agents get `stream-json | acp` only — `terminal` is frozen and
+    // never exposed to agents. Grok/opencode are always ACP (honest meta).
+    let protocol = parse_session_protocol(args)?;
+    let protocol = if matches!(
+        vendor,
+        ccteam_harness::AgentVendor::Grok | ccteam_harness::AgentVendor::Opencode
+    ) {
+        ccteam_harness::SessionProtocol::Acp
+    } else {
+        protocol
+    };
+    let host = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("local")
+        .to_string();
+    // Optional model/effort (composer facets). Grok effort is dropped (its
+    // value set is undocumented — an invalid value would fail the spawn),
+    // mirroring the REST `spawn_tuning_from_form` contract.
+    let model = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let effort = args
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let tuning = crate::gateway::SpawnTuning {
+        model,
+        effort: if vendor == ccteam_harness::AgentVendor::Grok {
+            None
+        } else {
+            effort
+        },
+    };
+    // Optional `title` — metadata/ledger only, NEVER concatenated into any
+    // prompt. Validate ≤80 chars; W1 accepts + echoes it (meta persistence
+    // lands with the W2 delegation ledger).
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if let Some(t) = &title {
+        let n = t.chars().count();
+        if n > 80 {
+            return Err(format!(
+                "session_spawn: `title` too long ({n} chars; max 80)"
+            ));
+        }
+    }
+    // Owner = the shared ops pool (`web-api`): MCP-spawned children stay visible
+    // to the owner's console + IM (owner is not inherited from the caller; the
+    // parent link is a meta property that lands in W2).
+    let owner_id = "web-api".to_string();
 
-    let mut gw = gateway.lock().await;
-    let created = gw
-        .create_session_api(project.clone(), role.clone(), vendor, permission_mode)
-        .await
-        .map_err(|e| format!("session_spawn failed: {e}"))?;
-    drop(gw);
+    let (sid, model_warning, resolved) = {
+        let mut gw = gateway.lock().await;
+        let created = gw
+            .create_session_api_on_host(
+                project.clone(),
+                role.clone(),
+                vendor,
+                permission_mode,
+                protocol,
+                owner_id,
+                host.clone(),
+                tuning,
+            )
+            .await
+            .map_err(|e| format!("session_spawn failed: {e}"))?;
+        let sid = created.sid.clone();
+        // Resolve the child's project_dir under the SAME lock (sync) so we can
+        // read its vendor resume key off-lock.
+        let resolved = gw.session_resolve(&sid);
+        (sid, created.model_warning, resolved)
+    };
+    // vendor_session_id = the vendor's native resume key (`meta.vendor_uuid`).
+    // May be empty for some vendors at spawn time — return "" honestly (the
+    // codex-plugin-cc lesson: always surface the resume key when we have it).
+    let vendor_session_id = resolved
+        .and_then(|r| {
+            ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &sid).ok()
+        })
+        .map(|m| m.vendor_uuid)
+        .unwrap_or_default();
+
     let mut body = serde_json::json!({
         "ok": true,
-        "sid": created.sid,
+        "sid": sid,
         "project": project,
         "role": role,
+        "vendor": session_vendor_wire(vendor),
+        "protocol": protocol.as_str(),
+        "host": host,
+        "vendor_session_id": vendor_session_id,
         "permission_mode": permission_mode.as_str(),
-        "hint": "dispatch a task with session_dispatch{sid, task}, then poll session_collect{sid}.",
+        "hint": "dispatch a task with session_dispatch{sid, task}, then read the result with session_collect{sid}.",
     });
-    if let Some(model_warning) = created.model_warning {
+    if let Some(t) = title {
+        body["title"] = serde_json::json!(t);
+    }
+    if let Some(model_warning) = model_warning {
         body["model_warning"] = serde_json::json!(model_warning);
     }
     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// Parse the optional `protocol` arg for `session_spawn`. Agents may select
+/// `stream-json` (default) or `acp` only — `terminal` (tmux/PTY) is frozen and
+/// NEVER exposed to agents (an explicit reject keeps the red line legible even
+/// if a caller bypasses the schema enum).
+fn parse_session_protocol(
+    args: &serde_json::Value,
+) -> std::result::Result<ccteam_harness::SessionProtocol, String> {
+    let raw = args.get("protocol").and_then(|v| v.as_str());
+    if let Some(r) = raw {
+        let low = r.trim().to_ascii_lowercase();
+        if low == "terminal" || low == "tmux" {
+            return Err(
+                "session_spawn: protocol `terminal` is not available to agents (use `stream-json` or `acp`)"
+                    .to_string(),
+            );
+        }
+    }
+    ccteam_harness::SessionProtocol::parse_opt(raw).map_err(|e| format!("session_spawn: {e}"))
+}
+
+/// Lowercase wire string for a spawned session's vendor (response field).
+fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
+    match v {
+        ccteam_harness::AgentVendor::Claude => "claude",
+        ccteam_harness::AgentVendor::Codex => "codex",
+        ccteam_harness::AgentVendor::Grok => "grok",
+        ccteam_harness::AgentVendor::Opencode => "opencode",
+    }
 }
 
 /// `session_dispatch` — forward a task as a user turn to a session by sid.
@@ -1280,7 +1374,7 @@ fn parse_session_vendor(
             "grok" => Ok(ccteam_harness::AgentVendor::Grok),
             "opencode" => Ok(ccteam_harness::AgentVendor::Opencode),
             other => Err(format!(
-                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, or `grok`"
+                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, or `opencode`"
             )),
         },
     }
@@ -1561,17 +1655,16 @@ mod session_tool_tests {
         )
     }
 
-    /// v0.8.7 review-fix (R-M1) — end-to-end: a cto presenting the WRONG secret
-    /// is rejected by `execute_session_tool` even though its plaintext role is
-    /// `cto` (the secret is the authoritative check, not the role arg).
+    /// v0.9.0 W1 (F1) — end-to-end: a caller presenting the WRONG secret for a
+    /// real sid is rejected by `execute_session_tool` (the `(sid, secret)`
+    /// principal is the authoritative check; a forged role arg is irrelevant).
     #[tokio::test]
-    async fn execute_session_tool_rejects_cto_with_wrong_secret() {
-        let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
+    async fn execute_session_tool_rejects_wrong_secret() {
+        let (gw, cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
             "ccteam__session_list",
             json!({
-                "_caller_role": "cto",
-                "_caller_slug": "alpha",
+                "_caller_sid": cto_sid,
                 "_caller_secret": "ffffffffffffffffffffffffffffffff",
             }),
         );
@@ -1584,40 +1677,37 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.8.7 review-fix (R-M1) — end-to-end: the CORRECT cto `(role, secret)`
-    /// pair passes the gate and the call reaches the gateway (session_list
-    /// returns the live sessions).
+    /// v0.9.0 W1 (F1) — end-to-end: the CORRECT `(sid, secret)` principal passes
+    /// the gate and the call reaches the gateway (session_list returns rows).
     #[tokio::test]
-    async fn execute_session_tool_allows_cto_with_correct_secret() {
-        let (gw, _cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+    async fn execute_session_tool_allows_correct_principal() {
+        let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
             "ccteam__session_list",
             json!({
-                "_caller_role": "cto",
-                "_caller_slug": "alpha",
+                "_caller_sid": cto_sid,
                 "_caller_secret": cto_secret,
             }),
         );
         let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
-        assert_eq!(resp["result"]["isError"], false, "correct secret passes");
+        assert_eq!(resp["result"]["isError"], false, "correct principal passes");
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"sessions\""), "got: {text}");
     }
 
-    /// v0.8.7 review-fix (R-M3) — end-to-end: a cto authenticated for project
-    /// `alpha` is REJECTED when it tries to dispatch/collect/stop a `beta` sid
-    /// (cross-project operation), with the correct secret.
+    /// v0.9.0 W1 (F1) — end-to-end: a caller authenticated for project `alpha`
+    /// is REJECTED when it tries to dispatch/collect/stop a `beta` sid
+    /// (cross-project). The scope comes from the SERVER-resolved CallerCtx.slug.
     #[tokio::test]
     async fn execute_session_tool_rejects_cross_project_sid() {
-        let (gw, _cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+        let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         for tool in [
             "ccteam__session_dispatch",
             "ccteam__session_collect",
             "ccteam__session_stop",
         ] {
             let mut args = json!({
-                "_caller_role": "cto",
-                "_caller_slug": "alpha",
+                "_caller_sid": cto_sid.clone(),
                 "_caller_secret": cto_secret.clone(),
                 "sid": beta_sid.clone(),
             });
@@ -1634,19 +1724,50 @@ mod session_tool_tests {
         }
     }
 
-    /// v0.8.7 review-fix (R-M3) — the positive control: the SAME cto operating
-    /// its OWN `alpha` sid is allowed (so the scope check isn't blanket-deny).
+    /// v0.9.0 W1 (F1) — server-side slug overwrite: even if the caller SPOOFS
+    /// `_caller_slug: "beta"`, the gate overwrites it from CallerCtx (the real
+    /// project of the presented sid = `alpha`), so a `beta` sid is still denied.
     #[tokio::test]
-    async fn execute_session_tool_allows_same_project_sid() {
-        let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+    async fn execute_session_tool_overwrites_spoofed_caller_slug() {
+        let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let resp = execute_session_tool(
             &call(
                 "ccteam__session_collect",
                 json!({
-                    "_caller_role": "cto",
-                    "_caller_slug": "alpha",
+                    "_caller_sid": cto_sid,
                     "_caller_secret": cto_secret,
-                    "sid": cto_sid,
+                    "_caller_slug": "beta", // spoof attempt — must be ignored
+                    "sid": beta_sid,
+                }),
+            ),
+            Some(&gw),
+            McpCaller::Ambient,
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "spoofed slug must not grant cross-project access"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("bound to project `alpha`"),
+            "server must use CallerCtx.slug (alpha), not the spoofed `beta`, got: {text}"
+        );
+    }
+
+    /// v0.9.0 W1 (F1) — positive control: the SAME caller operating its OWN
+    /// `alpha` sid is allowed (the scope check isn't blanket-deny).
+    #[tokio::test]
+    async fn execute_session_tool_allows_same_project_sid() {
+        let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
+        let target_sid = cto_sid.clone();
+        let resp = execute_session_tool(
+            &call(
+                "ccteam__session_collect",
+                json!({
+                    "_caller_sid": cto_sid,
+                    "_caller_secret": cto_secret,
+                    "sid": target_sid,
                 }),
             ),
             Some(&gw),
@@ -1681,70 +1802,45 @@ mod session_tool_tests {
         })));
     }
 
-    #[test]
-    fn gate_allows_cto_and_rejects_everyone_else() {
-        assert!(session_caller_authorized("cto"));
-        assert!(!session_caller_authorized("reviewer"));
-        assert!(!session_caller_authorized("helper"));
-        assert!(
-            !session_caller_authorized(""),
-            "empty role is not privileged"
-        );
-    }
-
-    /// DA.3 layer 2 — a non-cto caller is REJECTED with isError, and the gate
-    /// fires BEFORE any gateway use (so denial holds even with gateway None).
+    /// v0.9.0 W1 (F1) — an Ambient caller whose `(sid, secret)` principal
+    /// resolves to no live session is REJECTED (needs a gateway to check).
     #[tokio::test]
-    async fn execute_session_tool_rejects_non_cto_caller() {
-        let req = call(
-            "ccteam__session_spawn",
-            json!({ "role": "reviewer", "_caller_role": "reviewer", "_caller_slug": "demo" }),
-        );
-        let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("permission denied"),
-            "non-cto must be denied, got: {text}"
-        );
-    }
-
-    /// A missing ambient identity (no `_caller_role`) is treated as
-    /// unprivileged — denied, never defaulting to allow.
-    #[tokio::test]
-    async fn execute_session_tool_denies_when_caller_role_absent() {
-        let req = call("ccteam__session_list", json!({}));
-        let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("permission denied"), "got: {text}");
-    }
-
-    /// DA.3 — a cto caller PASSES the gate. With no gateway wired the next
-    /// failure is the structured "gateway not running" (not a permission
-    /// denial), proving the gate let the cto through.
-    #[tokio::test]
-    async fn execute_session_tool_allows_cto_then_reports_gateway_down() {
+    async fn execute_session_tool_ambient_denies_unknown_principal() {
+        let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
             "ccteam__session_list",
-            json!({ "_caller_role": "cto", "_caller_slug": "demo" }),
+            json!({ "_caller_sid": "s999", "_caller_secret": "deadbeefdeadbeefdeadbeefdeadbeef" }),
+        );
+        let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("could not be authenticated"),
+            "unknown principal must be denied, got: {text}"
+        );
+    }
+
+    /// v0.9.0 W1 (F1) — fail-closed: with no gateway wired, EVERY Ambient
+    /// session_* call is refused ("gateway not running"), never a fall-through
+    /// that would skip the principal check.
+    #[tokio::test]
+    async fn execute_session_tool_ambient_gateway_down_fails_closed() {
+        let req = call(
+            "ccteam__session_list",
+            json!({ "_caller_sid": "s1", "_caller_secret": "abc" }),
         );
         let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            !text.contains("permission denied"),
-            "cto must pass the gate, got: {text}"
-        );
-        assert!(
             text.contains("gateway not running"),
-            "expected gateway-down error after the gate, got: {text}"
+            "gateway-down must fail closed, got: {text}"
         );
     }
 
-    /// v0.9 T4 review fix — the HTTP front door's verified admin skips the cto
-    /// role/secret gate entirely: NO `_caller_*` args, straight to the op
-    /// (which then reports gateway-down here — proving the gate was passed).
+    /// v0.9 T4 — the HTTP front door's verified admin skips the principal gate
+    /// entirely: NO `_caller_*` args, straight to the op (which then reports
+    /// gateway-down here — proving the gate was bypassed, not that it denied).
     #[tokio::test]
     async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
         let req = call("ccteam__session_list", json!({}));
@@ -1752,8 +1848,8 @@ mod session_tool_tests {
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            !text.contains("permission denied"),
-            "admin must skip the cto gate, got: {text}"
+            !text.contains("permission denied") && !text.contains("could not be authenticated"),
+            "admin must skip the principal gate, got: {text}"
         );
         assert!(
             text.contains("gateway not running"),
@@ -1761,9 +1857,8 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.9 T4 review fix — admin `session_list` works with NO ambient args
-    /// and reaches the live gateway (fleet-wide semantics, same as the web
-    /// admin Identity).
+    /// v0.9 T4 — admin `session_list` works with NO ambient args and reaches the
+    /// live gateway (fleet-wide semantics, same as the web admin Identity).
     #[tokio::test]
     async fn execute_session_tool_admin_lists_sessions_fleet_wide() {
         let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
@@ -1775,7 +1870,7 @@ mod session_tool_tests {
         .await;
         assert_eq!(
             resp["result"]["isError"], false,
-            "admin bypasses the cto gate: {resp}"
+            "admin bypasses the principal gate: {resp}"
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"sessions\""), "got: {text}");

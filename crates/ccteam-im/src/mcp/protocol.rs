@@ -177,28 +177,37 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "ccteam__session_spawn",
-            "description": "Spawn a work-role session in the gateway and return its `s{n}` id. Privileged: only the `cto` role may call this (the daemon authenticates the caller's per-session secret; the cto agent's tool allow-list is a secondary discouragement). The new session runs `<role>` from `.claude/agents/<role>.md` and is ALWAYS created in the caller's OWN bound project (there is no project parameter — a cto bound to project A cannot spawn into another project). `vendor` defaults to `claude`. Always mints a NEW sid: a second spawn of the same role creates a SEPARATE session (its own pane + sid + independent transcript), so you can run several instances of one role in parallel. After spawning, drive it with session_dispatch and read its answer with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Drive it with session_dispatch and read its output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "Work-role to spawn (must exist as `.claude/agents/<role>.md`)." },
+                    "role": { "type": "string", "description": "Optional work-role (must exist as `.claude/agents/<role>.md`). Omit or pass \"\" for a roleless session (bare vendor reads the project CLAUDE.md/AGENTS.md)." },
                     "vendor": {
                         "type": "string",
-                        "enum": ["claude", "codex"],
+                        "enum": ["claude", "codex", "grok", "opencode"],
                         "description": "Harness vendor (lowercase). Default `claude`."
                     },
+                    "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
+                    "effort": { "type": "string", "description": "Optional reasoning-effort token (vendor-specific value set). Ignored for grok (undocumented value set)." },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["stream-json", "acp"],
+                        "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode (forced). `terminal` is not available to agents."
+                    },
+                    "host": { "type": "string", "description": "Execution host: `local` (default) or a registered satellite id." },
                     "permission_mode": {
                         "type": "string",
                         "enum": ["skip", "hitl"],
-                        "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) drops the skip flag at spawn so a non-allowlist tool call pops an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt. Use for a supervised work-role."
-                    }
+                        "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) makes a non-allowlist tool call pop an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt."
+                    },
+                    "title": { "type": "string", "description": "Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt." }
                 },
-                "required": ["role"],
+                "required": [],
             }),
         }),
         json!({
             "name": "ccteam__session_dispatch",
-            "description": "Dispatch a task (a user-turn) to a gateway session addressed by `sid` (e.g. `s2` from session_spawn). Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project dispatch is rejected). The `task` text is forwarded verbatim as a user turn to the child session's agent (NO system prompt injection). Returns the submitted turn id. The child runs asynchronously; poll session_collect to read its answer once the turn completes. This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). Returns the submitted turn id. The target runs asynchronously; read its answer with session_collect once the turn completes. This is an explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -210,7 +219,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_collect",
-            "description": "Collect (poll) a child session's transcript by `sid`. Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror the child's answers are written to, keyed by sid so parallel same-role sessions never bleed) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for collecting incremental results. MVP = polled (push-back-as-turn, where the child's result is injected straight into cto's context, is v0.8.8). Returns an empty `turns` array when the child hasn't answered yet.",
+            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Returns an empty `turns` array when the target hasn't answered yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +232,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_list",
-            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Privileged: cto only. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`. Use this to find a `sid` to dispatch to or collect from.",
+            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`. Use this to find a `sid` to dispatch to or collect from.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {},
@@ -232,7 +241,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_stop",
-            "description": "Stop a gateway session by `sid` (deregister + close its pane). Privileged: cto only, and the `sid` must run in the caller's OWN project (cross-project stop is rejected). This is an EXPLICIT command (the cto deciding the work is done), NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-collected `turns.jsonl` still works until cleanup. An unknown sid is an error.",
+            "description": "Stop a session by `sid` (deregister + close it). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project stop is rejected). This is an EXPLICIT command, NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-recorded `turns.jsonl` still works until cleanup. An unknown sid is an error.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -473,28 +482,63 @@ mod tests {
     }
 
     #[test]
-    fn session_spawn_schema_carries_permission_mode_param() {
+    fn session_spawn_schema_carries_full_facet_set() {
         let spawn = session_tool_definitions()
             .into_iter()
             .find(|t| t["name"] == "ccteam__session_spawn")
             .expect("session_spawn defined");
-        let pm = &spawn["inputSchema"]["properties"]["permission_mode"];
-        assert_eq!(pm["type"], "string");
-        let en: Vec<&str> = pm["enum"]
+        let props = &spawn["inputSchema"]["properties"];
+
+        // permission_mode enum unchanged.
+        let pm: Vec<&str> = props["permission_mode"]["enum"]
             .as_array()
             .expect("permission_mode has an enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(en, vec!["skip", "hitl"]);
+        assert_eq!(pm, vec!["skip", "hitl"]);
+
+        // v0.9.0 W1 (G1) — vendor enum lists all FOUR harnesses.
+        let vendors: Vec<&str> = props["vendor"]["enum"]
+            .as_array()
+            .expect("vendor has an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
+
+        // v0.9.0 W1 (G1) — new facets are present.
+        for key in ["model", "effort", "protocol", "host", "title"] {
+            assert!(
+                props[key].is_object(),
+                "session_spawn schema must carry `{key}`"
+            );
+        }
+
+        // protocol enum = stream-json | acp ONLY — terminal is NEVER exposed.
+        let protos: Vec<&str> = props["protocol"]["enum"]
+            .as_array()
+            .expect("protocol has an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(protos, vec!["stream-json", "acp"]);
+        assert!(
+            !protos.contains(&"terminal"),
+            "terminal must not be exposed to agents"
+        );
+
+        // role is now OPTIONAL (roleless is a first-class form) → required = [].
         let required: Vec<&str> = spawn["inputSchema"]["required"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(!required.contains(&"permission_mode"));
-        assert_eq!(required, vec!["role"]);
+        assert!(
+            required.is_empty(),
+            "role is optional; required must be empty"
+        );
     }
 
     #[test]

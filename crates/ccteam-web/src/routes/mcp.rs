@@ -83,13 +83,21 @@ async fn handle_post(
         }
     };
 
-    // Admin bearer → owner's front door (session tools skip cto gate).
-    // Session bearer `ccteam-sid:<sid>:<secret>` → Ambient path with injected
-    // _caller_role/_caller_secret so session_* auth matches the live session.
+    // Admin bearer → owner's front door (session tools skip the principal gate).
+    // Session bearer `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL
+    // caller identity injected (_caller_sid/_caller_secret/_caller_role/
+    // _caller_slug) so session_* principal auth matches the live session
+    // (v0.9.0 W1 G4 — previously only role+secret were injected, so session_*
+    // over HTTP failed closed with "no project scope").
     let (caller, req) = match auth {
         McpAuth::Admin => (ccteam_im::mcp::McpCaller::Admin, req),
-        McpAuth::Session { role, secret } => {
-            inject_session_caller(&mut req, &role, &secret);
+        McpAuth::Session {
+            sid,
+            role,
+            secret,
+            slug,
+        } => {
+            inject_session_caller(&mut req, &sid, &role, &secret, &slug);
             (ccteam_im::mcp::McpCaller::Ambient, req)
         }
     };
@@ -109,7 +117,12 @@ async fn handle_post(
 /// Who authenticated against `POST /mcp`.
 enum McpAuth {
     Admin,
-    Session { role: String, secret: String },
+    Session {
+        sid: String,
+        role: String,
+        secret: String,
+        slug: String,
+    },
 }
 
 /// Enforce bearer always. Accepts:
@@ -188,29 +201,29 @@ async fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Resul
         return Err(());
     };
     let guard = gw.lock().await;
-    // Reuse gateway secret map: any live session with matching secret.
-    // Role is taken from the matched session (not client-supplied).
-    if let Some((role, ok)) = guard.session_role_if_secret_matches(sid, secret) {
-        if ok {
-            return Ok(McpAuth::Session {
-                role,
-                secret: secret.to_string(),
-            });
-        }
+    // v0.9.0 W1 (F1/G4) — resolve the `(sid, secret)` PRINCIPAL to a CallerCtx
+    // (server-side sid + slug + role). role/slug come from the matched session,
+    // never the client; an empty secret / unknown sid returns None → 401.
+    match guard.verify_session_principal(sid, secret) {
+        Some(ctx) => Ok(McpAuth::Session {
+            sid: ctx.sid,
+            role: ctx.role,
+            secret: secret.to_string(),
+            slug: ctx.slug,
+        }),
+        None => Err(()),
     }
-    Err(())
 }
 
-/// Inject `_caller_role` / `_caller_secret` into a tools/call arguments object
-/// so Ambient session_* auth sees the curated session's identity.
-fn inject_session_caller(req: &mut Value, role: &str, secret: &str) {
+/// Inject the FULL caller identity (`_caller_sid` / `_caller_secret` /
+/// `_caller_role` / `_caller_slug`) into a tools/call arguments object so the
+/// Ambient session_* PRINCIPAL gate sees the curated session's identity. All
+/// four are OVERWRITTEN (never trust a caller-supplied value); the daemon
+/// re-verifies `(sid, secret)` and re-derives slug/role from CallerCtx.
+fn inject_session_caller(req: &mut Value, sid: &str, role: &str, secret: &str, slug: &str) {
     let Some(params) = req.get_mut("params") else {
         return;
     };
-    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    if !name.contains("session_") && !name.ends_with("session_list") {
-        // Still inject for all tools/call — harmless for non-session tools.
-    }
     let args = params.as_object_mut().and_then(|m| m.get_mut("arguments"));
     let args = match args {
         Some(a) => a,
@@ -224,8 +237,10 @@ fn inject_session_caller(req: &mut Value, role: &str, secret: &str) {
         }
     };
     if let Some(map) = args.as_object_mut() {
-        map.insert("_caller_role".into(), json!(role));
+        map.insert("_caller_sid".into(), json!(sid));
         map.insert("_caller_secret".into(), json!(secret));
+        map.insert("_caller_role".into(), json!(role));
+        map.insert("_caller_slug".into(), json!(slug));
     }
 }
 

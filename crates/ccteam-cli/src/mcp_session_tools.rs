@@ -55,11 +55,15 @@ async fn forward_session_tool(paths: &CcteamPaths, name: &str, args: &Value) -> 
     // daemon can resolve the SPECIFIC caller session post-dedup (`(slug, role)`
     // is no longer unique). Empty for a pre-F1 / restored pane.
     let caller_sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
-    if slug.is_empty() || role.is_empty() {
+    // v0.9.0 W1 (F1) — the caller identity is now the `(sid, secret)` PRINCIPAL,
+    // not `(slug, role)`. Require the principal env (a roleless session has an
+    // empty ROLE but still a valid sid+secret); slug/role ride along as
+    // audit labels the daemon overwrites from the resolved CallerCtx.
+    if caller_sid.is_empty() || secret.is_empty() {
         return Ok(vec![json!({
             "type": "text",
             "text": format!(
-                "{name}: not in a ccteam chat session (CCTEAM_CHAT_SLUG/ROLE unset); session tools are only callable from a live session"
+                "{name}: not in a ccteam session (CCTEAM_CHAT_SID/SECRET unset); session tools are only callable from a live session with a principal"
             ),
         })]);
     }
@@ -154,28 +158,37 @@ mod tests {
     }
 
     #[test]
-    fn session_spawn_schema_carries_permission_mode_param() {
+    fn session_spawn_schema_carries_full_facet_set() {
         let spawn = session_tool_definitions()
             .into_iter()
             .find(|t| t["name"] == "ccteam__session_spawn")
             .expect("session_spawn defined");
-        let pm = &spawn["inputSchema"]["properties"]["permission_mode"];
-        assert_eq!(pm["type"], "string");
-        let en: Vec<&str> = pm["enum"]
+        let props = &spawn["inputSchema"]["properties"];
+        // v0.9.0 W1 (G1) — vendor enum lists all FOUR harnesses.
+        let vendors: Vec<&str> = props["vendor"]["enum"]
             .as_array()
-            .expect("permission_mode has an enum")
+            .expect("vendor enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(en, vec!["skip", "hitl"]);
-        let required: Vec<&str> = spawn["inputSchema"]["required"]
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
+        // New facets present; protocol enum excludes terminal.
+        for key in ["model", "effort", "protocol", "host", "title"] {
+            assert!(props[key].is_object(), "schema must carry `{key}`");
+        }
+        let protos: Vec<&str> = props["protocol"]["enum"]
             .as_array()
-            .unwrap()
+            .expect("protocol enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(!required.contains(&"permission_mode"));
-        assert_eq!(required, vec!["role"]);
+        assert_eq!(protos, vec!["stream-json", "acp"]);
+        // role is optional now → required is empty.
+        let required = spawn["inputSchema"]["required"].as_array().unwrap();
+        assert!(
+            required.is_empty(),
+            "role is optional; required must be empty"
+        );
     }
 
     #[test]
@@ -211,23 +224,23 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        let prev_slug = std::env::var("CCTEAM_CHAT_SLUG").ok();
-        let prev_role = std::env::var("CCTEAM_CHAT_ROLE").ok();
-        std::env::remove_var("CCTEAM_CHAT_SLUG");
-        std::env::remove_var("CCTEAM_CHAT_ROLE");
+        let prev_sid = std::env::var("CCTEAM_CHAT_SID").ok();
+        let prev_secret = std::env::var("CCTEAM_CHAT_SECRET").ok();
+        std::env::remove_var("CCTEAM_CHAT_SID");
+        std::env::remove_var("CCTEAM_CHAT_SECRET");
         let body = dispatch(&paths, "ccteam__session_list", &json!({}))
             .await
             .unwrap()
             .expect("session tool matched");
         assert!(
-            body.contains("not in a ccteam chat session"),
+            body.contains("not in a ccteam session"),
             "expected soft-degrade message, got: {body}"
         );
-        if let Some(v) = prev_slug {
-            std::env::set_var("CCTEAM_CHAT_SLUG", v);
+        if let Some(v) = prev_sid {
+            std::env::set_var("CCTEAM_CHAT_SID", v);
         }
-        if let Some(v) = prev_role {
-            std::env::set_var("CCTEAM_CHAT_ROLE", v);
+        if let Some(v) = prev_secret {
+            std::env::set_var("CCTEAM_CHAT_SECRET", v);
         }
     }
 }

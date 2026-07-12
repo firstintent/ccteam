@@ -2762,3 +2762,178 @@ fn d2_5_every_codex_slash_command_is_builtin_or_rejected() {
         "snapshot count drift — re-sync the SlashCommand enum from b2344d8"
     );
 }
+
+/// v0.9.0 W1 (G2, spike-verified codex 0.144.1) — a fresh `start_thread` with a
+/// non-empty secret injects the ccteam MCP server into `thread/start`'s
+/// `config.mcp_servers.ccteam` (snake_case, stdio + identity env), and persists
+/// the resulting thread id as `raw_extras.vendor_uuid` (G5, for resume).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn start_thread_injects_per_thread_mcp_config_with_identity() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("codex-mcp-config");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let reqs: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let reqs_h = Arc::clone(&reqs);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        if req.get("id").is_some() {
+            reqs_h.lock().unwrap().push(req.clone());
+        }
+        match req["method"].as_str() {
+            Some("initialize") => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-cfg" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let tmp = TempDir::new().unwrap();
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "reviewer".into(),
+            },
+            &SpawnCtx {
+                slug: "demo".into(),
+                sid: "codex-w1".into(),
+                cwd: tmp.path().to_path_buf(),
+                project_dir: tmp.path().to_path_buf(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: "seKret1234".into(),
+            },
+        )
+        .await
+        .unwrap();
+    // G5 — vendor_uuid persisted (apply_new_session reads this into meta.json).
+    assert_eq!(h.raw_extras["vendor_uuid"], "t-cfg");
+
+    let start = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .cloned()
+        .expect("thread/start seen");
+    let srv = &start["params"]["config"]["mcp_servers"]["ccteam"];
+    assert_eq!(
+        srv["env"]["CCTEAM_CHAT_SID"], "codex-w1",
+        "per-thread config must carry the sid: {start}"
+    );
+    assert_eq!(
+        srv["env"]["CCTEAM_CHAT_SECRET"], "seKret1234",
+        "per-thread config must carry the secret: {start}"
+    );
+    assert_eq!(srv["args"][0], "internal");
+    assert_eq!(srv["args"][1], "mcp-serve");
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
+/// v0.9.0 W1 (G5) — after a daemon restart (a fresh adapter), `start_thread`
+/// reads the persisted `meta.vendor_uuid` and issues `thread/resume` for that
+/// exact id (carrying the same per-thread config) INSTEAD of silently starting
+/// a fresh thread and dropping the conversation.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("codex-resume-persisted");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let reqs: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let reqs_h = Arc::clone(&reqs);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        if req.get("id").is_some() {
+            reqs_h.lock().unwrap().push(req.clone());
+        }
+        match req["method"].as_str() {
+            Some("initialize") => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-prior" } } }),
+            Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-fresh" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let tmp = TempDir::new().unwrap();
+    // Simulate the "before the restart" state: a prior codex session whose
+    // vendor_uuid is persisted in meta.json (what apply_new_session writes).
+    let meta = ccteam_harness::SessionMeta {
+        sid: "codex-r1".into(),
+        slug: "demo".into(),
+        vendor: AgentVendor::Codex,
+        protocol: ccteam_harness::SessionProtocol::StreamJson,
+        role: "reviewer".into(),
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        owner: "user:web-api".into(),
+        vendor_uuid: "t-prior".into(),
+        host: "local".into(),
+        created_at: String::new(),
+        last_active: String::new(),
+        origin: ccteam_harness::SessionOrigin::Ccteam,
+        title: None,
+        title_source: None,
+        turn_count: 0,
+        cost_usd: None,
+        role_sha: None,
+        skills_sha: None,
+        trigger: None,
+        compare_group: None,
+    };
+    ccteam_harness::write_session_meta(tmp.path(), &meta).unwrap();
+
+    // Fresh adapter (= daemon restart) resumes the persisted id.
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "reviewer".into(),
+            },
+            &SpawnCtx {
+                slug: "demo".into(),
+                sid: "codex-r1".into(),
+                cwd: tmp.path().to_path_buf(),
+                project_dir: tmp.path().to_path_buf(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: "seKret".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.identity, "t-prior", "must resume the persisted thread id");
+
+    let seen = reqs.lock().unwrap().clone();
+    let resume = seen
+        .iter()
+        .find(|r| r["method"] == "thread/resume")
+        .unwrap_or_else(|| panic!("second start_thread must thread/resume: {seen:?}"));
+    assert_eq!(resume["params"]["threadId"], "t-prior");
+    assert_eq!(
+        resume["params"]["config"]["mcp_servers"]["ccteam"]["env"]["CCTEAM_CHAT_SID"], "codex-r1",
+        "resume must carry the per-thread ccteam config too"
+    );
+    assert!(
+        !seen.iter().any(|r| r["method"] == "thread/start"),
+        "resume succeeded → must NOT fall back to a fresh thread/start: {seen:?}"
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}

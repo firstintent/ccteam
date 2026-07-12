@@ -150,12 +150,15 @@ impl OpencodeAcpAdapter {
         transport: &AcpTransport,
         cwd: &std::path::Path,
         session_id: &str,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<ModelInfo, HarnessError> {
         Self::handshake_initialize(transport).await?;
+        // v0.9.0 W1 (G2) — resume/load MUST carry the SAME mcpServers as fresh;
+        // hardcoding `[]` here dropped the ccteam tool face after any resume.
         let params = json!({
             "sessionId": session_id,
             "cwd": cwd.to_string_lossy(),
-            "mcpServers": []
+            "mcpServers": mcp_servers
         });
         match transport.call("session/resume", params.clone()).await {
             Ok(result) => Ok(pluck_model_info(&result)),
@@ -324,8 +327,7 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         let inbound = Self::inbound_policy(ctx.permission_mode);
         // v0.8.24 C1 — best-effort ccteam MCP inject into session/new.
         // Failure to load MCP must not block the prompt path (empty vec).
-        let mcp_servers =
-            crate::execution::mcp_config::opencode_mcp_servers_http(&ctx.sid, &ctx.secret);
+        let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)
             .ok()
@@ -348,7 +350,8 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                             HarnessError::SpawnFailed(format!("spawn opencode acp: {e}"))
                         })?;
                 let transport = Arc::new(transport);
-                match Self::handshake_and_resume(&transport, &cwd, &uuid).await {
+                match Self::handshake_and_resume(&transport, &cwd, &uuid, mcp_servers.clone()).await
+                {
                     Ok(info) => (transport, uuid, info),
                     Err(resume_err) => {
                         tracing::warn!(
