@@ -5019,6 +5019,9 @@ impl Gateway {
         // 🔴 stuck — EXCEPT running subagents are an AUTHORITATIVE "still working"
         // signal (straight from claude) that overrides the silence heuristic, so
         // a main session quietly awaiting subagents never mis-reads idle/stuck.
+        // Background workflows do NOT override: they outlive the spawning turn,
+        // so a leftover run must not mask a genuinely stuck later turn.
+        let turn_scoped_running = running.iter().any(|t| t.task_type != "local_workflow");
         let mut stuck_after = gateway_turn_timeout_duration();
         if stuck_after.is_zero() {
             stuck_after = std::time::Duration::from_secs(300);
@@ -5033,7 +5036,7 @@ impl Gateway {
         let (state, detail) = match (started, silent_for) {
             (None, _) => ("🟢", "idle".to_string()),
             // Running subagents ⇒ definitively working (overrides silence).
-            (Some(t), _) if !running.is_empty() => (
+            (Some(t), _) if turn_scoped_running => (
                 "🔵",
                 format!("working {}", humanize_dur(now.saturating_duration_since(t))),
             ),
@@ -5093,33 +5096,11 @@ impl Gateway {
             .unwrap_or_else(|| "resume —".to_string());
         out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
 
-        // Running subagents / workflows — straight from claude's task lifecycle
-        // (NOT a fold). Oldest first (longest-running on top). Only present while
-        // working; an idle session has none.
-        if !running.is_empty() {
-            out.push_str(&format!("\n   🤖 在跑 subagent ({}):", running.len()));
-            let mut tasks: Vec<&RunningTask> = running.iter().collect();
-            tasks.sort_by_key(|t| t.started);
-            for t in tasks {
-                let kind = if t.kind.is_empty() {
-                    "subagent"
-                } else {
-                    t.kind.as_str()
-                };
-                let elapsed = humanize_dur(t.started.elapsed());
-                let desc = t.description.trim();
-                if desc.is_empty() {
-                    out.push_str(&format!("\n      · {kind} · {elapsed}"));
-                } else {
-                    let shown: String = if desc.chars().count() > 40 {
-                        format!("{}…", desc.chars().take(39).collect::<String>())
-                    } else {
-                        desc.to_string()
-                    };
-                    out.push_str(&format!("\n      · {kind}「{shown}」· {elapsed}"));
-                }
-            }
-        }
+        // Running subagents / background workflows — straight from claude's task
+        // lifecycle (NOT a fold). Subagents only exist while a turn is working;
+        // background workflows outlive the turn, so an idle session can still
+        // show its running workflows here.
+        out.push_str(&format_running_tasks(&running));
 
         // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
         if let Some(g) = status.as_ref().and_then(|st| st.goal.as_ref()) {
@@ -6713,6 +6694,52 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
 /// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
 /// `0s`.
+/// Render the `/status` running-task block — claude's own subagent/background
+/// workflow lifecycle mirrored verbatim (NOT a fold), oldest first
+/// (longest-running on top). Empty string when nothing runs. Workflows
+/// (`task_type: "local_workflow"`) are counted and labeled separately from
+/// subagents: they run in the background and outlive the spawning turn.
+fn format_running_tasks(running: &[RunningTask]) -> String {
+    if running.is_empty() {
+        return String::new();
+    }
+    let workflows = running
+        .iter()
+        .filter(|t| t.task_type == "local_workflow")
+        .count();
+    let subagents = running.len() - workflows;
+    let mut kinds: Vec<String> = Vec::new();
+    if subagents > 0 {
+        kinds.push(format!("subagent ({subagents})"));
+    }
+    if workflows > 0 {
+        kinds.push(format!("workflow ({workflows})"));
+    }
+    let mut out = format!("\n   🤖 在跑 {}:", kinds.join(" + "));
+    let mut tasks: Vec<&RunningTask> = running.iter().collect();
+    tasks.sort_by_key(|t| t.started);
+    for t in tasks {
+        let kind = match t.task_type.as_str() {
+            "local_workflow" => "workflow",
+            _ if t.kind.is_empty() => "subagent",
+            _ => t.kind.as_str(),
+        };
+        let elapsed = humanize_dur(t.started.elapsed());
+        let desc = t.description.trim();
+        if desc.is_empty() {
+            out.push_str(&format!("\n      · {kind} · {elapsed}"));
+        } else {
+            let shown: String = if desc.chars().count() > 40 {
+                format!("{}…", desc.chars().take(39).collect::<String>())
+            } else {
+                desc.to_string()
+            };
+            out.push_str(&format!("\n      · {kind}「{shown}」· {elapsed}"));
+        }
+    }
+    out
+}
+
 /// Render [`AccountUsage`] as the `/status` dashboard usage line:
 /// `⚡ 用量: 5h 17% (→19:00) · 周 78%⚠ (→06/29) · 额度 46% · max`. Each field is
 /// omitted when the vendor didn't report it; an empty result = nothing to show.
@@ -10505,6 +10532,43 @@ mod tests {
         assert!(s.contains("额度 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
         assert_eq!(format_account_usage(&AccountUsage::default()), "");
+    }
+
+    /// `/status` running-task block — background workflows (`local_workflow`)
+    /// are counted and labeled separately from subagents; a workflow's empty
+    /// `subagent_type` must NOT fall back to the "subagent" label.
+    #[test]
+    fn format_running_tasks_distinguishes_workflows_from_subagents() {
+        fn task(id: &str, kind: &str, desc: &str, task_type: &str) -> RunningTask {
+            RunningTask {
+                task_id: id.into(),
+                kind: kind.into(),
+                description: desc.into(),
+                task_type: task_type.into(),
+                started: std::time::Instant::now(),
+            }
+        }
+        // Nothing running → nothing rendered.
+        assert_eq!(format_running_tasks(&[]), "");
+        // Subagents only → the pre-workflow header, kind from subagent_type.
+        let subs = [task("a1", "code-reviewer", "review auth", "local_agent")];
+        let s = format_running_tasks(&subs);
+        assert!(s.contains("在跑 subagent (1):"), "{s}");
+        assert!(s.contains("code-reviewer「review auth」"), "{s}");
+        // Mixed → both kinds counted in the header; the workflow row is labeled
+        // "workflow" even though its subagent_type is empty.
+        let mixed = [
+            task("a1", "", "find bugs", "local_agent"),
+            task("w1", "", "audit the codebase", "local_workflow"),
+        ];
+        let s = format_running_tasks(&mixed);
+        assert!(s.contains("在跑 subagent (1) + workflow (1):"), "{s}");
+        assert!(s.contains("subagent「find bugs」"), "{s}");
+        assert!(s.contains("workflow「audit the codebase」"), "{s}");
+        // Workflows only (e.g. an idle session with a background run).
+        let wf = [task("w1", "", "migrate call sites", "local_workflow")];
+        let s = format_running_tasks(&wf);
+        assert!(s.contains("在跑 workflow (1):"), "{s}");
     }
 
     /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's

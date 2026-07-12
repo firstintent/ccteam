@@ -279,11 +279,14 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
-                        // The turn ended — no subagent/workflow task can still be
-                        // running (tasks live within a turn). Clear the list as a
-                        // safety net in case a terminal task event was missed.
+                        // The turn ended — turn-scoped tasks (subagents, shells)
+                        // cannot still be running, so drop them as a safety net in
+                        // case a terminal task event was missed. Background
+                        // workflows OUTLIVE the turn by design (the Workflow tool
+                        // returns immediately and the run keeps going), so they
+                        // stay until their own terminal task event arrives.
                         if let Ok(mut t) = running_tasks.lock() {
-                            t.clear();
+                            t.retain(task_outlives_turn);
                         }
                         // Context is read STRICTLY from claude's OWN accounting
                         // (`get_context_usage` → real totalTokens + maxTokens). No
@@ -335,6 +338,16 @@ fn spawn_status_tap(
             }
         }
     });
+}
+
+/// True for a task that legitimately OUTLIVES the turn that spawned it, so the
+/// turn-end safety net must not evict it. claude's background dynamic
+/// workflows (`task_type: "local_workflow"`) keep running after the spawning
+/// turn's result and report their own terminal `task_updated`/
+/// `task_notification` later; everything else (subagents, shells) is
+/// turn-scoped.
+fn task_outlives_turn(t: &crate::RunningTask) -> bool {
+    t.task_type == "local_workflow"
 }
 
 /// True for a task `status` that means the task is no longer running, so it
@@ -1535,7 +1548,8 @@ mod effort_tests {
     use super::protocol::SystemMsg;
     use super::{
         claude_model_options, normalize_effort, parse_latest_goal_status, preserve_1m_tag,
-        reflect_task_event, set_effort_level, split_model_effort, ClaudeModelOption, EFFORT_LEVELS,
+        reflect_task_event, set_effort_level, split_model_effort, task_outlives_turn,
+        ClaudeModelOption, EFFORT_LEVELS,
     };
     use std::sync::Mutex;
 
@@ -1598,6 +1612,34 @@ mod effort_tests {
         assert!(tasks.lock().unwrap().is_empty());
         // A non-task system line (init) is ignored (no panic, no insert).
         reflect_task_event(&tasks, &task_sys("init", ""));
+        assert!(tasks.lock().unwrap().is_empty());
+    }
+
+    /// The turn-end safety net evicts turn-scoped tasks (subagents) but keeps
+    /// background workflows (`local_workflow`), which outlive the spawning
+    /// turn; the workflow still leaves the list on its OWN terminal event.
+    #[test]
+    fn turn_end_safety_net_keeps_background_workflows() {
+        let tasks = Mutex::new(Vec::new());
+        let mut agent = task_sys("task_started", "a1");
+        agent.subagent_type = "general-purpose".into();
+        agent.task_type = "local_agent".into();
+        reflect_task_event(&tasks, &agent);
+        let mut wf = task_sys("task_started", "w1");
+        wf.description = "audit the codebase".into();
+        wf.task_type = "local_workflow".into();
+        reflect_task_event(&tasks, &wf);
+        // What the TurnResult arm applies: retain only tasks that outlive a turn.
+        tasks.lock().unwrap().retain(task_outlives_turn);
+        {
+            let g = tasks.lock().unwrap();
+            assert_eq!(g.len(), 1, "subagent evicted, workflow retained");
+            assert_eq!(g[0].task_id, "w1");
+        }
+        // The workflow's own terminal notification still removes it.
+        let mut note = task_sys("task_notification", "w1");
+        note.status = "completed".into();
+        reflect_task_event(&tasks, &note);
         assert!(tasks.lock().unwrap().is_empty());
     }
 
