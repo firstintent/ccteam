@@ -1434,6 +1434,39 @@ impl Gateway {
         )
         .await
         .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
+        // v0.9.0 W5 (real-machine smoke fix) — RE-WRITE the curated Claude
+        // stream-json mcp.json with the FRESHLY-MINTED secret. Secrets are
+        // in-memory and re-minted on every rebuild (`plan.secret`), but the
+        // file-based mcp.json is only written on FRESH spawn — so without this a
+        // session that cold-resumes after a daemon restart would keep the stale
+        // bearer and LOSE all ccteam MCP tools (it could no longer delegate).
+        // ACP/codex pass mcpServers inline with the current secret each resume,
+        // so this file rewrite is the one gap. Best-effort (mirrors fresh path).
+        if plan.vendor == AgentVendor::Claude
+            && plan.protocol == SessionProtocol::StreamJson
+            && !plan.secret.is_empty()
+        {
+            let bin = ccteam_core::current_ccteam_bin()
+                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
+            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
+                sid: &plan.sid,
+                secret: &plan.secret,
+                role: &plan.role,
+                slug: &plan.slug,
+                ccteam_bin: &bin,
+                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
+                http_url: None,
+            };
+            if let Err(e) =
+                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+            {
+                tracing::warn!(
+                    sid = %plan.sid,
+                    error = %e,
+                    "curated mcp.json rewrite on resume failed; stream-json continues without MCP"
+                );
+            }
+        }
         plan.adapter
             .start_thread(
                 &AgentSpecBrief {
@@ -12861,6 +12894,34 @@ mod tests {
             restored_s2, original_secret_s2,
             "secret is re-minted on cold-start rebuild, not persisted"
         );
+
+        // v0.9.0 W5 (real-machine smoke fix) — the curated Claude stream-json
+        // mcp.json MUST be re-written on cold-start rebuild with the FRESH
+        // secret, else the resumed session keeps a stale bearer and loses every
+        // ccteam MCP tool (can no longer delegate). Assert each session's
+        // mcp.json now carries the RESTORED secret and NOT the original one.
+        for (sid, restored_secret, original_secret) in [
+            ("s1", &restored_s1, &original_secret_s1),
+            ("s2", &restored_s2, &original_secret_s2),
+        ] {
+            let mcp = tmp
+                .path()
+                .join("beta")
+                .join(".ccteam")
+                .join("chat")
+                .join(sid)
+                .join("mcp.json");
+            let body = std::fs::read_to_string(&mcp)
+                .unwrap_or_else(|e| panic!("read {} after rebuild: {e}", mcp.display()));
+            assert!(
+                body.contains(restored_secret.as_str()),
+                "{sid} mcp.json must be rewritten with the fresh secret after resume"
+            );
+            assert!(
+                !body.contains(original_secret.as_str()),
+                "{sid} mcp.json must NOT keep the stale pre-restart secret"
+            );
+        }
 
         // v0.8.22 P0-3 — ordered by last_active desc: s2 (spawned after s1,
         // pre-restart) sorts first.
