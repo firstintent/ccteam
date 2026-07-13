@@ -112,12 +112,7 @@ pub fn build_curated_mcp_json(input: &CuratedMcpInput<'_>) -> Value {
             json!({
                 "command": bin,
                 "args": ["internal", "mcp-serve"],
-                "env": {
-                    "CCTEAM_CHAT_SID": input.sid,
-                    "CCTEAM_CHAT_SECRET": input.secret,
-                    "CCTEAM_CHAT_ROLE": input.role,
-                    "CCTEAM_CHAT_SLUG": input.slug,
-                }
+                "env": bridge_stdio_env(input.sid, input.secret, input.role, input.slug),
             })
         }
     };
@@ -198,15 +193,36 @@ pub fn codex_thread_mcp_config(
             "ccteam": {
                 "command": bin,
                 "args": ["internal", "mcp-serve"],
-                "env": {
-                    "CCTEAM_CHAT_SID": sid,
-                    "CCTEAM_CHAT_SECRET": secret,
-                    "CCTEAM_CHAT_ROLE": role,
-                    "CCTEAM_CHAT_SLUG": slug,
-                }
+                "env": bridge_stdio_env(sid, secret, role, slug),
             }
         }
     }))
+}
+
+/// Env map for the stdio `ccteam internal mcp-serve` bridge that a vendor
+/// (codex `thread/start.config.mcp_servers`, or claude stdio-mode `mcp.json`)
+/// spawns for a session. Carries the per-session identity (`CCTEAM_CHAT_*`) AND
+/// **propagates the daemon's `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT`** when set:
+/// a vendor may spawn the MCP server with ONLY this map as its environment
+/// (codex replaces, not merges), so without these the bridge would resolve
+/// `~/.ccteam/run/mcp.sock` (the DEFAULT home) instead of the daemon's actual
+/// socket — connecting a delegated session to the wrong daemon under any
+/// non-default `CCTEAM_HOME`. Production (default home) is unaffected; this
+/// fixes custom-home / multi-daemon setups (found in v0.9.0 real-machine smoke).
+fn bridge_stdio_env(sid: &str, secret: &str, role: &str, slug: &str) -> Value {
+    let mut env = serde_json::Map::new();
+    env.insert("CCTEAM_CHAT_SID".into(), json!(sid));
+    env.insert("CCTEAM_CHAT_SECRET".into(), json!(secret));
+    env.insert("CCTEAM_CHAT_ROLE".into(), json!(role));
+    env.insert("CCTEAM_CHAT_SLUG".into(), json!(slug));
+    for key in ["CCTEAM_HOME", "CCTEAM_PROJECTS_ROOT"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                env.insert(key.into(), json!(v));
+            }
+        }
+    }
+    Value::Object(env)
 }
 
 #[cfg(test)]
