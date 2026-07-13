@@ -1335,6 +1335,14 @@ fn spawn_gateway_event_consumer(
         // logged + swallowed, NEVER propagated, so it can't affect delivery.
         let mut reaction_handles: HashMap<String, Option<String>> = HashMap::new();
         while let Some(evt) = rx.recv().await {
+            // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
+            // (the team view's global SSE); it has no IM channel representation
+            // and no bound `evt.channel` to resolve, so skip it BEFORE the
+            // channel lookup (avoids a spurious "channel not configured"
+            // warning firing for every delegation transition).
+            if matches!(evt.kind, GatewayEventKind::Delegation { .. }) {
+                continue;
+            }
             // Clone the channel out under the read lock, then DROP the guard
             // before any `.await` (never hold a std RwLock guard across await).
             let channel = {
@@ -1375,6 +1383,11 @@ fn spawn_gateway_event_consumer(
                 // so this is a strict no-op (no send / no edit): IM delivery
                 // stays byte-identical to before the Activity event existed.
                 GatewayEventKind::Activity { .. } => {}
+                // v0.9.0 W4 — unreachable in practice (the early `continue`
+                // above already skips every `Delegation` event before this
+                // match), but the arm must exist for exhaustiveness and stays
+                // correct if that early skip is ever removed.
+                GatewayEventKind::Delegation { .. } => {}
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,
@@ -1846,6 +1859,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some("s1".to_string()),
+            slug: None,
         };
         tx.send(reaction_event(true)).unwrap();
         tx.send(reaction_event(false)).unwrap();
@@ -1908,6 +1922,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: None,
+            slug: None,
         };
         tx.send(ev(true)).unwrap();
         tx.send(ev(false)).unwrap();

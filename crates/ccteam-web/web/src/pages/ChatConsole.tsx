@@ -25,6 +25,7 @@ import HomeView, { type RecentEntry } from "./HomeView";
 import SessionView from "./SessionView";
 import WorkflowView from "./WorkflowView";
 import SettingsView from "./SettingsView";
+import AgentsView from "./AgentsView";
 import { Sidebar, type RailRow } from "../components/Sidebar";
 import { fetchDashboard } from "../lib/dashboardApi";
 import {
@@ -42,13 +43,16 @@ import { useMe } from "../hooks/useMe";
 import { railSessionLabel } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
 
-type ShellView = "home" | "conv" | "flow" | "settings";
+type ShellView = "home" | "conv" | "flow" | "settings" | "agents";
 
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
 export function shellViewFor(pathname: string): ShellView {
   if (pathname.startsWith("/chat/s/")) return "conv";
   if (pathname.startsWith("/flow")) return "flow";
   if (pathname.startsWith("/settings")) return "settings";
+  // v0.9.0 W4 — 团队/Team view (admin-only nav; the route itself isn't gated,
+  // see AgentsView's module doc).
+  if (pathname.startsWith("/agents")) return "agents";
   return "home";
 }
 
@@ -290,6 +294,8 @@ export default function ChatConsole() {
         query={query}
         flowActive={view === "flow"}
         settingsActive={view === "settings"}
+        teamActive={view === "agents"}
+        showTeam={isAdmin}
         userName={displayName}
         userInitial={initial}
         avatarColor={settings.avatar}
@@ -304,6 +310,10 @@ export default function ChatConsole() {
         }}
         onOpenSettings={() => {
           navigate("/settings");
+          closeMobile();
+        }}
+        onOpenTeam={() => {
+          navigate("/agents");
           closeMobile();
         }}
         onOpenRow={openRow}
@@ -345,6 +355,12 @@ export default function ChatConsole() {
             tab={routeTab}
             onNav={(t) => navigate(`/settings/${t}`)}
             rail={railSessions}
+          />
+        ) : view === "agents" ? (
+          <AgentsView
+            lang={lang}
+            isAdmin={isAdmin}
+            onOpenChat={(newSid) => navigate(`/chat/s/${encodeURIComponent(newSid)}`)}
           />
         ) : (
           <HomeView

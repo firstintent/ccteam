@@ -131,6 +131,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "auth", description = "Web-token introspection"),
         (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
         (name = "marketplace", description = "ccteam-hub plugin catalog (browse / body preview / per-project install)"),
+        (name = "agents", description = "v0.9.0 W4 — team visualization: cross-session graph snapshot + global SSE"),
     ),
 )]
 struct ApiDoc;
@@ -246,6 +247,9 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::marketplace::handle_marketplace_body))
         .routes(routes!(super::marketplace::handle_project_marketplace))
         .routes(routes!(super::marketplace::handle_project_marketplace_install))
+        // v0.9.0 W4 — team visualization graph snapshot + global SSE.
+        .routes(routes!(super::agents::handle_agents_graph))
+        .routes(routes!(super::agents::handle_agents_events))
 }
 
 /// The complete `/api/v1` router PLUS its self-documenting endpoints.

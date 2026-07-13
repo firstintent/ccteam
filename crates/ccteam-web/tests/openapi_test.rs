@@ -136,6 +136,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/marketplace/{id}/body"),
         ("GET", "/api/v1/projects/{slug}/marketplace"),
         ("POST", "/api/v1/projects/{slug}/marketplace/install"),
+        // v0.9.0 W4 — team visualization: graph snapshot + global SSE.
+        ("GET", "/api/v1/agents/graph"),
+        ("GET", "/api/v1/agents/events"),
     ]
     .into_iter()
     .collect()
@@ -205,34 +208,35 @@ fn spec_covers_every_api_v1_route() {
 
 #[test]
 fn sse_events_are_text_event_stream() {
-    // DE.4 — the two SSE endpoints can't be modeled as JSON; they must be
-    // declared `text/event-stream` so an integrator knows not to expect a
-    // JSON body.
+    // DE.4 — every SSE endpoint (per-session + v0.9.0 W4's global team-view
+    // feed) can't be modeled as JSON; each must be declared
+    // `text/event-stream` so an integrator knows not to expect a JSON body.
     let spec = openapi_spec();
-    let sse_path = "/api/v1/sessions/{sid}/events";
-    let item = spec
-        .paths
-        .paths
-        .get(sse_path)
-        .unwrap_or_else(|| panic!("spec missing {sse_path}"));
-    let op = item
-        .get
-        .as_ref()
-        .unwrap_or_else(|| panic!("{sse_path} has no GET operation"));
-    let resp = op
-        .responses
-        .responses
-        .get("200")
-        .unwrap_or_else(|| panic!("{sse_path} missing 200 response"));
-    let resp = match resp {
-        utoipa::openapi::RefOr::T(r) => r,
-        utoipa::openapi::RefOr::Ref(_) => panic!("{sse_path} 200 is a $ref"),
-    };
-    assert!(
-        resp.content.contains_key("text/event-stream"),
-        "{sse_path} 200 must declare text/event-stream; got {:?}",
-        resp.content.keys().collect::<Vec<_>>(),
-    );
+    for sse_path in ["/api/v1/sessions/{sid}/events", "/api/v1/agents/events"] {
+        let item = spec
+            .paths
+            .paths
+            .get(sse_path)
+            .unwrap_or_else(|| panic!("spec missing {sse_path}"));
+        let op = item
+            .get
+            .as_ref()
+            .unwrap_or_else(|| panic!("{sse_path} has no GET operation"));
+        let resp = op
+            .responses
+            .responses
+            .get("200")
+            .unwrap_or_else(|| panic!("{sse_path} missing 200 response"));
+        let resp = match resp {
+            utoipa::openapi::RefOr::T(r) => r,
+            utoipa::openapi::RefOr::Ref(_) => panic!("{sse_path} 200 is a $ref"),
+        };
+        assert!(
+            resp.content.contains_key("text/event-stream"),
+            "{sse_path} 200 must declare text/event-stream; got {:?}",
+            resp.content.keys().collect::<Vec<_>>(),
+        );
+    }
 }
 
 #[tokio::test]

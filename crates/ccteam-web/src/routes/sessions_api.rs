@@ -79,7 +79,7 @@ use crate::state::AppState;
 /// Keep-alive cadence for the per-session SSE stream. Mirrors
 /// [`super::sse`]'s 15s contract (its constant is private; we restate it
 /// to keep the same reverse-proxy idle-timeout defeat).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 503 body for the no-gateway (standalone internal-web) path. Returned
 /// by every session endpoint when [`AppState::gateway`] is `None`.
@@ -779,14 +779,14 @@ pub(crate) async fn handle_session_resolve(
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionEventsQuery {
     #[serde(default)]
-    last_event_id: Option<String>,
+    pub(crate) last_event_id: Option<String>,
 }
 
 /// Resolve the reconnect watermark from the standard `Last-Event-ID` header
 /// or the `?last_event_id=` query fallback. `None` for a fresh connect (no
 /// watermark at all) or an unparseable value — defensive: a bad query
 /// string degrades to "no replay", never a 4xx.
-fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuery) -> Option<u64> {
+pub(crate) fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuery) -> Option<u64> {
     headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -823,6 +823,10 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
             })
             .collect(),
         sid: Some(sid.to_string()),
+        // Not resolvable from a bare `(sid, prompt)` pair; the reseed just
+        // won't ACL-filter into the team view's global SSE for a tenant
+        // (admin-visible only). Known scope reduction (W4).
+        slug: None,
     }
 }
 
@@ -1357,7 +1361,14 @@ fn session_event(ev: &GatewayEvent, seq: u64) -> Event {
 /// stays backward-friendly: each entry is `{label, id}`. The token is parsed
 /// from the option callback `data` (`"{token}:{idx}"`), the single source of
 /// the token on the wire.
-fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
+///
+/// v0.9.0 W4 (F4) — also carries `slug` (unconditionally, `null` when
+/// unknown) and, for a [`GatewayEventKind::Delegation`], the
+/// `relation`/`parent_sid`/`child_sid`/`title?`/`reason?` fields — so
+/// `GET /api/v1/agents/events` (`crate::routes::agents`) can reuse this exact
+/// serializer for the team view's global SSE frames instead of duplicating
+/// the shape. `pub(crate)` for that cross-module reuse.
+pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     use ccteam_im::gateway::GatewayEventKind;
     let (kind, done) = match &ev.kind {
         GatewayEventKind::Answer => ("answer", false),
@@ -1368,10 +1379,17 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         // `is_im_only_event` before this serializer ever runs; the arm exists
         // only to keep the match exhaustive (a no-op label, never emitted).
         GatewayEventKind::Reaction { .. } => ("reaction", false),
+        // v0.9.0 W4 — a delegation lifecycle transition (team view only; a
+        // per-sid stream never sees one since `sid` is always `None` on a
+        // `Delegation` event, so `event_matches_sid` filters it out upstream
+        // of this call — the arm exists for the global agents SSE + match
+        // exhaustiveness).
+        GatewayEventKind::Delegation { .. } => ("delegation", false),
     };
     let mut payload = json!({
         "id": ev.id,
         "sid": ev.sid,
+        "slug": ev.slug,
         "kind": kind,
         "content": ev.content,
     });
@@ -1383,6 +1401,25 @@ fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     // kind + item_id for start↔complete dedup). IM never sees this branch.
     if let GatewayEventKind::Activity { activity, .. } = &ev.kind {
         payload["activity"] = serde_json::to_value(activity).unwrap_or(serde_json::Value::Null);
+    }
+    // v0.9.0 W4 — the team view's edge/status reducer input.
+    if let GatewayEventKind::Delegation {
+        relation,
+        parent_sid,
+        child_sid,
+        title,
+        reason,
+    } = &ev.kind
+    {
+        payload["relation"] = json!(relation);
+        payload["parent_sid"] = json!(parent_sid);
+        payload["child_sid"] = json!(child_sid);
+        if let Some(title) = title {
+            payload["title"] = json!(title);
+        }
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
     }
     if !ev.options.is_empty() {
         payload["options"] = serde_json::Value::Array(
@@ -1409,14 +1446,16 @@ fn approval_token(ev: &GatewayEvent) -> Option<String> {
 }
 
 /// Synthetic lag/close frame — mirrors [`super::sse`]'s `reconnect_hint`.
-fn reconnect_hint(reason: &str) -> Event {
+/// `pub(crate)` — also reused by `crate::routes::agents`'s global SSE.
+pub(crate) fn reconnect_hint(reason: &str) -> Event {
     Event::default()
         .event("reconnect_hint")
         .data(json!({ "type": "reconnect_hint", "reason": reason }).to_string())
 }
 
-/// One-shot notice emitted on the no-gateway SSE path.
-fn gateway_unavailable_event() -> Event {
+/// One-shot notice emitted on the no-gateway SSE path. `pub(crate)` — also
+/// reused by `crate::routes::agents`'s global SSE.
+pub(crate) fn gateway_unavailable_event() -> Event {
     Event::default()
         .event("gateway_unavailable")
         .data(json!({ "type": "gateway_unavailable", "reason": "no live gateway" }).to_string())
@@ -1613,6 +1652,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: sid.map(str::to_string),
+            slug: None,
         }
     }
 
@@ -2201,6 +2241,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some(sid.to_string()),
+            slug: None,
         };
         app.session_ring.record("s1", ans("a", "s1"));
         let since = app.session_ring.record("s1", ans("b", "s1"));

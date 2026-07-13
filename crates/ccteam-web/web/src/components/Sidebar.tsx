@@ -19,6 +19,7 @@ import {
   Plus,
   Search,
   Settings,
+  Users,
   Workflow,
 } from "lucide-react";
 import { CcLogo } from "./Logo";
@@ -91,6 +92,8 @@ export function Sidebar({
   query,
   flowActive,
   settingsActive,
+  teamActive = false,
+  showTeam = false,
   userName,
   userInitial,
   avatarColor,
@@ -101,6 +104,7 @@ export function Sidebar({
   onNewInProject,
   onOpenFlow,
   onOpenSettings,
+  onOpenTeam,
   onOpenRow,
   onStopRow,
 }: {
@@ -113,6 +117,11 @@ export function Sidebar({
   query: string;
   flowActive: boolean;
   settingsActive: boolean;
+  /** v0.9.0 W4 — whether the 团队/Team route is the active view. */
+  teamActive?: boolean;
+  /** v0.9.0 W4 — beta-gate: only an admin sees the nav entry (UI-only gate;
+   *  the backend graph/SSE ACL is unaffected — see AgentsView's module doc). */
+  showTeam?: boolean;
   userName: string;
   userInitial: string;
   avatarColor?: string;
@@ -123,6 +132,7 @@ export function Sidebar({
   onNewInProject: (project: string) => void;
   onOpenFlow: () => void;
   onOpenSettings: () => void;
+  onOpenTeam?: () => void;
   onOpenRow: (row: RailRow) => void;
   onStopRow: (row: RailRow) => void;
 }) {
@@ -189,6 +199,19 @@ export function Sidebar({
           <span>{t("workflow")}</span>
           <ChevronRight className="chev" />
         </button>
+
+        {showTeam ? (
+          <button
+            type="button"
+            className={`sflow ${teamActive ? "active" : ""}`}
+            onClick={onOpenTeam}
+            data-testid="side-team"
+          >
+            <Users />
+            <span>{t("team")}</span>
+            <ChevronRight className="chev" />
+          </button>
+        ) : null}
 
         <div className="side-sec">
           <span>{t("workspaces")}</span>
@@ -374,6 +397,18 @@ export function Sidebar({
         >
           <Workflow />
         </button>
+        {showTeam ? (
+          <button
+            type="button"
+            className="rail-btn"
+            onClick={onOpenTeam}
+            title={t("team")}
+            aria-label={t("team")}
+            data-testid="side-team-rail"
+          >
+            <Users />
+          </button>
+        ) : null}
         {/* 会话区空白:点击展开 */}
         <div
           className="mini-blank"

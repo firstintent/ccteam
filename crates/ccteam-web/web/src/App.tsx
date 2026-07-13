@@ -50,6 +50,8 @@ export default function App() {
         <Route path="/flow/:tab" element={<ChatConsole />} />
         <Route path="/settings" element={<ChatConsole />} />
         <Route path="/settings/:tab" element={<ChatConsole />} />
+        {/* v0.9.0 W4 — 团队/Team view (admin-only nav entry; beta-gate). */}
+        <Route path="/agents" element={<ChatConsole />} />
         {/* legacy flat routes → the new IA */}
         <Route path="/marketplace" element={<Navigate to="/settings/market" replace />} />
         <Route path="/status" element={<Navigate to="/settings/status" replace />} />

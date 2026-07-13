@@ -4,11 +4,10 @@
 //! `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT` before constructing
 //! [`AppState`]).
 //!
-//! V0.3 M5.2 added the [`EventBus`] field so SSE handlers can
-//! subscribe to the single watcher → broadcast pump. The bus is
-//! constructed eagerly in [`AppState::new`]; tests that don't care
-//! about live events use [`AppState::new_no_bus`] which still hands
-//! out a working bus (the watcher just has nothing to watch).
+//! V0.3 M5.2 added a progress-file-watcher `EventBus` field for the (now
+//! removed, v0.9.0 W4) `routes::sse`/`harness_sse`; every live event source
+//! today is the gateway's own broadcast (`Gateway::subscribe_events`, see
+//! `crate::ring`), so this state carries no file-watcher bus anymore.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,15 +19,10 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use crate::auth::AuthState;
 use crate::chat_protocol::{WebChannelMessage, WebSendMessage};
 use crate::pty::PtyRegistry;
-use crate::watcher::{spawn_watcher, EventBus};
 
 #[derive(Clone)]
 pub struct AppState {
     pub paths: Arc<CcteamPaths>,
-    /// Live progress event bus. Subscribers go through
-    /// `bus.subscribe()`; the producer side is owned by the
-    /// dedicated watcher thread spawned in [`AppState::new`].
-    pub bus: EventBus,
     /// V0.3 M5.3 — auth gate state. Cloned per request, so the inner
     /// `Arc<AuthState>` keeps the token allocation shared. When
     /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
@@ -84,6 +78,11 @@ pub struct AppState {
     /// separate `Option`. The feeder task is spawned once, alongside the
     /// gateway, in [`Self::with_gateway`].
     pub(crate) session_ring: Arc<crate::ring::SessionEventRing>,
+    /// v0.9.0 W4 (F4) — the team view's cross-session replay ring + live tap
+    /// (`GET /api/v1/agents/events`, see `crate::ring::GlobalEventRing`'s
+    /// module doc). Same always-present / feeder-spawned-once discipline as
+    /// `session_ring` above.
+    pub(crate) global_ring: Arc<crate::ring::GlobalEventRing>,
     /// v0.9 T4 — MCP HTTP (`POST /mcp`) dispatch pieces. Built into a
     /// [`ccteam_im::mcp::McpDispatch`] per request via [`Self::mcp_dispatch`].
     /// `sink` / `pending` are `Some` when the daemon composition root hands
@@ -120,14 +119,8 @@ pub type ChatConns = Arc<Mutex<HashMap<String, usize>>>;
 pub const CHAT_BACKLOG_CAP: usize = 1024;
 
 impl AppState {
-    /// Resolve paths + spawn the progress watcher. If the watcher
-    /// fails to start (e.g. progress dir cannot be created — rare),
-    /// we log + fall back to an inert bus so the read-only routes
-    /// (`/`, `/project/<slug>`) still serve. SSE will simply have no
-    /// publisher; clients reconnect harmlessly.
-    ///
-    /// Auth defaults to disabled — callers that want a token gate
-    /// (the `serve()` non-loopback path) construct via
+    /// Resolve paths. Auth defaults to disabled — callers that want a token
+    /// gate (the `serve()` non-loopback path) construct via
     /// [`AppState::with_auth`].
     pub fn new(paths: CcteamPaths) -> Self {
         Self::build(paths, AuthState::disabled())
@@ -141,22 +134,9 @@ impl AppState {
     }
 
     fn build(paths: CcteamPaths, auth: AuthState) -> Self {
-        let bus = match spawn_watcher(paths.progress_dir(), paths.harness_dir()) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::error!(
-                    ?err,
-                    progress_dir = %paths.progress_dir().display(),
-                    harness_dir = %paths.harness_dir().display(),
-                    "ccteam-web: progress + harness watchers failed to start; SSE will be inert",
-                );
-                EventBus::inert()
-            }
-        };
         let (chat_outbound, _) = broadcast::channel(256);
         Self {
             paths: Arc::new(paths),
-            bus,
             auth: Arc::new(auth),
             pty: PtyRegistry::new(),
             chat_inbound: None,
@@ -167,6 +147,7 @@ impl AppState {
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
             session_ring: Arc::new(crate::ring::SessionEventRing::new()),
+            global_ring: Arc::new(crate::ring::GlobalEventRing::new()),
             mcp_sink: None,
             mcp_pending: None,
         }
@@ -204,6 +185,10 @@ impl AppState {
     /// but not something to do casually.
     pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
         crate::ring::spawn_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.session_ring));
+        // v0.9.0 W4 — the team view's global feeder, spawned alongside the
+        // per-sid one (same composition-root call, same "one feeder per
+        // `with_gateway` call" caveat documented above).
+        crate::ring::spawn_global_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.global_ring));
         self.gateway = Some(gateway);
         self
     }

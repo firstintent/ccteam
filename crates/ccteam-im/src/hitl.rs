@@ -401,6 +401,11 @@ pub async fn ask_permission(
         // sid set so a per-session web UI stream can show the approval
         // (None would route to IM fine but be filtered out of SSE).
         sid: Some(sid_label.to_string()),
+        // v0.9.0 W4 — `HitlPromptContext` doesn't carry the project slug;
+        // this prompt just won't ACL-filter into the team view's global SSE
+        // (tenant-visible only via the existing per-sid stream). Known scope
+        // reduction, documented in the W4 handoff.
+        slug: None,
     });
     if sent.is_err() {
         pending.lock().await.take_by_token(&token);

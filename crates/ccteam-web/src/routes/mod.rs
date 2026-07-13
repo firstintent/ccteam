@@ -1,10 +1,11 @@
 //! Axum routers for the ccteam web layer.
 //!
 //! M5.0 shipped `/health`. M5.1 added `dashboard` / `project` /
-//! `assets`. M5.2 added `sse` (`/sse/all` + `/sse/project/<slug>`) +
-//! `screenshot` (`/screenshot/<slug>.png`). The pane snapshot route
-//! adds raw ANSI bytes for browser-side xterm.js rendering. **M5.3
-//! (this PR)** mounts `actions` (`POST
+//! `assets`. M5.2 added `screenshot` (`/screenshot/<slug>.png`) — the pane
+//! snapshot route adds raw ANSI bytes for browser-side xterm.js rendering
+//! — and a `sse`/`harness_sse` progress-file SSE pair **removed in v0.9.0
+//! W4** (superseded by the gateway-broadcast-backed `agents`/`sessions_api`
+//! SSE endpoints). **M5.3** mounts `actions` (`POST
 //! /api/<slug>/{btw,inject_decision,pause,resume}`) and the
 //! `auth_layer` middleware that gates the entire stateful router when
 //! token auth is enabled.
@@ -13,7 +14,11 @@ use axum::Router;
 
 use crate::state::AppState;
 
+// v0.9.0 W4 (F4) — team visualization: `GET /api/v1/agents/graph` +
+// `GET /api/v1/agents/events` (global SSE). Merged into the `/api/v1`
+// OpenApiRouter (see `openapi::build_api_v1`).
 pub mod actions;
+pub mod agents;
 pub mod api_v1;
 pub mod assets;
 // v0.8.6 W5b ResDisk — resource API: capabilities probe.
@@ -25,7 +30,6 @@ pub mod compare;
 pub mod chat_ws;
 pub mod dashboard;
 pub mod evolution;
-pub mod harness_sse;
 pub mod health;
 pub mod hosts;
 // v0.8.8 F4 — web IM credential configuration (Telegram + Lark; masked
@@ -61,7 +65,6 @@ pub mod status;
 // v0.8.8 B5 — 共享「sid → per-session pane 名」解析(pty_ws + pane_snapshot
 // 共用,避免 vendor 分支两份漂移)。
 pub mod session_pane;
-pub mod sse;
 // v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
 pub mod users;
 // v0.9 T4 — streamable HTTP MCP (`POST /mcp`, admin bearer always required).
@@ -79,8 +82,6 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(project::router())
         .merge(session::router())
         .merge(assets::router())
-        .merge(sse::router())
-        .merge(harness_sse::router())
         .merge(pane_snapshot::router())
         .merge(screenshot::router())
         .merge(actions::router())

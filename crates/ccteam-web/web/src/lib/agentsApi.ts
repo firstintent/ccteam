@@ -1,0 +1,59 @@
+// v0.9.0 W4 (F4) — team visualization data: `GET /api/v1/agents/graph`
+// (a point-in-time snapshot of every session across every host, as nodes +
+// parent→child delegation edges). Mirrors the `getJson` pattern every other
+// `lib/*Api.ts` module keeps its own private copy of (see `workflowApi.ts`).
+
+/** One session node in the team graph (mirrors the Rust `AgentNode`). */
+export interface AgentNode {
+  sid: string;
+  slug: string;
+  role: string;
+  vendor: string;
+  model?: string | null;
+  host: string;
+  /** `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). */
+  status: string;
+  parent_sid?: string | null;
+  depth: number;
+  cost_usd?: number | null;
+  title?: string | null;
+  last_active: string;
+  turn_count: number;
+}
+
+/** One parent→child delegation edge (mirrors the Rust `AgentEdge`). */
+export interface AgentEdge {
+  parent: string;
+  child: string;
+  title?: string | null;
+  /** Best-effort seed — the live SSE `dispatched`/`completed` frames correct
+   *  this in real time (see `lib/agentsReducer.ts`). */
+  active: boolean;
+}
+
+export interface AgentsGraphResponse {
+  nodes: AgentNode[];
+  edges: AgentEdge[];
+  /** Every host any node runs on, `"local"` first, then sorted. */
+  hosts: string[];
+}
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, {
+    headers: { Accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as T;
+}
+
+/** Build the graph snapshot URL. Exported for unit tests + so callers share
+ *  one template. */
+export function agentsGraphUrl(slug?: string): string {
+  return slug ? `/api/v1/agents/graph?slug=${encodeURIComponent(slug)}` : "/api/v1/agents/graph";
+}
+
+export function fetchAgentsGraph(slug?: string): Promise<AgentsGraphResponse> {
+  return getJson<AgentsGraphResponse>(agentsGraphUrl(slug));
+}

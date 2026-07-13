@@ -317,6 +317,11 @@ fn build_send_file_event(
         options: Vec::new(),
         // No gateway session backs the `chat_send_file` MCP path.
         sid: None,
+        slug: if slug.is_empty() {
+            None
+        } else {
+            Some(slug.to_string())
+        },
     })
 }
 
@@ -495,6 +500,11 @@ async fn execute_interaction_ask(
             options: message_options,
             // The D6 `interaction/ask` hook prompt has no gateway session.
             sid: None,
+            slug: if slug.is_empty() {
+                None
+            } else {
+                Some(slug.to_string())
+            },
         })
         .is_err()
     {
@@ -720,6 +730,11 @@ async fn execute_permission_ask(
             // sid set so a per-session web UI stream can show the approval
             // (None would route to IM fine but be filtered out of SSE).
             sid: sid_label.clone(),
+            slug: if slug.is_empty() {
+                None
+            } else {
+                Some(slug.to_string())
+            },
         })
         .is_err()
     {

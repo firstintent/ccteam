@@ -1,12 +1,11 @@
 //! V0.3 M5.4 — End-to-end happy-path canary.
 //!
-//! Each milestone (M5.1 dashboard / M5.2 SSE + screenshot / M5.3 write
-//! actions) ships its own focused integration suite. This test exists
-//! to catch the *cross-layer regression* the per-milestone tests miss:
-//! the same fixture project must survive the F59 legacy redirects, the
-//! F52 JSON data API used by the SPA, an SSE event delivery, and a
-//! write-action POST in one sequenced run, with the disk side-effect
-//! of the POST observable afterwards.
+//! Each milestone (M5.1 dashboard / M5.2 screenshot / M5.3 write actions)
+//! ships its own focused integration suite. This test exists to catch the
+//! *cross-layer regression* the per-milestone tests miss: the same fixture
+//! project must survive the F59 legacy redirects, the F52 JSON data API used
+//! by the SPA, and a write-action POST in one sequenced run, with the disk
+//! side-effect of the POST observable afterwards.
 //!
 //! The brief (`docs/versions/v0-3/dev-plan.md` §6 #5.1) explicitly orders the
 //! sequence:
@@ -15,15 +14,19 @@
 //!   GET /api/v1/projects   → JSON dashboard data mentions slug
 //!   GET /project/<slug>    → 301 /app/p/<slug>
 //!   GET /api/v1/projects/<slug> → JSON detail data mentions phase
-//!   open /sse/project/<slug>, append progress.jsonl line, observe SSE
 //!   POST /api/<slug>/btw   → 303, inbox file lands on disk
+//!
+//! v0.9.0 W4 — the original sequence's SSE step (`open /sse/project/<slug>,
+//! append progress.jsonl line, observe SSE`) is dropped: `routes::sse` is
+//! deleted (zero SPA consumers; see `crate::routes::agents` +
+//! `routes::sessions_api` for its gateway-broadcast-backed successors, each
+//! with their own focused integration coverage).
 //!
 //! Auth stays disabled (loopback default per PRD §6.2.4) so this test
 //! exercises the routing + handler stack only; auth is covered in
 //! `auth_test.rs`.
 
 use std::fs;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -33,7 +36,6 @@ use ccteam_core::{
 use ccteam_web::{router_with_state, AppState};
 use reqwest::redirect::Policy;
 use tempfile::TempDir;
-use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 
 fn fake_paths(root: &std::path::Path) -> CcteamPaths {
@@ -54,63 +56,8 @@ async fn spawn(state: AppState) -> SocketAddr {
     addr
 }
 
-/// Open `/sse/<path>` and return a streaming line-reader. Mirrors the
-/// helper in `sse_test.rs`; duplicated here intentionally to keep the
-/// e2e canary self-contained.
-async fn open_sse(addr: SocketAddr, path: &str) -> tokio::io::Lines<impl AsyncBufReadExt + Unpin> {
-    let url = format!("http://{addr}{path}");
-    let resp = client().get(&url).send().await.expect("sse get");
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-        "text/event-stream",
-    );
-    let stream = resp.bytes_stream();
-    use futures_util::StreamExt;
-    let mapped = stream.map(|r| r.map_err(std::io::Error::other));
-    let reader = tokio_util::io::StreamReader::new(mapped);
-    let buf = tokio::io::BufReader::new(reader);
-    buf.lines()
-}
-
 fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
-}
-
-async fn read_one_event(
-    lines: &mut tokio::io::Lines<impl AsyncBufReadExt + Unpin>,
-    deadline: Duration,
-) -> Option<String> {
-    let mut data = String::new();
-    let mut event_name: Option<String> = None;
-    tokio::time::timeout(deadline, async {
-        loop {
-            let next = lines.next_line().await.ok().flatten()?;
-            if next.is_empty() {
-                if !data.is_empty() || event_name.is_some() {
-                    return Some(data.clone());
-                }
-                continue;
-            }
-            if let Some(rest) = next.strip_prefix("data:") {
-                let v = rest.trim_start();
-                if data.is_empty() {
-                    data.push_str(v);
-                } else {
-                    data.push('\n');
-                    data.push_str(v);
-                }
-            } else if let Some(rest) = next.strip_prefix("event:") {
-                event_name = Some(rest.trim().to_string());
-            }
-        }
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 #[tokio::test]
@@ -141,14 +88,6 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
         state.cost_used_usd = 0.42;
     }
     state.save(&state_path).unwrap();
-
-    // Pre-create progress.jsonl as zero bytes so the watcher's
-    // initial watermark is 0 and our post-subscribe append registers
-    // as a delta. (Same trick `sse_end_to_end_file_append_reaches_stream`
-    // uses.)
-    fs::create_dir_all(paths.progress_dir()).unwrap();
-    let progress_file = paths.progress_jsonl(slug);
-    fs::write(&progress_file, b"").unwrap();
 
     let app_state = AppState::new(paths.clone());
     let addr = spawn(app_state).await;
@@ -213,33 +152,7 @@ async fn v0_3_happy_path_dashboard_project_sse_and_btw() {
     assert_eq!(detail["slug"], slug);
     assert_eq!(detail["state"]["current_phase"], "implement");
 
-    // ── 3. SSE — append progress.jsonl line, see it on the wire ─
-    let mut lines = open_sse(addr, &format!("/sse/project/{slug}")).await;
-    // Give the file watcher + broadcast subscribe both a tick.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    let mut handle = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&progress_file)
-        .unwrap();
-    handle
-        .write_all(
-            b"{\"ts\":\"2026-05-10T14:00:00Z\",\"event\":\"PostToolUse\",\"tool\":\"Edit\"}\n",
-        )
-        .unwrap();
-    handle.flush().unwrap();
-    drop(handle);
-
-    let payload = read_one_event(&mut lines, Duration::from_secs(2))
-        .await
-        .expect("SSE stream must deliver the appended progress line within 2s");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&payload).expect("SSE data must be valid JSON");
-    assert_eq!(parsed["slug"], slug, "server must inject slug field");
-    assert_eq!(parsed["event"], "PostToolUse");
-    assert_eq!(parsed["tool"], "Edit");
-
-    // ── 4. POST /api/<slug>/btw — observe inbox side-effect ─────
+    // ── 3. POST /api/<slug>/btw — observe inbox side-effect ─────
     let inbox_dir = paths.project_ccteam_dir(slug).join("inbox");
     let before: usize = fs::read_dir(&inbox_dir).map(|it| it.count()).unwrap_or(0);
 

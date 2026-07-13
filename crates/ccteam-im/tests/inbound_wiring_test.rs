@@ -2446,6 +2446,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
         }],
         options: Vec::new(),
         sid: None,
+        slug: None,
     })
     .unwrap();
 

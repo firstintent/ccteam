@@ -8,11 +8,13 @@
 //! - **M5.0** — `GET /health` + bind / shutdown plumbing.
 //! - **M5.1** — `GET /` dashboard, `GET /project/<slug>` detail
 //!   page, `GET /assets/{file}` vendored static assets.
-//! - **M5.2** — `GET /sse/all` + `GET /sse/project/<slug>` live
-//!   progress event streams (single `notify` watcher fans out into a
-//!   `tokio::sync::broadcast` capacity 1024) + on-demand pane
-//!   snapshots (`GET /api/<slug>/pane-snapshot.ansi` for xterm.js,
-//!   `GET /screenshot/<slug>.png` as the PNG fallback).
+//! - **M5.2** — on-demand pane snapshots (`GET /api/<slug>/pane-snapshot.ansi`
+//!   for xterm.js, `GET /screenshot/<slug>.png` as the PNG fallback). Also
+//!   shipped `GET /sse/all` + `GET /sse/project/<slug>` progress-file SSE
+//!   streams (a `notify`-watcher broadcast) — **removed in v0.9.0 W4**
+//!   (zero SPA consumers; superseded by the gateway-broadcast-backed
+//!   `GET /api/v1/sessions/{sid}/events` (per-session) and
+//!   `GET /api/v1/agents/events` (global team view)).
 //! - **M5.3 (this PR)** — `POST /api/<slug>/{btw,inject_decision,
 //!   pause,resume}` write actions backed by `ccteam_core::actions::*`,
 //!   plus a token-auth gate (`auth_layer` middleware) on the entire
@@ -48,11 +50,9 @@ pub mod state;
 pub mod status;
 pub mod token;
 pub mod views;
-pub mod watcher;
 
 pub use auth::AuthState;
 pub use state::{AppState, ChatConns, CHAT_BACKLOG_CAP};
-pub use watcher::{EventBus, HarnessSnapshotEvent, ProgressUpdate};
 
 /// Knobs accepted by [`serve`]. Mirrors the `ccteam web` CLI flags
 /// 1:1 so the CLI translation in `ccteam-cli::commands::run_web`

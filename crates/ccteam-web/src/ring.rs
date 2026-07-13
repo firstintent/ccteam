@@ -132,6 +132,97 @@ pub(crate) fn is_im_only_event(ev: &GatewayEvent) -> bool {
     matches!(ev.kind, GatewayEventKind::Reaction { .. })
 }
 
+/// v0.9.0 W4 (F4) — capacity for the team view's GLOBAL replay ring
+/// (`GET /api/v1/agents/events`). Bigger than the per-sid [`RING_CAPACITY`]
+/// since one stream now carries every session's events.
+pub(crate) const GLOBAL_RING_CAPACITY: usize = 256;
+
+/// v0.9.0 W4 — the team view's cross-session replay ring + live tap: the
+/// SAME shape as [`SessionEventRing`] (monotonic `seq`, bounded backlog,
+/// broadcast live tap for `Last-Event-ID` reconnects) but ONE stream instead
+/// of one-per-sid — every event the gateway broadcasts (minus the IM-only
+/// `Reaction`) lands here in arrival order. **ACL is the ROUTE's job, not
+/// this ring's** — same division of labor [`SessionEventRing`] already has
+/// with auth (this type has no concept of `Identity`); `crate::routes::agents`
+/// filters replayed + tapped frames by `ev.slug` before they reach a client.
+pub(crate) struct GlobalEventRing {
+    state: Mutex<RingState>,
+    tap: broadcast::Sender<RingEntry>,
+}
+
+impl GlobalEventRing {
+    pub(crate) fn new() -> Self {
+        let (tap, _rx) = broadcast::channel(TAP_CAPACITY);
+        Self {
+            state: Mutex::new(RingState::default()),
+            tap,
+        }
+    }
+
+    /// Subscribe to the live tap: every entry [`Self::record`] accepts.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<RingEntry> {
+        self.tap.subscribe()
+    }
+
+    /// Record `event`, evicting the oldest entry past
+    /// [`GLOBAL_RING_CAPACITY`], AND fan it out to every live subscriber.
+    /// Returns the assigned seq.
+    pub(crate) fn record(&self, event: GatewayEvent) -> u64 {
+        let seq = {
+            let mut guard = self.state.lock().unwrap();
+            guard.next_seq += 1;
+            let seq = guard.next_seq;
+            guard.buf.push_back(RingEntry {
+                seq,
+                event: event.clone(),
+            });
+            while guard.buf.len() > GLOBAL_RING_CAPACITY {
+                guard.buf.pop_front();
+            }
+            seq
+        };
+        let _ = self.tap.send(RingEntry { seq, event });
+        seq
+    }
+
+    /// Every buffered entry with `seq > since`, oldest first — the same
+    /// best-effort catch-up contract as [`SessionEventRing::replay_since`].
+    pub(crate) fn replay_since(&self, since: u64) -> Vec<RingEntry> {
+        let guard = self.state.lock().unwrap();
+        guard
+            .buf
+            .iter()
+            .filter(|e| e.seq > since)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Spawn the ONE persistent global-ring-feeder task for this gateway (mirrors
+/// [`spawn_ring_feeder`] below, see its doc for the "why a persistent feeder"
+/// rationale). Records every non-IM-only event regardless of `sid`/`slug` —
+/// the team view route filters by ACL at read time.
+pub(crate) fn spawn_global_ring_feeder(
+    gateway: Arc<tokio::sync::Mutex<Gateway>>,
+    ring: Arc<GlobalEventRing>,
+) {
+    tokio::spawn(async move {
+        let mut rx = gateway.lock().await.subscribe_events();
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    if is_im_only_event(&ev) {
+                        continue;
+                    }
+                    ring.record(ev);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 /// Spawn the ONE persistent ring-feeder task for this gateway — called once
 /// from [`crate::state::AppState::with_gateway`] (the composition root).
 /// Subscribes a fresh broadcast receiver off the gateway and forwards every
@@ -180,6 +271,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some(sid.to_string()),
+            slug: None,
         }
     }
 

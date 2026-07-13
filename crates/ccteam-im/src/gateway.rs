@@ -415,6 +415,28 @@ pub enum GatewayEventKind {
         /// `true` = add the ack reaction; `false` = remove it.
         on: bool,
     },
+    /// v0.9.0 W4 (F4) — a delegation lifecycle transition, broadcast for the
+    /// web team view's global SSE (`GET /api/v1/agents/events`). **IM-only
+    /// delivery ignores this** (no channel representation — mirrors
+    /// `Activity`); `progress.jsonl`'s `delegation_*` events (schema owned by
+    /// `progress_bridge`) remain the durable SoT, this is the live-fan-out
+    /// twin emitted at the SAME call sites (see
+    /// [`Gateway::emit_delegation_progress`]).
+    Delegation {
+        /// One of `spawned|dispatched|completed|notified|collected|stopped|
+        /// denied` (the `delegation_*` progress-event suffix).
+        relation: String,
+        /// The dispatching/spawning session's sid.
+        parent_sid: String,
+        /// The delegated session's sid (empty for a pre-spawn `denied`, which
+        /// has no child yet).
+        child_sid: String,
+        /// Optional dispatch/spawn label (ledger/display only — never a
+        /// prompt).
+        title: Option<String>,
+        /// Present only for `denied` (`depth|children|delegated|cycle|budget`).
+        reason: Option<String>,
+    },
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -452,6 +474,15 @@ pub struct GatewayEvent {
     /// The IM delivery path ignores `sid` entirely — it routes by `channel`
     /// + `chat_id` as before — so this is additive.
     pub sid: Option<String>,
+    /// v0.9.0 W4 (F4) — project slug owning this event, when known. The ACL
+    /// key for the team view's global SSE (`GET /api/v1/agents/events`): a
+    /// tenant only sees frames whose `slug` is one of their visible
+    /// projects; a frame with no `slug` is dropped for a tenant (fail-closed)
+    /// and shown only to an admin. Populated for delegation events (the
+    /// project the delegation lives in) and the ordinary per-session events
+    /// where the emitting session's project is cheaply known; `None`
+    /// elsewhere (additive field, never blocks IM delivery which ignores it).
+    pub slug: Option<String>,
 }
 
 /// The gateway's emit endpoint (V0.8.6 — fix #2). Every [`GatewayEvent`] the
@@ -2176,6 +2207,7 @@ impl Gateway {
                             }],
                             options: Vec::new(),
                             sid: Some(sid.clone()),
+                            slug: Some(slug.clone()),
                         });
                         Ok(None)
                     }
@@ -3126,6 +3158,7 @@ impl Gateway {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some(sid.to_string()),
+            slug: self.sessions.get(sid).map(|s| s.project.clone()),
         });
         Some(content)
     }
@@ -3352,6 +3385,7 @@ impl Gateway {
                                 attachments: Vec::new(),
                                 options: Vec::new(),
                                 sid: Some(session_id.clone()),
+                                slug: Some(session.project.clone()),
                             }) {
                                 break;
                             }
@@ -3673,6 +3707,7 @@ impl Gateway {
                                 attachments: Vec::new(),
                                 options: Vec::new(),
                                 sid: Some(session_id.clone()),
+                                slug: Some(session.project.clone()),
                             }) {
                                 break;
                             }
@@ -4423,6 +4458,7 @@ impl Gateway {
                 attachments: Vec::new(),
                 options: Vec::new(),
                 sid: Some(session_id.to_string()),
+                slug: Some(session.project.clone()),
             });
         }
         let start_visible_events = session.visible_events.load(Ordering::SeqCst);
@@ -4603,6 +4639,7 @@ impl Gateway {
                 attachments: Vec::new(),
                 options: to_message_options(&prompt),
                 sid: Some(session_id.to_string()),
+                slug: self.sessions.get(session_id).map(|s| s.project.clone()),
             });
             Ok(Vec::new())
         } else {
@@ -6048,6 +6085,15 @@ impl Gateway {
     /// v0.9.0 W2 (F2) — append one `delegation_*` event to the project's
     /// `progress.jsonl` (the state SoT; schema owned by `progress_bridge`).
     /// Best-effort: a write failure only warns, never blocks the delegation.
+    ///
+    /// v0.9.0 W4 (F4) — ALSO broadcasts a [`GatewayEventKind::Delegation`]
+    /// (the live-fan-out twin for the team view's global SSE,
+    /// `GET /api/v1/agents/events`) at this SAME call site, so every
+    /// `delegation_*` progress point and every `Delegation` broadcast stay in
+    /// lockstep by construction (one helper, not one per call site). The
+    /// broadcast fires independent of `self.project_paths` (unlike the
+    /// progress-file write below) since it has no filesystem dependency —
+    /// tests that never wire project paths still observe it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_delegation_progress(
         &self,
@@ -6061,6 +6107,34 @@ impl Gateway {
         title: Option<&str>,
         reason: Option<&str>,
     ) {
+        let relation = event.strip_prefix("delegation_").unwrap_or(event);
+        let title_owned = title.filter(|t| !t.is_empty()).map(str::to_string);
+        let reason_owned = reason.filter(|r| !r.is_empty()).map(str::to_string);
+        self.emit_user_signal(GatewayEvent {
+            id: format!(
+                "delegation-{relation}-{parent_sid}-{child_sid}-{}",
+                turn.unwrap_or("")
+            ),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("delegation {relation}: {parent_sid} -> {child_sid}"),
+            kind: GatewayEventKind::Delegation {
+                relation: relation.to_string(),
+                parent_sid: parent_sid.to_string(),
+                child_sid: child_sid.to_string(),
+                title: title_owned,
+                reason: reason_owned,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            // Not a per-session event (it names TWO sessions) — never routed
+            // through the per-sid SSE ring/filter; the global agents SSE
+            // subscribes the broadcast directly (see `crate::ring`).
+            sid: None,
+            slug: Some(slug.to_string()),
+        });
+
         let Some(paths) = self.project_paths.as_ref() else {
             return;
         };
@@ -6326,6 +6400,17 @@ impl Gateway {
                 child_sid,
             );
         }
+    }
+
+    /// v0.9.0 W4 (F4) — child sids with an ARMED completion watch, for the
+    /// team view graph's best-effort `edges[].active` seed (a dispatch that
+    /// hasn't yet been disarmed — see [`Self::disarm_delegation_watch`] for
+    /// when that happens). Honest scope: a watch also stays armed briefly
+    /// after a delivered (notified) completion until the next inline-wait
+    /// disarm or a parent-gone reconcile, so this is a best-effort snapshot —
+    /// the client corrects it live from `dispatched`/`completed` SSE frames.
+    pub fn armed_delegation_watch_sids(&self) -> std::collections::HashSet<String> {
+        self.delegations.keys().cloned().collect()
     }
 
     /// v0.9.0 W2 (F2/F7) — deliver one completed child turn to its watching
@@ -6723,6 +6808,7 @@ impl Gateway {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: Some(sid.to_string()),
+            slug: self.sessions.get(sid).map(|s| s.project.clone()),
         });
     }
 
@@ -7193,6 +7279,7 @@ fn emit_turn_stall_warning(
         attachments: Vec::new(),
         options: Vec::new(),
         sid: Some(session_id.to_string()),
+        slug: Some(session.project.clone()),
     });
 }
 
@@ -7334,6 +7421,7 @@ fn emit_progress(
         thread_ts: None,
         content: content.to_string(),
         sid: Some(session_id.to_string()),
+        slug: Some(session.project.clone()),
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
         options: Vec::new(),
@@ -7368,6 +7456,7 @@ fn emit_activity(
         },
         attachments: Vec::new(),
         options: Vec::new(),
+        slug: Some(session.project.clone()),
     })
 }
 
@@ -7936,6 +8025,7 @@ mod tests {
             attachments: Vec::new(),
             options: Vec::new(),
             sid: sid.map(str::to_string),
+            slug: None,
         }
     }
 
@@ -14504,5 +14594,91 @@ mod tests {
             !chain.contains(&sibling),
             "an unrelated sibling is NOT an ancestor"
         );
+    }
+
+    // ========================================================================
+    // v0.9.0 W4 (F4) — GatewayEventKind::Delegation broadcast (team view SSE).
+    // ========================================================================
+
+    /// A delegated spawn's `delegation_spawned` emit point ALSO broadcasts a
+    /// `GatewayEventKind::Delegation` (the team view's live twin) — fires even
+    /// with `project_paths` unset (no progress.jsonl write side effect needed
+    /// for the broadcast leg; see `emit_delegation_progress`'s doc). `sid` is
+    /// `None` (not a per-session event) and `slug` names the project — the
+    /// team view's global SSE ACL key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_spawn_broadcasts_delegation_event_with_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        let mut events = gw.subscribe_events();
+        // No mpsc sink wired: `emit_user_signal` falls back to the raw
+        // broadcast (still exercises the SAME `Delegation` construction path
+        // `emit_delegation_progress` uses at every call site).
+
+        let parent = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = gw
+            .create_delegated_session(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "local".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent.clone(),
+                    depth: 0,
+                    role: "brain".into(),
+                }),
+                Some("research task".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = events.recv().await.expect("broadcast still open");
+                if matches!(ev.kind, GatewayEventKind::Delegation { .. }) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("a Delegation broadcast arrives");
+
+        assert_eq!(
+            ev.sid, None,
+            "a Delegation event names two sessions, not one"
+        );
+        assert_eq!(ev.slug.as_deref(), Some("alpha"));
+        match ev.kind {
+            GatewayEventKind::Delegation {
+                relation,
+                parent_sid,
+                child_sid,
+                title,
+                reason,
+            } => {
+                assert_eq!(relation, "spawned");
+                assert_eq!(parent_sid, parent);
+                assert_eq!(child_sid, child);
+                assert_eq!(title.as_deref(), Some("research task"));
+                assert_eq!(reason, None);
+            }
+            _ => unreachable!("filtered above"),
+        }
     }
 }
