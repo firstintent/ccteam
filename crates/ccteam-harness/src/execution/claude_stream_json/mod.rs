@@ -869,6 +869,32 @@ impl ClaudeStreamJsonAdapter {
         let transport = StreamJsonTransport::connect_stdio(argv, env, cwd)
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("stream-json connect: {e:#}")))?;
+        Self::init_transport(transport).await
+    }
+
+    /// v0.9.0 W3 (F3, tech-design §0.4/§4.3) — the remote counterpart of
+    /// [`Self::spawn_and_init`]: dial the satellite's `ccteam-exec.v1`
+    /// bridge instead of spawning a local child, then run the EXACT SAME
+    /// `initialize` handshake ([`Self::init_transport`]) over the resulting
+    /// transport. The adapter's protocol logic downstream is unaware which
+    /// path built the transport (the transport law).
+    async fn spawn_and_init_remote(
+        target: &crate::execution::remote_exec::RemoteExecTarget,
+        exec_spec: crate::execution::remote_exec::ExecSpec,
+    ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
+        let (reader, writer) = crate::execution::remote_exec::connect(target, exec_spec)
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("ccteam-exec.v1 connect: {e:#}")))?;
+        let transport = StreamJsonTransport::spawn_from_io(reader, writer, None);
+        Self::init_transport(transport).await
+    }
+
+    /// Shared `initialize` control_request handshake — see
+    /// [`Self::spawn_and_init`]'s doc for why this (not `system:init`) is
+    /// the capability handshake stream-json uses.
+    async fn init_transport(
+        transport: StreamJsonTransport,
+    ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         match transport
             .request_control("initialize", json!({}), init_timeout())
             .await
@@ -892,6 +918,67 @@ impl ClaudeStreamJsonAdapter {
             }
         }
     }
+
+    /// v0.9.0 W3 — build the `ccteam-exec.v1` [`ExecSpec`](crate::execution::remote_exec::ExecSpec)
+    /// for one spawn attempt: argv MINUS argv\[0\] (the satellite resolves
+    /// its own `claude` binary — never trust a wire path), the `CCTEAM_*`
+    /// env subset (allowlist — mirrors the satellite's own filter, belt +
+    /// braces), and — when `ship_mcp` — the curated `mcp.json` body with
+    /// the `{{DAEMON_URL}}` template token in place of a concrete URL (the
+    /// satellite substitutes its own `daemon_url`; the main daemon never
+    /// has to guess its own LAN-reachable address).
+    fn build_exec_spec(
+        ctx: &SpawnCtx,
+        spec: &AgentSpecBrief,
+        argv: Vec<String>,
+        env: &[(String, String)],
+        ship_mcp: bool,
+        mcp_relpath: &Path,
+    ) -> crate::execution::remote_exec::ExecSpec {
+        let mut exec_spec = crate::execution::remote_exec::ExecSpec::new(
+            "claude",
+            ctx.slug.clone(),
+            ctx.sid.clone(),
+            "stream-json",
+        );
+        exec_spec.args = argv.into_iter().skip(1).collect();
+        for (k, v) in env {
+            if k.starts_with("CCTEAM_") {
+                exec_spec.env.insert(k.clone(), v.clone());
+            }
+        }
+        if ship_mcp {
+            let daemon_url_mcp = format!(
+                "{}/mcp",
+                crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN
+            );
+            let input = crate::execution::mcp_config::CuratedMcpInput {
+                sid: &ctx.sid,
+                secret: &ctx.secret,
+                role: &spec.role,
+                slug: &ctx.slug,
+                // Unused in Http mode (no stdio command to resolve).
+                ccteam_bin: Path::new("ccteam"),
+                mode: crate::execution::mcp_config::McpConfigMode::Http,
+                http_url: Some(&daemon_url_mcp),
+            };
+            let body = crate::execution::mcp_config::build_curated_mcp_json(&input);
+            match serde_json::to_string_pretty(&body) {
+                Ok(content) => exec_spec
+                    .files
+                    .push(crate::execution::remote_exec::ExecFile {
+                        relpath: mcp_relpath.to_string_lossy().to_string(),
+                        content,
+                    }),
+                Err(e) => tracing::warn!(
+                    sid = %ctx.sid,
+                    error = %e,
+                    "claude-stream-json: serialize remote mcp.json failed; spawning without in-agent MCP"
+                ),
+            }
+        }
+        exec_spec
+    }
 }
 
 #[async_trait]
@@ -911,21 +998,48 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
     ) -> Result<ThreadHandle, HarnessError> {
         // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
         // bot-token getUpdates poll structurally collides with ccteam's IM
-        // gateway). Same managed layer the tmux path uses; only this one plugin.
+        // gateway). Same managed layer the tmux path uses; only this one
+        // plugin. NOTE (v0.9.0 W3): this always touches the LOCAL
+        // project_dir, even for a remote spawn — a harmless no-op edit to
+        // the main daemon's own working copy; the satellite manages its
+        // own `.claude/settings.local.json` independently.
         crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
         let bin = spawn_spec::claude_bin();
         // §七 ⑤ — stable per-(slug,sid) uuid: the stateless resume key.
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);
-        let resume = Self::session_jsonl_exists(&ctx.cwd, &uuid);
+        // v0.9.0 W3 — a remote spawn's transcript lives on the SATELLITE,
+        // unreachable via the local `session_jsonl_exists` fs check, so
+        // ALWAYS attempt `--resume` first there: claude fails resume for an
+        // unknown uuid (the satellite's very first spawn of this sid) and
+        // the existing fallback-to-fresh path below catches it exactly like
+        // a local resume failure — same contract, just optimistic instead
+        // of fs-checked (tech-design §4.4: satellite `--resume` is how a
+        // remote rebuild continues context, PRD F3.4).
+        let resume = ctx.remote.is_some() || Self::session_jsonl_exists(&ctx.cwd, &uuid);
 
-        // v0.8.24 C1 — curated per-session MCP written by the gateway at
-        // spawn (chat/<sid>/mcp.json). Present → --mcp-config + strict;
-        // missing → strict alone (strip ambient), same as pre-C1.
-        let mcp_config_path = {
-            let p =
-                crate::execution::mcp_config::session_mcp_config_path(&ctx.project_dir, &ctx.sid);
-            p.exists().then_some(p)
+        // v0.8.24 C1 / v0.9.0 W3 — curated per-session MCP. `--mcp-config`
+        // is a RELATIVE path (`.ccteam/chat/<sid>/mcp.json`, cwd = project
+        // root) for BOTH local and remote spawns now (tech-design §4.3:
+        // one argv shape; local behavior is unaffected since cwd ==
+        // project_dir there too). Present ⇒ --mcp-config + strict; absent
+        // ⇒ strict alone (strip ambient). Remote ALWAYS ships a fresh
+        // mcp.json via `ExecSpec::files` (no local copy to fall back on,
+        // and the secret is freshly minted per rebuild anyway) — gated on
+        // a non-empty secret, mirroring the gateway's own gate for writing
+        // the local copy.
+        let mcp_present_locally =
+            crate::execution::mcp_config::session_mcp_config_path(&ctx.project_dir, &ctx.sid)
+                .exists();
+        let mcp_relpath = PathBuf::from(".ccteam")
+            .join("chat")
+            .join(&ctx.sid)
+            .join(crate::execution::mcp_config::MCP_CONFIG_FILENAME);
+        let ship_mcp = if ctx.remote.is_some() {
+            !ctx.secret.is_empty()
+        } else {
+            mcp_present_locally
         };
+        let mcp_config_arg: Option<PathBuf> = ship_mcp.then(|| mcp_relpath.clone());
         let make_argv = |resume: bool| {
             spawn_spec::build_argv(
                 &bin,
@@ -936,40 +1050,73 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     model_id: ctx.model_id.as_deref(),
                     effort: ctx.effort.as_deref(),
                     permission_mode: ctx.permission_mode,
-                    mcp_config_path: mcp_config_path.as_deref(),
+                    mcp_config_path: mcp_config_arg.as_deref(),
                 },
             )
         };
         let env = spawn_spec::build_env(&spec.role, &ctx.slug, &ctx.secret, &ctx.sid);
 
-        // Try the resume spawn first when a prior transcript exists; on
-        // failure fall back to a fresh `--session-id` spawn and emit a
-        // chat_session_reset with an explicit reason (the honest
-        // context-loss signal — never silently synthesize).
-        let (transport, init) = match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd).await
-        {
-            Ok(ok) => ok,
-            Err(resume_err) if resume => {
-                tracing::warn!(
-                    sid = %ctx.sid,
-                    slug = %ctx.slug,
-                    error = %resume_err,
-                    "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
-                );
-                let fresh = Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd).await?;
-                if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
-                    let ev = build_chat_session_reset_event_with_reason(
-                        &spec.role,
-                        &ctx.sid,
-                        "resume_failed_fallback_to_fresh",
+        // Try the resume spawn first when a prior transcript exists (or,
+        // remote, optimistically); on failure fall back to a fresh
+        // `--session-id` spawn and emit a chat_session_reset with an
+        // explicit reason (the honest context-loss signal — never silently
+        // synthesize). The transport-building step differs (local child vs
+        // `ccteam-exec.v1` WS bridge — tech-design §0.4: execution location
+        // is a transport parameter); everything after this `match` is
+        // identical for both.
+        let (transport, init) = if let Some(remote) = ctx.remote.as_ref() {
+            let build_spec = |resume: bool| {
+                Self::build_exec_spec(ctx, spec, make_argv(resume), &env, ship_mcp, &mcp_relpath)
+            };
+            match Self::spawn_and_init_remote(remote, build_spec(resume)).await {
+                Ok(ok) => ok,
+                Err(resume_err) if resume => {
+                    tracing::warn!(
+                        sid = %ctx.sid,
+                        slug = %ctx.slug,
+                        error = %resume_err,
+                        "claude-stream-json: remote --resume spawn failed; falling back to fresh --session-id"
                     );
-                    if let Err(err) = append_event(&progress_path, &ev) {
-                        tracing::warn!(error = %err, "claude-stream-json: append reset event failed");
+                    let fresh = Self::spawn_and_init_remote(remote, build_spec(false)).await?;
+                    if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
+                        let ev = build_chat_session_reset_event_with_reason(
+                            &spec.role,
+                            &ctx.sid,
+                            "resume_failed_fallback_to_fresh",
+                        );
+                        if let Err(err) = append_event(&progress_path, &ev) {
+                            tracing::warn!(error = %err, "claude-stream-json: append reset event failed");
+                        }
                     }
+                    fresh
                 }
-                fresh
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+        } else {
+            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd).await {
+                Ok(ok) => ok,
+                Err(resume_err) if resume => {
+                    tracing::warn!(
+                        sid = %ctx.sid,
+                        slug = %ctx.slug,
+                        error = %resume_err,
+                        "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
+                    );
+                    let fresh = Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd).await?;
+                    if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
+                        let ev = build_chat_session_reset_event_with_reason(
+                            &spec.role,
+                            &ctx.sid,
+                            "resume_failed_fallback_to_fresh",
+                        );
+                        if let Err(err) = append_event(&progress_path, &ev) {
+                            tracing::warn!(error = %err, "claude-stream-json: append reset event failed");
+                        }
+                    }
+                    fresh
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let identity = SessionIdentity {

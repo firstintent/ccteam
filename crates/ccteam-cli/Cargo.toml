@@ -48,6 +48,10 @@ async-trait.workspace = true
 futures.workspace = true
 # v0.8.24 Track D — `ccteam host join|heartbeat|join-token` HTTP client.
 reqwest = { workspace = true, features = ["json"] }
+# v0.9.0 W3 — `ccteam host serve` calls `axum::serve` directly on the
+# `Router` `ccteam_web::satellite::satellite_router` builds (the "ws"
+# feature that router needs lives on the ccteam-web dependency edge).
+axum.workspace = true
 
 # V0.6.0 Wave 3 F112 §C — `ccteam prefs show` pretty-prints the
 # Preferences struct via `toml::to_string_pretty`. Aligned with the
@@ -63,7 +67,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-axum.workspace = true
+# axum is a normal (non-dev) dependency now — see `[dependencies]` above.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # V0.6.6 F173 — `doctor_cost_orphan_test.rs` writes a project-registration
 # `config.yaml` via the same serde_yaml the production loader uses.

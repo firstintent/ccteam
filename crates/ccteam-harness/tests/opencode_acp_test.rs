@@ -64,6 +64,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 
@@ -300,6 +301,7 @@ async fn resume_carries_mcp_servers() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: "seKret1234".into(),
+        remote: None,
     };
     let adapter = OpencodeAcpAdapter::new();
     let handle = adapter
@@ -480,4 +482,29 @@ fn no_tmux_rmux_imports_in_opencode_module_sources() {
             );
         }
     }
+}
+
+/// v0.9.0 W3 (F3) — remote execution is claude-only this version; opencode
+/// must fail clean + readable rather than silently spawning locally under
+/// a remote host id. No fake binary needed — the guard runs before spawn.
+#[tokio::test(flavor = "current_thread")]
+async fn start_thread_rejects_remote_ctx_readable() {
+    let tmp = TempDir::new().unwrap();
+    let mut ctx = spawn_ctx(&tmp, "s-remote");
+    ctx.remote = Some(ccteam_harness::RemoteExecTarget {
+        exec_ws_url: "ws://127.0.0.1:1/ws/exec".into(),
+        agent_token: "tok".into(),
+    });
+    let adapter = OpencodeAcpAdapter::new();
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("remote opencode must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("not yet supported for opencode"), "got: {msg}");
 }

@@ -2002,6 +2002,9 @@ impl Orchestrator {
             // v0.8.7 review-fix (R-M1) — the orchestrator/bg path is not the
             // gateway cto-gate chat session; no per-session secret applies.
             secret: String::new(),
+            // v0.9.0 W3 — `ccteam-flow` is deferred/not driven by the daemon
+            // (§一); it never targets a remote host.
+            remote: None,
         };
 
         // Atomic check-and-spawn: hold the `running` lock from the

@@ -789,6 +789,13 @@ pub struct SpawnCtx {
     /// is then omitted, matching prior behavior. NOT a hard boundary — see
     /// `ccteam_core::session_secret` for the single-uid threat-model scope.
     pub secret: String,
+    /// v0.9.0 W3 (F3, tech-design §4.3) — when `Some`, this thread runs on a
+    /// satellite host: the adapter must dial
+    /// [`crate::execution::remote_exec::connect`] instead of spawning a
+    /// local child, per the transport law (tech-design §0.4: execution
+    /// location is a transport parameter, not an adapter branch). `None`
+    /// (the overwhelming majority) = local spawn, unchanged.
+    pub remote: Option<crate::execution::remote_exec::RemoteExecTarget>,
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`

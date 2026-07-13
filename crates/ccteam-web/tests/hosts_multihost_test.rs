@@ -282,6 +282,10 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         agent_token: "agenttok".into(),
         last_heartbeat_unix: now_unix().saturating_sub(10_000),
         agents: vec![],
+        projects: vec![ccteam_core::HostProjectReport {
+            slug: "demo".into(),
+            path: "/home/sat/projects/demo".into(),
+        }],
         joined_at: chrono::Utc::now().to_rfc3339(),
     });
     reg.save(&paths.host_registry_path()).unwrap();
@@ -291,6 +295,7 @@ async fn remote_spawn_offline_error_does_not_create_session() {
     let err = ccteam_im::remote_host::prepare_host_for_spawn(
         Some(&paths.root),
         "dead-sat",
+        "demo",
         SessionProtocol::StreamJson,
         Some(&proxy),
     )
@@ -315,27 +320,42 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         reg.get_mut("dead-sat").unwrap().last_heartbeat_unix = now_unix();
         reg.save(&paths.host_registry_path()).unwrap();
     }
-    let host = ccteam_im::remote_host::prepare_host_for_spawn(
+    let target = ccteam_im::remote_host::prepare_host_for_spawn(
         Some(&paths.root),
         "dead-sat",
+        "demo",
         SessionProtocol::StreamJson,
         Some(&proxy),
     )
     .await
     .unwrap();
-    assert_eq!(host, "dead-sat");
+    assert_eq!(target.host, "dead-sat");
+    assert!(target.remote.is_some());
     assert_eq!(fake.last_host.lock().unwrap().as_deref(), Some("dead-sat"));
 
     // Terminal on remote is rejected even when online.
     let err = ccteam_im::remote_host::prepare_host_for_spawn(
         Some(&paths.root),
         "dead-sat",
+        "demo",
         SessionProtocol::Terminal,
         Some(&proxy),
     )
     .await
     .unwrap_err();
     assert!(err.to_string().contains("terminal"));
+
+    // A slug the satellite never registered is rejected even when online.
+    let err = ccteam_im::remote_host::prepare_host_for_spawn(
+        Some(&paths.root),
+        "dead-sat",
+        "not-registered-there",
+        SessionProtocol::StreamJson,
+        Some(&proxy),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("not registered"), "got: {err}");
 }
 
 /// End-to-end: gateway create on offline host fails; session map stays empty.
@@ -358,6 +378,7 @@ async fn gateway_create_on_offline_host_fails_clean() {
         agent_token: "t".into(),
         last_heartbeat_unix: now_unix().saturating_sub(9999),
         agents: vec![],
+        projects: vec![],
         joined_at: chrono::Utc::now().to_rfc3339(),
     });
     reg.save(&paths.host_registry_path()).unwrap();

@@ -73,6 +73,7 @@ async fn real_codex_app_server_start_thread_smoke() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         ),
     )
@@ -135,6 +136,7 @@ async fn real_codex_reply_roundtrip_proves_model_output() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         ),
     )
@@ -329,6 +331,7 @@ async fn raw_extras_transport_is_resolved_tag() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         )
         .await
@@ -394,6 +397,7 @@ async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         )
         .await
@@ -494,6 +498,7 @@ async fn f10_real_codex_stdio_new_smoke() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         ),
     )
@@ -816,6 +821,7 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let err = adapter.start_thread(&spec, &ctx).await.unwrap_err();
     assert!(matches!(err, HarnessError::SpawnFailed(_)));
@@ -892,6 +898,7 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     assert_eq!(h.identity, "tid-77");
@@ -992,6 +999,7 @@ async fn adapter_start_thread_against_scripted_peer() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     assert_eq!(h.vendor, AgentVendor::Codex);
@@ -1060,6 +1068,7 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let h = adapter.start_thread(&spec, &ctx).await.unwrap();
     let user_turn = adapter
@@ -1281,6 +1290,7 @@ async fn d2_start_with_notif(
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: String::new(),
+                remote: None,
             },
         )
         .await
@@ -2808,6 +2818,7 @@ async fn start_thread_injects_per_thread_mcp_config_with_identity() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: "seKret1234".into(),
+                remote: None,
             },
         )
         .await
@@ -2915,6 +2926,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
                 effort: None,
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: "seKret".into(),
+                remote: None,
             },
         )
         .await
@@ -2939,4 +2951,40 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     drop(peer);
     let _ = std::fs::remove_file(&sock);
     restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
+/// v0.9.0 W3 (F3) — remote execution is claude-only this version; codex
+/// must fail clean + readable rather than silently spawning the
+/// daemon-singleton app-server locally under a remote host id. No fake
+/// socket needed — the guard runs before any transport dial.
+#[tokio::test(flavor = "current_thread")]
+async fn start_thread_rejects_remote_ctx_readable() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = SpawnCtx {
+        slug: "demo".into(),
+        sid: "s-remote".into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        effort: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
+        remote: Some(ccteam_harness::RemoteExecTarget {
+            exec_ws_url: "ws://127.0.0.1:1/ws/exec".into(),
+            agent_token: "tok".into(),
+        }),
+    };
+    let adapter = CodexAppServerAdapter::new();
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("remote codex must be rejected");
+    assert!(matches!(err, HarnessError::NotImplemented { .. }));
+    assert!(err.to_string().contains("not yet supported for codex"));
 }

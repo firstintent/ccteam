@@ -779,6 +779,21 @@ enum HostCommand {
     Heartbeat,
     /// Show the local satellite credentials (if joined).
     Ls,
+    /// v0.9.0 W3 (F3) — run this machine's `ccteam-exec.v1` satellite:
+    /// `GET /health` + `GET /ws/exec` (bearer = this host's `agent_token`
+    /// from a prior `ccteam host join`) plus an embedded heartbeat loop
+    /// (agents probe + this host's own registered projects). Foreground
+    /// process; Ctrl-C / SIGTERM to stop.
+    Serve {
+        /// Address to bind the exec bridge on.
+        #[arg(long, default_value = "0.0.0.0:7332")]
+        bind: String,
+        /// Override the `agent_url` this satellite advertises at heartbeat
+        /// (default: `http://<bind>` — wrong when `bind` is unspecified
+        /// `0.0.0.0`, so set this to the LAN-reachable address).
+        #[arg(long)]
+        advertise_url: Option<String>,
+    },
 }
 
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
@@ -1374,6 +1389,13 @@ fn run_host(cmd: HostCommand) -> Result<()> {
         } => rt.block_on(host_mint_token(daemon, web_token, label, max_uses)),
         HostCommand::Heartbeat => rt.block_on(host_heartbeat(&paths)),
         HostCommand::Ls => host_ls(&paths),
+        HostCommand::Serve {
+            bind,
+            advertise_url,
+        } => {
+            init_tracing();
+            rt.block_on(host_serve(&paths, bind, advertise_url))
+        }
     }
 }
 
@@ -1464,19 +1486,56 @@ async fn host_heartbeat(paths: &CcteamPaths) -> Result<()> {
     let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
     let me = ccteam_core::SatelliteSelf::load(&self_path)
         .with_context(|| format!("not joined? missing {}", self_path.display()))?;
+    let text = send_heartbeat(paths, &me, None).await?;
+    println!("{text}");
+    Ok(())
+}
+
+/// v0.9.0 W3 (G9) — one heartbeat POST, shared by the one-shot `ccteam
+/// host heartbeat` and the `ccteam host serve` embedded loop. Reports
+/// THIS machine's own agent probe (`ccteam_core::probe_agents`) and its
+/// own registered projects (`~/.ccteam/config.yaml::projects[]`) — the
+/// two fields that were previously always empty (the gap this closes:
+/// the main daemon's remote-spawn gate needs `projects` to know whether a
+/// slug is actually usable here before proxying a spawn).
+async fn send_heartbeat(
+    paths: &CcteamPaths,
+    me: &ccteam_core::SatelliteSelf,
+    agent_url: Option<&str>,
+) -> Result<String> {
+    let agents = tokio::task::spawn_blocking(ccteam_core::probe_agents)
+        .await
+        .unwrap_or_default();
+    let projects: Vec<ccteam_core::HostProjectReport> = ccteam_core::config::load(&paths.root)
+        .map(|cfg| {
+            cfg.projects
+                .into_iter()
+                .map(|p| ccteam_core::HostProjectReport {
+                    slug: p.slug,
+                    path: p.path.display().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let url = format!(
         "{}/api/v1/hosts/{}/heartbeat",
         me.daemon_url.trim_end_matches('/'),
         me.host
     );
+    let mut body = serde_json::json!({
+        "agent_token": me.agent_token,
+        "ccteam_version": env!("CARGO_PKG_VERSION"),
+        "agents": agents,
+        "projects": projects,
+    });
+    if let Some(u) = agent_url {
+        body["agent_url"] = serde_json::json!(u);
+    }
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer ccteam:{}", me.agent_token))
-        .json(&serde_json::json!({
-            "agent_token": me.agent_token,
-            "ccteam_version": env!("CARGO_PKG_VERSION"),
-        }))
+        .json(&body)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
@@ -1485,8 +1544,109 @@ async fn host_heartbeat(paths: &CcteamPaths) -> Result<()> {
     if !status.is_success() {
         anyhow::bail!("heartbeat failed HTTP {status}: {text}");
     }
-    println!("{text}");
+    Ok(text)
+}
+
+/// v0.9.0 W3 (F3) — `ccteam host serve`: run the `ccteam-exec.v1`
+/// satellite (`GET /health` + `GET /ws/exec`) plus an embedded heartbeat
+/// loop, until Ctrl-C / SIGTERM.
+async fn host_serve(
+    paths: &CcteamPaths,
+    bind: String,
+    advertise_url: Option<String>,
+) -> Result<()> {
+    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
+    let me = ccteam_core::SatelliteSelf::load(&self_path).with_context(|| {
+        format!(
+            "not joined? missing {} — run `ccteam host join` first",
+            self_path.display()
+        )
+    })?;
+    let bind_addr: std::net::SocketAddr = bind
+        .parse()
+        .with_context(|| format!("invalid --bind {bind}"))?;
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind {bind_addr} for ccteam host serve"))?;
+    let local = listener.local_addr().context("read local_addr")?;
+    let advertise = advertise_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{local}"));
+    println!("ccteam host serve listening on http://{local}");
+    println!(
+        "host: {}  daemon: {}  advertise: {advertise}",
+        me.host, me.daemon_url
+    );
+    tracing::info!(host = %me.host, %local, %advertise, "ccteam host serve starting");
+
+    let router = ccteam_web::satellite::satellite_router(
+        paths.clone(),
+        me.agent_token.clone(),
+        me.daemon_url.clone(),
+    );
+
+    let hb_paths = paths.clone();
+    let hb_me = me.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        host_heartbeat_loop(hb_paths, hb_me, advertise).await;
+    });
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(ccteam_web::shutdown_signal())
+        .await
+        .context("ccteam host serve: axum serve loop terminated with error")?;
+    heartbeat_task.abort();
     Ok(())
+}
+
+/// v0.9.0 W3 (F7 reliability) — heartbeat every `ttl/3` (+/- jitter so many
+/// satellites don't sync-beat), consecutive-failure exponential backoff
+/// capped at `ttl`. Runs until the process exits (aborted by `host_serve`
+/// when the exec server itself shuts down).
+async fn host_heartbeat_loop(
+    paths: CcteamPaths,
+    me: ccteam_core::SatelliteSelf,
+    advertise_url: String,
+) {
+    let ttl_secs = me.heartbeat_ttl_secs.max(3);
+    let base_period = std::time::Duration::from_secs((ttl_secs / 3).max(1));
+    let max_backoff = std::time::Duration::from_secs(ttl_secs);
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        let sleep_for = if consecutive_failures == 0 {
+            base_period
+        } else {
+            let mult = 1u32 << consecutive_failures.min(6);
+            base_period.saturating_mul(mult).min(max_backoff)
+        };
+        tokio::time::sleep(jittered(sleep_for)).await;
+        match send_heartbeat(&paths, &me, Some(&advertise_url)).await {
+            Ok(_) => {
+                if consecutive_failures > 0 {
+                    tracing::info!("ccteam host serve: heartbeat recovered");
+                }
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(error = %e, consecutive_failures, "ccteam host serve: heartbeat failed");
+            }
+        }
+    }
+}
+
+/// +/- 20% jitter derived from the wall clock (no new `rand` dependency
+/// for one non-cryptographic scheduling nicety).
+fn jittered(period: std::time::Duration) -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Map to a [-20%, +20%] fraction.
+    let frac = (nanos % 4001) as i64 - 2000; // [-2000, 2000] -> per-mille-ish
+    let delta_ms = (period.as_millis() as i64 * frac) / 10_000;
+    let total_ms = (period.as_millis() as i64 + delta_ms).max(100);
+    std::time::Duration::from_millis(total_ms as u64)
 }
 
 fn host_ls(paths: &CcteamPaths) -> Result<()> {

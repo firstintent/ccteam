@@ -44,6 +44,10 @@ pub mod queries;
 // and `routes::sessions_api` (the SSE handler) need it.
 mod ring;
 pub mod routes;
+// v0.9.0 W3 (F3) — the satellite side of `ccteam-exec.v1` (`ccteam host
+// serve` embeds `satellite::satellite_router`). Separate from `routes/`:
+// it is not part of the `/api/v1` main-daemon surface at all.
+pub mod satellite;
 pub mod state;
 pub mod status;
 pub mod token;
@@ -251,7 +255,10 @@ where
 
 /// Wait for Ctrl-C OR SIGTERM (unix only). Mirrors the orchestrator
 /// daemon's `run_start` shutdown plumbing so behavior is consistent.
-async fn shutdown_signal() {
+/// `pub` (v0.9.0 W3) so `ccteam host serve` (a standalone satellite
+/// process, not embedded in the main daemon) can reuse the same signal
+/// handling instead of duplicating it.
+pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

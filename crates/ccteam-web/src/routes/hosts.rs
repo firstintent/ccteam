@@ -21,7 +21,6 @@
 //! the shared web-token gate applies for free.
 
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use axum::{
@@ -164,12 +163,37 @@ pub struct HostDetail {
     /// ccteam build version driving this host.
     pub ccteam_version: String,
     pub agents: Vec<AgentHealth>,
+    /// v0.9.0 W3 (G9) — projects registered on this host (its own
+    /// `~/.ccteam/config.yaml::projects[]`, local read directly / satellite
+    /// last reported at heartbeat). Drives the remote-spawn gate
+    /// (`gate_remote_spawn_project`): a slug missing here cannot be
+    /// spawned/rebuilt on this host.
+    #[serde(default)]
+    pub projects: Vec<HostProjectView>,
 }
 
 /// `GET /api/v1/hosts` response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HostsResponse {
     pub hosts: Vec<HostSummary>,
+}
+
+/// v0.9.0 W3 (G9) — one project registered on a host, as surfaced by
+/// `GET /api/v1/hosts/{host}`. Web-local schema view over
+/// `ccteam_core::HostProjectReport` (which has no `utoipa` dependency).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostProjectView {
+    pub slug: String,
+    pub path: String,
+}
+
+impl From<ccteam_core::HostProjectReport> for HostProjectView {
+    fn from(p: ccteam_core::HostProjectReport) -> Self {
+        Self {
+            slug: p.slug,
+            path: p.path,
+        }
+    }
 }
 
 /// Result of one `<bin> --version` probe.
@@ -208,28 +232,12 @@ pub(crate) fn probe_bin(bin: &str, refresh: bool) -> ProbeResult {
             }
         }
     }
-    let result = match Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let version = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            ProbeResult {
-                installed: true,
-                version,
-            }
-        }
-        _ => ProbeResult {
-            installed: false,
-            version: None,
-        },
-    };
+    // v0.9.0 W3 — the raw `<bin> --version` shellout is shared with the
+    // satellite heartbeat loop (`ccteam host serve`) via
+    // `ccteam_core::host_registry::probe_bin_version`; this wrapper adds
+    // ONLY the process-lifetime cache (a satellite probes fresh every beat).
+    let (installed, version) = ccteam_core::host_registry::probe_bin_version(bin);
+    let result = ProbeResult { installed, version };
     if let Ok(mut cache) = probe_cache().lock() {
         cache.insert(bin.to_string(), result.clone());
     }
@@ -398,6 +406,17 @@ pub(crate) async fn handle_host_detail(
     }
     if host == LOCAL_HOST {
         let agents = probe_all_agents(q.refresh).await;
+        let projects = ccteam_core::config::load(&app.paths.root)
+            .map(|cfg| {
+                cfg.projects
+                    .into_iter()
+                    .map(|p| HostProjectView {
+                        slug: p.slug,
+                        path: p.path.display().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         return Json(HostDetail {
             host: LOCAL_HOST.to_string(),
             hostname: local_hostname(),
@@ -406,6 +425,7 @@ pub(crate) async fn handle_host_detail(
             arch: std::env::consts::ARCH.to_string(),
             ccteam_version: ccteam_core::VERSION.to_string(),
             agents,
+            projects,
         })
         .into_response();
     }
@@ -435,6 +455,12 @@ pub(crate) async fn handle_host_detail(
                     arch: h.arch.clone(),
                     ccteam_version: h.ccteam_version.clone(),
                     agents,
+                    projects: h
+                        .projects
+                        .iter()
+                        .cloned()
+                        .map(HostProjectView::from)
+                        .collect(),
                 })
                 .into_response()
             }
