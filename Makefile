@@ -43,7 +43,7 @@ MAC_LOG      := $(CCTEAM_HOME)/daemon.log
 .DEFAULT_GOAL := help
 .PHONY: help build release clean fmt fmt-check clippy check test test-web \
         web web-deps web-check gate \
-        install next-steps uninstall reinstall require-cli \
+        install next-steps uninstall reinstall require-cli require-node \
         config init start stop status doctor \
         daemon-start daemon-stop \
         daemon-restart daemon-status daemon-logs \
@@ -87,10 +87,44 @@ help:
 
 # --- Build & test ------------------------------------------------------------
 
-build:
+# Propagate an explicit skip to the ccteam-web build.rs whether it arrives as an
+# environment variable (CCTEAM_SKIP_WEB_BUILD=1 make ...) or a make variable
+# (make CCTEAM_SKIP_WEB_BUILD=1 ...) — make exports only env-origin vars by default.
+ifdef CCTEAM_SKIP_WEB_BUILD
+export CCTEAM_SKIP_WEB_BUILD
+endif
+
+# Preflight for from-source builds. `make build/release/web/clippy/test/...`
+# compile the ccteam-web crate, whose build.rs shells out to `npm` to bundle the
+# web console — so this machine needs Node.js (node + npm). This is a DEVELOPER
+# prerequisite ONLY: end users install the prebuilt binary
+# (`curl ... install.sh | sh`) with the SPA already baked in and never touch
+# Node. Fail fast here with the exact fix instead of letting build.rs die
+# cryptically mid-compile. Bypass for a CLI/daemon-only build (placeholder web
+# console — also how cross-machine satellites build): CCTEAM_SKIP_WEB_BUILD=1.
+require-node:
+	@if [ "$(CCTEAM_SKIP_WEB_BUILD)" = "1" ]; then \
+	    printf '\033[33m==>\033[0m CCTEAM_SKIP_WEB_BUILD=1 set — skipping the SPA build (placeholder web console).\n'; \
+	elif command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then \
+	    :; \
+	else \
+	    printf '\033[31merror:\033[0m Node.js (node + npm) not found — required to build the web console from source.\n' >&2; \
+	    printf '    Fix one of:\n' >&2; \
+	    if [ "$$(uname -s)" = "Darwin" ]; then \
+	        printf '      brew install node                          # then re-run\n' >&2; \
+	    else \
+	        printf '      sudo apt install nodejs npm                 # (or your distro equivalent), then re-run\n' >&2; \
+	    fi; \
+	    printf '      CCTEAM_SKIP_WEB_BUILD=1 make %s   # CLI/daemon only, placeholder web console\n' '$(MAKECMDGOALS)' >&2; \
+	    printf '\n    End users need neither Rust nor Node — install the prebuilt binary instead:\n' >&2; \
+	    printf '      curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh\n' >&2; \
+	    exit 1; \
+	fi
+
+build: require-node
 	cargo build
 
-release:
+release: require-node
 	cargo build --release
 
 clean:
@@ -103,7 +137,7 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-clippy:
+clippy: require-node
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # Quick correctness gate without tests (fmt + clippy; clippy type-checks too).
@@ -111,19 +145,19 @@ check: fmt-check clippy
 
 # Rust core gate — ccteam-web runs separately (its WS/PTY tests need a real
 # terminal). `--no-fail-fast` so one env-flaky test doesn't mask the count.
-test:
+test: require-node
 	cargo test --workspace --exclude ccteam-web --no-fail-fast
 
-test-web:
+test-web: require-node
 	cargo test -p ccteam-web
 
-web-deps:
+web-deps: require-node
 	cd $(WEB_DIR) && npm ci
 
-web:
+web: require-node
 	cd $(WEB_DIR) && npm run build
 
-web-check:
+web-check: require-node
 	cd $(WEB_DIR) && npm run lint && npm run test:unit
 
 # The full pre-push gate. Mirrors CI + the ship discipline.
