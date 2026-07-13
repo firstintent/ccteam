@@ -676,6 +676,10 @@ async fn import_external_claude_session_over_http() {
     )
     .unwrap();
     std::env::set_var("HOME", home.path());
+    // CCTEAM_HOME wins over HOME in the root resolvers; a shell that
+    // exports it would redirect every "isolated" write back into the
+    // REAL ~/.ccteam. Pin both.
+    std::env::set_var("CCTEAM_HOME", home.path().join(".ccteam"));
 
     let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>

@@ -42,6 +42,10 @@ pub struct TelegramChannel {
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
     name: String,
+    /// Chats whose non-allowlisted drop was already WARN-logged once —
+    /// the drop is otherwise invisible (DEBUG) while the getUpdates
+    /// offset keeps advancing, which reads as a message black hole.
+    warned_chats: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TelegramChannel {
@@ -58,6 +62,7 @@ impl TelegramChannel {
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
             name: "telegram".to_string(),
+            warned_chats: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -562,7 +567,19 @@ impl Channel for TelegramChannel {
                 if let Some(m) = upd.message {
                     let chat_id = m.chat.id.to_string();
                     if !self.chat_allowed(&chat_id) {
-                        tracing::debug!(chat = %chat_id, "drop msg from non-allowed chat");
+                        // WARN once per chat: the update is consumed
+                        // (offset advances) yet never reaches the
+                        // gateway, so a silent DEBUG here reads as the
+                        // bot ignoring the user entirely.
+                        if self.warned_chats.lock().await.insert(chat_id.clone()) {
+                            tracing::warn!(
+                                chat = %chat_id,
+                                allowlist_len = self.allowed_chat_ids.len(),
+                                "telegram: dropping messages from non-allowlisted chat (offset still advances; further drops from this chat log at DEBUG)"
+                            );
+                        } else {
+                            tracing::debug!(chat = %chat_id, "drop msg from non-allowed chat");
+                        }
                         continue;
                     }
                     let sender = m

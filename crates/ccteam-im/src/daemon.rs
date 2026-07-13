@@ -732,10 +732,30 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
     out
 }
 
-/// Telegram: union the user-configured chat-id allowlist with every
-/// registered telegram bot's `im_chat_id` (both live in `reply_target`
-/// chat-id space, so the union authorizes those chats). Verbatim move
-/// of the previous inline logic.
+/// Telegram effective inbound allowlist. An EMPTY user-configured list
+/// means "open mode" and MUST stay open — registry `im_chat_id`s only
+/// ADD authorization on top of an explicit list, never flip the channel
+/// from open to allowlist-only. (A single stale/fixture registration
+/// would otherwise silently lock out every real chat: drops log at
+/// DEBUG while the getUpdates offset still advances — an unobservable
+/// black hole.)
+#[cfg(feature = "telegram")]
+fn telegram_effective_allowlist(user_allowed: &[String], bots: &[BotRegistration]) -> Vec<String> {
+    if user_allowed.is_empty() {
+        return Vec::new();
+    }
+    let mut allowed = user_allowed.to_vec();
+    for b in bots.iter().filter(|b| b.im_platform == "telegram") {
+        allowed.push(b.im_chat_id.clone());
+    }
+    allowed.sort();
+    allowed.dedup();
+    allowed
+}
+
+/// Telegram: user-configured allowlist unioned with registered telegram
+/// bots' `im_chat_id`s (both live in `reply_target` chat-id space) via
+/// [`telegram_effective_allowlist`] — open mode is preserved.
 #[cfg(feature = "telegram")]
 fn build_telegram_channel(
     creds: &Credentials,
@@ -743,15 +763,9 @@ fn build_telegram_channel(
     _lark_probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let tg = creds.telegram.as_ref()?;
-    let mut allowed = tg.allowed_chat_ids.clone();
-    for b in bots.iter().filter(|b| b.im_platform == "telegram") {
-        allowed.push(b.im_chat_id.clone());
-    }
-    allowed.sort();
-    allowed.dedup();
     Some(Arc::new(TelegramChannel::new(
         tg.bot_token.clone(),
-        allowed,
+        telegram_effective_allowlist(&tg.allowed_chat_ids, bots),
     )))
 }
 
@@ -2054,6 +2068,45 @@ mod tests {
         } else {
             std::env::remove_var(key);
         }
+    }
+
+    #[cfg(feature = "telegram")]
+    fn tg_bot_reg(im_chat_id: &str) -> BotRegistration {
+        BotRegistration {
+            workflow_slug: "dev-foo".into(),
+            role: "lead".into(),
+            vendor: AgentVendor::Claude,
+            persona_id: None,
+            im_platform: "telegram".into(),
+            im_chat_id: im_chat_id.into(),
+            chat_handle: None,
+            project_dir: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Empty user allowlist = open mode; a registered bot must NOT flip
+    /// the channel into allowlist-only (regression guard for the
+    /// fixture-registration lockout).
+    #[cfg(feature = "telegram")]
+    #[test]
+    fn telegram_allowlist_empty_stays_open_despite_registered_bots() {
+        let out = telegram_effective_allowlist(&[], &[tg_bot_reg("chat-1")]);
+        assert!(out.is_empty(), "open mode must survive registry union");
+    }
+
+    /// Explicit user allowlist: registered telegram bots' chat ids are
+    /// unioned in (sorted + deduped); other platforms are ignored.
+    #[cfg(feature = "telegram")]
+    #[test]
+    fn telegram_allowlist_unions_registry_onto_explicit_list() {
+        let mut slack_bot = tg_bot_reg("C99");
+        slack_bot.im_platform = "slack".into();
+        let out = telegram_effective_allowlist(
+            &["339498819".to_string(), "chat-1".to_string()],
+            &[tg_bot_reg("chat-1"), tg_bot_reg("chat-2"), slack_bot],
+        );
+        assert_eq!(out, vec!["339498819", "chat-1", "chat-2"]);
     }
 
     #[allow(clippy::await_holding_lock)]

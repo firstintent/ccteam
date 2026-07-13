@@ -14,6 +14,10 @@ use tempfile::TempDir;
 fn isolate_home() -> TempDir {
     let tmp = TempDir::new().unwrap();
     std::env::set_var("HOME", tmp.path());
+    // CCTEAM_HOME wins over HOME in the root resolvers; a shell that
+    // exports it would redirect every "isolated" write back into the
+    // REAL ~/.ccteam. Pin both.
+    std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
     tmp
 }
 
