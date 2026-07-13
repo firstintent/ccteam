@@ -1597,6 +1597,18 @@ impl HarnessAdapter for CodexAppServerAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // v0.9.0 W3 (F3) — remote execution is claude-only in this version
+        // (PRD §五 explicit non-goal: codex/opencode/grok remote is
+        // best-effort, verified only by compiling). Fail clean + readable
+        // rather than silently spawning the daemon-singleton app-server
+        // locally under a remote host id.
+        if ctx.remote.is_some() {
+            return Err(HarnessError::NotImplemented {
+                reason: "remote execution (host != local) is not yet supported for codex; \
+                         use host=local"
+                    .to_string(),
+            });
+        }
         // Pick up on-disk `~/.codex/config.toml` edits: `codex app-server`
         // snapshots its config at process start, so re-spawn the shared child
         // when the file changed since it was dialed. Otherwise this new session

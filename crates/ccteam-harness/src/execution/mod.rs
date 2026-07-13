@@ -17,6 +17,7 @@ pub mod mcp_config;
 pub mod opencode_acp;
 pub mod process_inspect;
 pub mod progress_bridge;
+pub mod remote_exec;
 pub mod session_meta;
 pub mod session_recovery;
 pub mod transcript_tail;

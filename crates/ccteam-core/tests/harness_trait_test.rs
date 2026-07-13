@@ -130,6 +130,7 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
 
     let handle = ClaudeBgAdapter::new()
@@ -163,6 +164,7 @@ async fn claude_bg_start_thread_rejects_empty_role() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let err = ClaudeBgAdapter::new()
         .start_thread(&brief, &ctx)
@@ -282,6 +284,7 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
 
     let adapter = ClaudeBgAdapter::new();
@@ -465,6 +468,7 @@ mod codex_tmux {
             effort: None,
             permission_mode: ccteam_harness::PermissionMode::Skip,
             secret: String::new(),
+            remote: None,
         };
 
         let adapter = CodexExecAdapter::new();

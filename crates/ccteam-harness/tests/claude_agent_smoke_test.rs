@@ -179,6 +179,7 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 
@@ -501,6 +502,7 @@ fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
         secret: String::new(),
+        remote: None,
     }
 }
 
@@ -636,6 +638,7 @@ async fn run_hitl_decision_turn(allow: bool, tag: &str) -> (bool, bool) {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Hitl,
         secret: String::new(),
+        remote: None,
     };
     let handle = adapter
         .start_thread(

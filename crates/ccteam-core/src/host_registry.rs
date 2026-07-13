@@ -37,6 +37,98 @@ pub struct HostAgentReport {
     pub status: String,
 }
 
+/// v0.9.0 W3 (G9) — one project the satellite has registered locally
+/// (its OWN `~/.ccteam/config.yaml::projects[]`), reported at heartbeat so
+/// the main daemon's remote-spawn gate can tell whether a slug is actually
+/// usable on that host before proxying a spawn there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostProjectReport {
+    pub slug: String,
+    pub path: String,
+}
+
+/// One vendor this host can run + the env override / default binary name
+/// used to resolve it. Shared by the satellite heartbeat loop
+/// (`ccteam host serve`) and `ccteam-web::routes::hosts` (which wraps
+/// [`probe_bin_version`] with its own process-lifetime cache + MCP-registration
+/// status for the LOCAL admin host-detail page). Single source of truth for
+/// "which vendors ccteam knows how to probe".
+#[derive(Debug, Clone, Copy)]
+pub struct AgentProbeSpec {
+    pub vendor: &'static str,
+    pub bin_env: &'static str,
+    pub default_bin: &'static str,
+}
+
+/// The four vendor harnesses ccteam probes for. Extend here to add one.
+pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
+    AgentProbeSpec {
+        vendor: "claude",
+        bin_env: ccteam_harness::CLAUDE_BIN_ENV,
+        default_bin: "claude",
+    },
+    AgentProbeSpec {
+        vendor: "codex",
+        bin_env: ccteam_harness::CODEX_BIN_ENV,
+        default_bin: "codex",
+    },
+    AgentProbeSpec {
+        vendor: "grok",
+        bin_env: ccteam_harness::GROK_BIN_ENV,
+        default_bin: "grok",
+    },
+    AgentProbeSpec {
+        vendor: "opencode",
+        bin_env: ccteam_harness::OPENCODE_BIN_ENV,
+        default_bin: "opencode",
+    },
+];
+
+/// Resolve + run `<bin> --version`; any spawn error (binary not on PATH)
+/// folds to not-installed. The single shellout impl — both the web
+/// host-detail probe (cached) and the satellite heartbeat loop (uncached,
+/// one-shot per beat) reduce to this.
+pub fn probe_bin_version(bin: &str) -> (bool, Option<String>) {
+    match std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            (true, version)
+        }
+        _ => (false, None),
+    }
+}
+
+/// Probe every [`AGENT_PROBE_SPECS`] vendor on THIS machine and fold to the
+/// wire [`HostAgentReport`] shape. Blocking (shells out per vendor) — call
+/// via `spawn_blocking` from an async context (the satellite heartbeat
+/// loop does). `status` is `ready` / `not_installed`: a satellite has no
+/// MCP-registration concept (that is the `local`-only web host page's
+/// concern), so it never reports `needs_config`.
+pub fn probe_agents() -> Vec<HostAgentReport> {
+    AGENT_PROBE_SPECS
+        .iter()
+        .map(|spec| {
+            let bin = std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string());
+            let (installed, version) = probe_bin_version(&bin);
+            HostAgentReport {
+                vendor: spec.vendor.to_string(),
+                installed,
+                version,
+                status: if installed { "ready" } else { "not_installed" }.to_string(),
+            }
+        })
+        .collect()
+}
+
 /// One registered satellite (never `"local"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostRecord {
@@ -61,8 +153,24 @@ pub struct HostRecord {
     /// Agent matrix last reported by the satellite.
     #[serde(default)]
     pub agents: Vec<HostAgentReport>,
+    /// v0.9.0 W3 (G9) — projects the satellite has registered locally
+    /// (its own `~/.ccteam/config.yaml::projects[]`), last reported at
+    /// heartbeat. Empty until the first heartbeat with a non-`None`
+    /// `projects` field lands.
+    #[serde(default)]
+    pub projects: Vec<HostProjectReport>,
     /// RFC3339 join time.
     pub joined_at: String,
+}
+
+impl HostRecord {
+    /// Whether `slug` is registered as a project on this host (per its last
+    /// heartbeat report). Used by the remote-spawn gate (G9/G10): an
+    /// online-but-unregistered slug must fail readable, never silently
+    /// spawn/rebuild on the main daemon.
+    pub fn has_project(&self, slug: &str) -> bool {
+        self.projects.iter().any(|p| p.slug == slug)
+    }
 }
 
 impl HostRecord {
@@ -107,11 +215,24 @@ impl HostRegistry {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create host registry dir {}", parent.display()))?;
+            // v0.9.0 W3 (G13) — the registry holds every satellite's
+            // long-lived agent_token; harden the directory like
+            // `JoinTokenStore` does.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
         let body = serde_json::to_string_pretty(self).context("serialize host registry")?;
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, body.as_bytes())
             .with_context(|| format!("write host registry tmp {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
         fs::rename(&tmp, path)
             .with_context(|| format!("rename host registry into place {}", path.display()))?;
         Ok(())
@@ -292,6 +413,12 @@ pub struct HostHeartbeatRequest {
     pub agent_url: Option<String>,
     #[serde(default)]
     pub ccteam_version: Option<String>,
+    /// v0.9.0 W3 (G9) — the satellite's own registered projects
+    /// (`[{slug, path}]`). `None` leaves the last-known list untouched
+    /// (an older satellite binary that doesn't send this field); `Some`
+    /// (including `Some(vec![])`) replaces it.
+    #[serde(default)]
+    pub projects: Option<Vec<HostProjectReport>>,
 }
 
 /// Apply a join request against the registry + token store. Caller persists both.
@@ -322,6 +449,7 @@ pub fn apply_join(
         agent_token: agent_token.clone(),
         last_heartbeat_unix: now,
         agents: req.agents.clone(),
+        projects: vec![],
         joined_at: chrono_now_rfc3339(),
     };
     reg.upsert(record);
@@ -352,6 +480,9 @@ pub fn apply_heartbeat(
     host.last_heartbeat_unix = now_unix();
     if let Some(agents) = &req.agents {
         host.agents = agents.clone();
+    }
+    if let Some(projects) = &req.projects {
+        host.projects = projects.clone();
     }
     if let Some(url) = &req.agent_url {
         host.agent_url = if url.is_empty() {
@@ -399,6 +530,32 @@ pub fn gate_remote_spawn(
             "host `{host}` is offline (last heartbeat {}s ago; ttl {ttl_secs}s); \
              session was not created",
             now_unix().saturating_sub(rec.last_heartbeat_unix)
+        );
+    }
+    Ok(())
+}
+
+/// v0.9.0 W3 (G9) — gate a remote spawn/rebuild against the satellite's
+/// OWN registered project set (last reported at heartbeat). `local` /
+/// empty host always passes (nothing to check). An online, registered
+/// host that has never reported `slug` in its `projects` list fails
+/// readable — the session must not be created/rebuilt.
+///
+/// Callers run [`gate_remote_spawn`] first (offline / terminal / unknown
+/// host) and only reach here once that has already passed.
+pub fn gate_remote_spawn_project(reg: &HostRegistry, host: &str, slug: &str) -> Result<()> {
+    let host = if host.is_empty() { LOCAL_HOST } else { host };
+    if host == LOCAL_HOST {
+        return Ok(());
+    }
+    let Some(rec) = reg.get(host) else {
+        bail!("unknown host: {host}");
+    };
+    if !rec.has_project(slug) {
+        bail!(
+            "project `{slug}` is not registered on host `{host}`; run `ccteam init` \
+             for it there (or open it in that satellite's `~/.ccteam/config.yaml`) \
+             and wait for the next heartbeat, then retry"
         );
     }
     Ok(())
@@ -565,6 +722,7 @@ mod tests {
                 agents: None,
                 agent_url: None,
                 ccteam_version: Some("0.8.24-next".into()),
+                projects: None,
             },
         )
         .unwrap();
@@ -585,6 +743,7 @@ mod tests {
             agent_token: "abc".into(),
             last_heartbeat_unix: now_unix().saturating_sub(10_000),
             agents: vec![],
+            projects: vec![],
             joined_at: chrono_now_rfc3339(),
         });
         let err = gate_remote_spawn(&reg, "dead", false, DEFAULT_HEARTBEAT_TTL_SECS).unwrap_err();
@@ -609,6 +768,7 @@ mod tests {
             agent_token: "t".into(),
             last_heartbeat_unix: now_unix(),
             agents: vec![],
+            projects: vec![],
             joined_at: chrono_now_rfc3339(),
         });
         let err = gate_remote_spawn(&reg, "sat", true, DEFAULT_HEARTBEAT_TTL_SECS).unwrap_err();
@@ -626,5 +786,125 @@ mod tests {
     fn normalize_host_id_slugifies() {
         assert_eq!(normalize_host_id("Lab.Mac.local").unwrap(), "lab-mac-local");
         assert!(normalize_host_id("local").is_err());
+    }
+
+    fn sat_with_projects(projects: Vec<HostProjectReport>) -> HostRegistry {
+        let mut reg = HostRegistry::default();
+        reg.upsert(HostRecord {
+            id: "sat".into(),
+            hostname: "sat".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ccteam_version: "0.9.0".into(),
+            agent_url: Some("http://127.0.0.1:7332".into()),
+            agent_token: "t".into(),
+            last_heartbeat_unix: now_unix(),
+            agents: vec![],
+            projects,
+            joined_at: chrono_now_rfc3339(),
+        });
+        reg
+    }
+
+    #[test]
+    fn gate_remote_spawn_project_passes_for_registered_slug() {
+        let reg = sat_with_projects(vec![HostProjectReport {
+            slug: "demo".into(),
+            path: "/home/sat/projects/demo".into(),
+        }]);
+        gate_remote_spawn_project(&reg, "sat", "demo").unwrap();
+    }
+
+    #[test]
+    fn gate_remote_spawn_project_rejects_unregistered_slug() {
+        let reg = sat_with_projects(vec![HostProjectReport {
+            slug: "other".into(),
+            path: "/home/sat/projects/other".into(),
+        }]);
+        let err = gate_remote_spawn_project(&reg, "sat", "demo").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not registered"), "got: {msg}");
+        assert!(msg.contains("ccteam init"), "got: {msg}");
+    }
+
+    #[test]
+    fn gate_remote_spawn_project_local_always_passes() {
+        let reg = HostRegistry::default();
+        gate_remote_spawn_project(&reg, "local", "anything").unwrap();
+        gate_remote_spawn_project(&reg, "", "anything").unwrap();
+    }
+
+    #[test]
+    fn heartbeat_merges_projects_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let reg_path = registry_path_in(tmp.path());
+        let mut reg = sat_with_projects(vec![]);
+        reg.save(&reg_path).unwrap();
+
+        let updated = apply_heartbeat(
+            &mut reg,
+            "sat",
+            "t",
+            &HostHeartbeatRequest {
+                agent_token: Some("t".into()),
+                agents: None,
+                agent_url: None,
+                ccteam_version: None,
+                projects: Some(vec![HostProjectReport {
+                    slug: "demo".into(),
+                    path: "/home/sat/projects/demo".into(),
+                }]),
+            },
+        )
+        .unwrap();
+        assert!(updated.has_project("demo"));
+
+        // `projects: None` on a later heartbeat must NOT wipe the list.
+        let updated2 = apply_heartbeat(
+            &mut reg,
+            "sat",
+            "t",
+            &HostHeartbeatRequest {
+                agent_token: Some("t".into()),
+                agents: None,
+                agent_url: None,
+                ccteam_version: None,
+                projects: None,
+            },
+        )
+        .unwrap();
+        assert!(updated2.has_project("demo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_save_hardens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let reg_path = registry_path_in(tmp.path());
+        let reg = sat_with_projects(vec![]);
+        reg.save(&reg_path).unwrap();
+        let file_mode = fs::metadata(&reg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "registry.json must be 0600");
+        let dir_mode = fs::metadata(reg_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "state/hosts/ dir must be 0700");
+    }
+
+    #[test]
+    fn probe_bin_version_missing_binary_is_not_installed() {
+        // No env mutation (CLAUDE.md §六 pitfall) — probe a path directly.
+        let (installed, version) = probe_bin_version("/nonexistent/ccteam-fake-zzz");
+        assert!(!installed);
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn agent_probe_specs_covers_four_vendors() {
+        let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
     }
 }

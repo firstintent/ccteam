@@ -854,6 +854,14 @@ struct MetaRebuildPlan {
     secret: String,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// v0.9.0 W3 (G10) — snapshot of `Gateway::project_paths`/`remote_host_proxy`
+    /// (cheap clones, taken sync under the lock) so [`Gateway::spawn_for_plan`]
+    /// — self-less, runs OUTSIDE the lock in the batch-restore path — can
+    /// re-gate a non-local `host` right before the slow spawn: online +
+    /// registered → `SpawnCtx::remote` is populated; offline/unregistered →
+    /// readable `Err`, and the caller must NOT fall back to a local respawn.
+    ccteam_root: Option<PathBuf>,
+    remote_proxy: Option<Arc<dyn crate::remote_host::RemoteHostProxy>>,
 }
 
 /// v0.8.x (concurrency review §4.1 P1) — the sync-computed inputs needed to
@@ -902,6 +910,14 @@ struct NewSessionPlan {
     /// v0.9.0 W2 (F2) — explicit session title from `session_spawn` (ledger /
     /// display). `None` → auto-titled from the first message. Never a prompt.
     title: Option<String>,
+    /// v0.9.0 W3 (F3) — the exec-bridge target when `host != local`, already
+    /// resolved (+ gated) by the caller's `prepare_host_for_spawn` await
+    /// BEFORE `plan_new_session` mints the sid (a fresh spawn must never
+    /// burn an sid on a host that turns out offline). `None` for every
+    /// caller that hardcodes `host = "local"` (the implicit first-message
+    /// spawn, bot templates, `/compare` — see their `plan_new_session`
+    /// call sites). Threaded verbatim into `SpawnCtx::remote`.
+    remote: Option<ccteam_harness::RemoteExecTarget>,
 }
 
 /// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
@@ -915,6 +931,9 @@ struct ResumeDeadPlan {
     role: String,
     vendor: AgentVendor,
     protocol: SessionProtocol,
+    /// v0.9.0 W3 (G10) — the session's host (from the live `GatewaySession`,
+    /// which mirrors `meta.host`); `"local"` for the overwhelming majority.
+    host: String,
     permission_mode: PermissionMode,
     secret: String,
     cwd: PathBuf,
@@ -924,6 +943,10 @@ struct ResumeDeadPlan {
     /// was live when we planned. Apply aborts if the map's thread no longer
     /// matches (someone else resumed/replaced) or the sid is gone (stop).
     generation: String,
+    /// v0.9.0 W3 (G10) — see `MetaRebuildPlan::ccteam_root` / `remote_proxy`;
+    /// same re-gate contract, performed by `spawn_for_resume_plan`.
+    ccteam_root: Option<PathBuf>,
+    remote_proxy: Option<Arc<dyn crate::remote_host::RemoteHostProxy>>,
 }
 
 /// What [`Gateway::plan_ensure_current_session`] decided: either the chat
@@ -1386,13 +1409,31 @@ impl Gateway {
             secret: ccteam_core::session_secret::mint(),
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
+            ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
+            remote_proxy: self.remote_host_proxy.clone(),
         }
     }
 
     /// Cold-start the planned thread via the resume ladder (deterministic vendor
     /// uuid → `--resume`, so the Anthropic conversation resumes from transcript).
     /// The SLOW await — the batch-restore path runs this OUTSIDE the gateway lock.
+    ///
+    /// v0.9.0 W3 (G10, safety-critical) — a non-local `plan.host` is
+    /// RE-GATED here, right before the spawn: online + registered on that
+    /// satellite → `SpawnCtx::remote` carries the exec-bridge target;
+    /// offline / unregistered / unknown → `Err`, and the caller (every
+    /// rebuild path funnels through this one function) must leave the
+    /// session stopped — NEVER silently respawn it locally.
     async fn spawn_for_plan(plan: &MetaRebuildPlan) -> Result<ThreadHandle, HarnessError> {
+        let remote = crate::remote_host::regate_remote_host(
+            plan.ccteam_root.as_deref(),
+            &plan.host,
+            &plan.slug,
+            plan.protocol,
+            plan.remote_proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
         plan.adapter
             .start_thread(
                 &AgentSpecBrief {
@@ -1408,6 +1449,7 @@ impl Gateway {
                     effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
+                    remote,
                 },
             )
             .await
@@ -2604,10 +2646,13 @@ impl Gateway {
     ) -> Result<StartOutcome> {
         // v0.8.24 Track D — remote-host gate BEFORE minting a sid: offline /
         // terminal-on-remote / unknown host all fail without creating a
-        // session (red line: never kill / never half-create).
-        let host = crate::remote_host::prepare_host_for_spawn(
+        // session (red line: never kill / never half-create). v0.9.0 W3
+        // (G9) additionally gates on the satellite having `project`
+        // registered, and returns the exec-bridge target for an online host.
+        let host_target = crate::remote_host::prepare_host_for_spawn(
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
+            &project,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -2621,7 +2666,7 @@ impl Gateway {
         // `Gateway::handle_message_shared` is the one caller that instead
         // drops the gateway lock between `plan_new_session` and
         // `spawn_for_new_session_plan`.
-        let plan = self.plan_new_session(
+        let mut plan = self.plan_new_session(
             owner,
             project,
             vendor,
@@ -2629,9 +2674,10 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
-            host,
+            host_target.host,
             tuning,
         )?;
+        plan.remote = host_target.remote;
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
         let outcome = self.apply_new_session(plan, thread)?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
@@ -2736,6 +2782,7 @@ impl Gateway {
             spawned_by_role: None,
             delegation_depth: 0,
             title: None,
+            remote: None,
         })
     }
 
@@ -2789,6 +2836,7 @@ impl Gateway {
                     effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
+                    remote: plan.remote.clone(),
                 },
             )
             .await
@@ -2823,6 +2871,7 @@ impl Gateway {
             spawned_by_role,
             delegation_depth,
             title: spawn_title,
+            remote: _,
         } = plan;
         // Capture before the session insert moves these.
         let meta_vendor_uuid = thread
@@ -3071,6 +3120,7 @@ impl Gateway {
                 model_id.clone(),
                 permission_mode,
                 secret.clone(),
+                &host,
             )
             .await?;
         // Replace the record in place: same sid, new role/handle/thread, fresh
@@ -4142,6 +4192,7 @@ impl Gateway {
         let role = s.role.clone();
         let vendor = s.vendor;
         let protocol = s.protocol;
+        let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
         let generation = format!("{}@{}", s.thread.identity, s.thread.started_at);
@@ -4164,12 +4215,15 @@ impl Gateway {
             role,
             vendor,
             protocol,
+            host,
             permission_mode,
             secret,
             cwd,
             model_id,
             adapter,
             generation,
+            ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
+            remote_proxy: self.remote_host_proxy.clone(),
         }))
     }
 
@@ -4177,6 +4231,17 @@ impl Gateway {
     /// can run it with NO gateway lock held — same SpawnCtx assembly as the
     /// resume path of [`Self::spawn_session_thread`].
     async fn spawn_for_resume_plan(plan: &ResumeDeadPlan) -> Result<ThreadHandle, HarnessError> {
+        // v0.9.0 W3 (G10) — re-gate a non-local host right before the spawn;
+        // see `spawn_for_plan`'s doc for the full contract.
+        let remote = crate::remote_host::regate_remote_host(
+            plan.ccteam_root.as_deref(),
+            &plan.host,
+            &plan.project,
+            plan.protocol,
+            plan.remote_proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
         plan.adapter
             .start_thread(
                 &AgentSpecBrief {
@@ -4192,6 +4257,7 @@ impl Gateway {
                     effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
+                    remote,
                 },
             )
             .await
@@ -4213,12 +4279,15 @@ impl Gateway {
             role,
             vendor,
             protocol,
+            host: _,
             permission_mode: _,
             secret: _,
             cwd: _,
             model_id: _,
             adapter,
             generation,
+            ccteam_root: _,
+            remote_proxy: _,
         } = plan;
         let still_matches = self.sessions.get(&session_id).is_some_and(|s| {
             format!("{}@{}", s.thread.identity, s.thread.started_at) == generation
@@ -4275,6 +4344,7 @@ impl Gateway {
     /// fields can't drift between them. Returns the bound adapter + handle; the
     /// caller records them (insert a fresh [`GatewaySession`], or swap in place).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_session_thread(
         &self,
         vendor: AgentVendor,
@@ -4286,7 +4356,21 @@ impl Gateway {
         model_id: Option<String>,
         permission_mode: PermissionMode,
         secret: String,
+        host: &str,
     ) -> Result<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle), HarnessError> {
+        // v0.9.0 W3 (G10) — a `/role` switch re-spawns the SAME sid on the
+        // SAME host; re-gate a non-local host here too (same contract as
+        // `spawn_for_plan`/`spawn_for_resume_plan` — this is, in effect, a
+        // third rebuild path).
+        let remote = crate::remote_host::regate_remote_host(
+            self.project_paths.as_ref().map(|p| p.root.as_path()),
+            host,
+            slug,
+            protocol,
+            self.remote_host_proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
         let adapter = (self.adapter_factory)(vendor, protocol);
         let thread = adapter
             .start_thread(
@@ -4306,6 +4390,7 @@ impl Gateway {
                     effort: None,
                     permission_mode,
                     secret,
+                    remote,
                 },
             )
             .await?;
@@ -6247,13 +6332,15 @@ impl Gateway {
         };
 
         // ---- spawn (mirrors start_session: gate host → plan → spawn → apply) ----
-        let host = crate::remote_host::prepare_host_for_spawn(
+        let host_target = crate::remote_host::prepare_host_for_spawn(
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
+            &project,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
         .await?;
+        let host = host_target.host.clone();
         let owner = ChatKey::new("web", &owner_id, &owner_id);
         let handle = role.clone();
         let mut plan = self.plan_new_session(
@@ -6267,6 +6354,7 @@ impl Gateway {
             host.clone(),
             tuning,
         )?;
+        plan.remote = host_target.remote;
         plan.trigger_override = Some("session_spawn".into());
         plan.parent_sid = parent_sid.clone();
         plan.spawned_by_role = spawned_by_role;
@@ -8990,6 +9078,12 @@ mod tests {
             agent_token: "t".into(),
             last_heartbeat_unix: now_unix(),
             agents: vec![],
+            // v0.9.0 W3 (G9) — the satellite must report `alpha` registered
+            // (last heartbeat) before a remote spawn there is allowed.
+            projects: vec![ccteam_core::HostProjectReport {
+                slug: "alpha".into(),
+                path: project_dir.display().to_string(),
+            }],
             joined_at: chrono::Utc::now().to_rfc3339(),
         });
         reg.save(&ccteam_core::host_registry::registry_path_in(&ccteam_root))
@@ -9056,6 +9150,109 @@ mod tests {
         assert_eq!(
             fake.submissions.lock().await.last().map(|p| p.1.as_str()),
             Some("after-resume")
+        );
+    }
+
+    /// v0.9.0 W3 (G10, safety-critical) — a session whose host has gone
+    /// OFFLINE since it was created must NEVER be silently respawned on
+    /// the main daemon: every rebuild path re-gates the host right before
+    /// its spawn and fails readable instead. Covers BOTH funnels: the
+    /// cold-start trio (`plan_session_rebuild` → `spawn_for_plan`, shared
+    /// by `rebuild_session_from_meta` / `resume_restored_sessions[_shared]`)
+    /// and dead-child resume (`plan_resume_dead_session` →
+    /// `spawn_for_resume_plan`). In both cases the local `FakeAdapter` must
+    /// NEVER be invoked again once offline (`starts` stays pinned at 1).
+    #[tokio::test]
+    async fn remote_session_never_respawns_locally_when_host_offline() {
+        use ccteam_core::host_registry::{now_unix, HostRecord, HostRegistry};
+        use ccteam_core::CcteamPaths;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ccteam_root = tmp.path().join(".ccteam");
+        let project_dir = tmp.path().join("projects/alpha");
+        std::fs::create_dir_all(&ccteam_root).unwrap();
+        std::fs::create_dir_all(ccteam_root.join("hosts")).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let paths = CcteamPaths {
+            root: ccteam_root.clone(),
+            projects_root: tmp.path().join("projects"),
+        };
+        let reg_path = ccteam_core::host_registry::registry_path_in(&ccteam_root);
+
+        let mut reg = HostRegistry::default();
+        reg.upsert(HostRecord {
+            id: "sat-lab".into(),
+            hostname: "sat-lab".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ccteam_version: "0.9.0".into(),
+            agent_url: Some("http://127.0.0.1:9".into()),
+            agent_token: "t".into(),
+            last_heartbeat_unix: now_unix(),
+            agents: vec![],
+            projects: vec![ccteam_core::HostProjectReport {
+                slug: "alpha".into(),
+                path: project_dir.display().to_string(),
+            }],
+            joined_at: chrono::Utc::now().to_rfc3339(),
+        });
+        reg.save(&reg_path).unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let proxy = Arc::new(crate::remote_host::FakeRemoteHostProxy::default());
+        gateway.set_remote_host_proxy(proxy.clone());
+
+        let outcome = gateway
+            .create_session_api_on_host(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                "sat-lab".into(),
+                SpawnTuning::default(),
+            )
+            .await
+            .expect("online create");
+        let sid = outcome.sid.clone();
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // Satellite goes offline (crashed / lost network / never sent
+        // another heartbeat within the TTL).
+        let mut reg2 = HostRegistry::load(&reg_path).unwrap();
+        reg2.get_mut("sat-lab").unwrap().last_heartbeat_unix = now_unix().saturating_sub(10_000);
+        reg2.save(&reg_path).unwrap();
+
+        // Path A: cold-start rebuild.
+        let (slug, cwd, meta) = gateway.find_meta_for_sid(&sid).unwrap();
+        assert_eq!(meta.host, "sat-lab");
+        let reply_to = ChatKey::new("web", "web-api", "web-api");
+        let plan = gateway.plan_session_rebuild(&slug, cwd.clone(), &meta, &reply_to);
+        let err = Gateway::spawn_for_plan(&plan).await.unwrap_err();
+        assert!(err.to_string().contains("offline"), "got: {err}");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "cold-start rebuild must NOT spawn the adapter locally when offline"
+        );
+
+        // Path B: dead-child resume.
+        fake.live.store(false, Ordering::SeqCst);
+        let resume_plan = gateway
+            .plan_resume_dead_session(&sid)
+            .unwrap()
+            .expect("session is dead -> plan expected");
+        let err2 = Gateway::spawn_for_resume_plan(&resume_plan)
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("offline"), "got: {err2}");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            1,
+            "dead-child resume must NOT spawn the adapter locally when offline"
         );
     }
 

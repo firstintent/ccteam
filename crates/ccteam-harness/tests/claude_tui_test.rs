@@ -65,6 +65,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -113,6 +114,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -176,6 +178,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)
@@ -459,6 +462,7 @@ async fn claude_directive_bare_model_passes_through_to_native_picker() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     };
     let handle = ClaudeTuiAdapter::new()
         .start_thread(&brief, &ctx)

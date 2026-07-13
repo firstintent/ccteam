@@ -48,6 +48,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 

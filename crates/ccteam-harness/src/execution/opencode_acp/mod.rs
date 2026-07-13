@@ -314,6 +314,15 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // v0.9.0 W3 (F3) — remote execution is claude-only in this version;
+        // see `codex_app_server.rs`'s identical guard for the rationale.
+        if ctx.remote.is_some() {
+            return Err(HarnessError::NotImplemented {
+                reason: "remote execution (host != local) is not yet supported for opencode; \
+                         use host=local"
+                    .to_string(),
+            });
+        }
         // MVP roleless: ignore role (no persona injection).
         let bin = opencode_bin();
         let argv = build_argv(&bin, &OpencodeSpawnInput::default());

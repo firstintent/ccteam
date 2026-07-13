@@ -192,6 +192,7 @@ fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 

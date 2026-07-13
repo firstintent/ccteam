@@ -63,6 +63,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 
@@ -317,6 +318,7 @@ async fn session_new_and_load_carry_mcp_servers() {
         effort: None,
         permission_mode: PermissionMode::Skip,
         secret: "seKret1234".into(),
+        remote: None,
     };
 
     // Phase A — fresh session/new (no prior meta).
@@ -393,4 +395,29 @@ async fn session_new_and_load_carry_mcp_servers() {
         None => unsafe { std::env::remove_var("CCTEAM_ACP_MCP_DUMP") },
     }
     clear_fake();
+}
+
+/// v0.9.0 W3 (F3) — remote execution is claude-only this version; grok must
+/// fail clean + readable rather than silently spawning locally under a
+/// remote host id. No fake binary needed — the guard runs before spawn.
+#[tokio::test(flavor = "current_thread")]
+async fn start_thread_rejects_remote_ctx_readable() {
+    let tmp = TempDir::new().unwrap();
+    let mut ctx = spawn_ctx(&tmp, "s-remote");
+    ctx.remote = Some(ccteam_harness::RemoteExecTarget {
+        exec_ws_url: "ws://127.0.0.1:1/ws/exec".into(),
+        agent_token: "tok".into(),
+    });
+    let adapter = GrokAcpAdapter::new();
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("remote grok must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("not yet supported for grok"), "got: {msg}");
 }

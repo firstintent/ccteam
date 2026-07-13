@@ -35,6 +35,13 @@ tracing = { workspace = true }
 
 libc = "0.2"
 
+# v0.9.0 W3 — `ccteam-exec.v1` client (`execution::remote_exec::connect`):
+# the main daemon dials a satellite's `GET /ws/exec`. Same version pin as
+# ccteam-cli/ccteam-web/ccteam-im (`connect` + `handshake` features). Header
+# building uses `tokio_tungstenite::tungstenite::http` (re-exported) — no
+# separate `http` dependency needed.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
 # v0.8.9 — `capture(with_ansi=false)` renders the raw byte backlog
 # through a vt100 state machine to plain text (consuming mouse / alt-screen
 # / color / cursor sequences) so `peek` never leaks control codes to the
@@ -55,3 +62,6 @@ nix = { version = "0.29", default-features = false, features = ["fs"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 serial_test = "3"
+# v0.9.0 W3 — `remote_exec` unit test spins an in-process axum `GET /ws/echo`
+# to verify the WS↔AsyncRead/AsyncWrite bridge over a real loopback socket.
+axum = { workspace = true, features = ["ws"] }

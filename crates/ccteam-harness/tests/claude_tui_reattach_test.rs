@@ -63,6 +63,7 @@ fn make_ctx(slug: &str, sid: &str, role: &str, tmp: &tempfile::TempDir) -> Spawn
         effort: None,
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
+        remote: None,
     }
 }
 

@@ -471,6 +471,7 @@ version = "0.8.24"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "ccteam-cost",
  "chrono",
  "dirs",
@@ -490,6 +491,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tracing",
  "vt100",
 ]
