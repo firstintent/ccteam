@@ -29,6 +29,8 @@ export interface HostSummary {
   host: string;
   hostname: string;
   is_local: boolean;
+  /** `online` | `offline` (satellite heartbeat freshness; local always online). */
+  status?: string;
   agent_count: number;
   agents_ready: number;
 }
@@ -47,6 +49,10 @@ export interface HostDetail {
   arch: string;
   ccteam_version: string;
   agents: AgentHealth[];
+  /** Projects registered on THIS host (local: the daemon registry; satellite:
+   *  its own `~/.ccteam` registry as reported at heartbeat). A remote spawn
+   *  is only possible into a slug listed here. */
+  projects?: { slug: string; path: string }[];
 }
 
 /** `POST .../register-mcp` response. */

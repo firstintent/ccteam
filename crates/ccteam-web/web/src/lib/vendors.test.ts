@@ -78,7 +78,20 @@ describe("modelSwitchFor (lazy-create /model follow-up)", () => {
   });
 
   it("returns the model for a non-default pick", () => {
-    expect(modelSwitchFor({ vendor: "claude", model: "sonnet-5" })).toBe("sonnet-5");
+    expect(modelSwitchFor({ vendor: "claude", model: "sonnet" })).toBe("sonnet");
+  });
+
+  it("claude offers only CLI-documented --model aliases after the default", () => {
+    // Every non-default entry is wired verbatim to `claude --model` — the
+    // menu must never show a token the CLI rejects (old bug: "opus-4.8").
+    expect(vendorSpec("claude").models.slice(1)).toEqual(["fable", "opus", "sonnet", "haiku"]);
+  });
+
+  it("codex/grok/opencode offer only the honest vendor default", () => {
+    for (const vendor of ["codex", "grok", "opencode"] as const) {
+      expect(vendorSpec(vendor).models).toHaveLength(1);
+      expect(modelSwitchFor({ vendor, model: vendorSpec(vendor).models[0]! })).toBeNull();
+    }
   });
 
   it("never switches for opencode (self-selects its model)", () => {
@@ -124,12 +137,12 @@ describe("normalizeDraft", () => {
   it("repairs a cross-vendor model/protocol after a vendor switch", () => {
     const next = normalizeDraft({
       vendor: "codex",
-      model: "fable-5", // claude model — invalid for codex
+      model: "opus", // claude model — invalid for codex
       effortKey: "effMax",
       protocol: "terminal", // claude protocol — invalid for codex
       hitl: false,
     });
-    expect(next.model).toBe("gpt-5.2-codex");
+    expect(next.model).toBe(vendorSpec("codex").models[0]!);
     expect(next.protocol).toBe("app-server");
   });
 });

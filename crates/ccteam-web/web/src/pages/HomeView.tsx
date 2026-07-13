@@ -34,7 +34,8 @@ import {
   listProjectRoles,
   submitTurn,
 } from "../lib/sessionsApi";
-import { getHosts, type HostSummary } from "../lib/hostsApi";
+import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../lib/hostsApi";
+import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
 import { relativeTime } from "./railHelpers";
 
 /** One 最近会话 card (live or resumable history) the shell feeds in. */
@@ -158,6 +159,7 @@ export default function HomeView({
   const [rolesByProject, setRolesByProject] = useState<Record<string, string[]>>({});
   const roles = (project && !newProjectPath ? rolesByProject[project] : undefined) ?? [];
   const [hosts, setHosts] = useState<HostSummary[] | null>(null);
+  const [hostDetails, setHostDetails] = useState<Record<string, HostDetail | null>>({});
   const [host, setHost] = useState<string>("local");
   const [draft, setDraft] = useState<ComposerDraft>(() => loadModelDraft());
   const [pending, setPending] = useState(false);
@@ -188,12 +190,23 @@ export default function HomeView({
     };
   }, [project]);
 
-  // Hosts (admin data): tenants/errors gracefully HIDE the dimension.
+  // Hosts (admin data): tenants/errors gracefully HIDE the dimension. Details
+  // (per-host agent probe + registered projects) drive the project→host and
+  // host→vendor binding below; a failed detail marks the host not spawnable.
   useEffect(() => {
     let cancelled = false;
     getHosts()
-      .then((res) => {
-        if (!cancelled) setHosts(res.hosts);
+      .then(async (res) => {
+        if (cancelled) return;
+        setHosts(res.hosts);
+        const pairs = await Promise.all(
+          res.hosts.map((h) =>
+            getHostDetail(h.host)
+              .then((d) => [h.host, d] as const)
+              .catch(() => [h.host, null] as const),
+          ),
+        );
+        if (!cancelled) setHostDetails(Object.fromEntries(pairs));
       })
       .catch(() => {
         if (!cancelled) setHosts(null);
@@ -202,6 +215,26 @@ export default function HomeView({
       cancelled = true;
     };
   }, []);
+
+  // 项目绑定主机: only hosts that can actually run the current selection are
+  // offered. The EFFECTIVE host is derived (not state-synced): a project
+  // switch that invalidates the pick falls back to local instantly.
+  const spawnableHosts = hosts
+    ? eligibleHosts(hosts, hostDetails, project, newProjectPath !== null)
+    : null;
+  const effectiveHost =
+    !spawnableHosts || spawnableHosts.some((h) => h.host === host)
+      ? host
+      : (spawnableHosts.find((h) => h.is_local)?.host ?? spawnableHosts[0]?.host ?? "local");
+
+  // 主机绑定 vendor: the composer only offers harnesses installed on the
+  // effective host (null = unknown → don't filter); a pick the host can't
+  // run is normalized to the host's first installed vendor, derived too.
+  const hostVendors = allowedVendorsFor(hostDetails[effectiveHost]);
+  const effectiveDraft =
+    hostVendors && !hostVendors.includes(draft.vendor)
+      ? normalizeDraft({ ...draft, vendor: hostVendors[0]! })
+      : draft;
 
   const openNewProject = () => {
     setNewProjOpen(true);
@@ -247,12 +280,12 @@ export default function HomeView({
       // control turn.
       const { sid, model_warning: warning } = await apiCreateSession(slug, {
         role,
-        vendor: draft.vendor,
-        permission_mode: draft.hitl ? "hitl" : "skip",
-        protocol: wireProtocol(draft),
-        host,
-        model: modelSwitchFor(draft) ?? undefined,
-        effort: wireEffort(draft) ?? undefined,
+        vendor: effectiveDraft.vendor,
+        permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
+        protocol: wireProtocol(effectiveDraft),
+        host: effectiveHost,
+        model: modelSwitchFor(effectiveDraft) ?? undefined,
+        effort: wireEffort(effectiveDraft) ?? undefined,
       });
       if (warning) toastBus.handler?.info(warning);
       await submitTurn(sid, text);
@@ -280,7 +313,7 @@ export default function HomeView({
     project || t("newProject")
   );
 
-  const pickedHost = hosts?.find((x) => x.host === host);
+  const pickedHost = hosts?.find((x) => x.host === effectiveHost);
   const hostLabel = !pickedHost
     ? `local · ${t("localTag")}`
     : pickedHost.is_local
@@ -338,15 +371,18 @@ export default function HomeView({
               )}
             </CtxSelect>
 
-            {hosts && hosts.length > 0 ? (
+            {/* 主机 — bound by the project: only hosts that have this slug
+                (and ≥1 installed harness) are offered. With a single
+                spawnable host the dimension is read-only (项目绑定主机). */}
+            {spawnableHosts && spawnableHosts.length > 1 ? (
               <CtxSelect icon={<Globe />} value={hostLabel} title={t("host")} testId="ctx-host">
                 {(close) => (
                   <>
-                    {hosts.map((h) => (
+                    {spawnableHosts.map((h) => (
                       <button
                         key={h.host}
                         type="button"
-                        className={`sel-item ${host === h.host ? "selected" : ""}`}
+                        className={`sel-item ${effectiveHost === h.host ? "selected" : ""}`}
                         onClick={() => {
                           setHost(h.host);
                           close();
@@ -372,6 +408,11 @@ export default function HomeView({
                   </>
                 )}
               </CtxSelect>
+            ) : hosts && hosts.length > 0 ? (
+              <span className="ctx-btn" data-testid="ctx-host" title={t("host")} style={{ cursor: "default" }}>
+                <Globe />
+                <span className="v">{hostLabel}</span>
+              </span>
             ) : null}
 
             {/* v0.8.24 Q7 — 分支 dimension: READ-ONLY display of the project's
@@ -454,8 +495,9 @@ export default function HomeView({
             placeholderKey="inputPh"
             disabled={pending}
             isAdmin={isAdmin}
-            draft={draft}
+            draft={effectiveDraft}
             onDraftChange={setDraft}
+            allowedVendors={hostVendors ?? undefined}
             onSend={launch}
             sendTestId="home-send"
             topSlot={

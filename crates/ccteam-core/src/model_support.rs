@@ -14,6 +14,7 @@ pub fn is_claude_family(model: &str) -> bool {
     let base = trimmed.split_once('[').map_or(trimmed, |(head, _)| head);
     let lower = base.to_ascii_lowercase();
     lower.starts_with("claude-")
+        || lower.starts_with("fable")
         || lower.starts_with("sonnet")
         || lower.starts_with("opus")
         || lower.starts_with("haiku")
@@ -26,6 +27,7 @@ mod tests {
     #[test]
     fn claude_family_accepts_aliases_and_future_claude_ids() {
         for model in [
+            "fable",
             "sonnet",
             "opus",
             "haiku",

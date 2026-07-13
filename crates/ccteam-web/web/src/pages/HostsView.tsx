@@ -20,6 +20,7 @@ import {
   type HostSummary,
   type JoinTokenInfo,
 } from "../lib/hostsApi";
+import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
 
@@ -224,8 +225,14 @@ export function JoinCard({ lang = "zh" }: { lang?: Lang } = {}) {
   const origin =
     typeof window !== "undefined" && window.location ? window.location.origin : "https://<daemon>";
   const token = info?.token ?? null;
+  // Full flow: install → join (registers identity) → serve (exec bridge +
+  // heartbeat — only heartbeats fill the agent report above; join alone shows
+  // an empty host). A machine already running `ccteam start` embeds serve
+  // in-process (dual-role) — the last line is only for daemon-less machines.
+  // advertise-url must be a LAN address this daemon can reach.
   const command = `curl -fsSL https://ccteam.dev/install.sh | sh
-ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
+ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}
+ccteam host serve --advertise-url http://<this-host-lan-ip>:7332  # daemon-less machines only`;
 
   const onMint = async () => {
     setBusy(true);
@@ -242,12 +249,14 @@ ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
   };
 
   const onCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(command);
+    setError(null);
+    // copyText falls back to execCommand — the daemon is usually plain http://
+    // on a remote IP, where `navigator.clipboard` is undefined.
+    if (await copyText(command)) {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* clipboard unavailable — the <pre> stays selectable */
+    } else {
+      setError(t("joinTokenCopyFailed"));
     }
   };
 

@@ -1451,6 +1451,10 @@ async fn host_join(
         self_path.display()
     );
     println!("heartbeat_ttl_secs={}", join.heartbeat_ttl_secs);
+    println!(
+        "a running `ccteam start` daemon on this machine picks the join up within 30s \
+         (dual-role); on a machine without a daemon, run `ccteam host serve`"
+    );
     Ok(())
 }
 
@@ -1588,7 +1592,7 @@ async fn host_serve(
     let hb_paths = paths.clone();
     let hb_me = me.clone();
     let heartbeat_task = tokio::spawn(async move {
-        host_heartbeat_loop(hb_paths, hb_me, advertise).await;
+        host_heartbeat_loop(hb_paths, hb_me, Some(advertise)).await;
     });
 
     axum::serve(listener, router)
@@ -1606,7 +1610,7 @@ async fn host_serve(
 async fn host_heartbeat_loop(
     paths: CcteamPaths,
     me: ccteam_core::SatelliteSelf,
-    advertise_url: String,
+    advertise_url: Option<String>,
 ) {
     let ttl_secs = me.heartbeat_ttl_secs.max(3);
     let base_period = std::time::Duration::from_secs((ttl_secs / 3).max(1));
@@ -1620,7 +1624,7 @@ async fn host_heartbeat_loop(
             base_period.saturating_mul(mult).min(max_backoff)
         };
         tokio::time::sleep(jittered(sleep_for)).await;
-        match send_heartbeat(&paths, &me, Some(&advertise_url)).await {
+        match send_heartbeat(&paths, &me, advertise_url.as_deref()).await {
             Ok(_) => {
                 if consecutive_failures > 0 {
                     tracing::info!("ccteam host serve: heartbeat recovered");
@@ -1647,6 +1651,90 @@ fn jittered(period: std::time::Duration) -> std::time::Duration {
     let delta_ms = (period.as_millis() as i64 * frac) / 10_000;
     let total_ms = (period.as_millis() as i64 + delta_ms).max(100);
     std::time::Duration::from_millis(total_ms as u64)
+}
+
+/// v0.9.0 dual-role daemon — when this machine has ALSO joined another daemon
+/// as a satellite (`ccteam host join` → `state/hosts/self.json`), the
+/// resident `ccteam start` process embeds the `ccteam-exec.v1` bridge + the
+/// heartbeat loop in-process: one daemon is simultaneously a main daemon and
+/// a satellite. A dedicated `ccteam host serve` is only needed on machines
+/// that don't run a daemon at all.
+///
+/// - The credentials file is POLLED (30s), so a `host join` issued after the
+///   daemon started is picked up without a restart.
+/// - A bind conflict on the exec port (a standalone `ccteam host serve`
+///   already owns it) is non-fatal: heartbeats keep running so the host
+///   stays fresh in the remote registry, and exec is served by whichever
+///   process bound the port.
+/// - Advertise URL: `CCTEAM_EXEC_ADVERTISE_URL` env when set, else the
+///   heartbeat omits `agent_url` and the remote registry keeps the value
+///   from `host join --agent-url` (or a standalone serve run).
+async fn run_embedded_satellite(
+    paths: CcteamPaths,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    const RECHECK: Duration = Duration::from_secs(30);
+    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
+    let me = loop {
+        match ccteam_core::SatelliteSelf::load(&self_path) {
+            Ok(me) => break me,
+            Err(_) => {
+                // Not joined (yet) — keep watching for a later `host join`.
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(RECHECK) => {}
+                }
+            }
+        }
+    };
+    let bind = std::env::var("CCTEAM_EXEC_BIND").unwrap_or_else(|_| "0.0.0.0:7332".to_string());
+    let advertise = std::env::var("CCTEAM_EXEC_ADVERTISE_URL").ok();
+    tracing::info!(
+        host = %me.host,
+        daemon = %me.daemon_url,
+        %bind,
+        "dual-role daemon: embedding satellite exec bridge + heartbeat (joined via `ccteam host join`)"
+    );
+
+    let hb_paths = paths.clone();
+    let hb_me = me.clone();
+    let mut hb_shutdown = shutdown.clone();
+    let hb_advertise = advertise.clone();
+    let heartbeat = tokio::spawn(async move {
+        tokio::select! {
+            _ = hb_shutdown.changed() => {}
+            _ = host_heartbeat_loop(hb_paths, hb_me, hb_advertise) => {}
+        }
+    });
+
+    match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => {
+            let router = ccteam_web::satellite::satellite_router(
+                paths.clone(),
+                me.agent_token.clone(),
+                me.daemon_url.clone(),
+            );
+            let mut rx = shutdown.clone();
+            if let Err(err) = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.changed().await;
+                })
+                .await
+            {
+                tracing::warn!(error = %err, "embedded satellite exec bridge exited with error");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                %bind,
+                error = %err,
+                "embedded satellite: exec-bridge bind failed (standalone `ccteam host serve` running?); heartbeat continues"
+            );
+            let mut rx = shutdown.clone();
+            let _ = rx.changed().await;
+        }
+    }
+    heartbeat.abort();
 }
 
 fn host_ls(paths: &CcteamPaths) -> Result<()> {
@@ -2425,6 +2513,14 @@ fn run_start(
             .await
         });
 
+        // v0.9.0 dual-role daemon — if this machine is (or later becomes) a
+        // satellite of another daemon, serve the exec bridge + heartbeat from
+        // THIS process too (see `run_embedded_satellite`).
+        let satellite_handle = tokio::spawn(run_embedded_satellite(
+            hook_sink_paths.clone(),
+            shutdown_rx.clone(),
+        ));
+
             // V0.8 rmux W6 — flag-gated hook-sink listener (Option C).
             // ONLY when `CCTEAM_HOOK_VIA_DAEMON=1`: bind the ccteam-owned
             // `~/.ccteam/run/hook.sock`, consume each forwarded HookEvent,
@@ -2556,6 +2652,17 @@ fn run_start(
                         "W6 hook-sink drain timed out; aborting"
                     );
                 }
+            }
+        }
+        match tokio::time::timeout(TASK_DRAIN_TIMEOUT, satellite_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(je)) if je.is_cancelled() => {}
+            Ok(Err(je)) => tracing::warn!(?je, "embedded satellite task panicked"),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
+                    "embedded satellite drain timed out; aborting"
+                );
             }
         }
         signal_task.abort();

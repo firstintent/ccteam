@@ -20,6 +20,7 @@ import {
   visibleProtocols,
   VENDORS,
   type ComposerDraft,
+  type VendorId,
 } from "../lib/vendors";
 
 /** Pure decision for the composer's Enter keydown — the IME guard is
@@ -63,6 +64,7 @@ export function ChatComposer({
   onDraftChange,
   modelLabel,
   locked,
+  allowedVendors,
   isAdmin,
   topSlot,
   sendTestId = "composer-send",
@@ -86,6 +88,9 @@ export function ChatComposer({
   modelLabel?: string;
   /** Conversation: spawn parameters are fixed → picking toasts instead. */
   locked?: boolean;
+  /** Vendors installed on the target host (Home 主机绑定 vendor) — the menu
+   *  only offers these. Omit to offer the full registry. */
+  allowedVendors?: VendorId[];
   isAdmin: boolean;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
@@ -271,7 +276,10 @@ export function ChatComposer({
               <span className="eff">{t(draft.effortKey)}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
-              {VENDORS.map((v) => (
+              {(allowedVendors
+                ? VENDORS.filter((v) => allowedVendors.includes(v.id))
+                : VENDORS
+              ).map((v) => (
                 <div key={v.id}>
                   <div className="sel-group">{v.label}</div>
                   {v.models.map((m) => (

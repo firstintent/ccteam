@@ -30,11 +30,21 @@ export interface VendorSpec {
   protocols: ProtocolOption[];
 }
 
+/** The "vendor default" menu entry — wires nothing (the CLI picks its own
+ *  model). Every OTHER entry is sent verbatim to the vendor CLI, so the menu
+ *  must never show a name the CLI would reject: the old catalog offered
+ *  "fable-5"/"opus-4.8"/"grok-4" etc., which are neither valid aliases nor
+ *  full model ids — picking them errored (or warned) at spawn. */
+export const MODEL_DEFAULT = "默认";
+
 export const VENDORS: VendorSpec[] = [
   {
     id: "claude",
     label: "claude",
-    models: ["fable-5", "opus-4.8", "sonnet-5", "haiku-4.5"],
+    // Exactly the tokens `claude --model` documents: an alias for the latest
+    // model of each family ('fable', 'opus', 'sonnet', 'haiku'). Full ids
+    // (claude-fable-5) also work but the aliases track "latest" honestly.
+    models: [MODEL_DEFAULT, "fable", "opus", "sonnet", "haiku"],
     protocols: [
       { id: "stream-json", label: "stream-json", sub: "NDJSON", wire: "stream-json" },
       { id: "terminal", label: "terminal", sub: "tmux", wire: "terminal", adminOnly: true },
@@ -43,7 +53,9 @@ export const VENDORS: VendorSpec[] = [
   {
     id: "codex",
     label: "codex",
-    models: ["gpt-5.2-codex", "gpt-5.1"],
+    // codex `-m` takes a free-form model id we cannot enumerate from the CLI
+    // — offer only the honest default (codex's own configured model).
+    models: [MODEL_DEFAULT],
     protocols: [
       { id: "app-server", label: "app-server", sub: "JSON-RPC", wire: "stream-json" },
     ],
@@ -51,7 +63,8 @@ export const VENDORS: VendorSpec[] = [
   {
     id: "grok",
     label: "grok",
-    models: ["grok-4", "grok-code"],
+    // Same as codex: `-m` is free-form and undocumented — default only.
+    models: [MODEL_DEFAULT],
     protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
   {
@@ -59,7 +72,7 @@ export const VENDORS: VendorSpec[] = [
     label: "opencode",
     // OpenCode is provider-agnostic and picks its own initial model
     // (session/new carries no model) — offer only the honest default.
-    models: ["默认 (opencode 自选)"],
+    models: [MODEL_DEFAULT],
     protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
 ];

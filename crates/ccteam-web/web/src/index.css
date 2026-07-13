@@ -626,7 +626,11 @@ html.dark .dot.off { background: #4b4e57; }
   background: #0c0e10; border-radius: 10px;
   padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; color: #BCFF8C;
   overflow-x: auto;
+  user-select: text; -webkit-user-select: text; cursor: text;
 }
+/* The global ::selection (--ink at 14% alpha) is invisible on this dark block
+   in light theme — give the selection a highlight that reads on #0c0e10. */
+.join-card pre::selection { background: rgba(188, 255, 140, .3); }
 
 .mk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .mk-card { border: 1px solid var(--border); border-radius: var(--radius-card); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; background: var(--bg-card); }

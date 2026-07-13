@@ -11,6 +11,10 @@
 *.swp
 *~
 
+# Node tooling caches — the SPA's node_modules lives under
+# crates/ccteam-web/web/ (own .gitignore); never track one at the root.
+node_modules/
+
 .claude
 
 # Project-local gh CLI config (workspace-level GH_CONFIG_DIR; see .claude/settings.local.json)

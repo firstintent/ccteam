@@ -84,11 +84,13 @@ export const I18N: Record<Lang, Record<string, string>> = {
     notInstalled: "未安装",
     offlineRow: "离线 —— 无法探测 agent。",
     joinTitle: "连接新主机(卫星节点)",
-    joinDesc: "在目标机器上安装 ccteam 并加入本 daemon —— 加入后即出现在上方列表。",
+    joinDesc:
+      "在目标机器上安装 ccteam 并 join 本 daemon —— 首次心跳上报后即出现在上方列表。目标机器已在跑 ccteam daemon 的,join 后 30 秒内自动生效;没有 daemon 的机器再执行 host serve。",
     joinTokenGen: "生成 join token",
     joinTokenGenBusy: "生成中…",
     joinTokenCopy: "复制命令",
     joinTokenCopied: "已复制",
+    joinTokenCopyFailed: "复制失败 —— 请手动选中上方命令复制。",
     joinTokenHint: "join token 仅 admin 可见;凭它任何机器都能注册为卫星节点,请勿外传。",
     hostsUnit: "台",
     marketDesc:
@@ -207,11 +209,13 @@ export const I18N: Record<Lang, Record<string, string>> = {
     notInstalled: "not installed",
     offlineRow: "Offline — cannot probe agents.",
     joinTitle: "Connect a new host (satellite)",
-    joinDesc: "Install ccteam on the target machine and join this daemon — it then appears above.",
+    joinDesc:
+      "Install ccteam on the target machine and join this daemon — it appears above after the first heartbeat. A machine already running the ccteam daemon activates within 30s of joining; only daemon-less machines need host serve.",
     joinTokenGen: "Generate join token",
     joinTokenGenBusy: "Generating…",
     joinTokenCopy: "Copy command",
     joinTokenCopied: "Copied",
+    joinTokenCopyFailed: "Copy failed — select the command above and copy manually.",
     joinTokenHint:
       "The join token is admin-only; any machine holding it can register as a satellite — do not share.",
     hostsUnit: "",

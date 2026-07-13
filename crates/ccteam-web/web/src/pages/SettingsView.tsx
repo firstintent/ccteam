@@ -21,6 +21,7 @@ import HostsView from "./HostsView";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
 import SettingsPage, { MyImSection } from "./SettingsPage";
+import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
@@ -285,12 +286,11 @@ export function AccountPanel({
       toastBus.handler?.info(lang === "en" ? "No token stored in this browser" : "本浏览器未存 token");
       return;
     }
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(token).then(
-        () => toastBus.handler?.info(lang === "en" ? "Token copied" : "token 已复制"),
-        () => toastBus.handler?.error(lang === "en" ? "Copy failed" : "复制失败"),
-      );
-    }
+    void copyText(token).then((ok) =>
+      ok
+        ? toastBus.handler?.info(lang === "en" ? "Token copied" : "token 已复制")
+        : toastBus.handler?.error(lang === "en" ? "Copy failed" : "复制失败"),
+    );
   };
   return (
     <div data-testid="settings-account" className="flex flex-col gap-5">
