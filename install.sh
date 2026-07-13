@@ -269,13 +269,28 @@ start_launchd() {
 </dict>
 </plist>
 EOF
-    launchctl bootout "gui/$(id -u)/$_label" >/dev/null 2>&1 || true
-    if launchctl bootstrap "gui/$(id -u)" "$_plist" >/dev/null 2>&1; then
-        show_result "$_bin" "launchctl kickstart -k gui/\$(id -u)/$_label"
+    # Idempotent + race-free load. `bootout` is asynchronous, so a bootstrap
+    # fired immediately after can hit a transient "already loaded" / I/O error;
+    # settle first, then enable (clear any disabled flag), bootstrap, and
+    # kickstart. Verify success by the agent's actual STATE (launchctl print),
+    # not by bootstrap's exit code — on a fresh GUI session bootstrap can report
+    # a benign error while the agent still comes up. Surface launchctl's real
+    # message on genuine failure instead of guessing at the cause.
+    _dom="gui/$(id -u)"
+    _svc="$_dom/$_label"
+    launchctl bootout "$_svc" >/dev/null 2>&1 || true
+    sleep 1
+    launchctl enable "$_svc" >/dev/null 2>&1 || true
+    _err="$(launchctl bootstrap "$_dom" "$_plist" 2>&1)" || true
+    launchctl kickstart "$_svc" >/dev/null 2>&1 || true
+    if launchctl print "$_svc" >/dev/null 2>&1; then
+        show_result "$_bin" "launchctl kickstart -k $_svc"
     else
-        warn "Could not bootstrap the launchd agent (SSH / no GUI session?)."
-        printf '    Retry after logging in:  launchctl bootstrap gui/$(id -u) %s\n' "$_plist"
-        printf '    Or use nohup instead:    nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n'
+        warn "Could not load the launchd agent. launchctl reported:"
+        if [ -n "$_err" ]; then printf '      %s\n' "$_err" >&2; fi
+        printf '    The binary is installed. Load it manually (from a GUI login session):\n' >&2
+        printf '      launchctl bootstrap %s %s\n' "$_dom" "$_plist" >&2
+        printf '    Or run it in the background:  nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n' >&2
     fi
 }
 

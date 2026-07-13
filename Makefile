@@ -198,13 +198,20 @@ install: release
 	    mkdir -p $(HOME)/Library/LaunchAgents $(CCTEAM_HOME); \
 	    printf '%s\n' "$$CCTEAM_PLIST" > $(PLIST_FILE); \
 	    printf 'service:   %s\n' '$(PLIST_FILE)'; \
-	    launchctl bootout gui/$$(id -u)/$(PLIST_LABEL) >/dev/null 2>&1 || true; \
-	    if launchctl bootstrap gui/$$(id -u) $(PLIST_FILE) >/dev/null 2>&1; then \
+	    _dom="gui/$$(id -u)"; _svc="$$_dom/$(PLIST_LABEL)"; \
+	    launchctl bootout "$$_svc" >/dev/null 2>&1 || true; \
+	    sleep 1; \
+	    launchctl enable "$$_svc" >/dev/null 2>&1 || true; \
+	    _err="$$(launchctl bootstrap "$$_dom" $(PLIST_FILE) 2>&1)" || true; \
+	    launchctl kickstart "$$_svc" >/dev/null 2>&1 || true; \
+	    if launchctl print "$$_svc" >/dev/null 2>&1; then \
 	        $(MAKE) --no-print-directory next-steps; \
 	    else \
-	        printf '\033[33mwarning:\033[0m could not bootstrap the launchd agent (SSH / no GUI session?).\n'; \
-	        printf '    Retry after logging in:  launchctl bootstrap gui/$$(id -u) %s\n' '$(PLIST_FILE)'; \
-	        printf '    Or run in the foreground:  %s start\n' '$(BIN_NAME)'; \
+	        printf '\033[33mwarning:\033[0m could not load the launchd agent. launchctl reported:\n'; \
+	        if [ -n "$$_err" ]; then printf '      %s\n' "$$_err"; fi; \
+	        printf '    The binary is installed. Load it manually (from a GUI login session):\n'; \
+	        printf '      launchctl bootstrap %s %s\n' "$$_dom" '$(PLIST_FILE)'; \
+	        printf '    Or run it in the foreground:  %s start\n' '$(BIN_NAME)'; \
 	    fi; \
 	else \
 	    printf 'no systemd --user / launchd here — run the daemon in the foreground:  %s start\n' '$(BIN_NAME)'; \
@@ -363,8 +370,13 @@ export CCTEAM_PLIST
 
 daemon-start:
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    launchctl bootstrap gui/$$(id -u) $(PLIST_FILE) 2>/dev/null \
-	        || launchctl kickstart gui/$$(id -u)/$(PLIST_LABEL); \
+	    if [ ! -f $(PLIST_FILE) ]; then \
+	        printf '\033[31merror:\033[0m no launchd agent at %s — run `make install` first.\n' '$(PLIST_FILE)' >&2; \
+	        exit 1; \
+	    fi; \
+	    _dom="gui/$$(id -u)"; _svc="$$_dom/$(PLIST_LABEL)"; \
+	    launchctl bootstrap "$$_dom" $(PLIST_FILE) 2>/dev/null || true; \
+	    launchctl kickstart "$$_svc"; \
 	else \
 	    systemctl --user start $(UNIT_NAME); \
 	fi
