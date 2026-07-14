@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { allowedVendorsFor, eligibleHosts } from "./hostFilter";
-import type { AgentHealth, HostDetail, HostSummary } from "./hostsApi";
+import type { AgentHealth, HostDetail, HostProjectView, HostSummary } from "./hostsApi";
 
 function agent(vendor: string, installed: boolean): AgentHealth {
   return {
@@ -16,14 +16,14 @@ function agent(vendor: string, installed: boolean): AgentHealth {
   };
 }
 
-function summary(host: string, isLocal: boolean): HostSummary {
-  return { host, hostname: host.toUpperCase(), is_local: isLocal, agent_count: 4, agents_ready: 1 };
+function summary(host: string, isLocal: boolean, status = "online"): HostSummary {
+  return { host, hostname: host.toUpperCase(), is_local: isLocal, status, agent_count: 4, agents_ready: 1 };
 }
 
 function detail(
   host: string,
   agents: AgentHealth[],
-  projects: { slug: string; path: string }[],
+  projects: HostProjectView[] = [],
 ): HostDetail {
   return {
     host,
@@ -41,37 +41,33 @@ describe("eligibleHosts (项目绑定主机)", () => {
   const local = summary("local", true);
   const sat = summary("dxa347", false);
 
-  it("local is always eligible; a remote needs the slug + an installed agent", () => {
+  it("a new project gets every online host with an installed agent, local first", () => {
+    const online = summary("online-sat", false);
+    const offline = summary("offline-sat", false, "offline");
+    const empty = summary("empty-sat", false);
     const details = {
-      dxa347: detail("dxa347", [agent("claude", true)], [{ slug: "demo", path: "/w/demo" }]),
+      "online-sat": detail("online-sat", [agent("claude", true)]),
+      "offline-sat": detail("offline-sat", [agent("claude", true)]),
+      "empty-sat": detail("empty-sat", [agent("claude", false)]),
     };
-    expect(eligibleHosts([local, sat], details, "demo", false).map((h) => h.host)).toEqual([
+    expect(eligibleHosts([online, offline, local, empty], details, "", true).map((h) => h.host)).toEqual([
       "local",
-      "dxa347",
-    ]);
-    // Same satellite, different project → local only.
-    expect(eligibleHosts([local, sat], details, "other", false).map((h) => h.host)).toEqual([
-      "local",
+      "online-sat",
     ]);
   });
 
-  it("a new-project path pins the host to local", () => {
-    const details = {
-      dxa347: detail("dxa347", [agent("claude", true)], [{ slug: "demo", path: "/w/demo" }]),
-    };
-    expect(eligibleHosts([local, sat], details, "demo", true).map((h) => h.host)).toEqual([
-      "local",
-    ]);
+  it("an existing project gets exactly its bound host, even when offline", () => {
+    const offlineSat = summary("dxa347", false, "offline");
+    expect(eligibleHosts([local, offlineSat], {}, "dxa347", false)).toEqual([offlineSat]);
+    expect(eligibleHosts([local, sat], {}, "local", false)).toEqual([local]);
   });
 
-  it("a remote with no detail (offline) or no installed agent is not spawnable", () => {
-    expect(eligibleHosts([local, sat], {}, "demo", false).map((h) => h.host)).toEqual(["local"]);
-    const noAgents = {
-      dxa347: detail("dxa347", [agent("claude", false)], [{ slug: "demo", path: "/w/demo" }]),
-    };
-    expect(eligibleHosts([local, sat], noAgents, "demo", false).map((h) => h.host)).toEqual([
-      "local",
-    ]);
+  it("synthesizes a readable offline identity when a bound host is absent", () => {
+    expect(eligibleHosts([local], {}, "missing-sat", false)[0]).toMatchObject({
+      host: "missing-sat",
+      status: "offline",
+      is_local: false,
+    });
   });
 });
 

@@ -38,6 +38,9 @@ export const I18N: Record<Lang, Record<string, string>> = {
     role: "角色",
     localTag: "本机",
     newProjLabel: "新建项目路径",
+    newProjRemotePath: "在 {host} 上的绝对路径",
+    newProjPathRequired: "请填写项目路径",
+    cancel: "取消",
     newProject: "＋ 新建项目…",
     connectHost: "＋ 连接新主机…",
     installFromMarket: "从插件市场安装…",
@@ -78,6 +81,12 @@ export const I18N: Record<Lang, Record<string, string>> = {
     remoteBadge: "远程",
     reprobe: "重新探测",
     reconnect: "重连",
+    hostProjects: "主机项目",
+    projectCataloged: "已接入",
+    importProject: "接入",
+    importingProject: "接入中…",
+    importProjectFailed: "接入项目失败",
+    unknownError: "未知错误",
     probing: "探测中…",
     registerMcp: "注册 MCP",
     mcpOk: "MCP 已注册",
@@ -173,6 +182,9 @@ export const I18N: Record<Lang, Record<string, string>> = {
     role: "Role",
     localTag: "local",
     newProjLabel: "New project path",
+    newProjRemotePath: "Absolute path on {host}",
+    newProjPathRequired: "Project path is required",
+    cancel: "Cancel",
     newProject: "＋ New project…",
     connectHost: "＋ Connect a host…",
     installFromMarket: "Install from marketplace…",
@@ -213,6 +225,12 @@ export const I18N: Record<Lang, Record<string, string>> = {
     remoteBadge: "remote",
     reprobe: "Re-probe",
     reconnect: "Reconnect",
+    hostProjects: "Host projects",
+    projectCataloged: "Cataloged",
+    importProject: "Import",
+    importingProject: "Importing…",
+    importProjectFailed: "Project import failed",
+    unknownError: "Unknown error",
     probing: "Probing…",
     registerMcp: "Register MCP",
     mcpOk: "MCP registered",
@@ -311,6 +329,9 @@ export function tStopped(lang: Lang, sid: string): string {
   return lang === "en"
     ? `Stopped ${sid} (state kept, resume anytime)`
     : `已停止 ${sid}(状态保留,随时 resume)`;
+}
+export function tRemoteProjectPath(lang: Lang, host: string): string {
+  return t(lang, "newProjRemotePath").replace("{host}", host);
 }
 
 /** Shell / nav labels, keyed by route or shell surface (pre-dictionary seam;

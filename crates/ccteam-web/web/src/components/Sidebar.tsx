@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { CcLogo } from "./Logo";
 import { VendorChip } from "./VendorChip";
-import { makeT, tHostsCount, tShowMore, type Lang } from "../lib/i18n";
+import { makeT, tShowMore, type Lang } from "../lib/i18n";
 
 /** One sidebar session row — a live gateway session OR a stopped (history)
  *  session (dimmer; clicking resumes it). */
@@ -34,7 +34,6 @@ export interface RailRow {
   label: string;
   vendor: string;
   model?: string;
-  host?: string;
   /** Live status vocabulary (`live`/`idle`/`working`/`stale`/`stuck`) —
    *  ignored for history rows. */
   status?: string | null;
@@ -45,14 +44,14 @@ export interface RailRow {
 /** Default rows shown per workspace before 「展开显示」. */
 export const WS_SHOW = 4;
 
-/** Filter rows by the sidebar query (title + sid + model + project + host —
+/** Filter rows by the sidebar query (title + sid + model + project + vendor —
  *  mirrors the prototype's haystack). Pure for unit tests. */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
 export function filterRows(rows: RailRow[], query: string): RailRow[] {
   const q = query.trim().toLowerCase();
   if (!q) return rows;
   return rows.filter((r) =>
-    `${r.label} ${r.sid} ${r.model ?? ""} ${r.project} ${r.host ?? ""} ${r.vendor}`
+    `${r.label} ${r.sid} ${r.model ?? ""} ${r.project} ${r.vendor}`
       .toLowerCase()
       .includes(q),
   );
@@ -75,20 +74,6 @@ export function groupRows(
   return Array.from(byProject.entries()).map(([project, list]) => ({ project, rows: list }));
 }
 
-/** Distinct execution hosts across a group's LIVE rows (history rows are
- *  excluded — a stopped session no longer runs anywhere). A project is one
- *  logical unit whose sessions may run on several hosts; the header badge
- *  shows the host only when it is unanimous, otherwise a count (and each
- *  non-local row carries its own badge). Pure for unit tests. */
-// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
-export function runningHosts(rows: RailRow[]): string[] {
-  const hosts = new Set<string>();
-  for (const r of rows) {
-    if (!r.history) hosts.add(r.host ?? "local");
-  }
-  return Array.from(hosts);
-}
-
 /** A row is "running" (hover shows the stop affordance) when it is a LIVE
  *  session — stop keeps state + stays resumable, so it's offered for any
  *  non-history row. Pure for unit tests. */
@@ -103,6 +88,7 @@ export function Sidebar({
   mobileOpen,
   activeSid,
   projects,
+  projectHosts = {},
   rows,
   query,
   flowActive,
@@ -128,6 +114,7 @@ export function Sidebar({
   mobileOpen: boolean;
   activeSid: string | null;
   projects: string[];
+  projectHosts?: Record<string, { host: string; online: boolean }>;
   rows: RailRow[];
   query: string;
   flowActive: boolean;
@@ -244,10 +231,7 @@ export function Sidebar({
         <div className="side-list" data-testid="side-list">
           {groups.map(({ project, rows: list }) => {
             const closed = closedWs[project] && !q;
-            const running = list.find((r) => !r.history);
-            const hosts = runningHosts(list);
-            const hostShown =
-              hosts.length === 1 ? hosts[0] : hosts.length > 1 ? tHostsCount(lang, hosts.length) : null;
+            const projectHost = projectHosts[project] ?? { host: "local", online: true };
             const shown = expandedWs[project] || q ? list : list.slice(0, WS_SHOW);
             return (
               <div key={project}>
@@ -263,13 +247,13 @@ export function Sidebar({
                   <ChevronDown className={`chev ${closed ? "closed" : ""}`} />
                   <Folder className="fold" />
                   <span className="wname">{project}</span>
-                  {hostShown ? (
-                    <span className="wagent">
-                      {hostShown}
-                      <span
-                        className={`dot ${running ? "on" : "off"}`}
-                        style={{ width: 7, height: 7 }}
-                      />
+                  {projectHost.host !== "local" ? (
+                    <span
+                      className={`project-host ${projectHost.online ? "" : "offline"}`}
+                      title={projectHost.online ? projectHost.host : `${projectHost.host} · ${t("offline")}`}
+                    >
+                      @ {projectHost.host}
+                      {!projectHost.online ? ` · ${t("offline")}` : ""}
                     </span>
                   ) : null}
                   <button
@@ -299,7 +283,7 @@ export function Sidebar({
                               className={`srow ${row.sid === activeSid ? "active" : ""} ${row.history ? "hist" : ""}`}
                               role="button"
                               tabIndex={0}
-                              title={`${row.sid} · ${row.vendor}${row.model ? ` ${row.model}` : ""} · ${row.host ?? "local"}${row.history ? ` · ${t("historySec")}` : ""}`}
+                              title={`${row.sid} · ${row.vendor}${row.model ? ` ${row.model}` : ""}${row.history ? ` · ${t("historySec")}` : ""}`}
                               onClick={() => onOpenRow(row)}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter") onOpenRow(row);
@@ -307,9 +291,6 @@ export function Sidebar({
                             >
                               <VendorChip vendor={row.vendor} />
                               <span className="name">{row.label}</span>
-                              {!row.history && (row.host ?? "local") !== "local" ? (
-                                <span className="shost">{row.host}</span>
-                              ) : null}
                               {rowStoppable(row) ? (
                                 <button
                                   type="button"

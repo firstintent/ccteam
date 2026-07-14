@@ -20,7 +20,8 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import HomeView, { MAX_ACTIVE_SESSIONS, type RecentEntry } from "./HomeView";
+import HomeView, { MAX_ACTIVE_SESSIONS, NewProjectFields, type RecentEntry } from "./HomeView";
+import type { HostSummary } from "../lib/hostsApi";
 
 const RECENTS: RecentEntry[] = [
   {
@@ -73,12 +74,12 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain("会话在第一条消息发出时创建");
   });
 
-  it("ctx-bar: 项目 + 角色 render; 主机 hidden before host data; 分支 hidden without data", () => {
+  it("ctx-bar: 项目 + bound 主机 + 角色 render; 分支 hides without data", () => {
     const html = render();
     expect(html).toContain('data-testid="ctx-project"');
     expect(html).toContain('data-testid="ctx-role"');
-    // getHosts() hasn't resolved (never-resolving fetch) → dimension hidden.
-    expect(html).not.toContain('data-testid="ctx-host"');
+    // Project identity is available before the admin-only host probe resolves.
+    expect(html).toContain('data-testid="ctx-host"');
     // v0.8.24 Q7 — 分支 renders ONLY from real backend data (current_branch);
     // without it the dimension stays hidden (never mocked).
     expect(html).not.toContain('data-testid="ctx-branch"');
@@ -126,6 +127,48 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain('data-testid="newproj"');
     expect(html).toContain("新建项目路径");
     expect(html).toContain('id="newproj-path"');
+    expect(html).toContain('data-testid="newproj-host"');
+  });
+
+  it("new-project fields render every eligible host and a remote absolute-path hint", () => {
+    const hosts: HostSummary[] = [
+      { host: "local", hostname: "box", is_local: true, status: "online", agent_count: 1, agents_ready: 1 },
+      { host: "claude-dev-04", hostname: "dev04", is_local: false, status: "online", agent_count: 1, agents_ready: 1 },
+    ];
+    const html = renderToString(
+      <NewProjectFields
+        lang="en"
+        open
+        hosts={hosts}
+        host="claude-dev-04"
+        onHostChange={() => {}}
+        onPathChange={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(html).toContain('value="local"');
+    expect(html).toContain('value="claude-dev-04" selected=""');
+    expect(html).toContain('placeholder="Absolute path on claude-dev-04"');
+  });
+
+  it("project options wear their remote host and offline state", () => {
+    const html = renderToString(
+      <HomeView
+        lang="en"
+        isAdmin
+        projects={["remote-proj"]}
+        projectPaths={{ "remote-proj": "/srv/remote-proj" }}
+        projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
+        liveCount={0}
+        recents={[]}
+        onLaunched={() => {}}
+        onOpenRecent={() => {}}
+        onOpenSettings={() => {}}
+      />,
+    );
+    expect(html.replace(/<!-- -->/g, "")).toContain("@ sat-2");
+    expect(html).toContain("offline");
+    expect(html).toContain('disabled=""');
   });
 
   it("renders 最近会话 cards (4-way vendor chips + sid + host·time)", () => {

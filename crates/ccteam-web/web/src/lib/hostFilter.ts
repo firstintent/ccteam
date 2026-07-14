@@ -1,10 +1,8 @@
 // Home 工作区维度联动 — pure derivations, unit-tested without React.
 //
 // The rules (owner decision):
-// - A project BINDS its hosts: an existing project can only spawn on hosts
-//   that actually have that slug registered (local always qualifies — the
-//   Home project list IS the local daemon registry). A new-project path is
-//   created by the local daemon, so it pins host = local.
+// - A project BINDS exactly one host. Existing projects inherit that host;
+//   new projects may be created on any online host with an installed agent.
 // - A host BINDS its vendors: the composer's vendor/model menu only offers
 //   harnesses the picked host actually has installed (per its probe report).
 
@@ -12,21 +10,36 @@ import type { HostDetail, HostSummary } from "./hostsApi";
 import { VENDORS, type VendorId } from "./vendors";
 
 /** Hosts the current project selection can actually spawn on. `details` maps
- *  host id → detail (missing/null = detail fetch failed → not spawnable). */
+ *  host id → detail (missing/null = detail fetch failed → not spawnable).
+ *  `projectHost` is the existing project's binding, not its slug. */
 export function eligibleHosts(
   summaries: HostSummary[],
   details: Record<string, HostDetail | null>,
-  projectSlug: string,
+  projectHost: string,
   isNewProject: boolean,
 ): HostSummary[] {
-  return summaries.filter((s) => {
-    if (s.is_local) return true;
-    if (isNewProject) return false; // new projects are created on the local daemon
-    const d = details[s.host];
-    if (!d) return false; // offline / never heartbeated — remote spawn would fail
-    if (!d.agents.some((a) => a.installed)) return false; // nothing to spawn with
-    return (d.projects ?? []).some((p) => p.slug === projectSlug);
-  });
+  if (!isNewProject) {
+    const bound = projectHost || "local";
+    const known = summaries.find((summary) => summary.host === bound);
+    return known
+      ? [known]
+      : [{
+          host: bound,
+          hostname: bound,
+          is_local: bound === "local",
+          status: bound === "local" ? "online" : "offline",
+          agent_count: 0,
+          agents_ready: 0,
+        }];
+  }
+
+  return summaries
+    .filter((summary) => {
+      if (summary.is_local || summary.host === "local") return true;
+      if (summary.status !== "online") return false;
+      return details[summary.host]?.agents.some((agent) => agent.installed) ?? false;
+    })
+    .sort((a, b) => Number(b.is_local || b.host === "local") - Number(a.is_local || a.host === "local"));
 }
 
 /** Vendors installed on the picked host, in VENDORS menu order. `null` means

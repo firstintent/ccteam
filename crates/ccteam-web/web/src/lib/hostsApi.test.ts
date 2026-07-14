@@ -51,6 +51,9 @@ describe("hostsApi", () => {
         arch: "x86_64",
         ccteam_version: "0.8.18",
         agents: [],
+        projects: [
+          { slug: "demo", path: "/srv/demo", cataloged: true, catalog_slug: "demo2" },
+        ],
       }),
     );
     const got = await getHostDetail("local", true);
@@ -59,6 +62,12 @@ describe("hostsApi", () => {
       expect.objectContaining({ credentials: "same-origin" }),
     );
     expect(got.ccteam_version).toBe("0.8.18");
+    expect(got.projects?.[0]).toEqual({
+      slug: "demo",
+      path: "/srv/demo",
+      cataloged: true,
+      catalog_slug: "demo2",
+    });
   });
 
   it("getHostDetail omits the refresh query by default", async () => {

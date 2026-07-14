@@ -17,7 +17,7 @@ import { Folder, GitBranch, Globe } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
 import {
   defaultDraft,
   modelSwitchFor,
@@ -48,6 +48,11 @@ export interface RecentEntry {
   status?: string | null;
   history?: boolean;
   lastActive?: string;
+}
+
+export interface ProjectHostIdentity {
+  host: string;
+  online: boolean;
 }
 
 /** Frontend-only soft cap on concurrently-live sessions (UX guard). */
@@ -112,11 +117,65 @@ function CtxSelect({
   return right ? <div className="right">{body}</div> : body;
 }
 
+/** SSR-safe new-project path + host controls. Host options are already
+ * filtered by `eligibleHosts`; this component only renders the choice. */
+export function NewProjectFields({
+  lang,
+  open,
+  hosts,
+  host,
+  inputRef,
+  onHostChange,
+  onPathChange,
+  onCancel,
+}: {
+  lang: Lang;
+  open: boolean;
+  hosts: HostSummary[];
+  host: string;
+  inputRef?: React.Ref<HTMLInputElement>;
+  onHostChange: (host: string) => void;
+  onPathChange: (path: string) => void;
+  onCancel: () => void;
+}) {
+  const t = makeT(lang);
+  const remote = host !== "local";
+  return (
+    <div className={`newproj ${open ? "show" : ""}`} data-testid="newproj">
+      <label htmlFor="newproj-path">{t("newProjLabel")}</label>
+      <input
+        id="newproj-path"
+        ref={inputRef}
+        placeholder={remote ? tRemoteProjectPath(lang, host) : "~/work/my-app"}
+        spellCheck={false}
+        onChange={(event) => onPathChange(event.target.value.trim())}
+      />
+      <select
+        className="newproj-host"
+        data-testid="newproj-host"
+        title={t("host")}
+        value={host}
+        onChange={(event) => onHostChange(event.target.value)}
+      >
+        {hosts.map((option) => (
+          <option key={option.host} value={option.host}>
+            {option.host}{option.is_local ? ` · ${t("localTag")}` : ""}
+          </option>
+        ))}
+      </select>
+      <button type="button" className="x" onClick={onCancel} aria-label={t("cancel")}>
+        ✕
+      </button>
+    </div>
+  );
+}
+
 export default function HomeView({
   lang,
   isAdmin,
   projects,
   projectPaths,
+  projectHosts = {},
   projectBranches = {},
   liveCount,
   recents,
@@ -129,6 +188,7 @@ export default function HomeView({
   isAdmin: boolean;
   projects: string[];
   projectPaths: Record<string, string>;
+  projectHosts?: Record<string, ProjectHostIdentity>;
   /** v0.8.24 Q7 — current git branch per slug (absent ⇒ hide the dimension). */
   projectBranches?: Record<string, string>;
   /** Caller's live session count (soft cap gate). */
@@ -216,16 +276,27 @@ export default function HomeView({
     };
   }, []);
 
-  // 项目绑定主机: only hosts that can actually run the current selection are
-  // offered. The EFFECTIVE host is derived (not state-synced): a project
-  // switch that invalidates the pick falls back to local instantly.
+  const isNewProject = newProjOpen;
+  const boundHost = projectHosts[project]?.host ?? "local";
+
+  // Existing projects inherit exactly their bound host. A new project can be
+  // created on any online host with at least one installed harness.
   const spawnableHosts = hosts
-    ? eligibleHosts(hosts, hostDetails, project, newProjectPath !== null)
+    ? eligibleHosts(hosts, hostDetails, boundHost, isNewProject)
     : null;
-  const effectiveHost =
-    !spawnableHosts || spawnableHosts.some((h) => h.host === host)
+  const effectiveHost = !isNewProject
+    ? boundHost
+    : !spawnableHosts || spawnableHosts.some((candidate) => candidate.host === host)
       ? host
-      : (spawnableHosts.find((h) => h.is_local)?.host ?? spawnableHosts[0]?.host ?? "local");
+      : (spawnableHosts[0]?.host ?? "local");
+  const newProjectHosts = spawnableHosts ?? [{
+    host: "local",
+    hostname: "local",
+    is_local: true,
+    status: "online",
+    agent_count: 0,
+    agents_ready: 0,
+  }];
 
   // 主机绑定 vendor: the composer only offers harnesses installed on the
   // effective host (null = unknown → don't filter); a pick the host can't
@@ -237,6 +308,8 @@ export default function HomeView({
       : draft;
 
   const openNewProject = () => {
+    setHost("local");
+    setRole("");
     setNewProjOpen(true);
     window.setTimeout(() => newProjRef.current?.focus(), 30);
   };
@@ -250,7 +323,7 @@ export default function HomeView({
   // ---- lazy-create funnel ---------------------------------------------------
   const launch = (text: string): boolean => {
     if (pending) return false;
-    if (!project && !newProjectPath) {
+    if (!project && !isNewProject) {
       toastBus.handler?.error(
         lang === "en" ? "Pick a project first (＋ New project…)" : "先选一个项目(＋ 新建项目…)",
       );
@@ -267,12 +340,15 @@ export default function HomeView({
     setPending(true);
     const run = async () => {
       let slug = project;
-      if (newProjectPath) {
+      if (isNewProject) {
+        if (!newProjectPath) {
+          throw new Error(t("newProjPathRequired"));
+        }
         const derived = slugFromPath(newProjectPath);
         if (!derived) {
           throw new Error(lang === "en" ? "invalid project path" : "项目路径无效");
         }
-        const created = await apiCreateProject(derived, newProjectPath.trim());
+        const created = await apiCreateProject(derived, newProjectPath.trim(), { host: effectiveHost });
         slug = created.slug;
       }
       // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
@@ -283,7 +359,6 @@ export default function HomeView({
         vendor: effectiveDraft.vendor,
         permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
         protocol: wireProtocol(effectiveDraft),
-        host: effectiveHost,
         model: modelSwitchFor(effectiveDraft) ?? undefined,
         effort: wireEffort(effectiveDraft) ?? undefined,
       });
@@ -307,18 +382,22 @@ export default function HomeView({
     return true;
   };
 
-  const projLabel = newProjectPath ? (
-    <span style={{ color: "#0E7490" }}>{slugFromPath(newProjectPath) || "…"} (new)</span>
+  const projLabel = isNewProject ? (
+    <span style={{ color: "#0E7490" }}>{slugFromPath(newProjectPath ?? "") || "…"} (new)</span>
   ) : (
     project || t("newProject")
   );
 
   const pickedHost = hosts?.find((x) => x.host === effectiveHost);
+  const hostOnline = isNewProject
+    ? effectiveHost === "local" || pickedHost?.status === "online"
+    : (projectHosts[project]?.online ?? effectiveHost === "local");
   const hostLabel = !pickedHost
-    ? `local · ${t("localTag")}`
+    ? effectiveHost
     : pickedHost.is_local
       ? `${pickedHost.hostname} · ${t("localTag")}`
-      : pickedHost.hostname;
+      : `${pickedHost.hostname} @ ${pickedHost.host}`;
+  const hostLabelWithStatus = hostOnline ? hostLabel : `${hostLabel} · ${t("offline")}`;
 
   return (
     <section className="view active home-view" data-testid="home-view">
@@ -338,27 +417,36 @@ export default function HomeView({
             >
               {(close) => (
                 <>
-                  {projects.map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      className={`sel-item ${!newProjectPath && project === p ? "selected" : ""}`}
-                      title={projectPaths[p]}
-                      onClick={() => {
-                        setPicked(p);
-                        setNewProjectPath(null);
-                        setNewProjOpen(false);
-                        close();
-                      }}
-                    >
-                      {p}
-                      {projectPaths[p] ? <span className="sub">{projectPaths[p]}</span> : null}
-                      <span className="check">✓</span>
-                    </button>
-                  ))}
+                  {projects.map((p) => {
+                    const identity = projectHosts[p] ?? { host: "local", online: true };
+                    return (
+                      <button
+                        key={p}
+                        type="button"
+                        disabled={!identity.online}
+                        className={`sel-item ${!isNewProject && project === p ? "selected" : ""} ${identity.online ? "" : "offline"}`}
+                        title={identity.online ? projectPaths[p] : `${projectPaths[p] ?? p} · ${t("offline")}`}
+                        onClick={() => {
+                          setPicked(p);
+                          setNewProjectPath(null);
+                          setNewProjOpen(false);
+                          close();
+                        }}
+                      >
+                        <span>{p}</span>
+                        {identity.host !== "local" ? (
+                          <span className="project-option-host">@ {identity.host}</span>
+                        ) : null}
+                        {projectPaths[p] || !identity.online ? (
+                          <span className="sub">{identity.online ? projectPaths[p] : t("offline")}</span>
+                        ) : null}
+                        <span className="check">✓</span>
+                      </button>
+                    );
+                  })}
                   <button
                     type="button"
-                    className={`sel-item new ${newProjectPath ? "selected" : ""}`}
+                    className={`sel-item new ${isNewProject ? "selected" : ""}`}
                     onClick={() => {
                       openNewProject();
                       close();
@@ -371,54 +459,20 @@ export default function HomeView({
               )}
             </CtxSelect>
 
-            {/* 主机 — bound by the project: only hosts that have this slug
-                (and ≥1 installed harness) are offered. With a single
-                spawnable host the dimension is read-only (项目绑定主机). */}
-            {spawnableHosts && spawnableHosts.length > 1 ? (
-              <CtxSelect icon={<Globe />} value={hostLabel} title={t("host")} testId="ctx-host">
-                {(close) => (
-                  <>
-                    {spawnableHosts.map((h) => (
-                      <button
-                        key={h.host}
-                        type="button"
-                        className={`sel-item ${effectiveHost === h.host ? "selected" : ""}`}
-                        onClick={() => {
-                          setHost(h.host);
-                          close();
-                        }}
-                      >
-                        <span className="dot on" />
-                        {h.hostname}
-                        {h.is_local ? ` · ${t("localTag")}` : ""}
-                        <span className="check">✓</span>
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      className="sel-item new"
-                      onClick={() => {
-                        onOpenSettings("hosts");
-                        close();
-                      }}
-                    >
-                      {t("connectHost")}
-                      <span className="check">✓</span>
-                    </button>
-                  </>
-                )}
-              </CtxSelect>
-            ) : hosts && hosts.length > 0 ? (
+            {/* Existing project host is read-only: project identity owns the
+                execution location. New-project host choice lives with path. */}
+            {!isNewProject && project ? (
               <span className="ctx-btn" data-testid="ctx-host" title={t("host")} style={{ cursor: "default" }}>
                 <Globe />
-                <span className="v">{hostLabel}</span>
+                <span className={`dot ${hostOnline ? "on" : "off"}`} />
+                <span className="v">{hostLabelWithStatus}</span>
               </span>
             ) : null}
 
             {/* v0.8.24 Q7 — 分支 dimension: READ-ONLY display of the project's
                 current git branch (.git/HEAD, server-side best-effort); hidden
                 for non-git projects and for a not-yet-created project. */}
-            {!newProjectPath && project && projectBranches[project] ? (
+            {!isNewProject && project && projectBranches[project] ? (
               <span
                 className="ctx-btn"
                 data-testid="ctx-branch"
@@ -432,7 +486,7 @@ export default function HomeView({
 
             {/* 角色 — admin-only beta surface (v0.8.20 F4, AGENTS.md §五.8):
                 a tenant always launches roleless. */}
-            {isAdmin ? (
+            {isAdmin && !(isNewProject && effectiveHost !== "local") ? (
             <CtxSelect
               value={
                 <>
@@ -501,19 +555,16 @@ export default function HomeView({
             onSend={launch}
             sendTestId="home-send"
             topSlot={
-              <div className={`newproj ${newProjOpen ? "show" : ""}`} data-testid="newproj">
-                <label htmlFor="newproj-path">{t("newProjLabel")}</label>
-                <input
-                  id="newproj-path"
-                  ref={newProjRef}
-                  placeholder="~/work/my-app"
-                  spellCheck={false}
-                  onChange={(e) => setNewProjectPath(e.target.value.trim() || null)}
-                />
-                <button type="button" className="x" onClick={cancelNewProject} aria-label="cancel">
-                  ✕
-                </button>
-              </div>
+              <NewProjectFields
+                lang={lang}
+                open={newProjOpen}
+                hosts={newProjectHosts}
+                host={effectiveHost}
+                inputRef={newProjRef}
+                onHostChange={setHost}
+                onPathChange={(path) => setNewProjectPath(path || null)}
+                onCancel={cancelNewProject}
+              />
             }
           />
           {pending ? (

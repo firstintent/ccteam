@@ -20,6 +20,7 @@ import {
   type HostSummary,
   type JoinTokenInfo,
 } from "../lib/hostsApi";
+import { importProject } from "../lib/dashboardApi";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
@@ -111,6 +112,43 @@ export default function HostsView({ lang = "zh" }: { lang?: Lang } = {}) {
     }
   };
 
+  const onImport = async (host: string, remoteSlug: string) => {
+    const key = `import:${host}:${remoteSlug}`;
+    setActionError(null);
+    setBusy(key);
+    try {
+      const created = await importProject(host, remoteSlug);
+      setState((current) => {
+        if (current.kind !== "ready") return current;
+        return {
+          ...current,
+          hosts: current.hosts.map((entry) =>
+            entry.kind !== "ready" || entry.detail.host !== host
+              ? entry
+              : {
+                  ...entry,
+                  detail: {
+                    ...entry.detail,
+                    projects: (entry.detail.projects ?? []).map((project) =>
+                      project.slug === remoteSlug
+                        ? { ...project, cataloged: true, catalog_slug: created.slug }
+                        : project,
+                    ),
+                  },
+                },
+          ),
+        };
+      });
+      await load(false);
+    } catch (e) {
+      if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
+        setActionError(`${t("importProjectFailed")}: ${e instanceof Error ? e.message : t("unknownError")}`);
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div data-testid="hosts-view" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <header style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
@@ -168,6 +206,7 @@ export default function HostsView({ lang = "zh" }: { lang?: Lang } = {}) {
               busy={busy}
               lang={lang}
               onRegister={(vendor) => void onRegister(h.detail.host, vendor)}
+              onImport={(remoteSlug) => void onImport(h.detail.host, remoteSlug)}
             />
           ) : (
             <div className="host-card offline" key={h.summary.host} data-testid={`host-offline-${h.summary.host}`}>
@@ -302,11 +341,13 @@ export function HostDetailCards({
   busy,
   lang = "zh",
   onRegister,
+  onImport,
 }: {
   host: HostDetail;
   busy: string | null;
   lang?: Lang;
   onRegister: (vendor: string) => void;
+  onImport: (remoteSlug: string) => void;
 }) {
   const t = makeT(lang);
   return (
@@ -374,6 +415,41 @@ export function HostDetailCards({
           );
         })
       )}
+
+      {(host.projects ?? []).length > 0 ? (
+        <div className="host-projects" data-testid={`host-projects-${host.host}`}>
+          <div className="host-projects-title">{t("hostProjects")}</div>
+          {(host.projects ?? []).map((project) => {
+            const importing = busy === `import:${host.host}:${project.slug}`;
+            return (
+              <div className="host-project-row" data-testid={`host-project-${project.slug}`} key={project.slug}>
+                <span className="mono">{project.slug}</span>
+                <span className="host-project-path">{project.path}</span>
+                {project.cataloged ? (
+                  <span className="badge ok">
+                    {t("projectCataloged")}
+                    {project.catalog_slug && project.catalog_slug !== project.slug
+                      ? ` → ${project.catalog_slug}`
+                      : ""}
+                  </span>
+                ) : !host.is_local ? (
+                  <button
+                    type="button"
+                    className="btn primary mini"
+                    data-testid={`import-project-${project.slug}`}
+                    disabled={busy !== null}
+                    onClick={() => onImport(project.slug)}
+                  >
+                    {importing ? t("importingProject") : t("importProject")}
+                  </button>
+                ) : (
+                  <span className="badge">—</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createProject, fetchDashboard, type DashboardRow } from "./dashboardApi";
+import { createProject, fetchDashboard, importProject, type DashboardRow } from "./dashboardApi";
 
 // Spy on the global `fetch` per-test so the production code keeps using
 // the platform API verbatim. We restore in afterEach so cross-file test
@@ -27,6 +27,8 @@ describe("fetchDashboard", () => {
       {
         slug: "dev-foo",
         path: "/home/u/dev-foo",
+        host: "local",
+        host_online: true,
         team: "dev",
         kind: "workflow",
         last_event_label: "5s ago",
@@ -68,7 +70,7 @@ describe("createProject", () => {
 
   it("POSTs {slug,path} to /api/v1/projects with same-origin + json headers", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(jsonResponse(201, { slug: "demo", path: "/home/u/demo" }));
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, { slug: "demo", host: "local", path: "/home/u/demo" }));
     await createProject("demo", "~/demo");
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects", {
       method: "POST",
@@ -83,10 +85,10 @@ describe("createProject", () => {
 
   it("returns the created {slug,path} on 201", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-      jsonResponse(201, { slug: "demo", path: "/home/u/demo" }),
+      jsonResponse(201, { slug: "demo", host: "local", path: "/home/u/demo" }),
     );
     const got = await createProject("demo", "~/demo");
-    expect(got).toEqual({ slug: "demo", path: "/home/u/demo" });
+    expect(got).toEqual({ slug: "demo", host: "local", path: "/home/u/demo" });
   });
 
   it("lifts the JSON error body on 409 (not a bare 'HTTP 409')", async () => {
@@ -115,11 +117,26 @@ describe("createProject", () => {
     await expect(createProject("demo", "~/demo")).rejects.toThrow("UNAUTHENTICATED");
   });
 
-  it("includes team in the body when provided", async () => {
+  it("includes host and team in the body when provided", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(jsonResponse(201, { slug: "demo", path: "/home/u/demo" }));
-    await createProject("demo", "~/demo", "qa");
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, { slug: "demo", host: "sat-1", path: "/srv/demo" }));
+    await createProject("demo", "/srv/demo", { host: "sat-1", team: "qa" });
     const sent = JSON.parse(fetchMock.mock.calls[0][1]!.body as string);
-    expect(sent).toEqual({ slug: "demo", path: "~/demo", team: "qa" });
+    expect(sent).toEqual({ slug: "demo", path: "/srv/demo", host: "sat-1", team: "qa" });
+  });
+
+  it("imports a satellite project with its remote slug", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(201, { slug: "demo-local", host: "sat-1", path: "/data/demo-local" }),
+    );
+    const got = await importProject("sat-1", "demo", "demo-local");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/import", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ host: "sat-1", remote_slug: "demo", slug: "demo-local" }),
+    });
+    expect(got.host).toBe("sat-1");
   });
 });

@@ -308,8 +308,6 @@ export interface CreateSessionOpts {
    *  `"stream-json"` (the薄/default path); pass `"terminal"` for the advanced
    *  pane-backed session (terminal mirror / attach / screenshot). */
   protocol?: "stream-json" | "terminal" | "acp";
-  /** v0.8.24 multi-host — `local` (default) or a registered satellite id. */
-  host?: string;
   /** v0.8.24 A-U3 — explicit model id (overrides the role's `model:`
    *  frontmatter); omit for the vendor default. */
   model?: string;
@@ -334,7 +332,6 @@ export function createSession(
   if (opts.vendor) body.vendor = opts.vendor;
   if (opts.permission_mode) body.permission_mode = opts.permission_mode;
   if (opts.protocol) body.protocol = opts.protocol;
-  if (opts.host && opts.host !== "local") body.host = opts.host;
   if (opts.model) body.model = opts.model;
   if (opts.effort) body.effort = opts.effort;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);

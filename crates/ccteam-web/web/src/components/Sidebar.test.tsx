@@ -7,7 +7,6 @@ import {
   filterRows,
   groupRows,
   rowStoppable,
-  runningHosts,
   Sidebar,
   WS_SHOW,
   type RailRow,
@@ -24,16 +23,15 @@ const row = (over: Partial<RailRow> = {}): RailRow => ({
 
 describe("filterRows (⌘K search haystack)", () => {
   const rows = [
-    row({ sid: "s1", label: "修复 SSE 断线重连", model: "fable-5", host: "dev01" }),
+    row({ sid: "s1", label: "修复 SSE 断线重连", model: "fable-5" }),
     row({ sid: "s2", label: "购物车结算 bug", project: "shop", vendor: "codex" }),
   ];
 
-  it("matches on title / sid / project / model / host / vendor", () => {
+  it("matches on title / sid / project / model / vendor", () => {
     expect(filterRows(rows, "SSE").map((r) => r.sid)).toEqual(["s1"]);
     expect(filterRows(rows, "s2").map((r) => r.sid)).toEqual(["s2"]);
     expect(filterRows(rows, "shop").map((r) => r.sid)).toEqual(["s2"]);
     expect(filterRows(rows, "fable").map((r) => r.sid)).toEqual(["s1"]);
-    expect(filterRows(rows, "dev01").map((r) => r.sid)).toEqual(["s1"]);
     expect(filterRows(rows, "codex").map((r) => r.sid)).toEqual(["s2"]);
   });
 
@@ -60,23 +58,6 @@ describe("rowStoppable", () => {
   it("live rows get the hover stop; history rows don't", () => {
     expect(rowStoppable({ history: undefined })).toBe(true);
     expect(rowStoppable({ history: true })).toBe(false);
-  });
-});
-
-describe("runningHosts", () => {
-  it("collects distinct hosts of live rows, defaulting to local", () => {
-    const rows = [
-      row({ sid: "s1" }), // no host → local
-      row({ sid: "s2", host: "dev01" }),
-      row({ sid: "s3", host: "dev01" }),
-    ];
-    expect(runningHosts(rows).sort()).toEqual(["dev01", "local"]);
-  });
-
-  it("ignores history rows (a stopped session runs nowhere)", () => {
-    const rows = [row({ sid: "s1", host: "dev01" }), row({ sid: "s2", host: "gpu02", history: true })];
-    expect(runningHosts(rows)).toEqual(["dev01"]);
-    expect(runningHosts([row({ sid: "s9", history: true })])).toEqual([]);
   });
 });
 
@@ -148,30 +129,21 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("srow  hist");
   });
 
-  it("shows the workspace header with host + running dot", () => {
-    const html = renderSidebar([row({ host: "dev01" })]);
-    expect(html).toContain("wagent");
-    expect(html).toContain("dev01");
-    expect(html).toContain('class="wname"');
+  it("puts the project-bound remote host on the group header and marks offline", () => {
+    const html = renderSidebar([row()], {
+      projectHosts: { demo: { host: "claude-dev-04", online: false } },
+    });
+    expect(html).toContain('class="project-host offline"');
+    expect(html.replace(/<!-- -->/g, "")).toContain("@ claude-dev-04");
+    expect(html).toContain("离线");
+    expect(html).not.toContain("shost");
   });
 
-  // A project is ONE logical unit whose sessions may run on several hosts —
-  // the header must not claim the first row's host for the whole group.
-  it("mixed-host group: header shows a count, rows carry host badges", () => {
-    const html = renderSidebar([
-      row({ sid: "s1" }), // local
-      row({ sid: "s2", host: "dev01", label: "远程任务" }),
-    ]);
-    expect(html).toContain("2 台主机");
-    // Per-row badge only for the non-local row.
-    expect(html).toContain('class="shost"');
-    expect(html).toContain("dev01");
-  });
-
-  it("all-local group: header says local, no per-row badges", () => {
-    const html = renderSidebar([row({ sid: "s1" }), row({ sid: "s2" })]);
-    expect(html).toContain("local");
-    expect(html).not.toContain('class="shost"');
+  it("does not add a host chip for a local project", () => {
+    const html = renderSidebar([row()], {
+      projectHosts: { demo: { host: "local", online: true } },
+    });
+    expect(html).not.toContain("project-host");
   });
 
   it("renders the empty-workspace row (无会话)", () => {

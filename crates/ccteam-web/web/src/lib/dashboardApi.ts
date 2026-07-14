@@ -24,6 +24,10 @@ export interface DashboardRow {
    *  Disambiguates collision-suffixed slugs (demo / demo2 / demo3) in the UI —
    *  the sidebar list + new-session project picker show it under the slug. */
   path: string;
+  /** Project-bound execution host (`local` or a satellite id). */
+  host: string;
+  /** Local is always online; satellites reflect the registry heartbeat TTL. */
+  host_online: boolean;
   team: string;
   kind: string;
   last_event_label: string;
@@ -67,7 +71,13 @@ export async function fetchDashboard(): Promise<DashboardRow[]> {
  *  (`crates/ccteam-web/src/routes/projects.rs::CreatedProject`). */
 export interface CreatedProject {
   slug: string;
+  host: string;
   path: string;
+}
+
+export interface CreateProjectOpts {
+  host?: string;
+  team?: string;
 }
 
 /** `POST /api/v1/projects` — scaffold + register a brand-new project so the
@@ -84,10 +94,11 @@ export interface CreatedProject {
 export async function createProject(
   slug: string,
   path: string,
-  team?: string,
+  opts: CreateProjectOpts = {},
 ): Promise<CreatedProject> {
   const body: Record<string, unknown> = { slug, path };
-  if (team) body.team = team;
+  if (opts.host) body.host = opts.host;
+  if (opts.team) body.team = opts.team;
   let resp: Response;
   try {
     resp = await fetch("/api/v1/projects", {
@@ -115,6 +126,35 @@ export async function createProject(
       }
     } catch {
       // keep the status-code fallback
+    }
+    throw new Error(detail);
+  }
+  return (await resp.json()) as CreatedProject;
+}
+
+/** Catalog a project already registered on a satellite. The optional `slug`
+ * is the daemon-side alias; omitted means reuse `remoteSlug`. */
+export async function importProject(
+  host: string,
+  remoteSlug: string,
+  slug?: string,
+): Promise<CreatedProject> {
+  const body: Record<string, unknown> = { host, remote_slug: remoteSlug };
+  if (slug) body.slug = slug;
+  const resp = await fetch("/api/v1/projects/import", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (resp.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const data = (await resp.json()) as { error?: string };
+      if (typeof data.error === "string" && data.error) detail = data.error;
+    } catch {
+      // keep status fallback
     }
     throw new Error(detail);
   }

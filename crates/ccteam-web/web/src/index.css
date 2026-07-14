@@ -269,14 +269,15 @@ button { font-family: inherit; cursor: pointer; }
 .ws-head .chev.closed { transform: rotate(-90deg); }
 .ws-head .fold { width: 14px; height: 14px; color: var(--text-muted); flex: none; }
 .ws-head .wname { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ws-head .wagent { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); font-weight: 400; flex: none; font-family: var(--font-mono); }
+.ws-head .project-host { max-width: 116px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-muted); background: var(--bg-card); font: 10px var(--font-mono); font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; }
+.ws-head .project-host.offline { color: var(--red-text); border-color: color-mix(in srgb, var(--red) 35%, var(--border)); background: var(--red-soft); }
 .ws-head .wplus {
   color: var(--text-faint); width: 20px; height: 20px; border-radius: 6px;
   display: none; align-items: center; justify-content: center; font-size: 14px; flex: none;
   background: none; border: none;
 }
 .ws-head:hover .wplus { display: flex; }
-.ws-head:hover .wagent { display: none; }
+.ws-head:hover .project-host { display: none; }
 .ws-head .wplus:hover { background: var(--bg-hover); color: var(--text); }
 .srow {
   width: 100%; text-align: left;
@@ -293,14 +294,6 @@ button { font-family: inherit; cursor: pointer; }
 .srow.empty:hover { background: transparent; }
 .srow.more { color: var(--text-faint); font-size: 12.5px; }
 .srow.hist { color: var(--text-muted); }
-.srow .shost {
-  flex: none; max-width: 92px;
-  font-size: 11px; font-family: var(--font-mono); color: var(--text-muted);
-  background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px;
-  padding: 1px 6px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.srow:hover .shost { display: none; }
 .srow .stop {
   width: 20px; height: 20px; border-radius: 6px; flex: none;
   display: none; align-items: center; justify-content: center;
@@ -469,6 +462,9 @@ html.dark .send-btn { background: #3a3d45; }
 .sel-item .check { margin-left: auto; color: var(--ink); font-weight: 600; padding-left: 12px; visibility: hidden; }
 .sel-item.selected .check { visibility: visible; }
 .sel-item.selected .sub { display: none; }
+.sel-item .project-option-host { color: var(--text-muted); font: 11px var(--font-mono); }
+.sel-item.offline { color: var(--text-faint); cursor: not-allowed; opacity: .7; }
+.sel-item.offline:hover { background: transparent; }
 .sel-item.new { color: #0E7490; border-top: 1px solid var(--border-soft); border-radius: 0 0 8px 8px; margin-top: 4px; padding-top: 10px; }
 html.dark .sel-item.new { color: #67e8f9; }
 .sel-group { padding: 8px 10px 3px; font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .6px; }
@@ -486,6 +482,7 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .newproj.show { display: flex; }
 .newproj input { flex: 1; background: transparent; border: none; outline: none; color: var(--text); font-family: var(--font-mono); font-size: 13px; }
+.newproj .newproj-host { max-width: 150px; padding: 3px 24px 3px 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-card); color: var(--text-muted); font: 11px var(--font-mono); }
 .newproj label { font-size: 12.5px; color: var(--text-muted); white-space: nowrap; }
 .newproj .x { color: var(--text-faint); font-size: 15px; padding: 2px 6px; border-radius: 5px; background: none; border: none; }
 .newproj .x:hover { background: var(--bg-hover); color: var(--text); }
@@ -631,6 +628,10 @@ html.dark .dot.off { background: #4b4e57; }
 .agent-row .bin { font-family: var(--font-mono); font-size: 12px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-row .ver { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
 .agent-row.absent .v, .agent-row.absent .ver { color: var(--text-faint); }
+.host-projects { border-top: 1px solid var(--border-soft); }
+.host-projects-title { padding: 9px 20px 5px; color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+.host-project-row { min-height: 34px; padding: 5px 20px; display: grid; grid-template-columns: 130px minmax(120px, 1fr) auto; gap: 12px; align-items: center; border-top: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); font-size: 12px; }
+.host-project-path { color: var(--text-faint); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .join-card { border: 1px dashed var(--border); border-radius: var(--radius-card); padding: 20px; display: flex; flex-direction: column; gap: 12px; }
 .join-card h4 { font-size: 14.5px; font-weight: 600; }

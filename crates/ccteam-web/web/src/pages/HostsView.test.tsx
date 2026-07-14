@@ -92,7 +92,7 @@ describe("HostsView initial render", () => {
 
 describe("HostDetailCards (seeded)", () => {
   it("renders the hostname bar + per-agent cards + their statuses", () => {
-    const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} />);
+    const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} onImport={() => {}} />);
     expect(html).toContain('data-testid="host-bar"');
     expect(html).toContain("devbox");
     expect(visibleText(html)).toContain("linux/x86_64");
@@ -106,7 +106,7 @@ describe("HostDetailCards (seeded)", () => {
   });
 
   it("shows the register-MCP button only for an installed-but-unregistered registrable agent", () => {
-    const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} />);
+    const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} onImport={() => {}} />);
     // claude is installed + MCP not registered → button present.
     expect(html).toContain('data-testid="register-mcp-claude"');
     // codex is not installed → no register button (ccteam never installs a CLI).
@@ -133,9 +133,29 @@ describe("HostDetailCards (seeded)", () => {
         },
       ],
     };
-    const html = renderToString(<HostDetailCards host={ready} busy={null} onRegister={() => {}} />);
+    const html = renderToString(<HostDetailCards host={ready} busy={null} onRegister={() => {}} onImport={() => {}} />);
     expect(html).toContain("就绪");
     expect(html).not.toContain('data-testid="register-mcp-claude"');
+  });
+
+  it("shows catalog state/alias and an import CTA for uncataloged satellite projects", () => {
+    const remote: HostDetail = {
+      ...HOST,
+      host: "sat-1",
+      hostname: "sat-1",
+      is_local: false,
+      projects: [
+        { slug: "already", path: "/srv/already", cataloged: true, catalog_slug: "already-local" },
+        { slug: "fresh", path: "/srv/fresh", cataloged: false, catalog_slug: null },
+      ],
+    };
+    const html = renderToString(
+      <HostDetailCards host={remote} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).toContain("已接入");
+    expect(html).toContain("already-local");
+    expect(html).toContain('data-testid="import-project-fresh"');
+    expect(html).not.toContain('data-testid="import-project-already"');
   });
 });
 

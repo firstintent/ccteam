@@ -10,6 +10,8 @@ const dashboardRows = [
   {
     slug: "dev-team",
     path: "/home/u/dev-team",
+    host: "local",
+    host_online: true,
     team: "dev",
     kind: "workflow",
     last_event_label: "idle",
@@ -353,7 +355,7 @@ test("conversation posts a turn; sidebar hover-stop stops the session", async ({
   );
 });
 
-test("home lazy-create: first message POSTs session (vendor/protocol/hitl/host) then the turn", async ({
+test("home lazy-create: first message POSTs session without a host override, then the turn", async ({
   page,
 }) => {
   const captured = await mockCcteamApi(page);
@@ -378,6 +380,7 @@ test("home lazy-create: first message POSTs session (vendor/protocol/hitl/host) 
     protocol: "stream-json",
     permission_mode: "hitl",
   });
+  expect(create?.body).not.toHaveProperty("host");
 
   // The first message rides as the new session's first turn → Conversation.
   await expect

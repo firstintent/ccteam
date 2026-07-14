@@ -52,7 +52,14 @@ export interface HostDetail {
   /** Projects registered on THIS host (local: the daemon registry; satellite:
    *  its own `~/.ccteam` registry as reported at heartbeat). A remote spawn
    *  is only possible into a slug listed here. */
-  projects?: { slug: string; path: string }[];
+  projects?: HostProjectView[];
+}
+
+export interface HostProjectView {
+  slug: string;
+  path: string;
+  cataloged: boolean;
+  catalog_slug: string | null;
 }
 
 /** `POST .../register-mcp` response. */

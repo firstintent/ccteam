@@ -78,6 +78,7 @@ export default function ChatConsole() {
   );
   const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
   const [projectPaths, setProjectPaths] = useState<Record<string, string>>({});
+  const [projectHosts, setProjectHosts] = useState<Record<string, { host: string; online: boolean }>>({});
   // v0.8.24 Q7 — read-only branch per project (absent = not a git repo).
   const [projectBranches, setProjectBranches] = useState<Record<string, string>>({});
 
@@ -87,6 +88,11 @@ export default function ChatConsole() {
       const slugs = projects.map((p) => p.slug);
       setRegisteredProjects(slugs);
       setProjectPaths(Object.fromEntries(projects.map((p) => [p.slug, p.path])));
+      setProjectHosts(
+        Object.fromEntries(
+          projects.map((p) => [p.slug, { host: p.host || "local", online: p.host_online }]),
+        ),
+      );
       setProjectBranches(
         Object.fromEntries(
           projects
@@ -154,7 +160,6 @@ export default function ChatConsole() {
       label: railSessionLabel(s),
       vendor: s.vendor,
       model: undefined,
-      host: s.host,
       status: s.status,
     }));
     const hist: RailRow[] = Object.values(historyByProject)
@@ -165,7 +170,6 @@ export default function ChatConsole() {
         project: h.slug,
         label: railSessionLabel(h),
         vendor: h.vendor,
-        host: undefined,
         status: "off",
         history: true,
       }));
@@ -304,6 +308,7 @@ export default function ChatConsole() {
         mobileOpen={mobileOpen}
         activeSid={view === "conv" ? sid : null}
         projects={projects}
+        projectHosts={projectHosts}
         rows={rows}
         query={query}
         flowActive={view === "flow"}
@@ -382,6 +387,7 @@ export default function ChatConsole() {
             isAdmin={isAdmin}
             projects={projects}
             projectPaths={projectPaths}
+            projectHosts={projectHosts}
             projectBranches={projectBranches}
             liveCount={railSessions.length}
             recents={recents}
