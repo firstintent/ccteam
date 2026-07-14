@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ccteam_core::CcteamPaths;
@@ -17,7 +18,9 @@ use ccteam_web::{router_with_state, AppState};
 use futures::stream::{self, BoxStream};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpListener;
+use tokio::process::{ChildStdin, ChildStdout, Command};
 
 const TOKEN_HEX: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
@@ -132,6 +135,30 @@ async fn post_mcp(addr: SocketAddr, bearer: &str, body: Value) -> reqwest::Respo
         .unwrap()
 }
 
+async fn write_app_server_rpc(stdin: &mut ChildStdin, message: Value) {
+    let mut bytes = serde_json::to_vec(&message).unwrap();
+    bytes.push(b'\n');
+    stdin.write_all(&bytes).await.unwrap();
+    stdin.flush().await.unwrap();
+}
+
+async fn read_app_server_response(
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    expected_id: i64,
+) -> Value {
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for app-server response {expected_id}"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("app-server stdout closed before response {expected_id}"));
+        let message: Value = serde_json::from_str(&line).unwrap();
+        if message["id"].as_i64() == Some(expected_id) {
+            return message;
+        }
+    }
+}
+
 /// Build a gateway with one live session and return (AppState, sid, secret).
 async fn state_with_one_session(paths: CcteamPaths) -> (AppState, String, String) {
     let project_dir = paths.projects_root.join("demo");
@@ -217,6 +244,181 @@ async fn session_bearer_round_trip_list_and_spawn() {
     // vendor_session_id + host are always returned (may be empty honestly).
     assert!(spawned.get("vendor_session_id").is_some(), "got: {text}");
     assert_eq!(spawned["host"], "local");
+}
+
+/// Deterministic fake-Codex acceptance: build the exact
+/// `thread/start.config.mcp_servers.ccteam` HTTP entry, then use its URL and
+/// Authorization header against the real `/mcp` route. This composes the
+/// harness-side config builder with the daemon principal gate; a field-name,
+/// bearer, or auth-prefix drift fails here instead of only in a live CLI.
+#[tokio::test]
+async fn codex_http_thread_config_passes_session_principal_gate() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    seed_web_token(&paths, TOKEN_HEX);
+    let (app, sid, secret) = state_with_one_session(paths).await;
+    let addr = spawn_server(app).await;
+    let url = format!("http://{addr}/mcp");
+
+    let config =
+        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
+            .expect("live session principal produces a Codex thread override");
+    let server = &config["mcp_servers"]["ccteam"];
+    assert_eq!(server["url"], url);
+    assert!(server.get("command").is_none(), "Codex MCP must be HTTP");
+    let authorization = server["http_headers"]["Authorization"]
+        .as_str()
+        .expect("Codex static Authorization header");
+    let bearer = authorization
+        .strip_prefix("Bearer ")
+        .expect("Authorization uses Bearer scheme");
+
+    let resp = post_mcp(
+        addr,
+        bearer,
+        json!({"jsonrpc":"2.0","id":41,"method":"tools/call",
+               "params":{"name":"session_list","arguments":{}}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["isError"], false,
+        "Codex HTTP config: {body}"
+    );
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&sid),
+        "authenticated caller session missing: {text}"
+    );
+}
+
+/// Real-machine acceptance for the deferred Codex HTTP migration. It starts
+/// the installed `codex app-server`, gives it an HTTP global ccteam entry plus
+/// a per-thread session override, then asks Codex itself to call
+/// `session_spawn` through `/mcp`. The project is intentionally omitted: only
+/// a successfully authenticated session principal can derive `demo`
+/// server-side, so accidentally retaining the global admin bearer fails.
+///
+/// Run explicitly on a machine with Codex 0.144.x:
+/// `cargo test -p ccteam-web --test mcp_session_bearer_test \
+///   real_codex_http_mcp_passes_session_principal_gate -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "requires an installed codex 0.144.x binary"]
+async fn real_codex_http_mcp_passes_session_principal_gate() {
+    let version = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .expect("codex binary must be installed");
+    assert!(version.status.success(), "codex --version failed");
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    eprintln!("real Codex HTTP MCP smoke: {version}");
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    seed_web_token(&paths, TOKEN_HEX);
+    let (app, sid, secret) = state_with_one_session(paths).await;
+    let addr = spawn_server(app).await;
+    let url = format!("http://{addr}/mcp");
+
+    // Pin an isolated global config to HTTP too. Codex deep-merges this with
+    // the per-thread table; a legacy stdio global entry would make
+    // thread/start fail with `url is not supported for stdio`.
+    let codex_home = tmp.path().join("codex-home");
+    let config_toml = codex_home.join("config.toml");
+    ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, TOKEN_HEX).unwrap();
+
+    let thread_config =
+        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
+            .unwrap();
+    let mut child = Command::new("codex")
+        .args(["app-server", "--listen", "stdio://"])
+        .env("CODEX_HOME", &codex_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real codex app-server");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    write_app_server_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{
+                "clientInfo":{"name":"ccteam-real-http-smoke","version":"0"},
+                "capabilities":{"experimentalApi":true}
+            }
+        }),
+    )
+    .await;
+    let initialized = read_app_server_response(&mut stdout, 1).await;
+    assert!(
+        initialized.get("error").is_none(),
+        "initialize: {initialized}"
+    );
+    write_app_server_rpc(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","method":"initialized","params":null}),
+    )
+    .await;
+
+    write_app_server_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"thread/start",
+            "params":{
+                "cwd":tmp.path(),
+                "threadSource":"user",
+                "sessionStartSource":"startup",
+                "config":thread_config
+            }
+        }),
+    )
+    .await;
+    let started = read_app_server_response(&mut stdout, 2).await;
+    assert!(started.get("error").is_none(), "thread/start: {started}");
+    let thread_id = started
+        .pointer("/result/thread/id")
+        .or_else(|| started.pointer("/result/thread/threadId"))
+        .or_else(|| started.pointer("/result/thread/thread_id"))
+        .and_then(Value::as_str)
+        .expect("thread/start result carries thread id");
+
+    write_app_server_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"mcpServer/tool/call",
+            "params":{
+                "threadId":thread_id,
+                "server":"ccteam",
+                "tool":"session_spawn",
+                "arguments":{"vendor":"claude"}
+            }
+        }),
+    )
+    .await;
+    let called = read_app_server_response(&mut stdout, 3).await;
+    assert!(
+        called.get("error").is_none(),
+        "mcpServer/tool/call: {called}"
+    );
+    assert_ne!(called.pointer("/result/isError"), Some(&Value::Bool(true)));
+    let text = called
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("session_spawn returns MCP text content");
+    let spawned: Value = serde_json::from_str(text).expect("session_spawn result is JSON");
+    assert_eq!(spawned["ok"], true, "real Codex MCP call: {spawned}");
+    assert_eq!(
+        spawned["project"], "demo",
+        "session principal must derive project server-side"
+    );
+
+    child.kill().await.ok();
+    child.wait().await.ok();
 }
 
 /// A wrong secret or an unknown sid → 401 (the session bearer fails to resolve

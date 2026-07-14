@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{deny_non_admin, Identity};
+use crate::state::AppState;
 
 /// The id of this machine — the single host until the v0.9 host axis adds
 /// satellites.
@@ -506,8 +507,8 @@ pub struct RegisterMcpQuery {
 /// server into the vendor config(s). **Idempotent** (merge, never clobber)
 /// and the ONLY write this surface performs. ccteam executes nothing else:
 /// it never writes a vendor login/key and never installs a CLI. 404 for a
-/// non-`local` host; 400 for an unknown `vendor`; 500 if the binary path
-/// can't be resolved.
+/// non-`local` host; 400 for an unknown `vendor`; 500 if the vendor config or
+/// admin HTTP credential cannot be resolved.
 #[utoipa::path(
     post,
     path = "/api/v1/hosts/{host}/register-mcp",
@@ -520,10 +521,11 @@ pub struct RegisterMcpQuery {
         (status = 200, description = "Registered; `{registered:[vendor], paths:{vendor:path}}`", body = serde_json::Value),
         (status = 400, description = "Unknown vendor"),
         (status = 404, description = "Unknown host"),
-        (status = 500, description = "Cannot resolve the ccteam binary path"),
+        (status = 500, description = "Cannot resolve vendor config or MCP credentials"),
     ),
 )]
 pub(crate) async fn handle_register_mcp(
+    State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<RegisterMcpQuery>,
@@ -570,7 +572,12 @@ pub(crate) async fn handle_register_mcp(
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || register_mcp_blocking(want.as_deref())).await;
+    let token_path = app.paths.web_token_path();
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    let result = tokio::task::spawn_blocking(move || {
+        register_mcp_blocking(want.as_deref(), &token_path, &mcp_http_url)
+    })
+    .await;
     match result {
         Ok(Ok(paths)) => Json(serde_json::json!({
             "registered": paths.keys().collect::<Vec<_>>(),
@@ -600,19 +607,22 @@ pub(crate) async fn handle_register_mcp(
 /// `vendor → written-config-path` map. `want = None` registers every vendor.
 fn register_mcp_blocking(
     want: Option<&str>,
+    admin_token_path: &std::path::Path,
+    mcp_http_url: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    let bin = ccteam_core::current_ccteam_bin()?;
     let mut written = std::collections::BTreeMap::new();
     let do_vendor = |v: &str| want.is_none() || want == Some(v);
 
     if do_vendor("claude") {
+        let bin = ccteam_core::current_ccteam_bin()?;
         let path = ccteam_core::projects::resolve_claude_json_path()?;
         ccteam_core::mcp_register::install_mcp_into(&path, &bin)?;
         written.insert("claude".to_string(), path.display().to_string());
     }
     if do_vendor("codex") {
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::mcp_register::resolve_codex_config_path()?;
-        ccteam_core::mcp_register::install_codex_mcp_into(&path, &bin)?;
+        ccteam_core::mcp_register::install_codex_mcp_into(&path, mcp_http_url, &admin_token)?;
         written.insert("codex".to_string(), path.display().to_string());
     }
     Ok(written)

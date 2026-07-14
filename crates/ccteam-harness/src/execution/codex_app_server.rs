@@ -1616,23 +1616,17 @@ impl HarnessAdapter for CodexAppServerAdapter {
         self.reload_app_server_if_config_changed().await;
         let client = self.client().await?;
         let cwd_str = ctx.cwd.to_string_lossy().to_string();
-        // v0.9.0 W1 (G2, spike-verified codex 0.144.1) — inject the ccteam MCP
-        // server for THIS thread via `config.mcp_servers.ccteam` (snake_case,
-        // stdio form + identity env). The per-thread entry REPLACES a
-        // same-named global config entry (spike: one spawn, per-thread env
-        // wins), so the thread's ccteam server carries this session's
-        // sid/secret — caller identity intact. `None` (no secret) → fall
-        // through to the daemon's global config (identity-less). NOT a
-        // system-prompt injection; the developerInstructions line is unchanged.
-        let ccteam_bin =
-            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
-        let mcp_config = crate::execution::mcp_config::codex_thread_mcp_config(
-            &ctx.sid,
-            &ctx.secret,
-            &spec.role,
-            &ctx.slug,
-            &ccteam_bin,
-        );
+        // Inject the ccteam MCP server for THIS thread via
+        // `config.mcp_servers.ccteam` (snake_case Codex config schema). The
+        // HTTP entry carries this session's sid/secret bearer directly to the
+        // daemon; codex 0.144.3 real-machine smoke verifies thread/start,
+        // tools/list, and the Authorization header. The global Codex entry is
+        // HTTP too, because Codex deep-merges same-named global/thread entries
+        // and rejects a mixed `command + url` transport. `None` (no secret) →
+        // fall through to the global admin HTTP entry. NOT a system-prompt
+        // injection; the developerInstructions line is unchanged.
+        let mcp_config =
+            crate::execution::mcp_config::codex_thread_mcp_config(&ctx.sid, &ctx.secret);
         let mut start_params = json!({
             "cwd": cwd_str,
             "threadSource": "user",

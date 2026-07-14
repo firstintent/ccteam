@@ -2773,10 +2773,10 @@ fn d2_5_every_codex_slash_command_is_builtin_or_rejected() {
     );
 }
 
-/// v0.9.0 W1 (G2, spike-verified codex 0.144.1) — a fresh `start_thread` with a
-/// non-empty secret injects the ccteam MCP server into `thread/start`'s
-/// `config.mcp_servers.ccteam` (snake_case, stdio + identity env), and persists
-/// the resulting thread id as `raw_extras.vendor_uuid` (G5, for resume).
+/// A fresh `start_thread` with a non-empty secret injects the ccteam HTTP MCP
+/// server into `thread/start.config.mcp_servers.ccteam` (snake_case Codex
+/// schema, per-session bearer) and persists the resulting thread id as
+/// `raw_extras.vendor_uuid` (G5, for resume).
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_injects_per_thread_mcp_config_with_identity() {
@@ -2835,15 +2835,23 @@ async fn start_thread_injects_per_thread_mcp_config_with_identity() {
         .expect("thread/start seen");
     let srv = &start["params"]["config"]["mcp_servers"]["ccteam"];
     assert_eq!(
-        srv["env"]["CCTEAM_CHAT_SID"], "codex-w1",
-        "per-thread config must carry the sid: {start}"
+        srv["url"],
+        ccteam_harness::execution::mcp_config::default_mcp_http_url(),
+        "per-thread config must target the daemon HTTP MCP endpoint: {start}"
     );
     assert_eq!(
-        srv["env"]["CCTEAM_CHAT_SECRET"], "seKret1234",
-        "per-thread config must carry the secret: {start}"
+        srv["http_headers"]["Authorization"], "Bearer ccteam-sid:codex-w1:seKret1234",
+        "per-thread config must carry the session principal: {start}"
     );
-    assert_eq!(srv["args"][0], "internal");
-    assert_eq!(srv["args"][1], "mcp-serve");
+    assert!(
+        srv.get("command").is_none(),
+        "must not spawn mcp-serve: {start}"
+    );
+    assert!(
+        srv.get("args").is_none(),
+        "must not spawn mcp-serve: {start}"
+    );
+    assert!(srv.get("env").is_none(), "identity rides HTTP: {start}");
 
     drop(peer);
     let _ = std::fs::remove_file(&sock);
@@ -2940,8 +2948,9 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         .unwrap_or_else(|| panic!("second start_thread must thread/resume: {seen:?}"));
     assert_eq!(resume["params"]["threadId"], "t-prior");
     assert_eq!(
-        resume["params"]["config"]["mcp_servers"]["ccteam"]["env"]["CCTEAM_CHAT_SID"], "codex-r1",
-        "resume must carry the per-thread ccteam config too"
+        resume["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"],
+        "Bearer ccteam-sid:codex-r1:seKret",
+        "resume must carry the per-thread HTTP principal too"
     );
     assert!(
         !seen.iter().any(|r| r["method"] == "thread/start"),

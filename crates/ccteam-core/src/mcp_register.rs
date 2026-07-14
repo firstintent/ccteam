@@ -68,16 +68,32 @@ pub fn install_mcp_into(claude_json: &Path, ccteam_bin: &Path) -> Result<()> {
     atomic_write(claude_json, body.as_bytes())
 }
 
-/// Codex equivalent of [`install_mcp_into`]: register the ccteam MCP server
-/// in Codex's `config.toml` as a `[mcp_servers.ccteam]` stdio table.
+/// Register the ccteam MCP server in Codex's `config.toml` as a
+/// `[mcp_servers.ccteam]` Streamable HTTP table.
 ///
 /// MERGE, never clobber: every other top-level key and every other
 /// `[mcp_servers.*]` entry is preserved; only `mcp_servers.ccteam` is
-/// set/replaced. Parent dir + file are created if absent. Idempotent.
-pub fn install_codex_mcp_into(config_toml: &Path, ccteam_bin: &Path) -> Result<()> {
-    let bin = ccteam_bin
-        .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8"))?;
+/// set/replaced. The admin token is the bare value stored in
+/// `~/.ccteam/secrets/web-token`; this writer adds the `ccteam:` wire prefix
+/// and `Bearer` scheme. Parent dir + file are created if absent. Idempotent.
+///
+/// The global entry intentionally uses the same HTTP transport as Codex's
+/// per-thread override. Codex 0.144.3 deep-merges those tables, so retaining a
+/// legacy global `command` while a thread adds `url` creates an invalid mixed
+/// transport and rejects `thread/start`.
+pub fn install_codex_mcp_into(
+    config_toml: &Path,
+    mcp_http_url: &str,
+    admin_token: &str,
+) -> Result<()> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
+    }
+    let token = admin_token.trim();
+    if token.is_empty() {
+        anyhow::bail!("ccteam admin web token must not be empty");
+    }
 
     // Parse the existing config (or start empty). A non-table / unparseable
     // root is treated as "start fresh" rather than failing the install,
@@ -107,25 +123,33 @@ pub fn install_codex_mcp_into(config_toml: &Path, ccteam_bin: &Path) -> Result<(
     }
     let servers = servers_entry.as_table_mut().expect("checked above");
 
-    // Build the ccteam server entry: command + shared args const.
+    // Replace the whole ccteam table so a prior stdio command/args/env cannot
+    // survive and combine with `url` under Codex's deep config merge.
     let mut entry = toml::Table::new();
-    entry.insert("command".to_string(), toml::Value::String(bin.to_string()));
-    entry.insert(
-        "args".to_string(),
-        toml::Value::Array(
-            crate::CCTEAM_MCP_SERVE_ARGS
-                .iter()
-                .map(|s| toml::Value::String((*s).to_string()))
-                .collect(),
-        ),
+    entry.insert("url".to_string(), toml::Value::String(url.to_string()));
+    let mut headers = toml::Table::new();
+    headers.insert(
+        "Authorization".to_string(),
+        toml::Value::String(format!("Bearer ccteam:{token}")),
     );
+    entry.insert("http_headers".to_string(), toml::Value::Table(headers));
     servers.insert(
         crate::CCTEAM_MCP_SERVER_KEY.to_string(),
         toml::Value::Table(entry),
     );
 
     let body = toml::to_string_pretty(&root).context("serialize codex config.toml")?;
-    atomic_write(config_toml, body.as_bytes())
+    atomic_write(config_toml, body.as_bytes())?;
+    // This table now carries the admin bearer. Keep Codex's config private
+    // even when the caller's umask would otherwise create a world-readable
+    // replacement during the atomic rewrite.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_toml, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", config_toml.display()))?;
+    }
+    Ok(())
 }
 
 /// Whether `~/.claude.json` already carries the ccteam MCP server entry.
@@ -144,7 +168,10 @@ pub fn claude_mcp_registered(claude_json: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether Codex's `config.toml` already carries `[mcp_servers.ccteam]`.
+/// Whether Codex's `config.toml` carries the current HTTP form of
+/// `[mcp_servers.ccteam]`. A legacy stdio entry deliberately reads as `false`
+/// so doctor/host readiness asks the operator to rerun `ccteam config mcp` and
+/// removes the `mcp-serve` child instead of declaring the old shape ready.
 /// Best-effort: a missing / unreadable / junk file reads as `false`.
 pub fn codex_mcp_registered(config_toml: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(config_toml) else {
@@ -153,10 +180,25 @@ pub fn codex_mcp_registered(config_toml: &Path) -> bool {
     let Ok(root) = toml::from_str::<toml::Table>(&body) else {
         return false;
     };
-    root.get("mcp_servers")
+    let Some(entry) = root
+        .get("mcp_servers")
         .and_then(toml::Value::as_table)
-        .map(|t| t.contains_key(crate::CCTEAM_MCP_SERVER_KEY))
-        .unwrap_or(false)
+        .and_then(|t| t.get(crate::CCTEAM_MCP_SERVER_KEY))
+        .and_then(toml::Value::as_table)
+    else {
+        return false;
+    };
+    entry
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+        && entry
+            .get("http_headers")
+            .and_then(toml::Value::as_table)
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| value.starts_with("Bearer ccteam:"))
+        && !entry.contains_key("command")
 }
 
 /// Resolve `$CODEX_HOME/config.toml` (CODEX_HOME → `~/.codex` fallback),
@@ -181,6 +223,12 @@ fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
+        }
         f.write_all(body)?;
     }
     std::fs::rename(&tmp, path)
@@ -240,34 +288,107 @@ mod tests {
             "model = \"o3\"\n[mcp_servers.other]\ncommand = \"x\"\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, &PathBuf::from("/x/ccteam")).unwrap();
+        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "admin-secret").unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(root["model"].as_str(), Some("o3"));
         assert_eq!(root["mcp_servers"]["other"]["command"].as_str(), Some("x"));
         assert_eq!(
-            root["mcp_servers"]["ccteam"]["command"].as_str(),
-            Some("/x/ccteam")
+            root["mcp_servers"]["ccteam"]["url"].as_str(),
+            Some("http://127.0.0.1:7331/mcp")
         );
+        assert_eq!(
+            root["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer ccteam:admin-secret")
+        );
+        assert!(root["mcp_servers"]["ccteam"].get("command").is_none());
     }
 
     #[test]
     fn install_codex_mcp_into_is_idempotent_and_creates_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
-        install_codex_mcp_into(&config_toml, &PathBuf::from("/x/ccteam")).unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "token-a").unwrap();
         assert!(!codex_mcp_registered(
             &config_toml.with_file_name("absent.toml")
         ));
         assert!(codex_mcp_registered(&config_toml), "after install → true");
         // Second install must not error or duplicate.
-        install_codex_mcp_into(&config_toml, &PathBuf::from("/y/ccteam")).unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7444/mcp", "token-b").unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(
-            root["mcp_servers"]["ccteam"]["command"].as_str(),
-            Some("/y/ccteam"),
-            "idempotent re-install replaces only the ccteam command"
+            root["mcp_servers"]["ccteam"]["url"].as_str(),
+            Some("http://localhost:7444/mcp"),
+            "idempotent re-install replaces only the ccteam HTTP entry"
+        );
+        assert_eq!(
+            root["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].as_str(),
+            Some("Bearer ccteam:token-b")
+        );
+    }
+
+    #[test]
+    fn codex_mcp_registered_rejects_legacy_stdio_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_toml,
+            "[mcp_servers.ccteam]\ncommand = \"ccteam\"\nargs = [\"internal\", \"mcp-serve\"]\n",
+        )
+        .unwrap();
+        assert!(!codex_mcp_registered(&config_toml));
+        install_codex_mcp_into(&config_toml, "http://localhost/mcp", "token").unwrap();
+        assert!(codex_mcp_registered(&config_toml));
+    }
+
+    #[test]
+    fn install_codex_mcp_into_replaces_legacy_stdio_entry_atomically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_toml,
+            "[mcp_servers.ccteam]\ncommand = \"/old/ccteam\"\nargs = [\"internal\", \"mcp-serve\"]\nenv = { CCTEAM_CHAT_SID = \"stale\" }\n",
+        )
+        .unwrap();
+
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "fresh").unwrap();
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
+        let entry = root["mcp_servers"]["ccteam"].as_table().unwrap();
+        assert_eq!(
+            entry.get("url").and_then(toml::Value::as_str),
+            Some("http://localhost:7331/mcp")
+        );
+        assert!(!entry.contains_key("command"));
+        assert!(!entry.contains_key("args"));
+        assert!(!entry.contains_key("env"));
+    }
+
+    #[test]
+    fn install_codex_mcp_into_rejects_missing_http_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        assert!(install_codex_mcp_into(&config_toml, "", "token").is_err());
+        assert!(install_codex_mcp_into(&config_toml, "http://localhost/mcp", " ").is_err());
+        assert!(!config_toml.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_codex_mcp_into_makes_token_bearing_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        install_codex_mcp_into(&config_toml, "http://localhost/mcp", "secret").unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_toml)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 }

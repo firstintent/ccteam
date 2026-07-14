@@ -168,43 +168,53 @@ pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
 }
 
 /// Codex `thread/start` / `thread/resume` `config` override injecting the
-/// ccteam MCP server for THIS thread only (verified on codex 0.144.1, W1
-/// spike): `{"mcp_servers": {"ccteam": {command, args, env}}}` (snake_case,
-/// mirroring `~/.codex/config.toml`). The per-thread entry REPLACES a
-/// same-named global entry (spike: one spawn, per-thread env wins), so the
-/// thread's ccteam server carries the caller's identity env. stdio form (the
-/// spawned `ccteam internal mcp-serve` bridges to the daemon socket + forwards
-/// the identity); the daemon-singleton app-server topology is unchanged.
-/// `None` when sid/secret is empty (fall through to the daemon's global config,
-/// identity-less) — never an empty override that would strip tools.
-pub fn codex_thread_mcp_config(
-    sid: &str,
-    secret: &str,
-    role: &str,
-    slug: &str,
-    ccteam_bin: &Path,
-) -> Option<Value> {
+/// ccteam MCP server for THIS thread only. Codex 0.144.3 real-machine smoke
+/// verifies this exact snake_case shape:
+/// `{"mcp_servers":{"ccteam":{"url", "http_headers"}}}`.
+///
+/// The global Codex entry must also be HTTP. Codex deep-merges a per-thread
+/// server override with the same-named global entry; a legacy global stdio
+/// `command` plus this `url` is rejected as a mixed transport. With both sides
+/// HTTP, the per-thread Authorization value replaces the global admin bearer
+/// and carries this session's `(sid, secret)` principal directly to `/mcp`.
+/// No per-thread `ccteam internal mcp-serve` child is spawned.
+///
+/// `None` when sid/secret is empty (fall through to the daemon's global HTTP
+/// config, authenticated as admin) — never an empty override that strips tools.
+pub fn codex_thread_mcp_config(sid: &str, secret: &str) -> Option<Value> {
+    let url = default_mcp_http_url();
+    codex_thread_mcp_config_at(sid, secret, &url)
+}
+
+/// Explicit-URL seam for deterministic integration tests and non-default
+/// daemon binds. Production callers normally use [`codex_thread_mcp_config`].
+pub fn codex_thread_mcp_config_at(sid: &str, secret: &str, http_url: &str) -> Option<Value> {
     if sid.is_empty() || secret.is_empty() {
         return None;
     }
-    let bin = ccteam_bin.to_string_lossy();
+    let url = http_url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let bearer = session_mcp_bearer(sid, secret);
     Some(json!({
         "mcp_servers": {
             "ccteam": {
-                "command": bin,
-                "args": ["internal", "mcp-serve"],
-                "env": bridge_stdio_env(sid, secret, role, slug),
+                "url": url,
+                "http_headers": {
+                    "Authorization": format!("Bearer {bearer}"),
+                },
             }
         }
     }))
 }
 
 /// Env map for the stdio `ccteam internal mcp-serve` bridge that a vendor
-/// (codex `thread/start.config.mcp_servers`, or claude stdio-mode `mcp.json`)
-/// spawns for a session. Carries the per-session identity (`CCTEAM_CHAT_*`) AND
+/// (currently only Claude's explicit stdio-mode `mcp.json`) spawns for a
+/// session. Carries the per-session identity (`CCTEAM_CHAT_*`) AND
 /// **propagates the daemon's `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT`** when set:
-/// a vendor may spawn the MCP server with ONLY this map as its environment
-/// (codex replaces, not merges), so without these the bridge would resolve
+/// a vendor may spawn the MCP server with ONLY this map as its environment, so
+/// without these the bridge would resolve
 /// `~/.ccteam/run/mcp.sock` (the DEFAULT home) instead of the daemon's actual
 /// socket — connecting a delegated session to the wrong daemon under any
 /// non-default `CCTEAM_HOME`. Production (default home) is unaffected; this
@@ -311,20 +321,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_thread_config_snake_case_stdio_with_identity_env() {
-        let v = codex_thread_mcp_config("s7", "sek", "reviewer", "demo", Path::new("/opt/ccteam"))
-            .expect("non-empty secret -> Some config");
-        // snake_case `mcp_servers` (codex config.toml schema), stdio form.
+    fn codex_thread_config_snake_case_http_with_session_bearer() {
+        let v = codex_thread_mcp_config_at("s7", "sek", "http://127.0.0.1:7331/mcp")
+            .expect("non-empty principal -> Some config");
+        // Codex config.toml schema: snake_case `mcp_servers`, HTTP fields are
+        // `url` + `http_headers` (not Claude's `type` + `headers`).
         let srv = &v["mcp_servers"]["ccteam"];
-        assert_eq!(srv["command"], "/opt/ccteam");
-        assert_eq!(srv["args"][0], "internal");
-        assert_eq!(srv["args"][1], "mcp-serve");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_SID"], "s7");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_SECRET"], "sek");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_ROLE"], "reviewer");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_SLUG"], "demo");
-        // Empty secret / sid -> None (no override; daemon global config used).
-        assert!(codex_thread_mcp_config("s7", "", "r", "d", Path::new("/x")).is_none());
-        assert!(codex_thread_mcp_config("", "sek", "r", "d", Path::new("/x")).is_none());
+        assert_eq!(srv["url"], "http://127.0.0.1:7331/mcp");
+        assert_eq!(
+            srv["http_headers"]["Authorization"],
+            "Bearer ccteam-sid:s7:sek"
+        );
+        assert!(srv.get("command").is_none());
+        assert!(srv.get("args").is_none());
+        assert!(srv.get("env").is_none());
+        // Empty secret / sid / URL -> None (global HTTP config remains).
+        assert!(codex_thread_mcp_config_at("s7", "", "http://localhost/mcp").is_none());
+        assert!(codex_thread_mcp_config_at("", "sek", "http://localhost/mcp").is_none());
+        assert!(codex_thread_mcp_config_at("s7", "sek", " ").is_none());
     }
 }

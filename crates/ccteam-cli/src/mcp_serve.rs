@@ -353,20 +353,26 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
 /// Codex equivalent of [`install_mcp_into`].
 pub fn install_codex_mcp_into(
     config_toml: &std::path::Path,
-    ccteam_bin: &std::path::Path,
+    mcp_http_url: &str,
+    admin_token: &str,
 ) -> Result<()> {
-    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, ccteam_bin)
+    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, mcp_http_url, admin_token)
 }
 
-/// Production path for Codex MCP install.
+/// Production path for Codex MCP install. Unlike Claude's historical global
+/// stdio entry, Codex uses the daemon's HTTP MCP endpoint. The global entry is
+/// authenticated with the admin web token; ccteam-managed Codex threads
+/// override that header with their per-session bearer.
 pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
         .ok_or_else(|| anyhow!("cannot resolve CODEX_HOME or ~/.codex (no home dir)"))?;
     let config_toml = codex_home.join("config.toml");
-    let bin = ccteam_core::current_ccteam_bin()?;
-    install_codex_mcp_into(&config_toml, &bin)?;
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
     Ok(config_toml)
 }
 
@@ -477,24 +483,23 @@ mod tests {
     }
 
     #[test]
-    fn install_codex_mcp_into_writes_command_and_shared_args() {
+    fn install_codex_mcp_into_writes_http_url_and_admin_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
-        install_codex_mcp_into(&config_toml, &ccteam_bin).unwrap();
+        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
         let body = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(
-            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
-            "/usr/local/bin/ccteam"
+            v["mcp_servers"]["ccteam"]["url"].as_str().unwrap(),
+            "http://127.0.0.1:7331/mcp"
         );
-        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_str().unwrap())
-            .collect();
-        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
+        assert_eq!(
+            v["mcp_servers"]["ccteam"]["http_headers"]["Authorization"]
+                .as_str()
+                .unwrap(),
+            "Bearer ccteam:admin-token"
+        );
+        assert!(v["mcp_servers"]["ccteam"].get("command").is_none());
     }
 
     #[test]
@@ -506,7 +511,7 @@ mod tests {
             "model = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"foo-server\"\nargs = [\"--flag\"]\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(v["model"].as_str().unwrap(), "gpt-5");
@@ -519,16 +524,9 @@ mod tests {
             "--flag"
         );
         assert_eq!(
-            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
-            "/x/ccteam"
+            v["mcp_servers"]["ccteam"]["url"].as_str().unwrap(),
+            "http://localhost:7331/mcp"
         );
-        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_str().unwrap())
-            .collect();
-        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
     }
 
     #[test]
@@ -540,33 +538,20 @@ mod tests {
             "[mcp_servers.ccteam]\ncommand = \"/old/bin/ccteam\"\nargs = [\"mcp-serve\"]\n\n[mcp_servers.playwright]\ncommand = \"npx\"\n",
         )
         .unwrap();
-        install_codex_mcp_into(
-            &config_toml,
-            &std::path::PathBuf::from("/usr/local/bin/ccteam"),
-        )
-        .unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
         let first = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&first).unwrap();
         assert_eq!(
-            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
-            "/usr/local/bin/ccteam"
+            v["mcp_servers"]["ccteam"]["url"].as_str().unwrap(),
+            "http://localhost:7331/mcp"
         );
-        let args: Vec<&str> = v["mcp_servers"]["ccteam"]["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_str().unwrap())
-            .collect();
-        assert_eq!(args, ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec());
+        assert!(v["mcp_servers"]["ccteam"].get("command").is_none());
+        assert!(v["mcp_servers"]["ccteam"].get("args").is_none());
         assert_eq!(
             v["mcp_servers"]["playwright"]["command"].as_str().unwrap(),
             "npx"
         );
-        install_codex_mcp_into(
-            &config_toml,
-            &std::path::PathBuf::from("/usr/local/bin/ccteam"),
-        )
-        .unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
         let second = std::fs::read_to_string(&config_toml).unwrap();
         assert_eq!(first, second);
     }
@@ -576,13 +561,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
         assert!(!config_toml.exists());
-        install_codex_mcp_into(&config_toml, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
         assert!(config_toml.exists());
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(
-            v["mcp_servers"]["ccteam"]["command"].as_str().unwrap(),
-            "/x/ccteam"
+            v["mcp_servers"]["ccteam"]["url"].as_str().unwrap(),
+            "http://localhost:7331/mcp"
         );
     }
 

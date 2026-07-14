@@ -28,7 +28,7 @@ Two identities, both end at the same daemon gate:
 | Caller | Identity | Scope |
 |---|---|---|
 | **ccteam-spawned session** | per-session `(sid, secret)` principal, minted at spawn, injected via the session's curated MCP config | its **own project** only; delegation guardrails apply (depth, fan-out, cycles, budget) |
-| **Plain main session** — the `claude` / `codex` you launched yourself | same-user admin fallback: the stdio forwarder reads the admin web token (`~/.ccteam/secrets/web-token`, 0600) and the daemon verifies it | fleet-wide; `session_spawn` targets the project resolved from your **working directory** (or an explicit `project` arg); spawns are roots of new delegation trees |
+| **Plain main session** — the `claude` / `codex` you launched yourself | same-user admin registration: Codex uses the global HTTP MCP entry + admin bearer; Claude's existing global stdio bridge reads the same token (`~/.ccteam/secrets/web-token`, 0600) | fleet-wide; `session_spawn` targets the project resolved from your **working directory** (or an explicit `project` arg); spawns are roots of new delegation trees |
 
 Practical consequences for the main-session case:
 
