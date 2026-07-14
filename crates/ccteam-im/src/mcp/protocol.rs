@@ -177,7 +177,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "ccteam__session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Drive it with session_dispatch and read its output with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -201,7 +201,10 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "description": "Permission posture (default `skip`). `hitl` (human-in-the-loop) makes a non-allowlist tool call pop an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt."
                     },
                     "title": { "type": "string", "description": "Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt." },
-                    "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-project, within ~1h) replays the ORIGINAL spawn (same sid, zero side effects) instead of creating a second session — safe against MCP-client timeouts. In-memory only: a daemon restart forgets keys." }
+                    "task": { "type": "string", "description": "Optional FIRST task — dispatched to the fresh child in the same call, exactly like session_dispatch{sid, task} (verbatim user turn, no injection). Omit to spawn only." },
+                    "wait_seconds": { "type": "integer", "description": "With `task`: block up to this many seconds (0–600, default 0 = async) for the child's answer, returning it inline (`status:completed`, `result_text`); on timeout returns `status:pending` and the child keeps running." },
+                    "notify": { "type": "boolean", "description": "With `task`: when true (default), ccteam wakes you with a completion-notification turn once the child's first turn completes. Set false for ledger-only." },
+                    "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-project, within ~1h) replays the ORIGINAL spawn (same sid + same dispatch outcome, zero side effects) instead of creating a second session — safe against MCP-client timeouts. In-memory only: a daemon restart forgets keys." }
                 },
                 "required": [],
             }),
@@ -224,20 +227,21 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "ccteam__session_collect",
-            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns plus the child's `vendor_session_id` (native resume key), `status` (live/idle/stopped), and accrued `cost_usd`. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Returns an empty `turns` array when the target hasn't answered yet.",
+            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns plus the child's `vendor_session_id` (native resume key), `activity` (`working` = mid-turn / `idle` = turn done / `stale` / `stuck` — poll on `working`, read on `idle`), and accrued `cost_usd`. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Default paging is OLDEST-first (page forward with `cursor`); pass `tail:true` for the NEWEST `n` turns instead (the \"just give me the final answer\" shape). Returns an empty `turns` array when the target hasn't answered yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "sid": { "type": "string", "description": "Gateway session id (`s{n}`) to collect from." },
                     "since": { "type": "string", "description": "Optional turn_id cursor — return only assistant turns recorded AFTER this id." },
-                    "n": { "type": "integer", "description": "Max turns to return (default 20). Applied after the `since` cursor filter." }
+                    "n": { "type": "integer", "description": "Max turns to return (default 20). Applied after the `since` cursor filter." },
+                    "tail": { "type": "boolean", "description": "When true, return the NEWEST `n` turns (after the `since` filter) instead of the oldest — use to grab the final answer of a long transcript without paging." }
                 },
                 "required": ["sid"],
             }),
         }),
         json!({
             "name": "ccteam__session_list",
-            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`, plus the delegation `parent_sid` (null for a root), `host`, `cost_usd`, and `title`. The response also includes a `tree` field (roots → children by `parent_sid`) so you can see the delegation topology. Use this to find a `sid` to dispatch to or collect from.",
+            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`, `activity` (`working` = mid-turn / `idle` / `stale` / `stuck` — the honest busy signal), `waiting_approval` (a hitl session blocked on a human approve/deny), plus the delegation `parent_sid` (null for a root), `host`, `cost_usd`, and `title`. The response also includes a `tree` field (roots → children by `parent_sid`) so you can see the delegation topology. Use this to find a `sid` to dispatch to or collect from.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {},

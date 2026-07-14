@@ -172,8 +172,18 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
-        // New facets present; protocol enum excludes terminal.
-        for key in ["model", "effort", "protocol", "host", "title"] {
+        // New facets present; protocol enum excludes terminal. v0.9.1 adds the
+        // one-call spawn+dispatch trio (task / wait_seconds / notify).
+        for key in [
+            "model",
+            "effort",
+            "protocol",
+            "host",
+            "title",
+            "task",
+            "wait_seconds",
+            "notify",
+        ] {
             assert!(props[key].is_object(), "schema must carry `{key}`");
         }
         let protos: Vec<&str> = props["protocol"]["enum"]

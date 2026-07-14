@@ -12,24 +12,68 @@ vi.hoisted(() => {
   }
 });
 
-import AgentsView, { AgentsGraphSvg } from "./AgentsView";
+import AgentsView, { AgentsGraphSvg, AgentsRoster } from "./AgentsView";
 import { computeAgentsLayout } from "../lib/agentsLayout";
+import { flattenDelegationTree } from "../lib/agentsTree";
 import type { AgentEdge, AgentNode } from "../lib/agentsApi";
 
 describe("AgentsView (shell smoke)", () => {
-  it("renders the team-view container + header (data loads async, never under SSR)", () => {
+  it("renders the team-view container, KPI strip + tabs (data loads async, never under SSR)", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(<AgentsView />);
     expect(html).toContain('data-testid="agents-view"');
     expect(html).toContain('data-testid="agents-canvas"');
-    expect(html).toContain('data-testid="agents-timeline"');
+    expect(html).toContain('data-testid="agents-kpis"');
+    expect(html).toContain('data-testid="agents-tab-roster"');
+    expect(html).toContain('data-testid="agents-tab-timeline"');
+    expect(html).toContain('data-testid="agents-tab-topology"');
     expect(html).toContain("团队");
+  });
+
+  it("the timeline tab renders the timeline strip", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(<AgentsView initialTab="timeline" />);
+    expect(html).toContain('data-testid="agents-timeline"');
   });
 
   it("renders in English when lang='en'", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(<AgentsView lang="en" />);
     expect(html).toContain("Team");
+  });
+});
+
+describe("AgentsRoster (pure presentational, fixture-driven)", () => {
+  function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
+    return {
+      sid: "s0",
+      slug: "demo",
+      role: "brain",
+      vendor: "claude",
+      host: "local",
+      status: "live",
+      depth: 0,
+      last_active: "2026-01-01T00:00:00Z",
+      turn_count: 3,
+      ...over,
+    };
+  }
+
+  it("renders one row per session, children indented under parents", () => {
+    const rows = flattenDelegationTree([
+      fixtureNode({ sid: "s0" }),
+      fixtureNode({ sid: "s1", parent_sid: "s0", vendor: "codex", cost_usd: 0.42 }),
+    ]);
+    const html = renderToString(
+      <AgentsRoster rows={rows} selected="s1" pulsing={new Set(["s0"])} onSelect={() => {}} />,
+    );
+    expect(html).toContain('data-testid="agents-roster"');
+    expect(html).toContain('data-testid="agents-roster-row-s0"');
+    expect(html).toContain('data-testid="agents-roster-row-s1"');
+    // Selected row carries the class; costs render; child is elbow-indented.
+    expect(html).toMatch(/agents-roster-row selected"[^>]*data-testid="agents-roster-row-s1"/);
+    expect(html).toContain("$0.4200");
+    expect(html).toContain("agents-roster-elbow");
   });
 });
 

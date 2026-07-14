@@ -1063,6 +1063,25 @@ async fn run_session_spawn(
             ));
         }
     }
+    // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
+    // call (the dominant flow; saves the second round-trip and closes the
+    // crash window between a spawn and its first dispatch). Identical
+    // semantics to session_dispatch{sid, task}: async by default with a
+    // completion notification; `wait_seconds` blocks inline; `notify:false`
+    // opts out. Cycle checks are moot for a fresh child; the spawn guardrails
+    // (depth/children/delegated/budget) below already gate the delegation.
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(600);
+    let notify = args.get("notify").and_then(|v| v.as_bool()).unwrap_or(true);
     // Owner = the shared ops pool (`web-api`): MCP-spawned children stay visible
     // to the owner's console + IM. Owner is NOT inherited from the caller — the
     // parent link is a `meta.parent_sid` property (v0.9.0 W2), not an owner change.
@@ -1106,6 +1125,9 @@ async fn run_session_spawn(
         }
         McpCaller::Admin => None,
     };
+    // The dispatcher identity for an optional first `task` (captured before
+    // `parent` moves into the create call).
+    let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
 
     // Check idempotency + create under ONE lock so a concurrent same-key retry
     // can never race past the replay into a second spawn.
@@ -1188,11 +1210,34 @@ async fn run_session_spawn(
         "delegation_depth": delegation_depth,
         "hint": "dispatch a task with session_dispatch{sid, task}, then read the result with session_collect{sid}.",
     });
-    if let Some(t) = title {
+    if let Some(t) = &title {
         body["title"] = serde_json::json!(t);
     }
     if let Some(model_warning) = model_warning {
         body["model_warning"] = serde_json::json!(model_warning);
+    }
+    // v0.9.1 — dispatch the optional first task through the SAME submit path
+    // session_dispatch uses; its outcome (turn_id / status / inline result /
+    // hint) merges into the spawn body so one call returns everything. The
+    // caller's parent link doubles as the dispatcher identity (empty = admin,
+    // ledger-only submit without a watch).
+    if let Some(task) = task {
+        let dispatcher_sid = parent_sid_for_task.as_deref().unwrap_or("");
+        let frag = dispatch_task(
+            gateway,
+            "session_spawn",
+            dispatcher_sid,
+            &sid,
+            task,
+            wait_seconds,
+            notify,
+            title.clone(),
+        )
+        .await?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("hint");
+            obj.extend(frag);
+        }
     }
     let out = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string());
     // v0.9.0 W2 (F7) — record for idempotent replay (the exact body a retry
@@ -1374,7 +1419,50 @@ async fn run_session_dispatch(
         }
     }
 
-    // ---- Scope 2: subscribe (if waiting) → submit → arm watch → emit ----
+    // ---- Scope 2 + wait: the shared submit half (also used by spawn{task}) ----
+    let frag = dispatch_task(
+        gateway,
+        "session_dispatch",
+        &caller_sid,
+        &sid,
+        task,
+        wait_seconds,
+        notify,
+        title,
+    )
+    .await?;
+    let mut body = serde_json::json!({ "ok": true, "sid": sid });
+    if let Some(obj) = body.as_object_mut() {
+        obj.extend(frag);
+    }
+    let out = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string());
+    // v0.9.0 W2 (F7) — record for idempotent replay.
+    if let Some(key) = idem_key.as_deref() {
+        gateway.lock().await.dispatch_idem_record(&sid, key, &out);
+    }
+    Ok(out)
+}
+
+/// v0.9.1 delegation-ergonomics — the shared submit half of a dispatch, used
+/// by BOTH `session_dispatch` and `session_spawn{task}` (one-call
+/// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
+/// submit the task as a verbatim user turn → arm the delegation watch (agent
+/// callers only; `caller_sid` empty = admin, no watch) → emit
+/// `delegation_dispatched` → optionally block inline for the child's answer.
+/// Returns the response FRAGMENT (`turn_id`/`status`/result fields/`hint`)
+/// the caller merges into its own body; `tool` prefixes error strings.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_task(
+    gateway: &GatewayHandle,
+    tool: &str,
+    caller_sid: &str,
+    sid: &str,
+    task: String,
+    wait_seconds: u64,
+    notify: bool,
+    title: Option<String>,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
+    let is_delegation = !caller_sid.is_empty();
     let (turn_id, rx) = {
         let mut gw = gateway.lock().await;
         // Subscribe BEFORE submitting so a fast child can't answer before we
@@ -1385,23 +1473,23 @@ async fn run_session_dispatch(
             None
         };
         let turn_id = gw
-            .submit_to_sid(&sid, task)
+            .submit_to_sid(sid, task)
             .await
-            .map_err(|e| format!("session_dispatch failed: {e}"))?;
+            .map_err(|e| format!("{tool} failed: {e}"))?;
         if is_delegation {
             gw.arm_delegation_watch(
-                &sid,
-                &caller_sid,
+                sid,
+                caller_sid,
                 notify,
                 title.clone(),
                 Some(turn_id.clone()),
             );
-            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(&sid) {
+            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
                 gw.emit_delegation_progress(
                     &slug,
                     ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
-                    &caller_sid,
-                    &sid,
+                    caller_sid,
+                    sid,
                     vendor,
                     &host,
                     Some(&turn_id),
@@ -1414,23 +1502,23 @@ async fn run_session_dispatch(
     };
 
     // ---- wait branch (OFF the gateway lock) ----
-    let out = if let Some(rx) = rx {
-        dispatch_wait_for_completion(gateway, &sid, &turn_id, wait_seconds, rx, is_delegation).await
+    if let Some(rx) = rx {
+        Ok(
+            dispatch_wait_for_completion(gateway, sid, &turn_id, wait_seconds, rx, is_delegation)
+                .await,
+        )
     } else {
-        serde_json::to_string_pretty(&serde_json::json!({
-            "ok": true,
-            "sid": sid,
-            "turn_id": turn_id,
-            "status": "dispatched",
-            "hint": "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid}).",
-        }))
-        .unwrap_or_else(|_| "{}".to_string())
-    };
-    // v0.9.0 W2 (F7) — record for idempotent replay.
-    if let Some(key) = idem_key.as_deref() {
-        gateway.lock().await.dispatch_idem_record(&sid, key, &out);
+        let mut m = serde_json::Map::new();
+        m.insert("turn_id".to_string(), serde_json::json!(turn_id));
+        m.insert("status".to_string(), serde_json::json!("dispatched"));
+        m.insert(
+            "hint".to_string(),
+            serde_json::json!(
+                "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid})."
+            ),
+        );
+        Ok(m)
     }
-    Ok(out)
 }
 
 /// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits an
@@ -1447,7 +1535,7 @@ async fn dispatch_wait_for_completion(
     wait_seconds: u64,
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
-) -> String {
+) -> serde_json::Map<String, serde_json::Value> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
     let completed = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1471,14 +1559,16 @@ async fn dispatch_wait_for_completion(
     };
 
     if !completed {
-        return serde_json::to_string_pretty(&serde_json::json!({
-            "ok": true,
-            "sid": child_sid,
-            "turn_id": turn_id,
-            "status": "pending",
-            "hint": "still running; you will be notified on completion, or poll session_collect{sid}.",
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
+        let mut m = serde_json::Map::new();
+        m.insert("turn_id".to_string(), serde_json::json!(turn_id));
+        m.insert("status".to_string(), serde_json::json!("pending"));
+        m.insert(
+            "hint".to_string(),
+            serde_json::json!(
+                "still running; you will be notified on completion, or poll session_collect{sid}."
+            ),
+        );
+        return m;
     }
 
     // Resolve the child (sync) under a brief lock, then read its transcript
@@ -1511,18 +1601,15 @@ async fn dispatch_wait_for_completion(
         gateway.lock().await.disarm_delegation_watch(child_sid);
     }
 
-    let mut body = serde_json::json!({
-        "ok": true,
-        "sid": child_sid,
-        "turn_id": turn_id,
-        "status": "completed",
-        "result_text": result_text,
-        "result_turn": result_turn,
-    });
+    let mut m = serde_json::Map::new();
+    m.insert("turn_id".to_string(), serde_json::json!(turn_id));
+    m.insert("status".to_string(), serde_json::json!("completed"));
+    m.insert("result_text".to_string(), serde_json::json!(result_text));
+    m.insert("result_turn".to_string(), serde_json::json!(result_turn));
     if let Some(c) = cost_usd {
-        body["cost_usd"] = serde_json::json!(c);
+        m.insert("cost_usd".to_string(), serde_json::json!(c));
     }
-    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
+    m
 }
 
 /// v0.8.7 review-fix (R-L3) — pure paging core of [`run_session_collect`],
@@ -1541,6 +1628,7 @@ fn page_collected_turns(
     all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
     since: Option<&str>,
     n: usize,
+    tail: bool,
 ) -> (Vec<serde_json::Value>, Option<String>, bool) {
     let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match since {
         Some(cursor) => match all.iter().position(|t| t.turn_id == cursor) {
@@ -1563,13 +1651,43 @@ fn page_collected_turns(
         })
         .collect();
     let truncated = rows.len() > n;
-    rows.truncate(n);
+    if tail {
+        // v0.9.1 — the "final answer" shape: keep the NEWEST n (chronological
+        // order preserved inside the page).
+        let drop = rows.len().saturating_sub(n);
+        rows.drain(..drop);
+    } else {
+        rows.truncate(n);
+    }
     let last_turn_id = rows
         .last()
         .and_then(|r| r.get("turn_id"))
         .and_then(|v| v.as_str())
         .map(String::from);
     (rows, last_turn_id, truncated)
+}
+
+/// v0.9.1 — honest per-sid activity for the MCP surfaces: classify the
+/// session's progress stream the SAME way the web session list does
+/// (`ccteam_core::stall`, → `working|idle|stale|stuck`), so a polling parent
+/// can tell "child still thinking" from "turn done" without scraping
+/// anything. Best-effort: any read miss degrades to `None` (field omitted).
+fn classify_session_activity(slug: &str, sid: &str) -> Option<String> {
+    let paths = ccteam_core::CcteamPaths::from_env().ok()?;
+    let silent_seconds = ccteam_core::collect_projects(&paths)
+        .ok()?
+        .into_iter()
+        .find(|p| p.state.slug == slug)
+        .map(|p| p.stall_silent_seconds)?;
+    let events =
+        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
+    let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+        &events,
+        sid,
+        silent_seconds,
+        chrono::Utc::now(),
+    );
+    Some(activity.status.activity.to_string())
 }
 
 /// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
@@ -1587,6 +1705,7 @@ async fn run_session_collect(
         .and_then(|v| v.as_u64())
         .map(|x| x as usize)
         .unwrap_or(SESSION_COLLECT_DEFAULT_N);
+    let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("session_collect", args, gateway, &sid, caller).await?;
 
@@ -1623,8 +1742,9 @@ async fn run_session_collect(
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
 
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
-    // drop of a > `n` burst). Pure logic in `page_collected_turns`.
-    let (rows, last_turn_id, truncated) = page_collected_turns(&all, since.as_deref(), n);
+    // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
+    // `page_collected_turns`.
+    let (rows, last_turn_id, truncated) = page_collected_turns(&all, since.as_deref(), n, tail);
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -1642,6 +1762,12 @@ async fn run_session_collect(
     });
     if let Some(c) = cost_usd {
         body["cost_usd"] = serde_json::json!(c);
+    }
+    // v0.9.1 — honest per-sid activity (same classifier the web session list
+    // uses): `working` = the child is mid-turn (keep polling), `idle` = the
+    // turn is done. Best-effort: a read miss just omits the field.
+    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid) {
+        body["activity"] = serde_json::json!(activity);
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
     if caller == McpCaller::Ambient && !rows.is_empty() {
@@ -1674,9 +1800,33 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
         let gw = gateway.lock().await;
         gw.session_views()
     };
+    // v0.9.1 — honest activity per row (same classifier as the web session
+    // list): one progress read per DISTINCT project, not per session.
+    let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
+        std::collections::HashMap::new();
+    if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
+        if let Ok(projects) = ccteam_core::collect_projects(&paths) {
+            for p in projects {
+                if views.iter().any(|v| v.project == p.state.slug) {
+                    let events = ccteam_core::progress::read_all_events(
+                        &paths.progress_jsonl(&p.state.slug),
+                    )
+                    .unwrap_or_default();
+                    activity_ctx.insert(p.state.slug.clone(), (events, p.stall_silent_seconds));
+                }
+            }
+        }
+    }
+    let now = chrono::Utc::now();
     let rows: Vec<serde_json::Value> = views
         .iter()
         .map(|v| {
+            let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
+                ccteam_core::stall::classify_progress_activity_for_sid(events, &v.sid, *silent, now)
+                    .status
+                    .activity
+                    .to_string()
+            });
             serde_json::json!({
                 "sid": v.sid,
                 "project": v.project,
@@ -1684,6 +1834,10 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
                 "vendor": v.vendor,
                 "current": v.current,
                 "status": v.status,
+                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`)
+                // + the hitl blocked-on-human flag.
+                "activity": activity,
+                "waiting_approval": v.waiting_approval,
                 // v0.9.0 W2 (F2) — delegation topology + attribution.
                 "parent_sid": v.parent_sid,
                 "delegation_depth": v.delegation_depth,
@@ -2604,7 +2758,7 @@ mod session_tool_tests {
     fn page_collected_turns_pages_a_burst_without_loss() {
         let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
         // First poll, no cursor, page size 10.
-        let (rows, cursor, truncated) = page_collected_turns(&all, None, 10);
+        let (rows, cursor, truncated) = page_collected_turns(&all, None, 10, false);
         assert_eq!(rows.len(), 10);
         assert!(truncated, "25 > 10 ⇒ truncated");
         assert_eq!(rows[0]["turn_id"], "t0", "oldest-first (not the newest 10)");
@@ -2612,7 +2766,7 @@ mod session_tool_tests {
         assert_eq!(cursor.as_deref(), Some("t9"), "cursor = boundary turn");
 
         // Second poll from the boundary.
-        let (rows2, cursor2, truncated2) = page_collected_turns(&all, Some("t9"), 10);
+        let (rows2, cursor2, truncated2) = page_collected_turns(&all, Some("t9"), 10, false);
         assert_eq!(rows2.len(), 10);
         assert!(truncated2);
         assert_eq!(
@@ -2622,7 +2776,7 @@ mod session_tool_tests {
         assert_eq!(cursor2.as_deref(), Some("t19"));
 
         // Third poll drains the remainder.
-        let (rows3, _c3, truncated3) = page_collected_turns(&all, Some("t19"), 10);
+        let (rows3, _c3, truncated3) = page_collected_turns(&all, Some("t19"), 10, false);
         assert_eq!(rows3.len(), 5);
         assert!(!truncated3, "final page is not truncated");
         assert_eq!(rows3[0]["turn_id"], "t20");
@@ -2644,14 +2798,32 @@ mod session_tool_tests {
     #[test]
     fn page_collected_turns_short_and_unknown_cursor() {
         let all: Vec<_> = (0..3).map(|i| turn(&format!("t{i}"))).collect();
-        let (rows, cursor, truncated) = page_collected_turns(&all, None, 20);
+        let (rows, cursor, truncated) = page_collected_turns(&all, None, 20, false);
         assert_eq!(rows.len(), 3);
         assert!(!truncated);
         assert_eq!(cursor.as_deref(), Some("t2"));
         // Unknown cursor → all turns (defensive, no loss).
-        let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20);
+        let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20, false);
         assert_eq!(rows_u.len(), 3);
         assert!(!trunc_u);
+    }
+
+    /// v0.9.1 — `tail:true` returns the NEWEST `n` (chronological inside the
+    /// page), the "just give me the final answer" shape; cursor = newest turn.
+    #[test]
+    fn page_collected_turns_tail_returns_newest() {
+        let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
+        let (rows, cursor, truncated) = page_collected_turns(&all, None, 3, true);
+        assert_eq!(rows.len(), 3);
+        assert!(truncated, "25 > 3 ⇒ truncated");
+        assert_eq!(rows[0]["turn_id"], "t22", "newest 3, oldest of them first");
+        assert_eq!(rows[2]["turn_id"], "t24", "ends at the newest turn");
+        assert_eq!(cursor.as_deref(), Some("t24"));
+        // `since` still applies before the tail cut.
+        let (rows2, _c, trunc2) = page_collected_turns(&all, Some("t22"), 5, true);
+        assert_eq!(rows2.len(), 2, "only t23/t24 exist after t22");
+        assert!(!trunc2);
+        assert_eq!(rows2[0]["turn_id"], "t23");
     }
 
     // ========================================================================
@@ -2754,6 +2926,66 @@ mod session_tool_tests {
             .filter(|s| s["parent_sid"] == json!(principal))
             .count();
         assert_eq!(children, 1, "no double-spawn: {list}");
+    }
+
+    /// v0.9.1 — `session_spawn{task}`: one call spawns AND dispatches (the
+    /// dominant flow). The response merges the dispatch outcome (`turn_id` +
+    /// `status:dispatched`) into the spawn body, and the delegation lineage
+    /// is intact (`parent_sid` = the caller).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_with_task_dispatches_in_one_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let r = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "task": "do the thing" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["status"], json!("dispatched"), "dispatch merged: {r}");
+        assert!(
+            r["turn_id"].as_str().is_some_and(|t| !t.is_empty()),
+            "turn_id present: {r}"
+        );
+        assert_eq!(r["parent_sid"], json!(principal));
+    }
+
+    /// v0.9.1 — `session_spawn{task, wait_seconds}` with an answering child
+    /// returns the answer inline (`status:completed`, `result_text`), exactly
+    /// like session_dispatch's wait path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn spawn_with_task_and_wait_returns_inline_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let r = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "task": "answer me", "wait_seconds": 6 }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r["status"], json!("completed"), "inline: {r}");
+        assert!(
+            r["result_text"]
+                .as_str()
+                .unwrap()
+                .contains("echo: answer me"),
+            "inline result: {r}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

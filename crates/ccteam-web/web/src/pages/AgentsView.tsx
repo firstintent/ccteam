@@ -1,20 +1,24 @@
-// v0.9.0 W4 (F4) — 团队/Team view: a live cross-harness, cross-host graph of
-// every session (nodes) + delegation edges (parent→child), a detail side
-// panel for the selected node, and a 30-minute timeline strip. Admin-only
-// beta gate lives in the SIDEBAR nav button (ChatConsole/Sidebar) — this
-// page itself renders unconditionally once routed to (`/agents`), same as
-// every other admin-gated tab in this shell (e.g. WorkflowView's MCP
-// register form); the real ACL is the backend's per-tenant graph/SSE filter
-// (`crate::routes::agents`), which is fail-closed regardless of this UI gate.
+// v0.9.1 团队/Team view — redesigned around the operator's real questions
+// (who is working, who is stuck, who spent what, who delegated to whom):
 //
-// Hand-rolled SVG (no graphing library — none is a dependency of this repo):
-// one swim-lane per host (`lib/agentsLayout.ts`), nodes = vendor-colored
-// cards with a status ring, edges = cubic beziers (dashed + animated while a
-// dispatch is in flight). Live state comes from the global SSE
-// (`useAgentsEvents`) folded through `lib/agentsReducer.ts`.
+// - 成员 roster (DEFAULT): a delegation tree TABLE — one row per session,
+//   children indented under their parent (process-tree shape). The common
+//   no-delegation case reads as a clean list, not scattered graph boxes.
+// - 时间轴 timeline: the 30-min dispatch strip (rows + arrows), unchanged
+//   semantics from v0.9.0 W4, now with full-height room.
+// - 拓扑 topology: the original swim-lane SVG graph (lane per host, bezier
+//   delegation edges) — kept for structure-at-a-glance, demoted from default.
+//
+// A KPI strip (live / working / active dispatches / total cost) sits above
+// the tabs, computed client-side from the same graph+SSE data. Admin-only
+// beta gate lives in the SIDEBAR nav button; the real ACL is the backend's
+// per-tenant graph/SSE filter (fail-closed regardless of this UI gate).
+//
+// Live state comes from the global SSE (`useAgentsEvents`) folded through
+// `lib/agentsReducer.ts`; roster order from `lib/agentsTree.ts` (pure).
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchAgentsGraph, type AgentEdge, type AgentsGraphResponse } from "../lib/agentsApi";
+import { fetchAgentsGraph, type AgentEdge, type AgentNode, type AgentsGraphResponse } from "../lib/agentsApi";
 import { computeAgentsLayout, edgePath, type LayoutNode } from "../lib/agentsLayout";
 import {
   applyDelegationEvent,
@@ -22,6 +26,7 @@ import {
   sidsActiveWithin,
   type TimestampedAgentsEvent,
 } from "../lib/agentsReducer";
+import { flattenDelegationTree, type RosterRow } from "../lib/agentsTree";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
@@ -37,9 +42,18 @@ const EVENT_LOG_CAP = 500;
 const NODE_W = 168;
 const NODE_H = 58;
 
+export type AgentsTab = "roster" | "timeline" | "topology";
+
 function statusRingClass(sid: string, status: string, pulsing: Set<string>): string {
   if (status !== "live") return "agents-ring stopped";
   return pulsing.has(sid) ? "agents-ring pulse" : "agents-ring idle";
+}
+
+/** Roster status dot: pulsing = actively working (amber), live = idle-live
+ *  (green), persisted-only = off (grey). */
+function rosterDotClass(node: AgentNode, pulsing: Set<string>): string {
+  if (node.status !== "live") return "dot off";
+  return pulsing.has(node.sid) ? "dot busy" : "dot on";
 }
 
 /** Pure presentational graph SVG — given an already-computed layout, renders
@@ -121,17 +135,94 @@ export function AgentsGraphSvg({
   );
 }
 
+/** Pure presentational roster table — one row per session in delegation-tree
+ *  DFS order. Exported for SSR tests (fixture rows, no data loading). */
+export function AgentsRoster({
+  rows,
+  selected,
+  pulsing,
+  lang: langProp,
+  onSelect,
+  onOpenChat,
+}: {
+  rows: RosterRow[];
+  selected: string | null;
+  pulsing: Set<string>;
+  lang?: Lang;
+  onSelect: (sid: string) => void;
+  onOpenChat?: (sid: string) => void;
+}) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  return (
+    <div className="agents-roster" data-testid="agents-roster" role="table" aria-label={t("team")}>
+      <div className="agents-roster-head" role="row">
+        <span>{t("teamColSession")}</span>
+        <span>{t("vendor")}</span>
+        <span>{t("host")}</span>
+        <span>{t("cost")}</span>
+        <span>{t("teamColTurns")}</span>
+        <span>{t("teamColLastActive")}</span>
+        <span />
+      </div>
+      {rows.map(({ node: n, indent }) => (
+        <div
+          key={n.sid}
+          role="row"
+          tabIndex={0}
+          className={`agents-roster-row ${n.sid === selected ? "selected" : ""}`}
+          data-testid={`agents-roster-row-${n.sid}`}
+          onClick={() => onSelect(n.sid)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSelect(n.sid);
+          }}
+        >
+          <span className="agents-roster-name" style={{ paddingLeft: indent * 22 }}>
+            {indent > 0 ? <span className="agents-roster-elbow">└</span> : null}
+            <span className={rosterDotClass(n, pulsing)} />
+            <span className="t">{n.title || n.role || n.sid}</span>
+            <span className="agents-roster-sid mono">{n.sid}</span>
+          </span>
+          <span>
+            <span className={vendorDotClass(n.vendor)} /> {n.vendor}
+          </span>
+          <span className="mono">{n.host}</span>
+          <span className="mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
+          <span className="mono">{n.turn_count}</span>
+          <span>{relativeTime(lang, n.last_active)}</span>
+          <span>
+            <button
+              type="button"
+              className="btn ghost mini"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenChat?.(n.sid);
+              }}
+            >
+              {t("teamOpenChat")}
+            </button>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function AgentsView({
   lang: langProp,
   onOpenChat,
+  initialTab = "roster",
 }: {
   lang?: Lang;
   isAdmin?: boolean;
   onOpenChat?: (sid: string) => void;
+  /** Initial tab (tests / deep links); the user switches freely afterwards. */
+  initialTab?: AgentsTab;
 } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
 
+  const [tab, setTab] = useState<AgentsTab>(initialTab);
   const [graph, setGraph] = useState<AgentsGraphResponse>({ nodes: [], edges: [], hosts: [] });
   const [edges, setEdges] = useState<AgentEdge[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -204,6 +295,8 @@ export default function AgentsView({
     [graph.nodes, edges, graph.hosts],
   );
 
+  const roster = useMemo(() => flattenDelegationTree(graph.nodes), [graph.nodes]);
+
   const selectedNode: LayoutNode | null =
     layout.nodes.find((n) => n.sid === selected) ?? null;
 
@@ -249,6 +342,15 @@ export default function AgentsView({
   };
   const rowIndex = new Map(timelineNodes.map((n, i) => [n.sid, i]));
 
+  // ---- KPI strip (client-side, from the same graph + SSE data) ----
+  const liveCount = graph.nodes.filter((n) => n.status === "live").length;
+  const workingCount = graph.nodes.filter((n) => pulsing.has(n.sid)).length;
+  const activeDispatches = edges.filter((e) => e.active).length;
+  const totalCost = graph.nodes.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
+
+  const empty = !loading && layout.nodes.length === 0;
+  const showPanel = tab !== "timeline";
+
   return (
     <section className="view active agents-view" data-testid="agents-view">
       <header className="agents-head">
@@ -256,22 +358,107 @@ export default function AgentsView({
           <h1>{t("team")}</h1>
           <p>{t("teamDesc")}</p>
         </div>
+        <div className="agents-kpis" data-testid="agents-kpis">
+          <span>
+            <b>{liveCount}</b> {t("teamKpiLive")}
+          </span>
+          <span>
+            <b>{workingCount}</b> {t("teamKpiWorking")}
+          </span>
+          <span>
+            <b>{activeDispatches}</b> {t("teamKpiDispatches")}
+          </span>
+          <span>
+            <b>${totalCost.toFixed(2)}</b> {t("teamKpiCost")}
+          </span>
+        </div>
       </header>
+
+      <div className="seg agents-tabs" data-testid="agents-tabs">
+        {(
+          [
+            ["roster", t("teamTabRoster")],
+            ["timeline", t("teamTabTimeline")],
+            ["topology", t("teamTabTopology")],
+          ] as [AgentsTab, string][]
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            data-testid={`agents-tab-${id}`}
+            className={tab === id ? "active" : ""}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
       <div className="agents-body">
         <div className="agents-canvas" data-testid="agents-canvas">
-          {loading ? (
+          {tab !== "timeline" && loading ? (
             <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }}>{t("loading")}</p>
-          ) : layout.nodes.length === 0 ? (
+          ) : tab !== "timeline" && empty ? (
             <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }} data-testid="agents-empty">
               {t("teamEmpty")}
             </p>
-          ) : (
+          ) : tab === "roster" ? (
+            <AgentsRoster
+              rows={roster}
+              selected={selected}
+              pulsing={pulsing}
+              lang={lang}
+              onSelect={setSelected}
+              onOpenChat={onOpenChat}
+            />
+          ) : tab === "topology" ? (
             <AgentsGraphSvg layout={layout} selected={selected} pulsing={pulsing} lang={lang} onSelect={setSelected} />
+          ) : (
+            <div className="agents-timeline" data-testid="agents-timeline">
+              <h3>{t("teamTimeline")}</h3>
+              <div className="agents-timeline-rows">
+                {timelineNodes.map((n) => (
+                  <div key={n.sid} className="agents-timeline-row" data-testid={`agents-timeline-row-${n.sid}`}>
+                    <span className="agents-timeline-label">{n.title || n.role || n.sid}</span>
+                    <div className="agents-timeline-track">
+                      {n.status === "live" ? (
+                        <div
+                          className={`agents-timeline-bar ${pulsing.has(n.sid) ? "active" : ""}`}
+                          style={{ left: `${timelineX(Date.parse(n.last_active) || now)}%`, width: "2%" }}
+                        />
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <svg
+                className="agents-timeline-arrows"
+                viewBox={`0 0 100 ${Math.max(timelineNodes.length, 1) * 28}`}
+                preserveAspectRatio="none"
+              >
+                {timelineDispatches.map((ev, i) => {
+                  const fromRow = rowIndex.get(ev.parent_sid!);
+                  const toRow = rowIndex.get(ev.child_sid!);
+                  if (fromRow === undefined || toRow === undefined) return null;
+                  const x = timelineX(ev.receivedAt);
+                  return (
+                    <line
+                      key={`${ev.parent_sid}-${ev.child_sid}-${i}`}
+                      x1={x}
+                      y1={fromRow * 28 + 14}
+                      x2={x}
+                      y2={toRow * 28 + 14}
+                      className="agents-timeline-arrow"
+                      data-testid="agents-timeline-arrow"
+                    />
+                  );
+                })}
+              </svg>
+            </div>
           )}
         </div>
 
-        {selectedNode ? (
+        {showPanel && selectedNode ? (
           <aside className="agents-panel" data-testid="agents-panel">
             <h2>{selectedNode.title || selectedNode.role || selectedNode.sid}</h2>
             <div className="agents-panel-meta">
@@ -328,49 +515,11 @@ export default function AgentsView({
               {t("teamOpenChat")}
             </button>
           </aside>
-        ) : layout.nodes.length > 0 ? (
+        ) : showPanel && layout.nodes.length > 0 ? (
           <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
             <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
           </aside>
         ) : null}
-      </div>
-
-      <div className="agents-timeline" data-testid="agents-timeline">
-        <h3>{t("teamTimeline")}</h3>
-        <div className="agents-timeline-rows">
-          {timelineNodes.map((n) => (
-            <div key={n.sid} className="agents-timeline-row" data-testid={`agents-timeline-row-${n.sid}`}>
-              <span className="agents-timeline-label">{n.title || n.role || n.sid}</span>
-              <div className="agents-timeline-track">
-                {n.status === "live" ? (
-                  <div
-                    className={`agents-timeline-bar ${pulsing.has(n.sid) ? "active" : ""}`}
-                    style={{ left: `${timelineX(Date.parse(n.last_active) || now)}%`, width: "2%" }}
-                  />
-                ) : null}
-              </div>
-            </div>
-          ))}
-        </div>
-        <svg className="agents-timeline-arrows" viewBox={`0 0 100 ${Math.max(timelineNodes.length, 1) * 28}`} preserveAspectRatio="none">
-          {timelineDispatches.map((ev, i) => {
-            const fromRow = rowIndex.get(ev.parent_sid!);
-            const toRow = rowIndex.get(ev.child_sid!);
-            if (fromRow === undefined || toRow === undefined) return null;
-            const x = timelineX(ev.receivedAt);
-            return (
-              <line
-                key={`${ev.parent_sid}-${ev.child_sid}-${i}`}
-                x1={x}
-                y1={fromRow * 28 + 14}
-                x2={x}
-                y2={toRow * 28 + 14}
-                className="agents-timeline-arrow"
-                data-testid="agents-timeline-arrow"
-              />
-            );
-          })}
-        </svg>
       </div>
     </section>
   );

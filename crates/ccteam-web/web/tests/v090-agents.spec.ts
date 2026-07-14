@@ -111,6 +111,11 @@ test("team view renders the graph snapshot; a dispatched SSE frame activates the
   await page.goto("/app/agents");
 
   await expect(page.getByTestId("agents-view")).toBeVisible();
+  // v0.9.1 — the roster tree table is the default tab; both sessions row up.
+  await expect(page.getByTestId("agents-roster-row-s0")).toBeVisible();
+  await expect(page.getByTestId("agents-roster-row-s1")).toBeVisible();
+  // The topology graph lives in its own tab now.
+  await page.getByTestId("agents-tab-topology").click();
   await expect(page.getByTestId("agents-node-s0")).toBeVisible();
   await expect(page.getByTestId("agents-node-s1")).toBeVisible();
 

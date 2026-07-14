@@ -891,9 +891,25 @@ select:focus-visible,
 
 /* v0.9.0 W4 — 团队/Team view: graph canvas + detail side panel + timeline. */
 .agents-view { padding: 0; overflow: hidden; }
-.agents-head { padding: 24px 28px 8px; }
+.agents-head { padding: 24px 28px 8px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .agents-head h1 { font-size: 21px; font-weight: 600; }
 .agents-head p { color: var(--text-muted); font-size: 13.5px; font-weight: 300; margin-top: 6px; }
+/* v0.9.1 — KPI strip (live / working / active dispatches / total cost). */
+.agents-kpis { display: flex; gap: 18px; align-items: baseline; font-size: 12.5px; color: var(--text-muted); padding-top: 6px; flex-wrap: wrap; }
+.agents-kpis b { font-size: 17px; font-weight: 600; color: var(--text); margin-right: 5px; font-variant-numeric: tabular-nums; }
+.agents-tabs { margin: 6px 28px 10px; align-self: flex-start; }
+/* v0.9.1 — 成员 roster (delegation tree table, the default tab). */
+.agents-roster { display: flex; flex-direction: column; font-size: 13px; min-width: 640px; }
+.agents-roster-head, .agents-roster-row { display: grid; grid-template-columns: minmax(220px, 2.2fr) 110px 100px 90px 60px 110px 90px; gap: 8px; align-items: center; padding: 8px 10px; }
+.agents-roster-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--base); z-index: 1; }
+.agents-roster-row { border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); cursor: pointer; border-radius: 8px; }
+.agents-roster-row:hover { background: var(--bg-hover); }
+.agents-roster-row.selected { background: color-mix(in srgb, var(--claude) 9%, transparent); }
+.agents-roster-row .mono { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+.agents-roster-name { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.agents-roster-name .t { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agents-roster-sid { color: var(--text-faint); flex: none; }
+.agents-roster-elbow { color: var(--text-faint); font-size: 11px; flex: none; }
 .agents-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 .agents-canvas { flex: 1; overflow: auto; padding: 8px 20px; }
 .agents-graph { display: block; }
@@ -922,7 +938,8 @@ select:focus-visible,
 .agents-activity-line { font-size: 12.5px; color: var(--text-muted); font-family: var(--font-mono); }
 .agents-turns { display: flex; flex-direction: column; gap: 6px; }
 .agents-turn-row { display: flex; flex-direction: column; gap: 2px; border-bottom: 1px solid var(--border-soft); padding-bottom: 6px; }
-.agents-timeline { flex: none; height: 180px; border-top: 1px solid var(--border); padding: 10px 20px; overflow: hidden; display: flex; flex-direction: column; }
+/* v0.9.1 — the timeline is a full tab now (was a fixed 180px bottom strip). */
+.agents-timeline { min-height: 240px; padding: 4px 8px; overflow: hidden; display: flex; flex-direction: column; }
 .agents-timeline h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 6px; }
 .agents-timeline-rows { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .agents-timeline-row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: center; height: 24px; }
