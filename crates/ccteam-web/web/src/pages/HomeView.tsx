@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
 import { makeT, type Lang } from "../lib/i18n";
 import {
@@ -23,7 +24,6 @@ import {
   normalizeDraft,
   slugFromPath,
   statusDotClass,
-  vendorChipClass,
   wireEffort,
   wireProtocol,
   type ComposerDraft,
@@ -540,7 +540,7 @@ export default function HomeView({
                 </div>
                 <div className="m">
                   <span>{c.project}</span>
-                  <span className={vendorChipClass(c.vendor)}>{c.vendor}</span>
+                  <VendorChip vendor={c.vendor} />
                   <span className="chip sid">{c.sid}</span>
                   <span style={{ marginLeft: "auto" }} className="mono">
                     {c.host ?? "local"} · {relativeTime(lang, c.lastActive)}

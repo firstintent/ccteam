@@ -22,12 +22,12 @@ import { ChatComposer } from "../components/ChatComposer";
 import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
+import { VendorChip } from "../components/VendorChip";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import {
   defaultDraft,
   normalizeDraft,
-  vendorChipClass,
   type ComposerDraft,
 } from "../lib/vendors";
 import {
@@ -282,7 +282,7 @@ export default function SessionView({
         <div className="meta">
           <span className="chip sid">{sid}</span>
           {session ? <span className="chip">{session.project}</span> : null}
-          <span className={vendorChipClass(vendor)}>{vendor}</span>
+          <VendorChip vendor={vendor} />
           {session?.host && session.host !== "local" ? (
             <span className="chip">@ {session.host}</span>
           ) : null}

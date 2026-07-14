@@ -31,9 +31,10 @@ import {
   type RosterRow,
 } from "../lib/agentsTree";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
+import { VendorChip } from "../components/VendorChip";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
-import { vendorChipClass, vendorDotClass } from "../lib/vendors";
+import { vendorDotClass } from "../lib/vendors";
 import { makeT, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
@@ -137,7 +138,7 @@ export function AgentsTree({
                 ) : (
                   <span className="agents-tree-toggle-spacer" aria-hidden="true" />
                 )}
-                <span className={vendorChipClass(n.vendor)}>{n.vendor}</span>
+                <VendorChip vendor={n.vendor} />
                 <span className="agents-tree-sid mono">{n.sid}</span>
                 <span className="agents-tree-title">{n.title || n.role || "—"}</span>
                 <span className={rosterDotClass(n, pulsing)} aria-hidden="true" />
@@ -201,9 +202,7 @@ export function AgentsRoster({
             <span className="t">{n.title || n.role || n.sid}</span>
             <span className="agents-roster-sid mono">{n.sid}</span>
           </span>
-          <span>
-            <span className={vendorDotClass(n.vendor)} /> {n.vendor}
-          </span>
+          <span><VendorChip vendor={n.vendor} /></span>
           <span className="mono">{n.host}</span>
           <span className="mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
           <span className="mono">{n.turn_count}</span>

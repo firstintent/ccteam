@@ -134,6 +134,8 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain("修复 SSE 断线重连");
     expect(html).toContain("chip claude");
     expect(html).toContain("chip grok");
+    expect(html).toContain('data-vendor="claude"');
+    expect(html).toContain('data-vendor="grok"');
     expect(html).toContain(">s41<");
     expect(html).toContain("dev01");
     // A stopped session card shows the off dot.

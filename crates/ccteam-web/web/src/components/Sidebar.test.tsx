@@ -108,6 +108,23 @@ function renderSidebar(rows: RailRow[], over: Partial<React.ComponentProps<typeo
 }
 
 describe("Sidebar SSR structure", () => {
+  it("renders all vendor chips on live and history session rows", () => {
+    const html = renderSidebar([
+      row({ sid: "s1", vendor: "claude" }),
+      row({ sid: "s2", vendor: "codex" }),
+      row({ sid: "s3", vendor: "grok", history: true }),
+      row({ sid: "s4", vendor: "opencode", history: true }),
+    ]);
+    for (const vendor of ["claude", "codex", "grok", "opencode"]) {
+      expect(html).toContain(`data-vendor="${vendor}"`);
+      expect(html).toContain(`chip ${vendor} vendor-chip`);
+    }
+    const historyRows = html.match(/<div class="srow [^"]*hist[^"]*"[\s\S]*?<\/div>/g) ?? [];
+    expect(historyRows).toHaveLength(2);
+    expect(historyRows.join(" ")).toContain('data-vendor="grok"');
+    expect(historyRows.join(" ")).toContain('data-vendor="opencode"');
+  });
+
   it("caps each workspace at WS_SHOW rows and offers 展开显示(还有 N 个)", () => {
     const rows = Array.from({ length: WS_SHOW + 3 }, (_, i) =>
       row({ sid: `s${i}`, label: `任务 ${i}` }),

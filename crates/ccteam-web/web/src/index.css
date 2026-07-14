@@ -512,6 +512,11 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.grok  { color: var(--grok);  border-color: #8b5cf655; }
 .chip.opencode { color: var(--opencode); border-color: #0284c755; }
 .chip.sid { color: var(--text-muted); }
+.vendor-chip {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  max-width: 72px; padding: 0 5px; font-size: 10px; line-height: 15px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ============ CONVERSATION ============ */
 .conv-head {

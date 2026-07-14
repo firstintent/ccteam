@@ -23,6 +23,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { CcLogo } from "./Logo";
+import { VendorChip } from "./VendorChip";
 import { makeT, tHostsCount, tShowMore, type Lang } from "../lib/i18n";
 
 /** One sidebar session row — a live gateway session OR a stopped (history)
@@ -304,6 +305,7 @@ export function Sidebar({
                                 if (e.key === "Enter") onOpenRow(row);
                               }}
                             >
+                              <VendorChip vendor={row.vendor} />
                               <span className="name">{row.label}</span>
                               {!row.history && (row.host ?? "local") !== "local" ? (
                                 <span className="shost">{row.host}</span>
