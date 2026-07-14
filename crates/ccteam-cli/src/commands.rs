@@ -3036,7 +3036,7 @@ pub struct VerifyMcpReport {
     pub stub_count: usize,
     /// Number of tools with a real dispatch (= total - stub_count).
     pub active_count: usize,
-    /// Sorted, full tool names (e.g. `ccteam__workflow_show`) for the
+    /// Sorted, full tool names (e.g. `session_spawn`) for the
     /// human-readable + JSON reports.
     pub tool_list: Vec<String>,
     /// Per-group counts (`workflow` → 15, `chat` → 8, ...). Sorted by
@@ -4621,7 +4621,7 @@ pub fn run_admin_register_bot(
 }
 
 /// V0.6.8 F202 — unregister a chat-mode bot via the CLI. Mirrors the
-/// MCP `ccteam__chat_unregister_bot` path: idempotent — returns
+/// MCP `chat_unregister_bot` path (culled tool, CLI survives): idempotent — returns
 /// `ok:true, removed:false` when no registration exists.
 pub fn run_admin_unregister_bot(paths: &CcteamPaths, slug: &str, role: &str) -> Result<String> {
     use ccteam_im::unregister_bot_in;

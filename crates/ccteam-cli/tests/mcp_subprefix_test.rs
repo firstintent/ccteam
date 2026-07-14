@@ -102,9 +102,10 @@ fn list_tool_names() -> Vec<String> {
 
 #[test]
 fn server_name_stays_ccteam_for_v05_muscle_memory() {
-    // Only TOOL names get sub-prefixed; the SERVER identity in
-    // `initialize` stays `ccteam` so users' `~/.claude.json`
-    // `mcpServers.ccteam` entries continue to work without rename.
+    // The SERVER identity in `initialize` stays `ccteam` so users'
+    // `~/.claude.json` `mcpServers.ccteam` entries continue to work
+    // without rename; the client derives the model-visible namespace
+    // from it (`mcp__ccteam__<tool>`).
     let (_tmp, home, projects) = tmp_paths();
     let mut srv = McpServer::spawn(&home, &projects);
     srv.send(&json!({
@@ -121,18 +122,21 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
     let names = list_tool_names();
     assert!(!names.is_empty(), "tools/list returned empty");
     for n in &names {
-        // Each tool name must start with `ccteam__` (server prefix),
-        // followed by either `<group>_<rest>` OR a single-member
-        // exception (`screenshot`, `status`).
-        let bare = n
-            .strip_prefix("ccteam__")
-            .unwrap_or_else(|| panic!("tool name {n:?} missing required `ccteam__` server prefix"));
-        let ok = bare == "screenshot"
-            || bare == "status"
-            || bare.starts_with("admin_")
-            || bare.starts_with("workflow_")
-            || bare.starts_with("chat_")
-            || bare.starts_with("session_");
+        // Wire names are BARE `<group>_<rest>` (or a single-member
+        // exception: `screenshot`, `status`). The MCP client namespaces
+        // by server key, so Claude Code shows `mcp__ccteam__session_spawn`
+        // — a baked-in `ccteam__` prefix would render as the double
+        // `mcp__ccteam__ccteam__session_spawn`.
+        assert!(
+            !n.starts_with("ccteam__"),
+            "tool name {n:?} must not embed the server prefix (client namespaces by server key)"
+        );
+        let ok = n == "screenshot"
+            || n == "status"
+            || n.starts_with("admin_")
+            || n.starts_with("workflow_")
+            || n.starts_with("chat_")
+            || n.starts_with("session_");
         assert!(
             ok,
             "tool {n:?} is missing a group sub-prefix (chat_/session_/screenshot/status)",
@@ -171,6 +175,16 @@ fn legacy_v05_unprefixed_names_are_gone() {
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
         "ccteam__chat_list_bots",
+        // v0.9.1 rename: prefixed wire names dropped (client namespaces
+        // by server key; the old form double-prefixed for the model).
+        "ccteam__status",
+        "ccteam__screenshot",
+        "ccteam__chat_send_file",
+        "ccteam__session_spawn",
+        "ccteam__session_dispatch",
+        "ccteam__session_collect",
+        "ccteam__session_list",
+        "ccteam__session_stop",
     ] {
         assert!(
             !names.contains(&legacy.to_string()),
@@ -185,9 +199,9 @@ fn status_and_session_tools_dispatch_through_server() {
     // (forwards to daemon — may error without daemon, but must land
     // as a tools/call result shape rather than a transport failure).
     let names = list_tool_names();
-    assert!(names.contains(&"ccteam__status".to_string()));
-    assert!(names.contains(&"ccteam__session_list".to_string()));
-    assert!(names.contains(&"ccteam__chat_send_file".to_string()));
+    assert!(names.contains(&"status".to_string()));
+    assert!(names.contains(&"session_list".to_string()));
+    assert!(names.contains(&"chat_send_file".to_string()));
 
     let (_tmp, home, projects) = tmp_paths();
     let mut srv = McpServer::spawn(&home, &projects);
@@ -195,7 +209,7 @@ fn status_and_session_tools_dispatch_through_server() {
         "jsonrpc": "2.0", "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "ccteam__status",
+            "name": "status",
             "arguments": {}
         }
     }));
@@ -220,16 +234,16 @@ fn screenshot_keeps_v05_name_in_listing() {
     // NOT get a sub-prefix, to preserve V0.5 muscle memory.
     let names = list_tool_names();
     assert!(
-        names.contains(&"ccteam__screenshot".to_string()),
-        "ccteam__screenshot must survive without sub-prefix"
+        names.contains(&"screenshot".to_string()),
+        "screenshot must survive without sub-prefix"
     );
-    // Sanity: no `ccteam__screenshot_*` accidentally added.
+    // Sanity: no `screenshot_*` accidentally added.
     for n in &names {
-        if n == "ccteam__screenshot" {
+        if n == "screenshot" {
             continue;
         }
         assert!(
-            !n.starts_with("ccteam__screenshot_"),
+            !n.starts_with("screenshot_"),
             "no other tool may live under the screenshot group: {n}"
         );
     }

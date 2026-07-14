@@ -25,8 +25,8 @@ use std::collections::HashSet;
 /// STUB (returns "not implemented" / sentinel response). Empty after
 /// V0.6.5 (every shipped MCP tool has a real dispatch).
 ///
-/// Any PR introducing a new STUB tool MUST add its full name (e.g.
-/// `ccteam__advise_something`) to this list — `ccteam doctor
+/// Any PR introducing a new STUB tool MUST add its wire name (e.g.
+/// `advise_something`) to this list — `ccteam doctor
 /// --verify-mcp` reads this const to compute `stub_count` and exits
 /// non-zero when it sees STUBs (in CI builds) so unwired tools cannot
 /// silently ship. When the dispatch is later wired, drop the name from
@@ -112,14 +112,15 @@ pub fn disabled_groups_from_env() -> HashSet<ToolGroup> {
     parse_disable_env(env.as_deref())
 }
 
-/// Map a full tool name (e.g. `ccteam__session_spawn`) to its group.
+/// Map a wire tool name (e.g. `session_spawn`) to its group.
 /// Returns `None` for unknown names so unrecognised tools can't be
 /// filtered out accidentally.
+///
+/// Wire names are BARE (no `ccteam__` prefix): MCP clients already
+/// namespace by server key (Claude Code shows `mcp__ccteam__session_spawn`),
+/// so a baked-in prefix would double up.
 pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
-    // Strip the `ccteam__` server prefix; bail if the convention
-    // doesn't hold (defensive — callers should always pass our own
-    // tool names).
-    let bare = name.strip_prefix("ccteam__")?;
+    let bare = name;
     // Single-member groups that do not carry a sub-prefix:
     // - `screenshot` (V0.5 muscle memory)
     // - `status` (v0.9 T1 rename of `admin_ls` — admin group, no prefix)
@@ -207,50 +208,41 @@ mod tests {
 
     #[test]
     fn group_for_tool_maps_each_prefix() {
-        assert_eq!(group_for_tool("ccteam__status"), Some(ToolGroup::Admin));
-        assert_eq!(
-            group_for_tool("ccteam__workflow_show"),
-            Some(ToolGroup::Workflow)
-        );
-        assert_eq!(
-            group_for_tool("ccteam__screenshot"),
-            Some(ToolGroup::Screenshot)
-        );
-        assert_eq!(
-            group_for_tool("ccteam__chat_send_file"),
-            Some(ToolGroup::Chat)
-        );
-        assert_eq!(
-            group_for_tool("ccteam__session_spawn"),
-            Some(ToolGroup::Session)
-        );
-        assert_eq!(group_for_tool("ccteam__bogus"), None);
+        assert_eq!(group_for_tool("status"), Some(ToolGroup::Admin));
+        assert_eq!(group_for_tool("workflow_show"), Some(ToolGroup::Workflow));
+        assert_eq!(group_for_tool("screenshot"), Some(ToolGroup::Screenshot));
+        assert_eq!(group_for_tool("chat_send_file"), Some(ToolGroup::Chat));
+        assert_eq!(group_for_tool("session_spawn"), Some(ToolGroup::Session));
+        assert_eq!(group_for_tool("bogus"), None);
         assert_eq!(group_for_tool("not-a-ccteam-tool"), None);
         // Culled tools no longer map (advise group dropped).
-        assert_eq!(group_for_tool("ccteam__advise_vote"), None);
+        assert_eq!(group_for_tool("advise_vote"), None);
+        // Legacy prefixed wire names (pre-rename) no longer map either —
+        // the client's server namespace made the baked-in prefix redundant.
+        assert_eq!(group_for_tool("ccteam__session_spawn"), None);
     }
 
     #[test]
     fn filter_by_disabled_hides_matching_groups_only() {
         let tools = vec![
-            json!({ "name": "ccteam__status" }),
-            json!({ "name": "ccteam__screenshot" }),
-            json!({ "name": "ccteam__chat_send_file" }),
-            json!({ "name": "ccteam__session_list" }),
+            json!({ "name": "status" }),
+            json!({ "name": "screenshot" }),
+            json!({ "name": "chat_send_file" }),
+            json!({ "name": "session_list" }),
         ];
         let mut disabled = HashSet::new();
         disabled.insert(ToolGroup::Chat);
         disabled.insert(ToolGroup::Screenshot);
         let kept = filter_by_disabled(tools, &disabled);
         let names: Vec<&str> = kept.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["ccteam__status", "ccteam__session_list"]);
+        assert_eq!(names, vec!["status", "session_list"]);
     }
 
     #[test]
     fn filter_by_disabled_empty_set_is_passthrough() {
         let tools = vec![
-            json!({ "name": "ccteam__status" }),
-            json!({ "name": "ccteam__chat_send_file" }),
+            json!({ "name": "status" }),
+            json!({ "name": "chat_send_file" }),
         ];
         let kept = filter_by_disabled(tools.clone(), &HashSet::new());
         assert_eq!(kept.len(), 2);

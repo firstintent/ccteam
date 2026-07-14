@@ -110,7 +110,8 @@ fn names_with_disable(disable: Option<&str>) -> Vec<String> {
 fn group_set(names: &[String]) -> HashSet<&'static str> {
     let mut out = HashSet::new();
     for n in names {
-        let bare = n.strip_prefix("ccteam__").expect("server prefix");
+        // Wire names are bare (client namespaces by server key).
+        let bare = n.as_str();
         if bare == "screenshot" {
             out.insert("screenshot");
         } else if bare == "status" || bare.starts_with("admin_") {
@@ -160,8 +161,8 @@ fn disable_chat_hides_chat_keeps_others() {
     for g in ["admin", "screenshot", "session"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
-    assert!(!names.iter().any(|n| n.starts_with("ccteam__chat_")));
-    assert!(names.contains(&"ccteam__status".to_string()));
+    assert!(!names.iter().any(|n| n.starts_with("chat_")));
+    assert!(names.contains(&"status".to_string()));
 }
 
 #[test]
@@ -170,7 +171,7 @@ fn disable_chat_and_screenshot_combines() {
     let groups = group_set(&names);
     assert!(!groups.contains("chat"));
     assert!(!groups.contains("screenshot"));
-    assert!(!names.contains(&"ccteam__screenshot".to_string()));
+    assert!(!names.contains(&"screenshot".to_string()));
     assert!(groups.contains("admin"));
     assert!(groups.contains("session"));
 }
@@ -218,7 +219,7 @@ fn disable_workflow_preserves_screenshot_group() {
     // Disabling workflow must not collaterally hide screenshot.
     let names = names_with_disable(Some("workflow"));
     assert!(
-        names.contains(&"ccteam__screenshot".to_string()),
+        names.contains(&"screenshot".to_string()),
         "screenshot must survive when only `workflow` is disabled",
     );
     let groups = group_set(&names);

@@ -201,7 +201,7 @@ pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<V
             .pointer("/params/name")
             .and_then(|n| n.as_str())
             .unwrap_or("");
-        if name == "ccteam__chat_send_file" || mcp_session_tools::is_session_tool(name) {
+        if name == "chat_send_file" || mcp_session_tools::is_session_tool(name) {
             let id = req.get("id").cloned()?;
             let params = req.get("params").cloned().unwrap_or(json!({}));
             let result = match call_tool_forward(paths, &params).await {
@@ -225,7 +225,7 @@ async fn call_tool_forward(paths: &CcteamPaths, params: &Value) -> Result<Vec<Va
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
-        "ccteam__chat_send_file" => forward_chat_send_file(paths, &args).await,
+        "chat_send_file" => forward_chat_send_file(paths, &args).await,
         other => {
             if let Some(body) = mcp_session_tools::dispatch(paths, other, &args).await? {
                 return Ok(text_content(body));
@@ -256,7 +256,7 @@ async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": { "name": "ccteam__chat_send_file", "arguments": fwd_args },
+        "params": { "name": "chat_send_file", "arguments": fwd_args },
     });
     let socket = ccteam_core::daemon_socket_path(paths);
     match forward_to_socket(&socket, &req).await {
@@ -377,14 +377,14 @@ mod tests {
 
     /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
-        "ccteam__chat_send_file",
-        "ccteam__screenshot",
-        "ccteam__session_collect",
-        "ccteam__session_dispatch",
-        "ccteam__session_list",
-        "ccteam__session_spawn",
-        "ccteam__session_stop",
-        "ccteam__status",
+        "chat_send_file",
+        "screenshot",
+        "session_collect",
+        "session_dispatch",
+        "session_list",
+        "session_spawn",
+        "session_stop",
+        "status",
     ];
 
     #[test]
@@ -411,7 +411,9 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), 8, "tool names must be unique");
         for tool in &tools {
-            assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
+            // Wire names are BARE — the client namespaces by server key
+            // (`mcp__ccteam__session_spawn`); a baked-in prefix doubles up.
+            assert!(!tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
     }
@@ -421,7 +423,7 @@ mod tests {
         let tools = tool_definitions();
         let s = tools
             .iter()
-            .find(|t| t["name"] == "ccteam__screenshot")
+            .find(|t| t["name"] == "screenshot")
             .expect("screenshot tool registered");
         let req: Vec<&str> = s["inputSchema"]["required"]
             .as_array()
@@ -635,7 +637,7 @@ mod tests {
             let mut lines = tokio::io::BufReader::new(reader).lines();
             let req_line = lines.next_line().await.unwrap().unwrap();
             let req: Value = serde_json::from_str(&req_line).unwrap();
-            assert_eq!(req["params"]["name"], "ccteam__chat_send_file");
+            assert_eq!(req["params"]["name"], "chat_send_file");
             let resp = json!({
                 "jsonrpc": "2.0", "id": 1,
                 "result": { "content": [{"type":"text","text":"delivered: queued"}], "isError": false }
@@ -648,7 +650,7 @@ mod tests {
 
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "ccteam__chat_send_file", "arguments": { "path": "/x.png" } }
+            "params": { "name": "chat_send_file", "arguments": { "path": "/x.png" } }
         });
         let resp = forward_to_socket(&socket, &req).await.unwrap();
         assert_eq!(
@@ -704,6 +706,12 @@ mod tests {
             "ccteam__chat_list_bots",
             "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
+            // Pre-rename prefixed wire names — no compat alias.
+            "ccteam__status",
+            "ccteam__screenshot",
+            "ccteam__chat_send_file",
+            "ccteam__session_spawn",
+            "ccteam__session_list",
         ] {
             assert!(!names.contains(&gone), "culled tool present: {gone}");
         }
@@ -721,7 +729,7 @@ mod tests {
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__screenshot",
+                "name": "screenshot",
                 "arguments": { "slug": "no-such-slug-xyz", "lines": 5 }
             }
         });
@@ -760,7 +768,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ccteam__status", "arguments": {} }
+            "params": { "name": "status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -796,7 +804,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 72,
             "method": "tools/call",
-            "params": { "name": "ccteam__status", "arguments": {} }
+            "params": { "name": "status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);

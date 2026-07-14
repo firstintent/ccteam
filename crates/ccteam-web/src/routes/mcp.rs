@@ -241,6 +241,9 @@ fn inject_session_caller(req: &mut Value, sid: &str, role: &str, secret: &str, s
         map.insert("_caller_secret".into(), json!(secret));
         map.insert("_caller_role".into(), json!(role));
         map.insert("_caller_slug".into(), json!(slug));
+        // The local-socket admin fallback arg must never ride in over HTTP —
+        // this transport authenticates via bearer only (admin or sid).
+        map.remove("_caller_admin_token");
     }
 }
 

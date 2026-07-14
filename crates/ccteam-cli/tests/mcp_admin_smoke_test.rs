@@ -1,4 +1,4 @@
-//! Smoke tests for `ccteam__status` (renamed from `admin_ls` in v0.9 T1).
+//! Smoke tests for `status` (renamed from `admin_ls` in v0.9 T1).
 //!
 //! Verifies the status tool routes correctly through the MCP wire layer.
 //! Each test drives the real `ccteam mcp-serve` binary via stdin/stdout
@@ -6,8 +6,8 @@
 //! JSON response shapes.
 //!
 //! Operations covered (one test each):
-//!  1. `status` list projects — `ccteam__status` returns project list
-//!  2. `status` cost fields  — `ccteam__status` response carries cost fields
+//!  1. `status` list projects — `status` returns project list
+//!  2. `status` cost fields  — `status` response carries cost fields
 //!
 //! `admin_change_persona` / `admin_add_tool` were culled in v0.9 T1.
 
@@ -155,7 +155,7 @@ fn call_tool(srv: &mut McpServer, name: &str, args: Value) -> Value {
 
 // ─────────────────────────── 1. list workflows ─────────────────────
 
-/// `ccteam__status` must enumerate existing projects and report them
+/// `status` must enumerate existing projects and report them
 /// in a `projects` array with the correct slugs.
 #[test]
 fn status_list_projects() {
@@ -166,7 +166,7 @@ fn status_list_projects() {
     bootstrap(&home, &projects, "dev-delta");
 
     let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(&mut srv, "ccteam__status", json!({}));
+    let body = call_tool(&mut srv, "status", json!({}));
     let arr = body["projects"]
         .as_array()
         .expect("projects must be an array");
@@ -189,7 +189,7 @@ fn status_list_projects() {
 
 // ─────────────────────────── 2. cost today ─────────────────────────
 
-/// `ccteam__status` response must carry `cost_24h_usd` on every
+/// `status` response must carry `cost_24h_usd` on every
 /// project entry — that is the data backing the per-project cost
 /// surfaces (web cost pill, `/status`).
 #[test]
@@ -200,7 +200,7 @@ fn status_cost_today() {
     bootstrap(&home, &projects, "dev-epsilon");
 
     let mut srv = McpServer::spawn(&home, &projects);
-    let body = call_tool(&mut srv, "ccteam__status", json!({}));
+    let body = call_tool(&mut srv, "status", json!({}));
     let arr = body["projects"]
         .as_array()
         .expect("projects must be an array");

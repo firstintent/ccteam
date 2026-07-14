@@ -1,4 +1,4 @@
-//! `ccteam__chat_*` MCP tools.
+//! `chat_*` MCP tools.
 //!
 //! After v0.9 T1 the chat group is a single tool: `chat_send_file`.
 //! Tool **definitions** live in [`ccteam_im::mcp`]; this module keeps the
@@ -75,7 +75,7 @@ mod tests {
     fn one_chat_tool_registered_send_file() {
         let tools = chat_tool_definitions();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "ccteam__chat_send_file");
+        assert_eq!(tools[0]["name"], "chat_send_file");
         assert_eq!(tools[0]["inputSchema"]["type"], "object");
         let req: Vec<&str> = tools[0]["inputSchema"]["required"]
             .as_array()

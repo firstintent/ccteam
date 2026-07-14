@@ -88,10 +88,10 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     sorted.sort();
     assert_eq!(names, sorted, "tool_list must be sorted for stable output");
     // Spot-check a known tool from each surviving group is present.
-    assert!(names.contains(&"ccteam__status"));
-    assert!(names.contains(&"ccteam__screenshot"));
-    assert!(names.contains(&"ccteam__chat_send_file"));
-    assert!(names.contains(&"ccteam__session_spawn"));
+    assert!(names.contains(&"status"));
+    assert!(names.contains(&"screenshot"));
+    assert!(names.contains(&"chat_send_file"));
+    assert!(names.contains(&"session_spawn"));
     // Culled / retired tools are gone from the live surface.
     assert!(!names.contains(&"ccteam__admin_ls"));
     assert!(!names.contains(&"ccteam__advise_vote"));

@@ -60,8 +60,43 @@ pub enum McpCaller {
 impl McpDispatch {
     /// Dispatch one JSON-RPC request on the ambient (mcp.sock / stdio) path.
     /// Wire-compatible with the historical `handle_mcp_socket_connection`.
+    ///
+    /// v0.9.1 main-session fallback: a LOCAL caller may present the admin web
+    /// token (`_caller_admin_token` in the tool arguments — injected by the
+    /// stdio forwarder when its env carries no `(sid, secret)` principal, i.e.
+    /// the user's daily-driver Claude/Codex session that ccteam did not
+    /// spawn). A matching token promotes the call to [`McpCaller::Admin`] —
+    /// the same trust the HTTP `/mcp` admin bearer grants; the token file is
+    /// `0600` under `~/.ccteam/secrets/`, so presenting it proves same-user
+    /// file access, exactly like running the `ccteam` CLI. A missing or
+    /// wrong token leaves the call on the fail-closed Ambient path. The arg
+    /// is stripped either way so nothing downstream ever sees it.
     pub async fn dispatch(&self, req: Value) -> Option<Value> {
-        self.dispatch_as(req, McpCaller::Ambient).await
+        let (req, caller) = self.promote_local_admin(req);
+        self.dispatch_as(req, caller).await
+    }
+
+    /// Socket-only admin promotion (see [`Self::dispatch`]). Constant-time
+    /// token compare; never logs the presented value.
+    fn promote_local_admin(&self, mut req: Value) -> (Value, McpCaller) {
+        let presented = match req
+            .pointer_mut("/params/arguments")
+            .and_then(|a| a.as_object_mut())
+        {
+            Some(args) => match args.remove("_caller_admin_token") {
+                Some(v) => v.as_str().unwrap_or_default().to_string(),
+                None => return (req, McpCaller::Ambient),
+            },
+            None => return (req, McpCaller::Ambient),
+        };
+        let expected = std::fs::read_to_string(self.paths.web_token_path())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !expected.is_empty() && ccteam_core::session_secret::ct_eq(&expected, &presented) {
+            (req, McpCaller::Admin)
+        } else {
+            (req, McpCaller::Ambient)
+        }
     }
 
     /// Dispatch one JSON-RPC request as `caller`. Order matches the historical
@@ -164,7 +199,7 @@ static CHAT_SEND_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
     req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
-        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("ccteam__chat_send_file")
+        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("chat_send_file")
 }
 
 /// Resolve addressing, validate the file, and enqueue a `GatewayEvent`
@@ -820,7 +855,7 @@ fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> Stri
 // v0.9.0 W1 (F1) — session scheduling: daemon-side `session_*` tool handlers.
 //
 // The stdio MCP server (or HTTP `/mcp` session bearer) forwards
-// `ccteam__session_*` calls here (it doesn't own the gateway). This is where
+// `session_*` calls here (it doesn't own the gateway). This is where
 // we (a) authenticate the caller by its `(sid, secret)` PRINCIPAL — any live
 // session that holds the secret, role-agnostic; the retired cto-only gate is
 // gone — and (b) drive the gateway session map (spawn / dispatch / list /
@@ -842,7 +877,7 @@ fn is_session_tool_call(req: &serde_json::Value) -> bool {
         && req
             .pointer("/params/name")
             .and_then(|n| n.as_str())
-            .is_some_and(|n| n.starts_with("ccteam__session_"))
+            .is_some_and(|n| n.starts_with("session_"))
 }
 
 /// Build a tools/call-shaped JSON-RPC response carrying one text block.
@@ -857,7 +892,7 @@ fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) ->
     })
 }
 
-/// v0.9.0 W1 (F1) — handle one forwarded `ccteam__session_*` call. Authenticates
+/// v0.9.0 W1 (F1) — handle one forwarded `session_*` call. Authenticates
 /// the caller by its `(sid, secret)` PRINCIPAL (Ambient path), then dispatches
 /// to the gateway. Returns a JSON-RPC response (the caller side propagates
 /// `isError` to the agent).
@@ -949,11 +984,11 @@ async fn run_session_tool(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     match name {
-        "ccteam__session_spawn" => run_session_spawn(args, gateway, caller).await,
-        "ccteam__session_dispatch" => run_session_dispatch(args, gateway, caller).await,
-        "ccteam__session_collect" => run_session_collect(args, gateway, caller).await,
-        "ccteam__session_list" => run_session_list(gateway).await,
-        "ccteam__session_stop" => run_session_stop(args, gateway, caller).await,
+        "session_spawn" => run_session_spawn(args, gateway, caller).await,
+        "session_dispatch" => run_session_dispatch(args, gateway, caller).await,
+        "session_collect" => run_session_collect(args, gateway, caller).await,
+        "session_list" => run_session_list(gateway).await,
+        "session_stop" => run_session_stop(args, gateway, caller).await,
         other => Err(format!("unknown session tool: {other}")),
     }
 }
@@ -997,7 +1032,12 @@ async fn run_session_spawn(
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .ok_or_else(|| "session_spawn: missing `project` (admin caller)".to_string())?,
+            .ok_or_else(|| {
+                "session_spawn: missing `project` — pass the target project slug explicitly, \
+                 or run from inside a registered project directory (cwd is resolved for local \
+                 main-session callers)"
+                    .to_string()
+            })?,
     };
     let vendor = parse_session_vendor(args)?;
     // Optional `permission_mode` (`skip` default / `hitl`).
@@ -2153,6 +2193,78 @@ mod session_tool_tests {
         })
     }
 
+    /// A dispatcher with only `paths` wired (enough for the local-admin
+    /// promotion, which never touches gateway/sink/pending).
+    fn dispatch_with_root(root: &std::path::Path) -> McpDispatch {
+        McpDispatch {
+            paths: CcteamPaths {
+                root: root.to_path_buf(),
+                projects_root: root.join("projects"),
+            },
+            sink: None,
+            pending: None,
+            gateway: None,
+        }
+    }
+
+    fn write_web_token(root: &std::path::Path, token: &str) {
+        let secrets = root.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("web-token"), format!("{token}\n")).unwrap();
+    }
+
+    // v0.9.1 — main-session fallback: the LOCAL socket promotes a caller
+    // presenting the admin web token to Admin semantics, and strips the
+    // token arg either way.
+    #[test]
+    fn promote_local_admin_upgrades_on_matching_token_and_strips_arg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_web_token(tmp.path(), "tok-abc123");
+        let d = dispatch_with_root(tmp.path());
+        let req = call(
+            "session_list",
+            json!({ "_caller_admin_token": "tok-abc123" }),
+        );
+        let (req, caller) = d.promote_local_admin(req);
+        assert_eq!(caller, McpCaller::Admin);
+        assert!(
+            req.pointer("/params/arguments/_caller_admin_token")
+                .is_none(),
+            "token arg must be stripped before dispatch"
+        );
+    }
+
+    #[test]
+    fn promote_local_admin_fails_closed_on_wrong_or_missing_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_web_token(tmp.path(), "tok-abc123");
+        let d = dispatch_with_root(tmp.path());
+
+        // Wrong token → Ambient (and still stripped).
+        let req = call("session_list", json!({ "_caller_admin_token": "wrong" }));
+        let (req, caller) = d.promote_local_admin(req);
+        assert_eq!(caller, McpCaller::Ambient);
+        assert!(req
+            .pointer("/params/arguments/_caller_admin_token")
+            .is_none());
+
+        // No token arg → Ambient, request untouched.
+        let req = call("session_list", json!({ "_caller_sid": "s1" }));
+        let (req, caller) = d.promote_local_admin(req);
+        assert_eq!(caller, McpCaller::Ambient);
+        assert_eq!(
+            req.pointer("/params/arguments/_caller_sid"),
+            Some(&json!("s1"))
+        );
+
+        // Token file absent on the daemon → Ambient even with an arg.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let d2 = dispatch_with_root(tmp2.path());
+        let req = call("session_list", json!({ "_caller_admin_token": "anything" }));
+        let (_req, caller) = d2.promote_local_admin(req);
+        assert_eq!(caller, McpCaller::Ambient);
+    }
+
     // v0.8.7 review-fix (R-M1/R-M3) — a no-process stub adapter so a real
     // `Gateway` can mint per-session secrets + track project scope without
     // spawning a `claude` pane. `start_thread` records the `(sid, secret)` the
@@ -2355,7 +2467,7 @@ mod session_tool_tests {
     async fn execute_session_tool_rejects_wrong_secret() {
         let (gw, cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "ccteam__session_list",
+            "session_list",
             json!({
                 "_caller_sid": cto_sid,
                 "_caller_secret": "ffffffffffffffffffffffffffffffff",
@@ -2376,7 +2488,7 @@ mod session_tool_tests {
     async fn execute_session_tool_allows_correct_principal() {
         let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "ccteam__session_list",
+            "session_list",
             json!({
                 "_caller_sid": cto_sid,
                 "_caller_secret": cto_secret,
@@ -2394,17 +2506,13 @@ mod session_tool_tests {
     #[tokio::test]
     async fn execute_session_tool_rejects_cross_project_sid() {
         let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
-        for tool in [
-            "ccteam__session_dispatch",
-            "ccteam__session_collect",
-            "ccteam__session_stop",
-        ] {
+        for tool in ["session_dispatch", "session_collect", "session_stop"] {
             let mut args = json!({
                 "_caller_sid": cto_sid.clone(),
                 "_caller_secret": cto_secret.clone(),
                 "sid": beta_sid.clone(),
             });
-            if tool == "ccteam__session_dispatch" {
+            if tool == "session_dispatch" {
                 args["task"] = json!("do something");
             }
             let resp = execute_session_tool(&call(tool, args), Some(&gw), McpCaller::Ambient).await;
@@ -2425,7 +2533,7 @@ mod session_tool_tests {
         let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let resp = execute_session_tool(
             &call(
-                "ccteam__session_collect",
+                "session_collect",
                 json!({
                     "_caller_sid": cto_sid,
                     "_caller_secret": cto_secret,
@@ -2456,7 +2564,7 @@ mod session_tool_tests {
         let target_sid = cto_sid.clone();
         let resp = execute_session_tool(
             &call(
-                "ccteam__session_collect",
+                "session_collect",
                 json!({
                     "_caller_sid": cto_sid,
                     "_caller_secret": cto_secret,
@@ -2475,12 +2583,9 @@ mod session_tool_tests {
 
     #[test]
     fn is_session_tool_call_matches_only_session_tools_calls() {
+        assert!(is_session_tool_call(&call("session_spawn", json!({}))));
         assert!(is_session_tool_call(&call(
-            "ccteam__session_spawn",
-            json!({})
-        )));
-        assert!(is_session_tool_call(&call(
-            "ccteam__session_collect",
+            "session_collect",
             json!({ "sid": "s1" })
         )));
         // Foreign tool name.
@@ -2491,7 +2596,7 @@ mod session_tool_tests {
         // Right name, wrong method.
         assert!(!is_session_tool_call(&json!({
             "method": "tools/list",
-            "params": { "name": "ccteam__session_spawn" }
+            "params": { "name": "session_spawn" }
         })));
     }
 
@@ -2501,7 +2606,7 @@ mod session_tool_tests {
     async fn execute_session_tool_ambient_denies_unknown_principal() {
         let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "ccteam__session_list",
+            "session_list",
             json!({ "_caller_sid": "s999", "_caller_secret": "deadbeefdeadbeefdeadbeefdeadbeef" }),
         );
         let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
@@ -2519,7 +2624,7 @@ mod session_tool_tests {
     #[tokio::test]
     async fn execute_session_tool_ambient_gateway_down_fails_closed() {
         let req = call(
-            "ccteam__session_list",
+            "session_list",
             json!({ "_caller_sid": "s1", "_caller_secret": "abc" }),
         );
         let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
@@ -2536,7 +2641,7 @@ mod session_tool_tests {
     /// gateway-down here — proving the gate was bypassed, not that it denied).
     #[tokio::test]
     async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
-        let req = call("ccteam__session_list", json!({}));
+        let req = call("session_list", json!({}));
         let resp = execute_session_tool(&req, None, McpCaller::Admin).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -2556,7 +2661,7 @@ mod session_tool_tests {
     async fn execute_session_tool_admin_lists_sessions_fleet_wide() {
         let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let resp = execute_session_tool(
-            &call("ccteam__session_list", json!({})),
+            &call("session_list", json!({})),
             Some(&gw),
             McpCaller::Admin,
         )
@@ -2639,10 +2744,7 @@ mod session_tool_tests {
         assert!(!is_permission_ask_call(
             &json!({ "method": "interaction/ask" })
         ));
-        assert!(!is_permission_ask_call(&call(
-            "ccteam__session_spawn",
-            json!({})
-        )));
+        assert!(!is_permission_ask_call(&call("session_spawn", json!({}))));
     }
 
     #[test]

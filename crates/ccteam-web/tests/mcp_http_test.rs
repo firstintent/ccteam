@@ -167,7 +167,7 @@ async fn mcp_tools_call_status_succeeds() {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ccteam__status", "arguments": {} }
+            "params": { "name": "status", "arguments": {} }
         }),
     )
     .await;
@@ -331,7 +331,7 @@ async fn mcp_session_list_admin_bearer_bypasses_cto_gate() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "ccteam__session_list", "arguments": {} }
+            "params": { "name": "session_list", "arguments": {} }
         }),
     )
     .await;

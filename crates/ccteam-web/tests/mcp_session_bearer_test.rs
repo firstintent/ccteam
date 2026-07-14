@@ -182,7 +182,7 @@ async fn session_bearer_round_trip_list_and_spawn() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"ccteam__session_list","arguments":{}}}),
+               "params":{"name":"session_list","arguments":{}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -197,7 +197,7 @@ async fn session_bearer_round_trip_list_and_spawn() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"ccteam__session_spawn","arguments":{"vendor":"claude"}}}),
+               "params":{"name":"session_spawn","arguments":{"vendor":"claude"}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -233,7 +233,7 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
         addr,
         &format!("ccteam-sid:{sid}:ffffffffffffffffffffffffffffffff"),
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"ccteam__session_list","arguments":{}}}),
+               "params":{"name":"session_list","arguments":{}}}),
     )
     .await;
     assert_eq!(wrong.status(), 401, "wrong secret → 401");
@@ -242,7 +242,7 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
         addr,
         "ccteam-sid:s999:deadbeefdeadbeefdeadbeefdeadbeef",
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"ccteam__session_list","arguments":{}}}),
+               "params":{"name":"session_list","arguments":{}}}),
     )
     .await;
     assert_eq!(unknown.status(), 401, "unknown sid → 401");
@@ -265,7 +265,7 @@ async fn session_bearer_denied_after_stop() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"ccteam__session_list","arguments":{}}}),
+               "params":{"name":"session_list","arguments":{}}}),
     )
     .await;
     assert_eq!(ok.status(), 200);
@@ -277,7 +277,7 @@ async fn session_bearer_denied_after_stop() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"ccteam__session_list","arguments":{}}}),
+               "params":{"name":"session_list","arguments":{}}}),
     )
     .await;
     assert_eq!(denied.status(), 401, "stale bearer after stop → 401");

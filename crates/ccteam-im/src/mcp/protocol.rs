@@ -31,9 +31,29 @@ const MAX_CONCURRENT_PROJECTS: usize = 3;
 
 /// Server `instructions` surfaced to the agent on `initialize`.
 ///
-/// Load-bearing Read convention: a bare `claude` session does NOT auto-`Read`
-/// an attachment path — it must be told to.
-pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam routes IM (Telegram / web) chats to you and back. \
+/// Two load-bearing conventions:
+/// - **Orchestration-first**: when the user asks for another agent ("call
+///   codex", "have claude review this"), the tracked path is `session_*` —
+///   NOT shelling out to `codex exec` / `claude -p`, which bypasses the
+///   ledger (no sid, no transcript, no cost, invisible to `session_list`).
+///   The model only ever sees tool schemas + these instructions, so this is
+///   where that steer lives.
+/// - **Attachments**: a bare `claude` session does NOT auto-`Read` an
+///   attachment path — it must be told to.
+pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam is the local agent bridge: any session can hire other agent sessions \
+(Claude Code / Codex / Grok / OpenCode, on this machine or a registered satellite host) and ccteam does the identity, \
+routing, delivery, guardrails, cost ledger, and team observability underneath.\n\n\
+ORCHESTRATION (important): when the user asks you to call / use / delegate to another agent (e.g. \"call codex\", \
+\"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick `vendor`, optionally \
+`model` / `host` / `role`, and pass the first `task` in the same call), `session_dispatch` sends follow-up tasks \
+(async with a completion notification, or `wait_seconds` to block inline), `session_collect` reads its output \
+(`tail:true` for the final answer), `session_list` shows the delegation tree, `session_stop` ends it. Do NOT shell \
+out to vendor CLIs (`codex exec`, `claude -p`, …) for this: a raw CLI run has no session id, no transcript, no cost \
+tracking, no completion notification, and is invisible to the team — it bypasses the bridge. The tools work both \
+from ccteam-spawned sessions (per-session principal) and from a plain local session running inside a registered \
+project (same-user admin fallback; `session_spawn` then targets the project of your working directory, or an \
+explicit `project`).\n\n\
+CHAT ROUTING: ccteam routes IM (Telegram / web) chats to you and back. \
 An inbound chat message may arrive wrapped in a `<channel source=\"…\" chat_id=\"…\" user=\"…\" message_id=\"…\">` tag.\n\n\
 ATTACHMENTS (important): if a `<channel …>` tag carries an `image_path=\"/abs/path\"` attribute, immediately `Read` that file — \
 it is an image the user attached (often an error screenshot) and is essential context. If it carries a `file_path=\"/abs/path\"` \
@@ -43,14 +63,14 @@ looked at the file they sent.";
 
 /// Full tool names in the session group, registration order.
 pub const SESSION_TOOL_NAMES: &[&str] = &[
-    "ccteam__session_spawn",
-    "ccteam__session_dispatch",
-    "ccteam__session_collect",
-    "ccteam__session_list",
-    "ccteam__session_stop",
+    "session_spawn",
+    "session_dispatch",
+    "session_collect",
+    "session_list",
+    "session_stop",
 ];
 
-/// True if `name` is one of the `ccteam__session_*` tools.
+/// True if `name` is one of the `session_*` tools.
 pub fn is_session_tool(name: &str) -> bool {
     SESSION_TOOL_NAMES.contains(&name)
 }
@@ -130,12 +150,12 @@ fn tools_list_response() -> Value {
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
-            "name": "ccteam__status",
+            "name": "status",
             "description": "daemon health + sessions + today's cost",
             "inputSchema": object_schema(&[]),
         }),
         json!({
-            "name": "ccteam__screenshot",
+            "name": "screenshot",
             "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
             "inputSchema": json!({
                 "type": "object",
@@ -158,7 +178,7 @@ pub fn tool_definitions() -> Vec<Value> {
 /// Tool definitions for the chat group (`send_file` only after v0.9 T1).
 pub fn chat_tool_definitions() -> Vec<Value> {
     vec![json!({
-        "name": "ccteam__chat_send_file",
+        "name": "chat_send_file",
         "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
         "inputSchema": json!({
             "type": "object",
@@ -176,7 +196,7 @@ pub fn chat_tool_definitions() -> Vec<Value> {
 pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
-            "name": "ccteam__session_spawn",
+            "name": "session_spawn",
             "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
@@ -195,6 +215,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode (forced). `terminal` is not available to agents."
                     },
                     "host": { "type": "string", "description": "Execution host: `local` (default) or a registered satellite id." },
+                    "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Local callers default to the project resolved from the working directory." },
                     "permission_mode": {
                         "type": "string",
                         "enum": ["skip", "hitl"],
@@ -210,7 +231,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__session_dispatch",
+            "name": "session_dispatch",
             "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when it completes, ccteam delivers a completion notification back to you as a new turn (set `notify:false` to opt out and poll session_collect yourself). Pass `wait_seconds>0` to block inline for the answer: returns `{status:\"completed\", result_text, cost_usd?}` on completion or `{status:\"pending\"}` on timeout (the child keeps running — never cancelled). A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
@@ -226,7 +247,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__session_collect",
+            "name": "session_collect",
             "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns plus the child's `vendor_session_id` (native resume key), `activity` (`working` = mid-turn / `idle` = turn done / `stale` / `stuck` — poll on `working`, read on `idle`), and accrued `cost_usd`. Pass `since` (a turn_id you already saw) to return only turns AFTER it — the polling cursor for incremental results. Default paging is OLDEST-first (page forward with `cursor`); pass `tail:true` for the NEWEST `n` turns instead (the \"just give me the final answer\" shape). Returns an empty `turns` array when the target hasn't answered yet.",
             "inputSchema": json!({
                 "type": "object",
@@ -240,7 +261,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__session_list",
+            "name": "session_list",
             "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `role`, `vendor`, `current`, `status`, `activity` (`working` = mid-turn / `idle` / `stale` / `stuck` — the honest busy signal), `waiting_approval` (a hitl session blocked on a human approve/deny), plus the delegation `parent_sid` (null for a root), `host`, `cost_usd`, and `title`. The response also includes a `tree` field (roots → children by `parent_sid`) so you can see the delegation topology. Use this to find a `sid` to dispatch to or collect from.",
             "inputSchema": json!({
                 "type": "object",
@@ -249,7 +270,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
             }),
         }),
         json!({
-            "name": "ccteam__session_stop",
+            "name": "session_stop",
             "description": "Stop a session by `sid` (deregister + close it). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project stop is rejected). This is an EXPLICIT command, NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-recorded `turns.jsonl` still works until cleanup. An unknown sid is an error.",
             "inputSchema": json!({
                 "type": "object",
@@ -284,8 +305,8 @@ async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
-        "ccteam__status" => Ok(text_content(tool_ls(paths)?)),
-        "ccteam__screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
+        "status" => Ok(text_content(tool_ls(paths)?)),
+        "screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -391,14 +412,14 @@ mod tests {
 
     /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
-        "ccteam__chat_send_file",
-        "ccteam__screenshot",
-        "ccteam__session_collect",
-        "ccteam__session_dispatch",
-        "ccteam__session_list",
-        "ccteam__session_spawn",
-        "ccteam__session_stop",
-        "ccteam__status",
+        "chat_send_file",
+        "screenshot",
+        "session_collect",
+        "session_dispatch",
+        "session_list",
+        "session_spawn",
+        "session_stop",
+        "status",
     ];
 
     #[test]
@@ -425,7 +446,14 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), 8, "tool names must be unique");
         for tool in &tools {
-            assert!(tool["name"].as_str().unwrap().starts_with("ccteam__"));
+            // Wire names are BARE: the MCP client namespaces by server key
+            // (`mcp__ccteam__session_spawn`), so a baked-in `ccteam__`
+            // prefix would render as `mcp__ccteam__ccteam__session_spawn`.
+            assert!(
+                !tool["name"].as_str().unwrap().starts_with("ccteam__"),
+                "wire tool name must not embed the server prefix: {}",
+                tool["name"]
+            );
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
     }
@@ -435,7 +463,7 @@ mod tests {
         let tools = tool_definitions();
         let s = tools
             .iter()
-            .find(|t| t["name"] == "ccteam__screenshot")
+            .find(|t| t["name"] == "screenshot")
             .expect("screenshot tool registered");
         let req: Vec<&str> = s["inputSchema"]["required"]
             .as_array()
@@ -451,7 +479,7 @@ mod tests {
     fn one_chat_tool_registered_send_file() {
         let tools = chat_tool_definitions();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "ccteam__chat_send_file");
+        assert_eq!(tools[0]["name"], "chat_send_file");
     }
 
     #[test]
@@ -467,11 +495,11 @@ mod tests {
     #[test]
     fn cto_scheduling_tools_present_in_canonical_set() {
         for needed in [
-            "ccteam__session_spawn",
-            "ccteam__session_dispatch",
-            "ccteam__session_collect",
-            "ccteam__session_list",
-            "ccteam__session_stop",
+            "session_spawn",
+            "session_dispatch",
+            "session_collect",
+            "session_list",
+            "session_stop",
         ] {
             assert!(
                 SESSION_TOOL_NAMES.contains(&needed),
@@ -494,7 +522,7 @@ mod tests {
     fn session_spawn_schema_carries_full_facet_set() {
         let spawn = session_tool_definitions()
             .into_iter()
-            .find(|t| t["name"] == "ccteam__session_spawn")
+            .find(|t| t["name"] == "session_spawn")
             .expect("session_spawn defined");
         let props = &spawn["inputSchema"]["properties"];
 
@@ -552,10 +580,12 @@ mod tests {
 
     #[test]
     fn is_session_tool_recognizes_group_and_rejects_others() {
-        assert!(is_session_tool("ccteam__session_spawn"));
-        assert!(is_session_tool("ccteam__session_stop"));
-        assert!(!is_session_tool("ccteam__chat_register_bot"));
-        assert!(!is_session_tool("ccteam__session_bogus"));
+        assert!(is_session_tool("session_spawn"));
+        assert!(is_session_tool("session_stop"));
+        assert!(!is_session_tool("chat_register_bot"));
+        assert!(!is_session_tool("session_bogus"));
+        // Pre-rename prefixed wire names are gone — no compat alias.
+        assert!(!is_session_tool("ccteam__session_spawn"));
     }
 
     #[test]
@@ -591,6 +621,10 @@ mod tests {
         assert!(instructions.contains("file_path"));
         assert!(instructions.contains("Read"));
         assert!(instructions.contains("<channel"));
+        // Orchestration-first steer: the tracked path is session_*, not a
+        // raw vendor-CLI shell-out.
+        assert!(instructions.contains("session_spawn"));
+        assert!(instructions.contains("codex exec"));
     }
 
     #[tokio::test]
@@ -666,6 +700,16 @@ mod tests {
             "ccteam__chat_list_bots",
             "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
+            // Pre-rename prefixed wire names (client namespaces by server
+            // key; the baked-in prefix rendered as mcp__ccteam__ccteam__*).
+            "ccteam__status",
+            "ccteam__screenshot",
+            "ccteam__chat_send_file",
+            "ccteam__session_spawn",
+            "ccteam__session_dispatch",
+            "ccteam__session_collect",
+            "ccteam__session_list",
+            "ccteam__session_stop",
         ] {
             assert!(!names.contains(&gone), "culled tool present: {gone}");
         }
@@ -683,7 +727,7 @@ mod tests {
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "ccteam__screenshot",
+                "name": "screenshot",
                 "arguments": { "slug": "no-such-slug-xyz", "lines": 5 }
             }
         });
@@ -722,7 +766,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ccteam__status", "arguments": {} }
+            "params": { "name": "status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -758,7 +802,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 72,
             "method": "tools/call",
-            "params": { "name": "ccteam__status", "arguments": {} }
+            "params": { "name": "status", "arguments": {} }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);

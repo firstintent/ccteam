@@ -5,7 +5,7 @@ mod commands;
 mod mcp_serve;
 // ToolGroup enum + CCTEAM_DISABLE_TOOLS filter + chat send_file schema.
 mod mcp_chat_tools;
-// v0.8.7 W1 — `ccteam__session_*` tools (cto scheduling). Stdio side
+// v0.8.7 W1 — `session_*` tools (agent scheduling). Stdio side
 // forwards to the daemon over mcp.sock; the daemon-side handler
 // (`ccteam_im::mcp::McpDispatch`) holds the gateway + enforces the cto gate.
 mod mcp_session_tools;

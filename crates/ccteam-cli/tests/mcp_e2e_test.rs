@@ -3,9 +3,10 @@
 //!
 //! Confirms the wire contract:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 8 tools, all `ccteam__*`
-//!   (status 1 + screenshot 1 + chat 1 + session 5);
-//! - `tools/call ccteam__status` returns a JSON-encoded projects list as
+//! - `tools/list` enumerates exactly 8 bare-named tools — the client adds
+//!   the `mcp__ccteam__` namespace (status 1 + screenshot 1 + chat 1 +
+//!   session 5);
+//! - `tools/call status` returns a JSON-encoded projects list as
 //!   the first content[].text.
 
 use std::io::{BufRead, BufReader, Write};
@@ -136,14 +137,14 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     names.sort();
     let mut expected = vec![
-        "ccteam__chat_send_file",
-        "ccteam__screenshot",
-        "ccteam__session_collect",
-        "ccteam__session_dispatch",
-        "ccteam__session_list",
-        "ccteam__session_spawn",
-        "ccteam__session_stop",
-        "ccteam__status",
+        "chat_send_file",
+        "screenshot",
+        "session_collect",
+        "session_dispatch",
+        "session_list",
+        "session_spawn",
+        "session_stop",
+        "status",
     ];
     expected.sort();
     assert_eq!(names, expected);
@@ -190,7 +191,7 @@ fn mcp_serve_tools_call_status_returns_empty_projects_for_fresh_root() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": { "name": "ccteam__status", "arguments": {} }
+        "params": { "name": "status", "arguments": {} }
     }));
     let resp = srv.recv();
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
