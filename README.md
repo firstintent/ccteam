@@ -5,7 +5,7 @@
 
 Each agent is strong in a different way: Fable 5 has the deepest reasoning but costs the most; Codex grinds through long jobs without wobbling; Grok is the fastest. Alone, each is one terminal with one context and no colleagues. ccteam bridges them into a team — any session can **spawn** another (any vendor, any machine), **dispatch** work to it, and **collect** the result. How the team is organized is yours: personas are plain Markdown, orchestration patterns are skills you write or install from a marketplace. ccteam provides the bridge underneath — identity, routing, delivery guarantees, guardrails, cost, observability — and never injects a prompt, never scrapes a terminal.
 
-[Install](#install) • [Scenarios](#scenarios) • Manual: [English](docs/usage.md) · [中文](docs/usage-cn.md)
+[Install](#install) • [Best practices](#best-practices) • [Orchestration guide](docs/orchestration.md) • Manual: [English](docs/usage.md) · [中文](docs/usage-cn.md)
 
 ## Architecture
 
@@ -38,7 +38,7 @@ The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agen
 
 ## Best practices
 
-For people who already live in Claude Code / Codex — this is the Task tool, except the subagent is a full vendor session that survives you closing the laptop.
+For people who already live in Claude Code / Codex — this is the Task tool, except the subagent is a full vendor session that survives you closing the laptop. The full deep-user reference (tool-by-tool, identity model, multi-machine semantics) is the [orchestration guide](docs/orchestration.md).
 
 **Give the brain a team, keep it roleless.** Run Claude Code (Fable 5) as your orchestrator session and let it read your project's own `CLAUDE.md` — no ccteam persona needed. Install `fable-advisor` (marketplace) or write a skill that teaches it *when* to call `session_spawn` — orchestration lives in prompts you version, not in ccteam config.
 

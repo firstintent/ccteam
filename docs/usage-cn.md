@@ -17,7 +17,7 @@
 - **chat** = 一个对话入口(一个网页控制台标签、一个 Telegram/飞书私聊或群)。每个 chat 有自己的当前项目、当前会话和会话列表,互相隔离。
 - **project** = 一个本地代码目录,用 slug(短名)标识。
 - **session** = 一个独立的 agent 会话(像 Claude Code 原生会话一样自带上下文),属于某个项目。一个项目可同时开多个会话、互不串台,每个有持久句柄 `s<N>`(扛重启、不复用)。
-- **role** = 会话启动时绑定的角色(`.claude/agents/<role>.md` 里的 persona + 工具)。默认角色是 `cto`(懂 ccteam 的管家);也可以无角色 = 裸 Claude(自读项目 `CLAUDE.md`)。
+- **role** = 会话启动时**可选**绑定的角色(`.claude/agents/<role>.md` 里的 persona + 工具)。默认 **roleless**:裸 vendor 自读项目的 `CLAUDE.md`/`AGENTS.md`。persona 从插件市场装或自建,ccteam 不内置任何角色。
 
 > **ccteam 只管自己的东西。** 它从不修改你的业务代码、`.git/`、`.env`,也不改写你的 `CLAUDE.md` / `AGENTS.md` —— 这些都归项目自己,Claude 和 Codex 原生读取。
 
@@ -168,7 +168,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ```text
 # 项目
-/cd <project>              切到某个项目(进项目后第一条消息自动起一个 cto 管家)
+/cd <project>              切到某个项目(进项目后第一条消息自动起一个 roleless 会话)
 /projects                  列出已知项目
 /newproject <slug> <path>  新建并注册一个项目,再切过去
 
@@ -198,7 +198,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 @<role> <消息>    切到它并发一条
 ```
 
-`@` 永远指向一个会话。确定性控制走上面的斜杠命令面(`/status` `/sessions` `/stop` …);自由形式的运维问题("今天哪个项目烧钱最多?")直接跟会话聊 —— `cto` 角色会用它的工具回答。
+`@` 永远指向一个会话。确定性控制走上面的斜杠命令面(`/status` `/sessions` `/stop` …);自由形式的运维问题("今天哪个项目烧钱最多?")直接跟会话聊 —— 任何会话都能用 ccteam 的 MCP 工具回答。
 
 ### 直接对话 + 收发文件
 
@@ -211,13 +211,15 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Codex 会话自带 sandbox,忽略此模式。Grok 会话本版仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。
 
-### 让 cto 派活
+### 让任何会话派活
 
-默认 `cto` 管家能自己起 work-role 子会话、派任务、收结论 —— 不用你手动切来切去,直接用自然语言交代:
+每个会话都能通过 `mcp__ccteam__session_*` 工具雇同事、派任务、收结论 —— 不用你手动切来切去,也不需要特殊角色,直接用自然语言交代:
 
 ```text
-@cto 起一个 backend-architect,评审 src/ 的接口设计,把结论汇总给我
+起一个 codex 会话,按 docs/rfc-12.md 实现,测试全过后汇报给我
 ```
+
+这套编排面的深度参考(逐工具、身份模型、多机语义)见 [orchestration-cn.md](orchestration-cn.md)。
 
 ---
 
@@ -242,7 +244,7 @@ ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
-`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)、`.claude/agents/cto.md`(默认角色)、`.claude/settings.local.json`(ccteam 的 hook,写进本地层,**不碰**你的 `.claude/settings.json`)。重跑安全。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
+`ccteam init` 只写 ccteam 自己的东西:项目 `.ccteam/`(状态)+ `.claude/settings.local.json`(ccteam 的 hook,写进本地层,**不碰**你的 `.claude/settings.json`)——**不种任何角色**,`.claude/agents/` 归你。重跑安全。偏好存 `~/.ccteam/preferences.toml`(目前一个键:`fallback.on_claude_quota` = `off`|`codex`,Claude 配额触顶是否回退 Codex)。
 
 ### `project`(项目生命周期)
 
@@ -256,7 +258,7 @@ ccteam project rm demo --dry-run   # 先预览会停什么、删什么
 ccteam project rm demo --purge     # 注销 + 删 ccteam 在项目里建的痕迹
 ```
 
-`rm --purge` 只删 ccteam 建的(项目 `.ccteam/`、种入的 `cto.md`、settings.local.json 里 ccteam 的 hook 段);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
+`rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里 ccteam 的 hook 段);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
 
 ### `session`(会话 + bot 注册)
 
@@ -287,7 +289,7 @@ ccteam role list                   # 列当前项目已装角色(= /role 可切�
 ```bash
 ccteam status                  # daemon + 项目/会话 + 末尾两行 web token/url
 ccteam session ls              # 网关会话状态(daemon 离线降级标注)
-ccteam doctor --verify-mcp     # MCP 表面验收(active 15 / stub 0,漂移退出码 1)
+ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
 ccteam doctor --check-cost-orphan   # 成本 ledger 对账
 ```
 

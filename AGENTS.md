@@ -30,7 +30,7 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.9.0` |
-| 测试 baseline | 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1384/0**(反向连接净增 hub/引擎测试);全量口径 live-daemon 宿主有 env-flake 族(`inbound_wiring daemon_*`/`daemon_test register_*`/`im_progress_*`/`codex_streaming_delta`/`resume_*`/`ws_*`/`hook_*` + gateway 共享 `/tmp/alpha` 并行污染 —— 干净环境全绿,起手重记);`ccteam-web` 全量 307/0;vitest 371(SPA);Playwright 7。干净无 live daemon 宿主应全绿 |
+| 测试 baseline | 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1386/0**(v0.9.1 MCP 主会话 fallback 净增);全量口径 live-daemon 宿主有 env-flake 族(`inbound_wiring daemon_*`/`daemon_test register_*`/`im_progress_*`/`codex_streaming_delta`/`resume_*`/`ws_*`/`hook_*` + gateway 共享 `/tmp/alpha` 并行污染 —— 干净环境全绿,起手重记);`ccteam-web` 全量 307/0;vitest 375(SPA);Playwright 7。干净无 live daemon 宿主应全绿 |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
 | 当前在做 | **v0.9.0 = Agent2Agent 基础能力(多 harness × 多机中立委派底座),W1-W4 已落 dev(未 tag、未部署)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。已落:**W1** AgentPrincipal 通用调用面(`(sid,secret)` 调度门泛化去 cto-only + 四 vendor per-session MCP 身份注入 + codex `thread/start.config.mcp_servers` per-thread 注入 + codex `vendor_uuid` 落盘修重启丢上下文 + opencode/grok resume 补 `mcpServers` + `session_spawn` 扩 vendor/model/effort/protocol/host/title);**W2** 委派语义(child meta `parent_sid`/`delegation_depth`/`title` + 落盘 `delegation.json` watch + pump 完成通知 append→notify 顺序合同 + 启动 reconcile at-least-once + dispatch `wait_seconds`/`notify`/`idempotency_key` + 护栏 depth/children/delegated/cycle + Ambient 预算闸 + `/sessions` 树 + 7 个 `delegation_*` progress 事件)+ **引擎中立化**(废除 cto:删模板/种子,init 后 `.claude/agents/` 空,全链 roleless 默认);**W3** 跨机执行(**反向连接**:卫星零监听、出站 `ccteam-host.v1` 控制通道 + `ccteam-exec.v1` 拨回 rendezvous,只有 daemon 需要可达地址;`ccteam host serve`/HTTP heartbeat/`agent_url`/`:7332` 已删,卫星即 `ccteam start`;claude 远程 stream-json spawn + rebuild 三路径 re-gate 修远程会话本地重生 + registry 0600 + slug gate;codex/opencode/grok 远程 = 显式 NotImplemented);**W4** 团队可视化(`GatewayEventKind::Delegation` 广播 + `/api/v1/agents/{graph,events}` 全局 SSE + SPA 团队泳道图/时间轴/侧栏 + 删 legacy `/sse/*` 死代码 794+ 行 watcher)。**剩 W5**:hub 示例配方 + 三场景真机 smoke + README/usage 重写。**tag/部署 HELD。逐版改动史 = `git log` + `docs-local/versions/v0-9-0/`(gitignored);协议一律以代码为准。** |
 
@@ -46,7 +46,7 @@
 
 详 `docs/dev/tech-design.md`。
 
-## 二、必读文档(全局文档收敛到 3 份)
+## 二、必读文档(全局文档收敛到 4 份)
 
 > **代码是唯一 SoT**。文档只留代码里没有的「为什么 / 架构论证 / 怎么用」;协议细节(CLI / JSON / event / 路由)一律以代码为准 —— 见 `tech-design.md` 末尾「协议 → 代码位置」指针表。
 
@@ -55,6 +55,7 @@
 | `docs/dev/tech-design.md` | 架构 SoT(gateway daemon + 独立 session/sid + role 属性 + harness×provider + 标准资源 API)+ 协议→代码指针表 | 改架构前 / 找协议在哪 |
 | `docs/dev/requirements.md` | 原始需求(核心痛点 = 验收基准) | 验收基准 / PR 痛点映射 |
 | `docs/usage.md` | 用户命令手册(install→start→use→运维,纯命令) | 看怎么用 |
+| `docs/orchestration.md`(+`-cn`) | 深度用户编排指南(session_* 工具面 + 身份模型 + 多机语义 + 最佳实践,owner 钦点独立成文) | 写/改 A2A 编排面 |
 
 历史版本归档 `docs-local/versions/v0-X-Y/README.md`(冻结、按需)+ 探索研究 `docs-local/research/`(不更新、按需)—— **均在 gitignored `docs-local/`,不入库不推送**(owner 决策:版本档案 + 研究笔记本机留存,仓库瘦身);进行中的版本 PRD/dev-plan 也落 `docs-local/versions/v0-x-y/`。这些都**不**自动进上下文。
 

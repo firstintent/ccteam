@@ -17,7 +17,7 @@ Install once, start one resident process, then do daily work from three surfaces
 - **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group. Each chat has its own current project, current session, and session list. Chats are isolated from each other.
 - **project** = a local code directory registered with a short slug.
 - **session** = one independent agent conversation with its own context, like a native Claude Code session. A project can have many sessions running side by side. Each session has a durable handle `s<N>` that survives restarts and is never reused.
-- **role** = the persona and tool policy bound at session start, loaded from `.claude/agents/<role>.md`. The default role is `cto`, a ccteam-aware manager. You can also run roleless: bare Claude reading the project's `CLAUDE.md`.
+- **role** = an optional persona bound at session start, loaded from `.claude/agents/<role>.md`. The default is **roleless**: the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`. Personas are installed from the marketplace or written by you; ccteam seeds none.
 
 > **ccteam only manages its own footprint.** It never edits your product code, `.git/`, `.env`, `CLAUDE.md`, or `AGENTS.md`. Project instructions stay owned by the project and are read natively by Claude and Codex.
 
@@ -170,7 +170,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 ```text
 # Projects
-/cd <project>              Switch to a project. First message starts a cto manager.
+/cd <project>              Switch to a project. First message starts a roleless session.
 /projects                  List known projects.
 /newproject <slug> <path>  Create and register a project, then switch to it.
 
@@ -200,7 +200,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 @<role> <text>   Switch to it and send a message.
 ```
 
-`@` always addresses a session. Deterministic control is the slash surface above (`/status`, `/sessions`, `/stop`, …); free-form ops questions ("which project burned the most today?") are ordinary chat to a session — the `cto` role answers them with its tools.
+`@` always addresses a session. Deterministic control is the slash surface above (`/status`, `/sessions`, `/stop`, …); free-form ops questions ("which project burned the most today?") are ordinary chat to a session — any session answers them with the ccteam MCP tools.
 
 ### Direct Chat and File Exchange
 
@@ -213,13 +213,15 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode. Grok sessions currently run in `skip` (auto-approve) only; IM approval for Grok is planned but not yet wired.
 
-### Let `cto` Dispatch Work
+### Let Any Session Dispatch Work
 
-The default `cto` manager can spawn work-role sessions, dispatch tasks, and collect results so you do not need to switch manually:
+Every session can spawn colleagues, dispatch tasks, and collect results through the `mcp__ccteam__session_*` tools — no manual switching, no special role. Just ask in natural language:
 
 ```text
-@cto start a backend-architect, review the interface design under src/, and summarize the result for me
+start a codex session, implement the RFC under docs/rfc-12.md, and report back when tests pass
 ```
+
+The deep-user reference for this surface (tool-by-tool, identity model, multi-machine semantics) is [orchestration.md](orchestration.md).
 
 ---
 
@@ -244,7 +246,7 @@ ccteam status                  # Daemon heartbeat, projects, sessions, web link.
 ccteam doctor                  # Install/dependency checks; --verify-mcp checks MCP surface.
 ```
 
-`ccteam init` only writes ccteam-owned files: project `.ccteam/`, `.claude/agents/cto.md`, and the ccteam hook section in `.claude/settings.local.json`. It does **not** touch your `.claude/settings.json`. Re-running is safe. Preferences live in `~/.ccteam/preferences.toml`; currently `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
+`ccteam init` only writes ccteam-owned files: project `.ccteam/` and the ccteam hook section in `.claude/settings.local.json` (it seeds no roles — `.claude/agents/` stays yours). It does **not** touch your `.claude/settings.json`. Re-running is safe. Preferences live in `~/.ccteam/preferences.toml`; currently `fallback.on_claude_quota = off|codex` controls whether Claude quota exhaustion falls back to Codex.
 
 ### `project` (Project Lifecycle)
 
@@ -258,7 +260,7 @@ ccteam project rm demo --dry-run   # Preview what would stop/delete.
 ccteam project rm demo --purge     # Deregister and remove ccteam-owned project traces.
 ```
 
-`rm --purge` removes only ccteam-owned traces: project `.ccteam/`, the seeded `cto.md`, and ccteam hook entries in `settings.local.json`. It **always keeps** your work roles, `CLAUDE.md` / `AGENTS.md`, `.env`, product code, and `.claude/settings.json`.
+`rm --purge` removes only ccteam-owned traces: project `.ccteam/` and ccteam hook entries in `settings.local.json`. It **always keeps** your work roles, `CLAUDE.md` / `AGENTS.md`, `.env`, product code, and `.claude/settings.json`.
 
 ### `session` (Sessions and Bot Registration)
 
@@ -289,7 +291,7 @@ ccteam reads ccteam-hub over HTTPS with a local cache at `~/.ccteam/cache/hub/`,
 ```bash
 ccteam status                      # Daemon + projects/sessions + web token/url lines.
 ccteam session ls                  # Gateway session status; degrades when daemon is offline.
-ccteam doctor --verify-mcp         # MCP surface check: active 15 / stub 0; drift exits 1.
+ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
 ccteam doctor --check-cost-orphan  # Cost ledger reconciliation.
 ```
 
