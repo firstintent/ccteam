@@ -34,27 +34,30 @@ flowchart LR
     S3 -.-> S1
 ```
 
-The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agents organize themselves through eight `mcp__ccteam__*` tools; the bridge routes, records, and enforces limits. Sessions have durable ids (`s1`, `s2`, …) that survive restarts and cold-resume from disk. All state is plain files in your own repos.
+The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agents organize themselves through eight `mcp__ccteam__*` tools: `session_spawn` (vendor, model, host, persona — and the first task in one call), `session_dispatch` (async with completion notification, or wait inline), `session_collect` (cursor paging, `tail` for the final answer, honest `working/idle` signal), `session_list` (delegation tree), `session_stop`, plus `status` / `chat_send_file` / `screenshot`. The bridge routes and records every hop — at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told — and enforces the limits (delegation depth, fan-out, per-project ceilings, cycle rejection, daily per-vendor budget caps; per-session cryptographic identity, scoped to its own project). Sessions have durable ids (`s1`, `s2`, …) that survive restarts and cold-resume from disk; state is plain files in your repos, live in the console's team view, and scriptable via `/api/v1` (docs at `/api/docs`). Claude Code is the first-class harness; Codex, Grok and OpenCode run through the same session model best-effort (satellite execution currently supports Claude sessions).
 
-## Scenarios
+## Best practices
 
-**Architect and workers.** Claude Code (Fable 5) is the brain: decomposes the task, sets constraints, owns the verdict — you pay for its depth only where depth matters. Codex takes the long steady grind; Grok takes the quick turnarounds. A foreman persona in between (e.g. `fable-advisor` from the marketplace) separates *how it should be done* from *who does it*. You send one Telegram message; the architect spawns each worker with its first task in a single call, collects, verdicts, replies.
+For people who already live in Claude Code / Codex — this is the Task tool, except the subagent is a full vendor session that survives you closing the laptop.
 
-**Cross-model review gate.** Codex implements; before you merge, its parent spawns a Claude session to adversarially review the diff. A different model family catches different bugs.
+**Give the brain a team, keep it roleless.** Run Claude Code (Fable 5) as your orchestrator session and let it read your project's own `CLAUDE.md` — no ccteam persona needed. Install `fable-advisor` (marketplace) or write a skill that teaches it *when* to call `session_spawn` — orchestration lives in prompts you version, not in ccteam config.
 
-**Work where the environment is.** The daemon runs on your Mac; the tests need the Linux box with the GPU. Register it once as a satellite — `host: "linux-box"` on a spawn runs the worker there, while transcripts and cost stay on your daemon.
+**Route by strength, pay for depth once.** Fable 5 decomposes, sets constraints, verdicts. The long steady grind goes to Codex; the quick turnaround goes to Grok:
 
-**Steer from your pocket.** Kick off a migration at your desk, close the laptop, redirect the agent mid-task from Telegram on the train.
+```text
+session_spawn{vendor:"codex", title:"impl", task:"implement RFC-12, run tests, report"}
+session_spawn{vendor:"grok",  title:"probe", task:"profile the hot path", wait_seconds:120}
+```
 
-## The bridge
+Async by default — the completion notification lands in the parent's chat like a colleague reporting back; `wait_seconds` only for sub-minute answers you need inline.
 
-- **Eight MCP tools.** `session_spawn` (vendor, model, host, persona — and the first task in the same call) · `session_dispatch` (async with completion notification, or wait inline for the answer) · `session_collect` (cursor paging, `tail` for the final answer, honest `working / idle` signal) · `session_list` (delegation tree) · `session_stop` (your own delegates only) · plus `status`, `chat_send_file`, `screenshot`.
-- **Delivery you can trust.** At-least-once completion notifications across restarts; idempotency keys so retries never double-run; a child's turn is on disk before its parent is told.
-- **Guardrails in the daemon, not in prompts.** Delegation depth, fan-out, per-project ceilings, cycle rejection, daily per-vendor budget caps. Per-session cryptographic identity — no session acts outside its project.
-- **Observability.** The team view shows the delegation tree live: who's working, who's stuck, who spent what — plus a dispatch timeline and a cross-host topology.
-- **A real API.** Everything the console does is token-authenticated HTTP (`/api/v1`), self-documented at `/api/docs`.
+**Gate merges with a rival model.** Codex implements; the parent spawns a Claude reviewer on the diff before you merge. `session_collect{sid, tail:true}` grabs the verdict without paging the whole transcript.
 
-Claude Code is the first-class harness; Codex, Grok and OpenCode run through the same session model best-effort (satellite execution currently supports Claude sessions).
+**Run where the environment is.** Tests need the Linux box with the GPU? Register it once as a satellite; `host:"linux-box"` on the spawn runs the worker there — transcripts and cost stay on your daemon.
+
+**Poll like you mean it.** `session_collect` returns `working` while the child is mid-turn and `idle` when the turn is done — don't guess from silence. `session_list` shows the whole delegation tree, and `@s2 …` from Telegram talks to any member directly; you are part of the team, not just its audience.
+
+**Cap the blast radius.** Set delegation depth/fan-out and daily per-vendor budgets in config once; a runaway fan-out is refused by the daemon with a reason, not discovered on the invoice.
 
 ## Install
 
