@@ -3,7 +3,7 @@
 //   /                → Home (landing; lazy-create on first message)
 //   /chat/s/:sid     → Conversation
 //   /flow/:tab?      → 工作流 (Skills/Roles/MCP/自进化/Compare)
-//   /settings/:tab?  → 设置 (主机/插件市场/Status/IM/通用/账号)
+//   /settings/:tab?  → 设置 (运维总览/插件市场/IM/通用/账号)
 // Legacy flat routes (marketplace/status/hosts/workflow) redirect into the
 // new IA so old deep links keep working.
 
@@ -49,13 +49,15 @@ export default function App() {
         <Route path="/flow" element={<ChatConsole />} />
         <Route path="/flow/:tab" element={<ChatConsole />} />
         <Route path="/settings" element={<ChatConsole />} />
+        <Route path="/settings/status" element={<Navigate to="/settings/ops" replace />} />
+        <Route path="/settings/hosts" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/settings/:tab" element={<ChatConsole />} />
         {/* v0.9.0 W4 — 团队/Team view (admin-only nav entry; beta-gate). */}
         <Route path="/agents" element={<ChatConsole />} />
         {/* legacy flat routes → the new IA */}
         <Route path="/marketplace" element={<Navigate to="/settings/market" replace />} />
-        <Route path="/status" element={<Navigate to="/settings/status" replace />} />
-        <Route path="/hosts" element={<Navigate to="/settings/hosts" replace />} />
+        <Route path="/status" element={<Navigate to="/settings/ops" replace />} />
+        <Route path="/hosts" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/workflow" element={<Navigate to="/flow" replace />} />
         <Route path="*" element={<ChatConsole />} />
       </Routes>

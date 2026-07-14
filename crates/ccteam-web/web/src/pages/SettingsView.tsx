@@ -1,8 +1,8 @@
 // v0.8.24 Track A — 设置 top-level view (prototype `#view-settings`):
-// set-nav second column with SIX sub-pages — 主机 / 插件市场 / Status /
-// IM 接入 / 通用 / 账号.
+// set-nav second column with FIVE sub-pages — 运维总览 / 插件市场 /
+// IM 接入 / 通用 / 账号. 运维总览 combines Status + Hosts.
 //
-// ACL (红线 §1.6-3, fail-closed via useMe): 主机 / Status / IM 接入 are
+// ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / IM 接入 are
 // admin-only nav items — a tenant sees ONLY 插件市场 / 通用 / 账号 (the
 // backend 403s regardless; this is the UI层 beta/visibility gate). The 账号
 // panel absorbs the old AvatarMenu entirely (头像 / 昵称 / 语言入口 / 登出 +
@@ -13,7 +13,6 @@ import {
   Activity,
   MessageSquare,
   Package,
-  Server,
   SlidersHorizontal,
   User,
 } from "lucide-react";
@@ -30,12 +29,11 @@ import { resetToken } from "../lib/meApi";
 import { toastBus } from "../lib/toastBus";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
-export type SettingsTab = "hosts" | "market" | "status" | "im" | "general" | "account";
+export type SettingsTab = "ops" | "market" | "im" | "general" | "account";
 
 const ITEMS: { id: SettingsTab; labelKey: string; adminOnly: boolean; icon: React.ReactNode }[] = [
-  { id: "hosts", labelKey: "setHosts", adminOnly: true, icon: <Server /> },
+  { id: "ops", labelKey: "setOps", adminOnly: true, icon: <Activity /> },
   { id: "market", labelKey: "setMarket", adminOnly: false, icon: <Package /> },
-  { id: "status", labelKey: "setStatus", adminOnly: true, icon: <Activity /> },
   { id: "im", labelKey: "setIm", adminOnly: true, icon: <MessageSquare /> },
   { id: "general", labelKey: "setGeneral", adminOnly: false, icon: <SlidersHorizontal /> },
   { id: "account", labelKey: "setAccount", adminOnly: false, icon: <User /> },
@@ -52,8 +50,9 @@ export function visibleSettingsItems(isAdmin: boolean): SettingsTab[] {
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
 export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): SettingsTab {
   const visible = visibleSettingsItems(isAdmin);
-  if (tab && (visible as string[]).includes(tab)) return tab as SettingsTab;
-  return isAdmin ? "hosts" : "market";
+  const normalized = tab === "hosts" || tab === "status" ? "ops" : tab;
+  if (normalized && (visible as string[]).includes(normalized)) return normalized as SettingsTab;
+  return isAdmin ? "ops" : "market";
 }
 
 const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
@@ -100,8 +99,11 @@ export default function SettingsView({
       </div>
 
       <div className="set-detail">
-        <div className={`set-detail-inner fade-in ${active === "market" || active === "status" ? "wide" : ""}`} key={active}>
-          {active === "hosts" && isAdmin ? <HostsView lang={lang} /> : null}
+        <div
+          className={`set-detail-inner fade-in ${active === "market" ? "wide" : ""} ${active === "ops" ? "ops-wide" : ""}`}
+          key={active}
+        >
+          {active === "ops" && isAdmin ? <OpsPanel lang={lang} rail={rail} /> : null}
 
           {active === "market" ? (
             <>
@@ -112,8 +114,6 @@ export default function SettingsView({
               <MarketplaceView embedded />
             </>
           ) : null}
-
-          {active === "status" && isAdmin ? <StatusView rail={rail} /> : null}
 
           {active === "im" && isAdmin ? (
             <>
@@ -148,6 +148,19 @@ export default function SettingsView({
         </div>
       </div>
     </section>
+  );
+}
+
+export function OpsPanel({ lang, rail }: { lang: Lang; rail: SessionSummary[] }) {
+  return (
+    <div className="ops-grid" data-testid="ops-view">
+      <section className="ops-panel" aria-label="Status">
+        <StatusView rail={rail} />
+      </section>
+      <section className="ops-panel" aria-label="Hosts">
+        <HostsView lang={lang} />
+      </section>
+    </div>
   );
 }
 

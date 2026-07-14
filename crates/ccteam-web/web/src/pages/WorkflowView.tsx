@@ -118,7 +118,13 @@ export default function WorkflowView({
   }, [slug, tab]);
 
   useEffect(() => {
-    void refreshTab();
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void refreshTab();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refreshTab]);
 
   const toggleVendor = (v: string) => {

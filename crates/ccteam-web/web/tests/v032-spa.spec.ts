@@ -391,20 +391,46 @@ test("home lazy-create: first message POSTs session without a host override, the
   await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
 });
 
-test("工作流 and 设置 render as set-nav views; Status keeps its cards", async ({ page }) => {
+test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts responsively", async ({
+  page,
+}) => {
   await mockCcteamApi(page);
   await page.goto("/app/flow");
   await expect(page.getByTestId("workflow-view")).toBeVisible();
   await expect(page.getByTestId("workflow-tab-compare")).toBeVisible();
 
+  await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/app/settings/status");
+  await expect(page).toHaveURL(/\/app\/settings\/ops$/);
   await expect(page.getByTestId("settings-view")).toBeVisible();
+  await expect(page.getByTestId("ops-view")).toBeVisible();
   await expect(page.getByTestId("status-view")).toBeVisible();
+  await expect(page.getByTestId("hosts-view")).toBeVisible();
   await expect(page.getByText(/1 .*live/).first()).toBeVisible();
+  await expect
+    .poll(() =>
+      page
+        .getByTestId("ops-view")
+        .evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(" ").length),
+    )
+    .toBe(2);
 
-  // legacy flat route still lands on the new IA.
+  // Both legacy settings and flat routes canonicalize to the merged tab.
+  await page.goto("/app/settings/hosts");
+  await expect(page).toHaveURL(/\/app\/settings\/ops$/);
   await page.goto("/app/status");
-  await expect(page).toHaveURL(/\/app\/settings\/status$/);
+  await expect(page).toHaveURL(/\/app\/settings\/ops$/);
+  await page.goto("/app/hosts");
+  await expect(page).toHaveURL(/\/app\/settings\/ops$/);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() =>
+      page
+        .getByTestId("ops-view")
+        .evaluate((node) => getComputedStyle(node).gridTemplateColumns.split(" ").length),
+    )
+    .toBe(1);
 });
 
 test("mobile ≤820px: sidebar is a drawer behind the hamburger with a backdrop", async ({

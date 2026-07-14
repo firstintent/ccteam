@@ -224,14 +224,10 @@ export function useSessionEvents(
   // only on an actual sid change, below) — that persistence is exactly what
   // makes the reconnect watermark work.
   const lastSeenSeqRef = useRef(0);
+  const watermarkSidRef = useRef<string | null>(sid);
   if (sid !== streamedSid) {
     setStreamedSid(sid);
     setEvents([]);
-    // A new sid starts its own seq watermark; carrying over the PREVIOUS
-    // sid's seq would either wrongly drop the new sid's early frames (if it
-    // happened to be numerically lower) or just be meaningless (ring seqs
-    // are per-sid, not global).
-    lastSeenSeqRef.current = 0;
   }
 
   const esRef = useRef<EventSource | null>(null);
@@ -239,6 +235,16 @@ export function useSessionEvents(
   const retryCountRef = useRef(0);
 
   useEffect(() => {
+    // A new sid starts its own seq watermark; carrying over the PREVIOUS
+    // sid's seq would either wrongly drop the new sid's early frames (if it
+    // happened to be numerically lower) or just be meaningless (ring seqs
+    // are per-sid, not global). Refs are synchronized in the effect rather
+    // than during render so React's render phase stays pure.
+    if (watermarkSidRef.current !== sid) {
+      watermarkSidRef.current = sid;
+      lastSeenSeqRef.current = 0;
+    }
+
     // No sid (or disabled) — tear the stream down and reset state so the
     // pane renders empty rather than stale events from the previous sid.
     if (!sid || !enabled) {

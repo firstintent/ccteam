@@ -766,8 +766,9 @@ export function MyImSection() {
     };
   }, [larkCaptureSince]);
 
-  function startLarkCapture() {
+  function onStartLarkCapture() {
     setLarkCandidates([]);
+    // eslint-disable-next-line react-hooks/purity -- user-action timestamp, never called during render
     setLarkCaptureSince(Math.floor(Date.now() / 1000) - 2);
     toastBus.handler?.info("私聊 Lark / 飞书 bot,或在群里 @ bot,这里会出现 open_id");
   }
@@ -809,7 +810,7 @@ export function MyImSection() {
       setLarkAppId("");
       setLarkSecret("");
       if (larkOpen && larkUserIds.length === 0) {
-        startLarkCapture();
+        onStartLarkCapture();
       }
       toastBus.handler?.info("已保存 / Saved");
     } catch (err) {
@@ -952,7 +953,7 @@ export function MyImSection() {
                     type="button"
                     variant="ghost"
                     size="sm"
-                    onClick={startLarkCapture}
+                    onClick={onStartLarkCapture}
                     disabled={pending}
                   >
                     开始

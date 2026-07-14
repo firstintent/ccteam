@@ -46,6 +46,8 @@ describe("I18N dictionary", () => {
   it("makeT curries the language", () => {
     const tt = makeT("en");
     expect(tt("recent")).toBe("Recent sessions");
+    expect(t("zh", "setOps")).toBe("运维总览");
+    expect(tt("setOps")).toBe("Ops & Hosts");
   });
 
   it("parameterized phrases interpolate per language", () => {

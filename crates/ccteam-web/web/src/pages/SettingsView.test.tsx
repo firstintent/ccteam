@@ -1,7 +1,8 @@
-// v0.8.24 Track A — 设置 view (set-nav six sub-pages) + the tenant ACL gate
-// (红线 §1.6-3: fail-closed via useMe — a tenant NEVER sees 主机/Status/IM).
+// v0.8.24 Track A — 设置 view (set-nav five sub-pages) + the tenant ACL gate
+// (红线 §1.6-3: fail-closed via useMe — a tenant NEVER sees 运维总览/IM).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,6 +21,7 @@ import { MemoryRouter } from "react-router-dom";
 import SettingsView, {
   AccountPanel,
   GeneralPanel,
+  OpsPanel,
   maskToken,
   resolveSettingsTab,
   visibleSettingsItems,
@@ -30,11 +32,10 @@ describe("visibleSettingsItems (fail-closed ACL)", () => {
     expect(visibleSettingsItems(false)).toEqual(["market", "general", "account"]);
   });
 
-  it("admin sees all six", () => {
+  it("admin sees the five tabs, with Status + Hosts merged into ops", () => {
     expect(visibleSettingsItems(true)).toEqual([
-      "hosts",
+      "ops",
       "market",
-      "status",
       "im",
       "general",
       "account",
@@ -49,13 +50,19 @@ describe("resolveSettingsTab", () => {
   });
 
   it("denies an admin-only tab to a tenant (falls back to market)", () => {
+    expect(resolveSettingsTab("ops", false)).toBe("market");
     expect(resolveSettingsTab("hosts", false)).toBe("market");
     expect(resolveSettingsTab("im", false)).toBe("market");
     expect(resolveSettingsTab("status", false)).toBe("market");
   });
 
-  it("defaults: admin → hosts, tenant → market", () => {
-    expect(resolveSettingsTab(undefined, true)).toBe("hosts");
+  it("maps both legacy tabs to ops for admins", () => {
+    expect(resolveSettingsTab("hosts", true)).toBe("ops");
+    expect(resolveSettingsTab("status", true)).toBe("ops");
+  });
+
+  it("defaults: admin → ops, tenant → market", () => {
+    expect(resolveSettingsTab(undefined, true)).toBe("ops");
     expect(resolveSettingsTab(undefined, false)).toBe("market");
   });
 });
@@ -80,8 +87,7 @@ describe("SettingsView SSR (identity unresolved = fail-closed tenant view)", () 
     expect(html).toContain('data-testid="set-item-general"');
     expect(html).toContain('data-testid="set-item-account"');
     // Admin-only panels must never flash to a tenant.
-    expect(html).not.toContain('data-testid="set-item-hosts"');
-    expect(html).not.toContain('data-testid="set-item-status"');
+    expect(html).not.toContain('data-testid="set-item-ops"');
     expect(html).not.toContain('data-testid="set-item-im"');
   });
 
@@ -92,6 +98,31 @@ describe("SettingsView SSR (identity unresolved = fail-closed tenant view)", () 
       </MemoryRouter>,
     );
     expect(html).toContain('data-testid="marketplace-view"');
+  });
+});
+
+describe("OpsPanel (merged Status + Hosts)", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders both existing panels in one grid without changing their test ids", () => {
+    const html = renderToString(<OpsPanel lang="zh" rail={[]} />);
+    expect(html).toContain('data-testid="ops-view"');
+    expect(html).toContain('class="ops-grid"');
+    expect(html).toContain('data-testid="status-view"');
+    expect(html).toContain('data-testid="hosts-view"');
+  });
+
+  it("uses two columns on wide screens and one column at the narrow breakpoint", () => {
+    const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
+    expect(css).toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
+    expect(css).toMatch(
+      /@media \(max-width:\s*1280px\)\s*\{\s*\.ops-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
+    );
   });
 });
 
