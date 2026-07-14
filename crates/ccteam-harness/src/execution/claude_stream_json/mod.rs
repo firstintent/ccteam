@@ -937,7 +937,10 @@ impl ClaudeStreamJsonAdapter {
     ) -> crate::execution::remote_exec::ExecSpec {
         let mut exec_spec = crate::execution::remote_exec::ExecSpec::new(
             "claude",
-            ctx.slug.clone(),
+            ctx.remote
+                .as_ref()
+                .map(|target| target.wire_slug.clone())
+                .unwrap_or_else(|| ctx.slug.clone()),
             ctx.sid.clone(),
             "stream-json",
         );
@@ -999,11 +1002,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
         // bot-token getUpdates poll structurally collides with ccteam's IM
         // gateway). Same managed layer the tmux path uses; only this one
-        // plugin. NOTE (v0.9.0 W3): this always touches the LOCAL
-        // project_dir, even for a remote spawn — a harmless no-op edit to
-        // the main daemon's own working copy; the satellite manages its
-        // own `.claude/settings.local.json` independently.
-        crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
+        // plugin. A remote project's daemon-side `project_dir` is a DATA
+        // HOME, not a vendor working tree: never materialize `.claude/`
+        // there; the satellite's real working tree owns its settings.
+        if ctx.remote.is_none() {
+            crate::execution::claude_tui::ensure_telegram_plugin_disabled(&ctx.project_dir)?;
+        }
         let bin = spawn_spec::claude_bin();
         // §七 ⑤ — stable per-(slug,sid) uuid: the stateless resume key.
         let uuid = spawn_spec::deterministic_session_uuid(&ctx.slug, &ctx.sid);

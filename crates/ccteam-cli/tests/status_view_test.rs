@@ -51,6 +51,9 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
         ccteam_core::config::ProjectEntry {
             slug: slug.to_string(),
             path: project_dir.clone(),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".to_string(),
             installed_at: chrono::Utc::now(),
         },

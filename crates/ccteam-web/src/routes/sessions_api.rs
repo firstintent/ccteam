@@ -76,6 +76,19 @@ use utoipa::ToSchema;
 use super::actions::{FormOrJson, InputMode};
 use crate::state::AppState;
 
+#[derive(Debug, Default)]
+struct RemovedHostField(bool);
+
+impl<'de> Deserialize<'de> for RemovedHostField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
 /// Keep-alive cadence for the per-session SSE stream. Mirrors
 /// [`super::sse`]'s 15s contract (its constant is private; we restate it
 /// to keep the same reverse-proxy idle-timeout defeat).
@@ -245,11 +258,12 @@ pub struct CreateSessionForm {
     /// session channel; omitted → the daemon default (stream-json).
     #[serde(default)]
     pub protocol: Option<String>,
-    /// v0.8.24 Track D — host axis (`local` default, or a registered
-    /// satellite id). Remote hosts require an online registry entry and
-    /// a stdio protocol (stream-json / acp); terminal is rejected.
+    /// Compatibility trap only: `host` was removed from the public schema in
+    /// v0.9.2 and any supplied value is rejected with a migration-free error.
     #[serde(default)]
-    pub host: Option<String>,
+    #[serde(rename = "host")]
+    #[schema(ignore)]
+    removed_host: RemovedHostField,
     /// v0.8.24 A-U3 — explicit model id for the new session; overrides the
     /// role's `model:` frontmatter. Omitted/empty → vendor default. Wired
     /// vendor-natively: claude `--model`, codex `turn/start` override,
@@ -316,6 +330,13 @@ pub(crate) async fn handle_create_session(
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<CreateSessionForm>,
 ) -> Response {
+    if form.removed_host.0 {
+        return create_error(
+            StatusCode::BAD_REQUEST,
+            ccteam_im::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string(),
+            mode,
+        );
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -351,19 +372,12 @@ pub(crate) async fn handle_create_session(
         protocol
     };
 
-    let host = form
-        .host
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("local")
-        .to_string();
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
     let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
     let created = {
         let mut guard = gw.lock().await;
         guard
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 slug.clone(),
                 role.clone(),
                 vendor,
@@ -373,7 +387,6 @@ pub(crate) async fn handle_create_session(
                 // identity (`user:<tenant>` / `user:web-api`) so the tenant's own
                 // IM bot sees it too.
                 identity.web_chat_id(),
-                host,
                 tuning,
             )
             .await

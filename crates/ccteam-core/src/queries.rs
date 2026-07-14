@@ -1529,6 +1529,9 @@ mod tests {
             crate::config::ProjectEntry {
                 slug: "myapp".into(),
                 path: external.clone(),
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: Utc::now(),
             },
@@ -1559,6 +1562,9 @@ mod tests {
             crate::config::ProjectEntry {
                 slug: slug.into(),
                 path: paths.project_dir(slug),
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: Utc::now(),
             },
@@ -1581,6 +1587,9 @@ mod tests {
             crate::config::ProjectEntry {
                 slug: "ghost".into(),
                 path: tmp.path().join("nowhere"),
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: Utc::now(),
             },

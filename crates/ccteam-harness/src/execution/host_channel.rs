@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use futures::{Sink, Stream};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_util::sync::{CancellationToken, PollSender};
@@ -41,6 +42,10 @@ pub const HOST_CHANNEL_SUBPROTOCOL: &str = "ccteam-host.v1";
 /// dial-back after pushing `exec_open` (WAN-generous; a LAN dial-back is
 /// milliseconds).
 pub const EXEC_DIALBACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long project creation waits for a control-channel response. A timeout
+/// usually means the connected satellite predates the `project_init` op.
+pub const PROJECT_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Link keepalive: the daemon pings each control/exec socket this often.
 /// tokio-tungstenite / axum auto-answer pongs, so any healthy link shows
@@ -71,6 +76,25 @@ const EXEC_FRAME_BUFFER: usize = 64;
 pub enum HubCtrlMsg {
     /// Ask the satellite to dial back a fresh exec WS for `nonce`.
     ExecOpen { nonce: String, sid: String },
+    /// Ask the satellite to bootstrap and register a real working tree.
+    ProjectInit {
+        nonce: String,
+        path: String,
+        slug: String,
+    },
+}
+
+/// Satellite response to one [`HubCtrlMsg::ProjectInit`]. The enclosing wire
+/// frame adds `op:"project_init_result"` and the request nonce.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectInitResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One half of an in-memory duplex frame pipe. [`ExecBridge::pair`] returns
@@ -181,6 +205,11 @@ struct PendingExec {
     slot: oneshot::Sender<ExecBridge>,
 }
 
+struct PendingProjectInit {
+    host_id: String,
+    slot: oneshot::Sender<ProjectInitResult>,
+}
+
 /// Live satellite control channels + pending exec dial-backs, keyed by host
 /// id. One instance per daemon process, shared by the web WS handlers (which
 /// register connections / claim dial-backs) and the spawn path (which opens
@@ -189,6 +218,7 @@ struct PendingExec {
 pub struct HostChannelHub {
     hosts: Mutex<HashMap<String, HostHandle>>,
     pending: Mutex<HashMap<String, PendingExec>>,
+    pending_project_init: Mutex<HashMap<String, PendingProjectInit>>,
     generation: AtomicU64,
 }
 
@@ -196,7 +226,15 @@ impl std::fmt::Debug for HostChannelHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hosts = self.hosts.lock().map(|h| h.len()).unwrap_or(0);
         let pending = self.pending.lock().map(|p| p.len()).unwrap_or(0);
-        write!(f, "HostChannelHub{{hosts:{hosts}, pending:{pending}}}")
+        let project_init = self
+            .pending_project_init
+            .lock()
+            .map(|p| p.len())
+            .unwrap_or(0);
+        write!(
+            f,
+            "HostChannelHub{{hosts:{hosts}, pending:{pending}, project_init:{project_init}}}"
+        )
     }
 }
 
@@ -339,6 +377,103 @@ impl HostChannelHub {
         let p = pending.remove(nonce).expect("checked above");
         Ok(p.slot)
     }
+
+    /// Request remote project bootstrap over the live control channel and
+    /// await the nonce-matched result. No response within 15 seconds is a
+    /// readable version-skew failure, never an indefinite wait.
+    pub async fn request_project_init(
+        &self,
+        host_id: &str,
+        path: &str,
+        slug: &str,
+    ) -> Result<ProjectInitResult> {
+        self.request_project_init_with_timeout(host_id, path, slug, PROJECT_INIT_TIMEOUT)
+            .await
+    }
+
+    pub async fn request_project_init_with_timeout(
+        &self,
+        host_id: &str,
+        path: &str,
+        slug: &str,
+        timeout: Duration,
+    ) -> Result<ProjectInitResult> {
+        let ctrl_tx = {
+            let hosts = self.hosts.lock().expect("host hub lock");
+            let Some(handle) = hosts.get(host_id) else {
+                bail!("host `{host_id}` has no live control channel");
+            };
+            handle.ctrl_tx.clone()
+        };
+        let nonce = mint_nonce();
+        let (slot, rx) = oneshot::channel();
+        self.pending_project_init
+            .lock()
+            .expect("project init pending lock")
+            .insert(
+                nonce.clone(),
+                PendingProjectInit {
+                    host_id: host_id.to_string(),
+                    slot,
+                },
+            );
+        let msg = HubCtrlMsg::ProjectInit {
+            nonce: nonce.clone(),
+            path: path.to_string(),
+            slug: slug.to_string(),
+        };
+        if ctrl_tx.send(msg).await.is_err() {
+            self.pending_project_init
+                .lock()
+                .expect("project init pending lock")
+                .remove(&nonce);
+            bail!("host `{host_id}` control channel closed while creating project");
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => {
+                self.pending_project_init
+                    .lock()
+                    .expect("project init pending lock")
+                    .remove(&nonce);
+                Err(anyhow!("satellite dropped the project creation response"))
+            }
+            Err(_) => {
+                self.pending_project_init
+                    .lock()
+                    .expect("project init pending lock")
+                    .remove(&nonce);
+                Err(anyhow!(
+                    "satellite did not respond; it may be running an older ccteam"
+                ))
+            }
+        }
+    }
+
+    /// Complete a pending project-init request. Host-bound and single-use,
+    /// matching the exec nonce rendezvous contract.
+    pub fn complete_project_init(
+        &self,
+        nonce: &str,
+        host_id: &str,
+        result: ProjectInitResult,
+    ) -> Result<()> {
+        let mut pending = self
+            .pending_project_init
+            .lock()
+            .expect("project init pending lock");
+        match pending.get(nonce) {
+            None => bail!("unknown or expired project-init nonce"),
+            Some(p) if p.host_id != host_id => {
+                bail!("project-init nonce was not minted for host `{host_id}`")
+            }
+            Some(_) => {}
+        }
+        let p = pending.remove(nonce).expect("checked above");
+        p.slot
+            .send(result)
+            .map_err(|_| anyhow!("project-init requester dropped"))
+    }
 }
 
 /// Mint an unguessable dial-back nonce (16 CSPRNG bytes, lowercase hex).
@@ -455,6 +590,60 @@ mod tests {
         let (_mine, theirs) = ExecBridge::pair();
         slot.send(theirs).ok().unwrap();
         opener.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_init_pairs_nonce_keyed_result() {
+        let hub = Arc::new(HostChannelHub::default());
+        let mut reg = hub.register("sat");
+        let requester = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.request_project_init_with_timeout(
+                    "sat",
+                    "/srv/work/demo",
+                    "demo",
+                    Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+        let Some(HubCtrlMsg::ProjectInit { nonce, path, slug }) = reg.ctrl_rx.recv().await else {
+            panic!("expected ProjectInit");
+        };
+        assert_eq!(path, "/srv/work/demo");
+        assert_eq!(slug, "demo");
+        hub.complete_project_init(
+            &nonce,
+            "sat",
+            ProjectInitResult {
+                ok: true,
+                slug: Some("demo2".into()),
+                path: Some("/srv/work/demo".into()),
+                error: None,
+            },
+        )
+        .unwrap();
+        let result = requester.await.unwrap().unwrap();
+        assert_eq!(result.slug.as_deref(), Some("demo2"));
+    }
+
+    #[tokio::test]
+    async fn project_init_timeout_mentions_older_satellite_and_cleans_pending() {
+        let hub = HostChannelHub::default();
+        let _reg = hub.register("sat");
+        let err = hub
+            .request_project_init_with_timeout(
+                "sat",
+                "/srv/work/demo",
+                "demo",
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may be running an older ccteam"), "got: {err}");
+        assert!(hub.pending_project_init.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -154,7 +154,6 @@ async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, Str
             PermissionMode::Skip,
             SessionProtocol::StreamJson,
             "web-api".to_string(),
-            "local".to_string(),
             SpawnTuning::default(),
             Some(DelegationParent {
                 sid: "s0".to_string(),
@@ -349,7 +348,6 @@ async fn agents_events_delivers_delegation_frame_with_slug_and_replays_last_even
             PermissionMode::Skip,
             SessionProtocol::StreamJson,
             "web-api".to_string(),
-            "local".to_string(),
             SpawnTuning::default(),
             Some(DelegationParent {
                 sid: "s0".to_string(),

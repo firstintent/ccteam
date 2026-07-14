@@ -365,7 +365,6 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         joined_at: chrono::Utc::now().to_rfc3339(),
     });
     reg.save(&paths.host_registry_path()).unwrap();
-
     let fake = Arc::new(FakeRemoteHostProxy::default());
     let proxy: Arc<dyn RemoteHostProxy> = fake.clone();
     let err = ccteam_im::remote_host::prepare_host_for_spawn(
@@ -457,6 +456,19 @@ async fn gateway_create_on_offline_host_fails_clean() {
         joined_at: chrono::Utc::now().to_rfc3339(),
     });
     reg.save(&paths.host_registry_path()).unwrap();
+    ccteam_core::config::upsert_project(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: "alpha".into(),
+            path: project_dir.clone(),
+            host: "sat1".into(),
+            remote_slug: Some("alpha".into()),
+            remote_path: Some(project_dir.clone()),
+            team: "dev".into(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
 
     struct Stub;
     #[async_trait]
@@ -510,14 +522,13 @@ async fn gateway_create_on_offline_host_fails_clean() {
     gw.set_remote_host_proxy(proxy);
 
     let err = gw
-        .create_session_api_on_host(
+        .create_session_api_tuned(
             "alpha".into(),
             "".into(),
             AgentVendor::Claude,
             PermissionMode::Skip,
             SessionProtocol::StreamJson,
             "web-api".into(),
-            "sat1".into(),
             ccteam_im::gateway::SpawnTuning::default(),
         )
         .await

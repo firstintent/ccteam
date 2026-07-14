@@ -206,12 +206,18 @@ fn load_config_projects_map_populates_from_config_yaml() {
             ProjectEntry {
                 slug: "alpha".into(),
                 path: PathBuf::from("/vol4/alpha"),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: chrono::Utc::now(),
             },
             ProjectEntry {
                 slug: "beta".into(),
                 path: PathBuf::from("/srv/beta"),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "research".into(),
                 installed_at: chrono::Utc::now(),
             },

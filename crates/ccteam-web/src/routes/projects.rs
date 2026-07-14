@@ -46,6 +46,9 @@ use crate::state::AppState;
 pub struct CreateProjectForm {
     pub slug: String,
     pub path: String,
+    /// Project execution host. Omitted/empty means `local`.
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub team: Option<String>,
 }
@@ -54,7 +57,16 @@ pub struct CreateProjectForm {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreatedProject {
     pub slug: String,
+    pub host: String,
     pub path: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportProjectForm {
+    pub host: String,
+    pub remote_slug: String,
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// `POST /api/v1/projects`
@@ -90,49 +102,36 @@ pub(crate) async fn handle_create_project(
         .unwrap_or("dev")
         .to_string();
 
-    // 1. Validate the slug grammar ([a-z0-9-]+, ≤60, no edge dashes).
-    let slug = match ccteam_core::validate_slug_format(&form.slug) {
+    let host = form
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(ccteam_core::LOCAL_HOST)
+        .to_string();
+
+    // Validate the slug grammar and reserve a daemon-catalog identity. The
+    // satellite may independently suffix its own wire slug.
+    let base_slug = match ccteam_core::validate_slug_format(&form.slug) {
         Ok(s) => s,
         Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
     };
-
-    // 2. On a slug collision, AUTO-APPEND (demo → demo2 → demo3 …) instead of
-    //    rejecting — the same rule `ccteam init` uses. Two users (or two
-    //    different working trees) can then both create a "demo": their paths
-    //    differ; the numeric suffix just disambiguates the globally-unique slug
-    //    (the REST/key identity). The 201 returns the slug actually used.
-    //    Bounded so a pathological registry can't spin forever.
-    let slug = {
-        let base = slug;
-        let mut candidate = base.clone();
-        let mut n = 1u32;
-        loop {
-            match ccteam_core::lookup_project_in_config(&app.paths.root, &candidate) {
-                Ok(None) => break candidate,
-                Ok(Some(_)) => {
-                    n += 1;
-                    if n > 999 {
-                        return create_error(
-                            StatusCode::CONFLICT,
-                            format!("too many projects named {base}"),
-                            mode,
-                        );
-                    }
-                    candidate = format!("{base}{n}");
-                }
-                Err(err) => {
-                    tracing::error!(slug = %candidate, %err, "lookup_project_in_config failed");
-                    return create_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("registry read failed: {err}"),
-                        mode,
-                    );
-                }
-            }
+    let slug = match ccteam_core::pick_unused_project_slug(&app.paths.root, &base_slug) {
+        Ok(slug) => slug,
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry read failed: {err}"),
+                mode,
+            )
         }
     };
 
-    // 3. Resolve the working-tree dir. `~`-expansion + absolute-path
+    if host != ccteam_core::LOCAL_HOST {
+        return create_remote_project(&app, &identity, form, mode, slug, host, team).await;
+    }
+
+    // Resolve the local working-tree dir. `~`-expansion + absolute-path
     //    enforcement; we keep this local (the gateway's `expand_project_
     //    path` is private) but apply the same rule: must be absolute after
     //    expansion.
@@ -178,6 +177,9 @@ pub(crate) async fn handle_create_project(
             ProjectEntry {
                 slug: slug_for_blocking.clone(),
                 path: abs_for_blocking.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: team_for_blocking.clone(),
                 installed_at: chrono::Utc::now(),
             },
@@ -190,6 +192,7 @@ pub(crate) async fn handle_create_project(
         Ok(Ok(())) => {
             let body = CreatedProject {
                 slug: slug.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
                 path: abs.display().to_string(),
             };
             match mode {
@@ -217,6 +220,296 @@ pub(crate) async fn handle_create_project(
                 mode,
             )
         }
+    }
+}
+
+async fn create_remote_project(
+    app: &AppState,
+    identity: &crate::auth::Identity,
+    form: CreateProjectForm,
+    mode: InputMode,
+    slug: String,
+    host: String,
+    team: String,
+) -> Response {
+    let remote_path = std::path::PathBuf::from(form.path.trim());
+    if !remote_path.is_absolute() {
+        return create_error(
+            StatusCode::BAD_REQUEST,
+            "path must be absolute on the satellite".to_string(),
+            mode,
+        );
+    }
+    let registry = match ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
+        Ok(registry) => registry,
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("host registry read failed: {err}"),
+                mode,
+            )
+        }
+    };
+    let Some(record) = registry.get(&host) else {
+        return create_error(StatusCode::NOT_FOUND, format!("unknown host: {host}"), mode);
+    };
+    if !record.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS) {
+        return create_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("host `{host}` is offline"),
+            mode,
+        );
+    }
+    if !app.host_hub.is_connected(&host) {
+        return create_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("host `{host}` has no live control channel"),
+            mode,
+        );
+    }
+
+    let result = match app
+        .host_hub
+        .request_project_init(&host, form.path.trim(), &slug)
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let message = format!("remote project creation failed: {err}");
+            let status = if message.contains("did not respond") {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            return create_error(status, message, mode);
+        }
+    };
+    if !result.ok {
+        return create_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "satellite project creation failed: {}",
+                result.error.unwrap_or_else(|| "unknown error".to_string())
+            ),
+            mode,
+        );
+    }
+    let Some(remote_slug) = result.slug.filter(|value| !value.is_empty()) else {
+        return create_error(
+            StatusCode::BAD_GATEWAY,
+            "satellite returned success without a slug".to_string(),
+            mode,
+        );
+    };
+    let Some(remote_path) = result.path.map(std::path::PathBuf::from) else {
+        return create_error(
+            StatusCode::BAD_GATEWAY,
+            "satellite returned success without a path".to_string(),
+            mode,
+        );
+    };
+    if !remote_path.is_absolute() {
+        return create_error(
+            StatusCode::BAD_GATEWAY,
+            "satellite returned a non-absolute project path".to_string(),
+            mode,
+        );
+    }
+
+    let data_home = app.paths.projects_root.join(&slug);
+    let owner = identity.owner_tag();
+    let root = app.paths.root.clone();
+    let slug_for_write = slug.clone();
+    let host_for_write = host.clone();
+    let remote_slug_for_write = remote_slug.clone();
+    let remote_path_for_write = remote_path.clone();
+    let data_home_for_write = data_home.clone();
+    let write = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        ccteam_core::ensure_project_data_home(&data_home_for_write, &slug_for_write, Some(owner))?;
+        ccteam_core::upsert_project_in_config(
+            &root,
+            ProjectEntry {
+                slug: slug_for_write,
+                path: data_home_for_write,
+                host: host_for_write,
+                remote_slug: Some(remote_slug_for_write),
+                remote_path: Some(remote_path_for_write),
+                team,
+                installed_at: chrono::Utc::now(),
+            },
+        )?;
+        Ok(())
+    })
+    .await;
+    match write {
+        Ok(Ok(())) => (
+            StatusCode::CREATED,
+            Json(CreatedProject {
+                slug,
+                host,
+                path: data_home.display().to_string(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("catalog registration failed: {err}"),
+            mode,
+        ),
+        Err(err) => create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("catalog registration worker failed: {err}"),
+            mode,
+        ),
+    }
+}
+
+/// `POST /api/v1/projects/import` — catalog a project already registered on
+/// a satellite. This is a collection operation: it creates the daemon-side
+/// data home and ownership state but never contacts or mutates the satellite.
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/import",
+    tag = "projects",
+    request_body(content = ImportProjectForm),
+    responses(
+        (status = 200, description = "Already cataloged", body = CreatedProject),
+        (status = 201, description = "Imported into daemon catalog", body = CreatedProject),
+        (status = 400, description = "Invalid host or slug"),
+        (status = 404, description = "Host or remote project not reported"),
+    ),
+)]
+pub(crate) async fn handle_import_project(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    FormOrJson(form, mode): FormOrJson<ImportProjectForm>,
+) -> Response {
+    let host = form.host.trim();
+    if host.is_empty() || host == ccteam_core::LOCAL_HOST {
+        return create_error(
+            StatusCode::BAD_REQUEST,
+            "import requires a satellite host".to_string(),
+            mode,
+        );
+    }
+    let remote_slug = match ccteam_core::validate_slug_format(&form.remote_slug) {
+        Ok(slug) => slug,
+        Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
+    };
+    let config = match ccteam_core::load_ccteam_config(&app.paths.root) {
+        Ok(config) => config,
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry read failed: {err}"),
+                mode,
+            )
+        }
+    };
+    if let Some(existing) = config.projects.iter().find(|entry| {
+        entry.host == host && entry.remote_slug.as_deref() == Some(remote_slug.as_str())
+    }) {
+        let owner = ccteam_core::ProjectState::load(&ccteam_core::CcteamPaths::project_state_in(
+            &existing.path,
+        ))
+        .ok()
+        .and_then(|state| state.owner);
+        if !identity.can_see_owner(owner.as_deref()) {
+            return create_error(
+                StatusCode::NOT_FOUND,
+                "remote project is already cataloged by another owner".to_string(),
+                mode,
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(CreatedProject {
+                slug: existing.slug.clone(),
+                host: existing.host.clone(),
+                path: existing.path.display().to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let registry = match ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
+        Ok(registry) => registry,
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("host registry read failed: {err}"),
+                mode,
+            )
+        }
+    };
+    let Some(remote) = registry
+        .get(host)
+        .and_then(|record| record.projects.iter().find(|p| p.slug == remote_slug))
+    else {
+        return create_error(
+            StatusCode::NOT_FOUND,
+            format!("project `{remote_slug}` is not reported by host `{host}`"),
+            mode,
+        );
+    };
+    let base_slug = match form.slug.as_deref() {
+        Some(slug) => match ccteam_core::validate_slug_format(slug) {
+            Ok(slug) => slug,
+            Err(err) => return create_error(StatusCode::BAD_REQUEST, format!("{err}"), mode),
+        },
+        None => remote_slug.clone(),
+    };
+    let slug = match ccteam_core::pick_unused_project_slug(&app.paths.root, &base_slug) {
+        Ok(slug) => slug,
+        Err(err) => {
+            return create_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry read failed: {err}"),
+                mode,
+            )
+        }
+    };
+    let remote_path = std::path::PathBuf::from(&remote.path);
+    let data_home = app.paths.projects_root.join(&slug);
+    let owner = identity.owner_tag();
+    let entry = ProjectEntry {
+        slug: slug.clone(),
+        path: data_home.clone(),
+        host: host.to_string(),
+        remote_slug: Some(remote_slug),
+        remote_path: Some(remote_path),
+        team: "dev".to_string(),
+        installed_at: chrono::Utc::now(),
+    };
+    let root = app.paths.root.clone();
+    let write_home = data_home.clone();
+    let write_slug = slug.clone();
+    let write = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        ccteam_core::ensure_project_data_home(&write_home, &write_slug, Some(owner))?;
+        ccteam_core::upsert_project_in_config(&root, entry)?;
+        Ok(())
+    })
+    .await;
+    match write {
+        Ok(Ok(())) => (
+            StatusCode::CREATED,
+            Json(CreatedProject {
+                slug,
+                host: host.to_string(),
+                path: data_home.display().to_string(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("import failed: {err}"),
+            mode,
+        ),
+        Err(err) => create_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("import worker failed: {err}"),
+            mode,
+        ),
     }
 }
 

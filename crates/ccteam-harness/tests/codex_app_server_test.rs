@@ -2972,6 +2972,7 @@ async fn start_thread_rejects_remote_ctx_readable() {
         secret: String::new(),
         remote: Some(ccteam_harness::RemoteExecTarget {
             host_id: "sat".into(),
+            wire_slug: "demo".into(),
             hub: std::sync::Arc::new(ccteam_harness::HostChannelHub::default()),
         }),
     };

@@ -38,6 +38,9 @@ fn register_project(paths: &CcteamPaths, slug: &str, project_path: &Path) {
         ProjectEntry {
             slug: slug.to_string(),
             path: project_path.to_path_buf(),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".into(),
             installed_at: Utc::now(),
         },

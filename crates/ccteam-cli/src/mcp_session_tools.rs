@@ -405,6 +405,9 @@ mod tests {
         let entry = |slug: &str, path: std::path::PathBuf| ccteam_core::config::ProjectEntry {
             slug: slug.into(),
             path,
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".into(),
             installed_at: chrono::Utc::now(),
         };

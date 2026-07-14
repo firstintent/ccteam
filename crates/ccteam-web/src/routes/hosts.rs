@@ -185,15 +185,10 @@ pub struct HostsResponse {
 pub struct HostProjectView {
     pub slug: String,
     pub path: String,
-}
-
-impl From<ccteam_core::HostProjectReport> for HostProjectView {
-    fn from(p: ccteam_core::HostProjectReport) -> Self {
-        Self {
-            slug: p.slug,
-            path: p.path,
-        }
-    }
+    /// Whether this host-local project has a daemon catalog binding.
+    pub cataloged: bool,
+    /// Daemon catalog slug for that binding.
+    pub catalog_slug: Option<String>,
 }
 
 /// Result of one `<bin> --version` probe.
@@ -410,9 +405,12 @@ pub(crate) async fn handle_host_detail(
             .map(|cfg| {
                 cfg.projects
                     .into_iter()
+                    .filter(|p| p.host.is_empty() || p.host == LOCAL_HOST)
                     .map(|p| HostProjectView {
+                        catalog_slug: Some(p.slug.clone()),
                         slug: p.slug,
                         path: p.path.display().to_string(),
+                        cataloged: true,
                     })
                     .collect()
             })
@@ -432,6 +430,7 @@ pub(crate) async fn handle_host_detail(
     match ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
         Ok(reg) => match reg.get(&host) {
             Some(h) => {
+                let catalog = ccteam_core::config::load(&app.paths.root).unwrap_or_default();
                 let agents: Vec<AgentHealth> = h
                     .agents
                     .iter()
@@ -459,7 +458,23 @@ pub(crate) async fn handle_host_detail(
                         .projects
                         .iter()
                         .cloned()
-                        .map(HostProjectView::from)
+                        .map(|project| {
+                            let catalog_slug = catalog
+                                .projects
+                                .iter()
+                                .find(|entry| {
+                                    entry.host == h.id
+                                        && entry.remote_slug.as_deref()
+                                            == Some(project.slug.as_str())
+                                })
+                                .map(|entry| entry.slug.clone());
+                            HostProjectView {
+                                slug: project.slug,
+                                path: project.path,
+                                cataloged: catalog_slug.is_some(),
+                                catalog_slug,
+                            }
+                        })
                         .collect(),
                 })
                 .into_response()
@@ -863,6 +878,22 @@ fn handle_channel_frame(app: &crate::state::AppState, host_id: &str, raw: &str) 
                 tracing::debug!(host = %host_id, error = %err, "host channel: bad report frame")
             }
         },
+        Some("project_init_result") => {
+            let Some(nonce) = v.get("nonce").and_then(|n| n.as_str()) else {
+                tracing::debug!(host = %host_id, "host channel: project_init_result missing nonce");
+                return;
+            };
+            match serde_json::from_value::<ccteam_harness::ProjectInitResult>(v.clone()) {
+                Ok(result) => {
+                    if let Err(err) = app.host_hub.complete_project_init(nonce, host_id, result) {
+                        tracing::debug!(host = %host_id, error = %err, "host channel: stale project_init_result ignored");
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(host = %host_id, error = %err, "host channel: bad project_init_result frame")
+                }
+            }
+        }
         other => {
             tracing::debug!(host = %host_id, op = ?other, "host channel: unknown op ignored")
         }
@@ -923,6 +954,17 @@ async fn run_host_channel(
                         "op": "exec_open",
                         "nonce": nonce,
                         "sid": sid,
+                    });
+                    if socket.send(AxMessage::Text(frame.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(HubCtrlMsg::ProjectInit { nonce, path, slug }) => {
+                    let frame = serde_json::json!({
+                        "op": "project_init",
+                        "nonce": nonce,
+                        "path": path,
+                        "slug": slug,
                     });
                     if socket.send(AxMessage::Text(frame.to_string().into())).await.is_err() {
                         break;

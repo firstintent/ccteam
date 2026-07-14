@@ -1005,7 +1005,7 @@ async fn run_session_tool(
 /// names the target with an explicit `project` (fleet-wide).
 ///
 /// Facets mirror the REST `CreateSessionForm`: `{role?, vendor?, model?,
-/// effort?, protocol?, host?, permission_mode?, title?}`. `role` empty/absent =
+/// effort?, protocol?, permission_mode?, title?}`. `role` empty/absent =
 /// roleless (bare vendor reads the project CLAUDE.md/AGENTS.md). `title` is
 /// metadata/ledger only — NEVER concatenated into any prompt.
 async fn run_session_spawn(
@@ -1013,6 +1013,9 @@ async fn run_session_spawn(
     gateway: &GatewayHandle,
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
+    if args.get("host").is_some() {
+        return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
+    }
     // Roleless is a first-class form; absent or "" both mean roleless.
     let role = args
         .get("role")
@@ -1060,13 +1063,6 @@ async fn run_session_spawn(
     } else {
         protocol
     };
-    let host = args
-        .get("host")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("local")
-        .to_string();
     // Optional model/effort (composer facets). Grok effort is dropped (its
     // value set is undocumented — an invalid value would fail the spawn),
     // mirroring the REST `spawn_tuning_from_form` contract.
@@ -1189,7 +1185,6 @@ async fn run_session_spawn(
                         permission_mode,
                         protocol,
                         owner_id,
-                        host.clone(),
                         tuning,
                         parent,
                         title.clone(),
@@ -1209,7 +1204,6 @@ async fn run_session_spawn(
                     permission_mode,
                     protocol,
                     owner_id,
-                    host.clone(),
                     tuning,
                     parent,
                     title.clone(),
@@ -1239,6 +1233,10 @@ async fn run_session_spawn(
         .unwrap_or_default();
     let parent_sid = child_meta.as_ref().and_then(|m| m.parent_sid.clone());
     let delegation_depth = child_meta.as_ref().map(|m| m.delegation_depth).unwrap_or(0);
+    let host = child_meta
+        .as_ref()
+        .map(|meta| meta.host.clone())
+        .unwrap_or_else(|| ccteam_core::LOCAL_HOST.to_string());
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -3137,6 +3135,18 @@ mod session_tool_tests {
 
     fn parse(body: &str) -> serde_json::Value {
         serde_json::from_str(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_spawn_rejects_removed_host_parameter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let args = ambient(&principal, "alpha", json!({"host": "sat-a"}));
+        let err = run_session_spawn(&args, &gw, McpCaller::Ambient)
+            .await
+            .unwrap_err();
+        assert_eq!(err, crate::remote_host::HOST_SPAWN_PARAM_REMOVED);
+        assert_eq!(gw.lock().await.session_views().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

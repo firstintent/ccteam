@@ -232,6 +232,9 @@ async fn admin_404s_on_ghost_slug_but_reaches_registered_orphan() {
         ccteam_core::config::ProjectEntry {
             slug: "orphanp".into(),
             path: tmp.path().join("orphanp"),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".into(),
             installed_at: chrono::Utc::now(),
         },

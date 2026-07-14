@@ -148,10 +148,11 @@ pub use claude_job::{
 pub use claude_job::{link_scan_warn_count, reset_link_scan_warn_for_tests};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
-    default_claude_jobs_retention_days, load as load_ccteam_config,
-    lookup_project as lookup_project_in_config, remove_project as remove_project_from_config,
-    save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
-    DelegationConfig, ProjectEntry, SessionsConfig, CONFIG_FILENAME,
+    default_claude_jobs_retention_days, default_project_host, load as load_ccteam_config,
+    lookup_project as lookup_project_in_config, pick_unused_project_slug,
+    remove_project as remove_project_from_config, save as save_ccteam_config,
+    upsert_project as upsert_project_in_config, CcteamConfig, DelegationConfig, ProjectEntry,
+    SessionsConfig, CONFIG_FILENAME,
 };
 // V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};
@@ -243,9 +244,9 @@ pub use progress::{
     AgentSessionStatus, AgentSessionSummary,
 };
 pub use projects::{
-    bootstrap_project, bootstrap_project_at_dir, pick_unused_slug, pick_unused_slug_verbatim,
-    pre_trust_project, read_current_branch, refuses_active_session, slugify, slugify_brief,
-    validate_slug_format, ActiveSessionRefusal,
+    bootstrap_project, bootstrap_project_at_dir, ensure_project_data_home, pick_unused_slug,
+    pick_unused_slug_verbatim, pre_trust_project, read_current_branch, refuses_active_session,
+    slugify, slugify_brief, validate_slug_format, ActiveSessionRefusal,
 };
 // v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{
@@ -263,7 +264,7 @@ pub use host_registry::{
     normalize_host_id, now_unix, probe_agents, registry_path_in, AgentProbeSpec, HostAgentReport,
     HostJoinRequest, HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport,
     JoinToken, JoinTokenStore, SatelliteSelf, AGENT_PROBE_SPECS, DEFAULT_HEARTBEAT_TTL_SECS,
-    LOCAL_HOST as REGISTRY_LOCAL_HOST,
+    LOCAL_HOST, LOCAL_HOST as REGISTRY_LOCAL_HOST,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,

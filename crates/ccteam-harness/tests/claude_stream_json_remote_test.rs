@@ -276,6 +276,7 @@ async fn remote_spawn_e2e_answer_flows_and_exec_spec_is_sane() {
     let (hub, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
     let target = RemoteExecTarget {
         host_id: "sat".into(),
+        wire_slug: "sat-demo".into(),
         hub,
     };
 
@@ -290,6 +291,10 @@ async fn remote_spawn_e2e_answer_flows_and_exec_spec_is_sane() {
         )
         .await
         .expect("remote start_thread");
+    assert!(
+        !tmp.path().join(".claude").exists(),
+        "remote daemon-side data home must not get vendor settings"
+    );
 
     // Submit a turn and collect the answer over the events stream.
     adapter
@@ -328,7 +333,7 @@ async fn remote_spawn_e2e_answer_flows_and_exec_spec_is_sane() {
     );
     let spec = &specs[1];
     assert_eq!(spec.vendor, "claude");
-    assert_eq!(spec.slug, "demo");
+    assert_eq!(spec.slug, "sat-demo");
     assert_eq!(spec.sid, "s7");
     assert!(
         spec.args.iter().any(|a| a == "--session-id"),
@@ -379,6 +384,7 @@ async fn remote_reconnect_uses_resume_with_the_same_deterministic_uuid() {
     let (hub, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
     let target = RemoteExecTarget {
         host_id: "sat".into(),
+        wire_slug: "demo".into(),
         hub,
     };
     let uuid = deterministic_session_uuid("demo", "s9");

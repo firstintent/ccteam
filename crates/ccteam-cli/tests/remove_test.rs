@@ -75,6 +75,9 @@ impl Fixture {
             ProjectEntry {
                 slug: slug.into(),
                 path: project_dir.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: Utc::now(),
             },

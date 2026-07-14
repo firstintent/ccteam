@@ -607,6 +607,9 @@ mod tests {
             crate::config::ProjectEntry {
                 slug: "anywhere".into(),
                 path: elsewhere.clone(),
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".into(),
                 installed_at: chrono::Utc::now(),
             },

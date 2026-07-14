@@ -175,6 +175,9 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     let entry = ccteam_core::ProjectEntry {
         slug: project_report.slug.clone(),
         path: target.clone(),
+        host: ccteam_core::LOCAL_HOST.to_string(),
+        remote_slug: None,
+        remote_path: None,
         team: project_report.team.clone(),
         installed_at: chrono::Utc::now(),
     };

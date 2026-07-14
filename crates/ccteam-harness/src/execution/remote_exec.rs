@@ -146,6 +146,9 @@ pub struct ExecExit {
 pub struct RemoteExecTarget {
     /// Registered satellite host id.
     pub host_id: String,
+    /// Satellite-local project slug used only for `ExecSpec.slug` cwd
+    /// resolution. Daemon-side session identity remains the catalog slug.
+    pub wire_slug: String,
     /// The daemon's control-channel hub (rendezvous for the dial-back).
     pub hub: Arc<HostChannelHub>,
 }
@@ -154,6 +157,7 @@ impl std::fmt::Debug for RemoteExecTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteExecTarget")
             .field("host_id", &self.host_id)
+            .field("wire_slug", &self.wire_slug)
             .finish_non_exhaustive()
     }
 }
@@ -542,6 +546,7 @@ mod tests {
         });
         let target = RemoteExecTarget {
             host_id: "sat".into(),
+            wire_slug: "demo".into(),
             hub,
         };
         let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");
@@ -576,6 +581,7 @@ mod tests {
         });
         let target = RemoteExecTarget {
             host_id: "sat".into(),
+            wire_slug: "demo".into(),
             hub,
         };
         let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");
@@ -596,6 +602,7 @@ mod tests {
         let hub = Arc::new(HostChannelHub::default());
         let target = RemoteExecTarget {
             host_id: "ghost".into(),
+            wire_slug: "demo".into(),
             hub,
         };
         let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");

@@ -91,21 +91,33 @@ async fn build_report(paths: &CcteamPaths) -> serde_json::Value {
     let agents = tokio::task::spawn_blocking(ccteam_core::probe_agents)
         .await
         .unwrap_or_default();
-    let projects: Vec<ccteam_core::HostProjectReport> = ccteam_core::config::load(&paths.root)
+    serde_json::json!({
+        "op": "report",
+        "agents": agents,
+        "projects": registered_projects(paths),
+        "ccteam_version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn registered_projects(paths: &CcteamPaths) -> Vec<ccteam_core::HostProjectReport> {
+    ccteam_core::config::load(&paths.root)
         .map(|cfg| {
             cfg.projects
                 .into_iter()
+                .filter(|p| p.host.is_empty() || p.host == ccteam_core::LOCAL_HOST)
                 .map(|p| ccteam_core::HostProjectReport {
                     slug: p.slug,
                     path: p.path.display().to_string(),
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn build_project_report(paths: &CcteamPaths) -> serde_json::Value {
     serde_json::json!({
         "op": "report",
-        "agents": agents,
-        "projects": projects,
+        "projects": registered_projects(paths),
         "ccteam_version": env!("CARGO_PKG_VERSION"),
     })
 }
@@ -206,13 +218,14 @@ async fn run_control_channel(
     let mut idle_tick = tokio::time::interval(IDLE_TIMEOUT / 3);
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_rx = tokio::time::Instant::now();
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(8);
 
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     last_rx = tokio::time::Instant::now();
-                    handle_control_frame(paths, me, &t);
+                    handle_control_frame(paths, me, &t, outbound_tx.clone());
                 }
                 Some(Ok(Message::Close(_))) | None => return Ok(ChannelEnd::Closed),
                 Some(Ok(_)) => {
@@ -227,6 +240,12 @@ async fn run_control_channel(
                 sink.send(Message::Text(report.to_string()))
                     .await
                     .context("send report")?;
+            }
+            outbound = outbound_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    continue;
+                };
+                sink.send(outbound).await.context("send control response")?;
             }
             _ = idle_tick.tick() => {
                 if last_rx.elapsed() > IDLE_TIMEOUT {
@@ -245,7 +264,12 @@ async fn run_control_channel(
 }
 
 /// One inbound control frame. Unknown ops are ignored (forward compat).
-fn handle_control_frame(paths: &CcteamPaths, me: &SatelliteSelf, raw: &str) {
+fn handle_control_frame(
+    paths: &CcteamPaths,
+    me: &SatelliteSelf,
+    raw: &str,
+    outbound: tokio::sync::mpsc::Sender<Message>,
+) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         tracing::debug!("satellite: non-JSON control frame ignored");
         return;
@@ -271,10 +295,102 @@ fn handle_control_frame(paths: &CcteamPaths, me: &SatelliteSelf, raw: &str) {
                 }
             });
         }
+        Some("project_init") => {
+            let Some(nonce) = v.get("nonce").and_then(|n| n.as_str()).map(String::from) else {
+                tracing::warn!("satellite: project_init without nonce ignored");
+                return;
+            };
+            let path = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let slug = v
+                .get("slug")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let paths = paths.clone();
+            tokio::spawn(async move {
+                let init_paths = paths.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    initialize_satellite_project(&init_paths, &path, &slug)
+                })
+                .await;
+                let result = match result {
+                    Ok(Ok((slug, path))) => ccteam_harness::ProjectInitResult {
+                        ok: true,
+                        slug: Some(slug),
+                        path: Some(path.display().to_string()),
+                        error: None,
+                    },
+                    Ok(Err(err)) => ccteam_harness::ProjectInitResult {
+                        ok: false,
+                        error: Some(format!("{err:#}")),
+                        ..Default::default()
+                    },
+                    Err(err) => ccteam_harness::ProjectInitResult {
+                        ok: false,
+                        error: Some(format!("project initialization worker failed: {err}")),
+                        ..Default::default()
+                    },
+                };
+                let mut frame = serde_json::to_value(&result).unwrap_or_else(|_| {
+                    serde_json::json!({"ok": false, "error": "serialize project result failed"})
+                });
+                frame["op"] = serde_json::json!("project_init_result");
+                frame["nonce"] = serde_json::json!(nonce);
+                let succeeded = result.ok;
+                if succeeded {
+                    let report = build_project_report(&paths);
+                    if outbound
+                        .send(Message::Text(report.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = outbound.send(Message::Text(frame.to_string())).await;
+            });
+        }
         other => {
             tracing::debug!(op = ?other, "satellite: unknown control op ignored (forward-compat)")
         }
     }
+}
+
+fn initialize_satellite_project(
+    paths: &CcteamPaths,
+    raw_path: &str,
+    requested_slug: &str,
+) -> Result<(String, PathBuf)> {
+    let path = PathBuf::from(raw_path.trim());
+    if !path.is_absolute() {
+        anyhow::bail!("project path must be absolute on the satellite");
+    }
+    let requested_slug = ccteam_core::validate_slug_format(requested_slug)?;
+    let slug = ccteam_core::pick_unused_project_slug(&paths.root, &requested_slug)?;
+    ccteam_core::bootstrap_project_at_dir(
+        paths,
+        &path,
+        &slug,
+        "(created by daemon project binding)",
+        "dev",
+    )?;
+    ccteam_core::upsert_project_in_config(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: slug.clone(),
+            path: path.clone(),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
+            team: "dev".to_string(),
+            installed_at: chrono::Utc::now(),
+        },
+    )?;
+    Ok((slug, path))
 }
 
 /// Dial back one `ccteam-exec.v1` WS for `nonce` and run the exec engine

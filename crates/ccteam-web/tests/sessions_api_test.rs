@@ -152,6 +152,24 @@ async fn create_session_no_gateway_is_503() {
 }
 
 #[tokio::test]
+async fn create_session_rejects_removed_host_parameter() {
+    let tmp = TempDir::new().unwrap();
+    let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "host": "sat-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"],
+        ccteam_im::remote_host::HOST_SPAWN_PARAM_REMOVED
+    );
+}
+
+#[tokio::test]
 async fn create_session_returns_model_warning_in_body() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());

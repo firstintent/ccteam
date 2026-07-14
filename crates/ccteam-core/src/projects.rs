@@ -237,6 +237,30 @@ pub fn bootstrap_project(
     bootstrap_project_at_dir(paths, &paths.project_dir(slug), slug, request, team)
 }
 
+/// Materialize the daemon-side state home for a remote project without
+/// treating it as a vendor working tree. This intentionally writes only
+/// `.ccteam/state.json`: no Claude settings, hooks, trust entry, workflow,
+/// or project knowledge scaffold belongs in a data directory.
+pub fn ensure_project_data_home(
+    data_home: &Path,
+    slug: &str,
+    owner: Option<String>,
+) -> Result<PathBuf> {
+    let ccteam_dir = data_home.join(".ccteam");
+    std::fs::create_dir_all(&ccteam_dir)
+        .with_context(|| format!("create {}", ccteam_dir.display()))?;
+    let state_path = CcteamPaths::project_state_in(data_home);
+    let mut state = if state_path.exists() {
+        ProjectState::load(&state_path)?
+    } else {
+        ProjectState::initial(slug.to_string())
+    };
+    state.slug = slug.to_string();
+    state.owner = owner;
+    state.save(&state_path)?;
+    Ok(data_home.to_path_buf())
+}
+
 /// V0.4.2 F72: `bootstrap_project` generalized to install at an
 /// arbitrary `target_dir`. Used by `ccteam init` to bring an existing
 /// repo under management without moving files. Side effects (trust-marking)
@@ -1396,5 +1420,18 @@ mod tests {
             super::read_current_branch(&wt).as_deref(),
             Some("feature-x")
         );
+    }
+
+    #[test]
+    fn remote_data_home_contains_only_ccteam_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_home = tmp.path().join("projects/catalog-demo");
+        ensure_project_data_home(&data_home, "catalog-demo", Some("user:alice".into())).unwrap();
+        let state = ProjectState::load(&CcteamPaths::project_state_in(&data_home)).unwrap();
+        assert_eq!(state.slug, "catalog-demo");
+        assert_eq!(state.owner.as_deref(), Some("user:alice"));
+        assert!(!data_home.join(".claude").exists());
+        assert!(!data_home.join("AGENTS.md").exists());
+        assert!(!data_home.join("CLAUDE.md").exists());
     }
 }

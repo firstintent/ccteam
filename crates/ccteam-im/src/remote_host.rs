@@ -28,6 +28,10 @@ use ccteam_core::host_registry::{
 use ccteam_harness::{HostChannelHub, RemoteExecTarget, SessionProtocol};
 use std::path::Path;
 
+/// Stable error returned when a v0.9.1 caller still supplies per-spawn host.
+pub const HOST_SPAWN_PARAM_REMOVED: &str =
+    "removed in v0.9.2: host is bound to the project; spawn into a project on that host instead";
+
 /// Decision after the host gate for a create/resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteSpawnPlan {
@@ -77,6 +81,7 @@ pub trait RemoteHostProxy: Send + Sync {
     async fn ensure_remote_spawn(
         &self,
         host_id: &str,
+        wire_slug: &str,
         protocol: SessionProtocol,
     ) -> Result<RemoteExecTarget>;
 }
@@ -103,6 +108,7 @@ impl RemoteHostProxy for HubRemoteHostProxy {
     async fn ensure_remote_spawn(
         &self,
         host_id: &str,
+        wire_slug: &str,
         protocol: SessionProtocol,
     ) -> Result<RemoteExecTarget> {
         if protocol.is_terminal() {
@@ -119,6 +125,7 @@ impl RemoteHostProxy for HubRemoteHostProxy {
         }
         Ok(RemoteExecTarget {
             host_id: host_id.to_string(),
+            wire_slug: wire_slug.to_string(),
             hub: self.hub.clone(),
         })
     }
@@ -146,6 +153,7 @@ impl RemoteHostProxy for FakeRemoteHostProxy {
     async fn ensure_remote_spawn(
         &self,
         host_id: &str,
+        wire_slug: &str,
         protocol: SessionProtocol,
     ) -> Result<RemoteExecTarget> {
         if protocol.is_terminal() {
@@ -155,11 +163,13 @@ impl RemoteHostProxy for FakeRemoteHostProxy {
             bail!("host `{host_id}` proxy failed (fake); session was not created");
         }
         *self.last_host.lock().unwrap() = Some(host_id.to_string());
-        if let Some(target) = self.exec_target.lock().unwrap().clone() {
+        if let Some(mut target) = self.exec_target.lock().unwrap().clone() {
+            target.wire_slug = wire_slug.to_string();
             return Ok(target);
         }
         Ok(RemoteExecTarget {
             host_id: host_id.to_string(),
+            wire_slug: wire_slug.to_string(),
             hub: Arc::new(HostChannelHub::default()),
         })
     }
@@ -233,7 +243,7 @@ pub async fn prepare_host_for_spawn(
                      host-channel hub (web/API disabled?); session was not created"
                 );
             };
-            let target = proxy.ensure_remote_spawn(&host_id, protocol).await?;
+            let target = proxy.ensure_remote_spawn(&host_id, slug, protocol).await?;
             Ok(HostTarget {
                 host: host_id,
                 remote: Some(target),
@@ -333,6 +343,7 @@ mod tests {
             .remote
             .expect("online host must yield a remote target");
         assert_eq!(remote.host_id, "sat");
+        assert_eq!(remote.wire_slug, "demo");
     }
 
     #[tokio::test]
@@ -399,7 +410,7 @@ mod tests {
         let proxy = HubRemoteHostProxy::new(hub.clone());
 
         let err = proxy
-            .ensure_remote_spawn("sat", SessionProtocol::StreamJson)
+            .ensure_remote_spawn("sat", "demo", SessionProtocol::StreamJson)
             .await
             .unwrap_err()
             .to_string();
@@ -407,13 +418,13 @@ mod tests {
 
         let _reg = hub.register("sat");
         let target = proxy
-            .ensure_remote_spawn("sat", SessionProtocol::StreamJson)
+            .ensure_remote_spawn("sat", "demo", SessionProtocol::StreamJson)
             .await
             .unwrap();
         assert_eq!(target.host_id, "sat");
 
         let err = proxy
-            .ensure_remote_spawn("sat", SessionProtocol::Terminal)
+            .ensure_remote_spawn("sat", "demo", SessionProtocol::Terminal)
             .await
             .unwrap_err()
             .to_string();

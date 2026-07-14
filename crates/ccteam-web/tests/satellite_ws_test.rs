@@ -42,6 +42,7 @@ async fn reverse_connection_exec_round_trips_bytes_end_to_end() {
     }
     // The satellite resolves its own vendor binary — point `claude` at cat.
     std::env::set_var("CCTEAM_CLAUDE_BIN", "/bin/cat");
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
 
     // ── daemon side ──────────────────────────────────────────────────────
     let tmp_daemon = tempfile::TempDir::new().unwrap();
@@ -90,6 +91,9 @@ async fn reverse_connection_exec_round_trips_bytes_end_to_end() {
         ccteam_core::config::ProjectEntry {
             slug: "demo".into(),
             path: project_dir.clone(),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".into(),
             installed_at: chrono::Utc::now(),
         },
@@ -128,9 +132,55 @@ async fn reverse_connection_exec_round_trips_bytes_end_to_end() {
         .await;
     }
 
+    // ── project_init: daemon catalog identity ↔ satellite wire identity ──
+    let satellite_new_path = tmp_sat.path().join("work/remote-demo");
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects"))
+        .bearer_auth(format!("ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({
+            "slug": "remote-demo",
+            "path": satellite_new_path.display().to_string(),
+            "host": "sat-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let created: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(created["slug"], "remote-demo");
+    assert_eq!(created["host"], "sat-1");
+    let catalog = ccteam_core::lookup_project_in_config(&paths_daemon.root, "remote-demo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.host, "sat-1");
+    assert_eq!(catalog.remote_slug.as_deref(), Some("remote-demo"));
+    assert_eq!(
+        catalog.remote_path.as_deref(),
+        Some(satellite_new_path.as_path())
+    );
+    assert_eq!(catalog.path, paths_daemon.projects_root.join("remote-demo"));
+    assert!(catalog.path.join(".ccteam/state.json").is_file());
+    assert!(!catalog.path.join("AGENTS.md").exists());
+    let satellite_entry = ccteam_core::lookup_project_in_config(&paths_sat.root, "remote-demo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(satellite_entry.path, satellite_new_path);
+    assert!(satellite_entry.path.join(".ccteam/state.json").is_file());
+    {
+        let reg_path = paths_daemon.host_registry_path();
+        wait_until(5, "immediate project report", move || {
+            HostRegistry::load(&reg_path)
+                .ok()
+                .and_then(|r| r.get("sat-1").map(|h| h.has_project("remote-demo")))
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
     // ── exec: open → dial-back → byte round trip over /bin/cat ──────────
     let target = RemoteExecTarget {
         host_id: "sat-1".into(),
+        wire_slug: "demo".into(),
         hub: hub.clone(),
     };
     let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");

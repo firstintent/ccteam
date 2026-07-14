@@ -30,6 +30,10 @@ pub struct DashboardRow {
     /// The project's real working-tree path. The SPA shows it to disambiguate
     /// an auto-appended slug (demo2 vs demo): the dir is unambiguous.
     pub path: String,
+    /// Project-bound execution host (`local` or a satellite id).
+    pub host: String,
+    /// Local is always online; satellites use the host-registry TTL.
+    pub host_online: bool,
     pub team: String,
     pub kind: String,
     pub last_event_label: String,

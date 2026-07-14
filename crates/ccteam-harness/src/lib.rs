@@ -69,8 +69,9 @@ pub use execution::delegation::{
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};
 pub use execution::host_channel::{
-    ExecBridge, HostChannelHub, HostChannelRegistration, HubCtrlMsg, EXEC_DIALBACK_TIMEOUT,
-    HOST_CHANNEL_SUBPROTOCOL, IDLE_TIMEOUT, KEEPALIVE_PERIOD, REPORT_PERIOD,
+    ExecBridge, HostChannelHub, HostChannelRegistration, HubCtrlMsg, ProjectInitResult,
+    EXEC_DIALBACK_TIMEOUT, HOST_CHANNEL_SUBPROTOCOL, IDLE_TIMEOUT, KEEPALIVE_PERIOD,
+    PROJECT_INIT_TIMEOUT, REPORT_PERIOD,
 };
 pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
 pub use execution::remote_exec::{

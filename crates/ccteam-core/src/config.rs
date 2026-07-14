@@ -185,8 +185,24 @@ impl Default for CcteamConfig {
 pub struct ProjectEntry {
     pub slug: String,
     pub path: PathBuf,
+    /// Execution host bound to this project. Sessions inherit this value;
+    /// callers can no longer choose a host per spawn.
+    #[serde(default = "default_project_host")]
+    pub host: String,
+    /// Satellite-local project slug used on the exec wire. `None` for local
+    /// projects (and old config entries, which deserialize as local).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_slug: Option<String>,
+    /// Satellite-local working-tree path, retained for display only. Daemon
+    /// bookkeeping always uses [`Self::path`], the local data home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_path: Option<PathBuf>,
     pub team: String,
     pub installed_at: DateTime<Utc>,
+}
+
+pub fn default_project_host() -> String {
+    "local".to_string()
 }
 
 /// Absolute path to the config file under the given `~/.ccteam/`
@@ -290,6 +306,28 @@ pub fn lookup_project(ccteam_root: &Path, slug: &str) -> Result<Option<ProjectEn
     Ok(cfg.projects.into_iter().find(|p| p.slug == slug))
 }
 
+/// Pick a daemon-catalog slug by appending readable numeric suffixes on
+/// registry collision (`demo`, `demo2`, `demo3`, ...). The caller validates
+/// the base grammar before calling; this helper owns only catalog uniqueness.
+pub fn pick_unused_project_slug(ccteam_root: &Path, base: &str) -> Result<String> {
+    let cfg = load(ccteam_root)?;
+    let used: std::collections::HashSet<&str> = cfg
+        .projects
+        .iter()
+        .map(|entry| entry.slug.as_str())
+        .collect();
+    if !used.contains(base) {
+        return Ok(base.to_string());
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}{n}");
+        if !used.contains(candidate.as_str()) {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("integer accumulation always finds a free project slug")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +341,9 @@ mod tests {
         ProjectEntry {
             slug: slug.into(),
             path: path.to_path_buf(),
+            host: default_project_host(),
+            remote_slug: None,
+            remote_path: None,
             team: "dev".into(),
             installed_at: now(),
         }
@@ -322,6 +363,20 @@ mod tests {
         std::fs::write(config_path(tmp.path()), "").unwrap();
         let cfg = load(tmp.path()).unwrap();
         assert!(cfg.projects.is_empty());
+    }
+
+    #[test]
+    fn legacy_project_entry_defaults_to_local_binding() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "projects:\n  - slug: demo\n    path: /srv/demo\n    team: dev\n    installed_at: 2026-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        let entry = load(tmp.path()).unwrap().projects.remove(0);
+        assert_eq!(entry.host, "local");
+        assert!(entry.remote_slug.is_none());
+        assert!(entry.remote_path.is_none());
     }
 
     #[test]
@@ -397,6 +452,21 @@ mod tests {
         append_project(tmp.path(), e.clone()).unwrap();
         assert_eq!(lookup_project(tmp.path(), "hit").unwrap(), Some(e));
         assert_eq!(lookup_project(tmp.path(), "miss").unwrap(), None);
+    }
+
+    #[test]
+    fn pick_unused_project_slug_uses_numeric_suffixes() {
+        let tmp = TempDir::new().unwrap();
+        append_project(tmp.path(), sample_entry("demo", Path::new("/x/demo"))).unwrap();
+        append_project(tmp.path(), sample_entry("demo2", Path::new("/x/demo2"))).unwrap();
+        assert_eq!(
+            pick_unused_project_slug(tmp.path(), "demo").unwrap(),
+            "demo3"
+        );
+        assert_eq!(
+            pick_unused_project_slug(tmp.path(), "free").unwrap(),
+            "free"
+        );
     }
 
     #[test]

@@ -311,6 +311,7 @@ async fn post_project_creates_and_registers() {
     assert_eq!(resp.status(), 201);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v.get("slug").unwrap(), "myapp");
+    assert_eq!(v.get("host").unwrap(), "local");
     assert_eq!(v.get("path").unwrap(), &target.display().to_string());
 
     // Side effects: state.json on disk + registered in config.yaml.
@@ -319,6 +320,7 @@ async fn post_project_creates_and_registers() {
         .unwrap()
         .expect("myapp registered");
     assert_eq!(entry.path, target);
+    assert_eq!(entry.host, "local");
     assert_eq!(entry.team, "dev");
 }
 
@@ -382,6 +384,95 @@ async fn post_project_auto_appends_on_duplicate_slug() {
         created["slug"], "dup2",
         "duplicate slug auto-appends: {created}"
     );
+}
+
+#[tokio::test]
+async fn import_remote_project_is_idempotent_and_surfaces_binding() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let mut registry = ccteam_core::HostRegistry::default();
+    registry.upsert(ccteam_core::HostRecord {
+        id: "sat-a".into(),
+        hostname: "sat-a".into(),
+        os: "linux".into(),
+        arch: "aarch64".into(),
+        ccteam_version: "0.9.2".into(),
+        agent_token: "token".into(),
+        last_heartbeat_unix: ccteam_core::now_unix(),
+        agents: vec![],
+        projects: vec![ccteam_core::HostProjectReport {
+            slug: "wire-demo".into(),
+            path: "/srv/work/demo".into(),
+        }],
+        joined_at: chrono::Utc::now().to_rfc3339(),
+    });
+    registry.save(&paths.host_registry_path()).unwrap();
+    let root = paths.root.clone();
+    let data_home = paths.projects_root.join("catalog-demo");
+    let addr = spawn(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+    let request = serde_json::json!({
+        "host": "sat-a",
+        "remote_slug": "wire-demo",
+        "slug": "catalog-demo",
+    });
+    let first = client
+        .post(format!("http://{addr}/api/v1/projects/import"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 201);
+    let created: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(created["slug"], "catalog-demo");
+    assert_eq!(created["host"], "sat-a");
+    assert_eq!(created["path"], data_home.display().to_string());
+    let entry = ccteam_core::lookup_project_in_config(&root, "catalog-demo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.remote_slug.as_deref(), Some("wire-demo"));
+    assert_eq!(
+        entry.remote_path.as_deref(),
+        Some(std::path::Path::new("/srv/work/demo"))
+    );
+    assert!(data_home.join(".ccteam/state.json").is_file());
+    assert!(!data_home.join("AGENTS.md").exists());
+
+    let second = client
+        .post(format!("http://{addr}/api/v1/projects/import"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        ccteam_core::load_ccteam_config(&root)
+            .unwrap()
+            .projects
+            .len(),
+        1
+    );
+
+    let projects: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/projects"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(projects[0]["host"], "sat-a");
+    assert_eq!(projects[0]["host_online"], true);
+    let host: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/hosts/sat-a"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(host["projects"][0]["cataloged"], true);
+    assert_eq!(host["projects"][0]["catalog_slug"], "catalog-demo");
 }
 
 #[tokio::test]

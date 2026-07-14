@@ -892,6 +892,7 @@ struct MetaRebuildPlan {
     vendor: AgentVendor,
     protocol: SessionProtocol,
     host: String,
+    wire_slug: String,
     permission_mode: PermissionMode,
     parent_sid: Option<String>,
     delegation_depth: u32,
@@ -935,6 +936,8 @@ struct NewSessionPlan {
     protocol: SessionProtocol,
     /// v0.8.24 Track D — host axis (`local` or registered satellite id).
     host: String,
+    /// Satellite-local slug used only for the remote gate / ExecSpec cwd.
+    wire_slug: String,
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
@@ -967,6 +970,8 @@ struct NewSessionPlan {
     /// spawn, bot templates, `/compare` — see their `plan_new_session`
     /// call sites). Threaded verbatim into `SpawnCtx::remote`.
     remote: Option<ccteam_harness::RemoteExecTarget>,
+    ccteam_root: Option<PathBuf>,
+    remote_proxy: Option<Arc<dyn crate::remote_host::RemoteHostProxy>>,
 }
 
 /// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
@@ -983,6 +988,7 @@ struct ResumeDeadPlan {
     /// v0.9.0 W3 (G10) — the session's host (from the live `GatewaySession`,
     /// which mirrors `meta.host`); `"local"` for the overwhelming majority.
     host: String,
+    wire_slug: String,
     permission_mode: PermissionMode,
     secret: String,
     cwd: PathBuf,
@@ -1434,7 +1440,8 @@ impl Gateway {
         cwd: PathBuf,
         meta: &SessionMeta,
         reply_to: &ChatKey,
-    ) -> MetaRebuildPlan {
+    ) -> Result<MetaRebuildPlan> {
+        let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         let model_id = role_model_id(role_detail.as_ref());
         let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| reply_to.clone());
@@ -1445,13 +1452,14 @@ impl Gateway {
         } else {
             meta.role.clone()
         };
-        MetaRebuildPlan {
+        Ok(MetaRebuildPlan {
             sid: meta.sid.clone(),
             slug: slug.to_string(),
             role: meta.role.clone(),
             vendor: meta.vendor,
             protocol: meta.protocol,
-            host: meta.host.clone(),
+            host,
+            wire_slug,
             permission_mode: meta.permission_mode,
             parent_sid: meta.parent_sid.clone(),
             delegation_depth: meta.delegation_depth,
@@ -1463,7 +1471,7 @@ impl Gateway {
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
-        }
+        })
     }
 
     /// Cold-start the planned thread via the resume ladder (deterministic vendor
@@ -1480,7 +1488,7 @@ impl Gateway {
         let remote = crate::remote_host::regate_remote_host(
             plan.ccteam_root.as_deref(),
             &plan.host,
-            &plan.slug,
+            &plan.wire_slug,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -1597,7 +1605,7 @@ impl Gateway {
         meta: &SessionMeta,
         reply_to: ChatKey,
     ) -> Result<()> {
-        let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to);
+        let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to)?;
         let thread = Self::spawn_for_plan(&plan).await?;
         self.apply_rebuilt_session(plan, thread, reply_to).await;
         Ok(())
@@ -1673,10 +1681,13 @@ impl Gateway {
                         Ok((slug, cwd, meta)) => {
                             let reply_to = ChatKey::from_identity(&meta.owner)
                                 .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
-                            Some((
-                                g.plan_session_rebuild(&slug, cwd, &meta, &reply_to),
-                                reply_to,
-                            ))
+                            match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
+                                Ok(plan) => Some((plan, reply_to)),
+                                Err(err) => {
+                                    tracing::warn!(session = %sid, error = %err, "ccteam-im: restore skipped; project host binding changed");
+                                    None
+                                }
+                            }
                         }
                         Err(_) => {
                             tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
@@ -1741,6 +1752,61 @@ impl Gateway {
         if let Some(entry) = cfg.projects.iter().find(|p| p.slug == slug) {
             self.projects.insert(slug.to_string(), entry.path.clone());
         }
+    }
+
+    /// Resolve the project-owned execution binding from the daemon catalog.
+    /// Unregistered in-memory test/legacy projects remain local; serde-defaulted
+    /// old entries also normalize to local. Only `wire_slug` crosses the host
+    /// transport boundary — all daemon state stays keyed by `slug`.
+    fn project_host_binding(&self, slug: &str) -> Result<(String, String)> {
+        let entry = if let Some(config) = &self.config {
+            let config = config
+                .get()
+                .with_context(|| format!("load project host binding for `{slug}`"))?;
+            config
+                .projects
+                .iter()
+                .find(|entry| entry.slug == slug)
+                .cloned()
+        } else if let Some(paths) = &self.project_paths {
+            ccteam_core::config::lookup_project(&paths.root, slug)
+                .with_context(|| format!("load project host binding for `{slug}`"))?
+        } else {
+            None
+        };
+        let Some(entry) = entry else {
+            return Ok((ccteam_core::LOCAL_HOST.to_string(), slug.to_string()));
+        };
+        let host = if entry.host.trim().is_empty() {
+            ccteam_core::LOCAL_HOST.to_string()
+        } else {
+            entry.host
+        };
+        let wire_slug = if host == ccteam_core::LOCAL_HOST {
+            slug.to_string()
+        } else {
+            entry.remote_slug.unwrap_or_else(|| slug.to_string())
+        };
+        Ok((host, wire_slug))
+    }
+
+    fn ensure_session_host_binding(
+        &self,
+        slug: &str,
+        session_host: &str,
+    ) -> Result<(String, String)> {
+        let (host, wire_slug) = self.project_host_binding(slug)?;
+        let session_host = if session_host.trim().is_empty() {
+            ccteam_core::LOCAL_HOST
+        } else {
+            session_host
+        };
+        if session_host != host {
+            return Err(anyhow!(
+                "project host binding changed from `{session_host}` to `{host}`; start a new session"
+            ));
+        }
+        Ok((host, wire_slug))
     }
 
     /// Register a persisted bot as a spawn-on-demand gateway session template.
@@ -2083,7 +2149,6 @@ impl Gateway {
                         handle,
                         permission_mode,
                         protocol,
-                        "local".to_string(),
                         SpawnTuning::default(),
                     )
                     .await?;
@@ -2485,6 +2550,9 @@ impl Gateway {
             ProjectEntry {
                 slug: slug.clone(),
                 path: abs.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".to_string(),
                 installed_at: chrono::Utc::now(),
             },
@@ -2562,7 +2630,6 @@ impl Gateway {
                     PermissionMode::Skip,
                     // Template sessions default to the stream-json protocol.
                     SessionProtocol::StreamJson,
-                    "local".to_string(),
                     SpawnTuning::default(),
                 )?;
                 return Ok(EnsureSessionOutcome::Spawn(Box::new(plan)));
@@ -2591,7 +2658,6 @@ impl Gateway {
             // v0.8.11 E2 — defaults to the stream-json protocol (a pure chat
             // session with no terminal needs).
             SessionProtocol::StreamJson,
-            "local".to_string(),
             SpawnTuning::default(),
         )?;
         Ok(EnsureSessionOutcome::Spawn(Box::new(plan)))
@@ -2660,7 +2726,6 @@ impl Gateway {
                 handle,
                 permission_mode,
                 protocol,
-                "local".to_string(),
                 SpawnTuning::default(),
             )
             .await?;
@@ -2701,7 +2766,6 @@ impl Gateway {
             PermissionMode::Skip,
             // Template sessions default to the stream-json protocol.
             SessionProtocol::StreamJson,
-            "local".to_string(),
             SpawnTuning::default(),
         )
         .await
@@ -2722,9 +2786,9 @@ impl Gateway {
         handle: String,
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
-        host: String,
         tuning: SpawnTuning,
     ) -> Result<StartOutcome> {
+        let (host, wire_slug) = self.project_host_binding(&project)?;
         // v0.8.24 Track D — remote-host gate BEFORE minting a sid: offline /
         // terminal-on-remote / unknown host all fail without creating a
         // session (red line: never kill / never half-create). v0.9.0 W3
@@ -2733,7 +2797,7 @@ impl Gateway {
         let host_target = crate::remote_host::prepare_host_for_spawn(
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
-            &project,
+            &wire_slug,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -2755,7 +2819,6 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
-            host_target.host,
             tuning,
         )?;
         plan.remote = host_target.remote;
@@ -2780,7 +2843,6 @@ impl Gateway {
         handle: String,
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
-        host: String,
         tuning: SpawnTuning,
     ) -> Result<NewSessionPlan> {
         // v0.8.8 F1 — sessions are now keyed by sid, NOT (project, role): the
@@ -2840,6 +2902,7 @@ impl Gateway {
         // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
+        let (host, wire_slug) = self.project_host_binding(&project)?;
         let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor, protocol);
         Ok(NewSessionPlan {
@@ -2852,6 +2915,7 @@ impl Gateway {
             permission_mode,
             protocol,
             host,
+            wire_slug,
             secret,
             cwd,
             model_id,
@@ -2864,6 +2928,8 @@ impl Gateway {
             delegation_depth: 0,
             title: None,
             remote: None,
+            ccteam_root: self.project_paths.as_ref().map(|paths| paths.root.clone()),
+            remote_proxy: self.remote_host_proxy.clone(),
         })
     }
 
@@ -2873,6 +2939,19 @@ impl Gateway {
     async fn spawn_for_new_session_plan(
         plan: &NewSessionPlan,
     ) -> Result<ThreadHandle, HarnessError> {
+        let remote = if plan.remote.is_some() || plan.host == ccteam_core::LOCAL_HOST {
+            plan.remote.clone()
+        } else {
+            crate::remote_host::regate_remote_host(
+                plan.ccteam_root.as_deref(),
+                &plan.host,
+                &plan.wire_slug,
+                plan.protocol,
+                plan.remote_proxy.as_ref(),
+            )
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("remote host gate: {e:#}")))?
+        };
         // v0.8.24 C1 — curated per-session MCP for Claude stream-json only.
         // File path is well-known (chat/<sid>/mcp.json); the adapter attaches
         // --mcp-config when the file exists. Best-effort: spawn still proceeds
@@ -2917,7 +2996,7 @@ impl Gateway {
                     effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
-                    remote: plan.remote.clone(),
+                    remote,
                 },
             )
             .await
@@ -2941,6 +3020,7 @@ impl Gateway {
             permission_mode,
             protocol,
             host,
+            wire_slug: _,
             secret,
             cwd: _,
             model_id,
@@ -2953,6 +3033,8 @@ impl Gateway {
             delegation_depth,
             title: spawn_title,
             remote: _,
+            ccteam_root: _,
+            remote_proxy: _,
         } = plan;
         // Capture before the session insert moves these.
         let meta_vendor_uuid = thread
@@ -4288,6 +4370,7 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
         let model_id = role_model_id(ensure_role_exists(&cwd, &role)?.as_ref());
+        let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
         // no stored-secret update).
@@ -4299,6 +4382,7 @@ impl Gateway {
             vendor,
             protocol,
             host,
+            wire_slug,
             permission_mode,
             secret,
             cwd,
@@ -4319,7 +4403,7 @@ impl Gateway {
         let remote = crate::remote_host::regate_remote_host(
             plan.ccteam_root.as_deref(),
             &plan.host,
-            &plan.project,
+            &plan.wire_slug,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -4363,6 +4447,7 @@ impl Gateway {
             vendor,
             protocol,
             host: _,
+            wire_slug: _,
             permission_mode: _,
             secret: _,
             cwd: _,
@@ -4441,14 +4526,17 @@ impl Gateway {
         secret: String,
         host: &str,
     ) -> Result<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle), HarnessError> {
+        let (bound_host, wire_slug) = self
+            .ensure_session_host_binding(slug, host)
+            .map_err(|e| HarnessError::SpawnFailed(e.to_string()))?;
         // v0.9.0 W3 (G10) — a `/role` switch re-spawns the SAME sid on the
         // SAME host; re-gate a non-local host here too (same contract as
         // `spawn_for_plan`/`spawn_for_resume_plan` — this is, in effect, a
         // third rebuild path).
         let remote = crate::remote_host::regate_remote_host(
             self.project_paths.as_ref().map(|p| p.root.as_path()),
-            host,
-            slug,
+            &bound_host,
+            &wire_slug,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -6116,25 +6204,22 @@ impl Gateway {
         protocol: SessionProtocol,
         owner_id: String,
     ) -> Result<CreateSessionOutcome> {
-        self.create_session_api_on_host(
+        self.create_session_api_tuned(
             project,
             role,
             vendor,
             permission_mode,
             protocol,
             owner_id,
-            "local".to_string(),
             SpawnTuning::default(),
         )
         .await
     }
 
-    /// v0.8.24 Track D — like [`Self::create_session_api_proto`] with an
-    /// explicit `host` (`local` or a registered satellite id). Remote hosts
-    /// are gated (online + stdio-only); offline returns a readable error and
-    /// does **not** create a session.
+    /// Like [`Self::create_session_api_proto`] with explicit model/effort.
+    /// The execution host is resolved exclusively from the project catalog.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_session_api_on_host(
+    pub async fn create_session_api_tuned(
         &mut self,
         project: String,
         role: String,
@@ -6142,7 +6227,6 @@ impl Gateway {
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
         owner_id: String,
-        host: String,
         tuning: SpawnTuning,
     ) -> Result<CreateSessionOutcome> {
         // v0.8.20 web↔IM convergence — a web session is OWNED by the caller's
@@ -6164,7 +6248,6 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
-            host,
             tuning,
         )
         .await
@@ -6483,11 +6566,11 @@ impl Gateway {
         permission_mode: PermissionMode,
         protocol: SessionProtocol,
         owner_id: String,
-        host: String,
         tuning: SpawnTuning,
         parent: Option<DelegationParent>,
         title: Option<String>,
     ) -> Result<CreateSessionOutcome> {
+        let (host, wire_slug) = self.project_host_binding(&project)?;
         // ---- F5 guardrails (Ambient spawn with a real parent only) ----
         let (parent_sid, spawned_by_role, child_depth) = if let Some(p) = &parent {
             let cfg = self.delegation_config();
@@ -6559,7 +6642,7 @@ impl Gateway {
         let host_target = crate::remote_host::prepare_host_for_spawn(
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
-            &project,
+            &wire_slug,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -6575,7 +6658,6 @@ impl Gateway {
             handle,
             permission_mode,
             protocol,
-            host.clone(),
             tuning,
         )?;
         plan.remote = host_target.remote;
@@ -6980,7 +7062,6 @@ impl Gateway {
                 String::new(),
                 PermissionMode::Skip,
                 protocol,
-                "local".to_string(),
                 SpawnTuning::default(),
             ) {
                 Ok(p) => p,
@@ -8643,14 +8724,13 @@ mod tests {
 
         // Explicit tuning wins over the role frontmatter.
         let created = gateway
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 "alpha".into(),
                 "reviewer".into(),
                 AgentVendor::Claude,
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning {
                     model: Some("opus-4.8".into()),
                     effort: Some("max".into()),
@@ -8662,14 +8742,13 @@ mod tests {
 
         // No tuning → role frontmatter model, no effort.
         gateway
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 "alpha".into(),
                 "reviewer".into(),
                 AgentVendor::Claude,
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
             )
             .await
@@ -8677,14 +8756,13 @@ mod tests {
 
         // Whitespace-only tuning normalizes to None (role default holds).
         gateway
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 "alpha".into(),
                 "reviewer".into(),
                 AgentVendor::Claude,
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning {
                     model: Some("  ".into()),
                     effort: Some("".into()),
@@ -9463,13 +9541,26 @@ mod tests {
             // v0.9.0 W3 (G9) — the satellite must report `alpha` registered
             // (last heartbeat) before a remote spawn there is allowed.
             projects: vec![ccteam_core::HostProjectReport {
-                slug: "alpha".into(),
+                slug: "wire-alpha".into(),
                 path: project_dir.display().to_string(),
             }],
             joined_at: chrono::Utc::now().to_rfc3339(),
         });
         reg.save(&ccteam_core::host_registry::registry_path_in(&ccteam_root))
             .unwrap();
+        ccteam_core::config::upsert_project(
+            &ccteam_root,
+            ccteam_core::ProjectEntry {
+                slug: "alpha".into(),
+                path: project_dir.clone(),
+                host: "sat-lab".into(),
+                remote_slug: Some("wire-alpha".into()),
+                remote_path: Some(project_dir.clone()),
+                team: "dev".into(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
 
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
@@ -9478,14 +9569,13 @@ mod tests {
         gateway.set_remote_host_proxy(proxy.clone());
 
         let outcome = gateway
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 "alpha".into(),
                 "reviewer".into(),
                 AgentVendor::Claude,
                 ccteam_harness::PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "sat-lab".into(),
                 SpawnTuning::default(),
             )
             .await
@@ -9502,6 +9592,10 @@ mod tests {
         assert_eq!(views[0].host, "sat-lab", "session view stamps host");
         let meta = read_session_meta(&project_dir, "s1").unwrap();
         assert_eq!(meta.host, "sat-lab", "meta.json stamps host");
+        assert!(
+            !project_dir.join(".claude").exists(),
+            "remote data home must not become a vendor working tree"
+        );
         assert_eq!(
             meta.trigger.as_deref(),
             Some("web"),
@@ -9532,6 +9626,28 @@ mod tests {
         assert_eq!(
             fake.submissions.lock().await.last().map(|p| p.1.as_str()),
             Some("after-resume")
+        );
+
+        // A project rebind never moves an existing session. Rebuild/resume
+        // fails readable and requires a fresh sid on the new binding.
+        let mut config = ccteam_core::config::load(&ccteam_root).unwrap();
+        let entry = config
+            .projects
+            .iter_mut()
+            .find(|entry| entry.slug == "alpha")
+            .unwrap();
+        entry.host = ccteam_core::LOCAL_HOST.to_string();
+        entry.remote_slug = None;
+        entry.remote_path = None;
+        ccteam_core::config::save(&ccteam_root, &config).unwrap();
+        fake.live.store(false, Ordering::SeqCst);
+        let err = gateway
+            .plan_resume_dead_session("s1")
+            .err()
+            .expect("rebind must reject resume planning");
+        assert!(
+            err.to_string().contains("project host binding changed"),
+            "got: {err}"
         );
     }
 
@@ -9572,12 +9688,25 @@ mod tests {
             last_heartbeat_unix: now_unix(),
             agents: vec![],
             projects: vec![ccteam_core::HostProjectReport {
-                slug: "alpha".into(),
+                slug: "wire-alpha".into(),
                 path: project_dir.display().to_string(),
             }],
             joined_at: chrono::Utc::now().to_rfc3339(),
         });
         reg.save(&reg_path).unwrap();
+        ccteam_core::config::upsert_project(
+            &ccteam_root,
+            ccteam_core::ProjectEntry {
+                slug: "alpha".into(),
+                path: project_dir.clone(),
+                host: "sat-lab".into(),
+                remote_slug: Some("wire-alpha".into()),
+                remote_path: Some(project_dir.clone()),
+                team: "dev".into(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
 
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
@@ -9586,14 +9715,13 @@ mod tests {
         gateway.set_remote_host_proxy(proxy.clone());
 
         let outcome = gateway
-            .create_session_api_on_host(
+            .create_session_api_tuned(
                 "alpha".into(),
                 "reviewer".into(),
                 AgentVendor::Claude,
                 ccteam_harness::PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "sat-lab".into(),
                 SpawnTuning::default(),
             )
             .await
@@ -9611,7 +9739,9 @@ mod tests {
         let (slug, cwd, meta) = gateway.find_meta_for_sid(&sid).unwrap();
         assert_eq!(meta.host, "sat-lab");
         let reply_to = ChatKey::new("web", "web-api", "web-api");
-        let plan = gateway.plan_session_rebuild(&slug, cwd.clone(), &meta, &reply_to);
+        let plan = gateway
+            .plan_session_rebuild(&slug, cwd.clone(), &meta, &reply_to)
+            .unwrap();
         let err = Gateway::spawn_for_plan(&plan).await.unwrap_err();
         assert!(err.to_string().contains("offline"), "got: {err}");
         assert_eq!(
@@ -13577,6 +13707,9 @@ mod tests {
             ccteam_core::config::ProjectEntry {
                 slug: "beta".to_string(),
                 path: beta.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".to_string(),
                 installed_at: chrono::Utc::now(),
             },
@@ -13623,6 +13756,9 @@ mod tests {
             ccteam_core::config::ProjectEntry {
                 slug: "alpha".to_string(),
                 path: alpha.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".to_string(),
                 installed_at: chrono::Utc::now(),
             },
@@ -13746,6 +13882,9 @@ mod tests {
             ProjectEntry {
                 slug: "dev-gamma".to_string(),
                 path: gamma_dir.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".to_string(),
                 installed_at: chrono::Utc::now(),
             },
@@ -13794,6 +13933,9 @@ mod tests {
             ProjectEntry {
                 slug: "dev-delta".to_string(),
                 path: delta_dir.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
                 team: "dev".to_string(),
                 installed_at: chrono::Utc::now(),
             },
@@ -14790,7 +14932,6 @@ mod tests {
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
                 Some(DelegationParent {
                     sid: parent_sid.clone(),
@@ -14865,7 +15006,6 @@ mod tests {
             PermissionMode::Skip,
             SessionProtocol::StreamJson,
             "web-api".into(),
-            "local".into(),
             SpawnTuning::default(),
             Some(parent),
             None,
@@ -15014,7 +15154,6 @@ mod tests {
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
                 Some(DelegationParent {
                     sid: "sP".into(),
@@ -15152,7 +15291,6 @@ mod tests {
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
                 Some(DelegationParent {
                     sid: parent.clone(),
@@ -15210,7 +15348,6 @@ mod tests {
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
                 Some(DelegationParent {
                     sid: parent.clone(),
@@ -15280,7 +15417,6 @@ mod tests {
                 PermissionMode::Skip,
                 SessionProtocol::StreamJson,
                 "web-api".into(),
-                "local".into(),
                 SpawnTuning::default(),
                 Some(DelegationParent {
                     sid: parent.clone(),

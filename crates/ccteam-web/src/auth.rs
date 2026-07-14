@@ -273,6 +273,12 @@ pub async fn project_acl_layer(State(app): State<AppState>, req: Request, next: 
 /// the bare collection path (`/api/v1/projects`) or any non-project path.
 fn project_slug_from_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/v1/projects/")?;
+    // Collection action: creates a new catalog entry and stamps the caller as
+    // owner, so it has the same ACL posture as POST /projects (there is no
+    // existing project slug to authorize yet).
+    if rest == "import" {
+        return None;
+    }
     let slug = rest.split('/').next().unwrap_or(rest);
     if slug.is_empty() {
         None

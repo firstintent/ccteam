@@ -89,6 +89,9 @@ pub fn migrate_v041_to_v042(paths: &CcteamPaths) -> Result<MigrationReport> {
             cfg.projects.push(ProjectEntry {
                 slug: state.slug.clone(),
                 path: entry.path(),
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
                 team: state.team.clone(),
                 installed_at: state.created_at,
             });

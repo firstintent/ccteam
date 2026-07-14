@@ -45,7 +45,8 @@ pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam is the local agent bridge: any
 routing, delivery, guardrails, cost ledger, and team observability underneath.\n\n\
 ORCHESTRATION (important): when the user asks you to call / use / delegate to another agent (e.g. \"call codex\", \
 \"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick `vendor`, optionally \
-`model` / `host` / `role`, and pass the first `task` in the same call), `session_dispatch` sends follow-up tasks \
+`model` / `role`, and pass the first `task` in the same call); its execution host is inherited from the project \
+binding. `session_dispatch` sends follow-up tasks \
 (async with a completion notification, or `wait_seconds` to block inline), `session_collect` reads its output \
 (`tail:true` for the final answer), `session_list` shows the delegation tree, `session_stop` ends it. Do NOT shell \
 out to vendor CLIs (`codex exec`, `claude -p`, …) for this: a raw CLI run has no session id, no transcript, no cost \
@@ -197,7 +198,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -214,7 +215,6 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "enum": ["stream-json", "acp"],
                         "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode (forced). `terminal` is not available to agents."
                     },
-                    "host": { "type": "string", "description": "Execution host: `local` (default) or a registered satellite id." },
                     "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Local callers default to the project resolved from the working directory." },
                     "permission_mode": {
                         "type": "string",
@@ -566,12 +566,13 @@ mod tests {
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
 
         // v0.9.0 W1 (G1) — new facets are present.
-        for key in ["model", "effort", "protocol", "host", "title"] {
+        for key in ["model", "effort", "protocol", "title"] {
             assert!(
                 props[key].is_object(),
                 "session_spawn schema must carry `{key}`"
             );
         }
+        assert!(props.get("host").is_none());
 
         // protocol enum = stream-json | acp ONLY — terminal is NEVER exposed.
         let protos: Vec<&str> = props["protocol"]["enum"]

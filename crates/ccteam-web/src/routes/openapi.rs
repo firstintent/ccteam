@@ -182,6 +182,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::api_v1::handle_projects,
             super::projects::handle_create_project
         ))
+        .routes(routes!(super::projects::handle_import_project))
         .routes(routes!(
             super::api_v1::handle_project,
             super::projects::handle_delete_project

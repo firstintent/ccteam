@@ -493,6 +493,7 @@ async fn start_thread_rejects_remote_ctx_readable() {
     let mut ctx = spawn_ctx(&tmp, "s-remote");
     ctx.remote = Some(ccteam_harness::RemoteExecTarget {
         host_id: "sat".into(),
+        wire_slug: "demo".into(),
         hub: std::sync::Arc::new(ccteam_harness::HostChannelHub::default()),
     });
     let adapter = OpencodeAcpAdapter::new();

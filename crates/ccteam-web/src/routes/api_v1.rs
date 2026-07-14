@@ -148,6 +148,9 @@ fn build_projects(
     identity: &crate::auth::Identity,
 ) -> anyhow::Result<Vec<DashboardRow>> {
     let summaries = ccteam_core::collect_projects(&app.paths)?;
+    let config = ccteam_core::config::load(&app.paths.root).unwrap_or_default();
+    let hosts =
+        ccteam_core::HostRegistry::load(&app.paths.host_registry_path()).unwrap_or_default();
     let mut rows = Vec::with_capacity(summaries.len());
     for s in summaries {
         // v0.8.18 档1 — per-user project isolation: the admin sees every
@@ -174,11 +177,25 @@ fn build_projects(
         .map(|c| c.cost_total_usd)
         .unwrap_or(0.0);
         let project_dir = app.paths.project_dir(&s.state.slug);
+        let host = config
+            .projects
+            .iter()
+            .find(|entry| entry.slug == s.state.slug)
+            .map(|entry| entry.host.as_str())
+            .filter(|host| !host.is_empty())
+            .unwrap_or(ccteam_core::LOCAL_HOST)
+            .to_string();
+        let host_online = host == ccteam_core::LOCAL_HOST
+            || hosts
+                .get(&host)
+                .is_some_and(|record| record.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS));
         rows.push(DashboardRow {
             slug: s.state.slug.clone(),
             // The real working-tree dir (config-registry resolved) so the SPA can
             // show it next to the slug — disambiguates an auto-appended slug.
             path: project_dir.display().to_string(),
+            host,
+            host_online,
             team: s.state.team.clone(),
             kind: team_kind_label(s.state.team_kind).to_string(),
             last_event_label,
@@ -197,10 +214,10 @@ fn build_projects(
     // in the now-missing state.json), so a tenant must never see them — only the
     // admin, matching the orphan branch of `can_see_project`.
     if identity.is_admin {
-        if let Ok(cfg) = ccteam_core::config::load(&app.paths.root) {
+        {
             let seen: std::collections::HashSet<String> =
                 rows.iter().map(|r| r.slug.clone()).collect();
-            for entry in &cfg.projects {
+            for entry in &config.projects {
                 if seen.contains(&entry.slug) {
                     continue;
                 }
@@ -212,6 +229,16 @@ fn build_projects(
                 rows.push(DashboardRow {
                     slug: entry.slug.clone(),
                     path: entry.path.display().to_string(),
+                    host: if entry.host.is_empty() {
+                        ccteam_core::LOCAL_HOST.to_string()
+                    } else {
+                        entry.host.clone()
+                    },
+                    host_online: entry.host.is_empty()
+                        || entry.host == ccteam_core::LOCAL_HOST
+                        || hosts.get(&entry.host).is_some_and(|record| {
+                            record.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS)
+                        }),
                     team: String::new(),
                     kind: String::new(),
                     last_event_label: "—".to_string(),
