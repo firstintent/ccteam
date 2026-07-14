@@ -78,7 +78,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode)、可选力度与主机、spawn 前 HITL 开关。角色列表来自项目 `.claude/agents/`(管理员可选);租户默认 roleless。Grok / OpenCode 首版 roleless(不注入 persona)。建好回句柄 `s<N>`。
+- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode)、可选力度、spawn 前 HITL 开关。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`(管理员可选);租户默认 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
@@ -335,7 +335,12 @@ ccteam host join --daemon http://daemon-host:7331 --token <join-token>
 ccteam host ls                     # 查看本机卫星凭据(如已 join)
 ```
 
-卫星每 ~25s 经控制通道上报 agent 探测与已注册项目;主机页实时显示在线状态。要在卫星上跑会话:先在那台机器的仓库里 `ccteam init` 注册项目,再在 spawn 时带 `host:"<host-id>"`(web 控制台 / API / `session_spawn`)。远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。
+卫星每 ~25s 经控制通道上报 agent 探测与已注册项目;主机页实时显示在线状态。**项目绑定主机** —— 要在卫星上跑会话,先让它拥有一个项目,然后往那个项目里 spawn(不再按会话选主机):
+
+- **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
+- **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
+
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。舰队容量:daemon 全局最多 50 个 live 会话(`sessions.max_live` 可配);超限时优雅挤停最久无活动的 idle 会话,被停会话可随时恢复。
 
 ---
 

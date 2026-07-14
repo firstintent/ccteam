@@ -11,13 +11,13 @@ ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具。在 Claude Code �
 ## 1. 心智模型
 
 ```text
-chat ⇄ project ⇄ session          host = 会话进程跑在哪台机器
-                 └─ s1, s2, …     (local,或反向拨入的卫星)
+chat ⇄ project ⇄ session          project = (slug, host, path)
+                 └─ s1, s2, …     会话跑在它所属项目绑定的机器上
 ```
 
 - **session** — 一个有独立上下文的 vendor 进程,持久 id(`s1`、`s2`…)扛 daemon 重启、永不复用。每个 session 属于且只属于一个 **project**。
-- **project** — 注册过的仓库(slug → 路径),是委派护栏、成本上限、访问控制的**归属单元**。同一个*逻辑*项目可以在多台机器上各有一份 checkout:在卫星上注册同一个 slug,意思就是「那台机器上的这个项目的工作副本」。
-- **host** — session 的**执行位置属性**,不是 project 的属性。`session_spawn{host:"gpu02"}` 让子会话跑在那台机器上;transcript、成本、委派账本仍然全记在主 daemon。
+- **project** — 注册过的工作树,**绑定且只绑定一台主机**(`local` 或卫星),是委派护栏、成本上限、访问控制、以及**执行位置**的归属单元。同一个仓库在两台机器上的 checkout = **两个项目**(「slug 相同 = 同一项目」的跨机隐式关联已废除:slug 撞名会误导——可能是不同项目甚至不同用户,slug 不同也可能是同一仓库)。接入卫星上的 checkout:web 新建时选主机,或把卫星上已注册的项目一键 import 进 catalog。
+- **host** — **project 的属性**,不是 spawn 的参数。session 继承:往绑定 `gpu02` 的项目里 spawn,子会话就跑在 `gpu02`。无论进程在哪,transcript、成本、委派账本全记在主 daemon。`session_spawn` **没有** `host` 参数——传了就是硬错误。
 - **daemon 只路由,从不调度。** 没有 tick、没有 orchestrator。存在什么拓扑,就是你的会话(或你自己)用这 5 个工具搭出来的拓扑。
 - **委派是记录,不是注入。** 派的任务原文作为 user turn 转发;完成通知是投给父会话的一条普通 turn——和真人转告同构。永远不会写进任何会话的 system prompt。
 
@@ -64,7 +64,7 @@ claude -p "list your tools containing 'ccteam'"   # 真实会话看到的名字
 ```
 
 - `vendor`:`claude`(默认)| `codex` | `grok` | `opencode`。`model` / `effort`:vendor 特定覆盖。`protocol`:`stream-json`(默认)或 `acp`——grok/opencode 强制 `acp`;`terminal` 永不暴露给 agent。
-- `host`:`local`(默认)或已注册的卫星 id。slug 必须在那台机器上注册过(在那边 `ccteam init` 一次);远程执行当前支持 Claude stream-json 会话。
+- 执行主机**继承自 project**——没有 `host` 参数(传入即错)。要远程跑:往绑定那台卫星的项目里 spawn(web 新建项目时选主机,或 import 卫星上已注册的 checkout)。远程执行当前支持 Claude stream-json 会话。
 - `role`:`.claude/agents/<role>.md` persona,由 vendor 原生机制加载。省略 = roleless——裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`,多数时候这就是对的默认。
 - `task` + `wait_seconds` + `notify`:spawn+派活一次调用。默认异步:子会话干活,干完你收到一条完成通知 turn(仅 ccteam 会话调用方)。`wait_seconds:120` 阻塞并内联返回 `result_text`。`notify:false` = 只记账。
 - `title`:≤80 字符,只进账本/团队视图——永远不进任何 prompt。
@@ -88,13 +88,15 @@ claude -p "list your tools containing 'ccteam'"   # 真实会话看到的名字
 
 tail 子会话的 ccteam 侧 transcript。关键字段:`activity` — `working`(turn 进行中:去轮询,别猜沉默)/ `idle`(turn 结束:读结果)/ `stale` / `stuck`;`cost_usd`;`vendor_session_id`(原生 resume key)。增量轮询传 `since:<上次见过的 turn_id>`;长任务只要结论用 `tail:true`。默认 oldest-first,`n:20`。
 
+返回是**限幅的**:`max_chars`(默认 10000,clamp 500–50000)封顶本次返回的总字符;超长 turn 保留 70% 头 / 30% 尾摘录 + 显式截断标记,全文永在账本(用 `since`/`n` 翻页)。wait 内联的 `result_text` 封顶 10000;异步完成通知的答案嵌入封顶 4000 并附 `session_collect` 指针。你的上下文是最稀缺资源——限幅是兜底,prompt 里的回复契约才是上限(见 §5)。
+
 ### `session_list` — 委派树
 
 返回所有 live 会话(`sid` / `project` / `vendor` / `activity` / `waiting_approval` / `host` / `cost_usd` / `title` / `parent_sid`)外加 `tree`(根 → 子)。这就是工具形态的舰队面板;web 团队视图渲染的是同一张图。
 
 ### `session_stop` — 显式,永不主动
 
-停一个 sid。状态留盘,之后可按 sid 冷恢复。ccteam 从不主动杀会话——唯一自动刹车是每日 per-vendor 预算上限,而且是**拒绝新活**,不是杀在跑的。
+停一个 sid。状态留盘,之后可按 sid 冷恢复。ccteam 只有两个自动刹车,且都不偏好杀进行中的工作:每日 per-vendor 预算上限**拒绝新活**;live 容量(`sessions.max_live`,默认 50)超限时**优雅挤停**最久无活动的 idle 会话来接纳新会话——被挤停的 sid 可 resume,挤停上账(`session_evicted`)。**创建永不因容量失败。**
 
 ## 5. 值回票价的用法
 
@@ -116,11 +118,13 @@ tail 子会话的 ccteam 侧 transcript。关键字段:`activity` — `working`(
 
 然后 `session_collect{sid, tail:true}` 直接拿裁决,不用翻整个 transcript。跨厂商互审能抓住同模型互审会放过的东西。
 
-**哪里有环境去哪里跑。** GPU 测试在 Linux 盒子上:join 成卫星一次、在那边 `ccteam init` 这个仓库,然后 spawn 带 `host:"linux-box"`。卫星向 daemon 出站拨号——NAT 后面的笔记本也是合格卫星,只有 daemon 需要可达端口。host 选择器(和 daemon 的门)只接受真的上报了这个 slug 的主机——slug 没注册会快速报错「先去那边 ccteam init」,绝不静默本地兜底。
+**哪里有环境去哪里跑。** GPU 测试在 Linux 盒子上:join 成卫星一次、在那边 `ccteam init` 这个仓库、在 web 主机页把它 import 进 catalog(或新建项目时直接选那台主机)——它成为一个绑定 `linux-box` 的项目——然后往**那个项目**里 spawn。卫星向 daemon 出站拨号——NAT 后面的笔记本也是合格卫星,只有 daemon 需要可达端口。daemon 的门只接受卫星真实上报的 checkout——没注册会快速给可读错误,绝不静默本地兜底。
+
+**保护父会话的上下文。** 扇出会放大子会话说的每个字:10 个 worker × 每个 20KB 长文 = 200KB 灌进一个父会话。引擎有限幅兜底(§4),真正的解法在任务书:每个 task 末尾写死回复契约——「≤25 行:STATUS / FILES / DECISIONS / GATES;禁止贴代码/diff」——diff 用本地 `git diff` 审,别经子会话的嘴。长活优先 `notify:false` + 带游标的 `session_collect`;大产物落文件,不塞 chat turn。
 
 **认真轮询。** `working` = turn 进行中——先干别的,带 `since` 再来。`idle` = turn 结束——读。不要从沉默推断完成,有游标就不要整篇重拉。
 
-**先设上限,然后信它。** 委派深度、per-parent 扇出、per-project 委派会话上限、环拒绝、每日 per-vendor 预算,全部由 daemon 带理由拒绝——失控扇出死在 spawn 时,不是死在账单上。配置里设一次;写 prompt 时假设「可能被拒」。
+**先设上限,然后信它。** 委派深度(默认 2)、per-parent 扇出(10)、per-project 委派会话上限(50)、环拒绝、每日 per-vendor 预算,全部由 daemon 带理由拒绝——失控扇出死在 spawn 时,不是死在账单上。配置里设一次;写 prompt 时假设「可能被拒」。另一边,舰队级**容量**(50 个 live 会话)走优雅 LRU 挤停,不走拒绝。
 
 **一次 dispatch 一件事。** 完成通知按 turn 触发。一次塞三件事 = 一条通知 + 一份要自己拆的 transcript;拆成三次 = 三个检查点 + 三行成本。
 
@@ -134,7 +138,8 @@ per-session secret 和 admin-token fallback 是**单 OS 用户下的纵深防御
 |---|---|
 | 工具在列表里,但 `session_*` 回「not in a ccteam session … no admin web token」 | 这台机器 daemon 没启动过 → `ccteam start` 后重试 |
 | `session_spawn: missing project` | 主会话在注册项目之外 → `cd` 进项目,或显式传 `project` |
-| `project X is not registered on host Y` | 去那台卫星的仓库里 `ccteam init`,等一个心跳(~25s)重试 |
+| 项目绑定的卫星离线 / checkout 未上报 | 那台机器 `ccteam start` 拉回在线;或先 `ccteam init` 再 import,等一个心跳(~25s)重试 |
+| `removed in v0.9.2: host is bound to the project…` | 去掉 `host` 参数——改成往绑定目标主机的项目里 spawn |
 | client 超时后怀疑 spawn/dispatch 双发 | 设了 `idempotency_key` 就没有;从现在开始设 |
 | 子会话「没动静」 | `session_collect` 看 `activity` —— `working` 不是没动静,是在干活 |
 

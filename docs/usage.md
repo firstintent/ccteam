@@ -78,7 +78,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok and OpenCode), optional effort and host, and HITL at spawn time. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. Grok and OpenCode first-ship roleless (no persona injection). The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok and OpenCode), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex and Grok are chat-only (Grok runs over ACP, with no terminal mirror).
@@ -337,7 +337,12 @@ ccteam host join --daemon http://daemon-host:7331 --token <join-token>
 ccteam host ls                     # This machine's satellite credentials (if joined).
 ```
 
-The satellite reports its agents and registered projects every ~25s over its control channel; the hosts page shows online/offline live. To run a session on it: register the project there (`ccteam init` in the repo on that machine), then spawn with `host:"<host-id>"` (web console, API, or `session_spawn`). Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn.
+The satellite reports its agents and registered projects every ~25s over its control channel; the hosts page shows online/offline live. **Projects are bound to a host** — to run sessions on a satellite, give it a project there and spawn into that project (no per-session host choice):
+
+- **Create remotely:** web console → new project → pick the satellite in the host picker → absolute path on that machine. The daemon asks the satellite to bootstrap and register it in place.
+- **Import an existing checkout:** `ccteam init` in the repo on that machine, then hosts page → 接入/Import next to the reported project. Same-slug collisions get a distinct catalog slug (`demo` → `demo2`) — slug equality across machines is not project identity.
+
+Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn. Fleet capacity: at most 50 live sessions daemon-wide (configurable `sessions.max_live`); admitting one more gracefully stops the least-recently-active idle session, which stays resumable.
 
 ---
 

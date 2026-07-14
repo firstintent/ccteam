@@ -11,13 +11,13 @@ ccteam exposes eight MCP tools under the `ccteam` server. In Claude Code they ap
 ## 1. The mental model
 
 ```text
-chat ⇄ project ⇄ session          host = where a session's process runs
-                 └─ s1, s2, …     (local, or a satellite that dialed in)
+chat ⇄ project ⇄ session          project = (slug, host, path)
+                 └─ s1, s2, …     sessions run wherever their project lives
 ```
 
 - **session** — one vendor process with its own context, addressed by a durable id (`s1`, `s2`, …) that survives daemon restarts and is never reused. A session belongs to exactly one **project**.
-- **project** — a registered repo (slug → path). It is the unit of delegation guardrails, cost ceilings, and access control. One *logical* project can be checked out on several machines: registering the same slug on a satellite means "this is that project's working copy over there".
-- **host** — a per-session execution facet, not a property of the project. `session_spawn{host:"gpu02"}` runs the child on that machine; transcript, cost, and the delegation ledger stay on your daemon.
+- **project** — a registered working tree **bound to exactly one host** (`local` or a satellite). It is the unit of delegation guardrails, cost ceilings, access control — and now placement. The same repo checked out on two machines is **two projects** (slug equality across machines was abolished as an identity: it misled — same slug can be different projects, different slugs the same repo). Catalog a satellite checkout either by creating it from the web (pick the host) or by importing one already registered there.
+- **host** — a property of the **project**, not of the spawn. Sessions inherit it: spawn into a project on `gpu02` and the child runs on `gpu02`. Transcript, cost, and the delegation ledger stay on your daemon regardless of where the process runs. There is no `host` parameter on `session_spawn` — passing one is a hard error.
 - **The daemon routes; it never schedules.** No tick loop, no orchestrator. Whatever topology exists is the one your sessions (or you) built with these five tools.
 - **Delegation is recorded, not injected.** A dispatched task is forwarded verbatim as a user turn. A completion notification is an ordinary turn delivered to the parent — the same shape as a human relaying a message. Nothing is ever written into another session's system prompt.
 
@@ -64,7 +64,7 @@ Parameter lists below are exact; everything optional unless marked.
 ```
 
 - `vendor`: `claude` (default) | `codex` | `grok` | `opencode`. `model`, `effort`: vendor-specific overrides. `protocol`: `stream-json` (default) or `acp` — grok/opencode force `acp`; `terminal` is never available to agents.
-- `host`: `local` (default) or a registered satellite id. The slug must be registered on that host (`ccteam init` there once); remote execution currently supports Claude stream-json sessions.
+- Execution host is **inherited from the project** — there is no `host` parameter (passing one errors). To run remotely, spawn into a project bound to that satellite (create it from the web host picker, or import a checkout already registered there). Remote execution currently supports Claude stream-json sessions.
 - `role`: a `.claude/agents/<role>.md` persona, loaded by the vendor's native mechanism. Omit for roleless — the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, which is the right default more often than not.
 - `task` + `wait_seconds` + `notify`: spawn-and-dispatch in one call. Async by default: the child works, you get a completion-notification turn when it finishes (ccteam-session callers only). `wait_seconds:120` blocks inline and returns `result_text`. `notify:false` = ledger-only.
 - `title`: ≤80 chars, ledger/team-view label only — never enters any prompt.
@@ -88,13 +88,15 @@ Verbatim user turn, no injection. Async + notification by default; `wait_seconds
 
 Tails the child's ccteam-owned transcript. Key fields: `activity` — `working` (mid-turn: poll, don't parse silence) / `idle` (turn done: read) / `stale` / `stuck`; `cost_usd`; `vendor_session_id` (native resume key). Incremental polling: pass `since:<turn_id you last saw>`. Final answer of a long run: `tail:true`. Default page is oldest-first, `n:20`.
 
+Returns are **bounded**: `max_chars` (default 10 000, clamp 500–50 000) caps total returned content; longer turns keep a 70 % head / 30 % tail excerpt with an explicit marker and the full text stays in the ledger (page it with `since`/`n`). Waited spawn/dispatch `result_text` is capped at 10 000; the async completion-notification embed at 4 000 with a `session_collect` pointer. Your context is the scarce resource — the caps are the floor, your prompts are the ceiling (see §5).
+
 ### `session_list` — the delegation tree
 
 Returns every live session (`sid`, `project`, `vendor`, `activity`, `waiting_approval`, `host`, `cost_usd`, `title`, `parent_sid`) plus a `tree` — roots and children. This is your fleet dashboard in tool form; the web team view renders the same graph live.
 
 ### `session_stop` — explicit, never proactive
 
-Stops one sid. State stays on disk; the sid can cold-resume later. ccteam never kills a session on its own — the only automatic brake is the daily per-vendor budget cap, which refuses *new* work rather than killing running sessions.
+Stops one sid. State stays on disk; the sid can cold-resume later. ccteam has exactly two automatic brakes, neither of which kills work mid-turn by preference: the daily per-vendor budget cap refuses *new* work, and the live-session capacity (`sessions.max_live`, default 50) gracefully stops the least-recently-active idle session to admit a new one — evicted sids stay resumable and the eviction is on the ledger (`session_evicted`). Creation never fails for capacity.
 
 ## 5. Patterns that earn their keep
 
@@ -116,11 +118,13 @@ Async for the grind (the notification lands like a colleague reporting back), in
 
 Then `session_collect{sid, tail:true}` — the verdict without paging the whole transcript. Cross-vendor review catches what same-model review rubber-stamps.
 
-**Run where the environment is.** GPU tests live on the Linux box: join it once as a satellite, `ccteam init` the repo there, then `host:"linux-box"` on the spawn. Satellites dial out to the daemon — a laptop behind NAT is a perfectly good satellite; only the daemon needs a reachable port. The host picker (and the daemon's gate) only accept hosts that actually report the slug — an unregistered slug fails fast with "run `ccteam init` there first", never a silent local fallback.
+**Run where the environment is.** GPU tests live on the Linux box: join it once as a satellite, `ccteam init` the repo there, import that checkout from the web hosts page (or create it there via the new-project host picker) — it becomes a project bound to `linux-box` — then spawn into *that project*. Satellites dial out to the daemon — a laptop behind NAT is a perfectly good satellite; only the daemon needs a reachable port. The daemon's gate only accepts projects the satellite actually reports — an unregistered checkout fails fast with a readable error, never a silent local fallback.
+
+**Protect the parent's context.** Fan-out multiplies whatever your children say: ten workers × a 20 KB essay each is 200 KB into one parent. The engine caps returns (§4), but the real fix is the brief: end every task with a reply contract — "answer in ≤25 lines: STATUS / FILES / DECISIONS / GATES; no code or diff dumps" — and review diffs with `git diff` locally instead of through the child's mouth. Prefer `notify:false` + cursored `session_collect` for long jobs; big artifacts belong in files, not in chat turns.
 
 **Poll like you mean it.** `working` means mid-turn — do something else, poll again with `since`. `idle` means the turn is done — read. Don't infer completion from silence, and don't re-collect the whole transcript when a cursor gives you the delta.
 
-**Cap the blast radius, then trust it.** Delegation depth, per-parent fan-out, per-project delegated-session ceilings, cycle rejection, and daily per-vendor budgets are enforced by the daemon with a stated reason — a runaway fan-out is refused at spawn time, not discovered on the invoice. Set them once in config; design your prompts assuming refusal is possible.
+**Cap the blast radius, then trust it.** Delegation depth (default 2), per-parent fan-out (10), per-project delegated-session ceiling (50), cycle rejection, and daily per-vendor budgets are enforced by the daemon with a stated reason — a runaway fan-out is refused at spawn time, not discovered on the invoice. Set them once in config; design your prompts assuming refusal is possible. Separately, fleet-wide *capacity* (50 live sessions) is managed by graceful LRU eviction, not refusal.
 
 **One task per dispatch.** The completion notification fires per turn. Bundling three asks into one dispatch means one notification for the lot and a transcript you'll have to disentangle; three dispatches give you three checkpoints and three cost lines.
 
@@ -134,7 +138,8 @@ Per-session secrets and the admin-token fallback are **defense in depth under a 
 |---|---|
 | Tools listed but `session_*` answers "not in a ccteam session … no admin web token" | daemon never started on this machine → `ccteam start`, retry |
 | `session_spawn: missing project` | main session outside any registered repo → `cd` into one, or pass `project` |
-| `project X is not registered on host Y` | run `ccteam init` in the repo on that satellite, wait one heartbeat (~25 s), retry |
+| project's satellite is offline / checkout not reported | bring the satellite back online (`ccteam start` there), or `ccteam init` the repo on it and re-import; wait one heartbeat (~25 s), retry |
+| `removed in v0.9.2: host is bound to the project…` | drop the `host` argument — spawn into a project bound to the target host instead |
 | Spawn/dispatch might have double-fired after a client timeout | it didn't, if you set `idempotency_key`; start setting it |
 | Child seems silent | `session_collect` and look at `activity` — `working` is not silent, it's busy |
 
