@@ -293,6 +293,14 @@ button { font-family: inherit; cursor: pointer; }
 .srow.empty:hover { background: transparent; }
 .srow.more { color: var(--text-faint); font-size: 12.5px; }
 .srow.hist { color: var(--text-muted); }
+.srow .shost {
+  flex: none; max-width: 92px;
+  font-size: 11px; font-family: var(--font-mono); color: var(--text-muted);
+  background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px;
+  padding: 1px 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.srow:hover .shost { display: none; }
 .srow .stop {
   width: 20px; height: 20px; border-radius: 6px; flex: none;
   display: none; align-items: center; justify-content: center;

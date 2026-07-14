@@ -3,7 +3,15 @@
 import { describe, expect, it } from "vitest";
 import { renderToString } from "react-dom/server";
 
-import { filterRows, groupRows, rowStoppable, Sidebar, WS_SHOW, type RailRow } from "./Sidebar";
+import {
+  filterRows,
+  groupRows,
+  rowStoppable,
+  runningHosts,
+  Sidebar,
+  WS_SHOW,
+  type RailRow,
+} from "./Sidebar";
 
 const row = (over: Partial<RailRow> = {}): RailRow => ({
   sid: "s1",
@@ -52,6 +60,23 @@ describe("rowStoppable", () => {
   it("live rows get the hover stop; history rows don't", () => {
     expect(rowStoppable({ history: undefined })).toBe(true);
     expect(rowStoppable({ history: true })).toBe(false);
+  });
+});
+
+describe("runningHosts", () => {
+  it("collects distinct hosts of live rows, defaulting to local", () => {
+    const rows = [
+      row({ sid: "s1" }), // no host → local
+      row({ sid: "s2", host: "dev01" }),
+      row({ sid: "s3", host: "dev01" }),
+    ];
+    expect(runningHosts(rows).sort()).toEqual(["dev01", "local"]);
+  });
+
+  it("ignores history rows (a stopped session runs nowhere)", () => {
+    const rows = [row({ sid: "s1", host: "dev01" }), row({ sid: "s2", host: "gpu02", history: true })];
+    expect(runningHosts(rows)).toEqual(["dev01"]);
+    expect(runningHosts([row({ sid: "s9", history: true })])).toEqual([]);
   });
 });
 
@@ -111,6 +136,25 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("wagent");
     expect(html).toContain("dev01");
     expect(html).toContain('class="wname"');
+  });
+
+  // A project is ONE logical unit whose sessions may run on several hosts —
+  // the header must not claim the first row's host for the whole group.
+  it("mixed-host group: header shows a count, rows carry host badges", () => {
+    const html = renderSidebar([
+      row({ sid: "s1" }), // local
+      row({ sid: "s2", host: "dev01", label: "远程任务" }),
+    ]);
+    expect(html).toContain("2 台主机");
+    // Per-row badge only for the non-local row.
+    expect(html).toContain('class="shost"');
+    expect(html).toContain("dev01");
+  });
+
+  it("all-local group: header says local, no per-row badges", () => {
+    const html = renderSidebar([row({ sid: "s1" }), row({ sid: "s2" })]);
+    expect(html).toContain("local");
+    expect(html).not.toContain('class="shost"');
   });
 
   it("renders the empty-workspace row (无会话)", () => {

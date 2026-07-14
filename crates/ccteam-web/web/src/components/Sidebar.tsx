@@ -23,7 +23,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { CcLogo } from "./Logo";
-import { makeT, tShowMore, type Lang } from "../lib/i18n";
+import { makeT, tHostsCount, tShowMore, type Lang } from "../lib/i18n";
 
 /** One sidebar session row — a live gateway session OR a stopped (history)
  *  session (dimmer; clicking resumes it). */
@@ -72,6 +72,20 @@ export function groupRows(
     else byProject.set(r.project, [r]);
   }
   return Array.from(byProject.entries()).map(([project, list]) => ({ project, rows: list }));
+}
+
+/** Distinct execution hosts across a group's LIVE rows (history rows are
+ *  excluded — a stopped session no longer runs anywhere). A project is one
+ *  logical unit whose sessions may run on several hosts; the header badge
+ *  shows the host only when it is unanimous, otherwise a count (and each
+ *  non-local row carries its own badge). Pure for unit tests. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
+export function runningHosts(rows: RailRow[]): string[] {
+  const hosts = new Set<string>();
+  for (const r of rows) {
+    if (!r.history) hosts.add(r.host ?? "local");
+  }
+  return Array.from(hosts);
 }
 
 /** A row is "running" (hover shows the stop affordance) when it is a LIVE
@@ -230,7 +244,9 @@ export function Sidebar({
           {groups.map(({ project, rows: list }) => {
             const closed = closedWs[project] && !q;
             const running = list.find((r) => !r.history);
-            const hostShown = running ? (running.host ?? "local") : null;
+            const hosts = runningHosts(list);
+            const hostShown =
+              hosts.length === 1 ? hosts[0] : hosts.length > 1 ? tHostsCount(lang, hosts.length) : null;
             const shown = expandedWs[project] || q ? list : list.slice(0, WS_SHOW);
             return (
               <div key={project}>
@@ -289,6 +305,9 @@ export function Sidebar({
                               }}
                             >
                               <span className="name">{row.label}</span>
+                              {!row.history && (row.host ?? "local") !== "local" ? (
+                                <span className="shost">{row.host}</span>
+                              ) : null}
                               {rowStoppable(row) ? (
                                 <button
                                   type="button"

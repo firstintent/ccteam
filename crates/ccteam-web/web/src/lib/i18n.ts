@@ -302,6 +302,11 @@ export function makeT(lang: Lang): (key: string) => string {
 export function tShowMore(lang: Lang, n: number): string {
   return lang === "en" ? `Show more (${n} more)` : `展开显示(还有 ${n} 个)`;
 }
+/** Workspace-header badge when a project's live sessions span several
+ *  execution hosts (per-row badges carry the specifics). */
+export function tHostsCount(lang: Lang, n: number): string {
+  return lang === "en" ? `${n} hosts` : `${n} 台主机`;
+}
 export function tStopped(lang: Lang, sid: string): string {
   return lang === "en"
     ? `Stopped ${sid} (state kept, resume anytime)`
