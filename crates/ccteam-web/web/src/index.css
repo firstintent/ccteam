@@ -897,7 +897,7 @@ select:focus-visible,
     env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* v0.9.0 W4 — 团队/Team view: graph canvas + detail side panel + timeline. */
+/* 团队/Team view: scalable delegation tree + roster + detail panel + timeline. */
 .agents-view { padding: 0; overflow: hidden; }
 .agents-head { padding: 24px 28px 8px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .agents-head h1 { font-size: 21px; font-weight: 600; }
@@ -906,7 +906,7 @@ select:focus-visible,
 .agents-kpis { display: flex; gap: 18px; align-items: baseline; font-size: 12.5px; color: var(--text-muted); padding-top: 6px; flex-wrap: wrap; }
 .agents-kpis b { font-size: 17px; font-weight: 600; color: var(--text); margin-right: 5px; font-variant-numeric: tabular-nums; }
 .agents-tabs { margin: 6px 28px 10px; align-self: flex-start; }
-/* v0.9.1 — 成员 roster (delegation tree table, the default tab). */
+/* 成员 roster (delegation tree table). */
 .agents-roster { display: flex; flex-direction: column; font-size: 13px; min-width: 640px; }
 .agents-roster-head, .agents-roster-row { display: grid; grid-template-columns: minmax(220px, 2.2fr) 110px 100px 90px 60px 110px 90px; gap: 8px; align-items: center; padding: 8px 10px; }
 .agents-roster-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--base); z-index: 1; }
@@ -920,23 +920,28 @@ select:focus-visible,
 .agents-roster-elbow { color: var(--text-faint); font-size: 11px; flex: none; }
 .agents-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 .agents-canvas { flex: 1; overflow: auto; padding: 8px 20px; }
-.agents-graph { display: block; }
-.agents-lane-label { font-size: 11px; fill: var(--text-faint); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.5px; }
-.agents-lane-rule { stroke: var(--border-soft); stroke-width: 1; }
-.agents-edge { stroke: var(--border); stroke-width: 1.5; }
-.agents-edge.active { stroke: var(--claude); stroke-width: 2; stroke-dasharray: 5 4; animation: agents-edge-flow 1s linear infinite; }
-@keyframes agents-edge-flow { to { stroke-dashoffset: -18; } }
-.agents-node { cursor: pointer; }
-.agents-card { fill: var(--bg-card); stroke: var(--border); stroke-width: 1; }
-.agents-node.selected .agents-card { stroke: var(--claude); stroke-width: 2; }
-.agents-node-main { font-size: 12.5px; font-weight: 600; fill: var(--text); }
-.agents-node-sub { font-size: 10.5px; fill: var(--text-faint); font-family: var(--font-mono); }
-.agents-ring.idle { fill: #C9CBD1; }
-.agents-ring.stopped { fill: none; stroke: var(--text-faint); stroke-width: 1.5; }
-.agents-ring.pulse { fill: var(--green); animation: agent-active-pulse 1.8s ease-in-out infinite; transform-origin: center; }
+.agents-tree { min-width: 720px; display: flex; flex-direction: column; gap: 10px; padding-bottom: 12px; }
+.agents-tree-project { width: max-content; min-width: 100%; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; background: var(--bg-card); }
+.agents-tree-project-head { height: 26px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--bg-soft); border-bottom: 1px solid var(--border-soft); color: var(--text-faint); font-size: 11px; }
+.agents-tree-project-head .mono { color: var(--text-muted); font-weight: 600; }
+.agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 78px 50px minmax(140px, 1fr) 8px 90px 86px 38px; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
+.agents-tree-row:last-child { border-bottom: none; }
+.agents-tree-row:hover { background: var(--bg-hover); }
+.agents-tree-row.selected { background: color-mix(in srgb, var(--claude) 9%, transparent); box-shadow: inset 2px 0 var(--claude); }
+.agents-tree-row.delegating { --tree-guide: var(--claude); background: color-mix(in srgb, var(--claude) 7%, transparent); box-shadow: inset 2px 0 var(--claude); }
+.agents-tree-indent { position: relative; align-self: stretch; min-width: 0; background: repeating-linear-gradient(to right, transparent 0 7px, var(--tree-guide) 7px 8px, transparent 8px 16px); opacity: 0.75; }
+.agents-tree-indent.has-parent::after { content: ''; position: absolute; right: 0; top: 50%; width: 8px; border-top: 1px solid var(--tree-guide); }
+.agents-tree-toggle, .agents-tree-toggle-spacer { width: 18px; height: 22px; display: inline-flex; align-items: center; justify-content: center; }
+.agents-tree-toggle { padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 17px; line-height: 1; }
+.agents-tree-toggle:hover { color: var(--text); background: var(--bg-soft); }
+.agents-tree-row .chip { justify-self: start; width: 78px; padding-inline: 5px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
+.agents-tree-sid { color: var(--text-faint); }
+.agents-tree-title { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agents-tree-active { white-space: nowrap; text-align: right; }
+.agents-tree-cost, .agents-tree-turns { color: var(--text-muted); text-align: right; font-variant-numeric: tabular-nums; }
+.agents-tree-row > .dot.busy { animation: agent-active-pulse 1.8s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) {
-  .agents-edge.active { animation: none; }
-  .agents-ring.pulse { animation: none; }
+  .agents-tree-row > .dot.busy { animation: none; }
 }
 .agents-panel { width: 300px; flex: none; border-left: 1px solid var(--border); padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
 .agents-panel h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
@@ -949,8 +954,8 @@ select:focus-visible,
 /* v0.9.1 — the timeline is a full tab now (was a fixed 180px bottom strip). */
 .agents-timeline { min-height: 240px; padding: 4px 8px; overflow: hidden; display: flex; flex-direction: column; }
 .agents-timeline h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 6px; }
-.agents-timeline-rows { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-.agents-timeline-row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: center; height: 24px; }
+.agents-timeline-rows { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0; }
+.agents-timeline-row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: center; height: 28px; flex: 0 0 28px; }
 .agents-timeline-label { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agents-timeline-track { position: relative; height: 100%; background: var(--bg-soft); border-radius: 4px; }
 .agents-timeline-bar { position: absolute; top: 3px; bottom: 3px; background: var(--green); border-radius: 3px; }

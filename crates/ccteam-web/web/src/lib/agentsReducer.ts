@@ -1,6 +1,6 @@
 // v0.9.0 W4 (F4) — pure reducers driving the team graph's LIVE state from the
 // global SSE stream (`useAgentsEvents`). No React, no DOM — unit-testable in
-// node env, mirroring `lib/agentsLayout.ts`'s discipline.
+// a node environment.
 
 import type { AgentEdge } from "./agentsApi";
 import type { AgentsEvent } from "../hooks/useAgentsEvents";

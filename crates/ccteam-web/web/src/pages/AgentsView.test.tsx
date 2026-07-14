@@ -12,8 +12,7 @@ vi.hoisted(() => {
   }
 });
 
-import AgentsView, { AgentsGraphSvg, AgentsRoster } from "./AgentsView";
-import { computeAgentsLayout } from "../lib/agentsLayout";
+import AgentsView, { AgentsRoster, AgentsTree } from "./AgentsView";
 import { flattenDelegationTree } from "../lib/agentsTree";
 import type { AgentEdge, AgentNode } from "../lib/agentsApi";
 
@@ -77,7 +76,7 @@ describe("AgentsRoster (pure presentational, fixture-driven)", () => {
   });
 });
 
-describe("AgentsGraphSvg (pure presentational, fixture-driven)", () => {
+describe("AgentsTree (SSR-safe, fixture-driven)", () => {
   function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
     return {
       sid: "s0",
@@ -93,42 +92,28 @@ describe("AgentsGraphSvg (pure presentational, fixture-driven)", () => {
     };
   }
 
-  it("renders N node cards + M edge paths from fixture data", () => {
+  it("renders nested delegation rows grouped across projects", () => {
     const nodes: AgentNode[] = [
       fixtureNode({ sid: "s0", role: "brain" }),
       fixtureNode({ sid: "s1", role: "worker", vendor: "grok", depth: 1, parent_sid: "s0" }),
-      fixtureNode({ sid: "s2", role: "worker2", vendor: "codex", depth: 1, parent_sid: "s0" }),
+      fixtureNode({ sid: "s2", role: "worker2", vendor: "codex", depth: 2, parent_sid: "s1" }),
+      fixtureNode({ sid: "s3", slug: "other", role: "root", vendor: "opencode" }),
     ];
     const edges: AgentEdge[] = [
       { parent: "s0", child: "s1", active: true },
-      { parent: "s0", child: "s2", active: false },
+      { parent: "s1", child: "s2", active: false },
     ];
-    const layout = computeAgentsLayout(nodes, edges, ["local"]);
     const html = renderToString(
-      <AgentsGraphSvg layout={layout} selected={"s1"} pulsing={new Set(["s1"])} onSelect={() => {}} />,
+      <AgentsTree nodes={nodes} edges={edges} selected="s1" pulsing={new Set(["s2"])} onSelect={() => {}} />,
     );
-    // 3 node cards.
-    expect(html).toContain('data-testid="agents-node-s0"');
-    expect(html).toContain('data-testid="agents-node-s1"');
-    expect(html).toContain('data-testid="agents-node-s2"');
-    // 2 edge paths.
-    expect(html).toContain('data-testid="agents-edge-s0-s1"');
-    expect(html).toContain('data-testid="agents-edge-s0-s2"');
-    // The active edge is flagged; the inactive one is not.
-    expect(html).toMatch(/agents-edge-s0-s1"[^>]*data-active="true"/);
-    expect(html).toMatch(/agents-edge-s0-s2"[^>]*data-active="false"/);
-    // The selected node carries the selected class.
-    expect(html).toMatch(/agents-node selected"[^>]*data-testid="agents-node-s1"/);
-    // One lane (single host).
-    expect(html).toContain('data-testid="agents-lane-local"');
-  });
-
-  it("renders zero node/edge markup for an empty graph", () => {
-    const layout = computeAgentsLayout([], [], []);
-    const html = renderToString(
-      <AgentsGraphSvg layout={layout} selected={null} pulsing={new Set()} onSelect={() => {}} />,
-    );
-    expect(html).not.toContain("agents-node-");
-    expect(html).not.toContain("agents-edge-");
+    expect(html).toContain('data-testid="agents-tree"');
+    expect(html).toContain('data-testid="agents-tree-project-demo"');
+    expect(html).toContain('data-testid="agents-tree-project-other"');
+    expect(html).toContain('data-testid="agents-tree-row-s0"');
+    expect(html).toMatch(/agents-tree-row selected delegating"[^>]*data-testid="agents-tree-row-s1"/);
+    expect(html).toMatch(/data-testid="agents-tree-row-s1"[^>]*data-delegating="true"/);
+    expect(html).toMatch(/aria-level="3"[^>]*data-testid="agents-tree-row-s2"/);
+    expect(html).toContain("agents-tree-indent has-parent");
+    expect(html).toContain("chip opencode");
   });
 });

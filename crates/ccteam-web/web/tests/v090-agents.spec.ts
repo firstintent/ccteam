@@ -1,8 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 
-// v0.9.0 W4 (F4) — team visualization browser smoke: the graph snapshot
-// renders its nodes, and a live `delegation` SSE frame (`dispatched`) flips
-// the corresponding edge to active — all traffic mocked at the /api/v1 seam
+// Team visualization browser smoke: the graph snapshot renders as a tree,
+// and a live `delegation` SSE frame (`dispatched`) highlights its child row —
+// all traffic mocked at the /api/v1 seam
 // (mirrors `v032-spa.spec.ts`'s MockEventSource technique, extended to track
 // instances by URL so the test can inject a named SSE frame mid-run, which a
 // static `page.route` fulfill body cannot do for a live stream).
@@ -104,23 +104,20 @@ async function pushAgentsEvent(page: Page, payload: Record<string, unknown>): Pr
   }, payload);
 }
 
-test("team view renders the graph snapshot; a dispatched SSE frame activates the edge", async ({
+test("team view renders the delegation tree; a dispatched SSE frame highlights the child", async ({
   page,
 }) => {
   await mockAgentsApi(page);
   await page.goto("/app/agents");
 
   await expect(page.getByTestId("agents-view")).toBeVisible();
-  // v0.9.1 — the roster tree table is the default tab; both sessions row up.
-  await expect(page.getByTestId("agents-roster-row-s0")).toBeVisible();
-  await expect(page.getByTestId("agents-roster-row-s1")).toBeVisible();
-  // The topology graph lives in its own tab now.
-  await page.getByTestId("agents-tab-topology").click();
-  await expect(page.getByTestId("agents-node-s0")).toBeVisible();
-  await expect(page.getByTestId("agents-node-s1")).toBeVisible();
+  await expect(page.getByTestId("agents-tree")).toBeVisible();
+  await expect(page.getByTestId("agents-tree-project-demo")).toBeVisible();
+  await expect(page.getByTestId("agents-tree-row-s0")).toBeVisible();
+  await expect(page.getByTestId("agents-tree-row-s1")).toBeVisible();
 
-  const edge = page.getByTestId("agents-edge-s0-s1");
-  await expect(edge).toHaveAttribute("data-active", "false");
+  const child = page.getByTestId("agents-tree-row-s1");
+  await expect(child).toHaveAttribute("data-delegating", "false");
 
   await pushAgentsEvent(page, {
     kind: "delegation",
@@ -131,10 +128,11 @@ test("team view renders the graph snapshot; a dispatched SSE frame activates the
     title: "research task",
   });
 
-  await expect(edge).toHaveAttribute("data-active", "true");
+  await expect(child).toHaveAttribute("data-delegating", "true");
+  await expect(child).toHaveClass(/delegating/);
 
-  // Selecting a node opens the detail side panel.
-  await page.getByTestId("agents-node-s1").click();
+  // Selecting a row opens the existing detail side panel.
+  await child.click();
   await expect(page.getByTestId("agents-panel")).toBeVisible();
   await expect(page.getByTestId("agents-open-chat")).toBeVisible();
 });

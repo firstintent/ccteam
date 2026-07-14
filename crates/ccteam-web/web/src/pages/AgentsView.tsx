@@ -1,13 +1,13 @@
 // v0.9.1 团队/Team view — redesigned around the operator's real questions
 // (who is working, who is stuck, who spent what, who delegated to whom):
 //
-// - 成员 roster (DEFAULT): a delegation tree TABLE — one row per session,
+// - 拓扑 topology (DEFAULT): a compact, collapsible delegation tree grouped
+//   by project, designed to stay readable with 100+ sessions.
+// - 成员 roster: a delegation tree TABLE — one row per session,
 //   children indented under their parent (process-tree shape). The common
 //   no-delegation case reads as a clean list, not scattered graph boxes.
 // - 时间轴 timeline: the 30-min dispatch strip (rows + arrows), unchanged
 //   semantics from v0.9.0 W4, now with full-height room.
-// - 拓扑 topology: the original swim-lane SVG graph (lane per host, bezier
-//   delegation edges) — kept for structure-at-a-glance, demoted from default.
 //
 // A KPI strip (live / working / active dispatches / total cost) sits above
 // the tabs, computed client-side from the same graph+SSE data. Admin-only
@@ -19,35 +19,31 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchAgentsGraph, type AgentEdge, type AgentNode, type AgentsGraphResponse } from "../lib/agentsApi";
-import { computeAgentsLayout, edgePath, type LayoutNode } from "../lib/agentsLayout";
 import {
   applyDelegationEvent,
   delegationToast,
   sidsActiveWithin,
   type TimestampedAgentsEvent,
 } from "../lib/agentsReducer";
-import { flattenDelegationTree, type RosterRow } from "../lib/agentsTree";
+import {
+  flattenDelegationTree,
+  groupDelegationTrees,
+  type RosterRow,
+} from "../lib/agentsTree";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
-import { vendorDotClass } from "../lib/vendors";
+import { vendorChipClass, vendorDotClass } from "../lib/vendors";
 import { makeT, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
 
-const PULSE_WINDOW_MS = 15_000;
+const PULSE_WINDOW_MS = 60_000;
 const TIMELINE_WINDOW_MS = 30 * 60 * 1000;
 const GRAPH_REFRESH_MS = 15_000;
 const EVENT_LOG_CAP = 500;
-const NODE_W = 168;
-const NODE_H = 58;
 
 export type AgentsTab = "roster" | "timeline" | "topology";
-
-function statusRingClass(sid: string, status: string, pulsing: Set<string>): string {
-  if (status !== "live") return "agents-ring stopped";
-  return pulsing.has(sid) ? "agents-ring pulse" : "agents-ring idle";
-}
 
 /** Roster status dot: pulsing = actively working (amber), live = idle-live
  *  (green), persisted-only = off (grey). */
@@ -56,82 +52,104 @@ function rosterDotClass(node: AgentNode, pulsing: Set<string>): string {
   return pulsing.has(node.sid) ? "dot busy" : "dot on";
 }
 
-/** Pure presentational graph SVG — given an already-computed layout, renders
- *  the lane rules, edges, and node cards. Extracted from `AgentsView` so it's
- *  directly SSR-testable with fixture data (the parent component's data
- *  loading is `useEffect`-driven and doesn't run under `renderToString`). */
-export function AgentsGraphSvg({
-  layout,
+/** Project-grouped, collapsible delegation tree. Component state contains
+ *  only collapsed sids, so the initial render stays deterministic and SSR-safe. */
+export function AgentsTree({
+  nodes,
+  edges,
   selected,
   pulsing,
   lang: langProp,
   onSelect,
 }: {
-  layout: ReturnType<typeof computeAgentsLayout>;
+  nodes: AgentNode[];
+  edges: AgentEdge[];
   selected: string | null;
   pulsing: Set<string>;
   lang?: Lang;
   onSelect: (sid: string) => void;
 }) {
+  const lang = langProp ?? "zh";
   const t = makeT(langProp ?? "zh");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const projects = useMemo(() => groupDelegationTrees(nodes, collapsed), [nodes, collapsed]);
+  const delegating = useMemo(
+    () => new Set(edges.filter((edge) => edge.active).map((edge) => edge.child)),
+    [edges],
+  );
+
+  const toggleCollapsed = (sid: string) => {
+    setCollapsed((previous) => {
+      const next = new Set(previous);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+  };
+
   return (
-    <svg
-      className="agents-graph"
-      viewBox={`0 0 ${layout.width} ${layout.height}`}
-      width="100%"
-      height={Math.max(layout.height, 160)}
-      role="img"
-      aria-label={t("team")}
-    >
-      {layout.hosts.map((h, i) => (
-        <g key={h} data-testid={`agents-lane-${h}`}>
-          <text x={12} y={i * 320 + 24} className="agents-lane-label">
-            {h}
-          </text>
-          <line x1={0} y1={i * 320 + 34} x2={layout.width} y2={i * 320 + 34} className="agents-lane-rule" />
-        </g>
+    <div className="agents-tree" data-testid="agents-tree" role="tree" aria-label={t("team")}>
+      {projects.map((project) => (
+        <section className="agents-tree-project" data-testid={`agents-tree-project-${project.slug}`} key={project.slug}>
+          <header className="agents-tree-project-head">
+            <span className="mono">{project.slug}</span>
+            <span>{project.liveCount}/{project.totalCount} {t("teamKpiLive")}</span>
+          </header>
+          {project.rows.map(({ node: n, indent, hasChildren }) => {
+            const isCollapsed = collapsed.has(n.sid);
+            const isDelegating = delegating.has(n.sid);
+            return (
+              <div
+                key={n.sid}
+                role="treeitem"
+                aria-level={indent + 1}
+                aria-expanded={hasChildren ? !isCollapsed : undefined}
+                tabIndex={0}
+                className={[
+                  "agents-tree-row",
+                  n.sid === selected ? "selected" : "",
+                  isDelegating ? "delegating" : "",
+                ].filter(Boolean).join(" ")}
+                data-testid={`agents-tree-row-${n.sid}`}
+                data-delegating={isDelegating ? "true" : "false"}
+                onClick={() => onSelect(n.sid)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") onSelect(n.sid);
+                }}
+              >
+                <span
+                  className={indent > 0 ? "agents-tree-indent has-parent" : "agents-tree-indent"}
+                  style={{ width: indent * 16 }}
+                  aria-hidden="true"
+                />
+                {hasChildren ? (
+                  <button
+                    type="button"
+                    className="agents-tree-toggle"
+                    aria-label={isCollapsed ? t("expand") : t("collapse")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleCollapsed(n.sid);
+                    }}
+                  >
+                    {isCollapsed ? "›" : "⌄"}
+                  </button>
+                ) : (
+                  <span className="agents-tree-toggle-spacer" aria-hidden="true" />
+                )}
+                <span className={vendorChipClass(n.vendor)}>{n.vendor}</span>
+                <span className="agents-tree-sid mono">{n.sid}</span>
+                <span className="agents-tree-title">{n.title || n.role || "—"}</span>
+                <span className={rosterDotClass(n, pulsing)} aria-hidden="true" />
+                <span className="agents-tree-active">{relativeTime(lang, n.last_active)}</span>
+                <span className="agents-tree-cost mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
+                <span className="agents-tree-turns mono" title={t("teamColTurns")}>{n.turn_count}t</span>
+              </div>
+            );
+          })}
+        </section>
       ))}
-      {layout.edges.map((e) => (
-        <path
-          key={`${e.parent}-${e.child}`}
-          d={edgePath(e)}
-          className={`agents-edge ${e.active ? "active" : ""}`}
-          data-testid={`agents-edge-${e.parent}-${e.child}`}
-          data-active={e.active ? "true" : "false"}
-          fill="none"
-        />
-      ))}
-      {layout.nodes.map((n) => (
-        <g
-          key={n.sid}
-          transform={`translate(${n.x - NODE_W / 2}, ${n.y - NODE_H / 2})`}
-          className={`agents-node ${n.sid === selected ? "selected" : ""}`}
-          data-testid={`agents-node-${n.sid}`}
-          role="button"
-          tabIndex={0}
-          onClick={() => onSelect(n.sid)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onSelect(n.sid);
-          }}
-        >
-          <title>
-            {n.title || n.role || n.sid} · {n.vendor} · {n.host}
-          </title>
-          <rect width={NODE_W} height={NODE_H} rx={12} className="agents-card" />
-          <circle cx={14} cy={14} r={6} className={vendorDotClass(n.vendor)} />
-          <circle cx={NODE_W - 12} cy={12} r={5} className={statusRingClass(n.sid, n.status, pulsing)} />
-          <text x={26} y={19} className="agents-node-main">
-            {(n.title || n.role || n.sid).slice(0, 18)}
-          </text>
-          <text x={12} y={36} className="agents-node-sub">
-            {n.vendor} · {n.host}
-          </text>
-          <text x={12} y={50} className="agents-node-sub">
-            {n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"} · {n.turn_count}t
-          </text>
-        </g>
-      ))}
-    </svg>
+    </div>
   );
 }
 
@@ -211,7 +229,7 @@ export function AgentsRoster({
 export default function AgentsView({
   lang: langProp,
   onOpenChat,
-  initialTab = "roster",
+  initialTab = "topology",
 }: {
   lang?: Lang;
   isAdmin?: boolean;
@@ -290,15 +308,9 @@ export default function AgentsView({
     [timestamped, now],
   );
 
-  const layout = useMemo(
-    () => computeAgentsLayout(graph.nodes, edges, graph.hosts),
-    [graph.nodes, edges, graph.hosts],
-  );
-
   const roster = useMemo(() => flattenDelegationTree(graph.nodes), [graph.nodes]);
 
-  const selectedNode: LayoutNode | null =
-    layout.nodes.find((n) => n.sid === selected) ?? null;
+  const selectedNode = graph.nodes.find((node) => node.sid === selected) ?? null;
 
   const activityFold: ActivityFold = useMemo(() => {
     let fold = emptyFold();
@@ -319,8 +331,8 @@ export default function AgentsView({
   }, [selected, historyBySid]);
 
   const timelineNodes = useMemo(
-    () => [...layout.nodes].sort((a, b) => a.depth - b.depth || a.sid.localeCompare(b.sid)),
-    [layout.nodes],
+    () => [...graph.nodes].sort((a, b) => a.depth - b.depth || a.sid.localeCompare(b.sid)),
+    [graph.nodes],
   );
   const windowStart = now - TIMELINE_WINDOW_MS;
   const timelineDispatches = useMemo(
@@ -348,7 +360,7 @@ export default function AgentsView({
   const activeDispatches = edges.filter((e) => e.active).length;
   const totalCost = graph.nodes.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
 
-  const empty = !loading && layout.nodes.length === 0;
+  const empty = !loading && graph.nodes.length === 0;
   const showPanel = tab !== "timeline";
 
   return (
@@ -377,9 +389,9 @@ export default function AgentsView({
       <div className="seg agents-tabs" data-testid="agents-tabs">
         {(
           [
+            ["topology", t("teamTabTopology")],
             ["roster", t("teamTabRoster")],
             ["timeline", t("teamTabTimeline")],
-            ["topology", t("teamTabTopology")],
           ] as [AgentsTab, string][]
         ).map(([id, label]) => (
           <button
@@ -412,7 +424,14 @@ export default function AgentsView({
               onOpenChat={onOpenChat}
             />
           ) : tab === "topology" ? (
-            <AgentsGraphSvg layout={layout} selected={selected} pulsing={pulsing} lang={lang} onSelect={setSelected} />
+            <AgentsTree
+              nodes={graph.nodes}
+              edges={edges}
+              selected={selected}
+              pulsing={pulsing}
+              lang={lang}
+              onSelect={setSelected}
+            />
           ) : (
             <div className="agents-timeline" data-testid="agents-timeline">
               <h3>{t("teamTimeline")}</h3>
@@ -515,7 +534,7 @@ export default function AgentsView({
               {t("teamOpenChat")}
             </button>
           </aside>
-        ) : showPanel && layout.nodes.length > 0 ? (
+        ) : showPanel && graph.nodes.length > 0 ? (
           <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
             <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
           </aside>
