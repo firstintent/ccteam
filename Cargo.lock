@@ -476,6 +476,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "getrandom 0.2.17",
  "libc",
  "nix 0.29.0",
  "notify",
@@ -492,6 +493,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "tokio-util",
  "tracing",
  "vt100",
 ]

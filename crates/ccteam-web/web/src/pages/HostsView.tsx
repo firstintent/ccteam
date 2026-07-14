@@ -225,14 +225,12 @@ export function JoinCard({ lang = "zh" }: { lang?: Lang } = {}) {
   const origin =
     typeof window !== "undefined" && window.location ? window.location.origin : "https://<daemon>";
   const token = info?.token ?? null;
-  // Full flow: install → join (registers identity) → serve (exec bridge +
-  // heartbeat — only heartbeats fill the agent report above; join alone shows
-  // an empty host). A machine already running `ccteam start` embeds serve
-  // in-process (dual-role) — the last line is only for daemon-less machines.
-  // advertise-url must be a LAN address this daemon can reach.
+  // Full flow: install → start (the unified process) → join. The satellite
+  // dials OUT to this daemon (reverse connection — it exposes no port); a
+  // running `ccteam start` picks the join up within 30s and comes online.
   const command = `curl -fsSL https://ccteam.dev/install.sh | sh
-ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}
-ccteam host serve --advertise-url http://<this-host-lan-ip>:7332  # daemon-less machines only`;
+ccteam start
+ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
 
   const onMint = async () => {
     setBusy(true);

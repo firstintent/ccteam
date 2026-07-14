@@ -93,6 +93,13 @@ pub struct AppState {
     /// Shared pending-interaction registry for MCP `interaction/ask` /
     /// `permission/ask` (same Arc the gateway + mcp.sock hold).
     pub mcp_pending: Option<ccteam_im::mcp::PendingRegistry>,
+    /// v0.9.0 reverse-connection — live satellite control channels + exec
+    /// dial-back rendezvous (`GET /api/v1/hosts/channel` / `…/hosts/exec/{nonce}`
+    /// register into this). `ccteam start` hands in the SAME hub it wires
+    /// into the gateway's `HubRemoteHostProxy` ([`Self::with_host_hub`]);
+    /// a standalone/default state gets its own (empty) hub — handlers work,
+    /// spawns simply find no connected hosts.
+    pub host_hub: Arc<ccteam_harness::HostChannelHub>,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -150,7 +157,16 @@ impl AppState {
             global_ring: Arc::new(crate::ring::GlobalEventRing::new()),
             mcp_sink: None,
             mcp_pending: None,
+            host_hub: Arc::new(ccteam_harness::HostChannelHub::default()),
         }
+    }
+
+    /// v0.9.0 reverse-connection — share the daemon's host-channel hub (the
+    /// same instance the gateway's `HubRemoteHostProxy` opens execs
+    /// through) so satellite WS registrations and spawn-path lookups meet.
+    pub fn with_host_hub(mut self, hub: Arc<ccteam_harness::HostChannelHub>) -> Self {
+        self.host_hub = hub;
+        self
     }
 
     pub fn with_chat_bridge(

@@ -1,19 +1,22 @@
-//! v0.9.0 W3 (F3) — end-to-end remote spawn over a REAL in-process axum
-//! "fake satellite" speaking the real `ccteam-exec.v1` wire, driving the
-//! SAME fake-claude python fixture pattern `claude_stream_json_test.rs`
-//! uses. This proves the whole remote path: `ClaudeStreamJsonAdapter`
-//! (`ctx.remote` set) → `remote_exec::connect` → WS → fake satellite →
-//! real child process → stdout bridged back → `initialize` handshake →
-//! turn → answer, PLUS the exec-bridge invariants (vendor/args, `CCTEAM_*`
-//! env allowlist, `mcp.json` shipped with `{{DAEMON_URL}}` substituted) and
-//! the reconnect-uses-`--resume` contract (tech-design §4.4/§4.5).
+//! v0.9.0 W3 (F3) — end-to-end remote spawn over an in-process "fake
+//! satellite" speaking the real `ccteam-exec.v1` frames, driving the SAME
+//! fake-claude python fixture pattern `claude_stream_json_test.rs` uses.
+//! Reverse-connection era: the fake satellite registers a control channel
+//! in a real [`HostChannelHub`] and answers `exec_open` rendezvous with
+//! paired [`ExecBridge`] halves — exactly the daemon-side path production
+//! takes (the WS hop is proven separately in
+//! `ccteam-web/tests/satellite_ws_test.rs`). This proves the whole remote
+//! path: `ClaudeStreamJsonAdapter` (`ctx.remote` set) →
+//! `remote_exec::connect` → hub rendezvous → fake satellite → real child
+//! process → stdout bridged back → `initialize` handshake → turn → answer,
+//! PLUS the exec invariants (vendor/args, `CCTEAM_*` env allowlist,
+//! `mcp.json` shipped with `{{DAEMON_URL}}` substituted) and the
+//! reconnect-uses-`--resume` contract (tech-design §4.4/§4.5).
 //!
-//! The fake satellite here is a deliberately MINIMAL reimplementation of
-//! `ccteam-web::satellite`'s handler (harness cannot depend on web — the
-//! crate-layering red line) — just enough of the protocol to drive these
-//! assertions; the satellite's OWN safety invariants (vendor allowlist /
-//! slug registry / path confinement) are unit-tested in
-//! `ccteam-web/src/satellite.rs`.
+//! The fake satellite is a deliberately MINIMAL reimplementation of the
+//! exec engine — just enough protocol to drive these assertions; the
+//! engine's OWN safety invariants (vendor allowlist / slug registry / path
+//! confinement) are tested in `ccteam-harness/src/execution/satellite_exec.rs`.
 
 #![cfg(unix)]
 
@@ -22,21 +25,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
 use ccteam_harness::execution::claude_stream_json::spawn_spec::deterministic_session_uuid;
 use ccteam_harness::execution::claude_stream_json::ClaudeStreamJsonAdapter;
+use ccteam_harness::execution::host_channel::ExecBridge;
 use ccteam_harness::{
-    AgentSpecBrief, ExecSpec, HarnessAdapter, PermissionMode, RemoteExecTarget, SpawnCtx,
-    ThreadEvent, ThreadItemDetails,
+    AgentSpecBrief, ExecSpec, HarnessAdapter, HostChannelHub, HubCtrlMsg, PermissionMode,
+    RemoteExecTarget, SpawnCtx, ThreadEvent, ThreadItemDetails,
 };
 use futures::StreamExt;
 use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
+use tokio_tungstenite::tungstenite::Message as TMessage;
 
 /// Same fake `claude` stream-json vendor `claude_stream_json_test.rs`
 /// uses (kept in lockstep intentionally — a real second copy would drift).
@@ -138,37 +138,40 @@ struct FakeSatelliteState {
     project_root: Arc<StdMutex<Option<PathBuf>>>,
 }
 
-async fn spawn_fake_satellite(project_root: PathBuf) -> (String, FakeSatelliteState) {
+/// Register a fake satellite on a fresh hub: a control-channel task that
+/// answers every `exec_open` rendezvous by pairing an [`ExecBridge`] and
+/// running one fake exec session over it (each in its own task, so a
+/// retry can open a second exec while the first drains).
+async fn spawn_fake_satellite(project_root: PathBuf) -> (Arc<HostChannelHub>, FakeSatelliteState) {
     let state = FakeSatelliteState {
         received: Arc::new(StdMutex::new(Vec::new())),
         project_root: Arc::new(StdMutex::new(Some(project_root))),
     };
-    let app = Router::new()
-        .route("/ws/exec", get(handle_ws_exec))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let hub = Arc::new(HostChannelHub::default());
+    let mut reg = hub.register("sat");
+    let hub_for_task = hub.clone();
+    let state_for_task = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        while let Some(HubCtrlMsg::ExecOpen { nonce, .. }) = reg.ctrl_rx.recv().await {
+            let slot = hub_for_task.claim_exec(&nonce, "sat").unwrap();
+            let (mine, theirs) = ExecBridge::pair();
+            if slot.send(theirs).is_err() {
+                continue;
+            }
+            tokio::spawn(run_fake_exec_session(mine, state_for_task.clone()));
+        }
     });
-    (format!("ws://{addr}/ws/exec"), state)
-}
-
-async fn handle_ws_exec(
-    State(state): State<FakeSatelliteState>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.protocols([ccteam_harness::EXEC_SUBPROTOCOL])
-        .on_upgrade(move |socket| run_fake_exec_session(socket, state))
+    (hub, state)
 }
 
 /// Minimal `ccteam-exec.v1` satellite: read `ExecSpec` → record it →
 /// materialize `files` (substituting `{{DAEMON_URL}}`, no confinement
-/// check — that invariant is proven separately in `ccteam-web/satellite.rs`)
-/// → spawn `spec.vendor`'s `CCTEAM_<VENDOR>_BIN` env override → bridge
-/// stdio.
-async fn run_fake_exec_session(mut socket: WebSocket, state: FakeSatelliteState) {
-    let Some(AxumMessage::Text(t)) = socket.recv().await.and_then(|m| m.ok()) else {
+/// check — that invariant is proven separately in
+/// `execution/satellite_exec.rs`) → spawn `spec.vendor`'s
+/// `CCTEAM_<VENDOR>_BIN` env override → bridge stdio.
+async fn run_fake_exec_session(bridge: ExecBridge, state: FakeSatelliteState) {
+    let ExecBridge { tx, mut rx } = bridge;
+    let Some(TMessage::Text(t)) = rx.recv().await else {
         return;
     };
     let spec: ExecSpec = serde_json::from_str(&t).expect("valid ExecSpec");
@@ -200,17 +203,15 @@ async fn run_fake_exec_session(mut socket: WebSocket, state: FakeSatelliteState)
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = socket
-                .send(AxumMessage::Text(
-                    format!(r#"{{"ok":false,"code":"spawn-failed","message":"{e}"}}"#).into(),
-                ))
+            let _ = tx
+                .send(TMessage::Text(format!(
+                    r#"{{"ok":false,"code":"spawn-failed","message":"{e}"}}"#
+                )))
                 .await;
             return;
         }
     };
-    let _ = socket
-        .send(AxumMessage::Text(r#"{"ok":true}"#.into()))
-        .await;
+    let _ = tx.send(TMessage::Text(r#"{"ok":true}"#.into())).await;
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -227,24 +228,23 @@ async fn run_fake_exec_session(mut socket: WebSocket, state: FakeSatelliteState)
                 match n {
                     Ok(0) => break,
                     Ok(n) => {
-                        if socket.send(AxumMessage::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        if tx.send(TMessage::Binary(buf[..n].to_vec())).await.is_err() {
                             break;
                         }
                     }
                     Err(_) => break,
                 }
             }
-            msg = socket.recv() => {
+            msg = rx.recv() => {
                 match msg {
-                    Some(Ok(AxumMessage::Binary(b))) => {
+                    Some(TMessage::Binary(b)) => {
                         if stdin.write_all(&b).await.is_err() { break; }
                     }
-                    Some(Ok(AxumMessage::Text(t))) if t.contains("stdin_close") => {
+                    Some(TMessage::Text(t)) if t.contains("stdin_close") => {
                         let _ = stdin.shutdown().await;
                     }
-                    Some(Ok(AxumMessage::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(TMessage::Close(_)) | None => break,
+                    Some(_) => {}
                 }
             }
         }
@@ -255,7 +255,7 @@ async fn run_fake_exec_session(mut socket: WebSocket, state: FakeSatelliteState)
         r#"{{"exit":{}}}"#,
         status.and_then(|s| s.code()).unwrap_or(-1)
     );
-    let _ = socket.send(AxumMessage::Text(ev.into())).await;
+    let _ = tx.send(TMessage::Text(ev)).await;
 }
 
 /// v0.9.0 W3 (F3) — remote spawn e2e: `ExecSpec` carries claude/args/an
@@ -273,10 +273,10 @@ async fn remote_spawn_e2e_answer_flows_and_exec_spec_is_sane() {
     std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "2000");
     std::env::remove_var("FAKE_SJ_ARGV_LOG");
 
-    let (ws_url, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
+    let (hub, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
     let target = RemoteExecTarget {
-        exec_ws_url: ws_url,
-        agent_token: "tok".into(),
+        host_id: "sat".into(),
+        hub,
     };
 
     let adapter = ClaudeStreamJsonAdapter::new();
@@ -376,10 +376,10 @@ async fn remote_reconnect_uses_resume_with_the_same_deterministic_uuid() {
     std::env::set_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "2000");
     std::env::remove_var("FAKE_SJ_ARGV_LOG");
 
-    let (ws_url, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
+    let (hub, sat_state) = spawn_fake_satellite(tmp.path().to_path_buf()).await;
     let target = RemoteExecTarget {
-        exec_ws_url: ws_url,
-        agent_token: "tok".into(),
+        host_id: "sat".into(),
+        hub,
     };
     let uuid = deterministic_session_uuid("demo", "s9");
 

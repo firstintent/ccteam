@@ -1,18 +1,21 @@
-//! Remote-host spawn gate + satellite exec-bridge proxy seam
-//! (v0.8.24 Track D gate; v0.9.0 W3 F3 makes it a REAL execution proxy).
+//! Remote-host spawn gate + satellite exec proxy seam
+//! (v0.8.24 Track D gate; v0.9.0 W3 F3 real execution; reverse-connection
+//! since the network inversion — satellites dial in, no listener).
 //!
 //! Architecture (see `docs-local/versions/v0-9-0/tech-design.md` §4):
-//! - Host registry (join + heartbeat) is the ops registration surface.
+//! - Host registry (join + control-channel reports) is the ops
+//!   registration surface; it lives ONLY on the main daemon.
 //! - Session spawn/rebuild with `host != local` is gated: offline / unknown
 //!   host / terminal protocol / the satellite not having `slug` registered
 //!   → readable error (session **not** created, and — critically for G10 —
 //!   an existing remote session is **never** silently respawned locally).
-//! - Stdio protocols (stream-json / acp) proxy to the satellite's
-//!   `ccteam-exec.v1` bridge (`crate::remote_exec` re-export from
-//!   `ccteam-harness`) once the gate passes. Production proxy dials the
-//!   satellite's `GET /health` then hands back a [`RemoteExecTarget`]
-//!   pointing at its `GET /ws/exec`; tests inject a [`RemoteHostProxy`]
-//!   that fakes (or in-process-duplexes) the handoff.
+//! - Stdio protocols (stream-json / acp) proxy to the satellite through the
+//!   daemon's [`HostChannelHub`]: the satellite keeps a live outbound
+//!   `ccteam-host.v1` control channel; each spawn is an `exec_open`
+//!   dial-back rendezvous (`ccteam-exec.v1` frames, re-exported from
+//!   `ccteam-harness`). Production proxy ([`HubRemoteHostProxy`]) requires
+//!   a live channel; tests inject a [`RemoteHostProxy`] that fakes (or
+//!   in-process-duplexes) the handoff.
 
 use std::sync::Arc;
 
@@ -22,7 +25,7 @@ use ccteam_core::host_registry::{
     gate_remote_spawn, gate_remote_spawn_project, HostRegistry, DEFAULT_HEARTBEAT_TTL_SECS,
     LOCAL_HOST,
 };
-use ccteam_harness::{RemoteExecTarget, SessionProtocol};
+use ccteam_harness::{HostChannelHub, RemoteExecTarget, SessionProtocol};
 use std::path::Path;
 
 /// Decision after the host gate for a create/resume.
@@ -60,55 +63,47 @@ impl HostTarget {
     }
 }
 
-/// Pluggable satellite exec-bridge proxy. Production default health-checks
-/// `agent_url` then derives the `ws://…/ws/exec` target; tests install a
-/// fake that skips the network hop (or points at an in-process satellite).
+/// Pluggable satellite exec proxy. Production requires a live reverse
+/// control channel in the daemon's [`HostChannelHub`]; tests install a
+/// fake that skips the liveness check (or wires an in-process hub).
 #[async_trait]
 pub trait RemoteHostProxy: Send + Sync {
     /// Ensure a remote stdio session can be started on `host_id` and return
-    /// the exec-bridge target to dial. Returning `Ok` means the main daemon
-    /// may proceed to track the session; `Err` is a readable user-facing
-    /// failure — the session must not be inserted (and, on a rebuild, must
-    /// stay stopped rather than silently respawn locally — G10).
+    /// the exec target (host id + hub) to thread into `SpawnCtx::remote`.
+    /// Returning `Ok` means the main daemon may proceed to track the
+    /// session; `Err` is a readable user-facing failure — the session must
+    /// not be inserted (and, on a rebuild, must stay stopped rather than
+    /// silently respawn locally — G10).
     async fn ensure_remote_spawn(
         &self,
         host_id: &str,
         protocol: SessionProtocol,
-        agent_url: Option<&str>,
-        agent_token: &str,
     ) -> Result<RemoteExecTarget>;
 }
 
-/// Rewrite an `http(s)://host:port` agent base URL into its
-/// `ws(s)://host:port/ws/exec` exec-bridge counterpart.
-pub fn agent_url_to_exec_ws(agent_url: &str) -> String {
-    let trimmed = agent_url.trim().trim_end_matches('/');
-    let ws_base = if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        // Already a ws(s):// URL (or schemeless) — pass through.
-        trimmed.to_string()
-    };
-    format!("{ws_base}/ws/exec")
+/// Production proxy: the satellite must have a LIVE `ccteam-host.v1`
+/// control channel registered in the hub right now (instant, accurate
+/// presence — no probe, no address: the satellite has no listener).
+/// Failures are readable; offline-by-TTL / unregistered-slug were already
+/// gated before this is called.
+pub struct HubRemoteHostProxy {
+    hub: Arc<HostChannelHub>,
 }
 
-/// Production proxy: requires an `agent_url` and a successful HTTP health
-/// probe (`GET {agent_url}/health` → 2xx), then hands back the exec-bridge
-/// target (`ws://…/ws/exec` + the host's agent token). Failures are
-/// readable; offline / unregistered-slug were already gated before this is
-/// called.
-pub struct HttpRemoteHostProxy;
+impl HubRemoteHostProxy {
+    /// Wrap the daemon's shared [`HostChannelHub`] (the same instance the
+    /// web WS handlers register satellite connections into).
+    pub fn new(hub: Arc<HostChannelHub>) -> Self {
+        Self { hub }
+    }
+}
 
 #[async_trait]
-impl RemoteHostProxy for HttpRemoteHostProxy {
+impl RemoteHostProxy for HubRemoteHostProxy {
     async fn ensure_remote_spawn(
         &self,
         host_id: &str,
         protocol: SessionProtocol,
-        agent_url: Option<&str>,
-        agent_token: &str,
     ) -> Result<RemoteExecTarget> {
         if protocol.is_terminal() {
             bail!(
@@ -116,47 +111,33 @@ impl RemoteHostProxy for HttpRemoteHostProxy {
                  (multi-host supports stdio only)"
             );
         }
-        let Some(url) = agent_url.filter(|u| !u.is_empty()) else {
+        if !self.hub.is_connected(host_id) {
             bail!(
-                "host `{host_id}` is online but has no satellite agent endpoint \
-                 (agent_url); re-join with --agent-url or wait for a heartbeat that \
-                 advertises one"
+                "host `{host_id}` has no live control channel to this daemon \
+                 (satellite disconnected?); session was not created"
             );
-        };
-        let health = format!("{}/health", url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .map_err(|e| anyhow::anyhow!("remote host http client: {e}"))?;
-        match client.get(&health).send().await {
-            Ok(resp) if resp.status().is_success() => Ok(RemoteExecTarget {
-                exec_ws_url: agent_url_to_exec_ws(url),
-                agent_token: agent_token.to_string(),
-            }),
-            Ok(resp) => bail!(
-                "host `{host_id}` agent at {url} returned HTTP {}; session was not created",
-                resp.status()
-            ),
-            Err(e) => {
-                bail!("host `{host_id}` agent unreachable at {url}: {e}; session was not created")
-            }
         }
+        Ok(RemoteExecTarget {
+            host_id: host_id.to_string(),
+            hub: self.hub.clone(),
+        })
     }
 }
 
 /// Test / in-process proxy. Records the last host id for assertions;
 /// `exec_target` lets a test point the returned [`RemoteExecTarget`] at an
-/// in-process fake satellite (e.g. a `tokio::net::TcpListener` bound to
-/// `127.0.0.1:0` speaking real `ccteam-exec.v1`) instead of deriving one
-/// from the registry's (often dummy) `agent_url` — the "in-process duplex
-/// mode" gateway e2e tests need.
+/// in-process hub with a fake satellite attached (speaking real
+/// `ccteam-exec.v1` over `ExecBridge` halves) — the "in-process duplex
+/// mode" gateway e2e tests need. When unset, a dead hub is returned (fine
+/// for gate-only tests whose adapter never dials).
 #[derive(Default)]
 pub struct FakeRemoteHostProxy {
     /// Last host id passed to [`RemoteHostProxy::ensure_remote_spawn`].
     pub last_host: std::sync::Mutex<Option<String>>,
     /// When true, `ensure_remote_spawn` returns an error.
     pub fail: std::sync::Mutex<bool>,
-    /// Override the returned target (bypassing `agent_url` derivation).
+    /// Override the returned target (e.g. a hub with an in-process fake
+    /// satellite registered).
     pub exec_target: std::sync::Mutex<Option<RemoteExecTarget>>,
 }
 
@@ -166,8 +147,6 @@ impl RemoteHostProxy for FakeRemoteHostProxy {
         &self,
         host_id: &str,
         protocol: SessionProtocol,
-        agent_url: Option<&str>,
-        agent_token: &str,
     ) -> Result<RemoteExecTarget> {
         if protocol.is_terminal() {
             bail!("terminal protocol cannot run on remote host `{host_id}`");
@@ -179,12 +158,9 @@ impl RemoteHostProxy for FakeRemoteHostProxy {
         if let Some(target) = self.exec_target.lock().unwrap().clone() {
             return Ok(target);
         }
-        let url = agent_url
-            .filter(|u| !u.is_empty())
-            .unwrap_or("http://127.0.0.1:0");
         Ok(RemoteExecTarget {
-            exec_ws_url: agent_url_to_exec_ws(url),
-            agent_token: agent_token.to_string(),
+            host_id: host_id.to_string(),
+            hub: Arc::new(HostChannelHub::default()),
         })
     }
 }
@@ -243,33 +219,21 @@ pub async fn prepare_host_for_spawn(
         RemoteSpawnPlan::Local => Ok(HostTarget::local()),
         RemoteSpawnPlan::Remote { host_id } => {
             let reg = HostRegistry::load(&ccteam_core::host_registry::registry_path_in(root))?;
-            let rec = reg
-                .get(&host_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown host: {host_id}"))?;
             // v0.9.0 W3 (G9) — the satellite must have ITS OWN copy of this
-            // project registered (last reported at heartbeat), else a spawn
-            // there would fail `unknown-slug` at the exec bridge anyway —
-            // fail here with a more actionable message.
+            // project registered (last reported over the control channel),
+            // else a spawn there would fail `unknown-slug` at the exec
+            // engine anyway — fail here with a more actionable message.
             gate_remote_spawn_project(&reg, &host_id, slug)?;
-            let target = if let Some(proxy) = proxy {
-                proxy
-                    .ensure_remote_spawn(
-                        &host_id,
-                        protocol,
-                        rec.agent_url.as_deref(),
-                        &rec.agent_token,
-                    )
-                    .await?
-            } else {
-                HttpRemoteHostProxy
-                    .ensure_remote_spawn(
-                        &host_id,
-                        protocol,
-                        rec.agent_url.as_deref(),
-                        &rec.agent_token,
-                    )
-                    .await?
+            let Some(proxy) = proxy else {
+                // Reverse-connection model: remote exec REQUIRES the
+                // daemon's host-channel hub (wired by `ccteam start`). A
+                // gateway without one cannot reach any satellite.
+                bail!(
+                    "remote host `{host_id}` requested but this daemon has no \
+                     host-channel hub (web/API disabled?); session was not created"
+                );
             };
+            let target = proxy.ensure_remote_spawn(&host_id, protocol).await?;
             Ok(HostTarget {
                 host: host_id,
                 remote: Some(target),
@@ -308,7 +272,7 @@ mod tests {
     use ccteam_core::host_registry::{now_unix, HostRecord};
     use tempfile::TempDir;
 
-    fn registered_sat(tmp: &TempDir, agent_url: &str, last_heartbeat_unix: u64) {
+    fn registered_sat(tmp: &TempDir, last_heartbeat_unix: u64) {
         let mut reg = HostRegistry::default();
         reg.upsert(HostRecord {
             id: "sat".into(),
@@ -316,7 +280,6 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             ccteam_version: "0.9.0".into(),
-            agent_url: Some(agent_url.into()),
             agent_token: "t".into(),
             last_heartbeat_unix,
             agents: vec![],
@@ -333,11 +296,7 @@ mod tests {
     #[tokio::test]
     async fn offline_host_errors_without_proxy_call() {
         let tmp = TempDir::new().unwrap();
-        registered_sat(
-            &tmp,
-            "http://127.0.0.1:9",
-            now_unix().saturating_sub(10_000),
-        );
+        registered_sat(&tmp, now_unix().saturating_sub(10_000));
         let fake = Arc::new(FakeRemoteHostProxy::default());
         let proxy: Arc<dyn RemoteHostProxy> = fake.clone();
         let err = prepare_host_for_spawn(
@@ -356,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn online_host_calls_fake_proxy_and_returns_remote_target() {
         let tmp = TempDir::new().unwrap();
-        registered_sat(&tmp, "http://127.0.0.1:9", now_unix());
+        registered_sat(&tmp, now_unix());
         let fake = Arc::new(FakeRemoteHostProxy::default());
         let proxy: Arc<dyn RemoteHostProxy> = fake.clone();
         let target = prepare_host_for_spawn(
@@ -373,15 +332,14 @@ mod tests {
         let remote = target
             .remote
             .expect("online host must yield a remote target");
-        assert_eq!(remote.exec_ws_url, "ws://127.0.0.1:9/ws/exec");
-        assert_eq!(remote.agent_token, "t");
+        assert_eq!(remote.host_id, "sat");
     }
 
     #[tokio::test]
     async fn unregistered_slug_rejects_even_when_host_online() {
         let tmp = TempDir::new().unwrap();
         // Registered host, but its `projects` list does not include "other".
-        registered_sat(&tmp, "http://127.0.0.1:9", now_unix());
+        registered_sat(&tmp, now_unix());
         let fake = Arc::new(FakeRemoteHostProxy::default());
         let proxy: Arc<dyn RemoteHostProxy> = fake.clone();
         let err = prepare_host_for_spawn(
@@ -417,11 +375,7 @@ mod tests {
     #[tokio::test]
     async fn regate_remote_host_offline_errors_readable() {
         let tmp = TempDir::new().unwrap();
-        registered_sat(
-            &tmp,
-            "http://127.0.0.1:9",
-            now_unix().saturating_sub(10_000),
-        );
+        registered_sat(&tmp, now_unix().saturating_sub(10_000));
         let fake = Arc::new(FakeRemoteHostProxy::default());
         let proxy: Arc<dyn RemoteHostProxy> = fake;
         let err = regate_remote_host(
@@ -436,45 +390,33 @@ mod tests {
         assert!(err.to_string().contains("offline"));
     }
 
-    #[test]
-    fn agent_url_to_exec_ws_rewrites_scheme_and_path() {
-        assert_eq!(
-            agent_url_to_exec_ws("http://192.168.1.10:7332"),
-            "ws://192.168.1.10:7332/ws/exec"
-        );
-        assert_eq!(
-            agent_url_to_exec_ws("https://sat.example.com/"),
-            "wss://sat.example.com/ws/exec"
-        );
-    }
-
-    /// Production [`HttpRemoteHostProxy`] must actually reach the satellite's
-    /// exec bridge after a healthy probe — it no longer fails closed with a
-    /// "not implemented" error (v0.9.0 W3 retires the v0.8.24 placeholder).
+    /// Production [`HubRemoteHostProxy`]: a live control channel in the hub
+    /// yields a target; no channel is a readable failure (the satellite has
+    /// no listener to probe — presence IS the channel).
     #[tokio::test]
-    async fn http_proxy_healthy_satellite_returns_exec_target() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-        let url = format!("http://{addr}");
-        let target = HttpRemoteHostProxy
-            .ensure_remote_spawn("sat", SessionProtocol::StreamJson, Some(&url), "tok")
+    async fn hub_proxy_requires_a_live_control_channel() {
+        let hub = Arc::new(HostChannelHub::default());
+        let proxy = HubRemoteHostProxy::new(hub.clone());
+
+        let err = proxy
+            .ensure_remote_spawn("sat", SessionProtocol::StreamJson)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no live control channel"), "got: {err}");
+
+        let _reg = hub.register("sat");
+        let target = proxy
+            .ensure_remote_spawn("sat", SessionProtocol::StreamJson)
             .await
             .unwrap();
-        assert_eq!(target.exec_ws_url, format!("ws://{addr}/ws/exec"));
-        assert_eq!(target.agent_token, "tok");
-        server.abort();
+        assert_eq!(target.host_id, "sat");
+
+        let err = proxy
+            .ensure_remote_spawn("sat", SessionProtocol::Terminal)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("terminal"), "got: {err}");
     }
 }

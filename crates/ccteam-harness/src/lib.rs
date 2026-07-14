@@ -68,11 +68,16 @@ pub use execution::delegation::{
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};
+pub use execution::host_channel::{
+    ExecBridge, HostChannelHub, HostChannelRegistration, HubCtrlMsg, EXEC_DIALBACK_TIMEOUT,
+    HOST_CHANNEL_SUBPROTOCOL, IDLE_TIMEOUT, KEEPALIVE_PERIOD, REPORT_PERIOD,
+};
 pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
 pub use execution::remote_exec::{
     connect as remote_exec_connect, ExecExit, ExecFile, ExecSpec, ExecStarted, RemoteExecTarget,
     CONNECT_TIMEOUT, EXEC_SUBPROTOCOL, EXEC_WIRE_VERSION,
 };
+pub use execution::satellite_exec::{run_exec_session, SatelliteExecCtx};
 pub use execution::session_meta::{
     apply_title, discover_external_claude_sessions, list_session_metas, read_session_meta,
     touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,

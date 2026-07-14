@@ -53,7 +53,7 @@ Async by default — the completion notification lands in the parent's chat like
 
 **Gate merges with a rival model.** Codex implements; the parent spawns a Claude reviewer on the diff before you merge. `session_collect{sid, tail:true}` grabs the verdict without paging the whole transcript.
 
-**Run where the environment is.** Tests need the Linux box with the GPU? Register it once as a satellite; `host:"linux-box"` on the spawn runs the worker there — transcripts and cost stay on your daemon.
+**Run where the environment is.** Tests need the Linux box with the GPU? Register it once as a satellite; `host:"linux-box"` on the spawn runs the worker there — transcripts and cost stay on your daemon. Satellites dial in over one persistent channel, so only the daemon needs a reachable address — a laptop behind NAT is a perfectly good satellite.
 
 **Poll like you mean it.** `session_collect` returns `working` while the child is mid-turn and `idle` when the turn is done — don't guess from silence. `session_list` shows the whole delegation tree, and `@s2 …` from Telegram talks to any member directly; you are part of the team, not just its audience.
 

@@ -121,7 +121,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
-        (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join/heartbeat; register-mcp; admin-only list)"),
+        (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join; reverse control channel + exec dial-back ride WS at /hosts/channel and /hosts/exec/{nonce}; register-mcp; admin-only list)"),
         (name = "users", description = "档1 per-user web tenant management (admin-gated; web-first, no CLI — mint personal links, list, delete)"),
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
         (name = "projects", description = "Project lifecycle + detail"),
@@ -147,14 +147,15 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
         .routes(routes!(super::hosts::handle_register_mcp))
-        // v0.8.24 Track D — multi-host join / heartbeat / mint.
-        // GET (read newest valid) + POST (mint) share `/hosts/join-token`.
+        // v0.8.24 Track D — multi-host join / mint. GET (read newest valid)
+        // + POST (mint) share `/hosts/join-token`. (The satellite keepalive
+        // is no longer HTTP: reports ride the reverse `ccteam-host.v1` WS
+        // control channel, mounted as a plain route in `api_v1_router`.)
         .routes(routes!(
             super::hosts::handle_mint_join_token,
             super::hosts::handle_get_join_token
         ))
         .routes(routes!(super::hosts::handle_host_join))
-        .routes(routes!(super::hosts::handle_host_heartbeat))
         // v0.8.18 档1 — per-user web tenant management (admin-gated)
         .routes(routes!(
             super::users::handle_create_user,
@@ -262,6 +263,17 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
 pub fn api_v1_router() -> axum::Router<AppState> {
     let (router, api) = build_api_v1().split_for_parts();
     router
+        // v0.9.0 reverse-connection — WS endpoints (not OpenAPI-documented;
+        // the shared auth layer still wraps them: agent-token bearer →
+        // identity `host:<id>`).
+        .route(
+            "/api/v1/hosts/channel",
+            axum::routing::get(super::hosts::handle_host_channel),
+        )
+        .route(
+            "/api/v1/hosts/exec/{nonce}",
+            axum::routing::get(super::hosts::handle_host_exec_dialback),
+        )
         .route(OPENAPI_JSON_PATH, axum::routing::get(serve_openapi_json))
         // v0.8.7 review-fix (R-M5) — serve the SELF-HOSTED Scalar UI: a custom
         // HTML page whose loader `<script src>` points at the vendored JS route

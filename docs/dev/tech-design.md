@@ -191,22 +191,28 @@ per-adapter best-fit,不强行统一:
 
 > **前端落地**:统一 chat-shell SPA(§6.6)—— per-session `/chat/s/:sid`(走 gateway-sid `s{n}`)Chat|终端 tab + 底部全局导航 **插件市场 / Status / Settings** 三视图(Roles 页被插件市场浏览器取代)。standalone `internal web`(无 daemon)→ gateway None → session/status/marketplace-install/config 端点优雅 **503**,只读 project/role/capabilities/marketplace-catalog 仍可用。
 
-### 2.7 多机 host 轴(v0.8.24 Track D)
+### 2.7 多机 host 轴(v0.8.24 Track D;v0.9.0 反向连接)
 
-**目标**:把「主机」从预留字段升级为可注册、可心跳、可远程 spawn 的资源轴。本地机始终是 `local`;卫星机经 join-token 登记后出现在 `GET /hosts`。
+**目标**:把「主机」从预留字段升级为可注册、可在线、可远程 spawn 的资源轴。本地机始终是 `local`;卫星机经 join-token 登记后出现在 `GET /hosts`。
+
+**反向连接(v0.9.0 网络反转)**:**只有 main daemon 需要可达地址**(单端口 `:7331`)。卫星**零监听面** —— 所有流量出站:一条长驻 `ccteam-host.v1` 控制 WS(presence + report + exec 信令)+ 每次远程 spawn 一条 `ccteam-exec.v1` 拨回 WS。给 daemon 前置 HTTPS 反代即全链路 wss,卫星无证书无端口。**统一进程**:daemon 与卫星是同一个 `ccteam start`;是否卫星只取决于本机有没有 `state/hosts/self.json`(join 过),是否 daemon 只取决于有没有别人 join 它(registry 非空)——A join B、B join A 对称合法。注册状态只存 daemon 侧。
 
 #### 拓扑
 
 ```text
-[IM / web SPA] ──► main daemon (gateway + REST :7331)
-                      │  host registry  ~/.ccteam/state/hosts/registry.json
+[IM / web SPA] ──► main daemon (gateway + REST :7331)  ←—— 唯一需要可达的端口
+                      │  host registry  ~/.ccteam/state/hosts/registry.json(只在 daemon)
                       │  join tokens    ~/.ccteam/secrets/host-join-tokens.json
+                      │  HostChannelHub(内存:live 控制通道 + exec rendezvous)
                       │
                       ├── local spawn (stream-json / acp / terminal*)
                       │
-                      └── remote spawn (stdio only) ──HTTP probe/proxy──► satellite agent
-                              ▲                                              │
-                              └──────── heartbeat (agent_token) ─────────────┘
+                      │   ┌─── satellite『ccteam start』(零监听,全出站)───┐
+                      ◄────┤ ① GET /api/v1/hosts/channel(ccteam-host.v1 长驻)│
+                      │    │    report 周期 25s(agents/projects/version)     │
+                      │    │ ◄─ exec_open{nonce} 信令                        │
+                      ◄────┤ ② GET /api/v1/hosts/exec/{nonce}(ccteam-exec.v1)│
+                      │    └── 每 spawn 一条,nonce 单次 + host 绑定 ─────────┘
 ```
 
 \* `terminal` 协议(tmux/rmux/PTY)**永不**上多机(冻结红线);远程只接受 `stream-json` / `acp` / app-server 类长驻 stdio。
@@ -216,40 +222,48 @@ per-adapter best-fit,不强行统一:
 | 步骤 | 谁 | 动作 |
 |---|---|---|
 | mint | admin | `POST /api/v1/hosts/join-token` 或 `ccteam host mint-token --daemon … --web-token …` → 得到 join-token |
-| join | satellite | `ccteam host join --daemon <url> --token <join-token>` → `POST /hosts/join`;落 `~/.ccteam/state/hosts/self.json`(host id + long-lived `agent_token`) |
-| heartbeat | satellite | 周期 `POST /hosts/{host}/heartbeat`(Bearer = agent_token);TTL 默认 90s,超时 → `offline` |
+| join | satellite | `ccteam host join --daemon <url> --token <join-token>` → `POST /hosts/join`;落 `~/.ccteam/state/hosts/self.json`(host id + long-lived `agent_token`);本机 `ccteam start` 30s 内自动拨出上线 |
+| 控制通道 | satellite | 出站 `GET /api/v1/hosts/channel`(Bearer = agent_token,子协议 `ccteam-host.v1`);`{"op":"report"}` 帧周期 25s 更新 registry(TTL 90s 判 offline);**在线 = 通道活着**(hub),秒级 presence |
 
 join-token 是**运维登记面**(防误连),**不是**安全边界(同 OS-uid / LAN 信任模型不变;ACL 行诚实声明不变)。
 
-#### Remote spawn(档B)
+#### 稳定性合同(生产级跨网)
+
+- **保活/半开检测**:daemon 每 20s ping 控制/exec 两类 socket;任一侧 75s 无入站帧 → 判半开、主动拆链(exec 侧卫星 kill child,daemon 侧读到 EOF → 下次 re-gate + `--resume`)。
+- **重连**:卫星指数退避 1s→60s(±20% 抖动防 fleet 同拍),连接稳定 ≥30s 后清零;同 host 新连接**踢掉**旧幽灵连接(NAT rebind 场景,hub generation + CancellationToken 水平触发)。
+- **协议向前兼容**:控制通道未知 `op` 双向忽略不拆链;子协议版本经 `Sec-WebSocket-Protocol` 协商(`ccteam-host.v1` / `ccteam-exec.v1`)。
+- **exec 不做字节级续传**:断链 = EOF → re-gate + vendor `--resume`(与本地语义一致);控制通道与 exec 连接互相独立,通道闪断不 kill 运行中 session。
+
+#### Remote spawn(拨回 rendezvous)
 
 1. `POST …/sessions` 带 `host`(`local` 默认 / 卫星 id)。
 2. Gateway `prepare_host_for_spawn`:
    - `local` → 本机 adapter;
    - remote + `terminal` → 硬拒;
-   - remote + unknown / offline → **可读错误**,**不**创建 session、**不**删既有 session;
-   - remote + online → `RemoteHostProxy::ensure_remote_spawn`(生产 = HTTP `GET {agent_url}/health`;测试 = `FakeRemoteHostProxy`)。
-3. Session `meta.json.host` + `SessionView.host` 标注主机;成本入账沿既有 per-session cost 路径,自然带 host 标签。
-4. stop / resume 读 meta 的 host 重建;offline 时 resume/spawn 报错,registry 与历史 session 保留。
-
-**SoT**:卫星机项目目录的 turns/progress 倾向为本机路径(主 daemon 只路由);当前档B 以 gate + proxy 缝 + 假卫星测通为交付,全量 NDJSON 跨机流复用 `claude_stream_json::transport` 的 generic IO 缝后续收紧。
+   - remote + unknown / offline(TTL) → **可读错误**,**不**创建 session、**不**删既有 session;
+   - remote + online → `HubRemoteHostProxy`(要求 hub 里有 live 通道)→ `RemoteExecTarget{host_id, hub}` 进 `SpawnCtx.remote`。
+3. Adapter `remote_exec::connect`:`hub.open_exec` mint 单次 nonce → 控制通道推 `exec_open{nonce}` → 等卫星拨回(15s 超时)→ 配对 `ExecBridge` → 发 `ExecSpec` 首帧 → `ExecStarted` → `(reader, writer)` 进 `spawn_from_io`(transport law 不变;帧角色按 daemon/卫星定,与谁拨 TCP 无关)。
+4. Session `meta.json.host` + `SessionView.host` 标注主机;stop / resume 读 meta 的 host 重建;offline 时 resume/spawn 报错,registry 与历史 session 保留。
 
 #### ACL
 
 - `GET /hosts` / mint-token / register-mcp = **admin-only**(`deny_non_admin`)
 - join = join-token bearer 或 admin
-- heartbeat = host agent-token bearer
+- 控制通道 + exec 拨回 = host agent-token bearer(auth 层 `host:<id>` 身份;loopback no-auth 时 handler 内 bearer 兜底解析);nonce 单次 + host 绑定
 - tenant 访问 hosts/join 面 → **403 fail-closed**
 
 #### 代码指针
 
 | 面 | 位置 |
 |---|---|
-| registry / join / heartbeat / gate | `crates/ccteam-core/src/host_registry.rs` |
+| registry / join / report / gate | `crates/ccteam-core/src/host_registry.rs` |
+| HostChannelHub(通道注册 + exec rendezvous)| `crates/ccteam-harness/src/execution/host_channel.rs` |
+| 卫星 exec 引擎(协议盲字节泵)| `crates/ccteam-harness/src/execution/satellite_exec.rs` |
+| 卫星客户端(出站控制通道 + 拨回)| `crates/ccteam-web/src/satellite.rs` |
+| daemon 侧 WS(channel + exec 拨回泵)| `crates/ccteam-web/src/routes/hosts.rs` |
 | remote proxy seam | `crates/ccteam-im/src/remote_host.rs` |
 | gateway host gate + `create_session_api_on_host` | `crates/ccteam-im/src/gateway.rs` |
-| REST | `crates/ccteam-web/src/routes/hosts.rs` |
-| CLI | `ccteam host {join,mint-token,heartbeat,ls}` |
+| CLI | `ccteam host {join,mint-token,ls}`(serve/heartbeat 已删——卫星即 `ccteam start`)|
 
 ---
 
@@ -627,7 +641,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 | `ccteam status` / `session ls`(F3/B4)| `status` = `crates/ccteam-cli/src/main.rs`(`run_status` 嵌套列 project+sessions + `first_lan_ipv4`/`is_lan_ipv4` getifaddrs FFI,删 `--tail`);`session ls` = `commands.rs`(`run_sessions` + `render_sessions_table`,列 SLUG/SID/ROLE/VENDOR/STATUS;tracked→live、orphan=live-pane∧¬tracked、daemon-down 降级)| `cargo test -p ccteam-cli --test status_view_test`;`cargo test -p ccteam-cli render_sessions_table` |
 | web config/im(REST,非 MCP)| `crates/ccteam-web/src/routes/im_config.rs`(GET masked `handle_get_im_config` 响应类型不含 secret + `mask_last4` · PUT telegram/lark 先验后落盘 0600 · telegram chat-id 背景 long-poll task + GET 轮询 + `AppState.im_poll`;全写返 `restart_required`);onboarding 拆出 = `crates/ccteam-im/src/onboarding.rs`(`telegram_validate_token_with_base` + `telegram_poll_chat_id_with_base`);test seam = `AppState::with_creds_path` + `CCTEAM_{TELEGRAM,LARK}_API_BASE` | `cargo test -p ccteam-web --test im_config_test`;`cargo test -p ccteam-web --test openapi_test` |
 | web 统一 chat-shell(插件市场 / Status / Settings)| shell + 顶栏 cost pill + 底部导航 = `web/src/App.tsx` + `components/CostPill.tsx`;插件市场 = `web/src/pages/MarketplaceView.tsx` + `lib/marketplaceFormat.ts`(浏览/预览/install,取代旧 Roles 只读页);Status = `web/src/pages/StatusView.tsx` + `lib/statusApi.ts`(读 `GET /api/v1/status`);Settings = `web/src/pages/SettingsPage.tsx` + `lib/configApi.ts`(IM config,token 永 password 不预填 + 内联确认 + chat_id 可取消轮询)| vitest(`MarketplaceView.test` / `StatusView.test` / `CostPill.test` / `configApi.test` / `SettingsPage.test`)|
-| host 轴 + 多机 join/远程 spawn(v0.8.18 + v0.8.24 Track D)| **hosts API** = `crates/ccteam-web/src/routes/hosts.rs`(`GET /hosts` 含 local+satellites online/offline · `/{host}` · `POST …/register-mcp` · **`POST /hosts/join-token` mint · `POST /hosts/join` · `POST /hosts/{host}/heartbeat`**)+ registry = `ccteam_core::host_registry` + remote gate = `ccteam_im::remote_host` + gateway `create_session_api_on_host` · CLI `ccteam host *`。`probe_bin`/`PROBE_SPECS` 仍测 local agent。**status per-session 成本** = `routes/status.rs`(`StatusResponse.sessions: Vec<SessionCostRow>`,读 `chat_turn_completed` usage × `ccteam_cost::estimate_cost`)。**own-only ACL** = `ccteam-im/src/gateway.rs`(`chat_can_access = session.owner==*chat`;`/use`/`/stop`/`/screen`/`render_sessions` 全过它)+ `ProjectState.owner`(`core/src/state.rs`;`ChatKey::identity()`→`channel:chat_id`,`create_project` 时记)。**SPA** = `web/src/pages/HostsView.tsx` + `lib/hostsApi.ts`(主机页)· `StatusView.tsx` 成本列 · `components/AvatarMenu.tsx`(头像个人设置)+ `lib/i18n.ts` + `hooks/useWebSettings.ts`(界面语言中/英,默认中)| `cargo test -p ccteam-web --test openapi_test`;`cargo test -p ccteam-core mcp_register`;`cargo test -p ccteam-im own_only`;vitest(`hostsApi`/`HostsView`/`StatusView`/`AvatarMenu`/`i18n`)|
+| host 轴 + 多机 join/远程 spawn(v0.8.18 + v0.8.24 Track D;v0.9.0 反向连接)| **hosts API** = `crates/ccteam-web/src/routes/hosts.rs`(`GET /hosts` 含 local+satellites online/offline · `/{host}` · `POST …/register-mcp` · **`POST /hosts/join-token` mint · `POST /hosts/join`** · WS `GET /hosts/channel` + `GET /hosts/exec/{nonce}`(HTTP heartbeat 已删,report 走控制通道))+ registry = `ccteam_core::host_registry` + remote gate = `ccteam_im::remote_host` + gateway `create_session_api_on_host` · CLI `ccteam host *`。`probe_bin`/`PROBE_SPECS` 仍测 local agent。**status per-session 成本** = `routes/status.rs`(`StatusResponse.sessions: Vec<SessionCostRow>`,读 `chat_turn_completed` usage × `ccteam_cost::estimate_cost`)。**own-only ACL** = `ccteam-im/src/gateway.rs`(`chat_can_access = session.owner==*chat`;`/use`/`/stop`/`/screen`/`render_sessions` 全过它)+ `ProjectState.owner`(`core/src/state.rs`;`ChatKey::identity()`→`channel:chat_id`,`create_project` 时记)。**SPA** = `web/src/pages/HostsView.tsx` + `lib/hostsApi.ts`(主机页)· `StatusView.tsx` 成本列 · `components/AvatarMenu.tsx`(头像个人设置)+ `lib/i18n.ts` + `hooks/useWebSettings.ts`(界面语言中/英,默认中)| `cargo test -p ccteam-web --test openapi_test`;`cargo test -p ccteam-core mcp_register`;`cargo test -p ccteam-im own_only`;vitest(`hostsApi`/`HostsView`/`StatusView`/`AvatarMenu`/`i18n`)|
 | Web chat WS (`ccteam-chat.v1`) | `crates/ccteam-web/src/chat_protocol.rs` + `routes/chat_ws.rs`;CLI bridge = `crates/ccteam-cli/src/web_chat_bridge.rs` | `cargo test -p ccteam-web chat_frame` |
 | PTY WS (`ccteam-pty.v1`) | `crates/ccteam-web/src/routes/pty_ws.rs` + SPA `useTerminal` | `cargo test -p ccteam-web --test pty_ws_test`(env-gated) |
 | byte-faithful rmux 终端(裸字节流)| `crates/ccteam-harness/src/rmux_backend.rs`(`subscribe` 用 `output_stream()`/`PaneOutputChunk::Bytes`、`capture` 排 `Oldest` 字节 backlog;rmux-sdk **0.5**,byte API 自 0.3.1 起就有);snapshot-on-connect = `ccteam-web/src/pty.rs`;ANSI snapshot = `routes/pane_snapshot.rs` | env-gated 真机 smoke(`ws_*` / `pane_snapshot`,沙箱不流)|
@@ -652,7 +666,7 @@ MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + 
 | workflow.yaml schema(推后) | `ccteam-flow` / `ccteam-core` 解析代码(推后的编排层,§7) | — |
 | **(v0.9.0 W1)AgentPrincipal 调度门泛化 + 四 vendor 身份注入** | principal 认证 = `ccteam-im/src/gateway.rs`(`verify_session_principal(sid,secret)→CallerCtx{sid,slug,role}`,去 cto-only)· 门 = `mcp/dispatch.rs`(`execute_session_tool` 按 principal + `_caller_slug` 服务端覆写)· HTTP sid-bearer = `ccteam-web/src/routes/mcp.rs`(注入四件套)· MCP 注入 = `execution/mcp_config.rs`(`acp_mcp_servers_http` 共享 opencode+grok · `codex_thread_mcp_config` = `thread/start.config.mcp_servers` per-thread)· codex `vendor_uuid` 落盘 + resume-first = `execution/codex_app_server.rs`· `session_spawn` 扩参 = `mcp/protocol.rs` | `cargo test -p ccteam-web --test mcp_session_bearer_test`;`-p ccteam-harness --test codex_app_server_test`/`opencode_acp_test`/`grok_acp_test` |
 | **(v0.9.0 W2)委派语义 + 可靠性合同 + 引擎中立化** | 委派 meta 字段(`parent_sid`/`spawned_by_role`/`delegation_depth`)= `execution/session_meta.rs`· 落盘 watch = `execution/delegation.rs`(`DelegationWatch` armed/scan/reconcile,atomic-durable)· 通知/护栏/预算/reconcile/idem = `ccteam-im/src/{gateway.rs,delegation.rs}`(`create_delegated_session`/`run_delegation_notifier`/`reconcile_delegations`/`emit_delegation_progress` append→notify 顺序 · `IdemCache` · `fleet_cost_24h`/`budget_exceeded`)· dispatch wait/idem = `mcp/dispatch.rs`· 7 `delegation_*` = `execution/progress_bridge.rs`· `/status` delegations = `ccteam-web/src/routes/status.rs`· **引擎中立化**:删 `templates/cto_role.md`/`CTO_ROLE_MD`/`DEFAULT_AGENT_SCAFFOLDS`,`bootstrap_project_at_dir` 不种 role,roleless 默认(`chatDefaults.ts`/gateway `/new`)| `cargo test -p ccteam-im --lib`(delegation/notifier/reconcile/idem/guardrail 混沌);`-p ccteam-web --test status_test` |
-| **(v0.9.0 W3)跨机执行(host 轴)** | `ccteam-exec.v1` wire + WS client = `execution/remote_exec.rs`(`ExecSpec`/`connect`→`(AsyncRead,AsyncWrite)`)· 卫星 = `ccteam-web/src/satellite.rs`(`/health` + `/ws/exec`,vendor 允许名单/slug 注册表/relpath 限 `.ccteam/chat/<sid>/`/env 白名单 `CCTEAM_*`/`{{DAEMON_URL}}` 替换)+ `ccteam host serve` CLI(内嵌心跳)· registry `projects` + 0600 + slug gate = `ccteam-core/src/host_registry.rs`· 主侧 = `remote_host.rs`(`prepare_host_for_spawn`→`HostTarget{remote}` + `regate_remote_host`)+ `SpawnCtx.remote`(`adapter.rs`)+ claude 远程 spawn `execution/claude_stream_json/mod.rs`(相对 `--mcp-config` + files)· rebuild 三路径 re-gate = `gateway.rs`(offline 绝不本地重生);codex/opencode/grok 远程 = 显式 `NotImplemented` | `cargo test -p ccteam-harness --test claude_stream_json_remote_test`;`-p ccteam-web --test satellite_ws_test`;`-p ccteam-im`(`remote_session_never_respawns_locally_when_host_offline`) |
+| **(v0.9.0 W3 + 反向连接)跨机执行(host 轴)** | 反向传输:hub(通道注册 + exec rendezvous)= `execution/host_channel.rs`(`HostChannelHub`/`ExecBridge`/keepalive 常量)· `ccteam-exec.v1` wire + daemon 侧 `connect`(hub→`(AsyncRead,AsyncWrite)`)= `execution/remote_exec.rs` · 卫星 exec 引擎(协议盲字节泵:vendor 允许名单/relpath 限 `.ccteam/chat/<sid>/`/env 白名单 `CCTEAM_*`/`{{DAEMON_URL}}` 替换)= `execution/satellite_exec.rs` · 卫星客户端(出站控制通道 + 拨回 + 退避重连,`ccteam start` 内嵌)= `ccteam-web/src/satellite.rs` · daemon 侧 WS(`/api/v1/hosts/channel` + `/hosts/exec/{nonce}` + report 落 registry)= `ccteam-web/src/routes/hosts.rs` · registry `projects` + 0600 + slug gate = `ccteam-core/src/host_registry.rs`(`HostReport`/`apply_report`;HTTP heartbeat 已删)· 主侧 = `remote_host.rs`(`prepare_host_for_spawn`→`HostTarget{remote}` + `regate_remote_host` + `HubRemoteHostProxy`)+ `SpawnCtx.remote`(`adapter.rs`)+ claude 远程 spawn `execution/claude_stream_json/mod.rs`(相对 `--mcp-config` + files)· rebuild 三路径 re-gate = `gateway.rs`(offline 绝不本地重生);codex/opencode/grok 远程 = 显式 `NotImplemented` | `cargo test -p ccteam-harness --test claude_stream_json_remote_test --test satellite_exec_e2e`;`-p ccteam-web --test satellite_ws_test`(真 socket 反向 e2e)`--test hosts_multihost_test`;`-p ccteam-im`(`remote_session_never_respawns_locally_when_host_offline`) |
 | **(v0.9.0 W4)团队可视化 + 全局 SSE** | `GatewayEventKind::Delegation` + `GatewayEvent.slug` = `ccteam-im/src/gateway.rs`(`emit_delegation_progress` 同点广播)· REST + 全局 SSE = `ccteam-web/src/routes/agents.rs`(`GET /api/v1/agents/{graph,events}`,tenant ACL `can_see_project` 过滤,无 slug 帧 tenant fail-closed)+ `ring.rs`(`GlobalEventRing` 256 帧 Last-Event-ID)· 删 legacy `routes/{sse,harness_sse}.rs` + `watcher.rs`(SPA 零消费)· SPA = `web/src/pages/AgentsView.tsx` + `lib/{agentsApi,agentsLayout,agentsReducer}.ts` + `hooks/useAgentsEvents.ts`(自绘 SVG 泳道图/时间轴/侧栏,零新依赖,admin beta-gate)| `cargo test -p ccteam-web --test agents_test --test openapi_test`;vitest(`AgentsView`/`agentsLayout`/`agentsReducer`);Playwright `v090-agents.spec.ts` |
 
 改协议 = 改代码 +(若新增一类协议)补本表一行。**不**再维护独立的 interfaces.md。

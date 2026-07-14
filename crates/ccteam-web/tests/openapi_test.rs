@@ -62,7 +62,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),
-        ("POST", "/api/v1/hosts/{host}/heartbeat"),
+        // v0.9.0 reverse-connection: the satellite keepalive is a WS control
+        // channel (`GET /api/v1/hosts/channel` + `…/hosts/exec/{nonce}`),
+        // mounted as plain routes — WS upgrades are not OpenAPI operations,
+        // so they are intentionally absent here.
         // v0.8.18 档1 — per-user web tenant management (admin-gated).
         ("POST", "/api/v1/users"),
         ("GET", "/api/v1/users"),

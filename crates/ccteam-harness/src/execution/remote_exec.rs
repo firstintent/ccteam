@@ -1,30 +1,34 @@
-//! `ccteam-exec.v1` — the satellite exec-bridge wire protocol + WS client
-//! (v0.9.0 W3 F3, tech-design §4.2 / §4.3).
+//! `ccteam-exec.v1` — the satellite exec wire protocol + the daemon-side
+//! bridge plumbing (v0.9.0 W3 F3, tech-design §4.2 / §4.3; network-inverted
+//! in the reverse-connection rework: the satellite dials back, see
+//! [`super::host_channel`]).
 //!
 //! Tech-design §0.4 (transport law): execution location is a **transport
 //! parameter**, never an adapter branch. Every stdio-protocol transport
 //! constructor is already generic over `(reader, writer)`
 //! (`StreamJsonTransport::spawn_from_io`, `AcpTransport::from_halves`,
 //! `CodexJsonRpcClient::spawn`) and holds no `Child`. [`connect`] supplies
-//! exactly that pair over a WebSocket to a satellite's `GET /ws/exec` — the
-//! adapter's protocol logic is unaware whether its stdio is a local pipe or
-//! a remote byte pump.
+//! exactly that pair over the [`super::host_channel::ExecBridge`] a
+//! satellite dial-back paired — the adapter's protocol logic is unaware
+//! whether its stdio is a local pipe or a remote byte pump, and the
+//! protocol below is unaware who dialed the TCP connection.
 //!
-//! The satellite is a **protocol-blind byte pump**: it never parses
-//! stream-json / ACP / JSON-RPC, only bytes (red line: no scraping, no
-//! interpretation). Wire shape (`docs-local/versions/v0-9-0/tech-design.md`
-//! §4.2):
+//! The satellite is a **protocol-blind byte pump**
+//! ([`super::satellite_exec`]): it never parses stream-json / ACP /
+//! JSON-RPC, only bytes (red line: no scraping, no interpretation). Frame
+//! roles are fixed by daemon/satellite role, not dial direction:
 //!
 //! ```text
-//! C→S first frame (Text)  ExecSpec   — what to run
-//! S→C first frame (Text)  ExecStarted — ok / readable rejection
-//! …                       C→S Binary = child stdin, S→C Binary = child stdout
-//! C→S Text {"op":"stdin_close"}       = half-close
-//! S→C Text ExecExit                   = tail frame, then Close
+//! D→S first frame (Text)  ExecSpec   — what to run
+//! S→D first frame (Text)  ExecStarted — ok / readable rejection
+//! …                       D→S Binary = child stdin, S→D Binary = child stdout
+//! D→S Text {"op":"stdin_close"}       = half-close
+//! S→D Text ExecExit                   = tail frame, then Close
 //! ```
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -32,9 +36,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+use super::host_channel::HostChannelHub;
 
 /// WS subprotocol both sides negotiate (`Sec-WebSocket-Protocol`).
 pub const EXEC_SUBPROTOCOL: &str = "ccteam-exec.v1";
@@ -42,10 +46,11 @@ pub const EXEC_SUBPROTOCOL: &str = "ccteam-exec.v1";
 /// Wire version. Bump on any breaking frame-shape change.
 pub const EXEC_WIRE_VERSION: u32 = 1;
 
-/// How long [`connect`] waits for the TCP/WS handshake and for the
-/// satellite's [`ExecStarted`] ack before giving up (F7 reliability
-/// contract: "connect timeout 5s").
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`connect`] waits for the [`ExecSpec`] send + the satellite's
+/// [`ExecStarted`] ack once the dial-back is paired (the dial-back wait
+/// itself is [`super::host_channel::EXEC_DIALBACK_TIMEOUT`]). WAN-generous:
+/// the satellite writes confined files + spawns the vendor CLI in between.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One file to materialize under `<project>/.ccteam/chat/<sid>/` on the
 /// satellite before spawn (e.g. the curated `mcp.json`). `content` MAY
@@ -131,23 +136,30 @@ pub struct ExecExit {
     pub signal: Option<String>,
 }
 
-/// What the gateway needs to reach a satellite's exec bridge for one
-/// spawn/rebuild. Built by `ccteam_im::remote_host::prepare_host_for_spawn`
-/// from the host registry record + threaded into `SpawnCtx::remote`.
-#[derive(Debug, Clone)]
+/// What the gateway needs to reach a satellite for one spawn/rebuild:
+/// which host, and the daemon's [`HostChannelHub`] holding that host's
+/// live reverse control channel. Built by
+/// `ccteam_im::remote_host::prepare_host_for_spawn` + threaded into
+/// `SpawnCtx::remote`. No address, no token: the satellite has no listener
+/// — reachability IS the live channel.
+#[derive(Clone)]
 pub struct RemoteExecTarget {
-    /// Full `ws://host:port/ws/exec` (or `wss://…`) URL.
-    pub exec_ws_url: String,
-    /// Bearer token the satellite's `GET /ws/exec` checks (its
-    /// `SatelliteSelf::agent_token`, constant-time compared).
-    pub agent_token: String,
+    /// Registered satellite host id.
+    pub host_id: String,
+    /// The daemon's control-channel hub (rendezvous for the dial-back).
+    pub hub: Arc<HostChannelHub>,
 }
 
-/// Concrete WS stream type `tokio_tungstenite::connect_async` returns.
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+impl std::fmt::Debug for RemoteExecTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteExecTarget")
+            .field("host_id", &self.host_id)
+            .finish_non_exhaustive()
+    }
+}
 
-/// Dial `target`, send `spec` as the first frame, await [`ExecStarted`],
+/// Open an exec dial-back to `target`'s host (via the control channel
+/// rendezvous), send `spec` as the first frame, await [`ExecStarted`],
 /// then hand back a byte-plumbed `(reader, writer)` pair — exactly what
 /// `StreamJsonTransport::spawn_from_io` / `AcpTransport::from_halves` /
 /// `CodexJsonRpcClient::spawn` already accept (tech-design §0.4). An `!ok`
@@ -161,28 +173,12 @@ pub async fn connect(
     impl AsyncRead + Unpin + Send + 'static,
     impl AsyncWrite + Unpin + Send + 'static,
 )> {
-    let mut request = target
-        .exec_ws_url
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("invalid exec ws url: {}", target.exec_ws_url))?;
-    request.headers_mut().insert(
-        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", target.agent_token))
-            .context("agent token is not a valid header value")?,
-    );
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static(EXEC_SUBPROTOCOL),
-    );
-
-    let (ws, _resp): (WsStream, _) =
-        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-            .await
-            .map_err(|_| anyhow!("ccteam-exec.v1 connect to {} timed out", target.exec_ws_url))?
-            .with_context(|| format!("ccteam-exec.v1 connect to {} failed", target.exec_ws_url))?;
-
-    let (mut sink, mut stream) = ws.split();
+    let bridge = target
+        .hub
+        .open_exec(&target.host_id, &spec.sid)
+        .await
+        .with_context(|| format!("ccteam-exec.v1 open to host `{}`", target.host_id))?;
+    let (mut stream, mut sink) = bridge.into_io();
 
     let spec_json = serde_json::to_string(&spec).context("serialize ExecSpec")?;
     tokio::time::timeout(CONNECT_TIMEOUT, sink.send(Message::Text(spec_json)))
@@ -357,15 +353,23 @@ where
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
         // ccteam-exec.v1 half-close: tell the satellite to close the
-        // child's stdin (EOF), THEN close the WS sink. Mirrors the local
+        // child's stdin (EOF), THEN close the sink. Mirrors the local
         // stream-json transport's "writer task drops -> ChildStdin closes"
-        // shape (transport.rs doc comment) over the wire.
+        // shape (transport.rs doc comment) over the wire. Sink contract:
+        // `poll_ready` MUST precede `start_send` (tungstenite tolerates a
+        // bare start_send; the `BridgeSink`/`PollSender` path panics on it).
         if !self.stdin_closed {
-            self.stdin_closed = true;
-            if let Err(e) =
-                Pin::new(&mut self.sink).start_send(Message::Text(r#"{"op":"stdin_close"}"#.into()))
-            {
-                return Poll::Ready(Err(ws_err_to_io(e)));
+            match Pin::new(&mut self.sink).poll_ready(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.stdin_closed = true;
+                    if let Err(e) = Pin::new(&mut self.sink)
+                        .start_send(Message::Text(r#"{"op":"stdin_close"}"#.into()))
+                    {
+                        return Poll::Ready(Err(ws_err_to_io(e)));
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(ws_err_to_io(e))),
+                Poll::Pending => return Poll::Pending,
             }
         }
         Pin::new(&mut self.sink)
@@ -499,32 +503,46 @@ mod tests {
         assert_eq!(rej.code.as_deref(), Some("unknown-slug"));
     }
 
+    /// Register a fake satellite on `hub` that pairs one exec dial-back
+    /// and then runs `behavior` over its bridge half.
+    fn fake_satellite<F, Fut>(
+        hub: Arc<HostChannelHub>,
+        host: &'static str,
+        behavior: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: FnOnce(crate::execution::host_channel::ExecBridge) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut reg = hub.register(host);
+        tokio::spawn(async move {
+            let Some(crate::execution::host_channel::HubCtrlMsg::ExecOpen { nonce, .. }) =
+                reg.ctrl_rx.recv().await
+            else {
+                panic!("expected ExecOpen");
+            };
+            let slot = hub.claim_exec(&nonce, host).unwrap();
+            let (mine, theirs) = crate::execution::host_channel::ExecBridge::pair();
+            slot.send(theirs).ok().unwrap();
+            behavior(mine).await;
+        })
+    }
+
     #[tokio::test]
     async fn connect_rejects_immediately_when_satellite_declines() {
-        let app = Router::new().route(
-            "/ws/exec",
-            get(|ws: WebSocketUpgrade| async {
-                ws.protocols([EXEC_SUBPROTOCOL])
-                    .on_upgrade(|mut socket: WebSocket| async move {
-                        // Drain the ExecSpec, then reject.
-                        let _ = socket.recv().await;
-                        let _ = socket
-                            .send(AxumMessage::Text(
-                                r#"{"ok":false,"code":"unknown-slug","message":"no such project"}"#
-                                    .into(),
-                            ))
-                            .await;
-                    })
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+        let hub = Arc::new(HostChannelHub::default());
+        let sat = fake_satellite(hub.clone(), "sat", |mut bridge| async move {
+            let _ = bridge.rx.recv().await; // ExecSpec
+            let _ = bridge
+                .tx
+                .send(Message::Text(
+                    r#"{"ok":false,"code":"unknown-slug","message":"no such project"}"#.into(),
+                ))
+                .await;
         });
         let target = RemoteExecTarget {
-            exec_ws_url: format!("ws://{addr}/ws/exec"),
-            agent_token: "tok".into(),
+            host_id: "sat".into(),
+            hub,
         };
         let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");
         // `.err()` (not `.unwrap_err()`): the Ok side is an opaque
@@ -537,36 +555,28 @@ mod tests {
             .to_string();
         assert!(err.contains("unknown-slug"), "got: {err}");
         assert!(err.contains("no such project"), "got: {err}");
+        sat.await.unwrap();
     }
 
     #[tokio::test]
     async fn connect_bridges_stdio_bytes_after_ok_ack() {
-        let app = Router::new().route(
-            "/ws/exec",
-            get(|ws: WebSocketUpgrade| async {
-                ws.protocols([EXEC_SUBPROTOCOL])
-                    .on_upgrade(|mut socket: WebSocket| async move {
-                        let _ = socket.recv().await; // ExecSpec
-                        let _ = socket
-                            .send(AxumMessage::Text(r#"{"ok":true,"pid":42}"#.into()))
-                            .await;
-                        // Echo one Binary frame back (simulating the fake
-                        // vendor's stdout), then send the exit tail.
-                        if let Some(Ok(AxumMessage::Binary(b))) = socket.recv().await {
-                            let _ = socket.send(AxumMessage::Binary(b)).await;
-                        }
-                        let _ = socket.send(AxumMessage::Text(r#"{"exit":0}"#.into())).await;
-                    })
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+        let hub = Arc::new(HostChannelHub::default());
+        let sat = fake_satellite(hub.clone(), "sat", |mut bridge| async move {
+            let _ = bridge.rx.recv().await; // ExecSpec
+            let _ = bridge
+                .tx
+                .send(Message::Text(r#"{"ok":true,"pid":42}"#.into()))
+                .await;
+            // Echo one Binary frame back (simulating the fake vendor's
+            // stdout), then send the exit tail.
+            if let Some(Message::Binary(b)) = bridge.rx.recv().await {
+                let _ = bridge.tx.send(Message::Binary(b)).await;
+            }
+            let _ = bridge.tx.send(Message::Text(r#"{"exit":0}"#.into())).await;
         });
         let target = RemoteExecTarget {
-            exec_ws_url: format!("ws://{addr}/ws/exec"),
-            agent_token: "tok".into(),
+            host_id: "sat".into(),
+            hub,
         };
         let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");
         let (mut reader, mut writer) = connect(&target, spec).await.unwrap();
@@ -578,5 +588,22 @@ mod tests {
         // Exit tail reads as EOF.
         let n2 = reader.read(&mut buf).await.unwrap();
         assert_eq!(n2, 0);
+        sat.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_with_no_live_channel_is_a_readable_error() {
+        let hub = Arc::new(HostChannelHub::default());
+        let target = RemoteExecTarget {
+            host_id: "ghost".into(),
+            hub,
+        };
+        let spec = ExecSpec::new("claude", "demo", "s7", "stream-json");
+        let err = connect(&target, spec)
+            .await
+            .err()
+            .expect("connect must fail without a live control channel");
+        let err = format!("{err:#}");
+        assert!(err.contains("no live control channel"), "got: {err}");
     }
 }

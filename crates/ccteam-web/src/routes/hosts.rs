@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -233,9 +233,9 @@ pub(crate) fn probe_bin(bin: &str, refresh: bool) -> ProbeResult {
         }
     }
     // v0.9.0 W3 — the raw `<bin> --version` shellout is shared with the
-    // satellite heartbeat loop (`ccteam host serve`) via
-    // `ccteam_core::host_registry::probe_bin_version`; this wrapper adds
-    // ONLY the process-lifetime cache (a satellite probes fresh every beat).
+    // satellite report loop (`crate::satellite`, over the control channel)
+    // via `ccteam_core::host_registry::probe_bin_version`; this wrapper adds
+    // ONLY the process-lifetime cache (a satellite probes fresh per report).
     let (installed, version) = ccteam_core::host_registry::probe_bin_version(bin);
     let result = ProbeResult { installed, version };
     if let Ok(mut cache) = probe_cache().lock() {
@@ -782,83 +782,286 @@ pub(crate) async fn handle_host_join(
     }
 }
 
-/// `POST /api/v1/hosts/{host}/heartbeat` — satellite keepalive.
-#[utoipa::path(
-    post,
-    path = "/api/v1/hosts/{host}/heartbeat",
-    tag = "hosts",
-    params(("host" = String, Path, description = "Registered host id")),
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "Heartbeat accepted; `{host, status}`"),
-        (status = 401, description = "Bad agent token"),
-        (status = 404, description = "Unknown host"),
-    ),
-)]
-pub(crate) async fn handle_host_heartbeat(
+// ── v0.9.0 reverse-connection — control channel + exec dial-back ─────────────
+//
+// The satellite exposes NO listener. It dials `GET /api/v1/hosts/channel`
+// (bearer = agent token → identity `host:<id>` via `resolve_host_token`)
+// and keeps that WS up; `report` frames riding it replace the retired
+// `POST …/heartbeat` endpoint. Remote spawns push `exec_open{nonce}` down
+// the channel and the satellite dials back `GET /api/v1/hosts/exec/{nonce}`
+// — paired here into the `HostChannelHub` rendezvous the spawn awaits.
+
+/// Resolve the satellite host id for a channel/dial-back request.
+///
+/// Fast path: the shared auth layer already mapped the agent-token bearer
+/// to identity `host:<id>`. Fallback (auth disabled on a loopback bind —
+/// the layer stamps everyone `admin` without reading the header): resolve
+/// the `Authorization` bearer against the registry directly, exactly like
+/// the old standalone satellite listener did. No valid token ⇒ reject.
+fn resolve_channel_host(
+    app: &crate::state::AppState,
+    identity: &Identity,
+    headers: &HeaderMap,
+) -> Result<String, Box<Response>> {
+    if let Some(id) = identity.id.strip_prefix("host:") {
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("ccteam:");
+    if !bearer.is_empty() {
+        if let Ok(reg) = ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
+            if let Some(h) = reg.by_agent_token(bearer) {
+                return Ok(h.id.clone());
+            }
+        }
+    }
+    Err(Box::new(
+        (
+            StatusCode::FORBIDDEN,
+            "satellite agent-token bearer required",
+        )
+            .into_response(),
+    ))
+}
+
+/// Apply a satellite report to the persisted registry (best-effort: a
+/// registry IO failure is logged, never breaks the live channel).
+fn apply_report_persist(
+    app: &crate::state::AppState,
+    host_id: &str,
+    report: &ccteam_core::HostReport,
+) {
+    let reg_path = app.paths.host_registry_path();
+    let result = ccteam_core::HostRegistry::load(&reg_path).and_then(|mut reg| {
+        ccteam_core::apply_report(&mut reg, host_id, report)?;
+        reg.save(&reg_path)
+    });
+    if let Err(err) = result {
+        tracing::warn!(host = %host_id, error = %err, "host channel: report persist failed");
+    }
+}
+
+/// One inbound Text frame on the control channel. Unknown `op`s are
+/// ignored (forward compatibility — an older daemon must not kill the
+/// channel over a frame a newer satellite added).
+fn handle_channel_frame(app: &crate::state::AppState, host_id: &str, raw: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        tracing::debug!(host = %host_id, "host channel: non-JSON frame ignored");
+        return;
+    };
+    match v.get("op").and_then(|o| o.as_str()) {
+        Some("report") => match serde_json::from_value::<ccteam_core::HostReport>(v.clone()) {
+            Ok(rep) => apply_report_persist(app, host_id, &rep),
+            Err(err) => {
+                tracing::debug!(host = %host_id, error = %err, "host channel: bad report frame")
+            }
+        },
+        other => {
+            tracing::debug!(host = %host_id, op = ?other, "host channel: unknown op ignored")
+        }
+    }
+}
+
+/// `GET /api/v1/hosts/channel` — the satellite's persistent reverse control
+/// channel (`ccteam-host.v1`). Not OpenAPI-documented (WS). Auth: the
+/// shared bearer gate already resolved the agent token to `host:<id>`.
+pub(crate) async fn handle_host_channel(
     State(app): State<crate::state::AppState>,
     Extension(identity): Extension<Identity>,
-    Path(host): Path<String>,
-    Json(req): Json<ccteam_core::HostHeartbeatRequest>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
-    // Agent token from body, or (when identity is host:<id>) the stored
-    // registry token for that host. Auth layer already accepted the bearer.
-    let reg_path = app.paths.host_registry_path();
-    let mut reg = match ccteam_core::HostRegistry::load(&reg_path) {
-        Ok(r) => r,
+    let host_id = match resolve_channel_host(&app, &identity, &headers) {
+        Ok(h) => h,
+        Err(deny) => return *deny,
+    };
+    ws.protocols([ccteam_harness::HOST_CHANNEL_SUBPROTOCOL])
+        .on_upgrade(move |socket| run_host_channel(socket, app, host_id))
+}
+
+async fn run_host_channel(
+    mut socket: axum::extract::ws::WebSocket,
+    app: crate::state::AppState,
+    host_id: String,
+) {
+    use axum::extract::ws::Message as AxMessage;
+    use ccteam_harness::{HubCtrlMsg, IDLE_TIMEOUT, KEEPALIVE_PERIOD};
+
+    let mut reg = app.host_hub.register(&host_id);
+    tracing::info!(host = %host_id, "host channel connected");
+    // Presence is immediate: bump the registry on connect, not just on the
+    // first periodic report.
+    apply_report_persist(&app, &host_id, &ccteam_core::HostReport::default());
+
+    let mut last_rx = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval(KEEPALIVE_PERIOD);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = socket.recv() => match msg {
+                Some(Ok(AxMessage::Text(t))) => {
+                    last_rx = tokio::time::Instant::now();
+                    handle_channel_frame(&app, &host_id, t.as_str());
+                }
+                Some(Ok(AxMessage::Close(_))) | None => break,
+                Some(Ok(_)) => {
+                    // Ping/Pong/Binary — liveness only (axum auto-pongs).
+                    last_rx = tokio::time::Instant::now();
+                }
+                Some(Err(_)) => break,
+            },
+            ctrl = reg.ctrl_rx.recv() => match ctrl {
+                Some(HubCtrlMsg::ExecOpen { nonce, sid }) => {
+                    let frame = serde_json::json!({
+                        "op": "exec_open",
+                        "nonce": nonce,
+                        "sid": sid,
+                    });
+                    if socket.send(AxMessage::Text(frame.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = reg.kicked.cancelled() => {
+                // A newer connection for this host registered — this one is
+                // a stale ghost (NAT rebind); close and exit WITHOUT
+                // unregistering the replacement (generation check below).
+                let _ = socket.send(AxMessage::Close(None)).await;
+                break;
+            }
+            _ = ping.tick() => {
+                if last_rx.elapsed() > IDLE_TIMEOUT {
+                    tracing::warn!(host = %host_id, "host channel idle past {}s — dropping half-open link", IDLE_TIMEOUT.as_secs());
+                    break;
+                }
+                if socket.send(AxMessage::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    app.host_hub.unregister(&host_id, reg.generation);
+    tracing::info!(host = %host_id, "host channel disconnected");
+}
+
+/// `GET /api/v1/hosts/exec/{nonce}` — a satellite's exec dial-back
+/// (`ccteam-exec.v1`). Claims the single-use, host-bound nonce from the
+/// hub, then pumps WS frames ↔ the paired [`ccteam_harness::ExecBridge`]
+/// half until either side ends.
+pub(crate) async fn handle_host_exec_dialback(
+    State(app): State<crate::state::AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(nonce): Path<String>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    let host_id = match resolve_channel_host(&app, &identity, &headers) {
+        Ok(h) => h,
+        Err(deny) => return *deny,
+    };
+    let slot = match app.host_hub.claim_exec(&nonce, &host_id) {
+        Ok(s) => s,
         Err(err) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": format!("{err}")})),
             )
                 .into_response();
         }
     };
-    let agent_token = req.agent_token.clone().unwrap_or_default();
-    let token = if !agent_token.is_empty() {
-        agent_token
-    } else if identity.id == format!("host:{host}") || identity.is_admin {
-        reg.get(&host)
-            .map(|h| h.agent_token.clone())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if token.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "agent token required"})),
-        )
-            .into_response();
+    ws.protocols([ccteam_harness::EXEC_SUBPROTOCOL])
+        .on_upgrade(move |socket| pump_exec_dialback(socket, slot, host_id))
+}
+
+async fn pump_exec_dialback(
+    mut socket: axum::extract::ws::WebSocket,
+    slot: tokio::sync::oneshot::Sender<ccteam_harness::ExecBridge>,
+    host_id: String,
+) {
+    use axum::extract::ws::Message as AxMessage;
+    use ccteam_harness::{ExecBridge, IDLE_TIMEOUT, KEEPALIVE_PERIOD};
+    use tokio_tungstenite::tungstenite::Message as TMessage;
+
+    let (mine, theirs) = ExecBridge::pair();
+    if slot.send(theirs).is_err() {
+        // The opener gave up (dial-back arrived after its timeout).
+        tracing::warn!(host = %host_id, "exec dial-back arrived after the opener timed out");
+        let _ = socket.send(AxMessage::Close(None)).await;
+        return;
     }
-    match ccteam_core::apply_heartbeat(&mut reg, &host, &token, &req) {
-        Ok(rec) => {
-            if let Err(err) = reg.save(&reg_path) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("{err}")})),
-                )
-                    .into_response();
+    let ExecBridge {
+        tx: to_daemon,
+        rx: mut from_daemon,
+    } = mine;
+
+    let mut last_rx = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval(KEEPALIVE_PERIOD);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = socket.recv() => match msg {
+                Some(Ok(am)) => {
+                    last_rx = tokio::time::Instant::now();
+                    let forward = match am {
+                        AxMessage::Text(t) => Some(TMessage::Text(t.as_str().to_string())),
+                        AxMessage::Binary(b) => Some(TMessage::Binary(b.to_vec())),
+                        // Keepalive frames stay on this hop (axum
+                        // auto-pongs); the bridge carries payload only.
+                        AxMessage::Ping(_) | AxMessage::Pong(_) => None,
+                        AxMessage::Close(_) => break,
+                    };
+                    if let Some(m) = forward {
+                        if to_daemon.send(m).await.is_err() {
+                            break; // spawn side dropped the transport
+                        }
+                    }
+                }
+                Some(Err(_)) | None => break,
+            },
+            out = from_daemon.recv() => match out {
+                Some(m) => {
+                    let am = match m {
+                        TMessage::Text(t) => AxMessage::Text(t.into()),
+                        TMessage::Binary(b) => AxMessage::Binary(b.into()),
+                        TMessage::Close(_) => {
+                            let _ = socket.send(AxMessage::Close(None)).await;
+                            break;
+                        }
+                        // Ping/Pong/Frame never ride the bridge.
+                        _ => continue,
+                    };
+                    if socket.send(am).await.is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    // Daemon-side transport closed (writer shutdown / drop)
+                    // — mirror it as a WS close so the satellite ends the
+                    // child exactly like the direct-dial era did.
+                    let _ = socket.send(AxMessage::Close(None)).await;
+                    break;
+                }
+            },
+            _ = ping.tick() => {
+                if last_rx.elapsed() > IDLE_TIMEOUT {
+                    tracing::warn!(host = %host_id, "exec link idle past {}s — dropping half-open link", IDLE_TIMEOUT.as_secs());
+                    break;
+                }
+                if socket.send(AxMessage::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
-            Json(serde_json::json!({
-                "host": rec.id,
-                "status": rec.status_label(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS),
-                "last_heartbeat_unix": rec.last_heartbeat_unix,
-            }))
-            .into_response()
-        }
-        Err(err) => {
-            let msg = err.to_string();
-            let code = if msg.contains("unknown host") {
-                StatusCode::NOT_FOUND
-            } else if msg.contains("invalid agent") {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (code, Json(serde_json::json!({"error": msg}))).into_response()
         }
     }
+    // Dropping `to_daemon`/`from_daemon` EOFs the spawn-side reader.
 }
 
 #[cfg(test)]

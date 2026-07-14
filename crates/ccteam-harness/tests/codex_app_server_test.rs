@@ -2971,8 +2971,8 @@ async fn start_thread_rejects_remote_ctx_readable() {
         permission_mode: ccteam_harness::PermissionMode::Skip,
         secret: String::new(),
         remote: Some(ccteam_harness::RemoteExecTarget {
-            exec_ws_url: "ws://127.0.0.1:1/ws/exec".into(),
-            agent_token: "tok".into(),
+            host_id: "sat".into(),
+            hub: std::sync::Arc::new(ccteam_harness::HostChannelHub::default()),
         }),
     };
     let adapter = CodexAppServerAdapter::new();

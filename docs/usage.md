@@ -320,6 +320,23 @@ CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_B
 # Override vendor CLI paths (tests / non-PATH installs).
 ```
 
+### Multi-Machine (Satellites)
+
+Every node runs the same `ccteam start`. A node becomes a **satellite** of another daemon by joining it once — after that it **dials out** to the daemon (reverse connection): only the daemon needs a reachable address/port (`:7331`); satellites expose nothing and work from behind NAT/firewalls. Put an HTTPS reverse proxy in front of the daemon and all satellite traffic is `wss`.
+
+```bash
+# On the daemon (or web console → 主机 page): mint a join token.
+ccteam host mint-token --daemon http://daemon-host:7331 --web-token <admin-hex>
+
+# On the satellite (any machine running ccteam start):
+ccteam host join --daemon http://daemon-host:7331 --token <join-token>
+# The running `ccteam start` picks the join up within 30s and connects out.
+
+ccteam host ls                     # This machine's satellite credentials (if joined).
+```
+
+The satellite reports its agents and registered projects every ~25s over its control channel; the hosts page shows online/offline live. To run a session on it: register the project there (`ccteam init` in the repo on that machine), then spawn with `host:"<host-id>"` (web console, API, or `session_spawn`). Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn.
+
 ---
 
 ## Troubleshooting

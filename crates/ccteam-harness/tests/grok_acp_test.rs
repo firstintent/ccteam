@@ -405,8 +405,8 @@ async fn start_thread_rejects_remote_ctx_readable() {
     let tmp = TempDir::new().unwrap();
     let mut ctx = spawn_ctx(&tmp, "s-remote");
     ctx.remote = Some(ccteam_harness::RemoteExecTarget {
-        exec_ws_url: "ws://127.0.0.1:1/ws/exec".into(),
-        agent_token: "tok".into(),
+        host_id: "sat".into(),
+        hub: std::sync::Arc::new(ccteam_harness::HostChannelHub::default()),
     });
     let adapter = GrokAcpAdapter::new();
     let err = adapter

@@ -1,11 +1,14 @@
-//! v0.8.24 Track D — multi-host join / heartbeat / ACL / remote-spawn offline.
+//! v0.8.24 Track D (reverse-connection since v0.9.0) — multi-host join /
+//! control channel / ACL / remote-spawn offline.
 //!
 //! Proves:
 //! 1. mint join-token (admin) → join registers a host
-//! 2. heartbeat keeps the host online; stale last_heartbeat → offline
+//! 2. the reverse `ccteam-host.v1` control channel registers in the hub;
+//!    `report` frames keep the registry fresh; stale last_heartbeat → offline
 //! 3. remote spawn against offline host returns a readable error and does
 //!    **not** create a session
-//! 4. non-admin tenant is 403 on hosts list / join-token / join
+//! 4. non-admin tenant is 403 on hosts list / join-token / join; a
+//!    non-satellite bearer is rejected on the channel/dial-back endpoints
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,6 +61,7 @@ async fn join_registers_host_and_heartbeat_online_offline() {
     std::fs::create_dir_all(paths.hosts_dir()).unwrap();
 
     let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let hub = state.host_hub.clone();
     let addr = spawn(state).await;
     let c = client();
     let auth = format!("Bearer ccteam:{ADMIN_HEX}");
@@ -122,7 +126,6 @@ async fn join_registers_host_and_heartbeat_online_offline() {
             "os": "linux",
             "arch": "x86_64",
             "ccteam_version": "0.8.24",
-            "agent_url": "http://127.0.0.1:9",
             "agents": [{"vendor":"claude","installed":true,"version":"1.0","status":"ready"}]
         }))
         .send()
@@ -157,20 +160,94 @@ async fn join_registers_host_and_heartbeat_online_offline() {
     assert_eq!(sat["status"], "online");
     assert_eq!(sat["is_local"], false);
 
-    // Heartbeat with agent token.
-    let hb: serde_json::Value = c
-        .post(format!("http://{addr}/api/v1/hosts/lab-mac/heartbeat"))
-        .header("Authorization", format!("Bearer ccteam:{agent_token}"))
-        .json(&serde_json::json!({"agent_token": agent_token, "ccteam_version": "0.8.24"}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
+    // Reverse control channel (replaces the retired HTTP heartbeat): the
+    // agent-token bearer upgrades `GET /api/v1/hosts/channel`; a `report`
+    // frame refreshes the registry.
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut ws_req = format!("ws://{addr}/api/v1/hosts/channel")
+        .into_client_request()
         .unwrap();
-    assert_eq!(hb["status"], "online");
+    ws_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer ccteam:{agent_token}").parse().unwrap(),
+    );
+    ws_req
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", "ccteam-host.v1".parse().unwrap());
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
+    // Hub registration is synchronous with the upgrade completing.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !hub.is_connected("lab-mac") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "control channel never registered in the hub"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    ws.send(Message::Text(
+        serde_json::json!({"op":"report","ccteam_version":"0.9.0-report"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    // The report lands in the persisted registry (version proves it was
+    // THIS frame, not the on-connect presence bump).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let reg = HostRegistry::load(&paths.host_registry_path()).unwrap();
+        if reg
+            .get("lab-mac")
+            .map(|h| h.ccteam_version == "0.9.0-report")
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "report frame never applied to the registry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    // Unknown ops are ignored (forward compat) — the channel must survive.
+    ws.send(Message::Text(
+        serde_json::json!({"op":"from-the-future","x":1}).to_string(),
+    ))
+    .await
+    .unwrap();
+    // An admin bearer is NOT a satellite: channel upgrade is refused.
+    let mut admin_req = format!("ws://{addr}/api/v1/hosts/channel")
+        .into_client_request()
+        .unwrap();
+    admin_req
+        .headers_mut()
+        .insert("Authorization", auth.parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(admin_req).await.is_err(),
+        "admin bearer must not open a host channel"
+    );
+    // An unknown exec nonce is refused before upgrade.
+    let mut nonce_req = format!("ws://{addr}/api/v1/hosts/exec/deadbeef")
+        .into_client_request()
+        .unwrap();
+    nonce_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer ccteam:{agent_token}").parse().unwrap(),
+    );
+    assert!(
+        tokio_tungstenite::connect_async(nonce_req).await.is_err(),
+        "unknown nonce must not upgrade"
+    );
+    // Channel teardown unregisters from the hub.
+    drop(ws);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while hub.is_connected("lab-mac") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropped channel never unregistered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     // Force offline by rewriting last_heartbeat.
     let mut reg = HostRegistry::load(&paths.host_registry_path()).unwrap();
@@ -278,7 +355,6 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         os: "linux".into(),
         arch: "x86_64".into(),
         ccteam_version: "0.8.24".into(),
-        agent_url: Some("http://127.0.0.1:9".into()),
         agent_token: "agenttok".into(),
         last_heartbeat_unix: now_unix().saturating_sub(10_000),
         agents: vec![],
@@ -374,7 +450,6 @@ async fn gateway_create_on_offline_host_fails_clean() {
         os: "linux".into(),
         arch: "x86_64".into(),
         ccteam_version: "0.8.24".into(),
-        agent_url: Some("http://127.0.0.1:9".into()),
         agent_token: "t".into(),
         last_heartbeat_unix: now_unix().saturating_sub(9999),
         agents: vec![],

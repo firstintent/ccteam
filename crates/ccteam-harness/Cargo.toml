@@ -35,12 +35,17 @@ tracing = { workspace = true }
 
 libc = "0.2"
 
-# v0.9.0 W3 — `ccteam-exec.v1` client (`execution::remote_exec::connect`):
-# the main daemon dials a satellite's `GET /ws/exec`. Same version pin as
-# ccteam-cli/ccteam-web/ccteam-im (`connect` + `handshake` features). Header
-# building uses `tokio_tungstenite::tungstenite::http` (re-exported) — no
-# separate `http` dependency needed.
+# v0.9.0 W3 — `ccteam-exec.v1` frame type (`tungstenite::Message`) shared by
+# the daemon-side bridge plumbing and the satellite exec engine. Same version
+# pin as ccteam-cli/ccteam-web/ccteam-im (`connect` + `handshake` features).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Reverse-connection host channel: `ExecBridge::into_io` adapts an mpsc
+# half to the `Sink<Message>` shape via `PollSender` (`sync` feature).
+tokio-util = "0.7"
+# Dial-back nonce mint (`host_channel::mint_nonce`) — same CSPRNG line
+# `ccteam-core::session_secret` uses (core depends on harness, so the
+# helper cannot be shared downward).
+getrandom = { workspace = true }
 
 # v0.8.9 — `capture(with_ansi=false)` renders the raw byte backlog
 # through a vt100 state machine to plain text (consuming mouse / alt-screen

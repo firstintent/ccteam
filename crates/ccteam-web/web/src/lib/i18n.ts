@@ -85,7 +85,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     offlineRow: "离线 —— 无法探测 agent。",
     joinTitle: "连接新主机(卫星节点)",
     joinDesc:
-      "在目标机器上安装 ccteam 并 join 本 daemon —— 首次心跳上报后即出现在上方列表。目标机器已在跑 ccteam daemon 的,join 后 30 秒内自动生效;没有 daemon 的机器再执行 host serve。",
+      "在目标机器上安装 ccteam 并 join 本 daemon —— 卫星节点主动反向连接本机,自身无需暴露任何端口。目标机器跑着 ccteam start 即可,join 后 30 秒内自动上线。",
     joinTokenGen: "生成 join token",
     joinTokenGenBusy: "生成中…",
     joinTokenCopy: "复制命令",
@@ -220,7 +220,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     offlineRow: "Offline — cannot probe agents.",
     joinTitle: "Connect a new host (satellite)",
     joinDesc:
-      "Install ccteam on the target machine and join this daemon — it appears above after the first heartbeat. A machine already running the ccteam daemon activates within 30s of joining; only daemon-less machines need host serve.",
+      "Install ccteam on the target machine and join this daemon — the satellite dials back to this machine, so it never exposes a port of its own. Any machine running ccteam start comes online within 30s of joining.",
     joinTokenGen: "Generate join token",
     joinTokenGenBusy: "Generating…",
     joinTokenCopy: "Copy command",

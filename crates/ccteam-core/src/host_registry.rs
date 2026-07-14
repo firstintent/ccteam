@@ -1,14 +1,18 @@
-//! Multi-host registry (v0.8.24 Track D).
+//! Multi-host registry (v0.8.24 Track D; reverse-connection since v0.9.0).
 //!
 //! Persists satellite hosts the main daemon has accepted via
 //! `ccteam host join` / `POST /api/v1/hosts/join`. Local machine is
-//! always implicit (`"local"`) and is never written here.
+//! always implicit (`"local"`) and is never written here. Registration
+//! state lives ONLY on the main daemon — a satellite keeps just its own
+//! [`SatelliteSelf`] credentials and dials out (`ccteam-host.v1` control
+//! channel); it exposes no listener and stores no peer registry.
 //!
-//! **Honest scope**: join-token + heartbeat are an **ops registration
+//! **Honest scope**: join-token + agent-token are an **ops registration
 //! surface** (prevent accidental connect), not a security boundary.
-//! Online/offline is TTL-based on last heartbeat. Remote spawn for
-//! stdio protocols only (terminal never multi-host) is gated on this
-//! registry; see `docs/dev/tech-design.md` §2.7.
+//! Online/offline is TTL-based on the last `report` frame received over
+//! the satellite's control channel (live-channel presence gates the
+//! actual exec dial); terminal protocol is never multi-host. See
+//! `docs/dev/tech-design.md` §2.7.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,7 +27,9 @@ use crate::session_secret;
 /// Default host-id for the machine running the main daemon.
 pub const LOCAL_HOST: &str = "local";
 
-/// A host is offline when no heartbeat arrives within this window.
+/// A host is offline when no control-channel `report` frame arrives within
+/// this window (satellites report every ~25s — `REPORT_PERIOD` in
+/// `ccteam-harness::host_channel`).
 pub const DEFAULT_HEARTBEAT_TTL_SECS: u64 = 90;
 
 /// Wire shape of one probe row the satellite reports at join / heartbeat.
@@ -48,10 +54,11 @@ pub struct HostProjectReport {
 }
 
 /// One vendor this host can run + the env override / default binary name
-/// used to resolve it. Shared by the satellite heartbeat loop
-/// (`ccteam host serve`) and `ccteam-web::routes::hosts` (which wraps
-/// [`probe_bin_version`] with its own process-lifetime cache + MCP-registration
-/// status for the LOCAL admin host-detail page). Single source of truth for
+/// used to resolve it. Shared by the satellite report loop
+/// (`ccteam-web::satellite`, riding the control channel) and
+/// `ccteam-web::routes::hosts` (which wraps [`probe_bin_version`] with its
+/// own process-lifetime cache + MCP-registration status for the LOCAL
+/// admin host-detail page). Single source of truth for
 /// "which vendors ccteam knows how to probe".
 #[derive(Debug, Clone, Copy)]
 pub struct AgentProbeSpec {
@@ -140,15 +147,12 @@ pub struct HostRecord {
     pub arch: String,
     /// ccteam version the satellite is running.
     pub ccteam_version: String,
-    /// Optional agent callback base URL for remote spawn proxy
-    /// (e.g. `http://192.168.1.10:7332`). Absent ⇒ registry-only (ops
-    /// visibility) until the satellite advertises an endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_url: Option<String>,
-    /// Long-lived agent credential minted at join (for heartbeat +
-    /// future proxy auth). Stored as bare hex (no `ccteam:` prefix).
+    /// Long-lived agent credential minted at join. The bearer for the
+    /// satellite's outbound `ccteam-host.v1` control channel and its exec
+    /// dial-backs (the satellite itself exposes NO listener — v0.9.0
+    /// reverse connection). Stored as bare hex (no `ccteam:` prefix).
     pub agent_token: String,
-    /// Unix seconds of the last successful join or heartbeat.
+    /// Unix seconds of the last successful join or control-channel report.
     pub last_heartbeat_unix: u64,
     /// Agent matrix last reported by the satellite.
     #[serde(default)]
@@ -388,8 +392,6 @@ pub struct HostJoinRequest {
     pub arch: String,
     pub ccteam_version: String,
     #[serde(default)]
-    pub agent_url: Option<String>,
-    #[serde(default)]
     pub agents: Vec<HostAgentReport>,
 }
 
@@ -401,22 +403,20 @@ pub struct HostJoinResponse {
     pub heartbeat_ttl_secs: u64,
 }
 
-/// Heartbeat body (`POST /hosts/{host}/heartbeat`).
+/// Satellite status report — the body of the `{"op":"report", …}` frame a
+/// satellite pushes over its `ccteam-host.v1` control channel every
+/// `REPORT_PERIOD` (and immediately on connect). Auth is the channel's
+/// bearer (already verified before any report is applied) — no in-body
+/// token.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HostHeartbeatRequest {
-    /// Agent token minted at join (also accepted via Authorization bearer).
-    #[serde(default)]
-    pub agent_token: Option<String>,
+pub struct HostReport {
     #[serde(default)]
     pub agents: Option<Vec<HostAgentReport>>,
     #[serde(default)]
-    pub agent_url: Option<String>,
-    #[serde(default)]
     pub ccteam_version: Option<String>,
     /// v0.9.0 W3 (G9) — the satellite's own registered projects
-    /// (`[{slug, path}]`). `None` leaves the last-known list untouched
-    /// (an older satellite binary that doesn't send this field); `Some`
-    /// (including `Some(vec![])`) replaces it.
+    /// (`[{slug, path}]`). `None` leaves the last-known list untouched;
+    /// `Some` (including `Some(vec![])`) replaces it.
     #[serde(default)]
     pub projects: Option<Vec<HostProjectReport>>,
 }
@@ -445,7 +445,6 @@ pub fn apply_join(
         os: req.os.clone(),
         arch: req.arch.clone(),
         ccteam_version: req.ccteam_version.clone(),
-        agent_url: req.agent_url.clone(),
         agent_token: agent_token.clone(),
         last_heartbeat_unix: now,
         agents: req.agents.clone(),
@@ -460,36 +459,22 @@ pub fn apply_join(
     })
 }
 
-/// Apply a heartbeat. Returns the updated record or an error.
-pub fn apply_heartbeat(
-    reg: &mut HostRegistry,
-    host_id: &str,
-    agent_token: &str,
-    req: &HostHeartbeatRequest,
-) -> Result<HostRecord> {
+/// Apply a control-channel `report` frame. The caller has ALREADY
+/// authenticated the channel's agent-token bearer to `host_id` — no in-body
+/// token to re-verify. Returns the updated record or an error.
+pub fn apply_report(reg: &mut HostRegistry, host_id: &str, req: &HostReport) -> Result<HostRecord> {
     if host_id == LOCAL_HOST {
-        bail!("heartbeat is only for registered satellite hosts, not `{LOCAL_HOST}`");
+        bail!("reports are only for registered satellite hosts, not `{LOCAL_HOST}`");
     }
-    let bare = strip_ccteam_prefix(agent_token);
     let host = reg
         .get_mut(host_id)
         .ok_or_else(|| anyhow!("unknown host: {host_id}"))?;
-    if !session_secret::ct_eq(&host.agent_token, bare) {
-        bail!("invalid agent token for host {host_id}");
-    }
     host.last_heartbeat_unix = now_unix();
     if let Some(agents) = &req.agents {
         host.agents = agents.clone();
     }
     if let Some(projects) = &req.projects {
         host.projects = projects.clone();
-    }
-    if let Some(url) = &req.agent_url {
-        host.agent_url = if url.is_empty() {
-            None
-        } else {
-            Some(url.clone())
-        };
     }
     if let Some(ver) = &req.ccteam_version {
         if !ver.is_empty() {
@@ -673,7 +658,6 @@ mod tests {
                 os: "macos".into(),
                 arch: "aarch64".into(),
                 ccteam_version: "0.8.24".into(),
-                agent_url: Some("http://10.0.0.2:7332".into()),
                 agents: vec![HostAgentReport {
                     vendor: "claude".into(),
                     installed: true,
@@ -705,22 +689,18 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 ccteam_version: "0".into(),
-                agent_url: None,
                 agents: vec![],
             },
         );
         assert!(err.is_err());
 
-        // Heartbeat with agent token.
+        // Report over the (pre-authed) control channel.
         let mut reg3 = HostRegistry::load(&reg_path).unwrap();
-        let updated = apply_heartbeat(
+        let updated = apply_report(
             &mut reg3,
             "lab-mac",
-            &resp.agent_token,
-            &HostHeartbeatRequest {
-                agent_token: Some(resp.agent_token.clone()),
+            &HostReport {
                 agents: None,
-                agent_url: None,
                 ccteam_version: Some("0.8.24-next".into()),
                 projects: None,
             },
@@ -739,7 +719,6 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             ccteam_version: "0.8.24".into(),
-            agent_url: None,
             agent_token: "abc".into(),
             last_heartbeat_unix: now_unix().saturating_sub(10_000),
             agents: vec![],
@@ -764,7 +743,6 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             ccteam_version: "0.8.24".into(),
-            agent_url: Some("http://127.0.0.1:9".into()),
             agent_token: "t".into(),
             last_heartbeat_unix: now_unix(),
             agents: vec![],
@@ -796,7 +774,6 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             ccteam_version: "0.9.0".into(),
-            agent_url: Some("http://127.0.0.1:7332".into()),
             agent_token: "t".into(),
             last_heartbeat_unix: now_unix(),
             agents: vec![],
@@ -835,20 +812,17 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_merges_projects_when_present() {
+    fn report_merges_projects_when_present() {
         let tmp = TempDir::new().unwrap();
         let reg_path = registry_path_in(tmp.path());
         let mut reg = sat_with_projects(vec![]);
         reg.save(&reg_path).unwrap();
 
-        let updated = apply_heartbeat(
+        let updated = apply_report(
             &mut reg,
             "sat",
-            "t",
-            &HostHeartbeatRequest {
-                agent_token: Some("t".into()),
+            &HostReport {
                 agents: None,
-                agent_url: None,
                 ccteam_version: None,
                 projects: Some(vec![HostProjectReport {
                     slug: "demo".into(),
@@ -859,15 +833,12 @@ mod tests {
         .unwrap();
         assert!(updated.has_project("demo"));
 
-        // `projects: None` on a later heartbeat must NOT wipe the list.
-        let updated2 = apply_heartbeat(
+        // `projects: None` on a later report must NOT wipe the list.
+        let updated2 = apply_report(
             &mut reg,
             "sat",
-            "t",
-            &HostHeartbeatRequest {
-                agent_token: Some("t".into()),
+            &HostReport {
                 agents: None,
-                agent_url: None,
                 ccteam_version: None,
                 projects: None,
             },

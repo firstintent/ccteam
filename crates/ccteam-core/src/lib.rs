@@ -259,11 +259,11 @@ pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
 // v0.8.24 Track D — multi-host registry.
 pub use host::read_hostname;
 pub use host_registry::{
-    apply_heartbeat, apply_join, gate_remote_spawn, gate_remote_spawn_project, join_tokens_path_in,
+    apply_join, apply_report, gate_remote_spawn, gate_remote_spawn_project, join_tokens_path_in,
     normalize_host_id, now_unix, probe_agents, registry_path_in, AgentProbeSpec, HostAgentReport,
-    HostHeartbeatRequest, HostJoinRequest, HostJoinResponse, HostProjectReport, HostRecord,
-    HostRegistry, JoinToken, JoinTokenStore, SatelliteSelf, AGENT_PROBE_SPECS,
-    DEFAULT_HEARTBEAT_TTL_SECS, LOCAL_HOST as REGISTRY_LOCAL_HOST,
+    HostJoinRequest, HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport,
+    JoinToken, JoinTokenStore, SatelliteSelf, AGENT_PROBE_SPECS, DEFAULT_HEARTBEAT_TTL_SECS,
+    LOCAL_HOST as REGISTRY_LOCAL_HOST,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,

@@ -758,9 +758,6 @@ enum HostCommand {
         /// Optional preferred host id (default = hostname slug).
         #[arg(long)]
         host_id: Option<String>,
-        /// Optional satellite agent callback base URL for remote spawn.
-        #[arg(long)]
-        agent_url: Option<String>,
     },
     /// Mint a join token via the main daemon REST API (admin web-token).
     MintToken {
@@ -775,25 +772,8 @@ enum HostCommand {
         #[arg(long)]
         max_uses: Option<u32>,
     },
-    /// Send one heartbeat using the local `state/hosts/self.json` credentials.
-    Heartbeat,
     /// Show the local satellite credentials (if joined).
     Ls,
-    /// v0.9.0 W3 (F3) — run this machine's `ccteam-exec.v1` satellite:
-    /// `GET /health` + `GET /ws/exec` (bearer = this host's `agent_token`
-    /// from a prior `ccteam host join`) plus an embedded heartbeat loop
-    /// (agents probe + this host's own registered projects). Foreground
-    /// process; Ctrl-C / SIGTERM to stop.
-    Serve {
-        /// Address to bind the exec bridge on.
-        #[arg(long, default_value = "0.0.0.0:7332")]
-        bind: String,
-        /// Override the `agent_url` this satellite advertises at heartbeat
-        /// (default: `http://<bind>` — wrong when `bind` is unspecified
-        /// `0.0.0.0`, so set this to the LAN-reachable address).
-        #[arg(long)]
-        advertise_url: Option<String>,
-    },
 }
 
 /// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
@@ -1379,23 +1359,14 @@ fn run_host(cmd: HostCommand) -> Result<()> {
             daemon,
             token,
             host_id,
-            agent_url,
-        } => rt.block_on(host_join(&paths, daemon, token, host_id, agent_url)),
+        } => rt.block_on(host_join(&paths, daemon, token, host_id)),
         HostCommand::MintToken {
             daemon,
             web_token,
             label,
             max_uses,
         } => rt.block_on(host_mint_token(daemon, web_token, label, max_uses)),
-        HostCommand::Heartbeat => rt.block_on(host_heartbeat(&paths)),
         HostCommand::Ls => host_ls(&paths),
-        HostCommand::Serve {
-            bind,
-            advertise_url,
-        } => {
-            init_tracing();
-            rt.block_on(host_serve(&paths, bind, advertise_url))
-        }
     }
 }
 
@@ -1404,7 +1375,6 @@ async fn host_join(
     daemon: String,
     token: String,
     host_id: Option<String>,
-    agent_url: Option<String>,
 ) -> Result<()> {
     let hostname = ccteam_core::read_hostname().unwrap_or_else(|| "satellite".into());
     let body = ccteam_core::HostJoinRequest {
@@ -1414,7 +1384,6 @@ async fn host_join(
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         ccteam_version: env!("CARGO_PKG_VERSION").to_string(),
-        agent_url,
         agents: vec![],
     };
     let url = format!("{}/api/v1/hosts/join", daemon.trim_end_matches('/'));
@@ -1452,8 +1421,9 @@ async fn host_join(
     );
     println!("heartbeat_ttl_secs={}", join.heartbeat_ttl_secs);
     println!(
-        "a running `ccteam start` daemon on this machine picks the join up within 30s \
-         (dual-role); on a machine without a daemon, run `ccteam host serve`"
+        "a running `ccteam start` on this machine connects out to the daemon within 30s \
+         (reverse connection — this satellite exposes no port; start one with `ccteam start` \
+         if it isn't running)"
     );
     Ok(())
 }
@@ -1486,256 +1456,14 @@ async fn host_mint_token(
     Ok(())
 }
 
-async fn host_heartbeat(paths: &CcteamPaths) -> Result<()> {
-    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
-    let me = ccteam_core::SatelliteSelf::load(&self_path)
-        .with_context(|| format!("not joined? missing {}", self_path.display()))?;
-    let text = send_heartbeat(paths, &me, None).await?;
-    println!("{text}");
-    Ok(())
-}
-
-/// v0.9.0 W3 (G9) — one heartbeat POST, shared by the one-shot `ccteam
-/// host heartbeat` and the `ccteam host serve` embedded loop. Reports
-/// THIS machine's own agent probe (`ccteam_core::probe_agents`) and its
-/// own registered projects (`~/.ccteam/config.yaml::projects[]`) — the
-/// two fields that were previously always empty (the gap this closes:
-/// the main daemon's remote-spawn gate needs `projects` to know whether a
-/// slug is actually usable here before proxying a spawn).
-async fn send_heartbeat(
-    paths: &CcteamPaths,
-    me: &ccteam_core::SatelliteSelf,
-    agent_url: Option<&str>,
-) -> Result<String> {
-    let agents = tokio::task::spawn_blocking(ccteam_core::probe_agents)
-        .await
-        .unwrap_or_default();
-    let projects: Vec<ccteam_core::HostProjectReport> = ccteam_core::config::load(&paths.root)
-        .map(|cfg| {
-            cfg.projects
-                .into_iter()
-                .map(|p| ccteam_core::HostProjectReport {
-                    slug: p.slug,
-                    path: p.path.display().to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let url = format!(
-        "{}/api/v1/hosts/{}/heartbeat",
-        me.daemon_url.trim_end_matches('/'),
-        me.host
-    );
-    let mut body = serde_json::json!({
-        "agent_token": me.agent_token,
-        "ccteam_version": env!("CARGO_PKG_VERSION"),
-        "agents": agents,
-        "projects": projects,
-    });
-    if let Some(u) = agent_url {
-        body["agent_url"] = serde_json::json!(u);
-    }
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer ccteam:{}", me.agent_token))
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!("heartbeat failed HTTP {status}: {text}");
-    }
-    Ok(text)
-}
-
-/// v0.9.0 W3 (F3) — `ccteam host serve`: run the `ccteam-exec.v1`
-/// satellite (`GET /health` + `GET /ws/exec`) plus an embedded heartbeat
-/// loop, until Ctrl-C / SIGTERM.
-async fn host_serve(
-    paths: &CcteamPaths,
-    bind: String,
-    advertise_url: Option<String>,
-) -> Result<()> {
-    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
-    let me = ccteam_core::SatelliteSelf::load(&self_path).with_context(|| {
-        format!(
-            "not joined? missing {} — run `ccteam host join` first",
-            self_path.display()
-        )
-    })?;
-    let bind_addr: std::net::SocketAddr = bind
-        .parse()
-        .with_context(|| format!("invalid --bind {bind}"))?;
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("bind {bind_addr} for ccteam host serve"))?;
-    let local = listener.local_addr().context("read local_addr")?;
-    let advertise = advertise_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{local}"));
-    println!("ccteam host serve listening on http://{local}");
-    println!(
-        "host: {}  daemon: {}  advertise: {advertise}",
-        me.host, me.daemon_url
-    );
-    tracing::info!(host = %me.host, %local, %advertise, "ccteam host serve starting");
-
-    let router = ccteam_web::satellite::satellite_router(
-        paths.clone(),
-        me.agent_token.clone(),
-        me.daemon_url.clone(),
-    );
-
-    let hb_paths = paths.clone();
-    let hb_me = me.clone();
-    let heartbeat_task = tokio::spawn(async move {
-        host_heartbeat_loop(hb_paths, hb_me, Some(advertise)).await;
-    });
-
-    axum::serve(listener, router)
-        .with_graceful_shutdown(ccteam_web::shutdown_signal())
-        .await
-        .context("ccteam host serve: axum serve loop terminated with error")?;
-    heartbeat_task.abort();
-    Ok(())
-}
-
-/// v0.9.0 W3 (F7 reliability) — heartbeat every `ttl/3` (+/- jitter so many
-/// satellites don't sync-beat), consecutive-failure exponential backoff
-/// capped at `ttl`. Runs until the process exits (aborted by `host_serve`
-/// when the exec server itself shuts down).
-async fn host_heartbeat_loop(
-    paths: CcteamPaths,
-    me: ccteam_core::SatelliteSelf,
-    advertise_url: Option<String>,
-) {
-    let ttl_secs = me.heartbeat_ttl_secs.max(3);
-    let base_period = std::time::Duration::from_secs((ttl_secs / 3).max(1));
-    let max_backoff = std::time::Duration::from_secs(ttl_secs);
-    let mut consecutive_failures: u32 = 0;
-    loop {
-        let sleep_for = if consecutive_failures == 0 {
-            base_period
-        } else {
-            let mult = 1u32 << consecutive_failures.min(6);
-            base_period.saturating_mul(mult).min(max_backoff)
-        };
-        tokio::time::sleep(jittered(sleep_for)).await;
-        match send_heartbeat(&paths, &me, advertise_url.as_deref()).await {
-            Ok(_) => {
-                if consecutive_failures > 0 {
-                    tracing::info!("ccteam host serve: heartbeat recovered");
-                }
-                consecutive_failures = 0;
-            }
-            Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                tracing::warn!(error = %e, consecutive_failures, "ccteam host serve: heartbeat failed");
-            }
-        }
-    }
-}
-
-/// +/- 20% jitter derived from the wall clock (no new `rand` dependency
-/// for one non-cryptographic scheduling nicety).
-fn jittered(period: std::time::Duration) -> std::time::Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // Map to a [-20%, +20%] fraction.
-    let frac = (nanos % 4001) as i64 - 2000; // [-2000, 2000] -> per-mille-ish
-    let delta_ms = (period.as_millis() as i64 * frac) / 10_000;
-    let total_ms = (period.as_millis() as i64 + delta_ms).max(100);
-    std::time::Duration::from_millis(total_ms as u64)
-}
-
-/// v0.9.0 dual-role daemon — when this machine has ALSO joined another daemon
-/// as a satellite (`ccteam host join` → `state/hosts/self.json`), the
-/// resident `ccteam start` process embeds the `ccteam-exec.v1` bridge + the
-/// heartbeat loop in-process: one daemon is simultaneously a main daemon and
-/// a satellite. A dedicated `ccteam host serve` is only needed on machines
-/// that don't run a daemon at all.
-///
-/// - The credentials file is POLLED (30s), so a `host join` issued after the
-///   daemon started is picked up without a restart.
-/// - A bind conflict on the exec port (a standalone `ccteam host serve`
-///   already owns it) is non-fatal: heartbeats keep running so the host
-///   stays fresh in the remote registry, and exec is served by whichever
-///   process bound the port.
-/// - Advertise URL: `CCTEAM_EXEC_ADVERTISE_URL` env when set, else the
-///   heartbeat omits `agent_url` and the remote registry keeps the value
-///   from `host join --agent-url` (or a standalone serve run).
-async fn run_embedded_satellite(
-    paths: CcteamPaths,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    const RECHECK: Duration = Duration::from_secs(30);
-    let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
-    let me = loop {
-        match ccteam_core::SatelliteSelf::load(&self_path) {
-            Ok(me) => break me,
-            Err(_) => {
-                // Not joined (yet) — keep watching for a later `host join`.
-                tokio::select! {
-                    _ = shutdown.changed() => return,
-                    _ = tokio::time::sleep(RECHECK) => {}
-                }
-            }
-        }
-    };
-    let bind = std::env::var("CCTEAM_EXEC_BIND").unwrap_or_else(|_| "0.0.0.0:7332".to_string());
-    let advertise = std::env::var("CCTEAM_EXEC_ADVERTISE_URL").ok();
-    tracing::info!(
-        host = %me.host,
-        daemon = %me.daemon_url,
-        %bind,
-        "dual-role daemon: embedding satellite exec bridge + heartbeat (joined via `ccteam host join`)"
-    );
-
-    let hb_paths = paths.clone();
-    let hb_me = me.clone();
-    let mut hb_shutdown = shutdown.clone();
-    let hb_advertise = advertise.clone();
-    let heartbeat = tokio::spawn(async move {
-        tokio::select! {
-            _ = hb_shutdown.changed() => {}
-            _ = host_heartbeat_loop(hb_paths, hb_me, hb_advertise) => {}
-        }
-    });
-
-    match tokio::net::TcpListener::bind(&bind).await {
-        Ok(listener) => {
-            let router = ccteam_web::satellite::satellite_router(
-                paths.clone(),
-                me.agent_token.clone(),
-                me.daemon_url.clone(),
-            );
-            let mut rx = shutdown.clone();
-            if let Err(err) = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = rx.changed().await;
-                })
-                .await
-            {
-                tracing::warn!(error = %err, "embedded satellite exec bridge exited with error");
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                %bind,
-                error = %err,
-                "embedded satellite: exec-bridge bind failed (standalone `ccteam host serve` running?); heartbeat continues"
-            );
-            let mut rx = shutdown.clone();
-            let _ = rx.changed().await;
-        }
-    }
-    heartbeat.abort();
-}
+// v0.9.0 reverse-connection — the satellite is a CLIENT
+// (`ccteam_web::satellite::run_satellite_client`, spawned by `run_start`):
+// it dials OUT to the main daemon and exposes no listener, so the old
+// `ccteam host serve` / `host heartbeat` commands, the `:7332` exec-bridge
+// bind, and the `CCTEAM_EXEC_BIND`/`CCTEAM_EXEC_ADVERTISE_URL` knobs are
+// gone. Every node just runs `ccteam start`; whether it is ALSO a
+// satellite depends only on `state/hosts/self.json` (polled in-client, so
+// a `host join` after startup activates without a restart).
 
 fn host_ls(paths: &CcteamPaths) -> Result<()> {
     let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
@@ -2358,6 +2086,12 @@ fn run_start(
         // it can be threaded into `DaemonArgs::claude_stream_json_adapter`
         // below: the daemon wires the production HITL resolver onto this
         // EXACT adapter once pending + the event sink exist.
+        // v0.9.0 reverse-connection — ONE hub per daemon process: satellite
+        // control channels register into it (web WS handlers) and remote
+        // spawns open exec dial-backs through it (gateway proxy). Built
+        // before the gateway so it can be baked into both.
+        let host_hub = std::sync::Arc::new(ccteam_harness::HostChannelHub::default());
+
         let (shared_gateway, shared_claude_stream_json): (
             Option<std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>>,
             Option<std::sync::Arc<ccteam_harness::ClaudeStreamJsonAdapter>>,
@@ -2365,10 +2099,15 @@ fn run_start(
             (None, None)
         } else {
             match ccteam_im::build_gateway_for_daemon(None) {
-                Ok((g, adapter)) => (
-                    Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
-                    Some(adapter),
-                ),
+                Ok((mut g, adapter)) => {
+                    g.set_remote_host_proxy(std::sync::Arc::new(
+                        ccteam_im::remote_host::HubRemoteHostProxy::new(host_hub.clone()),
+                    ));
+                    (
+                        Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
+                        Some(adapter),
+                    )
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -2442,6 +2181,7 @@ fn run_start(
             // `POST /mcp` can drive session_* / chat_send_file / HITL.
             let web_mcp_sink = gw_event_tx.clone();
             let web_mcp_pending = pending_registry.clone();
+            let web_host_hub = host_hub.clone();
             Some(tokio::spawn(async move {
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
@@ -2454,6 +2194,7 @@ fn run_start(
                             state = state.with_gateway(gw);
                         }
                         state = state.with_mcp(web_mcp_sink, web_mcp_pending);
+                        state = state.with_host_hub(web_host_hub);
                         state
                     },
                     async move {
@@ -2513,10 +2254,11 @@ fn run_start(
             .await
         });
 
-        // v0.9.0 dual-role daemon — if this machine is (or later becomes) a
-        // satellite of another daemon, serve the exec bridge + heartbeat from
-        // THIS process too (see `run_embedded_satellite`).
-        let satellite_handle = tokio::spawn(run_embedded_satellite(
+        // v0.9.0 reverse-connection — if this machine is (or later becomes)
+        // a satellite of another daemon (`host join` → self.json), keep an
+        // outbound `ccteam-host.v1` control channel to it from THIS process.
+        // No listener: the same `ccteam start` is main daemon and satellite.
+        let satellite_handle = tokio::spawn(ccteam_web::satellite::run_satellite_client(
             hook_sink_paths.clone(),
             shutdown_rx.clone(),
         ));

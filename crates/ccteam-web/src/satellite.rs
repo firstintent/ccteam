@@ -1,466 +1,374 @@
-//! v0.9.0 W3 (F3, tech-design §4.1/§4.2) — the satellite side of
-//! `ccteam-exec.v1`. `ccteam host serve` embeds [`satellite_router`] (plus
-//! its own heartbeat loop, owned by the CLI) so a machine can run vendor
-//! CLIs on the main daemon's behalf.
+//! v0.9.0 reverse-connection — the satellite CLIENT.
 //!
-//! **The satellite is a protocol-blind byte pump** (red line: no
-//! scraping, no interpretation): it never parses stream-json / ACP /
-//! JSON-RPC, only bytes. Its own safety invariants (tech-design §4.2):
+//! A satellite exposes **no listener**. This module maintains one outbound
+//! `ccteam-host.v1` control WebSocket to the main daemon
+//! (`GET {daemon}/api/v1/hosts/channel`, bearer = this host's agent token)
+//! and, on each `exec_open{nonce}` frame, dials back a fresh
+//! `ccteam-exec.v1` WS (`GET {daemon}/api/v1/hosts/exec/{nonce}`) and runs
+//! the protocol-blind exec engine (`ccteam_harness::run_exec_session`)
+//! over it. All satellite traffic is outbound to the daemon's single web
+//! port — only the daemon needs a reachable address.
 //!
-//! 1. `vendor` → binary resolved from ITS OWN `CCTEAM_<VENDOR>_BIN` env or
-//!    `PATH` default name — the wire NEVER carries a binary path.
-//! 2. `slug` → cwd resolved from ITS OWN `~/.ccteam/config.yaml::projects[]`
-//!    — an unregistered slug is rejected, never guessed.
-//! 3. `files[].relpath` must resolve (lexically, no traversal) under
-//!    `<project>/.ccteam/chat/<sid>/`.
-//! 4. `env` — only `CCTEAM_*` keys are honored, merged over the
-//!    satellite's own environment.
-//! 5. `files[].content` may embed the literal token `{{DAEMON_URL}}`,
-//!    substituted with this satellite's own `SatelliteSelf::daemon_url`.
+//! Embedded in every `ccteam start` (unified process: a node is a
+//! satellite iff `ccteam host join` wrote `state/hosts/self.json`, which
+//! is polled so a join after startup activates without a restart).
 //!
-//! Bearer auth (`Authorization: Bearer <agent_token>`, `ct_eq`) gates
-//! `GET /ws/exec` before the WS upgrade — a bad/missing token never even
-//! reaches the exec handler.
+//! Production-stability contract:
+//! - reconnect with jittered exponential backoff (1s → 60s cap), reset
+//!   after a connection that stayed up ≥ [`STABLE_AFTER`];
+//! - periodic `report` frames (agents/projects/version, every
+//!   `REPORT_PERIOD`) double as application-level keepalive;
+//! - half-open detection: the daemon pings every `KEEPALIVE_PERIOD`; a
+//!   channel with no inbound frame for `IDLE_TIMEOUT` is torn down and
+//!   redialed;
+//! - unknown control-channel ops are ignored (forward compatibility).
 
-use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
+use anyhow::{Context, Result};
+use ccteam_core::{CcteamPaths, SatelliteSelf};
+use ccteam_harness::{
+    run_exec_session, SatelliteExecCtx, EXEC_SUBPROTOCOL, HOST_CHANNEL_SUBPROTOCOL, IDLE_TIMEOUT,
+    REPORT_PERIOD,
 };
-use ccteam_core::{session_secret, CcteamPaths};
-use ccteam_harness::{ExecExit, ExecFile, ExecSpec, ExecStarted, EXEC_SUBPROTOCOL};
-use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::Message;
 
-/// One vendor this satellite is willing to run + its `CCTEAM_*_BIN`
-/// override / default `PATH` name. The wire `vendor` token is checked
-/// against this allowlist — an unlisted vendor is rejected
-/// (`vendor-not-allowed`), never run.
-const ALLOWED_VENDORS: &[(&str, &str, &str)] = &[
-    ("claude", ccteam_harness::CLAUDE_BIN_ENV, "claude"),
-    ("codex", ccteam_harness::CODEX_BIN_ENV, "codex"),
-    ("grok", ccteam_harness::GROK_BIN_ENV, "grok"),
-    ("opencode", ccteam_harness::OPENCODE_BIN_ENV, "opencode"),
-];
+/// Re-check `state/hosts/self.json` this often while not joined.
+const RECHECK: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
-struct SatelliteState {
-    paths: Arc<CcteamPaths>,
-    agent_token: Arc<String>,
-    daemon_url: Arc<String>,
+/// TCP/WS handshake timeout for both the control channel and dial-backs.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A connection that stayed up at least this long resets the backoff.
+const STABLE_AFTER: Duration = Duration::from_secs(30);
+
+/// Reconnect backoff cap.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Why the control channel ended.
+enum ChannelEnd {
+    /// Daemon closed / link dropped / half-open teardown — redial.
+    Closed,
+    /// Process shutdown — exit the client loop.
+    Shutdown,
 }
 
-/// Build the satellite router: `GET /health` + `GET /ws/exec`. `paths` is
-/// THIS machine's `CcteamPaths` (its own project registry); `agent_token`
-/// is the bearer `GET /ws/exec` requires (the satellite's own
-/// `SatelliteSelf::agent_token`); `daemon_url` is substituted for the
-/// `{{DAEMON_URL}}` template token in shipped file content.
-pub fn satellite_router(paths: CcteamPaths, agent_token: String, daemon_url: String) -> Router {
-    let state = SatelliteState {
-        paths: Arc::new(paths),
-        agent_token: Arc::new(agent_token),
-        daemon_url: Arc::new(daemon_url),
+/// Rewrite the daemon's `http(s)://…` base URL to `ws(s)://…{path}`.
+fn ws_url(daemon_url: &str, path: &str) -> String {
+    let trimmed = daemon_url.trim().trim_end_matches('/');
+    let base = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        // Already ws(s):// (or schemeless) — pass through.
+        trimmed.to_string()
     };
-    Router::new()
-        .route("/health", get(handle_health))
-        .route("/ws/exec", get(handle_ws_exec))
-        .with_state(state)
+    format!("{base}{path}")
 }
 
-async fn handle_health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+/// ±20% wall-clock jitter (no `rand` dependency for a scheduling nicety) —
+/// keeps a fleet of satellites from sync-dialing a restarted daemon.
+fn jittered(period: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let frac = (nanos % 4001) as i64 - 2000; // [-2000, 2000]
+    let delta_ms = (period.as_millis() as i64 * frac) / 10_000;
+    let total_ms = (period.as_millis() as i64 + delta_ms).max(100);
+    Duration::from_millis(total_ms as u64)
 }
 
-fn bearer_token(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches("ccteam:")
-        .to_string()
+/// Build the `{"op":"report", …}` control frame: this machine's agent
+/// probe + its own registered projects — the fields the daemon-side gate
+/// (`gate_remote_spawn_project`) and the hosts UI read.
+async fn build_report(paths: &CcteamPaths) -> serde_json::Value {
+    let agents = tokio::task::spawn_blocking(ccteam_core::probe_agents)
+        .await
+        .unwrap_or_default();
+    let projects: Vec<ccteam_core::HostProjectReport> = ccteam_core::config::load(&paths.root)
+        .map(|cfg| {
+            cfg.projects
+                .into_iter()
+                .map(|p| ccteam_core::HostProjectReport {
+                    slug: p.slug,
+                    path: p.path.display().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "op": "report",
+        "agents": agents,
+        "projects": projects,
+        "ccteam_version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
-async fn handle_ws_exec(
-    State(state): State<SatelliteState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let presented = bearer_token(&headers);
-    if presented.is_empty() || !session_secret::ct_eq(&presented, &state.agent_token) {
-        return (StatusCode::UNAUTHORIZED, "invalid or missing agent token").into_response();
-    }
-    ws.protocols([EXEC_SUBPROTOCOL])
-        .on_upgrade(move |socket| run_exec_session(socket, state))
+/// Build an authenticated WS client request (bearer + subprotocol).
+fn ws_request(
+    url: &str,
+    agent_token: &str,
+    subprotocol: &'static str,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url
+        .into_client_request()
+        .with_context(|| format!("invalid ws url: {url}"))?;
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer ccteam:{agent_token}"))
+            .context("agent token is not a valid header value")?,
+    );
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static(subprotocol),
+    );
+    Ok(request)
 }
 
-/// Resolve `vendor` against [`ALLOWED_VENDORS`]. `None` ⇒ not allowed.
-fn resolve_vendor_bin(vendor: &str) -> Option<String> {
-    ALLOWED_VENDORS
-        .iter()
-        .find(|(v, _, _)| *v == vendor)
-        .map(|(_, env, default)| std::env::var(env).unwrap_or_else(|_| (*default).to_string()))
-}
-
-/// Resolve `slug` against THIS machine's OWN project registry
-/// (`~/.ccteam/config.yaml::projects[]`). `None` ⇒ unregistered — never a
-/// guessed fallback path (unlike `CcteamPaths::project_dir`, which is
-/// deliberately lenient for the local daemon's own use).
-fn resolve_project_dir(paths: &CcteamPaths, slug: &str) -> Option<PathBuf> {
-    let cfg = ccteam_core::config::load(&paths.root).ok()?;
-    cfg.projects
-        .into_iter()
-        .find(|p| p.slug == slug)
-        .map(|p| p.path)
-}
-
-/// Lexically resolve `relpath` against `cwd` and require the result to
-/// fall under `confine_under` (both already-absolute). Rejects absolute
-/// relpaths and any `..` component — no traversal, and no reliance on
-/// `canonicalize()` (the file may not exist yet).
-fn confined_join(cwd: &Path, relpath: &str, confine_under: &Path) -> Option<PathBuf> {
-    let rel = Path::new(relpath);
-    let mut normalized = PathBuf::new();
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(s) => normalized.push(s),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return None;
-    }
-    let full = cwd.join(&normalized);
-    full.starts_with(confine_under).then_some(full)
-}
-
-/// Materialize `files` under `<cwd>/.ccteam/chat/<sid>/`, substituting the
-/// `{{DAEMON_URL}}` template token. Returns `Err(readable message)` on the
-/// first violation — nothing is left half-written on a reject (each file
-/// is validated before any write starts).
-fn write_confined_files(
-    cwd: &Path,
-    sid: &str,
-    files: &[ExecFile],
-    daemon_url: &str,
-) -> Result<(), String> {
-    let confine_under = cwd.join(".ccteam").join("chat").join(sid);
-    let mut resolved = Vec::with_capacity(files.len());
-    for f in files {
-        let dest = confined_join(cwd, &f.relpath, &confine_under)
-            .ok_or_else(|| format!("relpath escapes .ccteam/chat/{sid}/: {}", f.relpath))?;
-        resolved.push((
-            dest,
-            f.content.replace(ExecSpec::DAEMON_URL_TOKEN, daemon_url),
-        ));
-    }
-    for (dest, content) in resolved {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
-        }
-        std::fs::write(&dest, content.as_bytes())
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
-    }
-    Ok(())
-}
-
-async fn send_started(
-    socket: &mut WebSocket,
-    ok: bool,
-    pid: Option<u32>,
-    code: &str,
-    message: &str,
+/// The resident satellite client: poll for join credentials, keep the
+/// control channel up (backoff + jitter + stable-reset), dispatch exec
+/// dial-backs. Runs until `shutdown` flips.
+pub async fn run_satellite_client(
+    paths: CcteamPaths,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let body = ExecStarted {
-        ok,
-        pid,
-        code: (!code.is_empty()).then(|| code.to_string()),
-        message: (!message.is_empty()).then(|| message.to_string()),
-    };
-    if let Ok(json) = serde_json::to_string(&body) {
-        let _ = socket.send(Message::Text(json.into())).await;
-    }
-}
-
-/// The whole exec-bridge session lifecycle for one WS connection: read
-/// [`ExecSpec`] → validate (vendor/slug/files) → spawn → bidirectional
-/// byte bridge → [`ExecExit`] tail. Never panics on a malformed/hostile
-/// peer — every failure path sends a readable [`ExecStarted`] rejection
-/// (or silently drops a connection that never sent a valid spec at all).
-async fn run_exec_session(mut socket: WebSocket, state: SatelliteState) {
-    let spec: ExecSpec = match socket.recv().await {
-        Some(Ok(Message::Text(t))) => match serde_json::from_str(&t) {
-            Ok(s) => s,
-            Err(e) => {
-                send_started(
-                    &mut socket,
-                    false,
-                    None,
-                    "bad-spec",
-                    &format!("invalid ExecSpec: {e}"),
-                )
-                .await;
-                return;
-            }
-        },
-        _ => return, // peer vanished / sent garbage before any spec — nothing to reject with.
-    };
-
-    let Some(bin) = resolve_vendor_bin(&spec.vendor) else {
-        send_started(
-            &mut socket,
-            false,
-            None,
-            "vendor-not-allowed",
-            &format!(
-                "vendor `{}` is not on this satellite's allowlist",
-                spec.vendor
-            ),
-        )
-        .await;
-        return;
-    };
-
-    let Some(cwd) = resolve_project_dir(&state.paths, &spec.slug) else {
-        send_started(
-            &mut socket,
-            false,
-            None,
-            "unknown-slug",
-            &format!(
-                "project `{}` is not registered on this host; run `ccteam init` here first",
-                spec.slug
-            ),
-        )
-        .await;
-        return;
-    };
-
-    if let Err(msg) = write_confined_files(&cwd, &spec.sid, &spec.files, &state.daemon_url) {
-        send_started(&mut socket, false, None, "bad-spec", &msg).await;
-        return;
-    }
-
-    let mut cmd = Command::new(&bin);
-    cmd.args(&spec.args)
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Env allowlist (§4.2 invariant ④): only CCTEAM_* keys, merged OVER
-    // the satellite's own environment (never a raw passthrough of the
-    // wire env, and never clobbering PATH/HOME/etc).
-    for (k, v) in &spec.env {
-        if k.starts_with("CCTEAM_") {
-            cmd.env(k, v);
-        }
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            send_started(
-                &mut socket,
-                false,
-                None,
-                "spawn-failed",
-                &format!("{bin}: {e}"),
-            )
-            .await;
+    let self_path = SatelliteSelf::path_in(&paths.root);
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        if *shutdown.borrow() {
             return;
         }
-    };
-    let pid = child.id();
-    send_started(&mut socket, true, pid, "", "").await;
-
-    let Some(mut stdout) = child.stdout.take() else {
-        return;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return;
-    };
-    if let Some(mut stderr) = child.stderr.take() {
-        // stderr → tracing only, NEVER the wire (red line: no terminal
-        // scraping surfaced to the caller; this is diagnostic-only).
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf).await;
-            if !buf.is_empty() {
-                tracing::warn!(
-                    stderr = %String::from_utf8_lossy(&buf),
-                    "ccteam-exec.v1: child stderr (diagnostic only, never streamed)"
-                );
+        // (Re)load credentials each attempt: a fresh `host join` (new
+        // daemon URL / token) takes effect on the next dial, not a restart.
+        let me = match SatelliteSelf::load(&self_path) {
+            Ok(me) => me,
+            Err(_) => {
+                // Not joined (yet) — keep watching.
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(RECHECK) => continue,
+                }
             }
-        });
-    }
-
-    let mut buf = [0u8; 8192];
-    let exit_status = loop {
+        };
+        let started = tokio::time::Instant::now();
+        match run_control_channel(&paths, &me, &mut shutdown).await {
+            Ok(ChannelEnd::Shutdown) => return,
+            Ok(ChannelEnd::Closed) => {
+                tracing::info!(host = %me.host, daemon = %me.daemon_url, "control channel closed; redialing");
+            }
+            Err(err) => {
+                tracing::warn!(host = %me.host, daemon = %me.daemon_url, error = %err, "control channel failed");
+            }
+        }
+        if started.elapsed() >= STABLE_AFTER {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+        }
+        let backoff = Duration::from_secs(1u64 << consecutive_failures.min(6)).min(MAX_BACKOFF);
         tokio::select! {
-            n = stdout.read(&mut buf) => {
-                match n {
-                    Ok(0) => break child.wait().await.ok(),
-                    Ok(n) => {
-                        if socket.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                            break None;
-                        }
-                    }
-                    Err(_) => break None,
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Binary(b))) => {
-                        if stdin.write_all(&b).await.is_err() {
-                            break None;
-                        }
-                    }
-                    Some(Ok(Message::Text(t))) if t.contains("stdin_close") => {
-                        let _ = stdin.shutdown().await;
-                    }
-                    Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => break None,
-                    Some(Err(_)) => break None,
-                }
-            }
-            status = child.wait() => {
-                break status.ok();
-            }
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(jittered(backoff)) => {}
         }
-    };
-
-    // WS dropped mid-flight or an IO error broke the loop before the
-    // child exited on its own — kill it (red line honesty: WS-side
-    // grandchildren of `bin` are NOT killed, a documented simplification;
-    // vendor `--resume` makes the next connect's context whole again).
-    let exit_status = match exit_status {
-        Some(s) => Some(s),
-        None => {
-            let _ = child.start_kill();
-            child.wait().await.ok()
-        }
-    };
-    let ev = build_exec_exit(exit_status);
-    if let Ok(json) = serde_json::to_string(&ev) {
-        let _ = socket.send(Message::Text(json.into())).await;
     }
 }
 
-#[cfg(unix)]
-fn build_exec_exit(status: Option<std::process::ExitStatus>) -> ExecExit {
-    use std::os::unix::process::ExitStatusExt;
-    match status {
-        Some(s) => ExecExit {
-            exit: s.code(),
-            signal: s.signal().map(|n| n.to_string()),
-        },
-        None => ExecExit::default(),
+/// One control-channel connection lifetime.
+async fn run_control_channel(
+    paths: &CcteamPaths,
+    me: &SatelliteSelf,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<ChannelEnd> {
+    let url = ws_url(&me.daemon_url, "/api/v1/hosts/channel");
+    let request = ws_request(&url, &me.agent_token, HOST_CHANNEL_SUBPROTOCOL)?;
+    let (ws, _resp) = tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("ccteam-host.v1 dial to {url} timed out"))?
+        .with_context(|| format!("ccteam-host.v1 dial to {url} failed"))?;
+    tracing::info!(host = %me.host, daemon = %me.daemon_url, "control channel connected");
+    let (mut sink, mut stream) = ws.split();
+
+    // Immediate report on connect (instant presence + fresh projects).
+    let first = build_report(paths).await;
+    sink.send(Message::Text(first.to_string()))
+        .await
+        .context("send initial report")?;
+
+    let mut report_tick = tokio::time::interval(REPORT_PERIOD);
+    report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    report_tick.reset(); // the initial report above covers the first period
+    let mut idle_tick = tokio::time::interval(IDLE_TIMEOUT / 3);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            msg = stream.next() => match msg {
+                Some(Ok(Message::Text(t))) => {
+                    last_rx = tokio::time::Instant::now();
+                    handle_control_frame(paths, me, &t);
+                }
+                Some(Ok(Message::Close(_))) | None => return Ok(ChannelEnd::Closed),
+                Some(Ok(_)) => {
+                    // Ping/Pong/Binary — liveness only (tungstenite
+                    // auto-answers pings while the stream is polled).
+                    last_rx = tokio::time::Instant::now();
+                }
+                Some(Err(e)) => return Err(e).context("control channel read"),
+            },
+            _ = report_tick.tick() => {
+                let report = build_report(paths).await;
+                sink.send(Message::Text(report.to_string()))
+                    .await
+                    .context("send report")?;
+            }
+            _ = idle_tick.tick() => {
+                if last_rx.elapsed() > IDLE_TIMEOUT {
+                    anyhow::bail!(
+                        "control channel idle past {}s (half-open link)",
+                        IDLE_TIMEOUT.as_secs()
+                    );
+                }
+            }
+            _ = shutdown.changed() => {
+                let _ = sink.send(Message::Close(None)).await;
+                return Ok(ChannelEnd::Shutdown);
+            }
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn build_exec_exit(status: Option<std::process::ExitStatus>) -> ExecExit {
-    ExecExit {
-        exit: status.and_then(|s| s.code()),
-        signal: None,
+/// One inbound control frame. Unknown ops are ignored (forward compat).
+fn handle_control_frame(paths: &CcteamPaths, me: &SatelliteSelf, raw: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        tracing::debug!("satellite: non-JSON control frame ignored");
+        return;
+    };
+    match v.get("op").and_then(|o| o.as_str()) {
+        Some("exec_open") => {
+            let Some(nonce) = v.get("nonce").and_then(|n| n.as_str()) else {
+                tracing::warn!("satellite: exec_open without nonce ignored");
+                return;
+            };
+            let sid = v
+                .get("sid")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            tracing::info!(sid = %sid, "satellite: exec_open — dialing back");
+            let paths = paths.clone();
+            let me = me.clone();
+            let nonce = nonce.to_string();
+            tokio::spawn(async move {
+                if let Err(err) = run_exec_dialback(paths, me, &nonce).await {
+                    tracing::warn!(sid = %sid, error = %err, "satellite: exec dial-back failed");
+                }
+            });
+        }
+        other => {
+            tracing::debug!(op = ?other, "satellite: unknown control op ignored (forward-compat)")
+        }
     }
+}
+
+/// Dial back one `ccteam-exec.v1` WS for `nonce` and run the exec engine
+/// over it. The engine owns the whole session lifecycle (spec → spawn →
+/// pump → exit tail); this function only supplies transport + context.
+async fn run_exec_dialback(paths: CcteamPaths, me: SatelliteSelf, nonce: &str) -> Result<()> {
+    let url = ws_url(&me.daemon_url, &format!("/api/v1/hosts/exec/{nonce}"));
+    let request = ws_request(&url, &me.agent_token, EXEC_SUBPROTOCOL)?;
+    let (ws, _resp) = tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| anyhow::anyhow!("ccteam-exec.v1 dial-back timed out"))?
+        .context("ccteam-exec.v1 dial-back failed")?;
+    let (sink, stream) = ws.split();
+    let root = paths.root.clone();
+    let resolver = move |slug: &str| -> Option<PathBuf> {
+        // THIS machine's own project registry — an unregistered slug is
+        // rejected by the engine, never guessed.
+        ccteam_core::config::load(&root)
+            .ok()?
+            .projects
+            .into_iter()
+            .find(|p| p.slug == slug)
+            .map(|p| p.path)
+    };
+    let ctx = SatelliteExecCtx {
+        daemon_url: &me.daemon_url,
+        resolve_project_dir: &resolver,
+    };
+    run_exec_session(stream, sink, &ctx).await;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
-    fn resolve_vendor_bin_rejects_unlisted_vendor() {
-        assert!(resolve_vendor_bin("gemini").is_none());
-        assert!(resolve_vendor_bin("claude").is_some());
+    fn ws_url_rewrites_scheme_and_appends_path() {
+        assert_eq!(
+            ws_url("http://192.168.1.10:7331", "/api/v1/hosts/channel"),
+            "ws://192.168.1.10:7331/api/v1/hosts/channel"
+        );
+        assert_eq!(
+            ws_url("https://daemon.example.com/", "/api/v1/hosts/exec/abc"),
+            "wss://daemon.example.com/api/v1/hosts/exec/abc"
+        );
+        assert_eq!(ws_url("ws://127.0.0.1:7331", "/x"), "ws://127.0.0.1:7331/x");
     }
 
     #[test]
-    fn resolve_project_dir_none_for_unregistered_slug() {
-        let tmp = TempDir::new().unwrap();
+    fn jittered_stays_within_20_percent_plus_floor() {
+        let base = Duration::from_secs(10);
+        for _ in 0..32 {
+            let j = jittered(base);
+            assert!(j >= Duration::from_secs(8), "got {j:?}");
+            assert!(j <= Duration::from_secs(12), "got {j:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_report_carries_op_and_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        std::fs::create_dir_all(&paths.root).unwrap();
-        assert!(resolve_project_dir(&paths, "demo").is_none());
+        let report = build_report(&paths).await;
+        assert_eq!(report["op"], "report");
+        assert_eq!(report["ccteam_version"], env!("CARGO_PKG_VERSION"));
+        assert!(report["projects"].is_array());
+        // Parses into the wire type the daemon applies (minus the op tag).
+        let parsed: ccteam_core::HostReport = serde_json::from_value(report).unwrap();
+        assert!(parsed.ccteam_version.is_some());
+    }
 
-        ccteam_core::config::upsert_project(
-            &paths.root,
-            ccteam_core::config::ProjectEntry {
-                slug: "demo".into(),
-                path: tmp.path().join("projects/demo"),
-                team: "dev".into(),
-                installed_at: chrono::Utc::now(),
-            },
+    #[test]
+    fn ws_request_carries_bearer_and_subprotocol() {
+        let req = ws_request(
+            "ws://127.0.0.1:7331/api/v1/hosts/channel",
+            "deadbeef",
+            HOST_CHANNEL_SUBPROTOCOL,
         )
         .unwrap();
         assert_eq!(
-            resolve_project_dir(&paths, "demo"),
-            Some(tmp.path().join("projects/demo"))
+            req.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer ccteam:deadbeef")
         );
-        assert!(resolve_project_dir(&paths, "other").is_none());
-    }
-
-    #[test]
-    fn confined_join_rejects_traversal_and_absolute() {
-        let cwd = Path::new("/home/sat/projects/demo");
-        let confine = cwd.join(".ccteam/chat/s7");
-        assert!(confined_join(cwd, "../../etc/passwd", &confine).is_none());
-        assert!(confined_join(cwd, "/etc/passwd", &confine).is_none());
-        assert!(confined_join(cwd, ".ccteam/chat/s7/../s8/mcp.json", &confine).is_none());
         assert_eq!(
-            confined_join(cwd, ".ccteam/chat/s7/mcp.json", &confine),
-            Some(cwd.join(".ccteam/chat/s7/mcp.json"))
+            req.headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some(HOST_CHANNEL_SUBPROTOCOL)
         );
-    }
-
-    #[test]
-    fn write_confined_files_substitutes_daemon_url_token() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path().join("demo");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let files = vec![ExecFile {
-            relpath: ".ccteam/chat/s7/mcp.json".into(),
-            content: format!(r#"{{"url":"{}/mcp"}}"#, ExecSpec::DAEMON_URL_TOKEN),
-        }];
-        write_confined_files(&cwd, "s7", &files, "http://127.0.0.1:7331").unwrap();
-        let written = std::fs::read_to_string(cwd.join(".ccteam/chat/s7/mcp.json")).unwrap();
-        assert_eq!(written, r#"{"url":"http://127.0.0.1:7331/mcp"}"#);
-    }
-
-    #[test]
-    fn write_confined_files_rejects_traversal_and_writes_nothing() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path().join("demo");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let files = vec![
-            ExecFile {
-                relpath: ".ccteam/chat/s7/mcp.json".into(),
-                content: "ok".into(),
-            },
-            ExecFile {
-                relpath: "../../../etc/passwd".into(),
-                content: "pwned".into(),
-            },
-        ];
-        let err = write_confined_files(&cwd, "s7", &files, "http://x").unwrap_err();
-        assert!(err.contains("escapes"), "got: {err}");
-        // Nothing partially written — validated before any write starts.
-        assert!(!cwd.join(".ccteam/chat/s7/mcp.json").exists());
     }
 }

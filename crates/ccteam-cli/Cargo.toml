@@ -46,11 +46,9 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-# v0.8.24 Track D — `ccteam host join|heartbeat|join-token` HTTP client.
+# v0.8.24 Track D — `ccteam host join|mint-token` HTTP client.
 reqwest = { workspace = true, features = ["json"] }
-# v0.9.0 W3 — `ccteam host serve` calls `axum::serve` directly on the
-# `Router` `ccteam_web::satellite::satellite_router` builds (the "ws"
-# feature that router needs lives on the ccteam-web dependency edge).
+# `web_chat_bridge` test server + `ccteam web` knob forwarding.
 axum.workspace = true
 
 # V0.6.0 Wave 3 F112 §C — `ccteam prefs show` pretty-prints the

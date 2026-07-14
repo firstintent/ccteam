@@ -318,6 +318,23 @@ CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_B
 # 覆盖 vendor CLI 路径
 ```
 
+### 多机(卫星节点)
+
+每台机器都跑同一个 `ccteam start`。join 过另一台 daemon 的节点就是它的**卫星**——之后由卫星**主动出站**连接 daemon(反向连接):只有 daemon 需要可达地址/端口(`:7331`),卫星零暴露、在 NAT/防火墙后也能用。给 daemon 前置 HTTPS 反代即可全链路 wss。
+
+```bash
+# daemon 侧(或 web 控制台 → 主机页):铸 join token
+ccteam host mint-token --daemon http://daemon-host:7331 --web-token <admin-hex>
+
+# 卫星侧(任何跑着 ccteam start 的机器):
+ccteam host join --daemon http://daemon-host:7331 --token <join-token>
+# 本机运行中的 ccteam start 30 秒内自动拨出上线。
+
+ccteam host ls                     # 查看本机卫星凭据(如已 join)
+```
+
+卫星每 ~25s 经控制通道上报 agent 探测与已注册项目;主机页实时显示在线状态。要在卫星上跑会话:先在那台机器的仓库里 `ccteam init` 注册项目,再在 spawn 时带 `host:"<host-id>"`(web 控制台 / API / `session_spawn`)。远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。
+
 ---
 
 ## 排错(卡住时)
