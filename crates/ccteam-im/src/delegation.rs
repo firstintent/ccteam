@@ -23,7 +23,8 @@ pub struct DelegationSignal {
     pub child_sid: String,
     /// The exact turn id the pump durably appended (the dedup key).
     pub turn_id: String,
-    /// Tail of the assistant text (already truncated to the notification cap).
+    /// Full assistant text. The notification builder applies its own bounded
+    /// head/tail excerpt; the durable session ledger retains this verbatim.
     pub tail: String,
     /// The child's vendor (for the notification text + the progress event).
     pub vendor: AgentVendor,
@@ -31,22 +32,82 @@ pub struct DelegationSignal {
     pub host: String,
 }
 
-/// Max chars of the child's assistant text echoed into the notification tail.
-pub const NOTIFICATION_TAIL_CHARS: usize = 500;
+/// Result of a Unicode-safe character cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedText {
+    pub text: String,
+    pub truncated: bool,
+    /// Original character count before truncation.
+    pub total_chars: usize,
+}
 
-/// The last [`NOTIFICATION_TAIL_CHARS`] chars of `text` (trimmed), with a
-/// leading `…` when truncated. A completion tail = the child's CONCLUSION (the
-/// end of its output), so we keep the tail, not the head.
-pub fn notification_tail(text: &str) -> String {
-    let collapsed = text.trim();
-    let chars: Vec<char> = collapsed.chars().collect();
-    if chars.len() > NOTIFICATION_TAIL_CHARS {
-        let start = chars.len() - NOTIFICATION_TAIL_CHARS;
-        let tail: String = chars[start..].iter().collect();
-        format!("…{tail}")
-    } else {
-        collapsed.to_string()
+/// Keep a 70% head / 30% tail excerpt while fitting the supplied marker and
+/// content inside `max_chars`. All arithmetic is in Unicode scalar values, so
+/// slicing never lands inside a UTF-8 codepoint. `marker` receives the exact
+/// number of omitted source characters.
+pub(crate) fn truncate_head_tail_with_marker(
+    text: &str,
+    max_chars: usize,
+    marker: impl Fn(usize) -> String,
+) -> BoundedText {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return BoundedText {
+            text: text.to_string(),
+            truncated: false,
+            total_chars,
+        };
     }
+
+    // Marker length depends on the omitted-count digits. Iterate to the small
+    // fixed point instead of reporting an approximate count.
+    let mut keep_chars = max_chars;
+    let mut resolved = None;
+    for _ in 0..16 {
+        let omitted = total_chars.saturating_sub(keep_chars);
+        let candidate = marker(omitted);
+        let next_keep = max_chars.saturating_sub(candidate.chars().count());
+        if next_keep == keep_chars {
+            resolved = Some((candidate, keep_chars));
+            break;
+        }
+        keep_chars = next_keep;
+    }
+    let (marker_text, keep_chars) = resolved.unwrap_or_else(|| {
+        let candidate = marker(total_chars.saturating_sub(keep_chars));
+        let next_keep = max_chars.saturating_sub(candidate.chars().count());
+        (candidate, next_keep)
+    });
+
+    if marker_text.chars().count() >= max_chars {
+        return BoundedText {
+            text: marker_text.chars().take(max_chars).collect(),
+            truncated: true,
+            total_chars,
+        };
+    }
+
+    let head_chars = keep_chars.saturating_mul(70) / 100;
+    let tail_chars = keep_chars.saturating_sub(head_chars);
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text
+        .chars()
+        .skip(total_chars.saturating_sub(tail_chars))
+        .collect();
+    BoundedText {
+        text: format!("{head}{marker_text}{tail}"),
+        truncated: true,
+        total_chars,
+    }
+}
+
+/// Max characters of child answer embedded in a completion notification.
+pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 4_000;
+
+pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
+    format!(
+        "…[truncated {omitted} chars — full text stays in the session ledger; run session_collect{{sid:{child_sid}, tail:true}} for the full answer]…"
+    )
 }
 
 /// Build the completion-notification text delivered to the parent. English,
@@ -65,12 +126,17 @@ pub fn build_notification_text(
         .filter(|t| !t.is_empty())
         .map(|t| format!(" \"{t}\""))
         .unwrap_or_default();
-    let tail = notification_tail(assistant_text);
+    let excerpt = truncate_head_tail_with_marker(
+        assistant_text.trim(),
+        NOTIFICATION_ANSWER_MAX_CHARS,
+        |omitted| full_answer_marker(omitted, child_sid),
+    );
     format!(
         "[ccteam] delegated session {child_sid} ({}{label}) completed turn {turn_id}.\n\
-         --- tail ---\n{tail}\n\
-         (use session_collect{{sid:\"{child_sid}\"}} for the full output)",
+         --- answer ---\n{}\n\
+         (run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
         vendor_key(vendor),
+        excerpt.text,
     )
 }
 
@@ -322,16 +388,57 @@ mod tests {
             t.starts_with("[ccteam] delegated session s7 (grok \"research\") completed turn s7-3.")
         );
         assert!(t.contains("hello"));
-        assert!(t.contains("session_collect{sid:\"s7\"}"));
+        assert!(t.contains("session_collect{sid:s7, tail:true}"));
     }
 
     #[test]
-    fn notification_tail_truncates() {
-        let long = "x".repeat(NOTIFICATION_TAIL_CHARS + 50);
+    fn notification_answer_truncates_with_head_tail_and_pointer() {
+        let long = format!(
+            "HEAD{}TAIL",
+            "x".repeat(NOTIFICATION_ANSWER_MAX_CHARS + 500)
+        );
         let t = build_notification_text("s1", AgentVendor::Claude, None, "s1-1", &long);
-        // The tail is capped + ellipsized; no title parens content.
-        assert!(t.contains('…'));
+        assert!(t.contains("HEAD"));
+        assert!(t.contains("TAIL"));
+        assert!(t.contains("truncated"));
+        assert!(t.contains("session_collect{sid:s1, tail:true}"));
         assert!(t.contains("(claude)"));
+        let embedded = t
+            .split_once("--- answer ---\n")
+            .unwrap()
+            .1
+            .split_once("\n(run session_collect")
+            .unwrap()
+            .0;
+        assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);
+    }
+
+    #[test]
+    fn bounded_text_under_cap_is_untouched() {
+        let got = truncate_head_tail_with_marker("hello", 5, |n| format!("[{n}]"));
+        assert_eq!(got.text, "hello");
+        assert!(!got.truncated);
+        assert_eq!(got.total_chars, 5);
+    }
+
+    #[test]
+    fn bounded_text_over_cap_keeps_head_tail_and_marker() {
+        let input = format!("HEAD{}TAIL", "x".repeat(200));
+        let got = truncate_head_tail_with_marker(&input, 100, |n| format!("[cut {n}]"));
+        assert!(got.truncated);
+        assert_eq!(got.text.chars().count(), 100);
+        assert!(got.text.starts_with("HEAD"));
+        assert!(got.text.ends_with("TAIL"));
+        assert!(got.text.contains("[cut "));
+    }
+
+    #[test]
+    fn bounded_text_is_unicode_safe() {
+        let input = format!("开头{}结尾", "🦀数据".repeat(100));
+        let got = truncate_head_tail_with_marker(&input, 80, |n| format!("[省略{n}字]"));
+        assert_eq!(got.text.chars().count(), 80);
+        assert!(got.text.starts_with("开头"));
+        assert!(got.text.ends_with("结尾"));
     }
 
     #[test]

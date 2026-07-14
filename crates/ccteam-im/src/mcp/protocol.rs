@@ -197,7 +197,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `host` (`local` default, or a registered satellite), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -232,7 +232,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when it completes, ccteam delivers a completion notification back to you as a new turn (set `notify:false` to opt out and poll session_collect yourself). Pass `wait_seconds>0` to block inline for the answer: returns `{status:\"completed\", result_text, cost_usd?}` on completion or `{status:\"pending\"}` on timeout (the child keeps running — never cancelled). A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when it completes, ccteam delivers a completion notification back to you as a new turn (set `notify:false` to opt out and poll session_collect yourself). Pass `wait_seconds>0` to block inline for the answer: returns `{status:\"completed\", result_text, cost_usd?}` on completion or `{status:\"pending\"}` on timeout (the child keeps running — never cancelled). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -255,7 +255,8 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "sid": { "type": "string", "description": "Gateway session id (`s{n}`) to collect from." },
                     "since": { "type": "string", "description": "Optional turn_id cursor — return only assistant turns recorded AFTER this id." },
                     "n": { "type": "integer", "description": "Max turns to return (default 20). Applied after the `since` cursor filter." },
-                    "tail": { "type": "boolean", "description": "When true, return the NEWEST `n` turns (after the `since` filter) instead of the oldest — use to grab the final answer of a long transcript without paging." }
+                    "tail": { "type": "boolean", "description": "When true, return the NEWEST `n` turns (after the `since` filter) instead of the oldest — use to grab the final answer of a long transcript without paging." },
+                    "max_chars": { "type": "integer", "description": "Maximum total characters across returned turn contents (default 10000; clamped to 500–50000). Longer contents retain a 70% head / 30% tail excerpt with an explicit ledger pointer." }
                 },
                 "required": ["sid"],
             }),
@@ -489,6 +490,26 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for needed in SESSION_TOOL_NAMES {
             assert!(names.contains(needed), "missing {needed}");
+        }
+    }
+
+    #[test]
+    fn collect_schema_exposes_character_budget_and_delegation_prompts_are_terse() {
+        let defs = session_tool_definitions();
+        let collect = defs
+            .iter()
+            .find(|t| t["name"] == "session_collect")
+            .unwrap();
+        assert_eq!(
+            collect["inputSchema"]["properties"]["max_chars"]["type"],
+            "integer"
+        );
+        for name in ["session_spawn", "session_dispatch"] {
+            let description = defs.iter().find(|t| t["name"] == name).unwrap()["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("answer tersely with a structured summary"));
+            assert!(description.contains("no code or diff dumps"));
         }
     }
 

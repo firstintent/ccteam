@@ -156,6 +156,10 @@ impl McpDispatch {
 /// caller doesn't pass `n`. Keeps a runaway transcript from flooding the
 /// cto's context in one poll.
 const SESSION_COLLECT_DEFAULT_N: usize = 20;
+const SESSION_COLLECT_DEFAULT_MAX_CHARS: usize = 10_000;
+const SESSION_COLLECT_MIN_MAX_CHARS: usize = 500;
+const SESSION_COLLECT_MAX_MAX_CHARS: usize = 50_000;
+const INLINE_RESULT_MAX_CHARS: usize = 10_000;
 
 /// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
 /// answer before forgetting the prompt + reporting a timeout (the hook then
@@ -1634,6 +1638,12 @@ async fn dispatch_wait_for_completion(
             }
         })
         .unwrap_or((String::new(), None, None));
+    let result_text = crate::delegation::truncate_head_tail_with_marker(
+        &result_text,
+        INLINE_RESULT_MAX_CHARS,
+        |omitted| crate::delegation::full_answer_marker(omitted, child_sid),
+    )
+    .text;
 
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
@@ -1707,6 +1717,103 @@ fn page_collected_turns(
     (rows, last_turn_id, truncated)
 }
 
+fn collect_max_chars(args: &serde_json::Value) -> usize {
+    let Some(value) = args.get("max_chars") else {
+        return SESSION_COLLECT_DEFAULT_MAX_CHARS;
+    };
+    if let Some(n) = value.as_u64() {
+        return n.clamp(
+            SESSION_COLLECT_MIN_MAX_CHARS as u64,
+            SESSION_COLLECT_MAX_MAX_CHARS as u64,
+        ) as usize;
+    }
+    value
+        .as_i64()
+        .map(|n| {
+            n.clamp(
+                SESSION_COLLECT_MIN_MAX_CHARS as i64,
+                SESSION_COLLECT_MAX_MAX_CHARS as i64,
+            ) as usize
+        })
+        .unwrap_or(SESSION_COLLECT_DEFAULT_MAX_CHARS)
+}
+
+/// Fairly allocate a total output-character budget across turn contents:
+/// short turns stay intact and the remaining budget is shared between long
+/// turns. The returned budgets sum to at most `max_chars`.
+fn collected_turn_budgets(lengths: &[usize], max_chars: usize) -> Vec<usize> {
+    let mut budgets = vec![0; lengths.len()];
+    if lengths.iter().sum::<usize>() <= max_chars {
+        return lengths.to_vec();
+    }
+    let mut active: Vec<usize> = lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, len)| (*len > 0).then_some(idx))
+        .collect();
+    let mut remaining = max_chars;
+    while !active.is_empty() {
+        let share = remaining / active.len();
+        let settled: Vec<usize> = active
+            .iter()
+            .copied()
+            .filter(|idx| lengths[*idx] <= share)
+            .collect();
+        if settled.is_empty() {
+            let each = remaining / active.len();
+            let extra = remaining % active.len();
+            for (pos, idx) in active.into_iter().enumerate() {
+                budgets[idx] = each + usize::from(pos < extra);
+            }
+            break;
+        }
+        for idx in &settled {
+            budgets[*idx] = lengths[*idx];
+            remaining = remaining.saturating_sub(lengths[*idx]);
+        }
+        active.retain(|idx| !settled.contains(idx));
+    }
+    budgets
+}
+
+/// Apply the collect character budget to the already-selected turn page.
+/// Returns `(original_total_chars, any_content_truncated)`.
+fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (usize, bool) {
+    let lengths: Vec<usize> = rows
+        .iter()
+        .map(|row| {
+            row.get("content")
+                .and_then(|v| v.as_str())
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0)
+        })
+        .collect();
+    let total_chars = lengths.iter().sum();
+    if total_chars <= max_chars {
+        return (total_chars, false);
+    }
+    let budgets = collected_turn_budgets(&lengths, max_chars);
+    let mut truncated = false;
+    for ((row, original_chars), budget) in rows.iter_mut().zip(lengths).zip(budgets) {
+        if original_chars <= budget {
+            continue;
+        }
+        let content = row
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, |n| {
+            format!(
+                "…[truncated {n} chars — full text stays in the session ledger; page with session_collect{{sid, since, n}}]…"
+            )
+        });
+        row["content"] = serde_json::json!(bounded.text);
+        truncated |= bounded.truncated;
+    }
+    (total_chars, truncated)
+}
+
 /// v0.9.1 — honest per-sid activity for the MCP surfaces: classify the
 /// session's progress stream the SAME way the web session list does
 /// (`ccteam_core::stall`, → `working|idle|stale|stuck`), so a polling parent
@@ -1746,6 +1853,7 @@ async fn run_session_collect(
         .map(|x| x as usize)
         .unwrap_or(SESSION_COLLECT_DEFAULT_N);
     let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("session_collect", args, gateway, &sid, caller).await?;
 
@@ -1784,7 +1892,10 @@ async fn run_session_collect(
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
     // `page_collected_turns`.
-    let (rows, last_turn_id, truncated) = page_collected_turns(&all, since.as_deref(), n, tail);
+    let (mut rows, last_turn_id, page_truncated) =
+        page_collected_turns(&all, since.as_deref(), n, tail);
+    let (total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars);
+    let truncated = page_truncated || content_truncated;
 
     let mut body = serde_json::json!({
         "ok": true,
@@ -1799,6 +1910,9 @@ async fn run_session_collect(
         // True when more turns than `n` were available after `since`; the caller
         // should poll again with `cursor` to page through the remainder.
         "truncated": truncated,
+        // Original character count across this selected page, before any
+        // max_chars excerpts were applied.
+        "total_chars": total_chars,
     });
     if let Some(c) = cost_usd {
         body["cost_usd"] = serde_json::json!(c);
@@ -2928,6 +3042,37 @@ mod session_tool_tests {
         assert_eq!(rows2[0]["turn_id"], "t23");
     }
 
+    #[test]
+    fn collect_max_chars_defaults_and_clamps() {
+        assert_eq!(collect_max_chars(&json!({})), 10_000);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": 1 })), 500);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": -10 })), 500);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": 999_999 })), 50_000);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": 12_345 })), 12_345);
+    }
+
+    #[test]
+    fn collect_character_budget_is_total_across_turns() {
+        let long = format!("HEAD{}TAIL", "🦀".repeat(900));
+        let mut rows = vec![
+            json!({ "turn_id": "t1", "content": "short" }),
+            json!({ "turn_id": "t2", "content": long }),
+        ];
+        let (total_chars, truncated) = bound_collected_turns(&mut rows, 500);
+        assert_eq!(total_chars, 5 + 908);
+        assert!(truncated);
+        let returned: usize = rows
+            .iter()
+            .map(|r| r["content"].as_str().unwrap().chars().count())
+            .sum();
+        assert_eq!(returned, 500);
+        assert_eq!(rows[0]["content"], "short");
+        let excerpt = rows[1]["content"].as_str().unwrap();
+        assert!(excerpt.starts_with("HEAD"));
+        assert!(excerpt.ends_with("TAIL"));
+        assert!(excerpt.contains("page with session_collect{sid, since, n}"));
+    }
+
     // ========================================================================
     // v0.9.0 W2 (F2/F7) — dispatch-handler: idempotency, cycle, stop, wait.
     // The handlers are called directly with the `_caller_*` context that
@@ -3067,12 +3212,13 @@ mod session_tool_tests {
     async fn spawn_with_task_and_wait_returns_inline_result() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let task = format!("HEAD{}TAIL", "🦀".repeat(12_000));
         let r = parse(
             &run_session_spawn(
                 &ambient(
                     &principal,
                     "alpha",
-                    json!({ "task": "answer me", "wait_seconds": 6 }),
+                    json!({ "task": task, "wait_seconds": 6 }),
                 ),
                 &gw,
                 McpCaller::Ambient,
@@ -3081,13 +3227,66 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(r["status"], json!("completed"), "inline: {r}");
-        assert!(
-            r["result_text"]
-                .as_str()
-                .unwrap()
-                .contains("echo: answer me"),
-            "inline result: {r}"
+        let result = r["result_text"].as_str().unwrap();
+        assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
+        assert!(result.starts_with("echo: HEAD"));
+        assert!(result.ends_with("TAIL"));
+        assert!(result.contains("truncated"));
+        assert!(result.contains("session_collect{sid:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_response_reports_total_chars_and_honest_truncation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let answer = format!("HEAD{}TAIL", "界".repeat(1_200));
+        ccteam_harness::execution::turns_mirror::append_turn(
+            tmp.path(),
+            &child,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: "answer-1".into(),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: "question".into(),
+                assistant: answer,
+                usage: serde_json::Value::Null,
+                tool_calls: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let response = parse(
+            &run_session_collect(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": child, "max_chars": 500 }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
         );
+        assert_eq!(response["total_chars"], 1_208);
+        assert_eq!(response["truncated"], true);
+        let content = response["turns"][0]["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), 500);
+        assert!(content.starts_with("HEAD"));
+        assert!(content.ends_with("TAIL"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3230,12 +3429,13 @@ mod session_tool_tests {
             .as_str()
             .unwrap()
             .to_string();
+        let task = format!("HEAD{}TAIL", "界".repeat(12_000));
         let r = parse(
             &run_session_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
-                    json!({ "sid": child, "task": "go", "wait_seconds": 6 }),
+                    json!({ "sid": child, "task": task, "wait_seconds": 6 }),
                 ),
                 &gw,
                 McpCaller::Ambient,
@@ -3244,10 +3444,11 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(r["status"], json!("completed"), "inline: {r}");
-        assert!(
-            r["result_text"].as_str().unwrap().contains("echo: go"),
-            "inline result: {r}"
-        );
+        let result = r["result_text"].as_str().unwrap();
+        assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
+        assert!(result.starts_with("echo: HEAD"));
+        assert!(result.ends_with("TAIL"));
+        assert!(result.contains("truncated"));
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();

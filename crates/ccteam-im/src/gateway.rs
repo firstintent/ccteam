@@ -5220,6 +5220,8 @@ impl Gateway {
                 web_rows.push(row);
                 continue;
             }
+            let vendor_tag = format!("[{}]", vendor_str(s.vendor));
+            row = format!("{vendor_tag:<10} {row}");
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host…
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
@@ -11675,7 +11677,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
+        assert_eq!(
+            bare,
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+        );
 
         // Now report a model + usage → suffix appears, rendered the same
         // way Codex /status renders (shared helper).
@@ -11695,7 +11700,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -11715,8 +11720,35 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_sessions_im_rows_prefix_all_vendor_tags() {
+        let factory: Arc<
+            dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
+        for vendor in ["claude", "codex", "grok", "opencode"] {
+            gateway
+                .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
+                .await
+                .unwrap();
+        }
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        for vendor in ["claude", "codex", "grok", "opencode"] {
+            assert!(listing.contains(&format!("[{vendor}] ")), "{listing}");
+        }
     }
 
     /// v0.8.23 review §1.3-D item 9 — IM `/sessions` pins a session with an
@@ -11749,7 +11781,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\ns2:alpha:Claude:qa\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   s2:alpha:Claude:qa\n[claude]   s1:alpha:Claude:reviewer"]
         );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -11769,7 +11801,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ s1:alpha:Claude:reviewer\ns2:alpha:Claude:qa"],
+            vec!["📁 当前项目: alpha\n⏳ [claude]   s1:alpha:Claude:reviewer\n[claude]   s2:alpha:Claude:qa"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -12589,7 +12621,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner_sees,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
         );
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -12624,7 +12656,10 @@ mod tests {
             .handle_text("telegram", "339498819", "rob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
+        assert_eq!(
+            seen,
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+        );
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -12782,7 +12817,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Codex:api"]
+            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude:reviewer\n[codex]    s1:beta:Codex:api"]
         );
 
         let use_first = gateway
@@ -12855,7 +12890,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\ns4:beta:Claude:qa\ns3:beta:Codex:api\ns2:alpha:Codex:docs\ns1:alpha:Claude:reviewer"
+                "📁 当前项目: beta\n[claude]   s4:beta:Claude:qa\n[codex]    s3:beta:Codex:api\n[codex]    s2:alpha:Codex:docs\n[claude]   s1:alpha:Claude:reviewer"
             ]
         );
         let projects = gateway
@@ -13277,7 +13312,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude:reviewer\n[claude]   s1:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -13349,7 +13384,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1:beta:Claude:reviewer"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 当前项目: beta\n[claude]   s1:beta:Claude:reviewer"]
+        );
 
         assert_eq!(
             restored
@@ -13800,7 +13838,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
+        assert_eq!(
+            before,
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+        );
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -13834,7 +13875,7 @@ mod tests {
         // empty role field (`s2:beta:Claude:` + title).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns2:beta:Claude: 「where am i」\ns1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude: 「where am i」\n[claude]   s1:alpha:Claude:reviewer"]
         );
     }
 
@@ -14106,7 +14147,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listing[0].lines().filter(|l| l.starts_with('s')).count(),
+            listing[0].lines().skip(1).count(),
             3,
             "expected 3 distinct sessions (no dedup): {}",
             listing[0]
@@ -14175,7 +14216,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer 「hi」"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -14248,7 +14289,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「hi」"]
         );
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
@@ -14346,7 +14387,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「my custom title」"]
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「my custom title」"]
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -14360,7 +14401,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing2,
-            vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto 「my custom title」"],
+            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「my custom title」"],
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -15128,8 +15169,8 @@ mod tests {
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
         // Parent row precedes the indented child row.
-        let pline = format!("{parent}:alpha:Claude:");
-        let cline = format!("└─ {child}:alpha:Claude:");
+        let pline = format!("[claude]   {parent}:alpha:Claude:");
+        let cline = format!("└─ [claude]   {child}:alpha:Claude:");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
