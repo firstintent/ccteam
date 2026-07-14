@@ -69,11 +69,46 @@ pub struct CcteamConfig {
     #[serde(default = "default_claude_jobs_retention_days")]
     pub claude_jobs_retention_days: u32,
 
+    /// v0.9.2 — daemon-wide live-session capacity. Absent → the documented
+    /// default; the gateway gracefully evicts the least-recently-active live
+    /// session before admitting a fresh or revived one.
+    #[serde(default, skip_serializing_if = "SessionsConfig::is_default")]
+    pub sessions: SessionsConfig,
+
     /// v0.9.0 W2 (F5) — delegation guardrails. Absent → all documented
     /// defaults (zero-config runs safely). Global engine policy the gateway
     /// enforces on every agent-initiated (Ambient) spawn/dispatch.
     #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
     pub delegation: DelegationConfig,
+}
+
+/// v0.9.2 — daemon-wide live-session capacity. Every field defaults so older
+/// config files remain valid and zero-config installs get the standard cap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionsConfig {
+    /// Maximum number of concurrently live sessions daemon-wide.
+    #[serde(default = "default_sessions_max_live")]
+    pub max_live: u32,
+}
+
+pub fn default_sessions_max_live() -> u32 {
+    50
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            max_live: default_sessions_max_live(),
+        }
+    }
+}
+
+impl SessionsConfig {
+    /// True when this section matches the built-in default, allowing config
+    /// serialization to omit it for byte-stability on untouched installs.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// v0.9.0 W2 (F5) — delegation guardrail knobs. Every field defaults, so an
@@ -99,10 +134,10 @@ pub fn default_delegation_max_depth() -> u32 {
     2
 }
 pub fn default_delegation_max_children() -> u32 {
-    5
+    10
 }
 pub fn default_delegation_max_delegated() -> u32 {
-    16
+    50
 }
 
 impl Default for DelegationConfig {
@@ -137,6 +172,7 @@ impl Default for CcteamConfig {
             projects: Vec::new(),
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
+            sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
         }
     }
@@ -297,6 +333,7 @@ mod tests {
             projects: vec![entry.clone()],
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
+            sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
         };
         save(tmp.path(), &cfg).unwrap();
@@ -368,5 +405,34 @@ mod tests {
         std::fs::write(config_path(tmp.path()), "projects: [not a list\n").unwrap();
         let err = load(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("config.yaml"));
+    }
+
+    #[test]
+    fn session_and_delegation_defaults_are_documented_values() {
+        let cfg = CcteamConfig::default();
+        assert_eq!(cfg.sessions.max_live, 50);
+        assert_eq!(cfg.delegation.max_depth, 2);
+        assert_eq!(cfg.delegation.max_children, 10);
+        assert_eq!(cfg.delegation.max_delegated, 50);
+    }
+
+    #[test]
+    fn session_and_delegation_yaml_overrides_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = CcteamConfig {
+            sessions: SessionsConfig { max_live: 7 },
+            delegation: DelegationConfig {
+                max_depth: 3,
+                max_children: 12,
+                max_delegated: 60,
+            },
+            ..Default::default()
+        };
+        save(tmp.path(), &cfg).unwrap();
+        assert_eq!(load(tmp.path()).unwrap(), cfg);
+
+        let yaml = std::fs::read_to_string(config_path(tmp.path())).unwrap();
+        assert!(yaml.contains("sessions:\n  max_live: 7"));
+        assert!(yaml.contains("delegation:\n  max_depth: 3"));
     }
 }

@@ -96,6 +96,12 @@ describe("chatTranscript per-sid keying", () => {
 });
 
 describe("chatTranscript eventToRow", () => {
+  it("does not render session lifecycle frames as conversation content", () => {
+    expect(
+      eventToRow(ev({ kind: "session_lifecycle", content: "session evicted: s4" })),
+    ).toBeNull();
+  });
+
   const ev = (e: Partial<SessionEvent>): SessionEvent => ({
     kind: "answer",
     content: "",

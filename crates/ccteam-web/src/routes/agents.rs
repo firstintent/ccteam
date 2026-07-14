@@ -272,17 +272,14 @@ fn event_visible(ev: &GatewayEvent, visible: &Option<HashSet<String>>) -> bool {
 /// [`super::sessions_api::session_event_payload`] for the JSON body — same
 /// shape the per-sid stream sends, now carrying `slug`).
 fn agents_event(ev: &GatewayEvent, seq: u64) -> Event {
-    let is_delegation = matches!(
-        ev.kind,
-        ccteam_im::gateway::GatewayEventKind::Delegation { .. }
-    );
+    let event_name = match ev.kind {
+        ccteam_im::gateway::GatewayEventKind::Delegation { .. } => "delegation",
+        ccteam_im::gateway::GatewayEventKind::SessionLifecycle { .. } => "session_lifecycle",
+        _ => "progress",
+    };
     Event::default()
         .id(seq.to_string())
-        .event(if is_delegation {
-            "delegation"
-        } else {
-            "progress"
-        })
+        .event(event_name)
         .data(super::sessions_api::session_event_payload(ev).to_string())
 }
 

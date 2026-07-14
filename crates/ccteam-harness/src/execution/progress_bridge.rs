@@ -27,6 +27,9 @@ pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
 pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
 pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
 pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
+/// v0.9.2 — a live session was gracefully stopped to admit another session
+/// under the daemon-wide capacity limit.
+pub const SESSION_EVICTED: &str = "session_evicted";
 /// v0.8.7 review-fix (R-L1) — a HITL session is PARKED awaiting a human
 /// approve/deny on a non-allowlist tool call. Emitted when the permission
 /// prompt is outstanding so an operator (status / dashboard / `progress`)
@@ -303,6 +306,18 @@ pub fn build_chat_turn_timeout_event(
     })
 }
 
+/// v0.9.2 — build the durable capacity-eviction lifecycle event. `reason` is
+/// currently `"capacity"`; keeping it explicit leaves the schema extensible
+/// without inventing a second event family.
+pub fn build_session_evicted_event(sid: &str, reason: &str) -> Value {
+    json!({
+        "event": SESSION_EVICTED,
+        "sid": sid,
+        "reason": reason,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 pub fn build_typed_event_event(
     vendor: &str,
     event_kind: &str,
@@ -464,5 +479,14 @@ mod tests {
         let lines: Vec<_> = body.lines().collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(serde_json::from_str::<Value>(lines[0]).unwrap(), event);
+    }
+
+    #[test]
+    fn session_evicted_event_has_minimal_capacity_shape() {
+        let event = build_session_evicted_event("s9", "capacity");
+        assert_eq!(event["event"], SESSION_EVICTED);
+        assert_eq!(event["sid"], "s9");
+        assert_eq!(event["reason"], "capacity");
+        assert!(event["ts"].is_string());
     }
 }

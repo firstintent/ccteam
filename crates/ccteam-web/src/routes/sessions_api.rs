@@ -1385,6 +1385,7 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         // of this call — the arm exists for the global agents SSE + match
         // exhaustiveness).
         GatewayEventKind::Delegation { .. } => ("delegation", false),
+        GatewayEventKind::SessionLifecycle { .. } => ("session_lifecycle", false),
     };
     let mut payload = json!({
         "id": ev.id,
@@ -1420,6 +1421,10 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         if let Some(reason) = reason {
             payload["reason"] = json!(reason);
         }
+    }
+    if let GatewayEventKind::SessionLifecycle { state, reason } = &ev.kind {
+        payload["state"] = json!(state);
+        payload["reason"] = json!(reason);
     }
     if !ev.options.is_empty() {
         payload["options"] = serde_json::Value::Array(
@@ -1714,6 +1719,20 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    #[test]
+    fn session_event_serializes_capacity_eviction_lifecycle() {
+        use ccteam_im::gateway::GatewayEventKind;
+        let mut ev = gw_event(Some("s4"));
+        ev.kind = GatewayEventKind::SessionLifecycle {
+            state: "evicted".into(),
+            reason: "capacity".into(),
+        };
+        let payload = session_event_payload(&ev);
+        assert_eq!(payload["kind"], "session_lifecycle");
+        assert_eq!(payload["state"], "evicted");
+        assert_eq!(payload["reason"], "capacity");
     }
 
     /// v0.8.19 — a structured `Activity` event serializes `kind:"activity"`

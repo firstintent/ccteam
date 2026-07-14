@@ -74,6 +74,20 @@ describe("parseAgentsEvent", () => {
     expect(ev!.reason).toBe("depth");
   });
 
+  it("parses a capacity eviction lifecycle frame", () => {
+    const ev = parseAgentsEvent(
+      JSON.stringify({
+        kind: "session_lifecycle",
+        sid: "s4",
+        slug: "demo",
+        content: "session evicted: s4",
+        state: "evicted",
+        reason: "capacity",
+      }),
+    );
+    expect(ev).toMatchObject({ kind: "session_lifecycle", sid: "s4", slug: "demo" });
+  });
+
   it("defaults an unrecognized kind to answer and missing content to ''", () => {
     const ev = parseAgentsEvent(JSON.stringify({ foo: "bar" }));
     expect(ev).toMatchObject({ kind: "answer", content: "" });

@@ -151,7 +151,7 @@ pub use config::{
     default_claude_jobs_retention_days, load as load_ccteam_config,
     lookup_project as lookup_project_in_config, remove_project as remove_project_from_config,
     save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
-    DelegationConfig, ProjectEntry, CONFIG_FILENAME,
+    DelegationConfig, ProjectEntry, SessionsConfig, CONFIG_FILENAME,
 };
 // V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};

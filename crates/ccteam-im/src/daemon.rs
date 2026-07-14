@@ -1354,7 +1354,10 @@ fn spawn_gateway_event_consumer(
             // and no bound `evt.channel` to resolve, so skip it BEFORE the
             // channel lookup (avoids a spurious "channel not configured"
             // warning firing for every delegation transition).
-            if matches!(evt.kind, GatewayEventKind::Delegation { .. }) {
+            if matches!(
+                evt.kind,
+                GatewayEventKind::Delegation { .. } | GatewayEventKind::SessionLifecycle { .. }
+            ) {
                 continue;
             }
             // Clone the channel out under the read lock, then DROP the guard
@@ -1402,6 +1405,7 @@ fn spawn_gateway_event_consumer(
                 // match), but the arm must exist for exhaustiveness and stays
                 // correct if that early skip is ever removed.
                 GatewayEventKind::Delegation { .. } => {}
+                GatewayEventKind::SessionLifecycle { .. } => {}
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,

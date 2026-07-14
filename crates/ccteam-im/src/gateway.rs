@@ -180,6 +180,41 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
+/// Snapshot used by the pure live-capacity eviction selector. `None`
+/// `last_event_at` is deliberately treated as newest: a just-spawned session
+/// has not emitted an event yet and must not look older than every timestamped
+/// session.
+#[derive(Debug, Clone)]
+struct LiveCapacityCandidate {
+    sid: String,
+    idle: bool,
+    last_event_at: Option<Instant>,
+    waiting_approval: bool,
+}
+
+/// Select the least-recently-active eligible live session. Idle sessions are
+/// always preferred; busy sessions are considered only when no idle candidate
+/// remains. Sids and HITL waiters are excluded before ordering.
+fn select_live_capacity_eviction(
+    candidates: &[LiveCapacityCandidate],
+    excluded: &HashSet<String>,
+) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|candidate| !excluded.contains(&candidate.sid) && !candidate.waiting_approval)
+        .min_by(|a, b| {
+            b.idle
+                .cmp(&a.idle)
+                .then_with(|| match (a.last_event_at, b.last_event_at) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.sid.cmp(&b.sid),
+                })
+        })
+        .map(|candidate| candidate.sid.clone())
+}
+
 #[derive(Debug, Clone)]
 struct GatewayRouteTemplate {
     channel: String,
@@ -294,6 +329,9 @@ pub struct Gateway {
     /// defaults). Set by [`Gateway::set_delegation_config`] (tests use it to
     /// exercise the guardrails without spawning up-to-the-limit sessions).
     delegation_config_override: Option<ccteam_core::DelegationConfig>,
+    /// v0.9.2 — optional programmatic capacity override. Production reads the
+    /// hot config; deterministic gateway tests use this to exercise a tiny cap.
+    sessions_config_override: Option<ccteam_core::SessionsConfig>,
 }
 
 /// v0.9.0 W2 (F2/F7) — in-memory mirror of one child's durable delegation
@@ -436,6 +474,15 @@ pub enum GatewayEventKind {
         title: Option<String>,
         /// Present only for `denied` (`depth|children|delegated|cycle|budget`).
         reason: Option<String>,
+    },
+    /// v0.9.2 — a session lifecycle transition for live web surfaces. These
+    /// frames are broadcast-only (no IM delivery); the durable state twin is a
+    /// progress event such as `session_evicted`.
+    SessionLifecycle {
+        /// Lifecycle state, currently `evicted`.
+        state: String,
+        /// Machine-readable cause, currently `capacity`.
+        reason: String,
     },
 }
 
@@ -846,6 +893,8 @@ struct MetaRebuildPlan {
     protocol: SessionProtocol,
     host: String,
     permission_mode: PermissionMode,
+    parent_sid: Option<String>,
+    delegation_depth: u32,
     /// Canonical owner (from meta, else the rebuild's reply target).
     owner: ChatKey,
     /// @mention handle = role, else sid for a roleless session.
@@ -1242,6 +1291,7 @@ impl Gateway {
             dispatch_idem: crate::delegation::IdemCache::default(),
             delegation_tx: None,
             delegation_config_override: None,
+            sessions_config_override: None,
         }
     }
 
@@ -1403,6 +1453,8 @@ impl Gateway {
             protocol: meta.protocol,
             host: meta.host.clone(),
             permission_mode: meta.permission_mode,
+            parent_sid: meta.parent_sid.clone(),
+            delegation_depth: meta.delegation_depth,
             owner,
             handle,
             model_id,
@@ -1488,22 +1540,17 @@ impl Gateway {
             .await
     }
 
-    /// Insert the rebuilt session into the live map (sync) and start its event
+    /// Admit the rebuilt session into the live map and start its event
     /// pump. `reply_to` is where this session's async turn answers route.
-    fn apply_rebuilt_session(
+    async fn apply_rebuilt_session(
         &mut self,
         plan: MetaRebuildPlan,
         thread: ThreadHandle,
         reply_to: ChatKey,
     ) {
         let sid = plan.sid.clone();
-        // v0.9.0 W2 — restore the delegation link from meta (the SoT), so a
-        // remote-restart rebuild keeps parent/depth for the guardrails + the
-        // stop-descendant walk.
-        let (parent_sid, delegation_depth) =
-            ccteam_harness::execution::session_meta::read_session_meta(&plan.cwd, &plan.sid)
-                .map(|m| (m.parent_sid, m.delegation_depth))
-                .unwrap_or((None, 0));
+        let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
+        self.ensure_live_capacity(&excluded).await;
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -1528,8 +1575,8 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
-                parent_sid,
-                delegation_depth,
+                parent_sid: plan.parent_sid,
+                delegation_depth: plan.delegation_depth,
             },
         );
         self.spawn_event_pump(&sid);
@@ -1552,7 +1599,7 @@ impl Gateway {
     ) -> Result<()> {
         let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to);
         let thread = Self::spawn_for_plan(&plan).await?;
-        self.apply_rebuilt_session(plan, thread, reply_to);
+        self.apply_rebuilt_session(plan, thread, reply_to).await;
         Ok(())
     }
 
@@ -1647,7 +1694,8 @@ impl Gateway {
                     gateway
                         .lock()
                         .await
-                        .apply_rebuilt_session(plan, thread, reply_to);
+                        .apply_rebuilt_session(plan, thread, reply_to)
+                        .await;
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -1953,7 +2001,7 @@ impl Gateway {
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
                 let sid = {
                     let mut g = gateway.lock().await;
-                    let outcome = g.apply_new_session(*plan, thread)?;
+                    let outcome = g.apply_new_session(*plan, thread).await?;
                     let sid = outcome.id.clone();
                     g.drain_and_dispatch_pending_turns(&sid).await;
                     sid
@@ -2464,7 +2512,7 @@ impl Gateway {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
             EnsureSessionOutcome::Spawn(plan) => {
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
-                let outcome = self.apply_new_session(*plan, thread)?;
+                let outcome = self.apply_new_session(*plan, thread).await?;
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
@@ -2712,7 +2760,7 @@ impl Gateway {
         )?;
         plan.remote = host_target.remote;
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
-        let outcome = self.apply_new_session(plan, thread)?;
+        let outcome = self.apply_new_session(plan, thread).await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
         Ok(outcome)
     }
@@ -2875,10 +2923,10 @@ impl Gateway {
             .await
     }
 
-    /// v0.8.x (concurrency review §4.1 P1) — the sync half after the spawn:
+    /// v0.8.x (concurrency review §4.1 P1) — the apply half after the spawn:
     /// insert the live [`GatewaySession`], persist routing + `meta.json`, and
     /// start its event pump. Mirrors `apply_rebuilt_session`'s shape.
-    fn apply_new_session(
+    async fn apply_new_session(
         &mut self,
         plan: NewSessionPlan,
         thread: ThreadHandle,
@@ -2917,6 +2965,8 @@ impl Gateway {
         let meta_role = role.clone();
         let owner_channel = owner.channel.clone();
         let owner_for_reply = owner.clone();
+        let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
+        self.ensure_live_capacity(&excluded).await;
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -6122,6 +6172,145 @@ impl Gateway {
         })
     }
 
+    // ── live-session capacity (v0.9.2) ──────────────────────────────────────
+
+    fn sessions_config(&self) -> ccteam_core::SessionsConfig {
+        if let Some(cfg) = &self.sessions_config_override {
+            return cfg.clone();
+        }
+        self.config
+            .as_ref()
+            .and_then(|c| c.get().ok())
+            .map(|cfg| cfg.sessions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Override the daemon-wide live-session cap. Production reads the hot
+    /// config; deterministic tests use this to make eviction cheap to exercise.
+    pub fn set_sessions_config(&mut self, cfg: ccteam_core::SessionsConfig) {
+        self.sessions_config_override = Some(cfg);
+    }
+
+    /// Build the exclusion set for a session admission: the admitted sid plus
+    /// its live parent chain. The bounded/cycle-safe walk is defensive against
+    /// corrupt in-memory lineage and deliberately independent of max_depth.
+    fn live_capacity_exclusions(&self, sid: &str, parent_sid: Option<&str>) -> Vec<String> {
+        let mut out = vec![sid.to_string()];
+        let mut seen = HashSet::from([sid.to_string()]);
+        let mut current = parent_sid.map(str::to_string);
+        for _ in 0..64 {
+            let Some(current_sid) = current else {
+                break;
+            };
+            if !seen.insert(current_sid.clone()) {
+                break;
+            }
+            out.push(current_sid.clone());
+            current = self
+                .sessions
+                .get(&current_sid)
+                .and_then(|session| session.parent_sid.clone());
+        }
+        out
+    }
+
+    /// Append the durable progress event and broadcast its live lifecycle twin
+    /// from the same call site so state and web surfaces cannot drift.
+    fn emit_session_evicted(&self, sid: &str, slug: &str) {
+        if let Some(paths) = self.project_paths.as_ref() {
+            let event = ccteam_harness::execution::progress_bridge::build_session_evicted_event(
+                sid, "capacity",
+            );
+            let path = paths.progress_jsonl(slug);
+            if let Err(err) = ccteam_core::progress::append_event(&path, &event) {
+                tracing::warn!(%sid, %slug, error = %err,
+                    "ccteam-im: failed to append session eviction progress event");
+            }
+        }
+        self.emit_user_signal(GatewayEvent {
+            id: format!("session-evicted-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session evicted: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "evicted".to_string(),
+                reason: "capacity".to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
+    }
+
+    /// Ensure one more live session can be admitted. Capacity never rejects a
+    /// creation/revival: eligible sessions are gracefully stopped LRU-first;
+    /// if every live session is protected, admission proceeds over cap.
+    async fn ensure_live_capacity(&mut self, exclude: &[String]) {
+        let configured = self.sessions_config().max_live;
+        let max_live = configured.max(1) as usize;
+        if configured == 0 {
+            tracing::warn!(
+                "ccteam-im: sessions.max_live=0 cannot admit a session; treating it as 1"
+            );
+        }
+        let excluded: HashSet<String> = exclude.iter().cloned().collect();
+
+        while self.sessions.len() >= max_live {
+            let candidates = {
+                let pending = self.pending.lock().await;
+                self.sessions
+                    .values()
+                    .map(|session| LiveCapacityCandidate {
+                        sid: session.id.clone(),
+                        idle: session
+                            .turn_started_at
+                            .lock()
+                            .map(|started| started.is_none())
+                            .unwrap_or(false),
+                        last_event_at: session.last_event_at.lock().ok().and_then(|last| *last),
+                        waiting_approval: pending.pending_for_sid(&session.id).is_some(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let Some(candidate_sid) = select_live_capacity_eviction(&candidates, &excluded) else {
+                tracing::warn!(
+                    live = self.sessions.len(),
+                    max_live,
+                    excluded = ?excluded,
+                    "ccteam-im: live-session capacity has no eligible eviction candidate; admitting over cap"
+                );
+                break;
+            };
+            let slug = self
+                .sessions
+                .get(&candidate_sid)
+                .map(|session| session.project.clone())
+                .unwrap_or_default();
+            let stop_result = self.stop_session(&candidate_sid).await;
+            if !self.sessions.contains_key(&candidate_sid) {
+                self.emit_session_evicted(&candidate_sid, &slug);
+                tracing::info!(
+                    sid = %candidate_sid,
+                    %slug,
+                    reason = "capacity",
+                    max_live,
+                    "ccteam-im: gracefully evicted live session"
+                );
+            }
+            if let Err(err) = stop_result {
+                tracing::warn!(sid = %candidate_sid, error = %err,
+                    "ccteam-im: capacity eviction stop reported an error");
+            }
+            if self.sessions.contains_key(&candidate_sid) {
+                tracing::warn!(sid = %candidate_sid,
+                    "ccteam-im: capacity eviction left candidate live; admitting over cap");
+                break;
+            }
+        }
+    }
+
     // ── delegation (v0.9.0 W2 — F2/F5/F7) ──────────────────────────────────
 
     /// The active delegation guardrail posture (hot-reloaded config, else the
@@ -6395,7 +6584,7 @@ impl Gateway {
         plan.title = title.clone();
         let child_sid = plan.id.clone();
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
-        let outcome = self.apply_new_session(plan, thread)?;
+        let outcome = self.apply_new_session(plan, thread).await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
 
         // ---- delegation_spawned (only when it IS a delegation) ----
@@ -6806,7 +6995,7 @@ impl Gateway {
             self.compare_taps.insert(sid.clone(), tap_tx);
             match Self::spawn_for_new_session_plan(&plan).await {
                 Ok(thread) => {
-                    if let Err(e) = self.apply_new_session(plan, thread) {
+                    if let Err(e) = self.apply_new_session(plan, thread).await {
                         self.compare_taps.remove(&sid);
                         spawn_errors.push((vendor, e.to_string()));
                         continue;
@@ -8054,6 +8243,165 @@ mod tests {
             id: "i1".into(),
             details: ThreadItemDetails::AgentMessage(text.into()),
         })
+    }
+
+    fn capacity_candidate(
+        sid: &str,
+        idle: bool,
+        last_event_at: Option<Instant>,
+    ) -> LiveCapacityCandidate {
+        LiveCapacityCandidate {
+            sid: sid.to_string(),
+            idle,
+            last_event_at,
+            waiting_approval: false,
+        }
+    }
+
+    #[test]
+    fn capacity_eviction_prefers_idle_oldest_and_none_is_newest() {
+        let now = Instant::now();
+        let candidates = vec![
+            capacity_candidate("idle-new", true, None),
+            capacity_candidate(
+                "idle-old",
+                true,
+                Some(now - std::time::Duration::from_secs(20)),
+            ),
+            capacity_candidate(
+                "busy-older",
+                false,
+                Some(now - std::time::Duration::from_secs(100)),
+            ),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("idle-old")
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_falls_back_to_busy_oldest() {
+        let now = Instant::now();
+        let candidates = vec![
+            capacity_candidate(
+                "busy-new",
+                false,
+                Some(now - std::time::Duration::from_secs(2)),
+            ),
+            capacity_candidate(
+                "busy-old",
+                false,
+                Some(now - std::time::Duration::from_secs(30)),
+            ),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("busy-old")
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_respects_sid_and_hitl_exclusions() {
+        let now = Instant::now();
+        let mut waiting = capacity_candidate(
+            "waiting",
+            true,
+            Some(now - std::time::Duration::from_secs(60)),
+        );
+        waiting.waiting_approval = true;
+        let candidates = vec![
+            waiting,
+            capacity_candidate(
+                "parent",
+                true,
+                Some(now - std::time::Duration::from_secs(40)),
+            ),
+            capacity_candidate(
+                "eligible",
+                true,
+                Some(now - std::time::Duration::from_secs(10)),
+            ),
+        ];
+        let excluded = HashSet::from(["parent".to_string()]);
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &excluded).as_deref(),
+            Some("eligible")
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_returns_none_when_all_candidates_are_excluded() {
+        let candidates = vec![
+            capacity_candidate("s1", true, Some(Instant::now())),
+            capacity_candidate("s2", false, None),
+        ];
+        let excluded = HashSet::from(["s1".to_string(), "s2".to_string()]);
+        assert_eq!(select_live_capacity_eviction(&candidates, &excluded), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_at_capacity_evicts_lru_idle_and_admits_new_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 2 });
+
+        let first = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let second = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.sessions.get_mut(&second).unwrap().parent_sid = Some(first.clone());
+        assert_eq!(
+            gateway.live_capacity_exclusions("s3", Some(&second)),
+            vec!["s3".to_string(), second.clone(), first.clone()]
+        );
+        gateway.sessions.get_mut(&second).unwrap().parent_sid = None;
+        let now = Instant::now();
+        *gateway.sessions[&first].last_event_at.lock().unwrap() =
+            Some(now - std::time::Duration::from_secs(30));
+        *gateway.sessions[&second].last_event_at.lock().unwrap() =
+            Some(now - std::time::Duration::from_secs(5));
+
+        let mut events = gateway.subscribe_events();
+        let third = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        assert!(!gateway.sessions.contains_key(&first));
+        assert!(gateway.sessions.contains_key(&second));
+        assert!(gateway.sessions.contains_key(&third));
+        assert_eq!(gateway.sessions.len(), 2);
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.sid.as_deref(), Some(first.as_str()));
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "capacity"
+        ));
     }
 
     /// Seed a `.claude/agents/<role>.md` under `project_dir` so the `/role`

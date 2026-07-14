@@ -54,7 +54,7 @@ export interface SessionActivity {
 export interface SessionEvent {
   id?: string;
   sid?: string;
-  kind: "answer" | "progress" | "activity";
+  kind: "answer" | "progress" | "activity" | "session_lifecycle";
   content: string;
   done?: boolean;
   options?: SessionEventOption[];
@@ -133,10 +133,16 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const obj = parsed as Record<string, unknown>;
-  // Three-way kind; anything unrecognized degrades to "answer" (the parser
+  // Known event kinds; anything unrecognized degrades to "answer" (the parser
   // never throws on a future/garbage kind — the next frame lands clean).
   const kind =
-    obj.kind === "progress" ? "progress" : obj.kind === "activity" ? "activity" : "answer";
+    obj.kind === "progress"
+      ? "progress"
+      : obj.kind === "activity"
+        ? "activity"
+        : obj.kind === "session_lifecycle"
+          ? "session_lifecycle"
+          : "answer";
   const event: SessionEvent = {
     kind,
     content: typeof obj.content === "string" ? obj.content : "",

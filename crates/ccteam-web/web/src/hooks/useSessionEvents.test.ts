@@ -61,6 +61,13 @@ describe("shouldAcceptEventSeq (review §3.1-3 reconnect dedup)", () => {
 });
 
 describe("parseSessionEvent (W2 payload shape)", () => {
+  it("preserves session lifecycle frames instead of degrading them to answers", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({ kind: "session_lifecycle", content: "session evicted: s4" }),
+    );
+    expect(ev).toMatchObject({ kind: "session_lifecycle", content: "session evicted: s4" });
+  });
+
   it("parses an answer payload", () => {
     const ev = parseSessionEvent(
       JSON.stringify({ id: "e1", sid: "s1", kind: "answer", content: "hello" }),

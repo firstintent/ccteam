@@ -17,7 +17,7 @@ export interface AgentsEvent {
   id?: string;
   sid?: string;
   slug?: string;
-  kind: "answer" | "progress" | "activity" | "delegation";
+  kind: "answer" | "progress" | "activity" | "delegation" | "session_lifecycle";
   content: string;
   done?: boolean;
   activity?: SessionActivity;
@@ -68,6 +68,8 @@ export function parseAgentsEvent(raw: string): AgentsEvent | null {
         ? "activity"
         : obj.kind === "delegation"
           ? "delegation"
+          : obj.kind === "session_lifecycle"
+            ? "session_lifecycle"
           : "answer";
   const event: AgentsEvent = {
     kind,
@@ -103,7 +105,10 @@ export function appendAgentsEvent(prev: AgentsEvent[], event: AgentsEvent): Agen
   return [...prev, event];
 }
 
-export function useAgentsEvents(enabled: boolean = true): UseAgentsEventsResult {
+export function useAgentsEvents(
+  enabled: boolean = true,
+  filter: "all" | "session_lifecycle" = "all",
+): UseAgentsEventsResult {
   const [events, setEvents] = useState<AgentsEvent[]>([]);
   const [connected, setConnected] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -143,7 +148,9 @@ export function useAgentsEvents(enabled: boolean = true): UseAgentsEventsResult 
       lastSeenSeqRef.current = decision.nextHighest;
       if (!decision.accept) return;
       const parsed = parseAgentsEvent(msgEvent.data);
-      if (parsed) setEvents((prev) => appendAgentsEvent(prev, parsed));
+      if (parsed && (filter === "all" || parsed.kind === "session_lifecycle")) {
+        setEvents((prev) => appendAgentsEvent(prev, parsed));
+      }
     };
 
     const connect = () => {
@@ -163,6 +170,7 @@ export function useAgentsEvents(enabled: boolean = true): UseAgentsEventsResult 
       // shape, just a different SSE `event:` name.
       es.addEventListener("progress", onFrame);
       es.addEventListener("delegation", onFrame);
+      es.addEventListener("session_lifecycle", onFrame);
 
       es.addEventListener("gateway_unavailable", () => {
         if (cancelled) return;
@@ -208,7 +216,7 @@ export function useAgentsEvents(enabled: boolean = true): UseAgentsEventsResult 
       esRef.current = null;
       retryCountRef.current = 0;
     };
-  }, [enabled]);
+  }, [enabled, filter]);
 
   return { events, connected, lastError, gatewayUnavailable };
 }

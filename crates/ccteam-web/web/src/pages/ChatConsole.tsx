@@ -39,6 +39,7 @@ import {
 import { toastBus } from "../lib/toastBus";
 import { tStopped } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { useMe } from "../hooks/useMe";
 import { railSessionLabel } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
@@ -110,6 +111,19 @@ export default function ChatConsole() {
       // Best-effort: the shell renders with whatever resolved.
     }
   }, []);
+
+  // Capacity eviction is out-of-band from the session the user is currently
+  // viewing. Listen to the daemon-wide lifecycle stream so the live/history
+  // rail refreshes immediately even when a different sid was evicted.
+  const { events: globalEvents } = useAgentsEvents(true, "session_lifecycle");
+  const latestGlobalEvent = globalEvents[globalEvents.length - 1];
+  useEffect(() => {
+    if (latestGlobalEvent?.kind === "session_lifecycle") {
+      queueMicrotask(() => {
+        void refreshSessions();
+      });
+    }
+  }, [latestGlobalEvent, refreshSessions]);
 
   useEffect(() => {
     queueMicrotask(() => {
