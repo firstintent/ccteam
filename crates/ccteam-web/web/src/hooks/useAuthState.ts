@@ -12,9 +12,14 @@
 //   - null      → backend says no auth needed (loopback default)
 //   - string    → "ccteam:<hex>" — auth required
 //
-// `authRequired` is just `wireToken !== null` (treats `undefined` as
-// not-yet-known but also not-required so the SPA renders during the
-// bootstrap; the first 401 will flip `saw401` and bring the gate up).
+// `authRequired` is true once we KNOW the server wants a token — either the
+// probe echoed our own token back (`wireToken` is a string) OR any /api/* call
+// returned 401 (`saw401`). The 401 path is essential: on a fresh unauthenticated
+// load the probe itself 401s at the server's auth gate and never reaches the
+// handler, so `wireToken` stays `undefined` — without folding `saw401` in,
+// `authRequired` would be stuck `false` and the TokenEntryGate could never open.
+// A 401 is only ever produced when auth is enabled AND the caller is not
+// authenticated (loopback / --no-auth never 401s), so it is a sound signal.
 
 import { useCallback, useEffect, useState } from "react";
 import { fetchAuthToken } from "../lib/api";
@@ -88,7 +93,7 @@ export function useAuthState(): AuthState {
 
   return {
     wireToken,
-    authRequired: wireToken !== null && wireToken !== undefined,
+    authRequired: (wireToken !== null && wireToken !== undefined) || saw401,
     saw401,
     clearAuth,
   };

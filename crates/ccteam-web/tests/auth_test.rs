@@ -80,14 +80,56 @@ async fn auth_enabled_rejects_missing_authorization() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
+    // An `/api/*` route stays gated: no credentials ⇒ 401 "auth required".
     let resp = client()
-        .get(format!("http://{addr}/"))
+        .get(format!("http://{addr}/api/v1/auth/token"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "no auth header ⇒ 401");
     let body = resp.text().await.unwrap();
     assert!(body.contains("auth required"), "got: {body}");
+}
+
+/// The SPA shell must load for unauthenticated visitors so the in-browser token
+/// flow (TokenEntryPage) can prompt for a token — a raw "auth required" body
+/// would leave the user with no login UI. The `/api/*` surface stays gated.
+#[tokio::test]
+async fn auth_enabled_serves_spa_shell_unauthenticated() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    // `/app/` (and `/app`) serve the SPA index unauthenticated.
+    for path in ["/app/", "/app"] {
+        let resp = client()
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "unauth {path} must serve the SPA shell");
+    }
+
+    // Bare `/` redirects into the SPA (301 → /app/) instead of 401.
+    let resp = nofollow()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_redirection(),
+        "unauth / must redirect to the SPA, got {}",
+        resp.status()
+    );
+
+    // The API surface is still gated — no shell exemption leaks it.
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "unauth /api/* must stay gated");
 }
 
 #[tokio::test]
@@ -111,8 +153,10 @@ async fn auth_enabled_rejects_wrong_bearer_token() {
     let paths = fake_paths(tmp.path());
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
+    // A gated `/api/*` path: a wrong bearer must not authenticate (the SPA shell
+    // is served open, but the API surface stays locked).
     let resp = client()
-        .get(format!("http://{addr}/"))
+        .get(format!("http://{addr}/api/v1/auth/token"))
         .header("Authorization", "Bearer ccteam:nope")
         .send()
         .await
@@ -213,8 +257,14 @@ async fn url_shim_rejects_wrong_token() {
     let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
     let addr = spawn(state).await;
     let client = nofollow();
+    // A wrong `?token=` on a gated `/api/*` path must not authenticate: the shim
+    // fails to resolve it (no cookie, no redirect) and the request falls through
+    // to 401. (On the open SPA-shell paths a wrong token instead lands the user
+    // on the login UI, covered by `auth_enabled_serves_spa_shell_unauthenticated`.)
     let resp = client
-        .get(format!("http://{addr}/?token=ccteam:wrong"))
+        .get(format!(
+            "http://{addr}/api/v1/auth/token?token=ccteam:wrong"
+        ))
         .send()
         .await
         .unwrap();

@@ -473,3 +473,20 @@ test("401 after auth-required bootstrap shows the token entry flow", async ({ pa
   await page.getByRole("button", { name: "Connect" }).click();
   await expect(page).toHaveURL(/\/\?token=ccteam%3Aabc123$/);
 });
+
+test("fresh unauthenticated load surfaces the token entry page, not a wedged shell", async ({
+  page,
+}) => {
+  // Auth-enabled server with no session: every /api/* call 401s — INCLUDING the
+  // `/api/v1/auth/token` bootstrap probe, which never reaches its handler
+  // because the server's auth gate rejects it first (so no `wire_token` comes
+  // back). The gate must still open on the observed 401; the regression was it
+  // stayed shut because `authRequired` was derived only from `wire_token`.
+  await page.route("**/api/**", (route) =>
+    route.fulfill({ status: 401, body: "auth required" }),
+  );
+  await page.route("**/sse/**", (route) => route.fulfill({ status: 200, body: "\n" }));
+
+  await page.goto("/app/");
+  await expect(page.getByLabel("Token or URL")).toBeVisible();
+});

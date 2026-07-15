@@ -376,6 +376,29 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     Ok(config_toml)
 }
 
+/// Daemon-start self-heal: if the global Codex `config.toml` still carries a
+/// legacy stdio `[mcp_servers.ccteam]` entry (written by a pre-HTTP ccteam),
+/// rewrite it to the current HTTP form so per-thread session overrides don't
+/// collide with it under Codex's deep config merge — the `thread/start` failure
+/// `url is not supported for stdio in mcp_servers.ccteam` that otherwise blocks
+/// every `/new codex` session until the operator manually reruns `ccteam config`.
+///
+/// Narrow + idempotent: a missing config, a config with no ccteam entry, or an
+/// already-HTTP entry is a no-op (`Ok(None)`) — so we never create a Codex
+/// config for a non-Codex user, only migrate an entry ccteam itself wrote.
+/// Returns the config path when a migration was performed.
+pub fn heal_codex_mcp_if_stale() -> Result<Option<std::path::PathBuf>> {
+    let config_toml = ccteam_core::mcp_register::resolve_codex_config_path()?;
+    if !ccteam_core::mcp_register::codex_mcp_entry_stale(&config_toml) {
+        return Ok(None);
+    }
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    Ok(Some(config_toml))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

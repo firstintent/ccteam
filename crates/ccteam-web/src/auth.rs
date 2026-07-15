@@ -58,7 +58,7 @@ use std::path::Path;
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderValue, Method, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -505,7 +505,30 @@ pub async fn auth_layer(
         }
     }
 
+    // 5. Unauthenticated request for the SPA shell (index.html + hashed bundle +
+    //    the `/` → `/app/` redirect): SERVE it instead of 401. The bundle carries
+    //    no secrets, and the browser MUST load it so the client-side token flow
+    //    (TokenEntryPage) can prompt for a token — otherwise the browser renders
+    //    a raw plain-text "auth required" and the login UI never appears. Every
+    //    `/api/*` route stays gated (not a shell path → falls through to 401
+    //    below), and the `?token=` URL shim (step 1) still runs first, so a login
+    //    link continues to establish the session cookie. GET-only: the shell is
+    //    never mutated.
+    if req.method() == Method::GET && is_public_shell_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
     (StatusCode::UNAUTHORIZED, "auth required").into_response()
+}
+
+/// Paths that make up the public SPA shell — the SPA `index.html` (any
+/// `/app` route, resolved client-side by react-router), the vite hashed bundle
+/// (`/assets/spa/...`), and the bare-domain `/` → `/app/` redirect. These are
+/// served to unauthenticated visitors (see [`auth_layer`] step 5) so the
+/// in-browser token flow can run; they hold no project state or secrets. Every
+/// other path — notably all of `/api/...` — stays behind the token gate.
+fn is_public_shell_path(path: &str) -> bool {
+    path == "/" || path == "/app" || path.starts_with("/app/") || path.starts_with("/assets/spa/")
 }
 
 #[cfg(test)]
@@ -579,6 +602,24 @@ mod tests {
         assert!(!is_loopback(&lan));
         let any: SocketAddr = "0.0.0.0:7331".parse().unwrap();
         assert!(!is_loopback(&any));
+    }
+
+    #[test]
+    fn is_public_shell_path_covers_spa_shell_but_never_the_api() {
+        // SPA shell + redirect root are public.
+        assert!(is_public_shell_path("/"));
+        assert!(is_public_shell_path("/app"));
+        assert!(is_public_shell_path("/app/"));
+        assert!(is_public_shell_path("/app/chat/s/s1"));
+        assert!(is_public_shell_path("/assets/spa/index-abc123.js"));
+        // The API and every other gated surface are NOT.
+        assert!(!is_public_shell_path("/api/v1/auth/token"));
+        assert!(!is_public_shell_path("/api/v1/projects/demo/sessions"));
+        assert!(!is_public_shell_path("/health"));
+        assert!(!is_public_shell_path("/screenshot/demo.png"));
+        // No prefix-confusion: a path that merely starts with "/app" but is not
+        // under the shell must not slip through.
+        assert!(!is_public_shell_path("/apple"));
     }
 
     #[test]

@@ -1969,6 +1969,25 @@ fn run_start(
         tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
     }
 
+    // Self-heal a stale Codex MCP registration (a pre-HTTP stdio
+    // `[mcp_servers.ccteam]` entry) so `/new codex` sessions don't fail
+    // `thread/start` with "url is not supported for stdio" under Codex's deep
+    // config merge. Narrow + idempotent: only a legacy stdio entry ccteam wrote
+    // is rewritten to HTTP; a missing config / no ccteam entry / already-HTTP
+    // entry is untouched. Best-effort — never block startup.
+    match crate::mcp_serve::heal_codex_mcp_if_stale() {
+        Ok(Some(path)) => tracing::info!(
+            config = %path.display(),
+            "migrated stale Codex MCP entry (stdio → HTTP) so codex sessions can start"
+        ),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            error = %err,
+            "could not check/heal Codex MCP registration at daemon start; if `/new codex` \
+             fails with 'url is not supported for stdio', rerun `ccteam config`"
+        ),
+    }
+
     // V0.4.0 F60: the shipped team seed writer was deleted with the
     // phase machinery (F63 will reintroduce a workflow seed). Daemon
     // start no longer self-heals — operators supply their own
