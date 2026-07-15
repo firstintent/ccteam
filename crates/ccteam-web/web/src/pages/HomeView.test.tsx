@@ -20,7 +20,7 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import HomeView, { MAX_ACTIVE_SESSIONS, NewProjectFields, type RecentEntry } from "./HomeView";
+import HomeView, { NewProjectFields, type RecentEntry } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
 
 const RECENTS: RecentEntry[] = [
@@ -50,7 +50,6 @@ function render(recents: RecentEntry[] = RECENTS, isAdmin = true) {
       isAdmin={isAdmin}
       projects={["ccteam", "demo"]}
       projectPaths={{ ccteam: "~/rob/ccteam" }}
-      liveCount={1}
       recents={recents}
       onLaunched={() => {}}
       onOpenRecent={() => {}}
@@ -93,7 +92,6 @@ describe("HomeView (landing page)", () => {
         projects={["ccteam"]}
         projectPaths={{ ccteam: "~/rob/ccteam" }}
         projectBranches={{ ccteam: "dev" }}
-        liveCount={0}
         recents={[]}
         onLaunched={() => {}}
         onOpenRecent={() => {}}
@@ -159,7 +157,6 @@ describe("HomeView (landing page)", () => {
         projects={["remote-proj"]}
         projectPaths={{ "remote-proj": "/srv/remote-proj" }}
         projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
-        liveCount={0}
         recents={[]}
         onLaunched={() => {}}
         onOpenRecent={() => {}}
@@ -195,9 +192,5 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain("卡片 0");
     expect(html).toContain("卡片 3");
     expect(html).not.toContain("卡片 4");
-  });
-
-  it("keeps the soft session cap exported for the launch gate", () => {
-    expect(MAX_ACTIVE_SESSIONS).toBe(10);
   });
 });

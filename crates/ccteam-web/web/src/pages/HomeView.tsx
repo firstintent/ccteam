@@ -55,9 +55,6 @@ export interface ProjectHostIdentity {
   online: boolean;
 }
 
-/** Frontend-only soft cap on concurrently-live sessions (UX guard). */
-export const MAX_ACTIVE_SESSIONS = 10;
-
 const MODEL_DRAFT_KEY = "ccteam.home.model.v1";
 
 function loadModelDraft(): ComposerDraft {
@@ -177,7 +174,6 @@ export default function HomeView({
   projectPaths,
   projectHosts = {},
   projectBranches = {},
-  liveCount,
   recents,
   initialProject,
   onLaunched,
@@ -191,8 +187,6 @@ export default function HomeView({
   projectHosts?: Record<string, ProjectHostIdentity>;
   /** v0.8.24 Q7 — current git branch per slug (absent ⇒ hide the dimension). */
   projectBranches?: Record<string, string>;
-  /** Caller's live session count (soft cap gate). */
-  liveCount: number;
   recents: RecentEntry[];
   /** Pre-picked project (sidebar 「在此工作区新建」). */
   initialProject?: string | null;
@@ -326,14 +320,6 @@ export default function HomeView({
     if (!project && !isNewProject) {
       toastBus.handler?.error(
         lang === "en" ? "Pick a project first (＋ New project…)" : "先选一个项目(＋ 新建项目…)",
-      );
-      return false;
-    }
-    if (liveCount >= MAX_ACTIVE_SESSIONS) {
-      toastBus.handler?.error(
-        lang === "en"
-          ? "Max 10 active sessions — stop others first"
-          : "最多 10 个活跃 session,请先停掉其他",
       );
       return false;
     }
