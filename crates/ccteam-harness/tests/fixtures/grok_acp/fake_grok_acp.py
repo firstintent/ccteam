@@ -16,6 +16,20 @@ import uuid
 SESSION_ID = "019f4547-0000-7000-8000-00000000cafe"
 MODEL = "grok-4.5"
 WINDOW = 500000
+KNOWN = {
+    "grok-4.5": {
+        "name": "Grok 4.5",
+        "window": WINDOW,
+        "efforts": ["high", "medium", "low"],
+        "default_effort": "high",
+    },
+    "grok-composer-2.5-fast": {
+        "name": "Composer 2.5",
+        "window": 200000,
+        "efforts": [],
+        "default_effort": None,
+    },
+}
 
 
 def emit(obj: dict) -> None:
@@ -35,21 +49,22 @@ def err(req_id, code: int, message: str) -> None:
     emit({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
-def models_block() -> dict:
-    return {
-        "currentModelId": MODEL,
-        "availableModels": [
-            {
-                "modelId": MODEL,
-                "name": "Grok 4.5",
-                "_meta": {
-                    "totalContextTokens": WINDOW,
-                    "reasoningEffort": "high",
-                    "reasoningEfforts": ["high", "medium", "low"],
-                },
-            }
-        ],
-    }
+def models_block(current=None):
+    current = current or MODEL
+    available = []
+    for mid, meta in KNOWN.items():
+        entry = {
+            "modelId": mid,
+            "name": meta["name"],
+            "_meta": {"totalContextTokens": meta["window"]},
+        }
+        if meta["efforts"]:
+            entry["_meta"]["reasoningEffort"] = (
+                meta["default_effort"] if mid == current else meta["efforts"][0]
+            )
+            entry["_meta"]["reasoningEfforts"] = meta["efforts"]
+        available.append(entry)
+    return {"currentModelId": current, "availableModels": available}
 
 
 def main() -> None:
@@ -62,6 +77,18 @@ def main() -> None:
     emit({"jsonrpc": "2.0", "id": "skills-reload", "result": {"ok": True}})
 
     session_id = SESSION_ID
+    current_model = MODEL
+    current_effort = "high"
+    # Honour spawn-time `-m MODEL` (argv: … -m MODEL … stdio).
+    if "-m" in sys.argv:
+        try:
+            idx = sys.argv.index("-m")
+            cand = sys.argv[idx + 1]
+            if cand in KNOWN:
+                current_model = cand
+                current_effort = KNOWN[cand]["default_effort"] or "high"
+        except (IndexError, ValueError):
+            pass
     loaded = False
 
     for line in sys.stdin:
@@ -122,7 +149,13 @@ def main() -> None:
                 err(req_id, -32602, "Invalid params: mcpServers required")
                 continue
             session_id = SESSION_ID
-            reply(req_id, {"sessionId": session_id, "models": models_block()})
+            reply(
+                req_id,
+                {
+                    "sessionId": session_id,
+                    "models": models_block(current_model),
+                },
+            )
             notif(
                 "session/update",
                 {
@@ -132,11 +165,51 @@ def main() -> None:
                         "availableCommands": [
                             {"name": "compact", "description": "Compact context"},
                             {"name": "context", "description": "Show context"},
+                            {"name": "model", "description": "Switch model"},
                         ],
                     },
                 },
             )
-            notif("_x.ai/models/update", {"models": [MODEL]})
+            notif("_x.ai/models/update", {"models": list(KNOWN.keys())})
+            continue
+
+        if method == "session/set_model":
+            mid = (params.get("modelId") or "").strip()
+            if mid not in KNOWN:
+                # Match live grok: data = "unknown model id"
+                emit(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params",
+                            "data": "unknown model id",
+                        },
+                    }
+                )
+                continue
+            current_model = mid
+            meta = params.get("_meta") or {}
+            effort = meta.get("reasoningEffort")
+            known_efforts = KNOWN[mid]["efforts"] or []
+            if effort and effort in known_efforts:
+                current_effort = effort
+            elif KNOWN[mid]["default_effort"]:
+                current_effort = KNOWN[mid]["default_effort"]
+            else:
+                current_effort = None
+            reply(req_id, {"_meta": {"model": {"Ok": mid}}})
+            update = {
+                "sessionUpdate": "model_changed",
+                "model_id": mid,
+            }
+            if current_effort:
+                update["reasoning_effort"] = current_effort
+            notif(
+                "_x.ai/session_notification",
+                {"sessionId": session_id, "update": update},
+            )
             continue
 
         if method == "session/load":
@@ -146,7 +219,7 @@ def main() -> None:
             sid = params.get("sessionId") or SESSION_ID
             session_id = sid
             loaded = True
-            reply(req_id, {"models": models_block()})
+            reply(req_id, {"models": models_block(current_model)})
             # Replay history with isReplay — must be filtered by client.
             notif(
                 "_x.ai/session/update",
@@ -216,7 +289,7 @@ def main() -> None:
                         "cachedReadTokens": 20,
                         "reasoningTokens": 5,
                         "totalTokens": 110,
-                        "modelId": MODEL,
+                        "modelId": current_model,
                         "promptId": str(uuid.uuid4()),
                     },
                 },

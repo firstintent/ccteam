@@ -18,6 +18,12 @@ import sys
 import uuid
 
 SESSION_ID = "ses_fake_opencode_0017cafe"
+# Multi-model catalog — mirrors real opencode configOptions (not a ccteam hardcode).
+KNOWN_MODELS = {
+    "tokenopen/gpt-5.5": "GPT 5.5",
+    "anthropic/claude-sonnet-4": "Sonnet 4",
+}
+KNOWN_EFFORTS = ["low", "medium", "high"]
 MODEL = "tokenopen/gpt-5.5"
 WINDOW = 128000
 
@@ -39,27 +45,27 @@ def err(req_id, code: int, message: str) -> None:
     emit({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
-def config_options() -> list:
+def config_options(current_model=None, current_effort=None):
+    current_model = current_model or MODEL
+    current_effort = current_effort or "medium"
     return [
         {
             "id": "model",
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": MODEL,
-            "options": [{"value": MODEL, "name": MODEL}],
+            "currentValue": current_model,
+            "options": [
+                {"value": mid, "name": name} for mid, name in KNOWN_MODELS.items()
+            ],
         },
         {
             "id": "effort",
             "name": "Effort",
             "category": "effort",
             "type": "select",
-            "currentValue": "medium",
-            "options": [
-                {"value": "low", "name": "low"},
-                {"value": "medium", "name": "medium"},
-                {"value": "high", "name": "high"},
-            ],
+            "currentValue": current_effort,
+            "options": [{"value": e, "name": e} for e in KNOWN_EFFORTS],
         },
         {
             "id": "mode",
@@ -95,6 +101,8 @@ def main() -> None:
         sys.exit(2)
 
     session_id = SESSION_ID
+    current_model = MODEL
+    current_effort = "medium"
     # Track whether client auto-allowed a permission request.
     permission_allowed = False
     # If FORCE_PERMISSION=1, request permission mid-prompt.
@@ -169,7 +177,10 @@ def main() -> None:
             session_id = SESSION_ID
             reply(
                 req_id,
-                {"sessionId": session_id, "configOptions": config_options()},
+                {
+                    "sessionId": session_id,
+                    "configOptions": config_options(current_model, current_effort),
+                },
             )
             available_commands_notif(session_id)
             continue
@@ -177,7 +188,10 @@ def main() -> None:
         if method == "session/resume":
             sid = params.get("sessionId") or SESSION_ID
             session_id = sid
-            reply(req_id, {"configOptions": config_options()})
+            reply(
+                req_id,
+                {"configOptions": config_options(current_model, current_effort)},
+            )
             available_commands_notif(session_id)
             # No history replay on resume.
             continue
@@ -206,13 +220,34 @@ def main() -> None:
                     },
                 },
             )
-            reply(req_id, {"configOptions": config_options()})
+            reply(
+                req_id,
+                {"configOptions": config_options(current_model, current_effort)},
+            )
             available_commands_notif(session_id)
             continue
 
         if method == "session/set_config_option":
-            # Accept model switches.
-            reply(req_id, {"ok": True})
+            config_id = (params.get("configId") or "").strip()
+            value = (params.get("value") or "").strip()
+            if not value:
+                err(req_id, -32602, "empty value")
+                continue
+            if config_id == "model":
+                # Real opencode accepts free-form provider/model; catalog is advisory.
+                current_model = value
+            elif config_id == "effort":
+                if value not in KNOWN_EFFORTS:
+                    err(req_id, -32602, f"unknown effort: {value}")
+                    continue
+                current_effort = value
+            reply(
+                req_id,
+                {
+                    "ok": True,
+                    "configOptions": config_options(current_model, current_effort),
+                },
+            )
             continue
 
         if method == "session/prompt":

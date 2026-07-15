@@ -10,8 +10,9 @@ pub mod translate;
 pub mod transport;
 
 pub use protocol::{
-    content_text, cost_from_usage_update, is_replay, is_turn_boundary, pluck_model_info,
-    pluck_session_id, usage_from_prompt_result, AvailableCommand, ModelInfo,
+    acp_model_picker_options, content_text, cost_from_usage_update, is_replay, is_turn_boundary,
+    known_efforts, pluck_model_info, pluck_session_id, split_trailing_effort,
+    usage_from_prompt_result, AcpModelOption, AvailableCommand, ModelInfo,
 };
 pub use translate::{
     apply_notification, apply_notification_shared, fail_turn, finalize_from_prompt_result,

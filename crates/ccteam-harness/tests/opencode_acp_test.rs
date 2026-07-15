@@ -427,6 +427,112 @@ async fn hitl_declines_permission_without_panic_or_kill() {
     clear_fake();
 }
 
+/// Bare `/model` → NeedsChoice from vendor `configOptions[id=model].options`
+/// (never a ccteam-hardcoded catalog). Choice re-entry + explicit arg both
+/// call `session/set_config_option`.
+#[tokio::test]
+#[serial]
+async fn model_directive_lists_and_sets() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = OpencodeAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-model"),
+        )
+        .await
+        .unwrap();
+
+    let bare = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    let prompt = match bare {
+        ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
+        other => panic!("expected NeedsChoice, got {other:?}"),
+    };
+    let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        ids.iter().any(|id| id.starts_with("tokenopen/gpt-5.5")),
+        "picker must include gpt-5.5 from vendor options, got {ids:?}"
+    );
+    assert!(
+        ids.iter()
+            .any(|id| id.starts_with("anthropic/claude-sonnet-4")),
+        "picker must include sonnet from vendor options, got {ids:?}"
+    );
+    // Shared effort axis expands model×effort.
+    assert!(
+        ids.contains(&"tokenopen/gpt-5.5 low")
+            || ids.contains(&"tokenopen/gpt-5.5 medium")
+            || ids.contains(&"tokenopen/gpt-5.5 high"),
+        "effort axis should expand options, got {ids:?}"
+    );
+
+    let set = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "anthropic/claude-sonnet-4 high".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match set {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("anthropic/claude-sonnet-4") && receipt.contains("high"),
+                "receipt={receipt}"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+
+    // Choice re-entry (id may include effort).
+    let set2 = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: Some(ccteam_harness::ChoiceSelection {
+                    token: prompt.token.clone(),
+                    ids: vec!["tokenopen/gpt-5.5 medium".into()],
+                    free_text: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    match set2 {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("tokenopen/gpt-5.5"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let status2 = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(status2.model.as_deref(), Some("tokenopen/gpt-5.5"));
+    assert_eq!(status2.effort.as_deref(), Some("medium"));
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// v0.8.24 A-U3 — an explicit spawn-time model/effort choice rides
 /// `session/set_config_option` (the fake acks it) and is reflected in
 /// `thread_status`. A missing choice keeps opencode's self-selected default

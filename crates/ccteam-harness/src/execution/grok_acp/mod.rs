@@ -22,13 +22,17 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::{
-    AgentSpecBrief, AgentVendor, ContextUsage, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId,
-    TurnInput,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
+    TurnId, TurnInput,
 };
 
+use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
-use protocol::{pluck_model_info, pluck_session_id, ModelInfo};
+use protocol::{
+    acp_model_picker_options, known_efforts, pluck_model_info, pluck_session_id,
+    split_trailing_effort, AcpModelOption, ModelInfo,
+};
 use spawn_spec::{build_argv, grok_bin, GrokSpawnInput};
 use translate::{
     apply_notification, fail_turn, finalize_from_prompt_result, SessionTranslateState,
@@ -52,9 +56,20 @@ struct LiveSession {
     sid: String,
     project_dir: PathBuf,
     cwd: PathBuf,
+    /// Vendor catalog from `session/new|load` `availableModels` — drives `/model`.
+    available_models: Vec<AcpModelOption>,
     state: Arc<StdMutex<SessionTranslateState>>,
     event_tx: broadcast::Sender<ThreadEvent>,
     _dispatcher: tokio::task::JoinHandle<()>,
+}
+
+fn acp_choice_prompt(title: &str, options: Vec<crate::ChoiceOption>) -> ChoicePrompt {
+    ChoicePrompt {
+        token: unique_prompt_token("gm"),
+        title: title.to_string(),
+        options,
+        multi: false,
+    }
 }
 
 /// Per-process singleton holding live Grok ACP sessions keyed by ACP sessionId.
@@ -205,6 +220,7 @@ impl GrokAcpAdapter {
             sid,
             project_dir,
             cwd,
+            available_models: info.available,
             state,
             event_tx,
             _dispatcher: dispatcher,
@@ -575,16 +591,97 @@ impl HarnessAdapter for GrokAcpAdapter {
                 reason: "grok /compact: native command RPC not yet wired; restart session if context is full".into(),
             }),
             "model" => {
-                let arg = d.args.trim();
+                let Some(live) = live else {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason: "grok session not live".into(),
+                    });
+                };
+                // Three forms (mirrors Claude stream-json):
+                // (1) picker re-entry — `d.choice` carries the picked option id
+                //     (`"<modelId>"` or `"<modelId> <effort>"`);
+                // (2) explicit `/model <id> [effort]`;
+                // (3) bare `/model` → NeedsChoice from captured availableModels.
+                let picked = d.choice.as_ref().and_then(|c| {
+                    c.ids
+                        .first()
+                        .cloned()
+                        .or_else(|| c.free_text.clone().filter(|s| !s.trim().is_empty()))
+                });
+                let arg = match picked {
+                    Some(p) => p,
+                    None => d.args.trim().to_string(),
+                };
                 if arg.is_empty() {
-                    Ok(DirectiveOutcome::Rejected {
-                        reason: "grok /model: list/set not yet wired; re-open session with desired model".into(),
-                    })
-                } else {
-                    Ok(DirectiveOutcome::Rejected {
-                        reason: "grok /model: set-model RPC not available; re-open session with -m"
-                            .into(),
-                    })
+                    let options = acp_model_picker_options(&live.available_models);
+                    if options.is_empty() {
+                        let current = live
+                            .state
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.model.clone())
+                            .unwrap_or_else(|| "(unknown)".into());
+                        return Ok(DirectiveOutcome::Rejected {
+                            reason: format!(
+                                "用法: /model <model-id> [effort]（当前: {current}；vendor 未返回 availableModels）"
+                            ),
+                        });
+                    }
+                    return Ok(DirectiveOutcome::NeedsChoice(acp_choice_prompt(
+                        "Choose a Grok model:",
+                        options,
+                    )));
+                }
+                let efforts = known_efforts(&live.available_models);
+                let (model_id, effort) = split_trailing_effort(&arg, &efforts);
+                if model_id.is_empty() {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason: "用法: /model <model-id> [effort]".into(),
+                    });
+                }
+                // Prefer vendor-listed id; still allow free-form (vendor rejects unknown).
+                let mut params = json!({
+                    "sessionId": live.session_id,
+                    "modelId": model_id,
+                });
+                if let Some(ref e) = effort {
+                    params["_meta"] = json!({ "reasoningEffort": e });
+                }
+                match live
+                    .transport
+                    .call("session/set_model", params)
+                    .await
+                {
+                    Ok(result) => {
+                        // Prefer vendor ack (`_meta.model.Ok`), else the requested id.
+                        let applied = result
+                            .pointer("/_meta/model/Ok")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(model_id.as_str())
+                            .to_string();
+                        // Window from the catalog entry when present.
+                        let window = live
+                            .available_models
+                            .iter()
+                            .find(|m| m.model_id == applied)
+                            .and_then(|m| m.window);
+                        if let Ok(mut st) = live.state.lock() {
+                            st.model = Some(applied.clone());
+                            if let Some(e) = effort.clone() {
+                                st.effort = Some(e);
+                            }
+                            if let Some(w) = window {
+                                st.window_tokens = Some(w);
+                            }
+                        }
+                        let mut receipt = format!("已切换 model → {applied}（live）");
+                        if let Some(e) = effort {
+                            receipt.push_str(&format!("；effort → {e}"));
+                        }
+                        Ok(DirectiveOutcome::Done { receipt })
+                    }
+                    Err(e) => Ok(DirectiveOutcome::Rejected {
+                        reason: format!("/model 切换失败: {e}"),
+                    }),
                 }
             }
             other => Ok(DirectiveOutcome::Rejected {
@@ -613,5 +710,57 @@ impl HarnessAdapter for GrokAcpAdapter {
 
     fn thread_is_live(&self, h: &ThreadHandle) -> bool {
         self.get_live(&h.identity).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_uses_vendor_captured_efforts_only() {
+        let known = known_efforts(&[AcpModelOption {
+            model_id: "grok-4.5".into(),
+            name: "Grok 4.5".into(),
+            description: String::new(),
+            window: None,
+            efforts: vec!["high".into(), "low".into()],
+        }]);
+        assert_eq!(
+            split_trailing_effort("grok-4.5 low", &known),
+            ("grok-4.5".into(), Some("low".into()))
+        );
+        assert_eq!(
+            split_trailing_effort("grok-4.5 HIGH", &known),
+            ("grok-4.5".into(), Some("high".into()))
+        );
+        assert_eq!(
+            split_trailing_effort("my-model turbo", &known),
+            ("my-model turbo".into(), None)
+        );
+    }
+
+    #[test]
+    fn picker_options_from_vendor_catalog() {
+        let models = vec![
+            AcpModelOption {
+                model_id: "grok-4.5".into(),
+                name: "Grok 4.5".into(),
+                description: String::new(),
+                window: Some(500_000),
+                efforts: vec!["high".into(), "low".into()],
+            },
+            AcpModelOption {
+                model_id: "composer".into(),
+                name: "Composer".into(),
+                description: String::new(),
+                window: None,
+                efforts: vec![],
+            },
+        ];
+        let opts = acp_model_picker_options(&models);
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].id, "grok-4.5 high");
+        assert_eq!(opts[2].id, "composer");
     }
 }

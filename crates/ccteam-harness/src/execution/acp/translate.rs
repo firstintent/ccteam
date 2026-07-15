@@ -94,6 +94,13 @@ pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -
         return apply_session_update(state, &n.params);
     }
 
+    // Grok live model switch: `_x.ai/session_notification` with
+    // `sessionUpdate: model_changed` (also after `session/set_model`).
+    if n.method.ends_with("session_notification") {
+        apply_model_changed(state, &n.params);
+        return Vec::new();
+    }
+
     // Everything else (`_x.ai/*` push noise, unknown methods): warn once, skip.
     if state.warned_methods.insert(n.method.clone()) {
         tracing::warn!(
@@ -102,6 +109,40 @@ pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -
         );
     }
     Vec::new()
+}
+
+/// Apply `model_changed` from a session_notification / session/update payload.
+fn apply_model_changed(state: &mut SessionTranslateState, params: &Value) {
+    let update = params
+        .get("update")
+        .cloned()
+        .unwrap_or_else(|| params.clone());
+    let kind = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind != "model_changed" {
+        return;
+    }
+    if let Some(model) = update
+        .get("model_id")
+        .or_else(|| update.get("modelId"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        state.model = Some(model.to_string());
+    }
+    if let Some(effort) = update
+        .get("reasoning_effort")
+        .or_else(|| update.get("reasoningEffort"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        state.effort = Some(effort.to_string());
+    }
 }
 
 fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Vec<ThreadEvent> {
@@ -191,6 +232,10 @@ fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Ve
                 state.prev_session_cost_usd = state.session_cost_usd;
                 state.session_cost_usd = Some(amount);
             }
+            Vec::new()
+        }
+        "model_changed" => {
+            apply_model_changed(state, params);
             Vec::new()
         }
         "plan" | "current_mode_update" | "config_option_update" | "session_info_update" => {

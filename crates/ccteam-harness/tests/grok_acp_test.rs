@@ -292,6 +292,139 @@ async fn unknown_directive_rejected() {
     clear_fake();
 }
 
+/// Bare `/model` → NeedsChoice picker from the REAL `availableModels` capture
+/// (never a hardcoded catalog). Choice re-entry + explicit arg both call
+/// `session/set_model`.
+#[tokio::test]
+#[serial]
+async fn model_directive_lists_and_sets() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-model"),
+        )
+        .await
+        .unwrap();
+
+    // Bare `/model` → picker with both fake catalog entries (effort-expanded).
+    let bare = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    let prompt = match bare {
+        ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
+        other => panic!("expected NeedsChoice, got {other:?}"),
+    };
+    assert!(!prompt.token.is_empty());
+    assert!(!prompt.multi);
+    let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        ids.iter().any(|id| id.starts_with("grok-4.5")),
+        "picker must include grok-4.5, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"grok-composer-2.5-fast"),
+        "picker must include composer, got {ids:?}"
+    );
+    // Effort-axis models expand to model×effort options.
+    assert!(
+        ids.contains(&"grok-4.5 high")
+            || ids.contains(&"grok-4.5 medium")
+            || ids.contains(&"grok-4.5 low"),
+        "grok-4.5 should expand with efforts, got {ids:?}"
+    );
+
+    // Explicit set with effort.
+    let set = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "grok-4.5 low".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match set {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("grok-4.5") && receipt.contains("low"),
+                "receipt={receipt}"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("grok-4.5"));
+    assert_eq!(status.effort.as_deref(), Some("low"));
+
+    // Switch to a no-effort model via choice re-entry shape.
+    let set2 = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: Some(ccteam_harness::ChoiceSelection {
+                    token: prompt.token.clone(),
+                    ids: vec!["grok-composer-2.5-fast".into()],
+                    free_text: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    match set2 {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("grok-composer-2.5-fast"),
+                "receipt={receipt}"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let status2 = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(status2.model.as_deref(), Some("grok-composer-2.5-fast"));
+
+    // Unknown model → Rejected (vendor error).
+    let bad = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "not-a-real-model".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match bad {
+        ccteam_harness::DirectiveOutcome::Rejected { reason } => {
+            assert!(
+                reason.contains("切换失败") || reason.contains("unknown"),
+                "reason={reason}"
+            );
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// v0.9.0 W1 (G2) — grok wires the ccteam `mcpServers` on BOTH session/new and
 /// session/load (was hardcoded `[]`, dropping `ctx.secret`, so grok children
 /// had no ccteam tool face). With a non-empty secret the adapter builds a

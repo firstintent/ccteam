@@ -20,14 +20,16 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::execution::acp::{
-    apply_notification, fail_turn, finalize_from_prompt_result, pluck_model_info, pluck_session_id,
+    acp_model_picker_options, apply_notification, fail_turn, finalize_from_prompt_result,
+    known_efforts, pluck_model_info, pluck_session_id, split_trailing_effort, AcpModelOption,
     AcpTransport, InboundPolicy, ModelInfo, SessionTranslateState,
 };
+use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::{
-    AgentSpecBrief, AgentVendor, ContextUsage, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadStatus, TurnId, TurnInput,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput,
 };
 
 use spawn_spec::{build_argv, opencode_bin, OpencodeSpawnInput};
@@ -47,10 +49,22 @@ struct LiveSession {
     sid: String,
     project_dir: PathBuf,
     cwd: PathBuf,
+    /// Vendor catalog from `session/new|resume|load` `configOptions` — drives `/model`.
+    /// Never a ccteam-hardcoded name list (options change with opencode upgrades).
+    available_models: Vec<AcpModelOption>,
     state: Arc<StdMutex<SessionTranslateState>>,
     event_tx: broadcast::Sender<ThreadEvent>,
     permission_mode: PermissionMode,
     _dispatcher: tokio::task::JoinHandle<()>,
+}
+
+fn acp_choice_prompt(title: &str, options: Vec<crate::ChoiceOption>) -> ChoicePrompt {
+    ChoicePrompt {
+        token: unique_prompt_token("om"),
+        title: title.to_string(),
+        options,
+        multi: false,
+    }
 }
 
 /// Per-process singleton holding live OpenCode ACP sessions keyed by sessionId.
@@ -206,6 +220,7 @@ impl OpencodeAcpAdapter {
             sid,
             project_dir,
             cwd,
+            available_models: info.available,
             state,
             event_tx,
             permission_mode,
@@ -623,21 +638,49 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                 }
             }
             "model" => {
-                let arg = d.args.trim();
                 let Some(live) = live else {
                     return Ok(DirectiveOutcome::Rejected {
                         reason: "opencode session not live".into(),
                     });
                 };
+                // Same three forms as Grok/Claude: picker re-entry, explicit
+                // `/model <id> [effort]`, bare `/model` → NeedsChoice from the
+                // vendor-captured configOptions catalog (never hardcoded).
+                let picked = d.choice.as_ref().and_then(|c| {
+                    c.ids
+                        .first()
+                        .cloned()
+                        .or_else(|| c.free_text.clone().filter(|s| !s.trim().is_empty()))
+                });
+                let arg = match picked {
+                    Some(p) => p,
+                    None => d.args.trim().to_string(),
+                };
                 if arg.is_empty() {
-                    let model = live
-                        .state
-                        .lock()
-                        .ok()
-                        .and_then(|s| s.model.clone())
-                        .unwrap_or_else(|| "(unknown)".into());
-                    return Ok(DirectiveOutcome::Done {
-                        receipt: format!("opencode model: {model}"),
+                    let options = acp_model_picker_options(&live.available_models);
+                    if options.is_empty() {
+                        let current = live
+                            .state
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.model.clone())
+                            .unwrap_or_else(|| "(unknown)".into());
+                        return Ok(DirectiveOutcome::Rejected {
+                            reason: format!(
+                                "用法: /model <provider/model> [effort]（当前: {current}；vendor 未返回 model options）"
+                            ),
+                        });
+                    }
+                    return Ok(DirectiveOutcome::NeedsChoice(acp_choice_prompt(
+                        "Choose an OpenCode model:",
+                        options,
+                    )));
+                }
+                let efforts = known_efforts(&live.available_models);
+                let (model_id, effort) = split_trailing_effort(&arg, &efforts);
+                if model_id.is_empty() {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason: "用法: /model <provider/model> [effort]".into(),
                     });
                 }
                 match live
@@ -647,21 +690,44 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                         json!({
                             "sessionId": live.session_id,
                             "configId": "model",
-                            "value": arg,
+                            "value": model_id,
                         }),
                     )
                     .await
                 {
                     Ok(_) => {
                         if let Ok(mut st) = live.state.lock() {
-                            st.model = Some(arg.to_string());
+                            st.model = Some(model_id.clone());
                         }
-                        Ok(DirectiveOutcome::Done {
-                            receipt: format!("opencode model set to {arg}"),
-                        })
+                        let mut receipt = format!("已切换 model → {model_id}（live）");
+                        if let Some(ref e) = effort {
+                            match live
+                                .transport
+                                .call(
+                                    "session/set_config_option",
+                                    json!({
+                                        "sessionId": live.session_id,
+                                        "configId": "effort",
+                                        "value": e,
+                                    }),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    if let Ok(mut st) = live.state.lock() {
+                                        st.effort = Some(e.clone());
+                                    }
+                                    receipt.push_str(&format!("；effort → {e}"));
+                                }
+                                Err(err) => {
+                                    receipt.push_str(&format!("；effort 切换失败: {err}"));
+                                }
+                            }
+                        }
+                        Ok(DirectiveOutcome::Done { receipt })
                     }
                     Err(e) => Ok(DirectiveOutcome::Rejected {
-                        reason: format!("opencode set_config_option model failed: {e}"),
+                        reason: format!("/model 切换失败: {e}"),
                     }),
                 }
             }
