@@ -4,7 +4,7 @@
 //! `turn_completed` notifications). Buffer only `agent_message_chunk`;
 //! drop thoughts and `isReplay` frames.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
@@ -28,6 +28,13 @@ pub struct TurnBuffer {
 #[derive(Debug, Default)]
 pub struct SessionTranslateState {
     pub buffer: Option<TurnBuffer>,
+    /// Turns steered in while `buffer` is occupied, `(turn_id, text)`, FIFO.
+    /// ACP `session/prompt` is a single-turn RPC and `buffer` holds exactly one
+    /// turn, so a second concurrent prompt would clobber it. The gateway (like
+    /// Claude/Codex) fires a fresh `submit_turn` the instant a user steers
+    /// mid-turn; instead of hard-rejecting, we queue here and the turn runner
+    /// drains FIFO — matching Grok/OpenCode native prompt-queue semantics.
+    pub pending: VecDeque<(String, String)>,
     /// Fired once by the dispatcher when it processes this turn's boundary
     /// (`turn_completed` / `prompt_complete`), which is FIFO-ordered after
     /// every `agent_message_chunk`. The submit task awaits this before

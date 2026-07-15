@@ -167,6 +167,76 @@ async fn handshake_prompt_final_only_on_fake() {
     clear_fake();
 }
 
+/// Mid-turn steer: a second `submit_turn` fired before the first turn finalizes
+/// must be QUEUED (not hard-rejected with "a turn is already in progress"), then
+/// run as its own turn once the first completes. Regression for the daemon
+/// steering an ACP session like Claude/Codex.
+#[tokio::test]
+#[serial]
+async fn mid_turn_submit_queues_second_turn() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = OpencodeAcpAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s1"),
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut finals = Vec::new();
+        let mut completed = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        finals.push(t);
+                    }
+                }
+                ThreadEvent::TurnCompleted { .. } => {
+                    completed += 1;
+                    if completed == 2 {
+                        break;
+                    }
+                }
+                ThreadEvent::TurnFailed { err, .. } => panic!("turn failed: {err:?}"),
+                _ => {}
+            }
+        }
+        finals
+    });
+
+    let first = adapter
+        .submit_turn(&handle, TurnInput::UserText("one".into()))
+        .await
+        .expect("first submit ok");
+    let second = adapter
+        .submit_turn(&handle, TurnInput::UserText("two".into()))
+        .await
+        .expect("second submit must queue, not reject");
+    assert_ne!(first.0, second.0, "queued turn gets its own id");
+
+    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    assert_eq!(finals.len(), 2, "both queued turns produce an answer");
+    assert_eq!(finals[0], "echo:one", "first turn runs first (FIFO)");
+    assert_eq!(finals[1], "echo:two", "queued turn drains after the first");
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 #[tokio::test]
 #[serial]
 async fn resume_prefers_session_resume_no_replay() {

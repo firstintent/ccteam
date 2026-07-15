@@ -27,6 +27,7 @@ use crate::{
     TurnId, TurnInput,
 };
 
+use crate::execution::acp::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use protocol::{
@@ -34,9 +35,7 @@ use protocol::{
     split_trailing_effort, AcpModelOption, ModelInfo,
 };
 use spawn_spec::{build_argv, grok_bin, GrokSpawnInput};
-use translate::{
-    apply_notification, fail_turn, finalize_from_prompt_result, SessionTranslateState,
-};
+use translate::{apply_notification, SessionTranslateState};
 use transport::AcpTransport;
 
 /// Max wait for the dispatcher to reach the turn boundary after the prompt
@@ -450,69 +449,44 @@ impl HarnessAdapter for GrokAcpAdapter {
             }
         };
 
-        let turn_id = format!("t-{}", Utc::now().timestamp_millis());
+        // Unique per-process id (timestamp + seq) so two turns steered in the
+        // same millisecond never collide in the pending queue / experience log.
+        let turn_id = next_acp_turn_id();
         // Barrier the dispatcher fires on the turn boundary so finalize sees
         // every buffered chunk (see FINALIZE_BARRIER / SessionTranslateState).
         let turn_done = Arc::new(tokio::sync::Notify::new());
-        {
+        // Reserve the buffer if idle (→ spawn the runner) or queue behind the
+        // in-flight turn (the runner drains FIFO). The gateway steers by firing
+        // a fresh submit_turn mid-turn, exactly like Claude/Codex; ACP prompts
+        // serialize natively, so we queue rather than reject.
+        let spawn_runner = {
             let mut st = live
                 .state
                 .lock()
                 .map_err(|_| HarnessError::Io("grok state lock poisoned".into()))?;
-            // Guard against a clobbered in-flight turn (the gateway serializes
-            // turns per session; this is defense-in-depth).
             if st.buffer.is_some() {
-                return Err(HarnessError::SubmitFailed(
-                    "grok_acp: a turn is already in progress for this session".into(),
-                ));
+                st.pending.push_back((turn_id.clone(), text.clone()));
+                false
+            } else {
+                st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
+                true
             }
-            st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
+        };
+
+        if spawn_runner {
+            AcpTurnRunner {
+                transport: Arc::clone(&live.transport),
+                state: Arc::clone(&live.state),
+                event_tx: live.event_tx.clone(),
+                session_id: live.session_id.clone(),
+                tuning: AcpTurnTuning {
+                    finalize_barrier: FINALIZE_BARRIER,
+                    post_finalize_sleep: None,
+                    label: "grok",
+                },
+            }
+            .spawn(turn_id.clone(), turn_done, text);
         }
-
-        let transport = Arc::clone(&live.transport);
-        let state = Arc::clone(&live.state);
-        let event_tx = live.event_tx.clone();
-        let session_id = live.session_id.clone();
-        let turn_id_bg = turn_id.clone();
-
-        tokio::spawn(async move {
-            let _ = event_tx.send(ThreadEvent::TurnStarted {
-                turn_id: turn_id_bg.clone(),
-            });
-            let result = transport
-                .call(
-                    "session/prompt",
-                    json!({
-                        "sessionId": session_id,
-                        "prompt": [{ "type": "text", "text": text }]
-                    }),
-                )
-                .await;
-            let events = match result {
-                Ok(result) => {
-                    // Wait until the dispatcher has drained through the turn
-                    // boundary (all `agent_message_chunk` buffered) before
-                    // finalizing. A stored permit makes this return instantly
-                    // when the boundary already arrived (the common case).
-                    let _ = tokio::time::timeout(FINALIZE_BARRIER, turn_done.notified()).await;
-                    if let Ok(mut st) = state.lock() {
-                        finalize_from_prompt_result(&mut st, &result)
-                    } else {
-                        Vec::new()
-                    }
-                }
-                Err(e) => {
-                    if let Ok(mut st) = state.lock() {
-                        fail_turn(&mut st, &e.to_string())
-                    } else {
-                        Vec::new()
-                    }
-                }
-            };
-            for ev in events {
-                let _ = event_tx.send(ev);
-            }
-        });
 
         Ok(TurnId(turn_id))
     }

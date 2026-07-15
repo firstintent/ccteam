@@ -8,6 +8,7 @@
 pub mod protocol;
 pub mod translate;
 pub mod transport;
+pub mod turn_runner;
 
 pub use protocol::{
     acp_model_picker_options, content_text, cost_from_usage_update, is_replay, is_turn_boundary,
@@ -19,3 +20,4 @@ pub use translate::{
     SessionTranslateState, TurnBuffer,
 };
 pub use transport::{AcpTransport, InboundPolicy, JsonRpcError, Notification};
+pub use turn_runner::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
