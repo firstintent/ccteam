@@ -389,7 +389,6 @@ export default function ChatConsole() {
             projectPaths={projectPaths}
             projectHosts={projectHosts}
             projectBranches={projectBranches}
-            liveCount={railSessions.length}
             recents={recents}
             initialProject={homeProject}
             onLaunched={(newSid) => {
