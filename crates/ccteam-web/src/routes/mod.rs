@@ -67,7 +67,8 @@ pub mod status;
 pub mod session_pane;
 // v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
 pub mod users;
-// v0.9 T4 — streamable HTTP MCP (`POST /mcp`, admin bearer always required).
+// v0.9 T4 — streamable HTTP MCP (`POST /mcp`). Self-gated (admin bearer OR
+// session principal); mounted OUTSIDE auth_layer in `lib::router_with_state`.
 pub mod mcp;
 pub mod mcp_servers;
 
@@ -97,10 +98,10 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(openapi::api_v1_router())
         .merge(chat_ws::router())
         .merge(pty_ws::router())
-        // v0.9 T4 — MCP over HTTP (stateless JSON). Outside `/api/v1` so it is
-        // not OpenAPI-registered; still inside auth_layer. Bearer is enforced
-        // again inside the handler even when AuthState is disabled.
-        .merge(mcp::router())
+    // NOTE: `mcp::router()` (`POST /mcp`) is deliberately NOT merged here — it
+    // mounts OUTSIDE auth_layer in `lib::router_with_state` because it
+    // authenticates itself (admin bearer OR session principal
+    // `ccteam-sid:<sid>:<secret>`, which auth_layer does not understand).
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

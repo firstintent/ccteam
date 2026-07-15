@@ -3,25 +3,34 @@
 //! Stateless JSON mode: one JSON-RPC 2.0 message in → one JSON-RPC response
 //! out via [`ccteam_im::mcp::McpDispatch`]. No SSE push, no `Mcp-Session-Id`.
 //!
-//! **Auth.** Bearer is ALWAYS required — even when `AuthState.enabled == false`
-//! (loopback / `--no-auth`). Rationale: DNS-rebinding / local-script hardening;
-//! curated per-session configs and external clients always hold a token.
+//! **Auth — self-gated, bearer-only.** This router mounts OUTSIDE the web
+//! `auth_layer` (see `lib::router_with_state`): that layer only understands
+//! the web token family (`ccteam:<hex>` + cookies) and would 401 a session
+//! bearer before this handler ran — which silently downgraded every managed
+//! session's A2A call to an admin fallback and dropped the delegation parent
+//! (fixed v0.9.2). [`require_mcp_auth`] is the single gate; it accepts exactly
+//! two bearers:
 //!
-//! // Future (comment-only reserve — do NOT implement yet): a session-scoped
-//! // bearer of the form `ccteam-sid:<sid>:<secret>` may be accepted once the
-//! // owner decides. Match seam lives next to the admin-token check in
-//! // [`require_mcp_bearer`].
+//! - admin web token `ccteam:<hex>` → [`McpAuth::Admin`] (owner front door;
+//!   `session_spawn` is a root spawn by design)
+//! - session principal `ccteam-sid:<sid>:<secret>` → Ambient with the FULL
+//!   caller identity injected (the delegation-parent edge)
+//!
+//! A bearer is ALWAYS required — even when `AuthState.enabled == false`
+//! (loopback / `--no-auth`): DNS-rebinding / local-script hardening; curated
+//! per-session configs and external clients always hold a token. Cookies
+//! never authenticate `/mcp`.
 
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Extension, Json, Router,
+    Json, Router,
 };
 use serde_json::{json, Value};
 
-use crate::auth::{validate_bearer, Identity, PresentedToken};
+use crate::auth::validate_bearer;
 use crate::state::AppState;
 use crate::token::generate_or_load_token;
 
@@ -50,13 +59,9 @@ async fn method_not_allowed() -> Response {
 async fn handle_post(
     State(app): State<AppState>,
     headers: HeaderMap,
-    // Injected by auth_layer when auth is enabled (absent on the loopback
-    // no-auth path, which inserts Identity::admin but no PresentedToken).
-    identity: Option<Extension<Identity>>,
-    presented: Option<Extension<PresentedToken>>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let auth = match require_mcp_auth(&app, &headers, identity, presented).await {
+    let auth = match require_mcp_auth(&app, &headers).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -125,15 +130,11 @@ enum McpAuth {
     },
 }
 
-/// Enforce bearer always. Accepts:
-/// - admin web token `ccteam:<hex>` (owner front door → [`McpCaller::Admin`])
+/// Enforce bearer always (this route mounts outside `auth_layer`, so this is
+/// the ONLY gate). Accepts:
+/// - admin web token `ccteam:<hex>` (owner front door → [`McpAuth::Admin`])
 /// - session-scoped `ccteam-sid:<sid>:<secret>` (curated per-session MCP → Ambient)
-async fn require_mcp_auth(
-    app: &AppState,
-    headers: &HeaderMap,
-    identity: Option<Extension<Identity>>,
-    presented: Option<Extension<PresentedToken>>,
-) -> Result<McpAuth, Response> {
+async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth, Response> {
     let unauthorized = || {
         (
             StatusCode::UNAUTHORIZED,
@@ -158,17 +159,12 @@ async fn require_mcp_auth(
         }
     }
 
-    if app.auth.enabled {
-        let is_admin = identity
-            .as_ref()
-            .map(|Extension(id)| id.is_admin)
-            .unwrap_or(false);
-        if presented.is_none() || !is_admin {
-            return Err(unauthorized());
-        }
-        Ok(McpAuth::Admin)
-    } else {
-        let expected = match generate_or_load_token(&app.paths.web_token_path()) {
+    // Admin web token — the LIVE AuthState token when the web gate is enabled
+    // (single source with the REST surface, including rotation); loaded from
+    // disk on the loopback / --no-auth path where AuthState holds none.
+    let expected = match app.auth.current_token() {
+        Some(hex) => hex,
+        None => match generate_or_load_token(&app.paths.web_token_path()) {
             Ok(hex) => hex,
             Err(err) => {
                 tracing::error!(error = %err, "POST /mcp: failed to load web token");
@@ -178,11 +174,11 @@ async fn require_mcp_auth(
                 )
                     .into_response());
             }
-        };
-        match raw {
-            Some(p) if validate_bearer(p, &expected) => Ok(McpAuth::Admin),
-            _ => Err(unauthorized()),
-        }
+        },
+    };
+    match raw {
+        Some(p) if validate_bearer(p, &expected) => Ok(McpAuth::Admin),
+        _ => Err(unauthorized()),
     }
 }
 

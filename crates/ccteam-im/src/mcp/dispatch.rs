@@ -1168,6 +1168,16 @@ async fn run_session_spawn(
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
+    // v0.9.2 — surface WHO spawned this child so a rootless spawn is
+    // self-explanatory: the admin front door is a root spawn BY DESIGN, an
+    // ambient caller is the delegation parent. This is the diagnostic for the
+    // "my agent's children lost their parent edge" class of misconfiguration
+    // (e.g. the agent's calls silently riding an admin-authenticated server).
+    let caller_label = match (caller, parent.as_ref()) {
+        (McpCaller::Admin, _) => "admin".to_string(),
+        (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
+        (McpCaller::Ambient, None) => "ambient".to_string(),
+    };
 
     // Check idempotency + create under ONE lock so a concurrent same-key retry
     // can never race past the replay into a second spawn.
@@ -1250,6 +1260,7 @@ async fn run_session_spawn(
         "permission_mode": permission_mode.as_str(),
         "parent_sid": parent_sid,
         "delegation_depth": delegation_depth,
+        "caller": caller_label,
         "hint": "dispatch a task with session_dispatch{sid, task}, then read the result with session_collect{sid}.",
     });
     if let Some(t) = &title {

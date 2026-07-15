@@ -125,9 +125,18 @@ pub fn router_with_state(state: AppState) -> Router {
         // wraps this) → auth injects `Identity` first, then this gate reads it.
         .layer(from_fn_with_state(state.clone(), auth::project_acl_layer))
         .layer(from_fn_with_state(state.clone(), auth::auth_layer))
-        .with_state(state);
+        .with_state(state.clone());
+    // `POST /mcp` mounts OUTSIDE auth_layer: it authenticates itself (admin
+    // web token OR session principal `ccteam-sid:<sid>:<secret>`) and enforces
+    // a bearer even when the web gate is disabled — strictly no weaker than
+    // the layer it left. Behind auth_layer — which only understands the web
+    // token family — the session bearer was 401'd before the handler ran, so
+    // managed sessions lost their Ambient identity and every A2A spawn came
+    // out rootless (the v0.9.2 "delegation parent lost over HTTP" fix).
+    let mcp = routes::mcp::router().with_state(state);
     Router::new()
         .merge(routes::stateless_router())
+        .merge(mcp)
         .merge(stateful)
 }
 
