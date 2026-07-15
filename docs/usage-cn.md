@@ -70,7 +70,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-进 **主机** 页,点 **「注册 ccteam MCP」**。这一步把 ccteam 自己的工具(派活、发文件、截图等)写进 Claude / Codex 配置,会话才能调用它们。主机页还显示这台机器上 Claude / Codex 装没装、版本、是否就绪。
+进 **主机** 页,点 **「注册 ccteam MCP」**。这一步把 ccteam 自己的工具(雇会话/派活、发文件、截图等)写进**全部四个 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -219,7 +219,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 起一个 codex 会话,按 docs/rfc-12.md 实现,测试全过后汇报给我
 ```
 
-这套编排面的深度参考(逐工具、身份模型、多机语义)见 [orchestration-cn.md](orchestration-cn.md)。
+日常用法建议把这句话包成 skill(比如用户级的 `cct-codex`:替你 spawn、盯进度、拿简短汇报回来),一句话可靠跑完整个闭环。人话版指南——该说什么、最佳实践、附录给 skill 作者的工具速查——见 [orchestration-cn.md](orchestration-cn.md)。
 
 ---
 
@@ -235,7 +235,7 @@ ccteam init --in /path/to/repo # 在别处初始化
 ccteam init --slug demo        # 覆盖自动推断的 slug
 ccteam init --owner user:u123  # 多用户:把项目归属给某租户
 ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot ③ 偏好(交互菜单)
-ccteam config mcp              # 仅注册/刷新 ccteam MCP(给 Claude + Codex 都写;无 TTY 用这个)
+ccteam config mcp              # 注册/刷新 ccteam MCP(四个 vendor 全写:Claude/Codex/Grok/OpenCode;无 TTY 用这个)
 ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
 ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web

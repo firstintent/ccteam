@@ -1,146 +1,111 @@
-# Agent orchestration — the deep-user guide
+# Use your AI team — the plain-language guide
 
 > 中文版: [orchestration-cn.md](orchestration-cn.md)
 
-**For people who already live in Claude Code / Codex.** This is the Task tool, except the subagent is a full vendor session — any vendor, any machine — that survives you closing the laptop, and every hop is recorded.
+**You don't memorize tool names.** You say "use cct-codex to refactor this page" and a skill hands the work to a Codex session, supervises it to completion, and brings back a short report — status, files changed, tests pass/fail — for you to review. The work keeps running after you close your laptop, and every hop is on the ledger.
 
-ccteam exposes eight MCP tools under the `ccteam` server. In Claude Code they appear as `mcp__ccteam__session_spawn`, `mcp__ccteam__session_dispatch`, `mcp__ccteam__session_collect`, `mcp__ccteam__session_list`, `mcp__ccteam__session_stop`, plus `mcp__ccteam__status`, `mcp__ccteam__chat_send_file`, `mcp__ccteam__screenshot`. The five `session_*` tools are the orchestration surface; everything below is about using them well.
+This is Claude Code's Task tool, except the "subagent" is a full vendor session — Codex, Grok, another Claude — possibly on another machine, and everything it does is recorded and inspectable.
 
 ---
 
-## 1. The mental model
+## 1. Three ways in
 
-```text
-chat ⇄ project ⇄ session          project = (slug, host, path)
-                 └─ s1, s2, …     sessions run wherever their project lives
-```
+| Where you are | How you use the team |
+|---|---|
+| **Phone / IM** (Telegram, Lark) | just message your session; `/compare why is this code slow` asks three models at once. Install the `team-brain` persona (marketplace) and one session becomes your chief of staff |
+| **Web console** | open sessions in the browser, watch the team tree, review diffs, track cost |
+| **Inside your coding agent** — Claude, Codex, Grok or OpenCode (this guide's focus) | delegate with one sentence, via **skills like cct-codex / cct-grok** that drive the tools for you |
 
-- **session** — one vendor process with its own context, addressed by a durable id (`s1`, `s2`, …) that survives daemon restarts and is never reused. A session belongs to exactly one **project**.
-- **project** — a registered working tree **bound to exactly one host** (`local` or a satellite). It is the unit of delegation guardrails, cost ceilings, access control — and now placement. The same repo checked out on two machines is **two projects** (slug equality across machines was abolished as an identity: it misled — same slug can be different projects, different slugs the same repo). Catalog a satellite checkout either by creating it from the web (pick the host) or by importing one already registered there.
-- **host** — a property of the **project**, not of the spawn. Sessions inherit it: spawn into a project on `gpu02` and the child runs on `gpu02`. Transcript, cost, and the delegation ledger stay on your daemon regardless of where the process runs. There is no `host` parameter on `session_spawn` — passing one is a hard error.
-- **The daemon routes; it never schedules.** No tick loop, no orchestrator. Whatever topology exists is the one your sessions (or you) built with these five tools.
-- **Delegation is recorded, not injected.** A dispatched task is forwarded verbatim as a user turn. A completion notification is an ordinary turn delivered to the parent — the same shape as a human relaying a message. Nothing is ever written into another session's system prompt.
+The full manual for the human surfaces is [usage.md](usage.md). This guide is about the third row — **commanding a whole team from inside your everyday AI session.**
 
-## 2. Which sessions can call the tools — and as whom
+## 2. The mental model (30 seconds)
 
-Two identities, both end at the same daemon gate:
+Think of a small team where you are the lead:
 
-| Caller | Identity | Scope |
-|---|---|---|
-| **ccteam-spawned session** | per-session `(sid, secret)` principal, minted at spawn, injected via the session's curated MCP config | its **own project** only; delegation guardrails apply (depth, fan-out, cycles, budget) |
-| **Plain main session** — the `claude` / `codex` you launched yourself | same-user admin registration: Codex uses the global HTTP MCP entry + admin bearer; Claude's existing global stdio bridge reads the same token (`~/.ccteam/secrets/web-token`, 0600) | fleet-wide; `session_spawn` targets the project resolved from your **working directory** (or an explicit `project` arg); spawns are roots of new delegation trees |
+- **You** = the lead. You say what you want, review results, decide what ships.
+- **Codex** = the colleague who grinds through long work. Multi-file implementation, migrations, test-fixing, mechanical slogs.
+- **Grok** = quick answers / second opinions. "Where's the bottleneck", "which of these three is right" — minute-scale answers (needs the grok CLI on that machine).
+- **Claude** = the deepest reasoner. Decomposition, verdicts, the review gate before a merge.
 
-Practical consequences for the main-session case:
+Each colleague is a **session** with a durable id (`s47`). A session runs on whatever machine its **project** is bound to (local or a satellite). Close your laptop and it keeps working; what it spent and what it changed is all on your daemon's ledger.
 
-- Run your session **inside a registered project directory** and `session_spawn{vendor:"codex", task:"…"}` just works — no setup beyond `ccteam config mcp` (once) and a running daemon.
-- Your main session is not itself a ccteam session, so **completion notifications have nowhere to land**. Use `wait_seconds` for short tasks or poll `session_collect`; the spawned child is fully tracked either way.
-- Outside any registered project, pass `project:"<slug>"` explicitly.
+**One iron rule:** when you want to "call another agent", **never** shell out to `codex exec` / `claude -p` yourself. That run has no session id, no cost accounting, no completion signal, and is invisible in the team view. If it's worth delegating, it's worth being on the ledger — let the skill go through the proper channel.
 
-**Never shell out to `codex exec` / `claude -p` to "call another agent".** A raw CLI run has no sid, writes no `turns.jsonl`, accrues untracked cost, sends no notification, and is invisible to `session_list` and the team view. If it matters enough to delegate, it matters enough to be on the ledger.
+## 3. The phrases you say
 
-## 3. Verify the surface (60 seconds)
+The skills hide the tool calls. You say the left column; the right column happens:
+
+| You say | What happens |
+|---|---|
+| "**use cct-codex** to implement / refactor / fix X" | a codex session grinds in the background; when done you get a **short report** (STATUS / files changed / test results) and review the diff yourself with `git diff` |
+| "**use cct-grok** for a quick look at X", "ask grok …" | a grok session spins up, waits a minute or two inline, pastes the answer back |
+| "have **claude review** whether this diff can merge" | a cross-model review gate: a different model reads the diff and returns MERGE / BLOCK |
+| "**what sessions** are running?" | the team tree: who reports to whom, busy or idle, cost so far |
+| "**stop s47**" | explicitly closes that session (state stays on disk, resumable later) |
+
+**cct-codex** is for long work (background + poll); **cct-grok** is for quick Q&A (wait inline). Once installed (§6), you just say these things in your everyday Claude session.
+
+## 4. Making delegation pay (best practices, in plain language)
+
+These turn "it works" into "it's good". The skills encode them, but you should know them too:
+
+1. **Brief clearly, and demand a short report with no code dumps.** The single biggest lever. One line — "reply in ≤25 lines: STATUS / files changed / test results / open questions, no diffs" — makes the reply ten times denser; otherwise a screenful of logs floods **your own** context.
+2. **Long work runs in the background; quick answers wait inline.** Implementation goes to codex async (it reports back like a colleague); only minute-scale answers you need for your next sentence are worth an inline grok wait.
+3. **Review the diff yourself; don't have it read aloud.** The colleague reports *which files and why*; you read the code with `git diff`.
+4. **Gate merges with a different model.** Codex implements; before merging, have a Claude or Grok session review the same diff — cross-vendor review catches what same-model review rubber-stamps.
+5. **Run where the environment is.** GPU tests live on the Linux box? Join it as a satellite, register the repo there, and delegate into *that project* — the work runs on that machine automatically.
+6. **Set the limits once, then trust them.** Delegation depth, fan-out, and daily budgets are guardrails the daemon enforces with a stated reason. Configure once, then delegate without worrying.
+7. **One task per dispatch.** Three asks in one message = one muddled report you must untangle; three dispatches = three clean checkpoints.
+
+## 5. A real example (how a real feature shipped)
+
+The lead says: "merge the settings 'Hosts' and 'Status' pages into one adaptive page."
+
+1. A **codex session `s47`** starts on it in the background (async).
+2. Minutes later it reports: changed `SettingsView / App / CSS / i18n` + tests, **Vitest 379 green, build passes**, and notes it "also fixed 3 pre-existing lint errors".
+3. The lead (an orchestrating Claude) **runs `git diff` itself**: merge is clean, the 3 lint fixes were already red in the repo and the changes are safe.
+4. It starts a **claude session `s49`** as a cross-model reviewer, waits a minute inline, gets the verdict: **MERGE, no blockers**.
+5. Done. `s49` is stopped; `s47` stays around for follow-ups.
+
+**The lead said two sentences in total.** Two sessions from different vendors did the work and reviewed each other, every hop on the ledger and in the team view.
+
+## 6. Install once
+
+`cct-codex` and `cct-grok` are first-party recipes on the **marketplace** — install them into a project from the web marketplace page (they land in `.claude/skills/`, so ccteam-managed sessions get them too), or keep personal copies user-level in `~/.claude/skills/` so every session of yours can use them. Prerequisites:
+
+- `ccteam start` is running on this machine; `ccteam config mcp` has registered ccteam with **all four vendors** — Claude, Codex, Grok, OpenCode (one-time; any vendor's plain session can orchestrate).
+- You're inside a **registered ccteam project** directory (the skill resolves the project from the working directory).
+- You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §7.)
+
+Verify in 60 seconds:
 
 ```bash
 ccteam doctor --verify-mcp       # 8 tools, 0 stubs — drift exits 1
 claude mcp list                  # server `ccteam` — ✔ Connected
-claude -p "list your tools containing 'ccteam'"   # names visible to a real session
+grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discovered
 ```
-
-If `claude mcp list` says Connected but a *particular* session has no `mcp__ccteam__*` tools:
-
-- The session predates `ccteam config mcp` — MCP servers are read at session start; restart it.
-- The session was spawned **by ccteam** with a curated `--strict-mcp-config` — it gets exactly one MCP entry (ccteam itself, with its principal). If that entry's HTTP endpoint can't be reached, the session has zero tools; check `ccteam status` and the daemon log.
-- SDK-driven harnesses may not load user-scope `~/.claude.json` servers at all — orchestrate from a normal CLI session, or wire the server into the SDK config explicitly.
-
-## 4. The five tools
-
-Parameter lists below are exact; everything optional unless marked.
-
-### `session_spawn` — hire a colleague (and hand over the first task)
-
-```json
-{"vendor":"codex", "title":"impl-rfc12",
- "task":"Implement RFC-12, run the test suite, report pass/fail with a diff summary."}
-```
-
-- `vendor`: `claude` (default) | `codex` | `grok` | `opencode`. `model`, `effort`: vendor-specific overrides. `protocol`: `stream-json` (default) or `acp` — grok/opencode force `acp`; `terminal` is never available to agents.
-- Execution host is **inherited from the project** — there is no `host` parameter (passing one errors). To run remotely, spawn into a project bound to that satellite (create it from the web host picker, or import a checkout already registered there). Remote execution currently supports Claude stream-json sessions.
-- `role`: a `.claude/agents/<role>.md` persona, loaded by the vendor's native mechanism. Omit for roleless — the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, which is the right default more often than not.
-- `task` + `wait_seconds` + `notify`: spawn-and-dispatch in one call. Async by default: the child works, you get a completion-notification turn when it finishes (ccteam-session callers only). `wait_seconds:120` blocks inline and returns `result_text`. `notify:false` = ledger-only.
-- `title`: ≤80 chars, ledger/team-view label only — never enters any prompt.
-- `permission_mode`: `skip` (default) or `hitl` — tool calls pop approve/deny to the bound IM chat.
-- `idempotency_key`: a retry with the same key replays the original spawn (same sid) instead of double-spawning — set it when your MCP client might time out and retry.
-- Returns `{sid, vendor_session_id, host, …}`. Always a **new** sid.
-
-### `session_dispatch` — send work to an existing session
-
-```json
-{"sid":"s7", "task":"Now rebase onto dev and re-run the failing suite only.", "wait_seconds":0}
-```
-
-Verbatim user turn, no injection. Async + notification by default; `wait_seconds` (≤600) blocks and returns `{status:"completed", result_text, cost_usd}` or `{status:"pending"}` on timeout — the child keeps running, never cancelled. Self/ancestor dispatch is rejected (cycle). Same `idempotency_key` semantics as spawn.
-
-### `session_collect` — read output without joining the session
-
-```json
-{"sid":"s7", "tail":true, "n":3}
-```
-
-Tails the child's ccteam-owned transcript. Key fields: `activity` — `working` (mid-turn: poll, don't parse silence) / `idle` (turn done: read) / `stale` / `stuck`; `cost_usd`; `vendor_session_id` (native resume key). Incremental polling: pass `since:<turn_id you last saw>`. Final answer of a long run: `tail:true`. Default page is oldest-first, `n:20`.
-
-Returns are **bounded**: `max_chars` (default 10 000, clamp 500–50 000) caps total returned content; longer turns keep a 70 % head / 30 % tail excerpt with an explicit marker and the full text stays in the ledger (page it with `since`/`n`). Waited spawn/dispatch `result_text` is capped at 10 000; the async completion-notification embed at 4 000 with a `session_collect` pointer. Your context is the scarce resource — the caps are the floor, your prompts are the ceiling (see §5).
-
-### `session_list` — the delegation tree
-
-Returns every live session (`sid`, `project`, `vendor`, `activity`, `waiting_approval`, `host`, `cost_usd`, `title`, `parent_sid`) plus a `tree` — roots and children. This is your fleet dashboard in tool form; the web team view renders the same graph live.
-
-### `session_stop` — explicit, never proactive
-
-Stops one sid. State stays on disk; the sid can cold-resume later. ccteam has exactly two automatic brakes, neither of which kills work mid-turn by preference: the daily per-vendor budget cap refuses *new* work, and the live-session capacity (`sessions.max_live`, default 50) gracefully stops the least-recently-active idle session to admit a new one — evicted sids stay resumable and the eviction is on the ledger (`session_evicted`). Creation never fails for capacity.
-
-## 5. Patterns that earn their keep
-
-**Route by strength, pay for depth once.** Let the deepest model decompose and verdict; ship the long grind to Codex and the quick probe to Grok:
-
-```json
-{"vendor":"codex", "title":"impl",  "task":"Implement RFC-12 per the constraints below… run tests, report."}
-{"vendor":"grok",  "title":"probe", "task":"Profile the hot path in src/ingest; top 3 offenders.", "wait_seconds":120}
-```
-
-Async for the grind (the notification lands like a colleague reporting back), inline wait only for sub-minute answers you need before your next sentence.
-
-**Gate merges with a rival model.** Codex implements; before merging, spawn a Claude reviewer *on the same project* and collect the verdict:
-
-```json
-{"vendor":"claude", "title":"review-rfc12",
- "task":"Review the diff on branch rfc12 for correctness and API-contract breaks. Verdict: MERGE or list blockers."}
-```
-
-Then `session_collect{sid, tail:true}` — the verdict without paging the whole transcript. Cross-vendor review catches what same-model review rubber-stamps.
-
-**Run where the environment is.** GPU tests live on the Linux box: join it once as a satellite, `ccteam init` the repo there, import that checkout from the web hosts page (or create it there via the new-project host picker) — it becomes a project bound to `linux-box` — then spawn into *that project*. Satellites dial out to the daemon — a laptop behind NAT is a perfectly good satellite; only the daemon needs a reachable port. The daemon's gate only accepts projects the satellite actually reports — an unregistered checkout fails fast with a readable error, never a silent local fallback.
-
-**Protect the parent's context.** Fan-out multiplies whatever your children say: ten workers × a 20 KB essay each is 200 KB into one parent. The engine caps returns (§4), but the real fix is the brief: end every task with a reply contract — "answer in ≤25 lines: STATUS / FILES / DECISIONS / GATES; no code or diff dumps" — and review diffs with `git diff` locally instead of through the child's mouth. Prefer `notify:false` + cursored `session_collect` for long jobs; big artifacts belong in files, not in chat turns.
-
-**Poll like you mean it.** `working` means mid-turn — do something else, poll again with `since`. `idle` means the turn is done — read. Don't infer completion from silence, and don't re-collect the whole transcript when a cursor gives you the delta.
-
-**Cap the blast radius, then trust it.** Delegation depth (default 2), per-parent fan-out (10), per-project delegated-session ceiling (50), cycle rejection, and daily per-vendor budgets are enforced by the daemon with a stated reason — a runaway fan-out is refused at spawn time, not discovered on the invoice. Set them once in config; design your prompts assuming refusal is possible. Separately, fleet-wide *capacity* (50 live sessions) is managed by graceful LRU eviction, not refusal.
-
-**One task per dispatch.** The completion notification fires per turn. Bundling three asks into one dispatch means one notification for the lot and a transcript you'll have to disentangle; three dispatches give you three checkpoints and three cost lines.
-
-## 6. Trust model, honestly
-
-Per-session secrets and the admin-token fallback are **defense in depth under a single OS user, not a hard boundary** — any same-uid process can ultimately read another's env or the token file. What the gate buys you: agents can't *accidentally* act cross-project or as each other; every action is attributed to an authenticated caller; remote hosts never see secrets that aren't theirs. Hard isolation (per-agent OS users / sandboxes) is deliberately out of scope for now. The HTTP `/mcp` endpoint always requires a bearer (admin or per-session) — the same-user fallback exists only on the local socket.
 
 ## 7. When something's off
 
-| Symptom | Likely cause → fix |
+| Symptom | What it is → what to do |
 |---|---|
-| Tools listed but `session_*` answers "not in a ccteam session … no admin web token" | daemon never started on this machine → `ccteam start`, retry |
-| `session_spawn: missing project` | main session outside any registered repo → `cd` into one, or pass `project` |
-| project's satellite is offline / checkout not reported | bring the satellite back online (`ccteam start` there), or `ccteam init` the repo on it and re-import; wait one heartbeat (~25 s), retry |
-| `removed in v0.9.2: host is bound to the project…` | drop the `host` argument — spawn into a project bound to the target host instead |
-| Spawn/dispatch might have double-fired after a client timeout | it didn't, if you set `idempotency_key`; start setting it |
-| Child seems silent | `session_collect` and look at `activity` — `working` is not silent, it's busy |
+| "tool not available / no such tool" | this session didn't load ccteam. Use a plain vendor CLI session; check `ccteam status`. SDK sessions can fall back to `POST http://localhost:7331/mcp` with `Authorization: Bearer ccteam:<hex>` (hex = `~/.ccteam/secrets/web-token`) — same tools, admin identity (spawns are roots). |
+| "it's been silent forever" | it's **working**, not stuck. Go do something else and come back for the report. |
+| "project not found" | you're not in a registered project directory. `cd` into one, or have the skill pass the project name. |
+| "grok doesn't work" | that machine doesn't have the grok CLI. `ccteam status` / capabilities shows which vendors this machine actually has. |
+| "did the delegation double-fire?" | the skills set an idempotency key; a timeout-retry never creates a duplicate. |
 
-Manual for the human surfaces (web console, Telegram/Lark, CLI): [usage.md](usage.md) · [中文](usage-cn.md).
+---
+
+## Appendix: tool reference (for skill authors / manual orchestration)
+
+You normally never touch these — the skills do. But if you're **writing a skill** or orchestrating by hand, ccteam exposes eight tools under the `ccteam` MCP server, visible in Claude as `mcp__ccteam__<name>`:
+
+- **`session_spawn`** — hire a colleague (and hand over the first task in the same call). `{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`. `vendor` = `claude` (default) / `codex` / `grok` / `opencode`; grok/opencode force `protocol:"acp"`. `role` names a `.claude/agents/<role>.md` persona — omit for roleless (the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, the right default more often than not). `title` ≤80 chars, ledger/team-view label only — never enters any prompt. `permission_mode:"hitl"` pops approve/deny to the bound IM chat. **There is no `host` parameter** — the execution machine is inherited from the project's binding; passing one is a hard error. `wait_seconds>0` waits inline for the first answer; default is async. Always returns a **new** `sid`; the response's `caller` names the authenticated spawner — `ambient:<sid>` (a ccteam session called it; it becomes the child's `parent_sid`) or `admin` (the owner front door / main-session fallback — always a **root** spawn, `parent_sid: null`). If you expected a parent edge and see `caller: "admin"`, your call rode an admin-authenticated MCP server instead of your session's own bearer.
+- **`session_dispatch`** — send another task to an existing session (`{sid, task, wait_seconds?, notify?, idempotency_key?}`). Forwarded verbatim as a user turn, zero injection. Async + completion notification by default; `wait_seconds` (≤600) blocks and returns `result_text`, or `status:"pending"` on timeout — the child keeps running, never cancelled. Dispatching to yourself or an ancestor is rejected (cycle guard).
+- **`session_collect`** — read a session's output without joining it (`{sid, tail?, n?, since?, max_chars?}`). Watch `activity`: `working` = mid-turn (poll again, pass `since:<last turn_id>` for the delta) / `idle` = turn done (read). **Codex flickers to `idle` between narration turns** — don't declare done on the first idle; confirm the final structured answer is present. Returns are bounded (`max_chars` default 10 000): long turns keep a 70 % head / 30 % tail excerpt with an explicit marker; the full text is always in the ledger.
+- **`session_list`** — the delegation tree (who reports to whom, busy/idle, cost, `parent_sid`). The web team view renders the same graph live.
+- **`session_stop`** — explicitly stop one `sid` (state stays on disk, cold-resumable). ccteam has exactly two automatic brakes: the daily per-vendor budget cap refuses *new* work, and live-session capacity gracefully evicts the least-recently-active idle session — **creation never fails for capacity**.
+- Plus **`status`** (daemon health + sessions + today's cost), **`chat_send_file`**, **`screenshot`**.
+
+**Identity & trust (honestly):** a ccteam-spawned session carries a per-session `(sid, secret)` principal and can only act within its own project, with delegation guardrails (depth 2, fan-out 10 per parent, 50 delegated per project, cycle rejection, budgets) enforced by the daemon with a stated reason. Your own main session rides the same-user admin fallback and can manage the whole fleet; it is not itself a ccteam session, so completion notifications have nowhere to land — use `wait_seconds` for short tasks or poll `session_collect`, and pass `project:"<slug>"` when outside a registered repo. The per-session secret is **defense in depth under a single OS user, not a hard boundary** — same-uid processes can ultimately read each other's env. What it buys: agents can't *accidentally* act cross-project or as each other, and every action is attributed to an authenticated caller. Hard isolation (per-agent OS users / sandboxes) is deliberately out of scope for now.

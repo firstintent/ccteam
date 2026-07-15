@@ -38,9 +38,9 @@ The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agen
 
 ## Best practices
 
-For people who already live in Claude Code / Codex — this is the Task tool, except the subagent is a full vendor session that survives you closing the laptop. The full deep-user reference (tool-by-tool, identity model, multi-machine semantics) is the [orchestration guide](docs/orchestration.md).
+For people who already live in Claude Code / Codex — this is the Task tool, except the subagent is a full vendor session that survives you closing the laptop. The [orchestration guide](docs/orchestration.md) is the plain-language walkthrough — what to say, best practices, a worked example — with a tool-by-tool appendix for skill authors.
 
-**Give the brain a team, keep it roleless.** Run Claude Code (Fable 5) as your orchestrator session and let it read your project's own `CLAUDE.md` — no ccteam persona needed. Install `fable-advisor` (marketplace) or write a skill that teaches it *when* to call `session_spawn` — orchestration lives in prompts you version, not in ccteam config.
+**Give the brain a team, keep it roleless.** Run Claude Code (Fable 5) as your orchestrator session and let it read your project's own `CLAUDE.md` — no ccteam persona needed. Install the first-party recipes from the marketplace — `cct-codex` / `cct-grok` skills for one-sentence delegation, the `team-brain` persona as an IM-first chief of staff — or write your own skill that teaches it *when* to call `session_spawn`: orchestration lives in prompts you version, not in ccteam config.
 
 **Route by strength, pay for depth once.** Fable 5 decomposes, sets constraints, verdicts. The long steady grind goes to Codex; the quick turnaround goes to Grok:
 

@@ -70,7 +70,7 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (One-Time)
 
-Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (dispatch, file sending, screenshots, and related controls) into Claude / Codex configuration so sessions can call them. The Hosts page also reports whether Claude and Codex are installed, their versions, and readiness.
+Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **all four vendors** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The Hosts page also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -221,7 +221,7 @@ Every session can spawn colleagues, dispatch tasks, and collect results through 
 start a codex session, implement the RFC under docs/rfc-12.md, and report back when tests pass
 ```
 
-The deep-user reference for this surface (tool-by-tool, identity model, multi-machine semantics) is [orchestration.md](orchestration.md).
+For everyday use, wrap the phrasing in a skill (e.g. a user-level `cct-codex` that spawns, supervises, and reports back with a short summary) so one sentence does the whole loop reliably. The plain-language guide — what to say, best practices, plus a tool appendix for skill authors — is [orchestration.md](orchestration.md).
 
 ---
 
@@ -237,7 +237,7 @@ ccteam init --in /path/to/repo # Initialize elsewhere.
 ccteam init --slug demo        # Override inferred slug.
 ccteam init --owner user:u123  # Multi-user: assign project ownership.
 ccteam config                  # One-time setup: MCP, IM bot, preferences.
-ccteam config mcp              # Register/refresh ccteam MCP only; useful without TTY.
+ccteam config mcp              # Register/refresh ccteam MCP for all four vendors; useful without TTY.
 ccteam start                   # Start resident service; add & for background.
 ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token.
 ccteam start --no-web | --no-imd         # Gateway only / web only.

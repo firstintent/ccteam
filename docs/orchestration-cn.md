@@ -1,6 +1,6 @@
 # 用你的 AI 团队 — 人话版
 
-> English tool reference: [orchestration.md](orchestration.md)（面向 skill 作者的工具级参考)
+> English version: [orchestration.md](orchestration.md)（同构英文版,附录含 skill 作者工具速查)
 
 **你不用记工具名。** 你说一句「用 cct-codex 把这个页面重构了」,一个 skill 就替你把活派给 codex、盯着它跑完、把「改了哪些文件、测试过没过」的结论拿回来给你审。合上笔记本它也接着跑,每一跳都有账。
 
@@ -12,9 +12,9 @@
 
 | 你在哪 | 怎么用 |
 |---|---|
-| **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;`/compare 这段代码为什么慢` 一次问三个模型 |
+| **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;`/compare 这段代码为什么慢` 一次问三个模型。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **Claude / Codex 里(本文重点)** | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode(本文重点) | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -71,17 +71,17 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 ## 6. 装一次
 
-这些 skill 是**用户级**的(住 `~/.claude/skills/cct-codex/` 和 `cct-grok/`),不在任何项目仓库里,你所有的 Claude 会话都能用。前提:
+`cct-codex` / `cct-grok` 是**插件市场里的第一方配方**——从 web 插件市场一键装进项目(落 `.claude/skills/`,ccteam 托管的会话也会加载),或放一份用户级副本在 `~/.claude/skills/` 让你所有会话可用。前提:
 
-- 本机 `ccteam start` 起着 daemon;`ccteam config mcp` 已把 ccteam 注册进 Claude/Codex(装一次)。
+- 本机 `ccteam start` 起着 daemon;`ccteam config mcp` 已把 ccteam 注册进**全部四个 vendor**——Claude / Codex / Grok / OpenCode(装一次;任何 vendor 的普通会话都能当指挥)。
 - 你在一个**已注册的 ccteam 项目**目录里(skill 从当前目录认出项目)。
-- 用**普通 `claude` 终端会话**——它会读 `~/.claude.json` 拿到 ccteam 工具。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §7。)
+- 用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证)。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §7。)
 
 ## 7. 出问题时(人话)
 
 | 现象 | 怎么回事 → 怎么办 |
 |---|---|
-| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 `claude` 终端会话;或 `ccteam status` 看 daemon 在不在。SDK 会话可退回走 `http://localhost:7331/mcp` + `ccteam status` 里的 token。 |
+| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;或 `ccteam status` 看 daemon 在不在。SDK 会话可退回 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam:<hex>`(hex = `~/.ccteam/secrets/web-token`)——同一套工具,admin 身份(spawn 是根)。 |
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
 | 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或让 skill 带上项目名。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
@@ -93,7 +93,7 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 平时你不碰这些——skill 替你调。但如果你在**写 skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
-- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`。
+- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`(grok/opencode 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。**Codex 会在中间叙述时闪 `idle`**——别只凭一次 idle 判完成,看最终结构化答案是否出现。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本)。web 团队视图渲染的是同一张图。
