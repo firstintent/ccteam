@@ -1891,6 +1891,13 @@ impl Gateway {
         // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
         // resolves the session's pending choice — never treated as text.
         if let Some(reply) = selection {
+            // A `nav:` callback is a self-describing project/session SWITCH
+            // button (it carries the target directly — `nav:cd:<slug>` /
+            // `nav:use:<sid>` — with no pending-registry token), so it is
+            // resolved here, before the token-keyed choice path.
+            if let Some(nav) = reply.data.strip_prefix("nav:") {
+                return self.resolve_nav_selection(&chat, nav).await;
+            }
             return self.resolve_selection(&chat, &reply.data).await;
         }
         // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
@@ -1904,6 +1911,14 @@ impl Gateway {
         // Commands parse on the raw text; attachments don't apply to them.
         if let Some(reply) = self.handle_command(&chat, text).await? {
             return Ok(vec![reply]);
+        }
+        // A gateway command may handle itself ENTIRELY via the event sink and
+        // return no inline reply — a screenshot (`/screen`), or a project /
+        // session picker delivered as text + inline buttons (`/projects`,
+        // `/sessions`). It must NOT fall through to `submit_to_current` below,
+        // where its `/command` text would be shipped to the agent verbatim.
+        if Self::is_gateway_command(text) {
+            return Ok(Vec::new());
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
@@ -2201,69 +2216,9 @@ impl Gateway {
                 } else {
                     arg
                 };
-                // `/use <sid>` switches the chat's focus to one of ITS OWN
-                // sessions (it then moves the chat's current project to the
-                // target's). v0.8.18 柱2 档0 — own-only: a chat can no longer
-                // `/use` a session another chat owns (it reads as unknown), so two
-                // IM chats on one machine stay isolated. Same-user cross-frontend
-                // reach (web↔IM) returns via 档1. The pairing ACL upstream gates
-                // who reaches the daemon at all; replies follow the per-turn
-                // submitter (`reply_to`).
-                let live_session = self
-                    .sessions
-                    .get(id)
-                    .filter(|s| Self::chat_can_access(chat, s));
-                if live_session.is_none() {
-                    // v0.8.21 — try to cold-resume a stopped session from meta.json.
-                    // ACL pre-check: peek at the stored owner BEFORE spawning so we
-                    // don't leak session existence to an unauthorised chat.
-                    let acl_ok = self
-                        .find_meta_for_sid(id)
-                        .ok()
-                        .map(|(_, _, meta)| Self::owner_identity_visible(chat, &meta.owner))
-                        .unwrap_or(false);
-                    if !acl_ok {
-                        return Ok(Some(format!("unknown session for this chat: {id}")));
-                    }
-                    let caller_identity = canonical_owner(chat).identity();
-                    // IM already owner-checked above (chat_owner_visible), so no
-                    // project-slug binding is needed here — pass None.
-                    match self
-                        .resume_stopped_session(id, &caller_identity, None)
-                        .await
-                    {
-                        Ok(resumed_sid) => {
-                            // Move current project to this session's project.
-                            if let Some(s) = self.sessions.get(&resumed_sid) {
-                                let proj = s.project.clone();
-                                self.current_project.insert(chat.clone(), proj);
-                            }
-                            return Ok(Some(format!("resumed session {resumed_sid}")));
-                        }
-                        Err(_) => {
-                            return Ok(Some(format!("unknown session for this chat: {id}")));
-                        }
-                    }
-                }
-                let session = live_session.expect("checked above");
-                let sid = session.id.clone();
-                // v0.8.10 — capture the target session's project so the switch can
-                // also move the chat's project context (below).
-                let project = session.project.clone();
-                if let Ok(mut target) = session.reply_to.lock() {
-                    *target = chat.clone();
-                }
-                // Switching INTO a session moves the chat's "current project" to
-                // that session's project, so a following /new (and /cd's default)
-                // lands in the same project you just switched into — not the stale
-                // prior one.
-                self.current_project.insert(chat.clone(), project);
-                self.current_session
-                    .write()
-                    .unwrap()
-                    .insert(chat.clone(), sid.clone());
-                self.persist_routing()?;
-                Ok(Some(format!("using session {sid}")))
+                // The switch itself lives in `use_session` (shared with the
+                // clickable session picker's `nav:use:<sid>` button tap).
+                self.use_session(chat, id).await.map(Some)
             }
             "/stop" => {
                 // v0.8.10 — stop (destroy) a session BY ID. Completes the session
@@ -2410,29 +2365,9 @@ impl Gateway {
                 let project = parts
                     .next()
                     .ok_or_else(|| anyhow!("/cd requires a project"))?;
-                // (v0.8.5) Pick up a project registered in config.yaml after the
-                // daemon started — the in-memory map is a cache, config.yaml is
-                // the source of truth — so /cd needs no daemon restart.
-                self.ensure_project_loaded(project);
-                if !self.projects.contains_key(project) {
-                    return Err(anyhow!("unknown project: {project}"));
-                }
-                self.current_project
-                    .insert(chat.clone(), project.to_string());
-                // The active session must follow the project switch, otherwise
-                // messages keep landing in the previous project's session while
-                // the receipt claims we moved. Adopt an existing session owned by
-                // this chat in the target project (deterministic: smallest id);
-                // otherwise clear the active session so the next message spawns
-                // one on demand in the target project via `ensure_current_session`.
-                let adopted = self.adopt_session_in_project(chat, project);
-                self.persist_routing()?;
-                Ok(Some(match adopted {
-                    Some(sid) => format!("project set to {project} (switched to {sid})"),
-                    None => {
-                        format!("project set to {project} (next message starts a session there)")
-                    }
-                }))
+                // The switch itself lives in `change_project` (shared with the
+                // clickable project picker's `nav:cd:<slug>` button tap).
+                self.change_project(chat, project).map(Some)
             }
             "/newproject" => {
                 // `/newproject <slug> <path>` — the path is the remainder
@@ -2467,10 +2402,40 @@ impl Gateway {
                 let all = parts
                     .next()
                     .is_some_and(|a| a.eq_ignore_ascii_case("all") || a == "*");
-                Ok(Some(self.render_sessions(chat, all).await))
+                let text = self.render_sessions(chat, all).await;
+                // On a button-capable channel (Telegram) the SAME list is
+                // delivered via the event sink as text + one inline "switch"
+                // button per live session (`nav:use:<sid>` tap → `/use`); the
+                // command then returns no inline reply. Every other channel
+                // (web's structured session frame, Lark's text-only send, the
+                // test mock) keeps the plain-text reply unchanged.
+                if Self::channel_supports_buttons(&chat.channel) {
+                    let options = self.session_switch_options(chat, all);
+                    self.emit_list_options(chat, text, options);
+                    Ok(None)
+                } else {
+                    Ok(Some(text))
+                }
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
-            "/projects" => Ok(Some(self.render_projects())),
+            "/projects" => {
+                // Button-capable channel (Telegram) → a text header + one inline
+                // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
+                // delivered via the event sink. Others keep the bare
+                // newline-separated slug list as an inline reply.
+                if Self::channel_supports_buttons(&chat.channel) {
+                    let options = self.project_switch_options(chat);
+                    let cur = self.current_project_for(chat);
+                    self.emit_list_options(
+                        chat,
+                        format!("📁 项目(点击切换,✓ = 当前 {cur}):"),
+                        options,
+                    );
+                    Ok(None)
+                } else {
+                    Ok(Some(self.render_projects()))
+                }
+            }
             "/compare" => {
                 // Remainder after the command (question may contain spaces).
                 let mut it = trimmed.splitn(2, char::is_whitespace);
@@ -2500,6 +2465,230 @@ impl Gateway {
             ))),
             _ => Ok(None),
         }
+    }
+
+    /// Switch the chat's current project to `project` — the `/cd` core, shared
+    /// with the clickable project picker (`nav:cd:<slug>` button tap).
+    ///
+    /// Picks up a project registered in `config.yaml` after the daemon started
+    /// (the in-memory map is a cache; config.yaml is the source of truth), then
+    /// moves the active session to follow the switch: adopt an existing session
+    /// this chat owns in the target project (deterministic smallest id), else
+    /// clear the active session so the next message spawns one there.
+    fn change_project(&mut self, chat: &ChatKey, project: &str) -> Result<String> {
+        self.ensure_project_loaded(project);
+        if !self.projects.contains_key(project) {
+            return Err(anyhow!("unknown project: {project}"));
+        }
+        self.current_project
+            .insert(chat.clone(), project.to_string());
+        let adopted = self.adopt_session_in_project(chat, project);
+        self.persist_routing()?;
+        Ok(match adopted {
+            Some(sid) => format!("project set to {project} (switched to {sid})"),
+            None => format!("project set to {project} (next message starts a session there)"),
+        })
+    }
+
+    /// Switch the chat's focus to session `id` — the `/use <sid>` core, shared
+    /// with the clickable session picker (`nav:use:<sid>` button tap).
+    ///
+    /// ACL is own-only (`chat_can_access` / `owner_identity_visible`): a chat
+    /// reaches only the sessions it owns plus the shared web pool. A session
+    /// that isn't live is cold-resumed from its `meta.json` after the same
+    /// owner check, so a button on a since-stopped session still works.
+    async fn use_session(&mut self, chat: &ChatKey, id: &str) -> Result<String> {
+        // v0.8.18 柱2 档0 — own-only: a chat can `/use` only its own (or a
+        // shared web-pool) session; another chat's reads as unknown. Same-user
+        // web↔IM reach returns via 档1; replies follow the per-turn submitter.
+        let live_session = self
+            .sessions
+            .get(id)
+            .filter(|s| Self::chat_can_access(chat, s));
+        if live_session.is_none() {
+            // v0.8.21 — try to cold-resume a stopped session from meta.json.
+            // ACL pre-check: peek at the stored owner BEFORE spawning so we
+            // don't leak session existence to an unauthorised chat.
+            let acl_ok = self
+                .find_meta_for_sid(id)
+                .ok()
+                .map(|(_, _, meta)| Self::owner_identity_visible(chat, &meta.owner))
+                .unwrap_or(false);
+            if !acl_ok {
+                return Ok(format!("unknown session for this chat: {id}"));
+            }
+            let caller_identity = canonical_owner(chat).identity();
+            // IM already owner-checked above, so no project-slug binding is
+            // needed here — pass None.
+            match self
+                .resume_stopped_session(id, &caller_identity, None)
+                .await
+            {
+                Ok(resumed_sid) => {
+                    // Move current project to this session's project.
+                    if let Some(s) = self.sessions.get(&resumed_sid) {
+                        let proj = s.project.clone();
+                        self.current_project.insert(chat.clone(), proj);
+                    }
+                    return Ok(format!("resumed session {resumed_sid}"));
+                }
+                Err(_) => return Ok(format!("unknown session for this chat: {id}")),
+            }
+        }
+        let session = live_session.expect("checked above");
+        let sid = session.id.clone();
+        let project = session.project.clone();
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = chat.clone();
+        }
+        // Switching INTO a session moves the chat's "current project" to that
+        // session's project, so a following /new (and /cd's default) lands in
+        // the same project you just switched into — not the stale prior one.
+        self.current_project.insert(chat.clone(), project);
+        self.current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid.clone());
+        self.persist_routing()?;
+        Ok(format!("using session {sid}"))
+    }
+
+    /// Resolve a `nav:` switch-button tap (`cd:<slug>` / `use:<sid>`) by
+    /// delegating to the SAME switch logic `/cd` / `/use` use (ACL + cold
+    /// resume included). The payload is self-describing, so no pending-registry
+    /// entry is consulted; a stale button just re-runs the (idempotent) switch
+    /// or reads as an unknown target.
+    async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
+        if let Some(slug) = nav.strip_prefix("cd:") {
+            return Ok(vec![self.change_project(chat, slug)?]);
+        }
+        if let Some(sid) = nav.strip_prefix("use:") {
+            return Ok(vec![self.use_session(chat, sid).await?]);
+        }
+        Ok(vec!["invalid selection".to_string()])
+    }
+
+    /// Whether a channel renders message `options` as tappable inline-keyboard
+    /// buttons. Only Telegram does today: Lark's `send` ignores options, web
+    /// turns an options-bearing message into a choice-chip frame (which would
+    /// REPLACE its structured session list), and the test mock reads the plain
+    /// text reply. Keyed by platform so per-tenant bots (`"telegram@<tenant>"`)
+    /// are covered too. Extend as other providers gain native buttons.
+    fn channel_supports_buttons(channel: &str) -> bool {
+        crate::transport::platform_of(channel) == "telegram"
+    }
+
+    /// Project slugs for `/projects` + the picker — the SAME source web and
+    /// `ccteam status` use (`collect_projects`: config.yaml filtered to on-disk
+    /// `state.json`), falling back to the in-memory routing cache when
+    /// `project_paths` isn't wired (unit tests without `enable_project_creation`).
+    fn project_slugs(&self) -> Vec<String> {
+        if let Some(paths) = &self.project_paths {
+            if let Ok(summaries) = ccteam_core::collect_projects(paths) {
+                return summaries.iter().map(|s| s.state.slug.clone()).collect();
+            }
+        }
+        self.projects.keys().cloned().collect()
+    }
+
+    /// One "switch project" button per project (`nav:cd:<slug>`), the current
+    /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
+    /// dropped (a pathologically long slug still shows in the text list).
+    fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
+        let cur = self.current_project_for(chat);
+        self.project_slugs()
+            .into_iter()
+            .map(|slug| {
+                let label = if slug == cur {
+                    format!("✓ {slug}")
+                } else {
+                    slug.clone()
+                };
+                MessageOption {
+                    data: format!("nav:cd:{slug}"),
+                    label,
+                    id: slug,
+                }
+            })
+            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
+            .collect()
+    }
+
+    /// One "switch session" button per live, chat-visible session
+    /// (`nav:use:<sid>`), the current one marked `✓`. Scoped + ordered like
+    /// [`Self::render_sessions`] (current project unless `all`; recency then
+    /// numeric-sid descending) so the buttons track the text list. Ended
+    /// (history) sessions switch only via their text `→ /use <sid>` hint.
+    fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
+        let cur = self.current_project_for(chat);
+        let mut visible: Vec<&GatewaySession> = self
+            .sessions
+            .values()
+            .filter(|s| Self::chat_can_access(chat, s))
+            .filter(|s| all || s.project == cur)
+            .collect();
+        visible.sort_by(|a, b| {
+            let la = self.session_last_active(a);
+            let lb = self.session_last_active(b);
+            lb.cmp(&la)
+                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
+        });
+        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
+        visible
+            .into_iter()
+            .map(|s| {
+                let mark = if Some(&s.id) == current_sid.as_ref() {
+                    "✓ "
+                } else {
+                    ""
+                };
+                let title = self
+                    .session_title(s)
+                    .map(|t| format!(" 「{t}」"))
+                    .unwrap_or_default();
+                let mut label = format!(
+                    "{mark}{}:{}:{}{}",
+                    s.id,
+                    vendor_str(s.vendor),
+                    s.role,
+                    title
+                );
+                // Readability trim (callback_data, below, is the hard 64B cap).
+                if label.chars().count() > 48 {
+                    label = format!("{}…", label.chars().take(47).collect::<String>());
+                }
+                MessageOption {
+                    data: format!("nav:use:{}", s.id),
+                    label,
+                    id: s.id.clone(),
+                }
+            })
+            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
+            .collect()
+    }
+
+    /// Emit a picker message (a project/session list) carrying inline `options`
+    /// to a button-capable channel, via the user-signal sink — the same egress
+    /// `/screen` uses. Delivers text + buttons as ONE message
+    /// (`spawn_gateway_event_consumer` calls `.with_options`), so the caller
+    /// returns no separate inline reply.
+    fn emit_list_options(&self, chat: &ChatKey, content: String, options: Vec<MessageOption>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options,
+            sid: None,
+            slug: None,
+        });
     }
 
     /// Scaffold a ccteam project at `raw_path`, register it in
@@ -5689,25 +5878,12 @@ impl Gateway {
     }
 
     fn render_projects(&self) -> String {
-        // Read the SAME source web / `ccteam status` use —
+        // `project_slugs` reads the SAME source web / `ccteam status` use —
         // `collect_projects` (config.yaml filtered to projects that have an
         // on-disk `state.json`) — so IM `/projects` never diverges from the
         // other surfaces: a half-registered project (in config, no state.json)
         // shows in NEITHER, and a removed project disappears from BOTH at once.
-        // The gateway's in-memory `self.projects` is an additive ROUTING cache
-        // (it never prunes on a config change), so reading it here is exactly
-        // what let IM drift ahead of web. Fall back to it only when
-        // `project_paths` isn't wired (unit tests without `enable_project_creation`).
-        if let Some(paths) = &self.project_paths {
-            if let Ok(summaries) = ccteam_core::collect_projects(paths) {
-                return summaries
-                    .iter()
-                    .map(|s| s.state.slug.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-        }
-        self.projects.keys().cloned().collect::<Vec<_>>().join("\n")
+        self.project_slugs().join("\n")
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -8223,6 +8399,12 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
     )
 }
 
+/// Telegram's hard cap on inline-button `callback_data` (bytes). The nav
+/// picker (`project_switch_options` / `session_switch_options`) drops any
+/// button whose payload would exceed it; slugs/sids are short, so this only
+/// guards a pathological slug and never the common case.
+const TELEGRAM_CALLBACK_MAX: usize = 64;
+
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
 /// IM callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
 /// 64-byte `callback_data` cap; the IM click resolves by idx (reverse-resolved
@@ -8569,6 +8751,31 @@ mod tests {
         })
         .await
         .expect("an Answer event arrives")
+    }
+
+    /// Fetch a `/sessions` or `/projects` list as the user SEES it, regardless
+    /// of whether it arrives as a plain-text inline reply (mock / web / Lark)
+    /// or — on a button-capable channel (Telegram) — as an event carrying the
+    /// list text + inline switch buttons. Returns the list text as a
+    /// single-element Vec so ACL assertions read identically across channels.
+    async fn list_text(
+        gateway: &mut Gateway,
+        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        cmd: &str,
+    ) -> Vec<String> {
+        let replies = gateway
+            .handle_text(channel, chat_id, user_id, cmd)
+            .await
+            .unwrap();
+        if replies.is_empty() {
+            // Button-capable channel → the list rode the event sink.
+            vec![recv_answer(events).await.content]
+        } else {
+            replies
+        }
     }
 
     /// Regression: a real `codex app-server` turn emits the agent message
@@ -11927,6 +12134,175 @@ mod tests {
         assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
+    /// Clickable project picker: on Telegram, `/projects` is delivered as a
+    /// header + one inline "switch" button per project (`nav:cd:<slug>`), so
+    /// the command returns NO inline reply (the buttons ride the event sink).
+    /// Non-button channels (the test mock, web, Lark) keep the plain slug list.
+    #[tokio::test]
+    async fn telegram_projects_delivers_switch_buttons() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.register_project("beta", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        // Telegram → the reply is empty; the list + buttons arrive as an Answer.
+        let replies = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "a button-capable /projects returns no inline reply: {replies:?}"
+        );
+        let ev = recv_answer(&mut events).await;
+        assert!(ev.content.contains("项目"), "header: {}", ev.content);
+        let datas: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert!(datas.contains(&"nav:cd:alpha"), "options: {datas:?}");
+        assert!(datas.contains(&"nav:cd:beta"), "options: {datas:?}");
+        // The current project is marked with ✓ (default project = alpha).
+        assert!(
+            ev.options
+                .iter()
+                .any(|o| o.data == "nav:cd:alpha" && o.label.starts_with('✓')),
+            "current project marked: {:?}",
+            ev.options
+        );
+
+        // The mock channel has no buttons → the bare newline slug list, verbatim.
+        let mock = gateway
+            .handle_text("mock", "chat-2", "bob", "/projects")
+            .await
+            .unwrap();
+        assert_eq!(mock, vec!["alpha\nbeta"]);
+    }
+
+    /// Clickable session picker: on Telegram, `/sessions` is delivered as the
+    /// usual text list PLUS one inline "switch" button per live session
+    /// (`nav:use:<sid>`), so the command returns no inline reply. The mock
+    /// channel still gets the plain-text list (regression guard).
+    #[tokio::test]
+    async fn telegram_sessions_delivers_switch_buttons() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let mut events = gateway.subscribe_events();
+        let replies = gateway
+            .handle_text("telegram", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "a button-capable /sessions returns no inline reply: {replies:?}"
+        );
+        let ev = recv_answer(&mut events).await;
+        assert!(ev.content.contains("s1"), "list text: {}", ev.content);
+        assert_eq!(
+            ev.options
+                .iter()
+                .map(|o| o.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nav:use:s1"],
+        );
+
+        // Mock channel = plain text list, unchanged.
+        gateway
+            .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mock = gateway
+            .handle_text("mock", "chat-2", "bob", "/sessions")
+            .await
+            .unwrap();
+        assert_eq!(mock.len(), 1);
+        assert!(mock[0].contains("s2:alpha:Claude:reviewer"), "{}", mock[0]);
+    }
+
+    /// Tapping a picker button switches project / session through the SAME
+    /// path `/cd` / `/use` use. A `nav:cd:<slug>` tap moves the current
+    /// project; a `nav:use:<sid>` tap focuses the session (and moves the
+    /// current project to that session's).
+    #[tokio::test]
+    async fn nav_button_tap_switches_project_and_session() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.register_project("beta", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+
+        // Tap "switch to beta".
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:cd:beta".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert!(
+            replies[0].starts_with("project set to beta"),
+            "{}",
+            replies[0]
+        );
+        assert_eq!(gateway.current_project_for(&chat), "beta");
+
+        // Tap "switch to s1" — focuses s1 and moves the project back to its own
+        // (alpha).
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:use:s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["using session s1"]);
+        assert_eq!(gateway.current_project_for(&chat), "alpha");
+        assert_eq!(
+            gateway.current_session.read().unwrap().get(&chat).cloned(),
+            Some("s1".to_string())
+        );
+
+        // A malformed nav payload is benign (never panics / switches).
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:bogus".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["invalid selection"]);
+    }
+
     /// P3 — `/sessions` appends each session's model + ctx from
     /// `thread_status`. With a `[1m]` model the window is 1M; with no
     /// status reported the legacy `id:project:vendor:role` row is unchanged.
@@ -12917,17 +13293,24 @@ mod tests {
         // on-disk history).
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
         // A session created from the web console (channel "web").
         gateway
             .handle_text("web", "web-api", "web-api", "/new claude reviewer")
             .await
             .unwrap();
 
-        // A telegram chat SEES it (shared user pool) and can /use it.
-        let seen = gateway
-            .handle_text("telegram", "339498819", "rob", "/sessions")
-            .await
-            .unwrap();
+        // A telegram chat SEES it (shared user pool) and can /use it. On
+        // Telegram the list rides the event sink (text + switch buttons).
+        let seen = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "339498819",
+            "rob",
+            "/sessions",
+        )
+        .await;
         assert_eq!(
             seen,
             vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
@@ -12948,17 +13331,24 @@ mod tests {
     async fn gateway_web_and_tenant_bot_converge() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let mut events = gateway.subscribe_events();
 
         // Tenant uaaa creates a session on the WEB → owned user:uaaa.
         gateway
             .handle_text("web", "uaaa", "uaaa", "/new claude reviewer")
             .await
             .unwrap();
-        // uaaa's OWN IM bot SEES it (convergence — the forward direction).
-        let seen = gateway
-            .handle_text("telegram@uaaa", "111", "alice", "/sessions")
-            .await
-            .unwrap();
+        // uaaa's OWN IM bot SEES it (convergence — the forward direction). On
+        // Telegram the list rides the event sink (text + switch buttons).
+        let seen = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram@uaaa",
+            "111",
+            "alice",
+            "/sessions",
+        )
+        .await;
         assert!(
             seen.iter().any(|m| m.contains("s1")),
             "uaaa's bot sees its tenant's web session: {seen:?}"
@@ -12969,20 +13359,30 @@ mod tests {
             .handle_text("telegram@uaaa", "111", "alice", "/new claude api")
             .await
             .unwrap();
-        let both = gateway
-            .handle_text("telegram@uaaa", "111", "alice", "/sessions")
-            .await
-            .unwrap();
+        let both = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram@uaaa",
+            "111",
+            "alice",
+            "/sessions",
+        )
+        .await;
         assert!(
             both.iter().any(|m| m.contains("s1")) && both.iter().any(|m| m.contains("s2")),
             "uaaa's bot sees BOTH its web + its own sessions: {both:?}"
         );
 
         // A DIFFERENT tenant's bot sees NEITHER (isolation holds).
-        let other = gateway
-            .handle_text("telegram@ubbb", "222", "bob", "/sessions")
-            .await
-            .unwrap();
+        let other = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram@ubbb",
+            "222",
+            "bob",
+            "/sessions",
+        )
+        .await;
         assert_eq!(
             other,
             vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"],
@@ -14335,6 +14735,7 @@ mod tests {
         // on-disk history).
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
 
         // A Telegram chat creates a session.
         gateway
@@ -14361,19 +14762,30 @@ mod tests {
         assert_eq!(used, vec!["unknown session for this chat: s1"]);
 
         // A different Telegram chat in the same default project also does NOT
-        // see it (the same-project sharing leak is gone).
-        let other = gateway
-            .handle_text("telegram", "tg-2", "bob", "/sessions")
-            .await
-            .unwrap();
+        // see it (the same-project sharing leak is gone). On Telegram the list
+        // rides the event sink (text + switch buttons).
+        let other = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "tg-2",
+            "bob",
+            "/sessions",
+        )
+        .await;
         assert_eq!(other, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
 
         // The OWNER (tg-1) still sees AND addresses its own session — isolation
         // doesn't break the owner's own flow.
-        let owner_sees = gateway
-            .handle_text("telegram", "tg-1", "rob", "/sessions")
-            .await
-            .unwrap();
+        let owner_sees = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "tg-1",
+            "rob",
+            "/sessions",
+        )
+        .await;
         assert!(
             owner_sees
                 .iter()
