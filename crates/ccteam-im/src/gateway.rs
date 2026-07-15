@@ -7009,6 +7009,53 @@ impl Gateway {
         }
     }
 
+    /// Web interactive submit for a per-`sid` chat. Mirrors the IM
+    /// [`handle_message`](Self::handle_message) control-command face so the web
+    /// input box behaves exactly like IM (three-surface parity): a **gateway**
+    /// control command (`/status`, `/sessions`, `/help`, `/projects`, `/new`,
+    /// `/role`, …) is handled here and its reply delivered over the session's
+    /// SSE stream (like a directive receipt); a **vendor** directive (`/model`,
+    /// `/compact`, `/clear`, …) and plain text fall through to
+    /// [`submit_to_sid`](Self::submit_to_sid) unchanged.
+    ///
+    /// Regression fix: `/status` from the web console used to reach the vendor
+    /// verbatim → "/status isn't available in this environment".
+    ///
+    /// `is_admin` gates the control face: the fleet renders (`/status`,
+    /// `/sessions`) use the IM chat-level ACL (`chat_can_access` over the shared
+    /// `user:` pool), which is coarser than the web's per-tenant REST ACL
+    /// (`can_see_owner`) — so exposing it to a tenant could over-share another
+    /// tenant's sessions. It is therefore admin-only, matching the web Status /
+    /// 主机 / Settings nav (already `useMe().isAdmin`-gated). A non-admin caller
+    /// falls straight through to a turn/vendor-directive (today's behaviour).
+    /// A2A `session_dispatch` keeps calling `submit_to_sid` directly, so
+    /// agent→agent routing is deliberately never given the human control face.
+    pub async fn submit_web_sid(
+        &mut self,
+        sid: &str,
+        text: String,
+        is_admin: bool,
+    ) -> Result<String> {
+        if is_admin && text.trim_start().starts_with('/') {
+            let chat = web_api_chat();
+            // Web navigates by URL, so the POST's `sid` is the authoritative
+            // focus: point the shared web chat at this session (+ its project)
+            // so `/status`/`/sessions` render THIS session in depth, matching
+            // the IM current-session semantics.
+            if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
+                self.current_project.insert(chat.clone(), project);
+                if let Ok(mut cur) = self.current_session.write() {
+                    cur.insert(chat.clone(), sid.to_string());
+                }
+            }
+            if let Some(reply) = self.handle_command(&chat, &text).await? {
+                self.emit_sid_answer(sid, 0, reply);
+                return Ok(format!("command:{sid}"));
+            }
+        }
+        self.submit_to_sid(sid, text).await
+    }
+
     /// v0.8.24 C2 — multi-vendor compare: roleless one-shot sessions, same
     /// prompt, wait up to `timeout` (default 300s), return aggregated result
     /// with real sids + cost subtotal. Partial failures are labeled, not fatal.
@@ -10100,6 +10147,101 @@ mod tests {
             ev.content.contains("directive: model"),
             "got: {}",
             ev.content
+        );
+    }
+
+    /// Three-surface parity: a GATEWAY control command (`/status`) submitted via
+    /// the web interactive path (`submit_web_sid`) is handled by the gateway
+    /// control face — NOT shipped to the vendor as literal text (which replied
+    /// "/status isn't available in this environment"). Its render is delivered
+    /// over the session's SSE stream as a sid-keyed Answer, like a directive.
+    #[tokio::test]
+    async fn submit_web_sid_handles_gateway_status_command() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webstatus");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+
+        let mut rx = gateway.subscribe_events();
+
+        // Admin web console: `/status` is a gateway control command.
+        let receipt = gateway
+            .submit_web_sid(&sid, "/status".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(receipt, format!("command:{sid}"));
+
+        // Never reached the vendor as a turn or a directive.
+        assert!(
+            fake.submissions.lock().await.is_empty(),
+            "a gateway /status must not be submitted to the agent as user text"
+        );
+        assert!(
+            fake.directives.lock().await.is_empty(),
+            "/status is a gateway command, not a vendor directive"
+        );
+
+        // Rendered back over the session's SSE (sid-keyed Answer).
+        let ev = rx.try_recv().expect("status render emitted to SSE");
+        assert_eq!(ev.sid.as_deref(), Some(sid.as_str()));
+        assert!(matches!(ev.kind, GatewayEventKind::Answer));
+    }
+
+    /// Non-gateway text and vendor directives still route to the vendor through
+    /// the web path — `submit_web_sid` only intercepts GATEWAY control commands.
+    #[tokio::test]
+    async fn submit_web_sid_passes_turns_and_vendor_directives_through() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webthru");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+
+        // Plain text → a real turn to the vendor.
+        gateway
+            .submit_web_sid(&sid, "hello".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await.len(),
+            1,
+            "plain text is a turn to the agent"
+        );
+
+        // Vendor directive → recorded as a directive (not a gateway command).
+        gateway
+            .submit_web_sid(&sid, "/model opus-x".into(), true)
+            .await
+            .unwrap();
+        let directives = fake.directives.lock().await;
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].1.name, "model");
+
+        // A non-admin caller never gets the gateway control face: `/status`
+        // falls through to `submit_to_sid` (today's behaviour; fleet renders
+        // stay admin-only), so the receipt is NOT a gateway `command:` marker.
+        drop(directives);
+        let receipt = gateway
+            .submit_web_sid(&sid, "/status".into(), false)
+            .await
+            .unwrap();
+        assert_ne!(
+            receipt,
+            format!("command:{sid}"),
+            "non-admin /status must NOT be handled by the gateway control face"
         );
     }
 

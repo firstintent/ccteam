@@ -685,7 +685,12 @@ pub(crate) async fn handle_session_turn(
         {
             return unknown_session(&sid);
         }
-        guard.submit_to_sid(&sid, form.text).await
+        // Web interactive path: run the gateway control-command face (/status,
+        // /sessions, …) first — parity with IM — then fall back to a turn. The
+        // fleet renders are admin-only (see `submit_web_sid`).
+        guard
+            .submit_web_sid(&sid, form.text, identity.is_admin)
+            .await
     };
     match result {
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
