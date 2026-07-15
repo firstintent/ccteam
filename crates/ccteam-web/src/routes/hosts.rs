@@ -625,6 +625,19 @@ fn register_mcp_blocking(
         ccteam_core::mcp_register::install_codex_mcp_into(&path, mcp_http_url, &admin_token)?;
         written.insert("codex".to_string(), path.display().to_string());
     }
+    // v0.9.3 vendor symmetry — any vendor's main session can orchestrate.
+    if do_vendor("grok") {
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
+        let path = ccteam_core::mcp_register::resolve_grok_config_path()?;
+        ccteam_core::mcp_register::install_grok_mcp_into(&path, mcp_http_url, &admin_token)?;
+        written.insert("grok".to_string(), path.display().to_string());
+    }
+    if do_vendor("opencode") {
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
+        let path = ccteam_core::mcp_register::resolve_opencode_config_path()?;
+        ccteam_core::mcp_register::install_opencode_mcp_into(&path, mcp_http_url, &admin_token)?;
+        written.insert("opencode".to_string(), path.display().to_string());
+    }
     Ok(written)
 }
 

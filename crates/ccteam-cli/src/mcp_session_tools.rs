@@ -285,7 +285,6 @@ mod tests {
             "model",
             "effort",
             "protocol",
-            "host",
             "title",
             "task",
             "wait_seconds",
@@ -293,6 +292,12 @@ mod tests {
         ] {
             assert!(props[key].is_object(), "schema must carry `{key}`");
         }
+        // v0.9.2 — host is a PROJECT binding, not a spawn facet: the schema
+        // must NOT offer it (passing one is a hard error at dispatch).
+        assert!(
+            props.get("host").is_none_or(|v| v.is_null()),
+            "schema must NOT carry `host` (v0.9.2: execution host is inherited from the project)"
+        );
         let protos: Vec<&str> = props["protocol"]["enum"]
             .as_array()
             .expect("protocol enum")

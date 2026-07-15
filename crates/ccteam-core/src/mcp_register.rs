@@ -152,6 +152,226 @@ pub fn install_codex_mcp_into(
     Ok(())
 }
 
+/// Register the ccteam MCP server in Grok CLI's `~/.grok/config.toml` as a
+/// `[mcp_servers.ccteam]` HTTP entry — the same table `grok mcp add
+/// --transport http` writes (`url` + `enabled` + `headers`; Grok's key is
+/// `headers`, Codex's is `http_headers`).
+///
+/// MERGE, never clobber + idempotent, mirroring [`install_codex_mcp_into`].
+/// The global entry carries the admin bearer, so any plain `grok` main
+/// session can orchestrate (v0.9.3 vendor symmetry). ccteam-managed grok
+/// sessions ALSO receive a same-named ACP-injected server with their
+/// per-session principal; real-machine probe (grok 0.2.x, 2026-07-15): grok
+/// connects both, dedups same-named tools, and `tools/call` lands on the
+/// ACP-injected (session) server — so the delegation parent edge survives the
+/// global entry.
+pub fn install_grok_mcp_into(
+    config_toml: &Path,
+    mcp_http_url: &str,
+    admin_token: &str,
+) -> Result<()> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
+    }
+    let token = admin_token.trim();
+    if token.is_empty() {
+        anyhow::bail!("ccteam admin web token must not be empty");
+    }
+
+    let mut root: toml::Table = if config_toml.exists() {
+        let body = std::fs::read_to_string(config_toml)
+            .with_context(|| format!("read {}", config_toml.display()))?;
+        if body.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            toml::from_str::<toml::Table>(&body)
+                .with_context(|| format!("parse existing {}", config_toml.display()))?
+        }
+    } else {
+        toml::Table::new()
+    };
+
+    let servers_entry = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !servers_entry.is_table() {
+        anyhow::bail!(
+            "{}: `mcp_servers` exists but is not a TOML table",
+            config_toml.display()
+        );
+    }
+    let servers = servers_entry.as_table_mut().expect("checked above");
+
+    let mut entry = toml::Table::new();
+    entry.insert("url".to_string(), toml::Value::String(url.to_string()));
+    entry.insert("enabled".to_string(), toml::Value::Boolean(true));
+    let mut headers = toml::Table::new();
+    headers.insert(
+        "Authorization".to_string(),
+        toml::Value::String(format!("Bearer ccteam:{token}")),
+    );
+    entry.insert("headers".to_string(), toml::Value::Table(headers));
+    servers.insert(
+        crate::CCTEAM_MCP_SERVER_KEY.to_string(),
+        toml::Value::Table(entry),
+    );
+
+    let body = toml::to_string_pretty(&root).context("serialize grok config.toml")?;
+    atomic_write(config_toml, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_toml, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", config_toml.display()))?;
+    }
+    Ok(())
+}
+
+/// Register the ccteam MCP server in OpenCode's global `opencode.json` under
+/// the runtime `mcp.<name>` shape (OpenCode 1.18.x CLI loader:
+/// `packages/opencode/src/config/config.ts` deep-merges raw JSON and the MCP
+/// service consumes `mcp.<name>` records — the `mcp.servers` shape belongs to
+/// the separate core-v2 path, not the shipped CLI).
+///
+/// MERGE, never clobber + idempotent: only `mcp.ccteam` is set; every other
+/// key survives. Admin bearer inside → 0600. ccteam-managed OpenCode sessions
+/// override this by name at runtime (`MCP.add` replaces the same-named config
+/// entry with the ACP-injected per-session principal).
+pub fn install_opencode_mcp_into(
+    opencode_json: &Path,
+    mcp_http_url: &str,
+    admin_token: &str,
+) -> Result<()> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
+    }
+    let token = admin_token.trim();
+    if token.is_empty() {
+        anyhow::bail!("ccteam admin web token must not be empty");
+    }
+
+    let mut root = if opencode_json.exists() {
+        let bytes = std::fs::read(opencode_json)
+            .with_context(|| format!("read {}", opencode_json.display()))?;
+        if bytes.is_empty() {
+            serde_json::Map::new()
+        } else {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            }
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    let mcp = root
+        .entry("mcp")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let map = match mcp {
+        Value::Object(m) => m,
+        _ => {
+            *mcp = Value::Object(serde_json::Map::new());
+            mcp.as_object_mut().unwrap()
+        }
+    };
+    map.insert(
+        crate::CCTEAM_MCP_SERVER_KEY.into(),
+        json!({
+            "type": "remote",
+            "url": url,
+            "enabled": true,
+            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
+        }),
+    );
+
+    let body = serde_json::to_string_pretty(&Value::Object(root))?;
+    atomic_write(opencode_json, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(opencode_json, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", opencode_json.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether Grok's `config.toml` carries the current HTTP form of
+/// `[mcp_servers.ccteam]`. Best-effort; missing/junk file reads as `false`.
+pub fn grok_mcp_registered(config_toml: &Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(config_toml) else {
+        return false;
+    };
+    let Ok(root) = toml::from_str::<toml::Table>(&body) else {
+        return false;
+    };
+    let Some(entry) = root
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get(crate::CCTEAM_MCP_SERVER_KEY))
+        .and_then(toml::Value::as_table)
+    else {
+        return false;
+    };
+    entry
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+        && entry
+            .get("headers")
+            .and_then(toml::Value::as_table)
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| value.starts_with("Bearer ccteam:"))
+}
+
+/// Whether OpenCode's global `opencode.json` carries the ccteam remote MCP
+/// entry. Best-effort; missing/junk file reads as `false`.
+pub fn opencode_mcp_registered(opencode_json: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(opencode_json) else {
+        return false;
+    };
+    let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(entry) = root
+        .get("mcp")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(crate::CCTEAM_MCP_SERVER_KEY))
+    else {
+        return false;
+    };
+    entry
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|u| !u.trim().is_empty())
+        && entry
+            .pointer("/headers/Authorization")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+}
+
+/// Resolve Grok CLI's user config: `~/.grok/config.toml`.
+pub fn resolve_grok_config_path() -> Result<PathBuf> {
+    dirs::home_dir()
+        .map(|h| h.join(".grok").join("config.toml"))
+        .ok_or_else(|| anyhow!("cannot resolve ~/.grok (no home dir)"))
+}
+
+/// Resolve OpenCode's global config: `$XDG_CONFIG_HOME/opencode/opencode.json`
+/// (default `~/.config/opencode/opencode.json`) — the middle file of the
+/// loader's `config.json` → `opencode.json` → `opencode.jsonc` merge chain.
+pub fn resolve_opencode_config_path() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .ok_or_else(|| anyhow!("cannot resolve XDG_CONFIG_HOME or ~/.config (no home dir)"))?;
+    Ok(base.join("opencode").join("opencode.json"))
+}
+
 /// Whether `~/.claude.json` already carries the ccteam MCP server entry.
 /// Best-effort: a missing / unreadable / junk file reads as `false` (not
 /// registered). Read-only — never writes.
@@ -426,6 +646,126 @@ mod tests {
         assert!(install_codex_mcp_into(&config_toml, "", "token").is_err());
         assert!(install_codex_mcp_into(&config_toml, "http://localhost/mcp", " ").is_err());
         assert!(!config_toml.exists());
+    }
+
+    #[test]
+    fn install_grok_mcp_into_writes_grok_shape_and_merges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_toml,
+            "[cli]\nuse_leader = true\n[mcp_servers.other]\nurl = \"http://x/mcp\"\n",
+        )
+        .unwrap();
+        install_grok_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
+        assert_eq!(root["cli"]["use_leader"].as_bool(), Some(true));
+        assert_eq!(
+            root["mcp_servers"]["other"]["url"].as_str(),
+            Some("http://x/mcp")
+        );
+        let entry = root["mcp_servers"]["ccteam"].as_table().unwrap();
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:7331/mcp"));
+        assert_eq!(entry["enabled"].as_bool(), Some(true));
+        // Grok's key is `headers` (Codex's is `http_headers`).
+        assert_eq!(
+            entry["headers"]["Authorization"].as_str(),
+            Some("Bearer ccteam:tok")
+        );
+        assert!(!entry.contains_key("http_headers"));
+        assert!(grok_mcp_registered(&config_toml));
+        assert!(!grok_mcp_registered(&tmp.path().join("absent.toml")));
+    }
+
+    #[test]
+    fn install_grok_mcp_into_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join(".grok").join("config.toml");
+        install_grok_mcp_into(&config_toml, "http://localhost:7331/mcp", "a").unwrap();
+        install_grok_mcp_into(&config_toml, "http://localhost:7444/mcp", "b").unwrap();
+        let root: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
+        assert_eq!(
+            root["mcp_servers"]["ccteam"]["url"].as_str(),
+            Some("http://localhost:7444/mcp")
+        );
+        assert_eq!(
+            root["mcp_servers"]["ccteam"]["headers"]["Authorization"].as_str(),
+            Some("Bearer ccteam:b")
+        );
+    }
+
+    #[test]
+    fn install_opencode_mcp_into_writes_runtime_v1_shape_and_merges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opencode_json = tmp.path().join("opencode.json");
+        std::fs::write(
+            &opencode_json,
+            r#"{"$schema":"https://opencode.ai/config.json","model":"x/y","mcp":{"other":{"type":"local","command":["x"]}}}"#,
+        )
+        .unwrap();
+        install_opencode_mcp_into(&opencode_json, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&opencode_json).unwrap()).unwrap();
+        assert_eq!(v["model"], "x/y");
+        assert_eq!(v["mcp"]["other"]["type"], "local");
+        // Runtime v1 shape: `mcp.<name>` (NOT the core-v2 `mcp.servers.<name>`).
+        let entry = &v["mcp"]["ccteam"];
+        assert_eq!(entry["type"], "remote");
+        assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["headers"]["Authorization"], "Bearer ccteam:tok");
+        assert!(v["mcp"].get("servers").is_none());
+        assert!(opencode_mcp_registered(&opencode_json));
+        assert!(!opencode_mcp_registered(&tmp.path().join("absent.json")));
+    }
+
+    #[test]
+    fn install_opencode_mcp_into_is_idempotent_and_creates_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opencode_json = tmp
+            .path()
+            .join("nested")
+            .join("opencode")
+            .join("opencode.json");
+        install_opencode_mcp_into(&opencode_json, "http://localhost:7331/mcp", "a").unwrap();
+        install_opencode_mcp_into(&opencode_json, "http://localhost:7444/mcp", "b").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&opencode_json).unwrap()).unwrap();
+        assert_eq!(v["mcp"]["ccteam"]["url"], "http://localhost:7444/mcp");
+        assert_eq!(
+            v["mcp"]["ccteam"]["headers"]["Authorization"],
+            "Bearer ccteam:b"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_and_opencode_installs_make_token_bearing_configs_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grok = tmp.path().join("config.toml");
+        install_grok_mcp_into(&grok, "http://localhost/mcp", "s").unwrap();
+        assert_eq!(
+            std::fs::metadata(&grok).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let oc = tmp.path().join("opencode.json");
+        install_opencode_mcp_into(&oc, "http://localhost/mcp", "s").unwrap();
+        assert_eq!(
+            std::fs::metadata(&oc).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn grok_and_opencode_installs_reject_missing_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(install_grok_mcp_into(&tmp.path().join("g.toml"), "", "t").is_err());
+        assert!(install_grok_mcp_into(&tmp.path().join("g.toml"), "http://x/mcp", " ").is_err());
+        assert!(install_opencode_mcp_into(&tmp.path().join("o.json"), "", "t").is_err());
+        assert!(
+            install_opencode_mcp_into(&tmp.path().join("o.json"), "http://x/mcp", " ").is_err()
+        );
     }
 
     #[cfg(unix)]

@@ -376,6 +376,36 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     Ok(config_toml)
 }
 
+/// Production path for Grok CLI MCP install (v0.9.3 vendor symmetry): the
+/// global `~/.grok/config.toml` entry authenticates with the admin web token
+/// so a plain `grok` main session can orchestrate; ccteam-managed grok
+/// sessions keep their ACP-injected per-session principal (same-name dedup,
+/// injected server wins — real-machine verified).
+pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
+    let config_toml = ccteam_core::mcp_register::resolve_grok_config_path()?;
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    Ok(config_toml)
+}
+
+/// Production path for OpenCode MCP install (v0.9.3 vendor symmetry). Managed
+/// OpenCode sessions override the same-named entry at runtime (`MCP.add`
+/// replaces by name with the ACP-injected per-session principal).
+pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
+    let opencode_json = ccteam_core::mcp_register::resolve_opencode_config_path()?;
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    ccteam_core::mcp_register::install_opencode_mcp_into(
+        &opencode_json,
+        &mcp_http_url,
+        &admin_token,
+    )?;
+    Ok(opencode_json)
+}
+
 /// Daemon-start self-heal: if the global Codex `config.toml` still carries a
 /// legacy stdio `[mcp_servers.ccteam]` entry (written by a pre-HTTP ccteam),
 /// rewrite it to the current HTTP form so per-thread session overrides don't

@@ -2263,28 +2263,51 @@ fn render_install_memory_bridge_report(
 
 fn render_install_mcp_report() -> Result<String> {
     // ccteam is a pure CLI (not a vendor plugin), so `ccteam config` is the
-    // MCP installer for BOTH vendors: Claude (`~/.claude.json`) and Codex
-    // (`~/.codex/config.toml`).
+    // MCP installer for ALL vendors (v0.9.3 symmetry — any vendor's main
+    // session can orchestrate): Claude (`~/.claude.json`), Codex
+    // (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
+    // (`~/.config/opencode/opencode.json`).
     let claude_path = crate::mcp_serve::install_mcp()?;
     let codex_path = crate::mcp_serve::install_codex_mcp()?;
-    Ok(render_install_mcp_body(&claude_path, &codex_path))
+    let grok_path = crate::mcp_serve::install_grok_mcp()?;
+    let opencode_path = crate::mcp_serve::install_opencode_mcp()?;
+    Ok(render_install_mcp_body(
+        &claude_path,
+        &codex_path,
+        &grok_path,
+        &opencode_path,
+    ))
 }
 
 /// Pure renderer for the `config mcp` report body, split out from the
-/// `~/.claude.json` + `~/.codex/config.toml` writes so it stays
-/// unit-testable without touching the real config. The `tools surface`
-/// line interpolates the live tool count from the same `tool_definitions()`
-/// source `run_verify_mcp` introspects — never hard-code it, or the number
-/// drifts (it was stuck at "9" while the surface grew to 27).
-fn render_install_mcp_body(claude_path: &std::path::Path, codex_path: &std::path::Path) -> String {
-    let mut out = String::from("ccteam config: register MCP server (Claude + Codex)\n\n");
+/// vendor-config writes so it stays unit-testable without touching the real
+/// configs. The `tools surface` line interpolates the live tool count from
+/// the same `tool_definitions()` source `run_verify_mcp` introspects — never
+/// hard-code it, or the number drifts (it was stuck at "9" while the surface
+/// grew to 27).
+fn render_install_mcp_body(
+    claude_path: &std::path::Path,
+    codex_path: &std::path::Path,
+    grok_path: &std::path::Path,
+    opencode_path: &std::path::Path,
+) -> String {
+    let mut out =
+        String::from("ccteam config: register MCP server (Claude + Codex + Grok + OpenCode)\n\n");
     out.push_str(&format!(
-        "  registered ccteam MCP server for Claude in {}\n",
+        "  registered ccteam MCP server for Claude   in {}\n",
         claude_path.display()
     ));
     out.push_str(&format!(
-        "  registered ccteam MCP server for Codex  in {}\n",
+        "  registered ccteam MCP server for Codex    in {}\n",
         codex_path.display()
+    ));
+    out.push_str(&format!(
+        "  registered ccteam MCP server for Grok     in {}\n",
+        grok_path.display()
+    ));
+    out.push_str(&format!(
+        "  registered ccteam MCP server for OpenCode in {}\n",
+        opencode_path.display()
     ));
     let total_tools = run_verify_mcp().total_tools;
     out.push_str(&format!("  tools surface : {total_tools}\n"));
@@ -6964,6 +6987,8 @@ mod tests {
         let report = render_install_mcp_body(
             std::path::Path::new("/tmp/fake-claude.json"),
             std::path::Path::new("/tmp/fake-codex/config.toml"),
+            std::path::Path::new("/tmp/fake-grok/config.toml"),
+            std::path::Path::new("/tmp/fake-opencode/opencode.json"),
         );
         assert!(
             report.contains(&format!("tools surface : {total}")),
@@ -6974,15 +6999,19 @@ mod tests {
             !report.contains("interfaces §12.2"),
             "stale section tag must be dropped: {report}",
         );
-        // Both vendor targets must be named in the report body.
-        assert!(
-            report.contains("/tmp/fake-claude.json"),
-            "report must name the Claude target path: {report}",
-        );
-        assert!(
-            report.contains("/tmp/fake-codex/config.toml"),
-            "report must name the Codex target path: {report}",
-        );
+        // All four vendor targets must be named in the report body
+        // (v0.9.3 symmetry: any vendor's main session can orchestrate).
+        for target in [
+            "/tmp/fake-claude.json",
+            "/tmp/fake-codex/config.toml",
+            "/tmp/fake-grok/config.toml",
+            "/tmp/fake-opencode/opencode.json",
+        ] {
+            assert!(
+                report.contains(target),
+                "report must name the {target} target path: {report}",
+            );
+        }
     }
 
     #[test]
