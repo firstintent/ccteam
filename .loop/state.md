@@ -13,8 +13,8 @@
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1433/0**(v0.9.5,+25;规划独立复核实测)
-- `ccteam-web` 全量 **314**(本机 311 过 + 3 `ws_*` env-flake,干净环境应全绿)· vitest **378**(SPA)· Playwright **7**
+- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1435/0**(v0.9.5 + web 附件/技能附加,+2 core `list_skills`)
+- `ccteam-web` 全量 **319**(本机 316 过 + 3 `ws_*` env-flake,干净环境应全绿;+4 sessions_api e2e +1 lib)· vitest **388**(SPA,+10)· Playwright **7**
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)

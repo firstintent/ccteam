@@ -27,7 +27,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::pending::InteractionOrigin;
-use crate::transport::{AttachmentKind, ChannelAttachment, ChoiceReply, MessageOption};
+use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
 
 /// v0.8.7 review-fix (R-M6) — a typed "the named role has no
@@ -7938,14 +7938,11 @@ fn wrap_inbound(
     );
     let mut extra_lines = Vec::new();
     for (i, att) in attachments.iter().enumerate() {
-        let key = match att.kind {
-            AttachmentKind::Image => "image_path",
-            AttachmentKind::File => "file_path",
-        };
         if i == 0 {
+            let key = crate::transport::attachment_path_key(att.kind);
             attrs.push_str(&format!(" {key}=\"{}\"", att.local_path));
         } else {
-            extra_lines.push(format!("[attachment {key}=\"{}\"]", att.local_path));
+            extra_lines.push(crate::transport::attachment_line(att));
         }
     }
     let body = if extra_lines.is_empty() {
@@ -9089,6 +9086,8 @@ mod tests {
     }
 
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
+
+    use crate::transport::AttachmentKind;
 
     fn img(path: &str) -> ChannelAttachment {
         ChannelAttachment {

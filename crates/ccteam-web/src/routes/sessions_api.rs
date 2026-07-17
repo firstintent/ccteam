@@ -640,10 +640,122 @@ pub(crate) async fn handle_session_status(
     .into_response()
 }
 
-/// POST body for a turn submission — `text` (required). Form or JSON.
+/// POST body for a turn submission — `text` (required unless `attachments`
+/// is non-empty). Form or JSON; `attachments` rides the JSON shape only.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TurnForm {
+    #[serde(default)]
     pub text: String,
+    /// Composer attachments to weave into the turn text (web parity with the
+    /// IM inbound attachment grammar). Empty for a plain text turn.
+    #[serde(default)]
+    pub attachments: Vec<TurnAttachment>,
+}
+
+/// One composer attachment named in a turn POST.
+///
+/// - `kind: "image" | "file"` → `path` names a file previously stored by
+///   `POST /projects/{slug}/uploads` (validated to live under THAT session's
+///   project `.ccteam/uploads/` — the API accepts no arbitrary paths).
+/// - `kind: "skill"` → `name` is an installed skill id
+///   (`.claude/skills/<name>/SKILL.md`); the turn gains a self-describing
+///   "read this skill file and follow it" line, which works identically for
+///   every vendor (a skill is prompt-layer markdown any agent can `Read`).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TurnAttachment {
+    /// `"image"` / `"file"` / `"skill"`.
+    pub kind: String,
+    /// Stored upload path (image/file kinds).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Display name; for `kind: "skill"` the skill id (required).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Weave validated attachments into the outgoing turn text — the web peer of
+/// the IM `wrap_inbound` extra-attachment lines, emitting the SAME
+/// `[attachment image_path|file_path="…"]` grammar (shared helper, so the
+/// format every vendor session is taught to `Read` never drifts) plus a
+/// self-describing skill line. Pure aside from existence checks; returns a
+/// readable error string for the 400 path.
+fn build_turn_text_with_attachments(
+    text: &str,
+    attachments: &[TurnAttachment],
+    project_dir: &std::path::Path,
+) -> Result<String, String> {
+    use ccteam_im::transport::{attachment_line, AttachmentKind, ChannelAttachment};
+    let uploads_root = project_dir.join(".ccteam").join("uploads");
+    let canonical_uploads = uploads_root.canonicalize().ok();
+    let mut lines: Vec<String> = Vec::new();
+    for att in attachments {
+        match att.kind.as_str() {
+            "image" | "file" => {
+                let Some(path) = att.path.as_deref().filter(|p| !p.trim().is_empty()) else {
+                    return Err(format!("attachment kind `{}` requires `path`", att.kind));
+                };
+                // Canonicalize (also proves existence) and pin under the
+                // project's uploads dir, so a turn can only name files the
+                // upload endpoint stored for THIS project.
+                let canon = std::path::Path::new(path)
+                    .canonicalize()
+                    .map_err(|_| format!("attachment not found: {path}"))?;
+                // No uploads dir yet (nothing was ever uploaded for this
+                // project) ⇒ any path is by definition outside it.
+                if !canonical_uploads
+                    .as_ref()
+                    .is_some_and(|root| canon.starts_with(root))
+                {
+                    return Err(format!(
+                        "attachment path is outside this project's uploads dir: {path}"
+                    ));
+                }
+                let kind = if att.kind == "image" {
+                    AttachmentKind::Image
+                } else {
+                    AttachmentKind::File
+                };
+                lines.push(attachment_line(&ChannelAttachment {
+                    kind,
+                    file_name: att.name.clone().unwrap_or_default(),
+                    local_path: canon.to_string_lossy().into_owned(),
+                    mime: None,
+                    size: None,
+                }));
+            }
+            "skill" => {
+                let Some(id) = att.name.as_deref().filter(|n| !n.trim().is_empty()) else {
+                    return Err("attachment kind `skill` requires `name` (the skill id)".into());
+                };
+                // Same charset rule as the skill write path — subsumes any
+                // path traversal (`/`, `\`, `..` all rejected).
+                if !id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    return Err(format!("invalid skill id: {id}"));
+                }
+                let md = ccteam_core::skill_md_path(project_dir, id);
+                if !md.is_file() {
+                    return Err(format!("skill not installed in this project: {id}"));
+                }
+                // Self-describing imperative — vendor-generic: any agent can
+                // `Read` a markdown skill file and follow it; no reliance on a
+                // vendor-native skill loader.
+                lines.push(format!(
+                    "[skill \"{id}\" attached — read {} and follow it for this request]",
+                    md.display()
+                ));
+            }
+            other => return Err(format!("unknown attachment kind: {other}")),
+        }
+    }
+    let trimmed = text.trim();
+    Ok(if trimmed.is_empty() {
+        lines.join("\n")
+    } else {
+        format!("{trimmed}\n\n{}", lines.join("\n"))
+    })
 }
 
 /// `POST /api/v1/sessions/{sid}/turn`
@@ -678,7 +790,9 @@ pub(crate) async fn handle_session_turn(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    if form.text.trim().is_empty() {
+    // Attachments make a bare send meaningful ("look at this file"), so text
+    // is only required when nothing is attached.
+    if form.text.trim().is_empty() && form.attachments.is_empty() {
         return create_error(
             StatusCode::BAD_REQUEST,
             "text must not be empty".into(),
@@ -687,19 +801,46 @@ pub(crate) async fn handle_session_turn(
     }
     let result = {
         let mut guard = gw.lock().await;
-        if !guard
+        let Some(view) = guard
             .session_views()
-            .iter()
-            .any(|session| session.sid == sid)
-        {
+            .into_iter()
+            .find(|session| session.sid == sid)
+        else {
             return unknown_session(&sid);
-        }
+        };
+        // Weave attachments into the turn text (the web peer of the IM
+        // inbound attachment grammar). Uploads live on the daemon host, so a
+        // remote-host session can't see them — readable error, no silent rot.
+        let text = if form.attachments.is_empty() {
+            form.text
+        } else {
+            if !view.host.is_empty() && view.host != "local" {
+                return create_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "session {sid} runs on remote host `{}` — attachments are not yet \
+                         supported for remote sessions",
+                        view.host
+                    ),
+                    mode,
+                );
+            }
+            let Some(resolved) = guard.session_resolve(&sid) else {
+                return unknown_session(&sid);
+            };
+            match build_turn_text_with_attachments(
+                &form.text,
+                &form.attachments,
+                &resolved.project_dir,
+            ) {
+                Ok(text) => text,
+                Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
+            }
+        };
         // Web interactive path: run the gateway control-command face (/status,
         // /sessions, …) first — parity with IM — then fall back to a turn. The
         // fleet renders are admin-only (see `submit_web_sid`).
-        guard
-            .submit_web_sid(&sid, form.text, identity.is_admin)
-            .await
+        guard.submit_web_sid(&sid, text, identity.is_admin).await
     };
     match result {
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),

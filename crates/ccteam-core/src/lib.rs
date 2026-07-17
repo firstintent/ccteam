@@ -256,7 +256,9 @@ pub use queries::{
     ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
     WorkflowSummary,
 };
-pub use roles::{agents_dir, list_roles, read_role, RoleDetail, RoleSummary};
+pub use roles::{
+    agents_dir, list_roles, list_skills, read_role, RoleDetail, RoleSummary, SkillSummary,
+};
 // v0.8.24 Track D — multi-host registry.
 pub use host::read_hostname;
 pub use host_registry::{

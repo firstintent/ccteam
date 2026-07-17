@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import type { TurnAttachment } from "../lib/attachmentsApi";
 import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
@@ -156,10 +157,16 @@ export default function SessionView({
 
   // ---- send a turn ----------------------------------------------------------
   const submitText = useCallback(
-    (content: string) => {
-      pushRow({ kind: "user", content });
+    (content: string, attachments: TurnAttachment[] = []) => {
+      // Optimistic transcript row: show the text plus a compact attachment
+      // note (the server-side turn text carries the full attachment lines).
+      const names = attachments
+        .map((a) => (a.kind === "skill" ? `skill:${a.name}` : (a.name ?? a.path ?? "")))
+        .filter(Boolean);
+      const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
+      pushRow({ kind: "user", content: shown });
       setBusyMark(doneCount);
-      submitTurn(sid, content).catch((e) => {
+      submitTurn(sid, content, attachments).catch((e) => {
         setBusyMark(null);
         const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
@@ -428,6 +435,7 @@ export default function SessionView({
                 locked
                 isAdmin={isAdmin}
                 modelLabel={statusModel ?? vendor}
+                uploadSlug={session?.project}
               />
             </div>
           </div>

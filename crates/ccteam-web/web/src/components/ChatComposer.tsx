@@ -8,11 +8,32 @@
 //     (per-vendor; claude `terminal` admin-only)
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
+//   - attach menu (＋): upload files/photos + attach installed skills; picked
+//     files upload immediately (chips show progress), paste/drag-drop attach
+//     too, and Send names the stored paths in the turn's `attachments[]` —
+//     the server weaves them into the turn text (vendor-generic IM grammar).
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Hand, Mic, Plus, Square } from "lucide-react";
+import {
+  ArrowUp,
+  FileText,
+  Hand,
+  Image as ImageIcon,
+  Loader2,
+  Mic,
+  Plus,
+  Sparkles,
+  Square,
+  X,
+} from "lucide-react";
 import { toastBus } from "../lib/toastBus";
 import { makeT, type Lang } from "../lib/i18n";
+import {
+  listProjectSkills,
+  uploadAttachment,
+  type SkillSummary,
+  type TurnAttachment,
+} from "../lib/attachmentsApi";
 import {
   EFFORT_KEYS,
   normalizeDraft,
@@ -40,6 +61,37 @@ export function shouldSubmitOnEnter(e: {
   return true;
 }
 
+/** One composer chip: a picked file mid-upload / stored, or an attached
+ *  skill. `path` is set once the server stored the file (skills carry the
+ *  id in `name` and never upload). */
+export interface ComposerAttachment {
+  id: string;
+  kind: "image" | "file" | "skill";
+  name: string;
+  path?: string;
+  status: "uploading" | "ready" | "error";
+}
+
+/** Pure: the turn-POST `attachments[]` payload for the current chips.
+ *  Only `ready` chips ride the turn; call [`attachmentsBlockSend`] first
+ *  to keep the draft while uploads are still in flight. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
+export function attachmentsPayload(items: ComposerAttachment[]): TurnAttachment[] {
+  return items
+    .filter((a) => a.status === "ready")
+    .map((a) =>
+      a.kind === "skill"
+        ? { kind: "skill" as const, name: a.name }
+        : { kind: a.kind, path: a.path, name: a.name },
+    );
+}
+
+/** Pure: true while any chip is still uploading (Send must wait). */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
+export function attachmentsBlockSend(items: ComposerAttachment[]): boolean {
+  return items.some((a) => a.status === "uploading");
+}
+
 /** Per-surface draft key — an unsent message survives a reload / a session
  *  switch (the conversation view is keyed by sid and remounts on switch). */
 const draftStorageKey = (key: string) => `ccteam.draft.v1.${key}`;
@@ -51,6 +103,9 @@ function loadDraft(key: string): string {
     return "";
   }
 }
+
+let attachmentSeq = 0;
+const nextAttachmentId = () => `att-${++attachmentSeq}`;
 
 export function ChatComposer({
   draftKey,
@@ -68,6 +123,7 @@ export function ChatComposer({
   isAdmin,
   topSlot,
   sendTestId = "composer-send",
+  uploadSlug,
 }: {
   /** localStorage draft scope — `"home"` or the sid. */
   draftKey: string;
@@ -76,9 +132,9 @@ export function ChatComposer({
   /** A turn is in flight → the send button morphs into Stop when empty. */
   busy?: boolean;
   disabled?: boolean;
-  /** Send the trimmed text. Return `false` to KEEP the draft (validation
-   *  failed upstream); anything else clears it. */
-  onSend: (text: string) => boolean | void;
+  /** Send the trimmed text (+ any ready attachments). Return `false` to KEEP
+   *  the draft (validation failed upstream); anything else clears it. */
+  onSend: (text: string, attachments: TurnAttachment[]) => boolean | void;
   /** Interrupt the running turn (session kept). */
   onStop?: () => void;
   /** The model/effort/protocol/HITL draft the menu edits. */
@@ -95,13 +151,21 @@ export function ChatComposer({
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
   sendTestId?: string;
+  /** Project slug uploads + the skill picker target. Omit (e.g. while the
+   *  Home new-project row is open) to disable attaching with a hint. */
+  uploadSlug?: string;
 }) {
   const t = makeT(lang);
   const [text, setText] = useState(() => loadDraft(draftKey));
   const [menuOpen, setMenuOpen] = useState(false);
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
+  const attachRef = useRef<HTMLDivElement | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
 
   // Persist (or clear) this surface's draft on every change.
   useEffect(() => {
@@ -112,6 +176,17 @@ export function ChatComposer({
       /* storage disabled — in-memory draft still works */
     }
   }, [draftKey, text]);
+
+  // Uploads are project-scoped: switching the target project orphans any
+  // already-stored files, so reset the chips + the skills cache instead of
+  // letting the next send 400 on a cross-project path. Render-phase derived
+  // reset (the React-endorsed alternative to setState-in-effect).
+  const [attachSlug, setAttachSlug] = useState(uploadSlug);
+  if (attachSlug !== uploadSlug) {
+    setAttachSlug(uploadSlug);
+    setSkills(null);
+    if (attachments.length > 0) setAttachments([]);
+  }
 
   // Auto-grow the textarea (52 → 260px, then scroll).
   const autoGrow = useCallback(() => {
@@ -124,32 +199,113 @@ export function ChatComposer({
     autoGrow();
   }, [text, autoGrow]);
 
-  // Close the model menu on any outside click.
+  // Close either menu on any outside click.
   useEffect(() => {
-    if (!menuOpen) return;
+    if (!menuOpen && !attachOpen) return;
     const close = (e: MouseEvent) => {
-      if (selRef.current && e.target instanceof Node && selRef.current.contains(e.target)) return;
+      const target = e.target instanceof Node ? e.target : null;
+      if (target && selRef.current?.contains(target)) return;
+      if (target && attachRef.current?.contains(target)) return;
       setMenuOpen(false);
+      setAttachOpen(false);
     };
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
-  }, [menuOpen]);
+  }, [menuOpen, attachOpen]);
+
+  // ---- attachments -----------------------------------------------------------
+
+  const attachFiles = useCallback(
+    (files: FileList | File[] | null | undefined) => {
+      const picked = Array.from(files ?? []);
+      if (picked.length === 0) return;
+      if (!uploadSlug) {
+        toastBus.handler?.info(t("attachNeedProject"));
+        return;
+      }
+      const slug = uploadSlug;
+      for (const file of picked) {
+        const id = nextAttachmentId();
+        const kind = file.type.startsWith("image/") ? "image" : "file";
+        setAttachments((current) => [
+          ...current,
+          { id, kind, name: file.name || "upload.bin", status: "uploading" },
+        ]);
+        uploadAttachment(slug, file)
+          .then((stored) => {
+            setAttachments((current) =>
+              current.map((a) =>
+                a.id === id
+                  ? { ...a, kind: stored.kind, name: stored.name, path: stored.path, status: "ready" }
+                  : a,
+              ),
+            );
+          })
+          .catch((e) => {
+            setAttachments((current) => current.filter((a) => a.id !== id));
+            if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+            toastBus.handler?.error(
+              `${t("uploadFailed")}: ${e instanceof Error ? e.message : "unknown"}`,
+            );
+          });
+      }
+    },
+    [uploadSlug, t],
+  );
+
+  const toggleSkill = useCallback((skill: string) => {
+    setAttachments((current) => {
+      const existing = current.find((a) => a.kind === "skill" && a.name === skill);
+      if (existing) return current.filter((a) => a.id !== existing.id);
+      return [
+        ...current,
+        { id: nextAttachmentId(), kind: "skill", name: skill, status: "ready" },
+      ];
+    });
+  }, []);
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((current) => current.filter((a) => a.id !== id));
+  }, []);
+
+  const openAttachMenu = useCallback(() => {
+    if (!uploadSlug) {
+      toastBus.handler?.info(t("attachNeedProject"));
+      return;
+    }
+    setAttachOpen((open) => {
+      const next = !open;
+      if (next && skills === null) {
+        listProjectSkills(uploadSlug)
+          .then(setSkills)
+          .catch(() => setSkills([]));
+      }
+      return next;
+    });
+  }, [uploadSlug, skills, t]);
+
+  // ---- send ------------------------------------------------------------------
 
   const send = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed) {
+    if (!trimmed && attachments.length === 0) {
       toastBus.handler?.info(t("emptyInput"));
       return;
     }
-    const keep = onSend(trimmed) === false;
+    if (attachmentsBlockSend(attachments)) {
+      toastBus.handler?.info(t("uploadingWait"));
+      return;
+    }
+    const keep = onSend(trimmed, attachmentsPayload(attachments)) === false;
     if (keep) return;
     setText("");
+    setAttachments([]);
     try {
       localStorage.removeItem(draftStorageKey(draftKey));
     } catch {
       /* ignore */
     }
-  }, [text, onSend, draftKey, t]);
+  }, [text, attachments, onSend, draftKey, t]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -226,10 +382,51 @@ export function ChatComposer({
   const spec = vendorSpec(draft.vendor);
   const showStop = !!busy && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor, isAdmin);
+  const sendable = !!text.trim() || attachments.length > 0;
 
   return (
-    <div className={`composer ${text.trim() ? "has-text" : ""}`}>
+    <div
+      className={`composer ${sendable ? "has-text" : ""}`}
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes("Files")) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer?.files?.length) return;
+        e.preventDefault();
+        attachFiles(e.dataTransfer.files);
+      }}
+    >
       {topSlot}
+      {attachments.length > 0 ? (
+        <div className="att-chips" data-testid="att-chips">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              className={`att-chip ${a.kind} ${a.status}`}
+              title={a.kind === "skill" ? `skill: ${a.name}` : a.name}
+            >
+              {a.status === "uploading" ? (
+                <Loader2 className="spin" />
+              ) : a.kind === "skill" ? (
+                <Sparkles />
+              ) : a.kind === "image" ? (
+                <ImageIcon />
+              ) : (
+                <FileText />
+              )}
+              <span className="att-name">{a.name}</span>
+              <button
+                type="button"
+                className="att-x"
+                aria-label={`remove ${a.name}`}
+                onClick={() => removeAttachment(a.id)}
+              >
+                <X />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <textarea
         ref={taRef}
         data-testid="composer-textarea"
@@ -239,6 +436,12 @@ export function ChatComposer({
         placeholder={t(placeholderKey)}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={onKeyDown}
+        onPaste={(e) => {
+          if (e.clipboardData?.files?.length) {
+            e.preventDefault();
+            attachFiles(e.clipboardData.files);
+          }
+        }}
         onCompositionStart={() => {
           composingRef.current = true;
         }}
@@ -246,10 +449,72 @@ export function ChatComposer({
           composingRef.current = false;
         }}
       />
+      <input
+        ref={fileRef}
+        type="file"
+        multiple
+        hidden
+        data-testid="composer-file-input"
+        onChange={(e) => {
+          attachFiles(e.currentTarget.files);
+          e.currentTarget.value = "";
+        }}
+      />
       <div className="composer-row">
-        <button type="button" className="icon-btn" title="＋" aria-label="attach">
-          <Plus />
-        </button>
+        <div className={`sel ${attachOpen ? "open" : ""}`} ref={attachRef}>
+          <button
+            type="button"
+            className="icon-btn"
+            data-testid="attach-btn"
+            title={t("attachTip")}
+            aria-label="attach"
+            onClick={(e) => {
+              e.stopPropagation();
+              openAttachMenu();
+            }}
+          >
+            <Plus />
+          </button>
+          <div className="sel-menu drop-up" style={{ minWidth: 260 }} data-testid="attach-menu">
+            <button
+              type="button"
+              className="sel-item"
+              data-testid="attach-files"
+              onClick={() => {
+                setAttachOpen(false);
+                fileRef.current?.click();
+              }}
+            >
+              <ImageIcon />
+              {t("attachFiles")}
+            </button>
+            <div className="sel-group">{t("attachSkillGroup")}</div>
+            {skills === null ? (
+              <div className="sel-item muted">…</div>
+            ) : skills.length === 0 ? (
+              <div className="sel-item muted">{t("noSkills")}</div>
+            ) : (
+              skills.map((s) => {
+                const on = attachments.some(
+                  (a) => a.kind === "skill" && a.name === s.skill,
+                );
+                return (
+                  <button
+                    key={s.skill}
+                    type="button"
+                    className={`sel-item ${on ? "selected" : ""}`}
+                    onClick={() => toggleSkill(s.skill)}
+                  >
+                    <Sparkles />
+                    {s.skill}
+                    {s.description ? <span className="sub">{s.description}</span> : null}
+                    <span className="check">✓</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
         <button
           type="button"
           data-testid="hitl-toggle"

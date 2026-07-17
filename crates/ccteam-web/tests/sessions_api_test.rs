@@ -955,3 +955,301 @@ async fn rename_session_denies_cross_tenant_project() {
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
 }
+
+// ── composer attachments (uploads + skills + turn weaving) ─────────────────────
+
+/// Seed `<project_dir>/.ccteam/state.json` so the uploads/skills endpoints'
+/// unknown-project gate passes (existence check only).
+fn seed_project_state(project_dir: &std::path::Path, slug: &str) {
+    let dir = project_dir.join(".ccteam");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), format!("{{\"slug\":\"{slug}\"}}")).unwrap();
+}
+
+/// End-to-end user flow: upload a file → send a turn naming it → the turn
+/// text the session receives (and the turns.jsonl user mirror shows) carries
+/// the SAME `[attachment image_path="…"]` line grammar the IM path emits —
+/// the vendor-generic contract every ccteam session is taught to `Read`.
+#[tokio::test]
+async fn upload_then_turn_weaves_attachment_lines_into_turn_text() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    // 1. Upload → 201 {path, kind:"image", name, size}; file stored under the
+    //    project's ccteam-owned uploads dir.
+    let uploaded = client
+        .post(format!("{base}/projects/demo/uploads?name=shot.png"))
+        .header("content-type", "image/png")
+        .body(&b"png-bytes"[..])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), 201);
+    let stored: Value = uploaded.json().await.unwrap();
+    assert_eq!(stored["kind"], "image");
+    assert_eq!(stored["name"], "shot.png");
+    assert_eq!(stored["size"], 9);
+    let stored_path = stored["path"].as_str().unwrap().to_string();
+    assert!(
+        stored_path.contains("/.ccteam/uploads/"),
+        "stored under the project uploads dir: {stored_path}"
+    );
+    assert_eq!(std::fs::read(&stored_path).unwrap(), b"png-bytes");
+
+    // 2. Create a session, then send a turn naming the upload.
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turned = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "look at this screenshot",
+            "attachments": [{"kind": "image", "path": stored_path, "name": "shot.png"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned.status(), 202);
+
+    // 3. The user mirror (what history renders + what the vendor received)
+    //    carries the text plus the IM-grammar attachment line.
+    let turns =
+        ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+    let user_text = turns
+        .iter()
+        .map(|t| t.user.clone())
+        .find(|u| !u.is_empty())
+        .expect("user turn mirrored");
+    assert!(
+        user_text.contains("look at this screenshot"),
+        "turn keeps the user text: {user_text}"
+    );
+    assert!(
+        user_text.contains("[attachment image_path=\""),
+        "turn gains the IM-grammar attachment line: {user_text}"
+    );
+}
+
+/// Skills: GET lists the project's installed `.claude/skills/<id>/SKILL.md`;
+/// attaching one to a (text-less) turn appends a self-describing
+/// read-and-follow line — the vendor-generic skill mechanism.
+#[tokio::test]
+async fn skill_list_and_attach_names_skill_file_in_turn() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+    let skill_dir = project_dir
+        .join(".claude")
+        .join("skills")
+        .join("deep-research");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: deep-research\ndescription: fan-out research harness\n---\nbody\n",
+    )
+    .unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    // 1. The picker face lists the installed skill with its description.
+    let skills: Value = client
+        .get(format!("{base}/projects/demo/skills"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(skills[0]["skill"], "deep-research");
+    assert_eq!(skills[0]["description"], "fan-out research harness");
+
+    // 2. Attach the skill to a turn with EMPTY text (attachments make a bare
+    //    send meaningful) → 202 + the self-describing skill line.
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turned = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "",
+            "attachments": [{"kind": "skill", "name": "deep-research"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned.status(), 202);
+    let turns =
+        ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+    let user_text = turns
+        .iter()
+        .map(|t| t.user.clone())
+        .find(|u| !u.is_empty())
+        .expect("user turn mirrored");
+    assert!(
+        user_text.contains("[skill \"deep-research\" attached — read"),
+        "turn gains the read-and-follow skill line: {user_text}"
+    );
+    assert!(
+        user_text.contains("SKILL.md"),
+        "the line names the SKILL.md path: {user_text}"
+    );
+}
+
+/// The turn attachment face accepts no arbitrary paths: only files under the
+/// session project's `.ccteam/uploads/` (stored by the upload endpoint) and
+/// installed skill ids pass; everything else is a readable 400.
+#[tokio::test]
+async fn turn_attachments_reject_foreign_paths_and_unknown_skills() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+    // A real file OUTSIDE the uploads dir — must be rejected even though it exists.
+    let outside = tmp.path().join("secret.txt");
+    std::fs::write(&outside, "nope").unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (attachment, needle) in [
+        (
+            serde_json::json!({"kind": "file", "path": outside.to_string_lossy()}),
+            "uploads dir",
+        ),
+        (
+            serde_json::json!({"kind": "skill", "name": "not-installed"}),
+            "not installed",
+        ),
+        (
+            serde_json::json!({"kind": "weird", "path": "/x"}),
+            "unknown attachment kind",
+        ),
+    ] {
+        let resp = client
+            .post(format!("{base}/sessions/{sid}/turn"))
+            .json(&serde_json::json!({"text": "hi", "attachments": [attachment]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "rejected: {attachment}");
+        let body: Value = resp.json().await.unwrap();
+        let err = body["error"].as_str().unwrap_or_default().to_string();
+        assert!(err.contains(needle), "readable error `{err}` ~ `{needle}`");
+    }
+
+    // Bare send with NO attachments still requires text (unchanged contract).
+    let resp = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({"text": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// The upload face itself: unknown project → 404; empty body → 400; a
+/// hostile name is sanitized (no traversal out of the uploads dir).
+#[tokio::test]
+async fn upload_endpoint_guards_project_body_and_name() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+    let addr = spawn_server(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    // Unknown project → 404 (uploads never touch disk for it).
+    let resp = client
+        .post(format!("{base}/projects/ghost/uploads?name=a.txt"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Empty body → 400.
+    let resp = client
+        .post(format!("{base}/projects/demo/uploads?name=a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Traversal-shaped name is sanitized to its basename — stored INSIDE the
+    // uploads dir, never at the traversal target.
+    let resp = client
+        .post(format!(
+            "{base}/projects/demo/uploads?name=..%2F..%2Fevil.sh"
+        ))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let stored: Value = resp.json().await.unwrap();
+    let path = stored["path"].as_str().unwrap();
+    assert!(path.contains("/.ccteam/uploads/"), "inside uploads: {path}");
+    assert!(path.ends_with("evil.sh"), "basename kept: {path}");
+    assert!(!project_dir.parent().unwrap().join("evil.sh").exists());
+}

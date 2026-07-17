@@ -165,6 +165,28 @@ describe("sessionsApi", () => {
     expect(got.accepted).toBe(true);
   });
 
+  it("submitTurn rides attachments[] on the body when present", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(202, { accepted: true }));
+    await submitTurn("s2", "look", [
+      { kind: "image", path: "/p/.ccteam/uploads/1-a.png", name: "a.png" },
+      { kind: "skill", name: "deep-research" },
+    ]);
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(String(init?.body))).toEqual({
+      text: "look",
+      attachments: [
+        { kind: "image", path: "/p/.ccteam/uploads/1-a.png", name: "a.png" },
+        { kind: "skill", name: "deep-research" },
+      ],
+    });
+    // Empty attachments stay OFF the wire (older servers see the same body).
+    fetchMock.mockResolvedValueOnce(jsonResponse(202, { accepted: true }));
+    await submitTurn("s2", "plain", []);
+    const [, init2] = fetchMock.mock.calls[1]!;
+    expect(JSON.parse(String(init2?.body))).toEqual({ text: "plain" });
+  });
+
   it("submitTurn lifts the server human error body", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(
       jsonResponse(502, {

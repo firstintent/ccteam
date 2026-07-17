@@ -106,6 +106,54 @@ pub fn list_roles(project_dir: &Path) -> Result<Vec<RoleSummary>> {
     Ok(out)
 }
 
+/// One entry in the project skill list (`GET .../skills`) — a directory
+/// `<project>/.claude/skills/<skill>/SKILL.md`. `description` is pulled
+/// from the SKILL.md frontmatter when present ("" otherwise) so the web
+/// composer's skill picker can show what each skill does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSummary {
+    /// Directory name (`deep-research` for `.claude/skills/deep-research/`).
+    pub skill: String,
+    /// Frontmatter `description`, or "" when absent.
+    pub description: String,
+}
+
+/// List the project's installed skills — every
+/// `<project>/.claude/skills/<dir>/SKILL.md` — sorted by skill id. The
+/// read-side sibling of [`crate::write_skill`] (multi-file skills still
+/// list: only the SKILL.md entrypoint is read). Missing skills dir →
+/// empty vec; an unreadable SKILL.md is skipped, never fatal (mirrors
+/// [`list_roles`]).
+pub fn list_skills(project_dir: &Path) -> Result<Vec<SkillSummary>> {
+    let dir = project_dir.join(".claude").join("skills");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let rd = fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
+    let mut out: Vec<SkillSummary> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(skill) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let md = path.join("SKILL.md");
+        let text = match fs::read_to_string(&md) {
+            Ok(s) => s,
+            Err(_) => continue, // no SKILL.md → not a skill dir
+        };
+        let (frontmatter, _body) = split_frontmatter(&text);
+        out.push(SkillSummary {
+            skill: skill.to_string(),
+            description: scalar_field(&frontmatter, "description"),
+        });
+    }
+    out.sort_by(|a, b| a.skill.cmp(&b.skill));
+    Ok(out)
+}
+
 /// Mirror of `admin_actions::validate_bot_name` (the write/PUT path
 /// validator) — kept independent here so the read-side resource API
 /// doesn't reach across modules for a few lines, and so a malicious
@@ -350,5 +398,35 @@ mod tests {
         let (fm, body) = split_frontmatter(text);
         assert_eq!(fm.get("model").unwrap(), "opus");
         assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn list_skills_reads_skill_md_descriptions_sorted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills.join("zeta")).unwrap();
+        std::fs::write(
+            skills.join("zeta").join("SKILL.md"),
+            "---\ndescription: z skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills.join("alpha")).unwrap();
+        std::fs::write(skills.join("alpha").join("SKILL.md"), "no frontmatter\n").unwrap();
+        // A dir WITHOUT SKILL.md is not a skill; a stray file is ignored.
+        std::fs::create_dir_all(skills.join("not-a-skill")).unwrap();
+        std::fs::write(skills.join("README.md"), "stray\n").unwrap();
+
+        let out = list_skills(tmp.path()).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].skill, "alpha");
+        assert_eq!(out[0].description, "");
+        assert_eq!(out[1].skill, "zeta");
+        assert_eq!(out[1].description, "z skill");
+    }
+
+    #[test]
+    fn list_skills_empty_without_skills_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(list_skills(tmp.path()).unwrap().is_empty());
     }
 }

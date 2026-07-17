@@ -394,6 +394,29 @@ button { font-family: inherit; cursor: pointer; }
   min-height: 52px; max-height: 260px;
 }
 .composer textarea::placeholder { color: var(--text-faint); }
+
+/* Composer attachment chips (files uploading/stored + attached skills). */
+.att-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.att-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 260px; padding: 4px 6px 4px 8px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 999px; font-size: 12.5px; color: var(--text);
+}
+.att-chip svg { width: 14px; height: 14px; flex: none; color: var(--text-dim); }
+.att-chip.skill svg { color: var(--accent, #b45309); }
+.att-chip .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-chip .att-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border: none; border-radius: 50%;
+  background: transparent; color: var(--text-dim); cursor: pointer; padding: 0;
+}
+.att-chip .att-x:hover { background: var(--border); color: var(--text); }
+.att-chip .att-x svg { width: 12px; height: 12px; }
+.att-chip .spin { animation: att-spin 0.9s linear infinite; }
+@keyframes att-spin { to { transform: rotate(360deg); } }
+.sel-item.muted { color: var(--text-faint); cursor: default; }
+
 .composer-row { display: flex; align-items: center; gap: 6px; }
 .composer-row .right { margin-left: auto; display: flex; align-items: center; gap: 6px; }
 

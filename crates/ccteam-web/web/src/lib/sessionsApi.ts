@@ -248,9 +248,17 @@ export function getRoleDetail(slug: string, role: string): Promise<RoleDetail> {
 }
 
 /** `POST /api/v1/sessions/{sid}/turn` — submit a user turn. 202
- *  `{accepted:true}`; the reply + progress arrive over the SSE stream. */
-export function submitTurn(sid: string, text: string): Promise<{ accepted: boolean }> {
-  return postJson<{ accepted: boolean }>(`${sessionUrl(sid)}/turn`, { text });
+ *  `{accepted:true}`; the reply + progress arrive over the SSE stream.
+ *  `attachments` (optional) names previously-uploaded files / installed
+ *  skills; the server weaves them into the turn text (IM-grammar parity). */
+export function submitTurn(
+  sid: string,
+  text: string,
+  attachments?: import("./attachmentsApi").TurnAttachment[],
+): Promise<{ accepted: boolean }> {
+  const body =
+    attachments && attachments.length > 0 ? { text, attachments } : { text };
+  return postJson<{ accepted: boolean }>(`${sessionUrl(sid)}/turn`, body);
 }
 
 /** `POST /api/v1/sessions/{sid}/stop` — deregister the session. */

@@ -208,6 +208,9 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::roles::handle_get_role,
             super::roles::handle_put_role
         ))
+        // composer attachments — project uploads + installed-skill picker
+        .routes(routes!(super::uploads::handle_project_upload))
+        .routes(routes!(super::uploads::handle_list_skills))
         // sessions (gateway spine) — GET list + POST create share the path.
         .routes(routes!(
             super::sessions_api::handle_list_sessions,

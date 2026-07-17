@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
 import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
@@ -315,7 +316,7 @@ export default function HomeView({
   };
 
   // ---- lazy-create funnel ---------------------------------------------------
-  const launch = (text: string): boolean => {
+  const launch = (text: string, attachments: TurnAttachment[] = []): boolean => {
     if (pending) return false;
     if (!project && !isNewProject) {
       toastBus.handler?.error(
@@ -349,7 +350,7 @@ export default function HomeView({
         effort: wireEffort(effectiveDraft) ?? undefined,
       });
       if (warning) toastBus.handler?.info(warning);
-      await submitTurn(sid, text);
+      await submitTurn(sid, text, attachments);
       return sid;
     };
     run()
@@ -540,6 +541,7 @@ export default function HomeView({
             allowedVendors={hostVendors ?? undefined}
             onSend={launch}
             sendTestId="home-send"
+            uploadSlug={isNewProject ? undefined : project || undefined}
             topSlot={
               <NewProjectFields
                 lang={lang}

@@ -55,6 +55,31 @@ pub struct ChannelAttachment {
     pub size: Option<u64>,
 }
 
+/// `image_path` / `file_path` — the attribute key for an attachment kind.
+/// Shared by the IM `<channel …>` first-attachment attribute, the IM
+/// `[attachment …]` extra lines, and the web turn's attachment lines, so
+/// the grammar the ccteam MCP instructions teach every vendor session
+/// ("Read the file at image_path/file_path") never drifts between entry
+/// surfaces.
+pub fn attachment_path_key(kind: AttachmentKind) -> &'static str {
+    match kind {
+        AttachmentKind::Image => "image_path",
+        AttachmentKind::File => "file_path",
+    }
+}
+
+/// The turn-text line naming one attachment for the agent to `Read` —
+/// `[attachment image_path="…"]` / `[attachment file_path="…"]`. The ONE
+/// line grammar both entry surfaces (IM extra attachments + web turn
+/// attachments) emit; see [`attachment_path_key`].
+pub fn attachment_line(att: &ChannelAttachment) -> String {
+    format!(
+        "[attachment {}=\"{}\"]",
+        attachment_path_key(att.kind),
+        att.local_path
+    )
+}
+
 /// A message received from or sent to a channel. Trait surface lifted
 /// from `references/openhuman/src/openhuman/channels/traits.rs` with
 /// `serde` added so the daemon can persist inbound events for
@@ -380,7 +405,7 @@ pub(crate) fn inbound_staging_dir() -> std::path::PathBuf {
 /// platform-supplied name can't traverse out of the staging dir. Also
 /// drops `" < >` so the name can't break (or inject into) the
 /// `<channel image_path="…">` turn-text attribute the gateway builds.
-pub(crate) fn sanitize_attachment_name(name: &str) -> String {
+pub fn sanitize_attachment_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base
         .chars()

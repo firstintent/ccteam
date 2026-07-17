@@ -55,7 +55,10 @@ pub mod projects;
 pub mod pty_ws;
 pub mod roles;
 pub mod screenshot;
+// Web composer attachments: project-scoped uploads + skill picker (the turn
+// side lives in `sessions_api::handle_session_turn`'s `attachments[]`).
 pub mod session;
+pub mod uploads;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.
 pub mod sessions_api;
 // v0.8.9 Phase 4 — daemon-wide status aggregate (`GET /api/v1/status`) for the
