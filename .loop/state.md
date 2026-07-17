@@ -7,14 +7,14 @@
 
 ## 当前焦点
 
-- **版本线**:workspace `0.9.2`;v0.9.0–0.9.2(A2A 底座)+ v0.9.3 增量(四 vendor MCP 对称注册,未单独 bump)已落 `main`,**未 tag、未部署**。
-- **在做**:A2A-W5(三场景真机 smoke + README/usage 重写)——卡在 `.loop/backlog.md`。
-- **下一版**:**v0.9.5(kimi-code 第五 vendor harness,`kimi acp` 薄壳 ACP)**,owner 2026-07-17 定向,PRD 自包含 = `docs-local/versions/v0-9-5/prd.md`,卡 = V095;v0.9.4(npm 分发)owner 暂缓(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
+- **版本线**:workspace `0.9.5` 已落 `main`(kimi-code 第五 vendor harness,d9e32e8 + 规划收口),**未 tag、未部署**。
+- **在做**:A2A-W5(三场景真机 smoke + README/usage 重写);P1-1/2/3 + P1-4/P2-1 待排 —— 队列 = `.loop/backlog.md`。
+- **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1408/0**
-- `ccteam-web` 全量 **310/0** · vitest **376**(SPA)· Playwright **7**
+- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1433/0**(v0.9.5,+25;规划独立复核实测)
+- `ccteam-web` 全量 **314**(本机 311 过 + 3 `ws_*` env-flake,干净环境应全绿)· vitest **378**(SPA)· Playwright **7**
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)
@@ -22,8 +22,7 @@
 | 事项 | 状态 |
 |---|---|
 | **tag + 部署** | **HELD** —— push 到 `main` 不等于发布,等 owner 显式「部署」 |
-| v0.9.4 动代码 | gated —— owner 暂缓(2026-07-17,v0.9.5 先行) |
-| v0.9.5 动代码 | **已授权**(owner 2026-07-17 定向;范围 = PRD F1–F9 + V095 卡面,越界仍须偏差申报) |
+| v0.9.4 动代码 | gated —— owner 暂缓(2026-07-17,v0.9.5 先行;v0.9.5 已于同日完成落 main,授权已消耗) |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训

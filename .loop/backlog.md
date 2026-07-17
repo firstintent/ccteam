@@ -33,29 +33,28 @@
 - **规格**:collect 游标语义去重;`max_chars` 限幅与账本指针行为零碰。
 - **DoD**:新定向测试先红后绿;`make test` 基线只增;writeback 绿。
 
-### V095 kimi-code 第五 vendor harness 集成
-- **状态**:完成(d9e32e8) · **冲突域**:`crates/ + crates/ccteam-web/web + README.md` · **建议入口**:dev 会话(owner 钦点 kimi-code 单会话一口气)
-- **背景**:owner 2026-07-17 定向(v0.9.4 暂缓,本版先行)。PRD 自包含(两侧源码坐标已内嵌)= `docs-local/versions/v0-9-5/prd.md`;模板 = grok/opencode 薄壳 ACP vendor。
-- **规格**:PRD F1–F9。协议钉 `kimi acp` 长驻 stdio(terminal 冻结红线);复用 `execution/acp/*` 通用引擎 + `mcp_config::acp_mcp_servers_http`;全局注册写 `~/.kimi-code/mcp.json`;cost `None` 仿 Opencode;roleless-only;remote NotImplemented。
-- **卡面授权路径**:`docs/usage.md`(仅本卡;AGENTS.md / docs 其余 = 规划会话收口时改,dev 偏差申报)。
-- **DoD**:PRD §6 全五条 —— `make gate` 基线只增 · 假件测试先红后绿 · 真机 smoke 留痕 · doctor 不退步 · version bump `0.9.5`(tag/部署 HELD);writeback 绿。
-- **验证**(kimi·2026-07-17,实现 d9e32e8):
-  - 假件先红后绿:`git stash`(缺陷态,kimi 面不存在)→ `cargo test -p ccteam-harness --test kimi_acp_test` 编译红(E0432/E0433/E0599 共 6 错);`git stash pop` → **11/11 绿**(留痕 `docs-local/versions/v0-9-5/test-red-green.log`)。
-  - 基线只增:lib `cargo test --workspace --exclude ccteam-web --lib` = **1433/0**(1408→1433,+25);vitest **378/0**(376→378,+2);ccteam-web `--no-fail-fast` = **311 过 + 3 失败**(3 个 = `ws_*` pipe-pane env-flake 族,AGENTS.md §六);clippy 0 warnings;`cargo fmt --all -- --check` 干净;`.loop/verify/writeback.sh` GREEN;`ccteam doctor --verify-mcp` PASS(8/8 无 STUB)。
-  - 全量对照:`cargo test --workspace --exclude ccteam-web --no-fail-fast` = 2287 过 / 6 失败,**6 个全部在干净 origin/main 同机复测同红**(env-flake 族;证据 = 本卡偏差段 + `docs-local/versions/v0-9-5/smoke/gate-evidence.md`)。
-  - 真机 smoke(daemon 重启到 0.9.5,留痕 `docs-local/versions/v0-9-5/smoke/smoke-run.log`):REST spawn kimi = s44 → dispatch → collect 收 `KIMI_SMOKE_OK`;`/model` picker 出**真 availableModels**(K2.7 Coding / K2.7 Coding Highspeed / K3)→ resolve 切 `kimi-code/k3`(`/status` 证实已切);stop;`ccteam config mcp` 五 vendor 注册含 `~/.kimi-code/mcp.json`(headers map 形态,0600);doctor `MCP (kimi)` PASS;**kimi 主会话经全局注册调通 `mcp__ccteam__status`**。
-- **偏差**:
-  1. 治理面未动(超卡面授权,按规则停手申报):AGENTS.md §〇/§四 vendor 提及、`docs/orchestration.md(+cn)`、`docs/usage-cn.md` 的 vendor 清单仍写四 vendor,请规划收口时同步五 vendor;`docs/usage.md` + `README.md` 已按卡面授权更新。
-  2. 观察(非本卡引入,未动):`remove_test` 的 `t03_purge_clears_ccteam_footprint_only` + `t17_project_rm_purge_via_group` 在本机**干净 origin/main 亦确定性红**(cto.md purge 期望,疑 v0.9.0 废 cto 后测试未跟);建议列入 env-flake 族或另立卡清理。
-  3. 观察(运维面):Makefile systemd unit `Environment=PATH` 未含 `~/.kimi-code/bin` —— daemon 找不到 kimi;本机已按其余 vendor 同款软链 `~/.local/bin/kimi` 解决。建议规划评估 unit 注释提及 kimi 路径。
-  4. 实现决策(卡面授权内,与 PRD 勘察偏差一处):真机 kimi ACP 的模型目录走 **`configOptions`**(opencode 同款,非 PRD 字面 "availableModels")——通用引擎 `pluck_model_info` 的 configOptions 路径原样复用,零新代码;`/model` 切换走 `session/set_model {sessionId, modelId}`(真机验证);effort 轴按 PRD 非目标未接(SPA/REST 两侧 kimi effort 均置 null)。
-  经验:SPA Sidebar 每工作区有 WS_SHOW 行数上限,扩 vendor 测试行时须跨 project 摆放,否则被折叠。
+### P1-3 remove_test 对齐 v0.9.0 废-cto 语义
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli(tests/remove_test.rs)` · **建议入口**:dev 会话
+- **背景**:`t03_purge_clears_ccteam_footprint_only` + `t17_project_rm_purge_via_group` 干净 origin/main 确定性红(V095 偏差 2 上报,规划复核复现):测试仍期望 purge 删「seeded cto.md」,但 v0.9.0 废 cto 后红线明确 `.claude/agents/cto.md` = 用户文件不删不改 —— **测试语义未跟,代码行为是对的**。CI 不跑测试故长期未拦(见 P2-1)。
+- **规格**:改两测试期望为「purge 保留 cto.md(用户 role 文件)」;顺带核 purge 实现与 §三红线一致,不改产品行为。
+- **DoD**:t03/t17 绿;`make test` 基线只增;writeback 绿。
 
-### V094 npm 分发 · daemon 管理 · 自更新
+### P1-4 systemd unit PATH 纳入 kimi 安装路径
+- **状态**:待排 · **冲突域**:`Makefile(systemd unit 段)` · **建议入口**:dev 会话(小改)
+- **背景**:V095 偏差 3:unit `Environment=PATH` 不含 `~/.kimi-code/bin`,daemon 找不到 kimi;本机临时以 `~/.local/bin/kimi` 软链绕过(与其余 vendor 同款)。
+- **规格**:unit PATH(或注释指引)纳入 kimi 默认安装路径;不改其它运行时契约。
+- **DoD**:最低门(fmt + writeback)+ 本机 daemon 重启后 `kimi` 可解析留痕。
+
 - **状态**:gated(owner 2026-07-17 暂缓,v0.9.5 先行) · **冲突域**:`install.sh + crates/ccteam-cli + Makefile` · **建议入口**:版本波(doc-first)
 - **背景**:PRD 已成文 `docs-local/versions/v0-9-4/prd.md`(DRAFT)。
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
+
+### P2-1 CI 增确定性测试 job
+- **状态**:待排 · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)
+- **背景**:V095 复核发现 `check.yml` 只跑 fmt + clippy,**测试完全不在 CI** —— 基线只增当前全靠会话自律 + 复核(P1-3 的测试陈化即因此漏网)。确定性口径(`--lib`)本就为免 env-flake 设计,适合上 CI。
+- **规格**:加 job `cargo test --workspace --exclude ccteam-web --lib --locked`;**不**上 web/e2e(env 依赖);过门后同步 `.loop/verify/README.md` 门禁地图。
+- **DoD**:CI 三 job 绿;writeback 绿。
 
 ## 历史波指针
 

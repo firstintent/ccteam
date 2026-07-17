@@ -14,7 +14,7 @@
 |---|---|
 | **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;`/compare 这段代码为什么慢` 一次问三个模型。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode(本文重点) | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi(本文重点) | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -93,7 +93,7 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 平时你不碰这些——skill 替你调。但如果你在**写 skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
-- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`(grok/opencode 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
+- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`(grok/opencode/kimi 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。**Codex 会在中间叙述时闪 `idle`**——别只凭一次 idle 判完成,看最终结构化答案是否出现。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本)。web 团队视图渲染的是同一张图。

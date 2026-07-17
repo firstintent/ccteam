@@ -26,6 +26,8 @@
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
   `resume_*` · `ws_*` · `hook_*` · gateway 共享 `/tmp/alpha` 并行污染。
   判 flake 前先在干净环境或 CI 复测;**禁「测试瞬时红就顺手改测试消红」**——先证据后定性,留账不冒充全绿。
+  另:`remove_test t03/t17` = **确定性红非 flake**(v0.9.0 废 cto 后测试语义未跟,已立卡 P1-3),判基线单列、不得再增同类;
+  注意 **CI 目前不跑测试**(只 fmt+clippy,P2-1 待补)——「CI 绿」不能当测试证据。
 
 ## 运行纪律(教训固化区;新教训从卡面「经验」行蒸馏进来)
 
@@ -34,3 +36,4 @@
 - **测试隔离必须同时 pin `HOME` + `CCTEAM_HOME`**(只指 HOME 不够,实锤 fixture 污染真实 registry;AGENTS.md §六)。
 - **输出过滤后读**(token 纪律):test 只看 `test result` 行、clippy/lint 看尾行;红了再放宽定位;大文件 grep 定位后按段读。
 - **等待 = 条件轮询 + 显式超时,禁裸 sleep**;进程/e2e 类门:同一命令连续 3 次全绿 + 前后进程零残留才算稳定绿。
+- **SPA Sidebar 每工作区有 WS_SHOW 行数上限**——扩 vendor/session 测试行须跨 project 摆放,否则被折叠断言假红(V095 经验)。

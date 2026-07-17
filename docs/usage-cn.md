@@ -44,6 +44,7 @@ claude --version   # 必需,需要时按提示登录
 codex --version    # 可选,用 Codex 会话才需要
 grok --version     # 可选,用 Grok Build 会话才需要
 opencode --version  # 可选,用 OpenCode 会话才需要
+kimi --version      # 可选,用 Kimi Code 会话才需要(先 `kimi login`)
 ```
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
@@ -70,7 +71,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-进 **主机** 页,点 **「注册 ccteam MCP」**。这一步把 ccteam 自己的工具(雇会话/派活、发文件、截图等)写进**全部四个 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+进 **主机** 页,点 **「注册 ccteam MCP」**。这一步把 ccteam 自己的工具(雇会话/派活、发文件、截图等)写进**全部五个 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -174,10 +175,10 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 # 会话
 /new [vendor] [role] [hitl]  新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex | grok | opencode
+                             · vendor = claude(默认)| codex | grok | opencode | kimi
 /compare <问题>              多 vendor 同题并行对比
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
-                             · grok = 无角色 ACP 会话(忽略 role/hitl 参数)
+                             · grok / opencode / kimi = 无角色 ACP 会话(忽略 role 参数)
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
 /use <id>                  切到会话 s<N>(已停止的会话会自动从磁盘冷恢复)
 /role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)

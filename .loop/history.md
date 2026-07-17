@@ -3,6 +3,7 @@
 > 每版一行,ship 时由规划(控制)会话回填;只留「可指导未来的」,详档 = `docs-local/versions/v0-X-Y/`
 > (gitignored 本机)+ `git log`。root README 不含版本进展(§三红线)——本文件是 repo 内唯一版本时间轴。
 
+- **v0.9.5** kimi-code 第五 vendor harness(`kimi acp` 长驻 stdio 薄壳,复用共享 ACP core:resume→load→new 阶梯 · skip auto-allow / hitl fail-closed · roleless-only · remote NotImplemented)· 五 vendor 全局 MCP 对称注册(+`~/.kimi-code/mcp.json`)· cost None 仿 opencode · 真机 smoke 全链路(spawn/dispatch/collect + live `/model`);dev = kimi-code 单会话一口气(owner 钦点),规划复核确认基线 1433/0
 - **v0.9.3 增量**(未单独 bump)四 vendor 全局 MCP 对称注册(Claude/Codex/Grok/OpenCode 任意主会话可编排)+ `/mcp` 出 auth_layer 修委派父边 + spawn 响应 `caller` 字段
 - **v0.9.2** 项目↔主机绑定(host 归 project、spawn 去 host 参、`project_init` op、卫星项目 import)· live 容量 50 LRU 挤停 · 团队拓扑树 · A2A 返回限幅防父会话膨胀 · 新建项目自由选主机
 - **v0.9.1** MCP 单前缀修复(去双前缀)+ 非 ccteam 主会话 admin fallback
