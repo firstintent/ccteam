@@ -9,7 +9,7 @@
 
 - **版本线**:workspace `0.9.2`;v0.9.0–0.9.2(A2A 底座)+ v0.9.3 增量(四 vendor MCP 对称注册,未单独 bump)已落 `main`,**未 tag、未部署**。
 - **在做**:A2A-W5(三场景真机 smoke + README/usage 重写)——卡在 `.loop/backlog.md`。
-- **下一版**:v0.9.4(npm 分发 / daemon 管理 / 自更新)PRD DRAFT 待 owner 拍板(`docs-local/versions/v0-9-4/prd.md`)。
+- **下一版**:**v0.9.5(kimi-code 第五 vendor harness,`kimi acp` 薄壳 ACP)**,owner 2026-07-17 定向,PRD 自包含 = `docs-local/versions/v0-9-5/prd.md`,卡 = V095;v0.9.4(npm 分发)owner 暂缓(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
@@ -22,7 +22,8 @@
 | 事项 | 状态 |
 |---|---|
 | **tag + 部署** | **HELD** —— push 到 `main` 不等于发布,等 owner 显式「部署」 |
-| v0.9.4 动代码 | gated —— 等 owner 拍板 PRD |
+| v0.9.4 动代码 | gated —— owner 暂缓(2026-07-17,v0.9.5 先行) |
+| v0.9.5 动代码 | **已授权**(owner 2026-07-17 定向;范围 = PRD F1–F9 + V095 卡面,越界仍须偏差申报) |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训
