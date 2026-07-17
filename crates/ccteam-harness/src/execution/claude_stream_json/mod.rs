@@ -568,10 +568,13 @@ fn claude_choice_prompt(title: &str, options: Vec<ChoiceOption>) -> ChoicePrompt
 }
 
 /// Read the vendor's REAL runtime-resolved reasoning effort via the
-/// `get_settings` control_request → `response.applied.effort` (the level that
-/// "will actually be sent to the API", after env / session / model defaults).
-/// `None` on timeout / error / an older CLI without the subtype, or a model
-/// with no effort axis. Short timeout — must never stall the status tap.
+/// `get_settings` control_request (the level that "will actually be sent to
+/// the API", after env / session / model defaults). The response shape has
+/// moved across CLI versions — older builds report `applied.effort`, 2.1.2xx
+/// reports the merged `effective.effortLevel` (verified against the live
+/// 2.1.212 wire) — so read both, old shape first. `None` on timeout / error /
+/// an older CLI without the subtype, or a model with no effort axis. Short
+/// timeout — must never stall the status tap.
 async fn get_applied_effort(transport: &StreamJsonTransport) -> Option<String> {
     let body = transport
         .request_control("get_settings", json!({}), Duration::from_secs(3))
@@ -580,11 +583,21 @@ async fn get_applied_effort(transport: &StreamJsonTransport) -> Option<String> {
     if body.subtype != "success" {
         return None;
     }
-    body.response
-        .as_ref()?
-        .get("applied")?
-        .get("effort")?
-        .as_str()
+    extract_effort_from_settings(body.response.as_ref()?)
+}
+
+/// Pull the effort level out of a `get_settings` response body, tolerating
+/// every known shape: `applied.effort` (pre-2.1.2xx), `effective.effortLevel`
+/// (2.1.212+), and `effective.effort` (defensive). Pure — unit-testable
+/// against captured wire fixtures.
+fn extract_effort_from_settings(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("applied")
+        .and_then(|a| a.get("effort"))
+        .or_else(|| response.get("effective").and_then(|e| e.get("effortLevel")))
+        .or_else(|| response.get("effective").and_then(|e| e.get("effort")))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
 }
 
@@ -1962,5 +1975,38 @@ mod effort_tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["effortLevel"], "medium");
+    }
+}
+
+#[cfg(test)]
+mod effort_shape_tests {
+    use super::extract_effort_from_settings;
+    use serde_json::json;
+
+    /// The `get_settings` effort location has moved across CLI versions; the
+    /// extractor must read every known shape. The `effective.effortLevel`
+    /// fixture is a captured wire response from the live 2.1.212 CLI (the
+    /// regression: `/status` showed `—` for effort because only the retired
+    /// `applied.effort` path was read).
+    #[test]
+    fn extracts_effort_from_old_and_new_settings_shapes() {
+        // Pre-2.1.2xx: applied.effort.
+        let old = json!({"applied": {"effort": "high"}});
+        assert_eq!(extract_effort_from_settings(&old).as_deref(), Some("high"));
+
+        // 2.1.212: effective.effortLevel (captured shape; sibling keys elided).
+        let new = json!({"effective": {"model": "claude-fable-5[1m]", "effortLevel": "xhigh"}});
+        assert_eq!(extract_effort_from_settings(&new).as_deref(), Some("xhigh"));
+
+        // Defensive: effective.effort.
+        let alt = json!({"effective": {"effort": "low"}});
+        assert_eq!(extract_effort_from_settings(&alt).as_deref(), Some("low"));
+
+        // Absent / empty → None (statusline shows `—`, never fabricated).
+        assert_eq!(extract_effort_from_settings(&json!({})), None);
+        assert_eq!(
+            extract_effort_from_settings(&json!({"effective": {"effortLevel": "  "}})),
+            None
+        );
     }
 }
