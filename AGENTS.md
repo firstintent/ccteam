@@ -3,6 +3,7 @@
 > 本仓库实现导引的**权威文件 = `AGENTS.md`**;`CLAUDE.md` 是指向它的软链(symlink)。
 > 面向**下一次接手 ccteam 实现的 agent session**:Claude Code 读 `CLAUDE.md`(→ 本文)、Codex 读 `AGENTS.md`(本文)—— 文中 Claude Code 特定机制,Codex 自行映射到等价工作流。每次起手必读。
 > 历史里程碑 + 升级 migration 见 `docs-local/versions/v0-X-Y/README.md`(**gitignored 本机文档区** —— 版本归档 + 研究笔记已从 `docs/` 迁出、不入库),本文描述**当前状态 + 红线 + 纪律**。
+> **治理脊柱 = `.loop/`**(state 焦点 / backlog 队列 / history 蒸馏史 / verify 门禁地图 + 写权守卫);**冷启动三读 = 本文 → `.loop/state.md` → `.loop/backlog.md`**,代码按卡面坐标按需读。
 
 ---
 
@@ -21,7 +22,7 @@
 - **统一 chat-shell web UI + 逐字节保真终端**:两套分叉 SPA 布局收敛成**一个** chat 壳(`ChatConsole`;删旧 operator UI:Dashboard/ProjectDetail/SessionDetail/SessionsList/Teams*/WorkflowView + 侧栏/顶栏);底部全局导航 = **插件市场 / Status / 主机 / Settings**(v0.8.18 加主机页 + 界面语言中/英 + 头像个人设置),per-session Chat|终端 tab,顶栏 cost pill,轻量 Status view(backed by `GET /api/v1/status`);Roles 页被插件市场浏览器取代。终端:rmux backend 改流**裸 pane 字节**(`output_stream()`/`PaneOutputChunk::Bytes`,`capture` 排 `Oldest` backlog)→ 默认 rmux 即逐字节保真(修 v0.8.8 连上空白 + 换行歪);rmux pin **0.5**(byte API 自 0.3.1 起就有 → 保真**不依赖** 0.5;升 0.5 取 tmux-compat / window APIs,call-site 0.3→0.5 byte-identical),tmux backend 不变。
 - **progress 写入权威**:`harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export。
 
-> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)+ 真实 WS/HTTP smoke;不退 baseline。起手/恢复先读本文 §一 + `docs/dev/tech-design.md`(架构 SoT)。
+> 验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`)+ 真实 WS/HTTP smoke;不退 baseline。起手/恢复走**冷启动三读**(§二);改架构前再读 `docs/dev/tech-design.md`(架构 SoT)。
 
 ---
 
@@ -30,11 +31,11 @@
 | 项 | 值 |
 |---|---|
 | Workspace version | `0.9.2` |
-| 测试 baseline | 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1408/0**(v0.9.2 净增);全量口径 live-daemon 宿主有 env-flake 族(`inbound_wiring daemon_*`/`daemon_test register_*`/`im_progress_*`/`codex_streaming_delta`/`resume_*`/`ws_*`/`hook_*` + gateway 共享 `/tmp/alpha` 并行污染 —— 干净环境全绿,起手重记);`ccteam-web` 全量 310/0;vitest 376(SPA);Playwright 7。干净无 live daemon 宿主应全绿 |
+| 测试 baseline | **口径**:确定性 `cargo test --workspace --exclude ccteam-web --lib` + `ccteam-web` 全量 + vitest + Playwright;**当前数字与 env-flake 族 = `.loop/state.md` + `.loop/verify/README.md`**(基线只增不减) |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.9.0-0.9.2 = Agent2Agent 底座已落 dev(未 tag、未部署)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。v0.9.0 W1-W4(principal 调用面 / 委派语义+引擎中立化 / 反向连接跨机 / 团队可视化)+ v0.9.1(MCP 单前缀 + 主会话 fallback)+ **v0.9.2(owner 六点:项目↔主机绑定(host 归 project、spawn 去 host 参、`project_init` op、import)· live 容量 50 LRU 挤停 · 团队拓扑树替换泳道 SVG · 会话 vendor chips · A2A 返回限幅防父会话膨胀 · 新建项目自由选主机)** 详见 §〇/§三/§四 + `docs-local/versions/v0-9-{0,1,2}/`。**剩 W5**:三场景真机 smoke + README/usage 重写(hub 示例配方已落:`cct-codex`/`cct-grok` skill + `team-brain` agent 进 ccteam-hub,grok 跨模型 review 过;另落 v0.9.3 四 vendor 全局 MCP 对称注册 + `/mcp` 出 auth_layer 修父边 + spawn 响应 `caller` 字段);backlog P1 = codex turn 粒度折叠(叙述消息≠独立 turn)+ collect 游标去重。**tag/部署 HELD。逐版改动史 = `git log` + `docs-local/versions/`(gitignored);协议一律以代码为准。** |
+| 当前在做 | **v0.9.x A2A 线收尾(未 tag、未部署)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
 
-> 主分支 HEAD 以 `git rev-parse origin/dev` 为准;历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
+> 主分支 HEAD 以 `git rev-parse origin/main` 为准(开发直落 `main`;`dev` 分支已滞后停用);历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 
@@ -46,9 +47,9 @@
 
 详 `docs/dev/tech-design.md`。
 
-## 二、必读文档(全局文档收敛到 4 份)
+## 二、必读文档(tier-1 收敛 4 份 + `.loop/` 治理脊柱)
 
-> **代码是唯一 SoT**。文档只留代码里没有的「为什么 / 架构论证 / 怎么用」;协议细节(CLI / JSON / event / 路由)一律以代码为准 —— 见 `tech-design.md` 末尾「协议 → 代码位置」指针表。
+> **代码是唯一 SoT**。文档只留代码里没有的「为什么 / 架构论证 / 怎么用」;协议细节(CLI / JSON / event / 路由)一律以代码为准 —— 见 `tech-design.md` 末尾「协议 → 代码位置」指针表。**同一事实只有一个家**,其余位置只放指针;内容住错家 = 搬家优先于续写。
 
 | 文档 | 角色 | 何时读 |
 |---|---|---|
@@ -56,10 +57,14 @@
 | `docs/dev/requirements.md` | 原始需求(核心痛点 = 验收基准) | 验收基准 / PR 痛点映射 |
 | `docs/usage.md` | 用户命令手册(install→start→use→运维,纯命令) | 看怎么用 |
 | `docs/orchestration.md`(+`-cn`) | 深度用户编排指南(session_* 工具面 + 身份模型 + 多机语义 + 最佳实践,owner 钦点独立成文) | 写/改 A2A 编排面 |
+| `.loop/state.md` | 当前焦点 + 基线数字 + **人工门登记** + 未固化教训(每版回填,dev 只读) | 每次起手(三读之二) |
+| `.loop/backlog.md` | **任务队列唯一来源**(文件头 = 取活/回写协议,卡面自包含) | 取活/排卡(三读之三) |
+| `.loop/verify/README.md` | 门禁地图:改动面→Makefile target + 判据 + 运行纪律;`writeback.sh` = 写权守卫(dev 收口必跑) | 收口前 |
+| `.loop/history.md` | 每版一行蒸馏史(repo 内唯一版本时间轴) | 找版本脉络 |
 
 历史版本归档 `docs-local/versions/v0-X-Y/README.md`(冻结、按需)+ 探索研究 `docs-local/research/`(不更新、按需)—— **均在 gitignored `docs-local/`,不入库不推送**(owner 决策:版本档案 + 研究笔记本机留存,仓库瘦身);进行中的版本 PRD/dev-plan 也落 `docs-local/versions/v0-x-y/`。这些都**不**自动进上下文。
 
-**起手 30 秒**:`git log -1` 看 HEAD → `cargo test --workspace --exclude ccteam-web --no-fail-fast 2>&1 | awk '/^test result/{p+=$4;f+=$6}END{print p,f}'` 记基线 → 读用户诉求 → 干。
+**起手 30 秒(冷启动三读)**:本文(harness 自动加载)→ `.loop/state.md`(焦点/基线/人工门)→ `.loop/backlog.md` 文件头 + 所取卡 → 干。代码按卡面坐标按需读,**不做全仓扫描**;基线重记只在收口时(门禁地图 `.loop/verify/README.md`)。
 
 **对照参考**(`references/` gitignore 不入库):`references/claude-code/` + `references/codex/codex-rs/` + `references/opencode/`(OpenCode ACP)+ `references/OpenHands/`(同层竞品)+ `references/rmux/`。HarnessAdapter / 协议适配时翻;**不**当 ccteam 依赖。
 
@@ -121,19 +126,29 @@
 5. **优先编辑现有文件,不轻易新建**
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning
 7. **版本发布同步文档(ship gate)** — 每次 `vX.Y.Z` ship 必须同步:
-   - **内部 SoT**:CLAUDE.md §一(只更 version + baseline 数 + 当前标题 —— **不写逐版 changelog**,那进 `git log` + `docs-local/versions/`)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
+   - **内部 SoT**:本文 §一(只更 version 行 + 一行 headline)+ `.loop/state.md`(焦点/基线回填)+ `.loop/history.md`(一行蒸馏)+ backlog 完成卡蒸馏移出(**队列只持现势**)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
    - **用户面**:root `README.md`(英文,不含版本进展)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
 
+### 角色与写权(治理骨架;守卫 = `.loop/verify/writeback.sh`)
+
+| 角色 | 写权 |
+|---|---|
+| **owner**(人) | 下令 + 签核人工门(tag·部署·红线·降基线·对外契约,登记 `.loop/state.md`);不直接写仓 |
+| **规划(控制)会话** | **治理面唯一作者**:本文 + `docs/` + `.loop/`(卡片窄写回域除外)+ `.github/`;排卡、批 review、教训蒸馏 |
+| **dev 会话**(任意 harness,可多个) | 代码面(crates / SPA / tests / README.md)+ backlog **窄写回**(只改所取卡状态行 + 追加验证/偏差段) |
+
+执法三层:**声明**(本节 + backlog 文件头)→ **机械**(`writeback.sh <开工 base sha>`,dev 收口必跑;`--selftest` 证守卫自身有牙)→ **复核**(规划批 review 兜守卫盲区)。DoD 要求越出卡面授权 = **停手**,卡面偏差申报(附最窄解锁提议)等裁决;裁决只授权提议字面,不隐性扩 scope。
+
 ### 多 session 并行编辑同一仓库
 
-主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/ccteam-<name> origin/dev` 起独立工作树,完事 `git worktree remove`。**主仓不变 dirty**。跨 session 见主仓 dirty:`git stash push -m "<owner> WIP"` 再切;**别盲目 `git checkout -- .`**。
+主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/ccteam-<name> origin/main` 起独立工作树,完事 `git worktree remove`。**并行的唯一合法形态 = 不同冲突域**(backlog 卡面字段判定,同域串行)+ 一 worktree 一写者。**主仓不变 dirty**。跨 session 见主仓 dirty:`git stash push -m "<owner> WIP"` 再切;**别盲目 `git checkout -- .`**。
 
-### 版本开发流程
+### 版本开发流程(版本化迭代不变;`.loop/` 只是承载)
 
-- **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review 后动代码;owner `/goal` 直驱的小/中改可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(briefing 含 PRD section + 验收条目)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ CLAUDE.md §一 + docs-local/versions 回填。
-- **推送 = direct-on-dev no-PR 是常态**(`gh` 不能开 firstintent PR,见 §六 → SSH push `<branch>:dev`);PR 仅当远端支持时。**tag + 部署 HELD,等 owner 显式「部署」**(push 到 dev 不等于发布)。
+- **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review;拍板后**规划把 PRD 拆成卡进 `.loop/backlog.md`**(冲突域/规格/DoD/建议入口),wave = 一组卡。owner `/goal` 直驱的小/中改 = 独立卡可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(**briefing 自包含**:规格/坐标/验收直接写进 brief)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ §五.7 ship gate 回填。
+- **推送 = direct-on-main no-PR 是常态**(`gh` 不能开 firstintent PR,见 §六 → SSH push);PR 仅当远端支持时。**tag + 部署 HELD,等 owner 显式「部署」**(push 到 main 不等于发布)。
 - **wave 范式**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 commit;subagent briefing 必含 wave acceptance gate + 上 wave handoff link。**红线:每 wave baseline ≥ 上 wave**(test pass count + clippy 0 warnings),否则不推。架构级大改可把 tier-1 文档**全量重写**放最后一 wave(docs 反映已落地代码)。
 
 ## 六、易踩的坑(实战累积)

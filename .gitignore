@@ -43,6 +43,14 @@ nohup.out
 # Local-only env file — never commit secrets.
 .env
 
+# Local skill installs (mattpocock/skills etc.) — prompt-type plugin content
+# never enters the ccteam repo (AGENTS.md §三红线).
+.agents/
+skills-lock.json
+
+# Machine-local notes (machine profiles / calibration numbers never enter the repo)
+*.local.md
+
 # Smoke-run artifact: a CWD-rooted `CCTEAM_HOME=<repo>` smoke makes
 # ccteam_core::config::config_path resolve to <repo>/config.yaml. Repo root
 # is never the real config home (runtime config = ~/.ccteam/config.yaml).
