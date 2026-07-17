@@ -1,12 +1,12 @@
-// v0.8.24 Track A — the 4-way vendor registry driving the composer's
+// v0.8.24 Track A — the 5-way vendor registry driving the composer's
 // model+effort+protocol menu (prototype `VENDORS`), extended with opencode
-// (the prototype predates the 4th vendor; owner call: never collapse opencode
-// into codex/grok colors).
+// (the prototype predates the 4th vendor) and kimi (the 5th; owner call:
+// never collapse a vendor into another vendor's colors).
 //
 // Dependency-free + pure so the menu structure / gating is unit-testable
 // without the React import chain.
 
-export type VendorId = "claude" | "codex" | "grok" | "opencode";
+export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi";
 
 /** One selectable wire protocol for a vendor. `wire` is the value POSTed to
  *  `POST /projects/{slug}/sessions` (`protocol` field); `label` is what the
@@ -75,6 +75,15 @@ export const VENDORS: VendorSpec[] = [
     models: [MODEL_DEFAULT],
     protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
+  {
+    id: "kimi",
+    label: "Kimi",
+    // Kimi's model catalog arrives live via ACP `availableModels` (the
+    // in-session `/model` picker); `kimi acp` takes no model argv — offer
+    // only the honest default.
+    models: [MODEL_DEFAULT],
+    protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
+  },
 ];
 
 export function vendorSpec(id: string): VendorSpec {
@@ -95,7 +104,9 @@ export type EffortKey = (typeof EFFORT_KEYS)[number];
  *  - grok: never (its `--reasoning-effort` value set is undocumented — the
  *    backend drops it too);
  *  - opencode: never from the UI (effort values are per-model "variants" we
- *    cannot enumerate; the adapter seam exists for API callers). */
+ *    cannot enumerate; the adapter seam exists for API callers);
+ *  - kimi: never (thinking axis not wired this version — the backend drops
+ *    it too). */
 export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): string | null {
   if (draft.effortKey === "effDefault") return null;
   const claude: Record<string, string> = {
@@ -158,7 +169,9 @@ export function wireProtocol(draft: Pick<ComposerDraft, "vendor" | "protocol">):
  *  this used to drive a post-spawn `/model` control turn; it now rides
  *  `POST .../sessions` directly and the vendor-native spawn seam applies it:
  *  claude `--model`, codex turn/start override, grok `-m`, opencode
- *  `set_config_option`). Opencode stays null — it self-selects. */
+ *  `set_config_option`, kimi `session/set_model`). Opencode stays null — it
+ *  self-selects; kimi's menu is default-only (its catalog is live via ACP),
+ *  so the includes-check below already holds it to null. */
 export function modelSwitchFor(draft: Pick<ComposerDraft, "vendor" | "model">): string | null {
   const spec = vendorSpec(draft.vendor);
   if (spec.id === "opencode") return null; // opencode self-selects

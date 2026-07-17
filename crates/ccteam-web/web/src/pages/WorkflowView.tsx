@@ -35,7 +35,7 @@ const TABS: { id: TabId; label: string; labelKey?: string; subKey: string; icon:
   { id: "compare", label: "Compare", subKey: "compareSub", icon: <GitCompareArrows /> },
 ];
 
-const COMPARE_VENDORS = ["claude", "codex", "grok", "opencode"] as const;
+const COMPARE_VENDORS = ["claude", "codex", "grok", "opencode", "kimi"] as const;
 
 function isTab(v: string | undefined): v is TabId {
   return !!v && TABS.some((t) => t.id === v);

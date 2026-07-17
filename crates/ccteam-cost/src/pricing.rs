@@ -72,6 +72,8 @@ pub enum Vendor {
     Grok,
     /// OpenCode ACP — no static price table; cost is vendor-reported USD only.
     Opencode,
+    /// Kimi Code ACP — ACP `session/update` carries no usage/cost; always "—".
+    Kimi,
 }
 
 impl Vendor {
@@ -82,6 +84,7 @@ impl Vendor {
         Vendor::Codex,
         Vendor::Grok,
         Vendor::Opencode,
+        Vendor::Kimi,
     ];
 }
 
@@ -171,6 +174,8 @@ fn table_for(vendor: Vendor) -> Option<&'static PricingTable> {
         })),
         // OpenCode: never use a static table; cost is reported_cost_usd only.
         Vendor::Opencode => None,
+        // Kimi: ACP `session/update` carries no usage/cost at all — no table.
+        Vendor::Kimi => None,
     }
 }
 
@@ -182,8 +187,8 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
         if c > 0.0 {
             return Some(c);
         }
-        // Reported zero: honest "—" for OpenCode; other vendors may still estimate.
-        if matches!(vendor, Vendor::Opencode) {
+        // Reported zero: honest "—" for OpenCode/Kimi; other vendors may still estimate.
+        if matches!(vendor, Vendor::Opencode | Vendor::Kimi) {
             return None;
         }
     }
@@ -201,7 +206,7 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
 /// suffix (so `claude-opus-4-8[1m]` resolves to `claude-opus-4-8`).
 /// OpenCode always returns `None` (no table).
 pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
-    if matches!(vendor, Vendor::Opencode) {
+    if matches!(vendor, Vendor::Opencode | Vendor::Kimi) {
         return None;
     }
     let prices = resolve(vendor, model)?;

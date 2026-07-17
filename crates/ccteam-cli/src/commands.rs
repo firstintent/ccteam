@@ -2266,16 +2266,18 @@ fn render_install_mcp_report() -> Result<String> {
     // MCP installer for ALL vendors (v0.9.3 symmetry — any vendor's main
     // session can orchestrate): Claude (`~/.claude.json`), Codex
     // (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode
-    // (`~/.config/opencode/opencode.json`).
+    // (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`).
     let claude_path = crate::mcp_serve::install_mcp()?;
     let codex_path = crate::mcp_serve::install_codex_mcp()?;
     let grok_path = crate::mcp_serve::install_grok_mcp()?;
     let opencode_path = crate::mcp_serve::install_opencode_mcp()?;
+    let kimi_path = crate::mcp_serve::install_kimi_mcp()?;
     Ok(render_install_mcp_body(
         &claude_path,
         &codex_path,
         &grok_path,
         &opencode_path,
+        &kimi_path,
     ))
 }
 
@@ -2290,9 +2292,11 @@ fn render_install_mcp_body(
     codex_path: &std::path::Path,
     grok_path: &std::path::Path,
     opencode_path: &std::path::Path,
+    kimi_path: &std::path::Path,
 ) -> String {
-    let mut out =
-        String::from("ccteam config: register MCP server (Claude + Codex + Grok + OpenCode)\n\n");
+    let mut out = String::from(
+        "ccteam config: register MCP server (Claude + Codex + Grok + OpenCode + Kimi)\n\n",
+    );
     out.push_str(&format!(
         "  registered ccteam MCP server for Claude   in {}\n",
         claude_path.display()
@@ -2308,6 +2312,10 @@ fn render_install_mcp_body(
     out.push_str(&format!(
         "  registered ccteam MCP server for OpenCode in {}\n",
         opencode_path.display()
+    ));
+    out.push_str(&format!(
+        "  registered ccteam MCP server for Kimi     in {}\n",
+        kimi_path.display()
     ));
     let total_tools = run_verify_mcp().total_tools;
     out.push_str(&format!("  tools surface : {total_tools}\n"));
@@ -2816,6 +2824,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                     "codex" => CostVendor::Codex,
                     "grok" => CostVendor::Grok,
                     "opencode" => CostVendor::Opencode,
+                    "kimi" => CostVendor::Kimi,
                     _ => continue, // unknown vendor — skip (forward-compat)
                 };
                 *counts.agent_done.entry(key).or_insert(0) += 1;
@@ -2834,6 +2843,7 @@ pub fn compute_cost_orphan(paths: &CcteamPaths) -> (CostOrphanCounts, Vec<String
                 ccteam_core::Vendor::Codex => CostVendor::Codex,
                 ccteam_core::Vendor::Grok => CostVendor::Grok,
                 ccteam_core::Vendor::Opencode => CostVendor::Opencode,
+                ccteam_core::Vendor::Kimi => CostVendor::Kimi,
             };
             *counts.ledger_rows.entry(key).or_insert(0) += 1;
         }
@@ -2879,6 +2889,7 @@ pub enum CostVendor {
     Codex,
     Grok,
     Opencode,
+    Kimi,
 }
 
 impl CostVendor {
@@ -2889,6 +2900,7 @@ impl CostVendor {
         CostVendor::Codex,
         CostVendor::Grok,
         CostVendor::Opencode,
+        CostVendor::Kimi,
     ];
 
     fn label(self) -> &'static str {
@@ -2897,6 +2909,7 @@ impl CostVendor {
             CostVendor::Codex => "codex",
             CostVendor::Grok => "grok",
             CostVendor::Opencode => "opencode",
+            CostVendor::Kimi => "kimi",
         }
     }
 }
@@ -4558,9 +4571,10 @@ pub fn run_admin_register_bot(
         "codex" => AgentVendor::Codex,
         "grok" => AgentVendor::Grok,
         "opencode" => AgentVendor::Opencode,
+        "kimi" => AgentVendor::Kimi,
         other => {
             return Err(anyhow::anyhow!(
-                "invalid vendor `{other}`: expected one of `claude`, `codex`, `grok`"
+                "invalid vendor `{other}`: expected one of `claude`, `codex`, `grok`, `opencode`, `kimi`"
             ))
         }
     };
@@ -6989,6 +7003,7 @@ mod tests {
             std::path::Path::new("/tmp/fake-codex/config.toml"),
             std::path::Path::new("/tmp/fake-grok/config.toml"),
             std::path::Path::new("/tmp/fake-opencode/opencode.json"),
+            std::path::Path::new("/tmp/fake-kimi/mcp.json"),
         );
         assert!(
             report.contains(&format!("tools surface : {total}")),
@@ -6999,13 +7014,14 @@ mod tests {
             !report.contains("interfaces §12.2"),
             "stale section tag must be dropped: {report}",
         );
-        // All four vendor targets must be named in the report body
-        // (v0.9.3 symmetry: any vendor's main session can orchestrate).
+        // All five vendor targets must be named in the report body
+        // (vendor symmetry: any vendor's main session can orchestrate).
         for target in [
             "/tmp/fake-claude.json",
             "/tmp/fake-codex/config.toml",
             "/tmp/fake-grok/config.toml",
             "/tmp/fake-opencode/opencode.json",
+            "/tmp/fake-kimi/mcp.json",
         ] {
             assert!(
                 report.contains(target),

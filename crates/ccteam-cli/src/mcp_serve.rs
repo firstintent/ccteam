@@ -406,6 +406,20 @@ pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
     Ok(opencode_json)
 }
 
+/// Production path for Kimi Code MCP install (vendor symmetry): the global
+/// `$KIMI_CODE_HOME/mcp.json` entry authenticates with the admin web token so
+/// a plain `kimi` main session can orchestrate; ccteam-managed kimi sessions
+/// keep their ACP-injected per-session principal (same-name dedup posture as
+/// grok/opencode).
+pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
+    let mcp_json = ccteam_core::mcp_register::resolve_kimi_config_path()?;
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &admin_token)?;
+    Ok(mcp_json)
+}
+
 /// Daemon-start self-heal: if the global Codex `config.toml` still carries a
 /// legacy stdio `[mcp_servers.ccteam]` entry (written by a pre-HTTP ccteam),
 /// rewrite it to the current HTTP form so per-thread session overrides don't

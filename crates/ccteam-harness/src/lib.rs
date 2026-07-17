@@ -54,7 +54,7 @@ pub use adapter::{
     SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
     ThreadItemDetails, ThreadStatus, TurnId, TurnInput, UnifiedTokenUsage, CCTEAM_HOME_ENV,
     CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, OPENCODE_BIN_ENV,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -73,6 +73,7 @@ pub use execution::host_channel::{
     EXEC_DIALBACK_TIMEOUT, HOST_CHANNEL_SUBPROTOCOL, IDLE_TIMEOUT, KEEPALIVE_PERIOD,
     PROJECT_INIT_TIMEOUT, REPORT_PERIOD,
 };
+pub use execution::kimi_acp::{KimiAcpAdapter, KIMI_ACP_ADAPTER_NAME};
 pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
 pub use execution::remote_exec::{
     connect as remote_exec_connect, ExecExit, ExecFile, ExecSpec, ExecStarted, RemoteExecTarget,

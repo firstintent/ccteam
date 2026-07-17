@@ -148,6 +148,7 @@ pub fn vendor_key(vendor: AgentVendor) -> &'static str {
         AgentVendor::Codex => "codex",
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
+        AgentVendor::Kimi => "kimi",
     }
 }
 
@@ -157,6 +158,7 @@ fn vendor_to_cost(vendor: AgentVendor) -> ccteam_cost::Vendor {
         AgentVendor::Codex => ccteam_cost::Vendor::Codex,
         AgentVendor::Grok => ccteam_cost::Vendor::Grok,
         AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
+        AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
     }
 }
 
@@ -336,8 +338,8 @@ pub fn project_vendor_budget_cap(
 }
 
 /// True when the vendor's trailing-24h project cost has reached its configured
-/// cap. No cap configured → `false` (never gates). grok/opencode have no price
-/// table (cost aggregates to 0) so the gate is naturally inert for them.
+/// cap. No cap configured → `false` (never gates). grok/opencode/kimi have no
+/// price table (cost aggregates to 0) so the gate is naturally inert for them.
 pub fn budget_exceeded(paths: &CcteamPaths, slug: &str, vendor: AgentVendor) -> bool {
     match project_vendor_budget_cap(paths, slug, vendor) {
         Some(cap) => project_vendor_cost_24h(paths, slug, vendor) >= cap,

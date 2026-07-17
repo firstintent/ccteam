@@ -348,6 +348,7 @@ fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
         "codex" => ccteam_cost::Vendor::Codex,
         "grok" => ccteam_cost::Vendor::Grok,
         "opencode" => ccteam_cost::Vendor::Opencode,
+        "kimi" => ccteam_cost::Vendor::Kimi,
         _ => ccteam_cost::Vendor::Claude,
     }
 }

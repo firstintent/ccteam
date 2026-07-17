@@ -1,4 +1,4 @@
-// v0.8.24 Track A — the 4-way vendor registry driving the composer's
+// v0.8.24 Track A — the 5-way vendor registry driving the composer's
 // model+effort+protocol menu (prototype VENDORS + the opencode extension).
 
 import { describe, expect, it } from "vitest";
@@ -18,9 +18,9 @@ import {
   VENDORS,
 } from "./vendors";
 
-describe("VENDORS registry (4-way)", () => {
-  it("lists exactly claude / codex / grok / opencode — opencode never collapses", () => {
-    expect(VENDORS.map((v) => v.id)).toEqual(["claude", "codex", "grok", "opencode"]);
+describe("VENDORS registry (5-way)", () => {
+  it("lists exactly claude / codex / grok / opencode / kimi — never collapses", () => {
+    expect(VENDORS.map((v) => v.id)).toEqual(["claude", "codex", "grok", "opencode", "kimi"]);
   });
 
   it("claude offers stream-json (default) + terminal (admin-only, frozen)", () => {
@@ -29,12 +29,13 @@ describe("VENDORS registry (4-way)", () => {
     expect(claude.protocols[1]?.adminOnly).toBe(true);
   });
 
-  it("codex = app-server (wire stream-json); grok/opencode = acp", () => {
+  it("codex = app-server (wire stream-json); grok/opencode/kimi = acp", () => {
     expect(vendorSpec("codex").protocols.map((p) => `${p.id}:${p.wire}`)).toEqual([
       "app-server:stream-json",
     ]);
     expect(vendorSpec("grok").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("opencode").protocols.map((p) => p.wire)).toEqual(["acp"]);
+    expect(vendorSpec("kimi").protocols.map((p) => p.wire)).toEqual(["acp"]);
   });
 
   it("falls back to claude for an unknown vendor", () => {
@@ -87,8 +88,8 @@ describe("modelSwitchFor (lazy-create /model follow-up)", () => {
     expect(vendorSpec("claude").models.slice(1)).toEqual(["fable", "opus", "sonnet", "haiku"]);
   });
 
-  it("codex/grok/opencode offer only the honest vendor default", () => {
-    for (const vendor of ["codex", "grok", "opencode"] as const) {
+  it("codex/grok/opencode/kimi offer only the honest vendor default", () => {
+    for (const vendor of ["codex", "grok", "opencode", "kimi"] as const) {
       expect(vendorSpec(vendor).models).toHaveLength(1);
       expect(modelSwitchFor({ vendor, model: vendorSpec(vendor).models[0]! })).toBeNull();
     }
@@ -105,7 +106,7 @@ describe("modelSwitchFor (lazy-create /model follow-up)", () => {
 
 describe("wireEffort (A-U3 create-form effort field)", () => {
   it("effDefault wires nothing for every vendor (vendor default holds)", () => {
-    for (const vendor of ["claude", "codex", "grok", "opencode"] as const) {
+    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi"] as const) {
       expect(wireEffort({ vendor, effortKey: "effDefault" })).toBeNull();
     }
   });
@@ -122,9 +123,10 @@ describe("wireEffort (A-U3 create-form effort field)", () => {
     expect(wireEffort({ vendor: "codex", effortKey: "effLow" })).toBe("low");
   });
 
-  it("never wires grok/opencode effort (undocumented / per-model value sets)", () => {
+  it("never wires grok/opencode/kimi effort (undocumented / per-model / unwired value sets)", () => {
     expect(wireEffort({ vendor: "grok", effortKey: "effMax" })).toBeNull();
     expect(wireEffort({ vendor: "opencode", effortKey: "effHigh" })).toBeNull();
+    expect(wireEffort({ vendor: "kimi", effortKey: "effHigh" })).toBeNull();
   });
 
   it("defaultDraft starts at effDefault (nothing wired until picked)", () => {
@@ -148,11 +150,13 @@ describe("normalizeDraft", () => {
 });
 
 describe("dot / chip classes", () => {
-  it("emits prototype vendor classes for all four vendors", () => {
+  it("emits prototype vendor classes for all five vendors", () => {
     expect(vendorDotClass("claude")).toBe("dot claude");
     expect(vendorDotClass("opencode")).toBe("dot opencode");
+    expect(vendorDotClass("kimi")).toBe("dot kimi");
     expect(vendorChipClass("grok")).toBe("chip grok");
     expect(vendorChipClass("codex")).toBe("chip codex");
+    expect(vendorChipClass("kimi")).toBe("chip kimi");
   });
 
   it("maps live status to prototype dot states", () => {

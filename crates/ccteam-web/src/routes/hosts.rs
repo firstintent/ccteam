@@ -29,7 +29,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, GROK_BIN_ENV, OPENCODE_BIN_ENV};
+use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -94,6 +94,15 @@ pub(crate) const PROBE_SPECS: &[ProbeSpec] = &[
         bin_env: OPENCODE_BIN_ENV,
         default_bin: "opencode",
         mcp_registrable: false,
+    },
+    ProbeSpec {
+        vendor: "kimi",
+        harness_id: "kimi",
+        bin_env: KIMI_BIN_ENV,
+        default_bin: "kimi",
+        // Kimi has a config-file MCP seam: `$KIMI_CODE_HOME/mcp.json`
+        // (`mcpServers.ccteam` HTTP entry) — registrable from the host page.
+        mcp_registrable: true,
     },
 ];
 
@@ -253,6 +262,9 @@ fn mcp_registered(vendor: &str) -> bool {
         // Grok MCP registration not wired in MVP (L18: best-effort, non-blocking).
         "grok" => false,
         "opencode" => false,
+        "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
+            .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -637,6 +649,12 @@ fn register_mcp_blocking(
         let path = ccteam_core::mcp_register::resolve_opencode_config_path()?;
         ccteam_core::mcp_register::install_opencode_mcp_into(&path, mcp_http_url, &admin_token)?;
         written.insert("opencode".to_string(), path.display().to_string());
+    }
+    if do_vendor("kimi") {
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
+        let path = ccteam_core::mcp_register::resolve_kimi_config_path()?;
+        ccteam_core::mcp_register::install_kimi_mcp_into(&path, mcp_http_url, &admin_token)?;
+        written.insert("kimi".to_string(), path.display().to_string());
     }
     Ok(written)
 }

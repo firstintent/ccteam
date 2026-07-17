@@ -124,7 +124,10 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
         "codex" => Ok(AgentVendor::Codex),
         "grok" => Ok(AgentVendor::Grok),
         "opencode" => Ok(AgentVendor::Opencode),
-        other => Err(format!("unknown vendor: {other} (expected claude|codex)")),
+        "kimi" => Ok(AgentVendor::Kimi),
+        other => Err(format!(
+            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi)"
+        )),
     }
 }
 
@@ -267,7 +270,8 @@ pub struct CreateSessionForm {
     /// v0.8.24 A-U3 — explicit model id for the new session; overrides the
     /// role's `model:` frontmatter. Omitted/empty → vendor default. Wired
     /// vendor-natively: claude `--model`, codex `turn/start` override,
-    /// grok `-m`, opencode `session/set_config_option` (best-effort).
+    /// grok `-m`, opencode `session/set_config_option`, kimi
+    /// `session/set_model` (both best-effort).
     #[serde(default)]
     pub model: Option<String>,
     /// v0.8.24 A-U3 — explicit reasoning-effort token. Vendor value sets:
@@ -275,7 +279,8 @@ pub struct CreateSessionForm {
     /// `none|minimal|low|medium|high|xhigh`; opencode = a model variant
     /// (best-effort). Grok is NOT wired (its `--reasoning-effort` value set
     /// is undocumented; an invalid value would fail the spawn) — the field
-    /// is ignored for grok.
+    /// is ignored for grok. Kimi's effort axis (thinking) is likewise NOT
+    /// wired — the field is ignored for kimi.
     #[serde(default)]
     pub effort: Option<String>,
 }
@@ -283,7 +288,8 @@ pub struct CreateSessionForm {
 /// v0.8.24 A-U3 — map the create form's model/effort into a [`SpawnTuning`].
 /// Grok effort is dropped (see [`CreateSessionForm::effort`]): the flag
 /// exists but its value set is undocumented, so passing one through could
-/// fail the spawn; model still rides `-m`. Empty strings normalize to `None`
+/// fail the spawn; model still rides `-m`. Kimi effort is likewise dropped
+/// (thinking axis not wired this version). Empty strings normalize to `None`
 /// downstream (`SpawnTuning::normalized`).
 fn spawn_tuning_from_form(
     vendor: AgentVendor,
@@ -292,7 +298,7 @@ fn spawn_tuning_from_form(
 ) -> ccteam_im::gateway::SpawnTuning {
     ccteam_im::gateway::SpawnTuning {
         model,
-        effort: if vendor == AgentVendor::Grok {
+        effort: if matches!(vendor, AgentVendor::Grok | AgentVendor::Kimi) {
             None
         } else {
             effort
@@ -366,7 +372,10 @@ pub(crate) async fn handle_create_session(
         Ok(p) => p,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
-    let protocol = if vendor == AgentVendor::Grok || vendor == AgentVendor::Opencode {
+    let protocol = if matches!(
+        vendor,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
+    ) {
         SessionProtocol::Acp
     } else {
         protocol
@@ -2351,8 +2360,15 @@ mod tests {
         );
         assert_eq!(t.model.as_deref(), Some("grok-code"), "grok keeps -m");
         assert_eq!(t.effort, None, "grok effort must be dropped");
-
         let t = spawn_tuning_from_form(AgentVendor::Opencode, None, Some("high".into()));
         assert_eq!(t.effort.as_deref(), Some("high"));
+
+        let t = spawn_tuning_from_form(
+            AgentVendor::Kimi,
+            Some("kimi-k2".into()),
+            Some("high".into()),
+        );
+        assert_eq!(t.model.as_deref(), Some("kimi-k2"), "kimi keeps set_model");
+        assert_eq!(t.effort, None, "kimi effort must be dropped");
     }
 }

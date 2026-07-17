@@ -1,6 +1,6 @@
 # ccteam User Manual
 
-**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build / OpenCode on your own machine from the web console, Telegram, or Lark/Feishu.**
+**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build / OpenCode / Kimi Code on your own machine from the web console, Telegram, or Lark/Feishu.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
@@ -29,7 +29,7 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ### 1. Install
 
-ccteam calls the Claude Code, Codex, and Grok Build CLIs already installed and logged in on your machine. It does not bundle them.
+ccteam calls the Claude Code, Codex, Grok Build, OpenCode, and Kimi Code CLIs already installed and logged in on your machine. It does not bundle them.
 
 ```bash
 # Recommended: build from source and install as a service.
@@ -44,6 +44,8 @@ ccteam --version
 claude --version   # required; log in if prompted
 codex --version    # optional; only needed for Codex sessions
 grok --version     # optional; only needed for Grok Build sessions
+opencode --version # optional; only needed for OpenCode sessions
+kimi --version     # optional; only needed for Kimi Code sessions (`kimi login` first)
 ```
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
@@ -70,7 +72,7 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (One-Time)
 
-Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **all four vendors** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The Hosts page also reports which vendors are installed, their versions, and readiness.
+Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **all five vendors** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The Hosts page also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -78,13 +80,13 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok and OpenCode), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
-- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex and Grok are chat-only (Grok runs over ACP, with no terminal mirror).
+- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
 
-> Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok chat flow by default; advanced controls will open up as they stabilize.
+> Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
@@ -111,7 +113,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode uses only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table).
+- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode uses only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **Kimi always shows "—"** (its ACP wire carries no usage/cost).
 
 ### Standard Resource API
 
@@ -176,10 +178,10 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 # Sessions
 /new [vendor] [role] [hitl]  Create a session and return handle s<N>.
-                             vendor = claude (default) | codex | grok | opencode
+                             vendor = claude (default) | codex | grok | opencode | kimi
 /compare <question>          Fan the same question across available vendors
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
-                             grok = roleless ACP session (role/hitl args ignored)
+                             grok/opencode/kimi = roleless ACP session (role arg ignored)
                              add hitl = approve tools in IM; default skip runs directly
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
@@ -211,7 +213,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 ### Human-in-the-Loop (HITL)
 
-Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode. Grok sessions currently run in `skip` (auto-approve) only; IM approval for Grok is planned but not yet wired.
+Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode. Grok and Kimi sessions currently run in `skip` (auto-approve) only; IM approval for them is planned but not yet wired.
 
 ### Let Any Session Dispatch Work
 

@@ -104,10 +104,12 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let codex = check_codex_binary();
     let grok = check_grok_binary();
     let opencode = check_opencode_binary();
+    let kimi = check_kimi_binary();
     let codex_present = codex.status == CheckStatus::Pass;
     let tmux = check_tmux();
     let mcp_claude = check_mcp_claude();
     let mcp_codex = check_mcp_codex(codex_present);
+    let mcp_kimi = check_mcp_kimi();
     let daemon = check_daemon(paths);
     let pricing = check_pricing();
     let home = check_home_layout(paths);
@@ -115,15 +117,18 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let auth_codex = check_vendor_auth_codex();
     let auth_grok = check_vendor_auth_grok();
     let auth_opencode = check_vendor_auth_opencode();
+    let auth_kimi = check_vendor_auth_kimi();
 
     let checks = [
         claude,
         codex,
         grok,
         opencode,
+        kimi,
         tmux,
         mcp_claude,
         mcp_codex,
+        mcp_kimi,
         daemon,
         pricing,
         home,
@@ -131,6 +136,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
         auth_codex,
         auth_grok,
         auth_opencode,
+        auth_kimi,
     ];
 
     let mut pass = 0usize;
@@ -216,6 +222,17 @@ fn check_opencode_binary() -> CheckLine {
         "opencode",
         CheckStatus::Warn,
         "install the OpenCode CLI (optional), or point",
+    )
+}
+
+/// kimi is optional (fifth vendor) — missing binary WARNs only.
+fn check_kimi_binary() -> CheckLine {
+    probe_binary(
+        "kimi binary",
+        ccteam_core::KIMI_BIN_ENV,
+        "kimi",
+        CheckStatus::Warn,
+        "install the Kimi Code CLI (optional), or point",
     )
 }
 
@@ -344,6 +361,30 @@ fn check_vendor_auth_opencode() -> CheckLine {
     }
 }
 
+fn check_vendor_auth_kimi() -> CheckLine {
+    let kimi_home = std::env::var_os("KIMI_CODE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".kimi-code")));
+    let ok = std::env::var("MOONSHOT_API_KEY").is_ok()
+        || kimi_home
+            .as_ref()
+            .map(|h| h.join("credentials").exists() || h.join("oauth").exists())
+            .unwrap_or(false);
+    if ok {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "kimi auth",
+            "credentials present (oauth store or MOONSHOT_API_KEY)",
+        )
+    } else {
+        CheckLine::new(
+            CheckStatus::Warn,
+            "kimi auth",
+            "no credentials found — run `kimi login` or set MOONSHOT_API_KEY",
+        )
+    }
+}
+
 /// `tmux` is only needed for the `terminal` session protocol (the
 /// bundled rmux backend works with no external tmux) — WARN, not FAIL.
 fn check_tmux() -> CheckLine {
@@ -426,6 +467,37 @@ fn check_mcp_codex(codex_present: bool) -> CheckLine {
             CheckStatus::Warn,
             "MCP (codex)",
             format!("could not resolve codex config.toml: {err}"),
+        ),
+    }
+}
+
+/// Kimi equivalent of [`check_mcp_codex`] (WARN, kimi is optional): the
+/// global `$KIMI_CODE_HOME/mcp.json` entry lets a plain `kimi` main session
+/// orchestrate.
+fn check_mcp_kimi() -> CheckLine {
+    match ccteam_core::mcp_register::resolve_kimi_config_path() {
+        Ok(path) => {
+            if ccteam_core::mcp_register::kimi_mcp_registered(&path) {
+                CheckLine::new(
+                    CheckStatus::Pass,
+                    "MCP (kimi)",
+                    format!("registered in {}", path.display()),
+                )
+            } else {
+                CheckLine::new(
+                    CheckStatus::Warn,
+                    "MCP (kimi)",
+                    format!(
+                        "ccteam MCP server not registered in {} — fix: `ccteam config mcp`",
+                        path.display()
+                    ),
+                )
+            }
+        }
+        Err(err) => CheckLine::new(
+            CheckStatus::Warn,
+            "MCP (kimi)",
+            format!("could not resolve kimi mcp.json: {err}"),
         ),
     }
 }

@@ -77,6 +77,10 @@ pub const GROK_BIN_ENV: &str = "CCTEAM_GROK_BIN";
 /// to the hermetic fake (`tests/fixtures/opencode_acp/fake_opencode_acp.py`).
 pub const OPENCODE_BIN_ENV: &str = "CCTEAM_OPENCODE_BIN";
 
+/// Environment override for the `kimi` binary path. Tests set this to
+/// the hermetic fake (`tests/fixtures/kimi_acp/fake_kimi_acp.py`).
+pub const KIMI_BIN_ENV: &str = "CCTEAM_KIMI_BIN";
+
 /// Environment override for the global ccteam root. Harness-owned
 /// adapters use this for per-session state sidecars without depending
 /// on `ccteam-core::paths::CcteamPaths`.
@@ -117,6 +121,7 @@ pub enum AgentVendor {
     Codex,
     Grok,
     Opencode,
+    Kimi,
 }
 
 impl AgentVendor {
@@ -127,6 +132,7 @@ impl AgentVendor {
         AgentVendor::Codex,
         AgentVendor::Grok,
         AgentVendor::Opencode,
+        AgentVendor::Kimi,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
@@ -135,6 +141,7 @@ impl AgentVendor {
             AgentVendor::Codex => ccteam_cost::Vendor::Codex,
             AgentVendor::Grok => ccteam_cost::Vendor::Grok,
             AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
+            AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
         }
     }
 }
@@ -1116,6 +1123,7 @@ impl SessionHandle {
             AgentVendor::Codex => "codex",
             AgentVendor::Grok => "grok",
             AgentVendor::Opencode => "opencode",
+            AgentVendor::Kimi => "kimi",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

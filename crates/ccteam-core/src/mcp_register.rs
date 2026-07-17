@@ -298,6 +298,108 @@ pub fn install_opencode_mcp_into(
     Ok(())
 }
 
+/// Register the ccteam MCP server in Kimi Code CLI's global
+/// `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`) as an
+/// `mcpServers.ccteam` HTTP entry — the shape `docs/en/customization/mcp.md`
+/// documents (`url` + `headers`; an entry with `url` and no `transport` is
+/// HTTP). NOTE: the file schema's `headers` is a **map** — do NOT copy the
+/// ACP `mcpServers` parameter's name/value array shape here.
+///
+/// MERGE, never clobber + idempotent: only `mcpServers.ccteam` is set; every
+/// other key survives. Admin bearer inside → 0600. ccteam-managed kimi
+/// sessions ALSO receive a same-named ACP-injected server with their
+/// per-session principal (same dedup-by-name posture as grok/opencode).
+pub fn install_kimi_mcp_into(mcp_json: &Path, mcp_http_url: &str, admin_token: &str) -> Result<()> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
+    }
+    let token = admin_token.trim();
+    if token.is_empty() {
+        anyhow::bail!("ccteam admin web token must not be empty");
+    }
+
+    let mut root = if mcp_json.exists() {
+        let bytes =
+            std::fs::read(mcp_json).with_context(|| format!("read {}", mcp_json.display()))?;
+        if bytes.is_empty() {
+            serde_json::Map::new()
+        } else {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            }
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let map = match servers {
+        Value::Object(m) => m,
+        _ => {
+            *servers = Value::Object(serde_json::Map::new());
+            servers.as_object_mut().unwrap()
+        }
+    };
+    map.insert(
+        crate::CCTEAM_MCP_SERVER_KEY.into(),
+        json!({
+            "url": url,
+            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
+        }),
+    );
+
+    let body = serde_json::to_string_pretty(&Value::Object(root))?;
+    atomic_write(mcp_json, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(mcp_json, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", mcp_json.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether Kimi's `mcp.json` carries the ccteam HTTP MCP entry. Best-effort;
+/// missing/junk file reads as `false`.
+pub fn kimi_mcp_registered(mcp_json: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(mcp_json) else {
+        return false;
+    };
+    let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(entry) = root
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(crate::CCTEAM_MCP_SERVER_KEY))
+    else {
+        return false;
+    };
+    entry
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|u| !u.trim().is_empty())
+        && entry
+            .pointer("/headers/Authorization")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+}
+
+/// Resolve Kimi Code CLI's user MCP config: `$KIMI_CODE_HOME/mcp.json`
+/// (KIMI_CODE_HOME → `~/.kimi-code` fallback), mirroring kimi's own session
+/// dir resolution.
+pub fn resolve_kimi_config_path() -> Result<PathBuf> {
+    let kimi_home = std::env::var_os("KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".kimi-code")))
+        .ok_or_else(|| anyhow!("cannot resolve KIMI_CODE_HOME or ~/.kimi-code (no home dir)"))?;
+    Ok(kimi_home.join("mcp.json"))
+}
+
 /// Whether Grok's `config.toml` carries the current HTTP form of
 /// `[mcp_servers.ccteam]`. Best-effort; missing/junk file reads as `false`.
 pub fn grok_mcp_registered(config_toml: &Path) -> bool {
@@ -766,6 +868,65 @@ mod tests {
         assert!(
             install_opencode_mcp_into(&tmp.path().join("o.json"), "http://x/mcp", " ").is_err()
         );
+    }
+
+    #[test]
+    fn install_kimi_mcp_into_writes_http_shape_and_merges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mcp_json = tmp.path().join("mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","fs"]}}}"#,
+        )
+        .unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
+        // Sibling server survives (merge, never clobber).
+        assert_eq!(v["mcpServers"]["filesystem"]["command"], "npx");
+        let entry = &v["mcpServers"]["ccteam"];
+        assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
+        // File-schema headers are a MAP (never the ACP name/value array).
+        assert_eq!(entry["headers"]["Authorization"], "Bearer ccteam:tok");
+        assert!(entry.get("command").is_none());
+        assert!(kimi_mcp_registered(&mcp_json));
+        assert!(!kimi_mcp_registered(&tmp.path().join("absent.json")));
+    }
+
+    #[test]
+    fn install_kimi_mcp_into_is_idempotent_and_creates_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mcp_json = tmp.path().join("nested").join("kimi").join("mcp.json");
+        install_kimi_mcp_into(&mcp_json, "http://localhost:7331/mcp", "a").unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://localhost:7444/mcp", "b").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["url"],
+            "http://localhost:7444/mcp"
+        );
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["headers"]["Authorization"],
+            "Bearer ccteam:b"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kimi_install_makes_token_bearing_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mcp_json = tmp.path().join("mcp.json");
+        install_kimi_mcp_into(&mcp_json, "http://localhost/mcp", "s").unwrap();
+        assert_eq!(
+            std::fs::metadata(&mcp_json).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn kimi_install_rejects_missing_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(install_kimi_mcp_into(&tmp.path().join("k.json"), "", "t").is_err());
+        assert!(install_kimi_mcp_into(&tmp.path().join("k.json"), "http://x/mcp", " ").is_err());
     }
 
     #[cfg(unix)]

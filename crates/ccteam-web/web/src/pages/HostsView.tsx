@@ -368,7 +368,7 @@ export function HostDetailCards({
 
       {host.agents.length === 0 ? (
         <div style={{ padding: "16px 20px", color: "var(--text-faint)", fontSize: 13 }}>
-          未在 PATH 上发现 claude / codex / grok / opencode。安装后点上方「{t("reprobe")}」。
+          未在 PATH 上发现 claude / codex / grok / opencode / kimi。安装后点上方「{t("reprobe")}」。
         </div>
       ) : (
         host.agents.map((agent) => {

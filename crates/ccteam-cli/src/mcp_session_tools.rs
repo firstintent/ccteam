@@ -271,14 +271,14 @@ mod tests {
             .find(|t| t["name"] == "session_spawn")
             .expect("session_spawn defined");
         let props = &spawn["inputSchema"]["properties"];
-        // v0.9.0 W1 (G1) — vendor enum lists all FOUR harnesses.
+        // v0.9.0 W1 (G1) — vendor enum lists all FIVE harnesses.
         let vendors: Vec<&str> = props["vendor"]["enum"]
             .as_array()
             .expect("vendor enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
         // New facets present; protocol enum excludes terminal. v0.9.1 adds the
         // one-call spawn+dispatch trio (task / wait_seconds / notify).
         for key in [

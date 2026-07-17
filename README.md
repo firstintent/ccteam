@@ -1,7 +1,7 @@
 # ccteam
 
 > **Your coding agents, working as one team.**
-> Claude Code, Codex, Grok and OpenCode — resident on your machines, hiring each other for work, driven from your phone.
+> Claude Code, Codex, Grok, OpenCode and Kimi — resident on your machines, hiring each other for work, driven from your phone.
 
 Each agent is strong in a different way: Fable 5 has the deepest reasoning but costs the most; Codex grinds through long jobs without wobbling; Grok is the fastest. Alone, each is one terminal with one context and no colleagues. ccteam bridges them into a team — any session can **spawn** another (any vendor, any machine), **dispatch** work to it, and **collect** the result. How the team is organized is yours: personas are plain Markdown, orchestration patterns are skills you write or install from a marketplace. ccteam provides the bridge underneath — identity, routing, delivery guarantees, guardrails, cost, observability — and never injects a prompt, never scrapes a terminal.
 
@@ -34,7 +34,7 @@ flowchart LR
     S3 -.-> S1
 ```
 
-The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agents organize themselves through eight `mcp__ccteam__*` tools: `session_spawn` (vendor, model, persona — and the first task in one call; the execution host comes from the project), `session_dispatch` (async with completion notification, or wait inline), `session_collect` (cursor paging, `tail` for the final answer, honest `working/idle` signal, bounded returns that never bloat the caller's context), `session_list` (delegation tree), `session_stop`, plus `status` / `chat_send_file` / `screenshot`. The bridge routes and records every hop — at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told — and enforces the limits (delegation depth, fan-out, per-project ceilings, cycle rejection, daily per-vendor budget caps; per-session cryptographic identity, scoped to its own project). Sessions have durable ids (`s1`, `s2`, …) that survive restarts and cold-resume from disk; state is plain files in your repos, live in the console's team view, and scriptable via `/api/v1` (docs at `/api/docs`). Claude Code is the first-class harness; Codex, Grok and OpenCode run through the same session model best-effort (satellite execution currently supports Claude sessions).
+The daemon is a router, not an orchestrator — no scheduler, no tick loop. Agents organize themselves through eight `mcp__ccteam__*` tools: `session_spawn` (vendor, model, persona — and the first task in one call; the execution host comes from the project), `session_dispatch` (async with completion notification, or wait inline), `session_collect` (cursor paging, `tail` for the final answer, honest `working/idle` signal, bounded returns that never bloat the caller's context), `session_list` (delegation tree), `session_stop`, plus `status` / `chat_send_file` / `screenshot`. The bridge routes and records every hop — at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told — and enforces the limits (delegation depth, fan-out, per-project ceilings, cycle rejection, daily per-vendor budget caps; per-session cryptographic identity, scoped to its own project). Sessions have durable ids (`s1`, `s2`, …) that survive restarts and cold-resume from disk; state is plain files in your repos, live in the console's team view, and scriptable via `/api/v1` (docs at `/api/docs`). Claude Code is the first-class harness; Codex, Grok, OpenCode and Kimi run through the same session model best-effort (satellite execution currently supports Claude sessions).
 
 ## Best practices
 
@@ -96,4 +96,4 @@ From chat, the whole team is addressable:
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on **Claude Code**, with support for **Codex**, **Grok** and **OpenCode**.
+MIT — see [LICENSE](LICENSE). Built on **Claude Code**, with support for **Codex**, **Grok**, **OpenCode** and **Kimi**.

@@ -22,7 +22,7 @@ pub struct CompareRequest {
     /// The question / prompt to fan out (also accepts `question` alias).
     #[serde(alias = "question")]
     pub prompt: String,
-    /// Optional vendor list (`claude`/`codex`/`grok`/`opencode`). Empty = all.
+    /// Optional vendor list (`claude`/`codex`/`grok`/`opencode`/`kimi`). Empty = all.
     #[serde(default)]
     pub vendors: Option<Vec<String>>,
     /// Optional timeout in seconds (default 300, max 600).
@@ -106,7 +106,7 @@ pub(crate) async fn handle_compare(
 pub struct CompareHistoryMember {
     /// Gateway session id — still `/use`-able to continue that answer.
     pub sid: String,
-    /// Vendor token (`claude` / `codex` / `grok` / `opencode`).
+    /// Vendor token (`claude` / `codex` / `grok` / `opencode` / `kimi`).
     pub vendor: String,
     /// Accrued session cost USD (never a faked 0).
     #[serde(skip_serializing_if = "Option::is_none")]

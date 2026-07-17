@@ -261,7 +261,7 @@ export default function SessionView({
     () =>
       normalizeDraft({
         ...defaultDraft(),
-        vendor: (["claude", "codex", "grok", "opencode"].includes(vendor)
+        vendor: (["claude", "codex", "grok", "opencode", "kimi"].includes(vendor)
           ? vendor
           : "claude") as ComposerDraft["vendor"],
         model: statusModel ?? "",

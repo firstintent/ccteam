@@ -104,8 +104,10 @@ pub fn default_adapter_factory_with_stream_json_handle(
         Arc::new(ccteam_harness::GrokAcpAdapter::new());
     let opencode: Arc<dyn HarnessAdapter + Send + Sync> =
         Arc::new(ccteam_harness::OpencodeAcpAdapter::new());
+    let kimi: Arc<dyn HarnessAdapter + Send + Sync> =
+        Arc::new(ccteam_harness::KimiAcpAdapter::new());
     // Vendor-first factory (v0.8.23 §3.E + v0.8.24 OpenCode): protocol is
-    // Claude-only for stream-json/terminal; Grok/OpenCode always ACP.
+    // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi always ACP.
     let factory: AdapterFactory = Arc::new(
         move |vendor: AgentVendor, protocol: SessionProtocol| match vendor {
             AgentVendor::Claude => match protocol {
@@ -117,6 +119,7 @@ pub fn default_adapter_factory_with_stream_json_handle(
             AgentVendor::Codex => Arc::clone(&codex),
             AgentVendor::Grok => Arc::clone(&grok),
             AgentVendor::Opencode => Arc::clone(&opencode),
+            AgentVendor::Kimi => Arc::clone(&kimi),
         },
     );
     (factory, claude_stream_json)

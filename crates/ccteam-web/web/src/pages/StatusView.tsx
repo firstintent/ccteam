@@ -396,7 +396,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
   );
 }
 
-/** 4-way vendor text color (never collapse opencode into codex/grok). */
+/** 5-way vendor text color (never collapse a vendor into another's color). */
 function vendorTextClass(vendor: string): string {
   switch (vendor) {
     case "claude":
@@ -405,6 +405,8 @@ function vendorTextClass(vendor: string): string {
       return "text-vendor-grok";
     case "opencode":
       return "text-vendor-opencode";
+    case "kimi":
+      return "text-vendor-kimi";
     default:
       return "text-vendor-codex";
   }

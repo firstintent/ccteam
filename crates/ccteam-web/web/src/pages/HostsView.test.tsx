@@ -70,6 +70,19 @@ const HOST: HostDetail = {
       status: "ready",
       hint: null,
     },
+    {
+      // kimi (5th vendor): config-file MCP seam ($KIMI_CODE_HOME/mcp.json),
+      // registered → ready, no CTA.
+      vendor: "kimi",
+      harness_id: "kimi",
+      installed: true,
+      version: "kimi 0.26.0",
+      bin: "kimi",
+      mcp_registered: true,
+      mcp_registrable: true,
+      status: "ready",
+      hint: null,
+    },
   ],
 };
 
@@ -100,6 +113,7 @@ describe("HostDetailCards (seeded)", () => {
     expect(html).toContain('data-testid="agent-card-codex"');
     expect(html).toContain('data-testid="agent-card-grok"');
     expect(html).toContain('data-testid="agent-card-opencode"');
+    expect(html).toContain('data-testid="agent-card-kimi"');
     expect(html).toContain("需配置"); // claude needs_config
     expect(html).toContain("未安装"); // codex not_installed
     expect(html).toContain("claude 1.2.3"); // captured version string

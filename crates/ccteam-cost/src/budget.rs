@@ -42,6 +42,8 @@ pub struct Budgets {
     pub grok: BudgetCap,
     #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
     pub opencode: BudgetCap,
+    #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
+    pub kimi: BudgetCap,
 }
 
 /// One vendor's cost + spawn caps.
@@ -73,6 +75,7 @@ impl Budgets {
             Vendor::Codex => &self.codex,
             Vendor::Grok => &self.grok,
             Vendor::Opencode => &self.opencode,
+            Vendor::Kimi => &self.kimi,
         }
     }
 
@@ -222,6 +225,7 @@ mod vendor_wire {
             Vendor::Codex => "codex",
             Vendor::Grok => "grok",
             Vendor::Opencode => "opencode",
+            Vendor::Kimi => "kimi",
         })
     }
 
@@ -235,6 +239,7 @@ mod vendor_wire {
             "codex" => Ok(Vendor::Codex),
             "grok" => Ok(Vendor::Grok),
             "opencode" => Ok(Vendor::Opencode),
+            "kimi" => Ok(Vendor::Kimi),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }

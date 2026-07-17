@@ -170,7 +170,7 @@ pub use daemon::{
 pub use defaults::{
     claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,
     CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
-    GROK_BIN_ENV, OPENCODE_BIN_ENV,
+    GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via

@@ -1053,11 +1053,13 @@ async fn run_session_spawn(
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
     // Protocol: agents get `stream-json | acp` only — `terminal` is frozen and
-    // never exposed to agents. Grok/opencode are always ACP (honest meta).
+    // never exposed to agents. Grok/opencode/kimi are always ACP (honest meta).
     let protocol = parse_session_protocol(args)?;
     let protocol = if matches!(
         vendor,
-        ccteam_harness::AgentVendor::Grok | ccteam_harness::AgentVendor::Opencode
+        ccteam_harness::AgentVendor::Grok
+            | ccteam_harness::AgentVendor::Opencode
+            | ccteam_harness::AgentVendor::Kimi
     ) {
         ccteam_harness::SessionProtocol::Acp
     } else {
@@ -1343,6 +1345,7 @@ fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
         ccteam_harness::AgentVendor::Codex => "codex",
         ccteam_harness::AgentVendor::Grok => "grok",
         ccteam_harness::AgentVendor::Opencode => "opencode",
+        ccteam_harness::AgentVendor::Kimi => "kimi",
     }
 }
 
@@ -2176,8 +2179,9 @@ fn parse_session_vendor(
             "codex" => Ok(ccteam_harness::AgentVendor::Codex),
             "grok" => Ok(ccteam_harness::AgentVendor::Grok),
             "opencode" => Ok(ccteam_harness::AgentVendor::Opencode),
+            "kimi" => Ok(ccteam_harness::AgentVendor::Kimi),
             other => Err(format!(
-                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, or `opencode`"
+                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, `opencode`, or `kimi`"
             )),
         },
     }

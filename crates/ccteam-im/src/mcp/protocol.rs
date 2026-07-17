@@ -198,14 +198,14 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, or `opencode`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, `opencode`, or `kimi`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default with a completion notification back to you; `wait_seconds>0` blocks inline for the answer; `notify:false` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "role": { "type": "string", "description": "Optional work-role (must exist as `.claude/agents/<role>.md`). Omit or pass \"\" for a roleless session (bare vendor reads the project CLAUDE.md/AGENTS.md)." },
                     "vendor": {
                         "type": "string",
-                        "enum": ["claude", "codex", "grok", "opencode"],
+                        "enum": ["claude", "codex", "grok", "opencode", "kimi"],
                         "description": "Harness vendor (lowercase). Default `claude`."
                     },
                     "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
@@ -213,7 +213,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "protocol": {
                         "type": "string",
                         "enum": ["stream-json", "acp"],
-                        "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode (forced). `terminal` is not available to agents."
+                        "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode/kimi (forced). `terminal` is not available to agents."
                     },
                     "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Local callers default to the project resolved from the working directory." },
                     "permission_mode": {
@@ -556,14 +556,14 @@ mod tests {
             .collect();
         assert_eq!(pm, vec!["skip", "hitl"]);
 
-        // v0.9.0 W1 (G1) — vendor enum lists all FOUR harnesses.
+        // v0.9.0 W1 (G1) — vendor enum lists all FIVE harnesses.
         let vendors: Vec<&str> = props["vendor"]["enum"]
             .as_array()
             .expect("vendor has an enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
 
         // v0.9.0 W1 (G1) — new facets are present.
         for key in ["model", "effort", "protocol", "title"] {

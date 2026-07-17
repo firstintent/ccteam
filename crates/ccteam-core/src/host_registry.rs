@@ -67,7 +67,7 @@ pub struct AgentProbeSpec {
     pub default_bin: &'static str,
 }
 
-/// The four vendor harnesses ccteam probes for. Extend here to add one.
+/// The five vendor harnesses ccteam probes for. Extend here to add one.
 pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
     AgentProbeSpec {
         vendor: "claude",
@@ -88,6 +88,11 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         vendor: "opencode",
         bin_env: ccteam_harness::OPENCODE_BIN_ENV,
         default_bin: "opencode",
+    },
+    AgentProbeSpec {
+        vendor: "kimi",
+        bin_env: ccteam_harness::KIMI_BIN_ENV,
+        default_bin: "kimi",
     },
 ];
 
@@ -874,8 +879,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_probe_specs_covers_four_vendors() {
+    fn agent_probe_specs_covers_five_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode"]);
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
     }
 }

@@ -2150,7 +2150,10 @@ impl Gateway {
                         }
                     }
                 }
-                if vendor == AgentVendor::Grok || vendor == AgentVendor::Opencode {
+                if matches!(
+                    vendor,
+                    AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
+                ) {
                     protocol = SessionProtocol::Acp;
                 }
                 let project = self.current_project_for(chat);
@@ -2443,7 +2446,7 @@ impl Gateway {
                 let question = it.next().unwrap_or("").trim();
                 if question.is_empty() {
                     return Err(anyhow!(
-                        "用法: /compare <问题>(并发问 claude/codex/grok/opencode)"
+                        "用法: /compare <问题>(并发问 claude/codex/grok/opencode/kimi)"
                     ));
                 }
                 let project = self.current_project_for(chat);
@@ -6597,8 +6600,8 @@ impl Gateway {
     /// v0.9.0 W2 (F5) — true when the vendor's trailing-24h project cost has
     /// reached its configured budget cap (the Ambient delegation budget gate,
     /// applied on both spawn + dispatch). No `project_paths` / no cap configured
-    /// / a vendor with no price table (grok/opencode) → `false` (inert), so the
-    /// count guardrails are those vendors' only ceiling.
+    /// / a vendor with no price table (grok/opencode/kimi) → `false` (inert),
+    /// so the count guardrails are those vendors' only ceiling.
     pub(crate) fn delegation_budget_exceeded(&self, slug: &str, vendor: AgentVendor) -> bool {
         self.project_paths
             .as_ref()
@@ -7572,6 +7575,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Codex => "codex",
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
+        AgentVendor::Kimi => "kimi",
     }
 }
 
@@ -8481,6 +8485,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "codex" => Ok(AgentVendor::Codex),
         "grok" => Ok(AgentVendor::Grok),
         "opencode" => Ok(AgentVendor::Opencode),
+        "kimi" => Ok(AgentVendor::Kimi),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -12381,7 +12386,7 @@ mod tests {
         > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
-        for vendor in ["claude", "codex", "grok", "opencode"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
             gateway
                 .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
                 .await
@@ -12394,7 +12399,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
             assert!(listing.contains(&format!("[{vendor}] ")), "{listing}");
         }
     }
@@ -13518,6 +13523,7 @@ mod tests {
                         AgentVendor::Codex => codex.clone(),
                         AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
                         AgentVendor::Opencode => codex.clone(),
+                        AgentVendor::Kimi => codex.clone(),
                     }
                 },
             )
@@ -13609,6 +13615,7 @@ mod tests {
                         AgentVendor::Codex => codex.clone(),
                         AgentVendor::Grok => codex.clone(),
                         AgentVendor::Opencode => codex.clone(),
+                        AgentVendor::Kimi => codex.clone(),
                     }
                 },
             )

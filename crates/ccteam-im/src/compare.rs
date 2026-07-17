@@ -15,7 +15,7 @@ pub const DEFAULT_COMPARE_TIMEOUT: Duration = Duration::from_secs(300);
 /// One vendor's slot in a compare result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareSlot {
-    /// Vendor token (`claude` / `codex` / `grok` / `opencode`).
+    /// Vendor token (`claude` / `codex` / `grok` / `opencode` / `kimi`).
     pub vendor: String,
     /// Gateway session id (`s{n}`) that produced this slot.
     pub sid: String,
@@ -111,13 +111,14 @@ fn truncate_chars(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// Default vendor set for compare (all four; unavailable ones fail partial).
+/// Default vendor set for compare (all five; unavailable ones fail partial).
 pub fn default_compare_vendors() -> Vec<AgentVendor> {
     vec![
         AgentVendor::Claude,
         AgentVendor::Codex,
         AgentVendor::Grok,
         AgentVendor::Opencode,
+        AgentVendor::Kimi,
     ]
 }
 
@@ -133,9 +134,10 @@ pub fn parse_compare_vendors(raw: &[String]) -> Result<Vec<AgentVendor>, String>
             "codex" => AgentVendor::Codex,
             "grok" => AgentVendor::Grok,
             "opencode" | "open-code" => AgentVendor::Opencode,
+            "kimi" => AgentVendor::Kimi,
             other => {
                 return Err(format!(
-                    "unknown vendor `{other}` (claude|codex|grok|opencode)"
+                    "unknown vendor `{other}` (claude|codex|grok|opencode|kimi)"
                 ))
             }
         };
@@ -162,7 +164,9 @@ pub fn mint_compare_group() -> String {
 /// Protocol for a compare target (roleless, skip permissions).
 pub fn protocol_for_vendor(v: AgentVendor) -> ccteam_harness::SessionProtocol {
     match v {
-        AgentVendor::Grok | AgentVendor::Opencode => ccteam_harness::SessionProtocol::Acp,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => {
+            ccteam_harness::SessionProtocol::Acp
+        }
         _ => ccteam_harness::SessionProtocol::StreamJson,
     }
 }
@@ -174,6 +178,7 @@ pub fn vendor_label(v: AgentVendor) -> &'static str {
         AgentVendor::Codex => "codex",
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
+        AgentVendor::Kimi => "kimi",
     }
 }
 
@@ -196,9 +201,11 @@ mod tests {
 
     #[test]
     fn parse_vendors_default_and_subset() {
-        assert_eq!(parse_compare_vendors(&[]).unwrap().len(), 4);
+        assert_eq!(parse_compare_vendors(&[]).unwrap().len(), 5);
         let v = parse_compare_vendors(&["claude".into(), "codex".into()]).unwrap();
         assert_eq!(v, vec![AgentVendor::Claude, AgentVendor::Codex]);
+        let v = parse_compare_vendors(&["kimi".into()]).unwrap();
+        assert_eq!(v, vec![AgentVendor::Kimi]);
         assert!(parse_compare_vendors(&["nope".into()]).is_err());
     }
 

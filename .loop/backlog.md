@@ -34,7 +34,7 @@
 - **DoD**:新定向测试先红后绿;`make test` 基线只增;writeback 绿。
 
 ### V095 kimi-code 第五 vendor harness 集成
-- **状态**:待排 · **冲突域**:`crates/ + crates/ccteam-web/web + README.md` · **建议入口**:dev 会话(owner 钦点 kimi-code 单会话一口气)
+- **状态**:进行中(kimi·2026-07-17) · **冲突域**:`crates/ + crates/ccteam-web/web + README.md` · **建议入口**:dev 会话(owner 钦点 kimi-code 单会话一口气)
 - **背景**:owner 2026-07-17 定向(v0.9.4 暂缓,本版先行)。PRD 自包含(两侧源码坐标已内嵌)= `docs-local/versions/v0-9-5/prd.md`;模板 = grok/opencode 薄壳 ACP vendor。
 - **规格**:PRD F1–F9。协议钉 `kimi acp` 长驻 stdio(terminal 冻结红线);复用 `execution/acp/*` 通用引擎 + `mcp_config::acp_mcp_servers_http`;全局注册写 `~/.kimi-code/mcp.json`;cost `None` 仿 Opencode;roleless-only;remote NotImplemented。
 - **卡面授权路径**:`docs/usage.md`(仅本卡;AGENTS.md / docs 其余 = 规划会话收口时改,dev 偏差申报)。

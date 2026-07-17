@@ -1,0 +1,734 @@
+//! Kimi Code ACP adapter — fifth harness vendor (`AgentVendor::Kimi`).
+//!
+//! Topology: **1 live session = 1 `kimi acp` child** (stdio JSON-RPC 2.0).
+//! Zero PTY / pane / hook path. Wire SoT: `docs-local/versions/v0-9-5/prd.md`
+//! (kimi 0.26.0, `references/kimi-code` is protocol reference only — never
+//! vendored).
+//!
+//! Kimi specifics vs the opencode sibling this module mirrors:
+//! - Model switches ride `session/set_model` (`{sessionId, modelId}`; kimi
+//!   also accepts `session/set_config_option` with configId `model`, but the
+//!   dedicated method is the pinned surface). `kimi acp` takes no model argv.
+//! - The effort axis (`session/set_config_option` thinking) is NOT wired in
+//!   this version (PRD non-goal — backlog).
+//! - Kimi has no `--agent` persona face → sessions are roleless-only; kimi
+//!   reads the project `AGENTS.md` natively (no prompt injection red line).
+//! - Skip sessions use [`InboundPolicy::AutoAllowPermission`] — kimi's
+//!   `session/request_permission` reverse RPC must never silently block the
+//!   default (skip) posture.
+
+pub mod bridge;
+pub mod protocol;
+pub mod spawn_spec;
+pub mod translate;
+pub mod transport;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use async_trait::async_trait;
+use chrono::Utc;
+use futures::stream::{self, BoxStream, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::broadcast;
+
+use crate::execution::acp::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
+use crate::execution::claude_common::unique_prompt_token;
+use crate::execution::session_meta::read_session_meta;
+use crate::{
+    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput,
+};
+
+use protocol::{
+    acp_model_picker_options, known_efforts, pluck_model_info, pluck_session_id,
+    split_trailing_effort, AcpModelOption, ModelInfo,
+};
+use spawn_spec::{build_argv, kimi_bin, KimiSpawnInput};
+use translate::{apply_notification, SessionTranslateState};
+use transport::{AcpTransport, InboundPolicy};
+
+/// Max wait for the dispatcher to reach the turn boundary after the prompt
+/// response, before finalizing anyway (best-effort if `turn_completed` is
+/// ever absent). The boundary is normally already signalled by then.
+const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Adapter name — stable id for handles / logs / tests.
+pub const KIMI_ACP_ADAPTER_NAME: &str = "kimi-acp";
+
+const EVENT_BUFFER: usize = 256;
+
+struct LiveSession {
+    transport: Arc<AcpTransport>,
+    session_id: String,
+    slug: String,
+    sid: String,
+    project_dir: PathBuf,
+    cwd: PathBuf,
+    /// Vendor catalog from `session/new|resume|load` `availableModels` —
+    /// drives `/model`. Never a ccteam-hardcoded name list.
+    available_models: Vec<AcpModelOption>,
+    state: Arc<StdMutex<SessionTranslateState>>,
+    event_tx: broadcast::Sender<ThreadEvent>,
+    permission_mode: PermissionMode,
+    _dispatcher: tokio::task::JoinHandle<()>,
+}
+
+fn acp_choice_prompt(title: &str, options: Vec<crate::ChoiceOption>) -> ChoicePrompt {
+    ChoicePrompt {
+        token: unique_prompt_token("km"),
+        title: title.to_string(),
+        options,
+        multi: false,
+    }
+}
+
+/// Per-process singleton holding live Kimi ACP sessions keyed by sessionId.
+#[derive(Clone, Default)]
+pub struct KimiAcpAdapter {
+    live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
+}
+
+impl std::fmt::Debug for KimiAcpAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KimiAcpAdapter").finish_non_exhaustive()
+    }
+}
+
+impl KimiAcpAdapter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn crate_version() -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn inbound_policy(mode: PermissionMode) -> InboundPolicy {
+        // Skip (default): auto-allow every `session/request_permission` —
+        // skip sessions must run tools without prompting (same posture as
+        // opencode; a client that never answers would stall the vendor).
+        //
+        // Hitl: **fail-closed decline**, same posture as opencode hitl.
+        // Decline only blocks THAT tool call (the turn continues — never a
+        // kill); the full IM [同意][拒绝] bridge remains future work.
+        match mode {
+            PermissionMode::Hitl => InboundPolicy::DefaultDecline,
+            _ => InboundPolicy::AutoAllowPermission,
+        }
+    }
+
+    async fn handshake_initialize(transport: &AcpTransport) -> Result<(), HarnessError> {
+        let _init = transport
+            .call(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false
+                    },
+                    "clientInfo": {
+                        "name": "ccteam",
+                        "version": Self::crate_version()
+                    }
+                }),
+            )
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("kimi initialize failed: {e}")))?;
+
+        // Harmless if the vendor does not require it; keeps parity with the
+        // grok/opencode ACP clients.
+        let _ = transport
+            .notify("notifications/initialized", Value::Null)
+            .await;
+        Ok(())
+    }
+
+    async fn handshake_and_new(
+        transport: &AcpTransport,
+        cwd: &std::path::Path,
+        mcp_servers: Vec<Value>,
+    ) -> Result<(String, ModelInfo), HarnessError> {
+        Self::handshake_initialize(transport).await?;
+        let new_result = transport
+            .call(
+                "session/new",
+                json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "mcpServers": mcp_servers
+                }),
+            )
+            .await
+            .map_err(|e| HarnessError::SpawnFailed(format!("kimi session/new failed: {e}")))?;
+
+        let session_id = pluck_session_id(&new_result).ok_or_else(|| {
+            HarnessError::SpawnFailed("kimi session/new missing sessionId".into())
+        })?;
+        Ok((session_id, pluck_model_info(&new_result)))
+    }
+
+    /// Prefer `session/resume` (no history replay). Fall back to
+    /// `session/load` only if resume fails; load replays history — translate
+    /// drops replayed frames (isReplay), late updates are best-effort.
+    async fn handshake_and_resume(
+        transport: &AcpTransport,
+        cwd: &std::path::Path,
+        session_id: &str,
+        mcp_servers: Vec<Value>,
+    ) -> Result<ModelInfo, HarnessError> {
+        Self::handshake_initialize(transport).await?;
+        // Resume/load MUST carry the SAME mcpServers as fresh — hardcoding
+        // `[]` here would drop the ccteam tool face after any resume.
+        let params = json!({
+            "sessionId": session_id,
+            "cwd": cwd.to_string_lossy(),
+            "mcpServers": mcp_servers
+        });
+        match transport.call("session/resume", params.clone()).await {
+            Ok(result) => Ok(pluck_model_info(&result)),
+            Err(resume_err) => {
+                tracing::warn!(
+                    error = %resume_err,
+                    session_id,
+                    "kimi session/resume failed; falling back to session/load"
+                );
+                let load_result = transport.call("session/load", params).await.map_err(|e| {
+                    HarnessError::SpawnFailed(format!(
+                        "kimi session/load failed after resume error: {e}"
+                    ))
+                })?;
+                Ok(pluck_model_info(&load_result))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_live(
+        &self,
+        transport: Arc<AcpTransport>,
+        session_id: String,
+        slug: String,
+        sid: String,
+        project_dir: PathBuf,
+        cwd: PathBuf,
+        info: ModelInfo,
+        permission_mode: PermissionMode,
+    ) -> Arc<LiveSession> {
+        let state = Arc::new(StdMutex::new(SessionTranslateState {
+            model: info.model,
+            window_tokens: info.window,
+            effort: info.effort,
+            ..Default::default()
+        }));
+        let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
+        let dispatcher =
+            spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
+        let live = Arc::new(LiveSession {
+            transport,
+            session_id: session_id.clone(),
+            slug,
+            sid,
+            project_dir,
+            cwd,
+            available_models: info.available,
+            state,
+            event_tx,
+            permission_mode,
+            _dispatcher: dispatcher,
+        });
+        if let Ok(mut map) = self.live.lock() {
+            map.insert(session_id, Arc::clone(&live));
+        }
+        live
+    }
+
+    fn get_live(&self, session_id: &str) -> Option<Arc<LiveSession>> {
+        self.live
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).cloned())
+    }
+
+    fn make_handle(live: &LiveSession) -> ThreadHandle {
+        ThreadHandle {
+            identity: live.session_id.clone(),
+            vendor: AgentVendor::Kimi,
+            mode: ExecutionMode::Chat,
+            started_at: Utc::now(),
+            raw_extras: json!({
+                // vendor_uuid is what gateway meta.json + resume paths read.
+                "vendor_uuid": live.session_id,
+                "sessionId": live.session_id,
+                "slug": live.slug,
+                "sid": live.sid,
+                "project_dir": live.project_dir,
+                "cwd": live.cwd,
+                "protocol": "acp",
+                "adapter": KIMI_ACP_ADAPTER_NAME,
+                "permission_mode": match live.permission_mode {
+                    PermissionMode::Skip => "skip",
+                    PermissionMode::Hitl => "hitl",
+                },
+            }),
+        }
+    }
+
+    fn thread_status_inner(&self, live: &LiveSession) -> ThreadStatus {
+        let Ok(st) = live.state.lock() else {
+            return ThreadStatus::default();
+        };
+        ThreadStatus {
+            model: st.model.clone(),
+            context: match (st.used_tokens, st.window_tokens) {
+                (Some(used), Some(window)) => Some(ContextUsage {
+                    used_tokens: used,
+                    window_tokens: window,
+                }),
+                (None, Some(window)) => Some(ContextUsage {
+                    used_tokens: 0,
+                    window_tokens: window,
+                }),
+                _ => None,
+            },
+            effort: st.effort.clone(),
+            goal: None,
+        }
+    }
+}
+
+fn spawn_notif_dispatcher(
+    transport: Arc<AcpTransport>,
+    state: Arc<StdMutex<SessionTranslateState>>,
+    event_tx: broadcast::Sender<ThreadEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sub = transport.subscribe();
+        loop {
+            tokio::select! {
+                _ = transport.wait_closed() => return,
+                msg = sub.recv() => match msg {
+                    Ok(n) => {
+                        let events = if let Ok(mut guard) = state.lock() {
+                            apply_notification(&mut guard, &n)
+                        } else {
+                            Vec::new()
+                        };
+                        for ev in events {
+                            let _ = event_tx.send(ev);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    })
+}
+
+#[async_trait]
+impl HarnessAdapter for KimiAcpAdapter {
+    fn name(&self) -> &'static str {
+        KIMI_ACP_ADAPTER_NAME
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        AgentVendor::Kimi
+    }
+
+    async fn start_thread(
+        &self,
+        _spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        // Remote execution is claude-only (red line: 跨机 verdict 钉 claude);
+        // see `codex_app_server.rs`'s identical guard for the rationale.
+        if ctx.remote.is_some() {
+            return Err(HarnessError::NotImplemented {
+                reason: "remote execution (host != local) is not yet supported for kimi; \
+                         use host=local"
+                    .to_string(),
+            });
+        }
+        // Roleless-only: kimi has no `--agent` persona face; it reads the
+        // project AGENTS.md natively (no prompt injection).
+        let bin = kimi_bin();
+        let argv = build_argv(&bin, &KimiSpawnInput::default());
+        let program = argv[0].clone();
+        let args: Vec<String> = argv.into_iter().skip(1).collect();
+        let cwd = if ctx.cwd.as_os_str().is_empty() {
+            ctx.project_dir.clone()
+        } else {
+            ctx.cwd.clone()
+        };
+        let inbound = Self::inbound_policy(ctx.permission_mode);
+        // The ccteam MCP tool face (HTTP + session bearer), passed
+        // identically to session/new and session/resume|load. Empty when
+        // sid/secret missing; failure to inject must not block the prompt
+        // path (empty vec).
+        let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
+
+        // Cold-resume ladder: if meta.json already has a Kimi ACP sessionId
+        // (vendor_uuid), `session/resume` (→ `session/load`) instead of
+        // `session/new` so daemon rebuild / `/use` keep conversation context.
+        let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)
+            .ok()
+            .map(|m| m.vendor_uuid)
+            .filter(|u| !u.trim().is_empty());
+
+        if let Some(ref uuid) = prior_uuid {
+            if let Some(live) = self.get_live(uuid) {
+                return Ok(Self::make_handle(&live));
+            }
+        }
+
+        let try_resume = prior_uuid.clone();
+        let (transport, session_id, info) = match try_resume {
+            Some(uuid) => {
+                let transport =
+                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
+                        .await
+                        .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
+                let transport = Arc::new(transport);
+                match Self::handshake_and_resume(&transport, &cwd, &uuid, mcp_servers.clone()).await
+                {
+                    Ok(info) => (transport, uuid, info),
+                    Err(resume_err) => {
+                        tracing::warn!(
+                            error = %resume_err,
+                            "kimi resume/load failed; falling back to session/new"
+                        );
+                        let _ = transport.shutdown().await;
+                        let transport =
+                            AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
+                                .await
+                                .map_err(|e| {
+                                    HarnessError::SpawnFailed(format!(
+                                        "spawn kimi after resume fail: {e}"
+                                    ))
+                                })?;
+                        let transport = Arc::new(transport);
+                        let (sid, info) =
+                            Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                        (transport, sid, info)
+                    }
+                }
+            }
+            None => {
+                let transport =
+                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
+                        .await
+                        .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
+                let transport = Arc::new(transport);
+                let (sid, info) =
+                    Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
+                (transport, sid, info)
+            }
+        };
+
+        let live = self.register_live(
+            transport,
+            session_id,
+            ctx.slug.clone(),
+            ctx.sid.clone(),
+            ctx.project_dir.clone(),
+            cwd,
+            info,
+            ctx.permission_mode,
+        );
+        // Best-effort spawn-time model via the SAME vendor-native seam the
+        // `/model` directive uses (`session/set_model`; `kimi acp` takes no
+        // model argv). A failure must never fail the spawn — the session
+        // then runs on kimi's own default (honest degrade, warn only). The
+        // effort axis is NOT wired in this version (PRD non-goal).
+        if let Some(model) = ctx
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            match live
+                .transport
+                .call(
+                    "session/set_model",
+                    json!({
+                        "sessionId": live.session_id,
+                        "modelId": model,
+                    }),
+                )
+                .await
+            {
+                Ok(_) => {
+                    if let Ok(mut st) = live.state.lock() {
+                        st.model = Some(model.to_string());
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    sid = %ctx.sid,
+                    model,
+                    error = %e,
+                    "kimi spawn-time session/set_model failed; continuing with vendor default"
+                ),
+            }
+        }
+        let mut handle = Self::make_handle(&live);
+        if let Ok(st) = live.state.lock() {
+            if let Some(m) = &st.model {
+                handle.raw_extras["model"] = json!(m);
+            }
+        }
+        Ok(handle)
+    }
+
+    async fn submit_turn(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        let live = self.get_live(&h.identity).ok_or_else(|| {
+            HarnessError::ThreadDied(format!("kimi session {} not live", h.identity))
+        })?;
+
+        let text = match input {
+            TurnInput::UserText(t) => t,
+            other => {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "kimi_acp: unsupported turn input {other:?}"
+                )));
+            }
+        };
+
+        // Unique per-process id (timestamp + seq) so two turns steered in the
+        // same millisecond never collide in the pending queue / experience log.
+        let turn_id = next_acp_turn_id();
+        // Barrier the dispatcher fires on the turn boundary so finalize sees
+        // every buffered chunk (see FINALIZE_BARRIER / SessionTranslateState).
+        let turn_done = Arc::new(tokio::sync::Notify::new());
+        // Reserve the buffer if idle (→ spawn the runner) or queue behind the
+        // in-flight turn (the runner drains FIFO). The gateway steers by firing
+        // a fresh submit_turn mid-turn, exactly like Claude/Codex; ACP prompts
+        // serialize natively, so we queue rather than reject.
+        let spawn_runner = {
+            let mut st = live
+                .state
+                .lock()
+                .map_err(|_| HarnessError::Io("kimi state lock poisoned".into()))?;
+            if st.buffer.is_some() {
+                st.pending.push_back((turn_id.clone(), text.clone()));
+                false
+            } else {
+                st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
+                true
+            }
+        };
+
+        if spawn_runner {
+            AcpTurnRunner {
+                transport: Arc::clone(&live.transport),
+                state: Arc::clone(&live.state),
+                event_tx: live.event_tx.clone(),
+                session_id: live.session_id.clone(),
+                tuning: AcpTurnTuning {
+                    finalize_barrier: FINALIZE_BARRIER,
+                    // Kimi's ACP `session/update` stream carries no usage
+                    // (PRD §2) — nothing races the response worth waiting for.
+                    post_finalize_sleep: None,
+                    label: "kimi",
+                },
+            }
+            .spawn(turn_id.clone(), turn_done, text);
+        }
+
+        Ok(TurnId(turn_id))
+    }
+
+    fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        let Some(live) = self.get_live(&h.identity) else {
+            return stream::empty().boxed();
+        };
+        let rx = live.event_tx.subscribe();
+        stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => return Some((ev, rx)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .boxed()
+    }
+
+    async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        if let Some(live) = self.get_live(persistent_id) {
+            return Ok(Self::make_handle(&live));
+        }
+        // Cold resume needs the project cwd, which this bare-id entrypoint
+        // lacks. The daemon rebuild path (`rebuild_session_from_meta`) instead
+        // calls `start_thread` with the same sid, which reads meta.vendor_uuid
+        // and runs the `session/resume|load` ladder — that is the working
+        // cold-resume route for Kimi. Fail loudly here so nothing silently
+        // relies on it.
+        Err(HarnessError::NotImplemented {
+            reason: format!(
+                "kimi cold resume of {persistent_id} needs project cwd — rebuild via start_thread (rebuild_session_from_meta)"
+            ),
+        })
+    }
+
+    async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let live = {
+            let mut map = self
+                .live
+                .lock()
+                .map_err(|_| HarnessError::Io("live map poisoned".into()))?;
+            map.remove(&h.identity)
+        };
+        if let Some(live) = live {
+            let _ = live
+                .transport
+                .notify("session/cancel", json!({ "sessionId": live.session_id }))
+                .await;
+            let _ = live.transport.shutdown().await;
+        }
+        Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        let name = d.name.trim().trim_start_matches('/').to_ascii_lowercase();
+        let live = self.get_live(&h.identity);
+        match name.as_str() {
+            "status" | "context" => {
+                let status = if let Some(live) = live {
+                    self.thread_status_inner(&live)
+                } else {
+                    ThreadStatus::default()
+                };
+                let receipt = status
+                    .status_suffix()
+                    .unwrap_or_else(|| "kimi · acp".into());
+                Ok(DirectiveOutcome::Done { receipt })
+            }
+            "compact" => Ok(DirectiveOutcome::Rejected {
+                reason: "kimi /compact: native command RPC not yet wired; restart session if context is full".into(),
+            }),
+            "model" => {
+                let Some(live) = live else {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason: "kimi session not live".into(),
+                    });
+                };
+                // Three forms (mirrors grok/opencode):
+                // (1) picker re-entry — `d.choice` carries the picked option id
+                //     (`"<modelId>"` or `"<modelId> <effort>"`);
+                // (2) explicit `/model <id> [effort]`;
+                // (3) bare `/model` → NeedsChoice from captured availableModels.
+                let picked = d.choice.as_ref().and_then(|c| {
+                    c.ids
+                        .first()
+                        .cloned()
+                        .or_else(|| c.free_text.clone().filter(|s| !s.trim().is_empty()))
+                });
+                let arg = match picked {
+                    Some(p) => p,
+                    None => d.args.trim().to_string(),
+                };
+                if arg.is_empty() {
+                    let options = acp_model_picker_options(&live.available_models);
+                    if options.is_empty() {
+                        let current = live
+                            .state
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.model.clone())
+                            .unwrap_or_else(|| "(unknown)".into());
+                        return Ok(DirectiveOutcome::Rejected {
+                            reason: format!(
+                                "用法: /model <model-id>（当前: {current}；vendor 未返回 availableModels）"
+                            ),
+                        });
+                    }
+                    return Ok(DirectiveOutcome::NeedsChoice(acp_choice_prompt(
+                        "Choose a Kimi model:",
+                        options,
+                    )));
+                }
+                let efforts = known_efforts(&live.available_models);
+                let (model_id, effort) = split_trailing_effort(&arg, &efforts);
+                if model_id.is_empty() {
+                    return Ok(DirectiveOutcome::Rejected {
+                        reason: "用法: /model <model-id>".into(),
+                    });
+                }
+                // Prefer vendor-listed id; still allow free-form (vendor rejects unknown).
+                match live
+                    .transport
+                    .call(
+                        "session/set_model",
+                        json!({
+                            "sessionId": live.session_id,
+                            "modelId": model_id,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        // Window from the catalog entry when present.
+                        let window = live
+                            .available_models
+                            .iter()
+                            .find(|m| m.model_id == model_id)
+                            .and_then(|m| m.window);
+                        if let Ok(mut st) = live.state.lock() {
+                            st.model = Some(model_id.clone());
+                            if let Some(w) = window {
+                                st.window_tokens = Some(w);
+                            }
+                        }
+                        let mut receipt = format!("已切换 model → {model_id}（live）");
+                        if effort.is_some() {
+                            // Effort axis (kimi thinking) is not wired in this
+                            // version (PRD non-goal) — say so, never silently drop.
+                            receipt.push_str("；effort 轴本版未接，已忽略");
+                        }
+                        Ok(DirectiveOutcome::Done { receipt })
+                    }
+                    Err(e) => Ok(DirectiveOutcome::Rejected {
+                        reason: format!("/model 切换失败: {e}"),
+                    }),
+                }
+            }
+            other => Ok(DirectiveOutcome::Rejected {
+                reason: format!("kimi does not support /{other}"),
+            }),
+        }
+    }
+
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        let Some(live) = self.get_live(&h.identity) else {
+            return Ok(ThreadStatus::default());
+        };
+        Ok(self.thread_status_inner(&live))
+    }
+
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        let Some(live) = self.get_live(&h.identity) else {
+            return Ok(());
+        };
+        live.transport
+            .notify("session/cancel", json!({ "sessionId": live.session_id }))
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("session/cancel: {e}")))?;
+        Ok(())
+    }
+
+    fn thread_is_live(&self, h: &ThreadHandle) -> bool {
+        self.get_live(&h.identity).is_some()
+    }
+}

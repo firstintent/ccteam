@@ -90,13 +90,18 @@ function renderSidebar(rows: RailRow[], over: Partial<React.ComponentProps<typeo
 
 describe("Sidebar SSR structure", () => {
   it("renders all vendor chips on live and history session rows", () => {
-    const html = renderSidebar([
-      row({ sid: "s1", vendor: "claude" }),
-      row({ sid: "s2", vendor: "codex" }),
-      row({ sid: "s3", vendor: "grok", history: true }),
-      row({ sid: "s4", vendor: "opencode", history: true }),
-    ]);
-    for (const vendor of ["claude", "codex", "grok", "opencode"]) {
+    const html = renderSidebar(
+      [
+        row({ sid: "s1", vendor: "claude" }),
+        row({ sid: "s2", vendor: "codex" }),
+        row({ sid: "s3", vendor: "grok", history: true }),
+        row({ sid: "s4", vendor: "opencode", history: true }),
+        // Second workspace so the WS_SHOW row cap never folds this row away.
+        row({ sid: "s5", vendor: "kimi", project: "demo2" }),
+      ],
+      { projects: ["demo", "demo2"] },
+    );
+    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi"]) {
       expect(html).toContain(`data-vendor="${vendor}"`);
       expect(html).toContain(`chip ${vendor} vendor-chip`);
     }
