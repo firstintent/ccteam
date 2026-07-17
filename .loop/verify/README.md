@@ -2,14 +2,14 @@
 
 > **「完成」的定义 = 可执行命令的退出码,不是任何会话的文字声称。**
 > 可执行门禁的家 = **根 `Makefile`**(同一事实一个家,此处不复制脚本);本文件 = 「改动面 → 跑什么」
-> 映射 + 通过判据 + 运行纪律。本目录唯一脚本 = `writeback.sh`(写权守卫 + 队列结构校验,Makefile 之外的新增面)。
+> 映射 + 通过判据 + 运行纪律。本目录唯一脚本 = `writeback.sh`(**队列结构校验**;治理写权执法 = 声明 + Fable 5 复核,**不做脚本硬防护**,AGENTS.md §五)。
 > 维护者 = 规划(控制)会话(改门禁 = 改「完成」的定义)。
 
 ## 改动面 → 必跑
 
 | 改动面 | 必跑 | 说明 |
 |---|---|---|
-| **任何收口(最低门)** | `cargo fmt --all -- --check` + `.loop/verify/writeback.sh <开工 base sha>` | fmt 是 CI required;writeback 见其头注 |
+| **任何收口(最低门)** | `cargo fmt --all -- --check` + `.loop/verify/writeback.sh` | fmt 是 CI required;writeback 见其头注 |
 | Rust(非 ccteam-web) | 最低门 + `make check` + `make test` | clippy `-D warnings`;test = workspace 除 web,`--no-fail-fast` |
 | `crates/ccteam-web/src` | 上行 + `make test-web` | web 的 WS/PTY 测试需真终端 |
 | SPA(`crates/ccteam-web/web`) | 最低门 + `make web-check` | vitest + tsc |

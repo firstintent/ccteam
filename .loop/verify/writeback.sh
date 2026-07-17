@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# .loop/verify/writeback.sh — 写权守卫 + backlog 结构校验(dev 收口必跑)
+# .loop/verify/writeback.sh — backlog 队列结构校验(收口必跑)
 #
 # 用法:
-#   .loop/verify/writeback.sh <base-sha>   # 收口检查:base = 开工时的 HEAD
-#   .loop/verify/writeback.sh --selftest   # 守卫自证:每类坏样例必红 + 合法样例必绿
+#   .loop/verify/writeback.sh             # 校验 .loop/backlog.md 结构
+#   .loop/verify/writeback.sh --selftest  # 自证:每类坏样例必红 + 合法样例必绿
 #
-# 语义与 AGENTS.md §五「角色与写权」逐条对齐:
-#   1) 保护路径:AGENTS.md / CLAUDE.md / docs/** / .github/workflows/** / .loop/**(除 backlog.md)
-#      在 base..工作区(含未跟踪)被改 ⇒ 红。卡面显式授权某路径时 WRITEBACK_ALLOW="<前缀>…";
-#      规划(控制)会话改治理面用 WRITEBACK_ALLOW='*' 跳过路径守卫(结构校验仍跑)。
-#   2) backlog 结构:每张 `### ` 卡必有状态行(ASCII 冒号);状态词闭合:
-#      待排 | 进行中(…) | 完成(7+位hex) | 阻塞(…) | gated[(…)];完成卡必有「验证」段;
-#      同冲突域双「进行中」⇒ 红;游离状态行 ⇒ 红。
-#   3) 真仓绿检:对当前真实 .loop/backlog.md 的结构校验永远执行(防守卫与现实脱节)。
+# 治理写权(AGENTS.md §五「角色与写权」)= 声明 + Fable 5 规划会话复核执法,
+# **不做脚本硬防护**(owner 决策 2026-07-17;此前的保护路径守卫已删)。
+# 本脚本只守队列结构,语义与 backlog 文件头协议对齐:
+#   每张 `### ` 卡必有状态行(ASCII 冒号);状态词闭合:
+#   待排 | 进行中(…) | 完成(7+位hex) | 阻塞(…) | gated[(…)];完成卡必有「验证」段;
+#   同冲突域双「进行中」⇒ 红(冲突域首段 = 路径前缀,前缀重叠即同域);游离状态行 ⇒ 红。
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BACKLOG=".loop/backlog.md"
 
 fail() { echo "writeback: RED — $*" >&2; exit 1; }
@@ -53,27 +50,8 @@ check_backlog() { # $1 = backlog 文件;结构违规打印诊断并返回非零
     ' "$1"
 }
 
-run_guard() { # $1 = base sha
+run_check() {
     cd "$(git rev-parse --show-toplevel)"
-    git rev-parse --verify -q "$1^{commit}" >/dev/null || fail "base sha 无效:$1"
-    local allow="${WRITEBACK_ALLOW:-}"
-    if [ "$allow" = "*" ]; then
-        echo "writeback: 路径守卫跳过(WRITEBACK_ALLOW='*',规划会话语义)"
-    else
-        local viol="" f a ok
-        while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            case "$f" in
-                .loop/backlog.md) continue ;;
-                AGENTS.md | CLAUDE.md | docs/* | .github/workflows/* | .loop/*)
-                    ok=0
-                    for a in $allow; do case "$f" in "$a"*) ok=1 ;; esac; done
-                    [ "$ok" = 1 ] || viol="$viol $f"
-                    ;;
-            esac
-        done <<<"$({ git diff --name-only "$1" --; git ls-files --others --exclude-standard; } | sort -u)"
-        [ -z "$viol" ] || fail "保护路径被改(治理面 = 规划会话专属;卡面授权走 WRITEBACK_ALLOW):$viol"
-    fi
     [ -f "$BACKLOG" ] || fail "缺 $BACKLOG"
     check_backlog "$BACKLOG" || fail "backlog 结构校验失败(见上)"
     echo "writeback: GREEN"
@@ -118,30 +96,11 @@ EOF
     sed '/make test 绿/d' "$tmp/good.md" >"$tmp/bad-noverify.md"
     expect_red "完成卡缺验证段" "$tmp/bad-noverify.md"
 
-    # 保护路径守卫:临时 git 仓,base 后改 docs/ ⇒ 红;只改代码 + backlog ⇒ 绿
-    (
-        cd "$tmp" && git init -q repo && cd repo
-        git config user.email t@t && git config user.name t
-        mkdir -p docs .loop src
-        cp "$tmp/good.md" .loop/backlog.md
-        echo x >docs/a.md && echo fn >src/lib.rs
-        git add -A && git commit -qm base
-        base="$(git rev-parse HEAD)"
-        echo y >>docs/a.md
-        if WRITEBACK_ALLOW='' "$SCRIPT" "$base" >/dev/null 2>&1; then
-            echo "selftest: FAIL(保护路径应红未红)" >&2; exit 1
-        fi
-        git checkout -q -- docs/a.md
-        echo more >>src/lib.rs && echo add >>.loop/backlog.md
-        WRITEBACK_ALLOW='' "$SCRIPT" "$base" >/dev/null 2>&1 || { echo "selftest: FAIL(合法收口被误红)" >&2; exit 1; }
-    ) || exit 1
-    red=$((red + 1)) pass=$((pass + 1))
-
     echo "writeback selftest: GREEN(合法 ${pass} 绿 + 坏样例 ${red} 红)"
 }
 
 case "${1:-}" in
     --selftest) selftest ;;
-    "") fail "用法:writeback.sh <base-sha> | --selftest" ;;
-    *) run_guard "$1" ;;
+    "") run_check ;;
+    *) fail "用法:writeback.sh(无参数 = 结构校验)| --selftest" ;;
 esac

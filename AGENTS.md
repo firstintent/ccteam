@@ -59,7 +59,7 @@
 | `docs/orchestration.md`(+`-cn`) | 深度用户编排指南(session_* 工具面 + 身份模型 + 多机语义 + 最佳实践,owner 钦点独立成文) | 写/改 A2A 编排面 |
 | `.loop/state.md` | 当前焦点 + 基线数字 + **人工门登记** + 未固化教训(每版回填,dev 只读) | 每次起手(三读之二) |
 | `.loop/backlog.md` | **任务队列唯一来源**(文件头 = 取活/回写协议,卡面自包含) | 取活/排卡(三读之三) |
-| `.loop/verify/README.md` | 门禁地图:改动面→Makefile target + 判据 + 运行纪律;`writeback.sh` = 写权守卫(dev 收口必跑) | 收口前 |
+| `.loop/verify/README.md` | 门禁地图:改动面→Makefile target + 判据 + 运行纪律;`writeback.sh` = 队列结构校验(dev 收口必跑;写权执法 = 声明 + 复核,见 §五) | 收口前 |
 | `.loop/history.md` | 每版一行蒸馏史(repo 内唯一版本时间轴) | 找版本脉络 |
 
 历史版本归档 `docs-local/versions/v0-X-Y/README.md`(冻结、按需)+ 探索研究 `docs-local/research/`(不更新、按需)—— **均在 gitignored `docs-local/`,不入库不推送**(owner 决策:版本档案 + 研究笔记本机留存,仓库瘦身);进行中的版本 PRD/dev-plan 也落 `docs-local/versions/v0-x-y/`。这些都**不**自动进上下文。
@@ -131,15 +131,15 @@
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
 
-### 角色与写权(治理骨架;守卫 = `.loop/verify/writeback.sh`)
+### 角色与写权(治理骨架;执法 = 声明 + 复核,**不做脚本硬防护**)
 
 | 角色 | 写权 |
 |---|---|
 | **owner**(人) | 下令 + 签核人工门(tag·部署·红线·降基线·对外契约,登记 `.loop/state.md`);不直接写仓 |
-| **规划(控制)会话** | **治理面唯一作者**:本文 + `docs/` + `.loop/`(卡片窄写回域除外)+ `.github/`;排卡、批 review、教训蒸馏 |
+| **规划(控制)会话 = Fable 5** | **治理面唯一作者**:本文(AGENTS.md/CLAUDE.md)+ `docs/` + `.loop/`(卡片窄写回域除外)+ `.github/`;排卡、批 review、教训蒸馏。治理面写权**归属 Fable 5 规划会话**(owner 决策 2026-07-17) |
 | **dev 会话**(任意 harness,可多个) | 代码面(crates / SPA / tests / README.md)+ backlog **窄写回**(只改所取卡状态行 + 追加验证/偏差段) |
 
-执法三层:**声明**(本节 + backlog 文件头)→ **机械**(`writeback.sh <开工 base sha>`,dev 收口必跑;`--selftest` 证守卫自身有牙)→ **复核**(规划批 review 兜守卫盲区)。DoD 要求越出卡面授权 = **停手**,卡面偏差申报(附最窄解锁提议)等裁决;裁决只授权提议字面,不隐性扩 scope。
+执法两层:**声明**(本节 + backlog 文件头;dev 会话发现治理面需要改 = 停手偏差申报,不自己动手)→ **复核**(Fable 5 规划会话批 review 抓写权越界;`writeback.sh`(无参数)只做**队列结构校验**,dev 收口必跑,`--selftest` 证其有牙 —— 写权**不设脚本硬防护**,owner 决策)。冲突域约定:**卡面冲突域首段 = 路径前缀**(如 `crates/ccteam-harness`),前缀重叠即同域须串行。DoD 要求越出卡面授权 = **停手**,卡面偏差申报(附最窄解锁提议)等裁决;裁决只授权提议字面,不隐性扩 scope。
 
 ### 多 session 并行编辑同一仓库
 
