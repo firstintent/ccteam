@@ -673,16 +673,47 @@ pub struct TurnAttachment {
     pub name: Option<String>,
 }
 
+/// Render the skill-attachment line for the session's vendor — the ONE seam
+/// where vendor-native skill invocation syntaxes are unified. The wire/API
+/// stays vendor-neutral (`{kind:"skill", name}`); this rendering picks the
+/// richest path each vendor understands:
+/// - **claude** — the native loader path is the Skill tool (`/name`); a
+///   mid-text `/name` does NOT auto-trigger it, so the line names the tool
+///   explicitly (Claude then invokes it natively) with the read-path fallback.
+/// - **codex** — `$name`: Codex's plaintext `TOOL_MENTION_SIGIL` (`'$'`)
+///   resolves skill mentions natively anywhere in a user message.
+/// - **grok / opencode / kimi** (ACP; no native skill loader) — the neutral
+///   read-and-follow line (a skill is prompt-layer markdown any agent can
+///   `Read`).
+fn skill_attachment_line(vendor: &str, id: &str, md: &std::path::Path) -> String {
+    match vendor {
+        "claude" => format!(
+            "[skill \"{id}\" attached — invoke /{id} with your Skill tool \
+             (fallback: read {}) and follow it for this request]",
+            md.display()
+        ),
+        "codex" => format!(
+            "[skill \"{id}\" attached — use ${id} for this request (definition: {})]",
+            md.display()
+        ),
+        _ => format!(
+            "[skill \"{id}\" attached — read {} and follow it for this request]",
+            md.display()
+        ),
+    }
+}
+
 /// Weave validated attachments into the outgoing turn text — the web peer of
 /// the IM `wrap_inbound` extra-attachment lines, emitting the SAME
 /// `[attachment image_path|file_path="…"]` grammar (shared helper, so the
-/// format every vendor session is taught to `Read` never drifts) plus a
-/// self-describing skill line. Pure aside from existence checks; returns a
-/// readable error string for the 400 path.
+/// format every vendor session is taught to `Read` never drifts) plus the
+/// per-vendor skill line ([`skill_attachment_line`]). Pure aside from
+/// existence checks; returns a readable error string for the 400 path.
 fn build_turn_text_with_attachments(
     text: &str,
     attachments: &[TurnAttachment],
     project_dir: &std::path::Path,
+    vendor: &str,
 ) -> Result<String, String> {
     use ccteam_im::transport::{attachment_line, AttachmentKind, ChannelAttachment};
     let uploads_root = project_dir.join(".ccteam").join("uploads");
@@ -739,13 +770,7 @@ fn build_turn_text_with_attachments(
                 if !md.is_file() {
                     return Err(format!("skill not installed in this project: {id}"));
                 }
-                // Self-describing imperative — vendor-generic: any agent can
-                // `Read` a markdown skill file and follow it; no reliance on a
-                // vendor-native skill loader.
-                lines.push(format!(
-                    "[skill \"{id}\" attached — read {} and follow it for this request]",
-                    md.display()
-                ));
+                lines.push(skill_attachment_line(vendor, id, &md));
             }
             other => return Err(format!("unknown attachment kind: {other}")),
         }
@@ -832,6 +857,7 @@ pub(crate) async fn handle_session_turn(
                 &form.text,
                 &form.attachments,
                 &resolved.project_dir,
+                &view.vendor,
             ) {
                 Ok(text) => text,
                 Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
@@ -2511,5 +2537,33 @@ mod tests {
         );
         assert_eq!(t.model.as_deref(), Some("kimi-k2"), "kimi keeps set_model");
         assert_eq!(t.effort, None, "kimi effort must be dropped");
+    }
+}
+
+#[cfg(test)]
+mod skill_line_tests {
+    use super::skill_attachment_line;
+    use std::path::Path;
+
+    /// The vendor-native invocation seam: claude names its Skill tool
+    /// (`/name`), codex gets the plaintext `$name` mention, and the ACP trio
+    /// (no native loader) keeps the neutral read-and-follow line.
+    #[test]
+    fn skill_line_renders_per_vendor_native_syntax() {
+        let md = Path::new("/p/.claude/skills/deep-research/SKILL.md");
+        let claude = skill_attachment_line("claude", "deep-research", md);
+        assert!(claude.contains("invoke /deep-research"), "{claude}");
+        assert!(claude.contains("SKILL.md"), "{claude}");
+
+        let codex = skill_attachment_line("codex", "deep-research", md);
+        assert!(codex.contains("$deep-research"), "{codex}");
+
+        for acp in ["grok", "opencode", "kimi"] {
+            let line = skill_attachment_line(acp, "deep-research", md);
+            assert!(
+                line.contains("read /p/.claude/skills/deep-research/SKILL.md and follow it"),
+                "{acp}: {line}"
+            );
+        }
     }
 }

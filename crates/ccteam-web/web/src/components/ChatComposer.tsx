@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  ChevronRight,
   FileText,
   Hand,
   Image as ImageIcon,
@@ -159,6 +160,7 @@ export function ChatComposer({
   const [text, setText] = useState(() => loadDraft(draftKey));
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const composingRef = useRef(false);
@@ -208,6 +210,7 @@ export function ChatComposer({
       if (target && attachRef.current?.contains(target)) return;
       setMenuOpen(false);
       setAttachOpen(false);
+      setSkillsOpen(false);
     };
     document.addEventListener("click", close);
     return () => document.removeEventListener("click", close);
@@ -273,16 +276,23 @@ export function ChatComposer({
       toastBus.handler?.info(t("attachNeedProject"));
       return;
     }
-    setAttachOpen((open) => {
+    setSkillsOpen(false);
+    setAttachOpen((open) => !open);
+  }, [uploadSlug, t]);
+
+  /** Expand/collapse the folded skills submenu; fetch the list lazily on
+   *  first expand (per project — the render-phase reset clears the cache). */
+  const toggleSkillsOpen = useCallback(() => {
+    setSkillsOpen((open) => {
       const next = !open;
-      if (next && skills === null) {
+      if (next && skills === null && uploadSlug) {
         listProjectSkills(uploadSlug)
           .then(setSkills)
           .catch(() => setSkills([]));
       }
       return next;
     });
-  }, [uploadSlug, skills, t]);
+  }, [skills, uploadSlug]);
 
   // ---- send ------------------------------------------------------------------
 
@@ -475,7 +485,11 @@ export function ChatComposer({
           >
             <Plus />
           </button>
-          <div className="sel-menu drop-up" style={{ minWidth: 260 }} data-testid="attach-menu">
+          <div
+            className="sel-menu drop-up attach-menu"
+            style={{ minWidth: 240 }}
+            data-testid="attach-menu"
+          >
             <button
               type="button"
               className="sel-item"
@@ -488,31 +502,44 @@ export function ChatComposer({
               <ImageIcon />
               {t("attachFiles")}
             </button>
-            <div className="sel-group">{t("attachSkillGroup")}</div>
-            {skills === null ? (
-              <div className="sel-item muted">…</div>
-            ) : skills.length === 0 ? (
-              <div className="sel-item muted">{t("noSkills")}</div>
-            ) : (
-              skills.map((s) => {
-                const on = attachments.some(
-                  (a) => a.kind === "skill" && a.name === s.skill,
-                );
-                return (
-                  <button
-                    key={s.skill}
-                    type="button"
-                    className={`sel-item ${on ? "selected" : ""}`}
-                    onClick={() => toggleSkill(s.skill)}
-                  >
-                    <Sparkles />
-                    {s.skill}
-                    {s.description ? <span className="sub">{s.description}</span> : null}
-                    <span className="check">✓</span>
-                  </button>
-                );
-              })
-            )}
+            {/* Skills fold into a collapsed submenu row (claude.ai-style
+                "Skills ›"); names only — the long model-trigger descriptions
+                stay off the menu (hover a name for the full text). */}
+            <button
+              type="button"
+              className="sel-item"
+              data-testid="attach-skills"
+              onClick={toggleSkillsOpen}
+            >
+              <Sparkles />
+              {t("attachSkillGroup")}
+              <ChevronRight className={`chev ${skillsOpen ? "open" : ""}`} />
+            </button>
+            {skillsOpen ? (
+              skills === null ? (
+                <div className="sel-item muted skill-row">…</div>
+              ) : skills.length === 0 ? (
+                <div className="sel-item muted skill-row">{t("noSkills")}</div>
+              ) : (
+                skills.map((s) => {
+                  const on = attachments.some(
+                    (a) => a.kind === "skill" && a.name === s.skill,
+                  );
+                  return (
+                    <button
+                      key={s.skill}
+                      type="button"
+                      className={`sel-item skill-row ${on ? "selected" : ""}`}
+                      onClick={() => toggleSkill(s.skill)}
+                      title={s.description || s.skill}
+                    >
+                      {s.skill}
+                      <span className="check">✓</span>
+                    </button>
+                  );
+                })
+              )
+            ) : null}
           </div>
         </div>
         <button

@@ -1125,13 +1125,48 @@ async fn skill_list_and_attach_names_skill_file_in_turn() {
         .map(|t| t.user.clone())
         .find(|u| !u.is_empty())
         .expect("user turn mirrored");
+    // Claude session → the vendor-native rendering names the Skill tool.
     assert!(
-        user_text.contains("[skill \"deep-research\" attached — read"),
-        "turn gains the read-and-follow skill line: {user_text}"
+        user_text.contains("invoke /deep-research"),
+        "claude turn names the native Skill tool invocation: {user_text}"
     );
     assert!(
         user_text.contains("SKILL.md"),
         "the line names the SKILL.md path: {user_text}"
+    );
+
+    // 3. Same neutral wire, codex session → the `$name` plaintext mention
+    //    (codex's TOOL_MENTION_SIGIL) rides the turn instead.
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "codex"}))
+        .send()
+        .await
+        .unwrap();
+    let codex_sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turned = client
+        .post(format!("{base}/sessions/{codex_sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "",
+            "attachments": [{"kind": "skill", "name": "deep-research"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned.status(), 202);
+    let turns =
+        ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &codex_sid).unwrap();
+    let user_text = turns
+        .iter()
+        .map(|t| t.user.clone())
+        .find(|u| !u.is_empty())
+        .expect("codex user turn mirrored");
+    assert!(
+        user_text.contains("$deep-research"),
+        "codex turn carries the native $name mention: {user_text}"
     );
 }
 

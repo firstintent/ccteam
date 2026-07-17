@@ -417,6 +417,18 @@ button { font-family: inherit; cursor: pointer; }
 @keyframes att-spin { to { transform: rotate(360deg); } }
 .sel-item.muted { color: var(--text-faint); cursor: default; }
 
+/* Attach menu (claude.ai-style): "Skills ›" folds the installed-skill names
+ * into a submenu; descriptions stay OFF the menu (hover a name for the full
+ * text via title). Cap the height so many skills scroll. */
+.attach-menu { max-height: 340px; overflow-y: auto; }
+.attach-menu .chev { margin-left: auto; width: 15px; height: 15px; color: var(--text-dim); transition: transform 0.12s ease; }
+.attach-menu .chev.open { transform: rotate(90deg); }
+.sel-item.skill-row {
+  padding-left: 37px; /* indent under the Skills row's icon column */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
+}
+.sel-item.skill-row .check { float: right; }
+
 .composer-row { display: flex; align-items: center; gap: 6px; }
 .composer-row .right { margin-left: auto; display: flex; align-items: center; gap: 6px; }
 
