@@ -21,10 +21,16 @@
 - **规格**:① 三场景真机 smoke(单机委派 / 跨 vendor / 卫星跨机),结果留痕 `docs-local/versions/`;② root README + `docs/usage.md` 把 A2A 融入当前能力描述(README 英文、不写版本时间轴,§三红线)。
 - **DoD**:三场景各一次全链路通过记录;docs-only 面走最低门(fmt + writeback);writeback 绿。
 
-### P1-1 codex turn 粒度折叠
+### FB-1 MCP 委派面反馈修复(通知=turn 边界 + 超时 + list 过滤 + token 账)
+- **状态**:完成(e96bf56) · **冲突域**:`crates/ccteam-im + crates/ccteam-harness(delegation/meta)` · **入口**:规划会话(owner 2026-07-18 直驱,Fable 5 亲自实现)
+- **背景**:owner 提交 excore 实测反馈(s69 codex 委派):P0×2(叙述逐条通知洪泛 / idle 停摆无信号,共同根因=通知单位是 assistant 消息而非任务)+ P1(collect/list 无超时整 turn 悬挂)+ P2×2(非 claude vendor 零落账 / session_list 无过滤全量灌上下文)。
+- **落地**:通知时机改 vendor turn 边界(pump 聚合中途叙述,`TurnCompleted/TurnFailed/Error` 才发,文案明示 child 已 idle+折叠计数);`notify: final(默认)/all/off`(bool 兼容);wait 等真边界不被叙述提前结束;session_* 全带服务端超时;ACP 也 mirror `chat_turn_completed` + meta `tokens_total`;list 加 `project/activity/limit` + 行瘦身 + task 首行派生 title;重启 reconcile 卷总。
+- **验证**:lib 基线 1435→1447/0;clippy 0;web 与 origin/main 同基线(3 `ws_*` env-flake 族不变);+12 定向测试(边界折叠 e2e / all·off 模式 / dedup 重放 / reconcile 卷总 / wait-vs-叙述 / list 过滤 / 派生 title / NotifyMode wire / 旧 bool watch 兼容);writeback 绿。未部署(tag+部署 HELD 不变)。
+
+### P1-1 codex turn 粒度折叠(范围已缩:仅记账/展示面)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(codex adapter)` · **建议入口**:dev 会话
-- **背景**:codex 叙述消息被当独立 turn 记账/展示,应折叠进所属 turn(v0.9.2 遗留 P1)。坐标开工时核现值。
-- **规格**:折叠 codex 叙述消息进所属 turn;不改 `CanonicalEvent` schema 语义(schema 权威 = `harness/progress_bridge`)。
+- **背景**:codex 叙述消息被当独立 turn 记账/展示(v0.9.2 遗留 P1)。**通知面已由 FB-1(e96bf56)按 turn 边界修复**;本卡余量 = turns.jsonl/展示侧的叙述折叠是否仍值得做,开工时先核现值再定。
+- **规格**:折叠 codex 叙述消息进所属 turn(记账/展示);不改 `CanonicalEvent` schema 语义(schema 权威 = `harness/progress_bridge`)。
 - **DoD**:新定向测试先造缺陷态红、后修绿(证有牙,留痕验证段);`make test` 基线只增;writeback 绿。
 
 ### P1-2 session_collect 游标去重

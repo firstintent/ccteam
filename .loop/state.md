@@ -7,13 +7,13 @@
 
 ## 当前焦点
 
-- **版本线**:workspace `0.9.5` 已落 `main`(kimi-code 第五 vendor harness,d9e32e8 + 规划收口),**未 tag、未部署**。
-- **在做**:A2A-W5(三场景真机 smoke + README/usage 重写);P1-1/2/3 + P1-4/P2-1 待排 —— 队列 = `.loop/backlog.md`。
+- **版本线**:workspace `0.9.5` 已落 `main`(kimi-code 第五 vendor harness,d9e32e8 + 规划收口 + **FB-1 委派面反馈修复 e96bf56**:通知=turn 边界/notify 三模式/工具超时/list 过滤/tokens_total),**未 tag、未部署**。
+- **在做**:A2A-W5(三场景真机 smoke + README/usage 重写);P1-1(缩范围)/2/3 + P1-4/P2-1 待排 —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1435/0**(v0.9.5 + web 附件/技能附加,+2 core `list_skills`)
+- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1447/0**(FB-1 +12:委派通知边界/notify 模式/list 过滤/wait 边界等定向测试)
 - `ccteam-web` 全量 **320**(本机 317 过 + 3 `ws_*` env-flake,干净环境应全绿;+4 sessions_api e2e +2 lib)· vitest **388**(SPA,+10)· Playwright **7**
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
