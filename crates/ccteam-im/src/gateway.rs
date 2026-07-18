@@ -343,8 +343,9 @@ pub struct Gateway {
 struct DelegationMirror {
     /// sid of the session to notify on a watched turn (the dispatcher).
     parent_sid: String,
-    /// Whether completion delivers a notification turn (`false` = ledger-only).
-    notify: bool,
+    /// When completion delivers a notification turn — `final` (turn boundary
+    /// only, default) / `all` (every mirrored message) / `off` (ledger-only).
+    notify: ccteam_harness::NotifyMode,
     /// Optional dispatch label (ledger/notification only — never a prompt).
     title: Option<String>,
     /// Project slug hosting the child's `delegation.json` + `turns.jsonl`.
@@ -682,6 +683,12 @@ pub struct SessionView {
     /// when no turn has priced yet (never a faked `0.0`).
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// v0.9.5 feedback fix — accrued raw token count from `meta.json`
+    /// (`tokens_total`): the honest ledger number for vendors with no USD
+    /// price table. `None` when no turn reported usage. `#[serde(default)]`
+    /// keeps older clients tolerant.
+    #[serde(default)]
+    pub tokens_total: Option<u64>,
     /// v0.8.23 review §1.3-D item 9 — true when a HITL approval is currently
     /// outstanding for this sid ([`crate::pending::PendingInteractions::pending_for_sid`]).
     /// Drives the "等待批准" attention badge (web rail/history rows) and the
@@ -3334,6 +3341,7 @@ impl Gateway {
                 title_source: None,
                 turn_count: 0,
                 cost_usd: None,
+                tokens_total: None,
                 role_sha,
                 skills_sha,
                 trigger: Some(trigger),
@@ -3690,6 +3698,16 @@ impl Gateway {
             // v0.9 T5 — baseline activity_events at the start of each turn
             // (approximation for signals.tool_calls).
             let mut activity_at_turn_start: Option<u64> = None;
+            // v0.9.5 feedback fix — delegation notifications fire on the VENDOR
+            // TURN boundary, not per mirrored assistant message (codex narrates
+            // checkpoints as separate messages inside one turn; per-message
+            // notification floods the parent's context). Track, within the
+            // current vendor turn: the latest mirrored (turn_id, text) — the
+            // boundary's final answer — plus every mirrored turn id (batch
+            // dedup bookkeeping) and the interim count.
+            let mut turn_last_answer: Option<(String, String)> = None;
+            let mut turn_covered: Vec<String> = Vec::new();
+            let mut turn_notes: usize = 0;
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog,
             // folded from a detached per-turn `tokio::spawn` into THIS
             // per-session pump's own `tokio::select!` loop (one fewer task per
@@ -3908,15 +3926,46 @@ impl Gateway {
                                     );
                                 }
                             }
+
+                            // v0.9.5 feedback fix — the vendor turn is DONE and
+                            // the child is idle: flush ONE boundary signal
+                            // carrying the turn's final answer (the last
+                            // mirrored message) + the whole turn's mirrored ids
+                            // for batch dedup. Interim messages already flowed
+                            // as non-boundary signals (an `all` watch consumes
+                            // those); the default `final` watch notifies here
+                            // and ONLY here.
+                            let finished = turn_last_answer.take();
+                            let covered = std::mem::take(&mut turn_covered);
+                            let notes = turn_notes;
+                            turn_notes = 0;
+                            if let (Some(dtx), Some((final_turn, final_text))) =
+                                (delegation_tx.as_ref(), finished)
+                            {
+                                let _ = dtx.send(crate::delegation::DelegationSignal {
+                                    child_sid: session_id.clone(),
+                                    turn_id: final_turn,
+                                    tail: final_text,
+                                    vendor: pump_vendor,
+                                    host: pump_host.clone(),
+                                    boundary: true,
+                                    interim_notes: notes.saturating_sub(1),
+                                    covered_turns: covered,
+                                });
+                            }
                         }
-                        // v0.8.11 E4 — for a stream-json session (no hooks), the
-                        // pump mirrors each completed turn to progress.jsonl with
-                        // the sid, so the session-list activity classifier (which
-                        // keys off the latest sid-tagged event) sees it as active
-                        // and `last_activity_seconds` tracks. Tmux sessions get
-                        // this from their Stop hook → gate on protocol to avoid a
-                        // double-write.
-                        if session.protocol.is_stream_json() {
+                        // v0.8.11 E4 — for a paneless session (no hooks:
+                        // stream-json AND acp), the pump mirrors each completed
+                        // turn to progress.jsonl with the sid, so the
+                        // session-list activity classifier (which keys off the
+                        // latest sid-tagged event) sees it as active and
+                        // `last_activity_seconds` tracks — and the per-session
+                        // cost/token accounting has its `usage` row for EVERY
+                        // vendor (v0.9.5 feedback: codex/grok/opencode/kimi
+                        // sessions previously never accrued a ledger row on the
+                        // acp path). Tmux sessions get this from their Stop
+                        // hook → gate on protocol to avoid a double-write.
+                        if !session.protocol.is_terminal() {
                             if let (
                                 ThreadEvent::TurnCompleted {
                                     turn_id,
@@ -3999,14 +4048,56 @@ impl Gateway {
                                         // after a notification is guaranteed to see
                                         // this turn. Fire-and-forget; the notifier
                                         // filters non-watched sids.
-                                        if let Some(dtx) = delegation_tx.as_ref() {
-                                            let _ = dtx.send(crate::delegation::DelegationSignal {
-                                                child_sid: session_id.clone(),
-                                                turn_id: record.turn_id.clone(),
-                                                tail: text.clone(),
-                                                vendor: pump_vendor,
-                                                host: pump_host.clone(),
-                                            });
+                                        //
+                                        // v0.9.5 feedback fix — notification unit =
+                                        // the TASK: a TurnFailed/Error text IS the
+                                        // turn boundary (flush immediately, folding
+                                        // any interim notes); an ordinary assistant
+                                        // message flows as an interim signal (only
+                                        // an `all` watch notifies) and is remembered
+                                        // as the boundary candidate flushed on
+                                        // `TurnCompleted` above.
+                                        let is_boundary_evt = matches!(
+                                            &evt,
+                                            ThreadEvent::TurnFailed { .. }
+                                                | ThreadEvent::Error(_)
+                                        );
+                                        turn_covered.push(record.turn_id.clone());
+                                        if is_boundary_evt {
+                                            let notes = turn_notes;
+                                            turn_notes = 0;
+                                            turn_last_answer = None;
+                                            let covered = std::mem::take(&mut turn_covered);
+                                            if let Some(dtx) = delegation_tx.as_ref() {
+                                                let _ = dtx.send(crate::delegation::DelegationSignal {
+                                                    child_sid: session_id.clone(),
+                                                    turn_id: record.turn_id.clone(),
+                                                    tail: text.clone(),
+                                                    vendor: pump_vendor,
+                                                    host: pump_host.clone(),
+                                                    boundary: true,
+                                                    interim_notes: notes,
+                                                    covered_turns: covered,
+                                                });
+                                            }
+                                        } else {
+                                            turn_notes = turn_notes.saturating_add(1);
+                                            turn_last_answer = Some((
+                                                record.turn_id.clone(),
+                                                text.clone(),
+                                            ));
+                                            if let Some(dtx) = delegation_tx.as_ref() {
+                                                let _ = dtx.send(crate::delegation::DelegationSignal {
+                                                    child_sid: session_id.clone(),
+                                                    turn_id: record.turn_id.clone(),
+                                                    tail: text.clone(),
+                                                    vendor: pump_vendor,
+                                                    host: pump_host.clone(),
+                                                    boundary: false,
+                                                    interim_notes: 0,
+                                                    covered_turns: vec![record.turn_id.clone()],
+                                                });
+                                            }
                                         }
                                     }
                                     Err(err) => {
@@ -5995,6 +6086,7 @@ impl Gateway {
                 let title = meta.as_ref().and_then(|m| m.title.clone());
                 let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
                 let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
+                let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
                 // v0.8.23 review item 9 — best-effort (never blocks): a
                 // `try_lock` failure (rare, momentary registry contention)
                 // just reports "not waiting" for this one snapshot rather
@@ -6024,6 +6116,7 @@ impl Gateway {
                     title,
                     turn_count,
                     cost_usd,
+                    tokens_total,
                     waiting_approval,
                     parent_sid: s.parent_sid.clone(),
                     delegation_depth: s.delegation_depth,
@@ -6178,6 +6271,7 @@ impl Gateway {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            tokens_total: None,
             // Roleless adoption → no role file; still snapshot project skills.
             role_sha: None,
             skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
@@ -6910,6 +7004,23 @@ impl Gateway {
             .map(|s| (s.vendor, s.host.clone(), s.project.clone()))
     }
 
+    /// v0.9.5 feedback fix — is `sid`'s vendor turn still in flight? Reads the
+    /// same `turn_started_at` cell the submit path sets and the pump clears on
+    /// `TurnCompleted` (protocol-independent). `false` for an unknown sid. A
+    /// `wait_seconds` dispatch uses this to keep waiting past interim assistant
+    /// messages (codex narrates mid-turn) until the TASK actually finishes.
+    pub fn session_turn_in_flight(&self, sid: &str) -> bool {
+        self.sessions
+            .get(sid)
+            .map(|s| {
+                s.turn_started_at
+                    .lock()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// v0.9.0 W2 (F2/F7) — arm/refresh the durable completion watch for a child
     /// after a dispatch: writes `<project>/.ccteam/chat/<child>/delegation.json`
     /// (atomic-durable) + the in-memory mirror. A re-dispatch UPDATES
@@ -6921,7 +7032,7 @@ impl Gateway {
         &mut self,
         child_sid: &str,
         parent_sid: &str,
-        notify: bool,
+        notify: ccteam_harness::NotifyMode,
         title: Option<String>,
         dispatched_turn: Option<String>,
     ) -> bool {
@@ -7002,35 +7113,69 @@ impl Gateway {
         &mut self,
         signal: crate::delegation::DelegationSignal,
     ) {
+        use ccteam_harness::NotifyMode;
         let child = signal.child_sid.clone();
         // Hot-path gate: no mirror entry ⇒ not a watched child ⇒ nothing to do.
         let Some(mirror) = self.delegations.get(&child).cloned() else {
             return;
         };
-        // Dedup: this exact turn was already handled (crash-safe at-most-once).
-        if mirror.notified_turns.iter().any(|t| t == &signal.turn_id) {
+        // v0.9.5 feedback fix — interim messages (a still-running vendor turn)
+        // only concern an `all` watch; the default `final` mode drops them here
+        // (they stay in the ledger) so a chatty child can NEVER flood its
+        // parent's context or hold the notifier busy.
+        if !signal.boundary && mirror.notify != NotifyMode::All {
             return;
         }
-        // A watched turn completed (regardless of notify).
-        self.emit_delegation_progress(
-            &mirror.slug,
-            ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
-            &mirror.parent_sid,
-            &child,
-            signal.vendor,
-            &signal.host,
-            Some(&signal.turn_id),
-            mirror.title.as_deref(),
-            None,
-        );
-        if mirror.notify {
-            let text = crate::delegation::build_notification_text(
+        // Dedup: this exact delivery was already handled (crash-safe
+        // at-most-once). A boundary uses a distinct `{turn_id}#final` key so an
+        // `all` watch still gets its idle wake-up after the same turn's interim
+        // notification.
+        let dedup_key = if signal.boundary {
+            crate::delegation::final_dedup_key(&signal.turn_id)
+        } else {
+            signal.turn_id.clone()
+        };
+        if mirror.notified_turns.iter().any(|t| t == &dedup_key) {
+            return;
+        }
+        // The watched TASK completed (turn boundary; regardless of notify).
+        if signal.boundary {
+            self.emit_delegation_progress(
+                &mirror.slug,
+                ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
+                &mirror.parent_sid,
                 &child,
                 signal.vendor,
+                &signal.host,
+                Some(&signal.turn_id),
                 mirror.title.as_deref(),
-                &signal.turn_id,
-                &signal.tail,
+                None,
             );
+        }
+        let should_notify = match mirror.notify {
+            NotifyMode::Final => signal.boundary,
+            NotifyMode::All => true,
+            NotifyMode::Off => false,
+        };
+        if should_notify {
+            let text = if signal.boundary {
+                crate::delegation::build_notification_text(
+                    &child,
+                    signal.vendor,
+                    mirror.title.as_deref(),
+                    &signal.turn_id,
+                    &signal.tail,
+                    signal.interim_notes,
+                )
+            } else {
+                crate::delegation::build_interim_notification_text(
+                    &child,
+                    signal.vendor,
+                    mirror.title.as_deref(),
+                    &signal.turn_id,
+                    &signal.tail,
+                )
+            };
             match self.submit_to_sid(&mirror.parent_sid, text).await {
                 Ok(_) => {
                     self.emit_delegation_progress(
@@ -7053,9 +7198,18 @@ impl Gateway {
                 }
             }
         }
-        // Record the turn as handled — mirror (hot path) + durable delegation.json.
+        // Record the delivery as handled — mirror (hot path) + durable
+        // delegation.json. A boundary batch-records every turn id it covered
+        // (the folded interim messages) so a daemon-restart reconcile never
+        // re-delivers them.
+        let mut to_record: Vec<String> = signal.covered_turns.clone();
+        to_record.push(dedup_key);
         if let Some(m) = self.delegations.get_mut(&child) {
-            m.notified_turns.push(signal.turn_id.clone());
+            for id in &to_record {
+                if !m.notified_turns.iter().any(|t| t == id) {
+                    m.notified_turns.push(id.clone());
+                }
+            }
         }
         let mut watch = ccteam_harness::read_delegation_watch(&mirror.project_dir, &child)
             .unwrap_or_else(|| {
@@ -7066,8 +7220,10 @@ impl Gateway {
                     None,
                 )
             });
-        if !watch.notified_turns.iter().any(|t| t == &signal.turn_id) {
-            watch.notified_turns.push(signal.turn_id.clone());
+        for id in &to_record {
+            if !watch.notified_turns.iter().any(|t| t == id) {
+                watch.notified_turns.push(id.clone());
+            }
         }
         if let Err(e) = ccteam_harness::write_delegation_watch(&mirror.project_dir, &child, &watch)
         {
@@ -7127,19 +7283,34 @@ impl Gateway {
                         notified_turns: watch.notified_turns.clone(),
                     },
                 ));
-                let turns =
+                // v0.9.5 feedback fix — a restart reconcile folds ALL missed
+                // turns into ONE boundary signal (latest text wins, earlier
+                // ones counted as interim notes): after a daemon restart the
+                // child is idle by construction (its process died with the
+                // daemon), so the "task finished / child idle" shape is the
+                // honest one — and a chatty child can't flood the parent with
+                // a backlog replay. Covered ids batch-record so a second
+                // reconcile delivers nothing.
+                let missed: Vec<_> =
                     ccteam_harness::execution::turns_mirror::read_all_turns(dir, &child_sid)
-                        .unwrap_or_default();
-                for t in turns.into_iter().filter(|t| !t.assistant.is_empty()) {
-                    if !watch.notified_turns.iter().any(|n| n == &t.turn_id) {
-                        pending.push(crate::delegation::DelegationSignal {
-                            child_sid: child_sid.clone(),
-                            turn_id: t.turn_id,
-                            tail: t.assistant,
-                            vendor,
-                            host: host.clone(),
-                        });
-                    }
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|t| {
+                            !t.assistant.is_empty()
+                                && !watch.notified_turns.iter().any(|n| n == &t.turn_id)
+                        })
+                        .collect();
+                if let Some(last) = missed.last() {
+                    pending.push(crate::delegation::DelegationSignal {
+                        child_sid: child_sid.clone(),
+                        turn_id: last.turn_id.clone(),
+                        tail: last.assistant.clone(),
+                        vendor,
+                        host: host.clone(),
+                        boundary: true,
+                        interim_notes: missed.len().saturating_sub(1),
+                        covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
+                    });
                 }
             }
         }
@@ -7620,24 +7791,38 @@ fn refresh_session_activity_meta(
         .map(|turns| turns.len() as u64)
         .unwrap_or(meta.turn_count);
     if let Some(path) = progress_path {
-        meta.cost_usd = session_cost_usd(path, sid, vendor);
+        let (cost_usd, tokens_total) = session_cost_and_tokens(path, sid, vendor);
+        meta.cost_usd = cost_usd;
+        meta.tokens_total = tokens_total;
     }
     let _ = write_session_meta(project_dir, &meta);
 }
 
-/// Sum the deterministic per-turn cost of every `chat_turn_completed` event in
-/// `progress_path` tagged with `sid`, pricing each turn's `usage` against its
-/// own canonical `model` via [`ccteam_cost::estimate_cost`] — mirrors
-/// `ccteam-web`'s `status::build_session_cost_rows`, scoped to one sid so it
-/// can run from the harness-side pump (which has no access to that
-/// web-layer helper). `None` when nothing priced yet (never a faked `0.0`);
-/// a turn whose model is absent/not in the pricing table is silently skipped
-/// (no fallback to a wrong rate — same honesty contract as the status route).
-fn session_cost_usd(progress_path: &Path, sid: &str, vendor: AgentVendor) -> Option<f64> {
-    let events = ccteam_core::progress::read_all_events(progress_path).ok()?;
+/// Sum the deterministic per-turn cost AND raw token count of every
+/// `chat_turn_completed` event in `progress_path` tagged with `sid`, pricing
+/// each turn's `usage` against its own canonical `model` via
+/// [`ccteam_cost::estimate_cost`] — mirrors `ccteam-web`'s
+/// `status::build_session_cost_rows`, scoped to one sid so it can run from the
+/// harness-side pump (which has no access to that web-layer helper). `None`
+/// when nothing priced/counted yet (never a faked `0.0`); a turn whose model
+/// is absent/not in the pricing table is silently skipped from the COST sum
+/// (no fallback to a wrong rate — same honesty contract as the status route)
+/// but still counted into `tokens_total` — the v0.9.5 feedback fix: a vendor
+/// with no price table (codex/grok/opencode/kimi) at least accrues an honest
+/// token ledger instead of a permanently-null row.
+fn session_cost_and_tokens(
+    progress_path: &Path,
+    sid: &str,
+    vendor: AgentVendor,
+) -> (Option<f64>, Option<u64>) {
+    let Ok(events) = ccteam_core::progress::read_all_events(progress_path) else {
+        return (None, None);
+    };
     let cost_vendor = vendor.cost_vendor();
     let mut total = 0.0_f64;
     let mut priced = 0usize;
+    let mut tokens = 0u64;
+    let mut counted = 0usize;
     for ev in &events {
         if ev.get("event").and_then(|v| v.as_str())
             != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
@@ -7653,13 +7838,20 @@ fn session_cost_usd(progress_path: &Path, sid: &str, vendor: AgentVendor) -> Opt
         else {
             continue;
         };
+        if usage.total() > 0 {
+            tokens = tokens.saturating_add(usage.total());
+            counted += 1;
+        }
         let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(cost) = ccteam_cost::estimate_cost(&usage, cost_vendor, model) {
             total += cost;
             priced += 1;
         }
     }
-    (priced > 0).then_some(total)
+    (
+        (priced > 0).then_some(total),
+        (counted > 0).then_some(tokens),
+    )
 }
 
 /// The synthetic chat key used by the network resource API (W5b) as the
@@ -12974,6 +13166,7 @@ mod tests {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            tokens_total: None,
             role_sha: None,
             skills_sha: None,
             trigger: None,
@@ -15447,7 +15640,11 @@ mod tests {
                 + Send
                 + Sync,
         > = Arc::new(|vendor, _protocol| {
-            Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
+            // `with_turn_boundary` mirrors every REAL adapter (all five emit
+            // `TurnCompleted`) — required since v0.9.5: the delegation
+            // notification fires on the turn boundary, not per answer.
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
         });
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
         gw.register_project("alpha", project_dir);
@@ -15517,7 +15714,7 @@ mod tests {
             gw.arm_delegation_watch(
                 &child_sid,
                 &parent_sid,
-                true,
+                ccteam_harness::NotifyMode::Final,
                 Some("research task".into()),
                 None,
             );
@@ -15550,6 +15747,265 @@ mod tests {
                 .iter()
                 .any(|t| t.assistant.contains("echo: do the research")),
             "child turn is durably appended BEFORE the notification (read-your-writes)"
+        );
+    }
+
+    /// Count the `[ccteam]` notification turns delivered to `sid`.
+    fn ccteam_notification_turns(
+        project_dir: &std::path::Path,
+        sid: &str,
+    ) -> Vec<ccteam_harness::execution::turns_mirror::TurnRecord> {
+        ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .collect()
+    }
+
+    /// v0.9.5 feedback fix (P0) — a codex-shaped chatty child (several
+    /// mirrored assistant messages inside ONE vendor turn) must produce
+    /// exactly ONE notification for the default `final` watch: at the turn
+    /// boundary, explicitly marked idle, folding the interim count. Interim
+    /// signals must not notify; a replayed boundary must dedup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_final_mode_notifies_once_per_turn_and_marks_idle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    Some("long wave".into()),
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("long wave".into()),
+                None,
+            );
+            (parent, child)
+        };
+
+        let interim = |n: u32| crate::delegation::DelegationSignal {
+            child_sid: child_sid.clone(),
+            turn_id: format!("{child_sid}-{n}"),
+            tail: format!("narration checkpoint {n}"),
+            vendor: AgentVendor::Codex,
+            host: "local".into(),
+            boundary: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child_sid}-{n}")],
+        };
+        // Three interim narration messages inside the running turn → silence.
+        {
+            let mut gw = gateway.lock().await;
+            for n in 1..=3 {
+                gw.deliver_delegation_signal(interim(n)).await;
+            }
+        }
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent_sid).is_empty(),
+            "interim narration must NOT wake a `final` watch"
+        );
+
+        // The vendor turn boundary → exactly one notification, marked idle.
+        let boundary = crate::delegation::DelegationSignal {
+            child_sid: child_sid.clone(),
+            turn_id: format!("{child_sid}-4"),
+            tail: "wave finished: 3 cards done".into(),
+            vendor: AgentVendor::Codex,
+            host: "local".into(),
+            boundary: true,
+            interim_notes: 3,
+            covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
+        };
+        gateway
+            .lock()
+            .await
+            .deliver_delegation_signal(boundary.clone())
+            .await;
+        let notes = ccteam_notification_turns(&project_dir, &parent_sid);
+        assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
+        assert!(
+            notes[0]
+                .user
+                .contains("is now IDLE, waiting for the next dispatch"),
+            "notification states the child went idle: {}",
+            notes[0].user
+        );
+        assert!(
+            notes[0].user.contains("3 interim note(s)"),
+            "notification folds the interim count: {}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains("wave finished: 3 cards done"));
+
+        // Replay (at-least-once upstream) → deduped, still one notification.
+        gateway
+            .lock()
+            .await
+            .deliver_delegation_signal(boundary)
+            .await;
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            1,
+            "boundary replay must dedup"
+        );
+    }
+
+    /// v0.9.5 feedback fix — an `all` watch still gets the per-message
+    /// firehose (labeled still-working) PLUS the idle boundary wake-up; an
+    /// `off` watch gets nothing while `delegation_completed` still lands in
+    /// progress.jsonl at the boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_all_and_off_modes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(&child, &parent, ccteam_harness::NotifyMode::All, None, None);
+            (parent, child)
+        };
+
+        let signal = |n: u32, boundary: bool| crate::delegation::DelegationSignal {
+            child_sid: child_sid.clone(),
+            turn_id: format!("{child_sid}-{n}"),
+            tail: format!("message {n}"),
+            vendor: AgentVendor::Codex,
+            host: "local".into(),
+            boundary,
+            interim_notes: if boundary { n as usize - 1 } else { 0 },
+            covered_turns: vec![format!("{child_sid}-{n}")],
+        };
+        {
+            let mut gw = gateway.lock().await;
+            gw.deliver_delegation_signal(signal(1, false)).await;
+            gw.deliver_delegation_signal(signal(2, false)).await;
+            // Boundary carries the same turn_id as the last interim (the
+            // final answer IS the last mirrored message) — the distinct
+            // `#final` dedup key must still let the idle wake-up through.
+            let mut b = signal(2, true);
+            b.interim_notes = 1;
+            gw.deliver_delegation_signal(b).await;
+        }
+        let notes = ccteam_notification_turns(&project_dir, &parent_sid);
+        assert_eq!(notes.len(), 3, "all-mode: 2 interim + 1 boundary");
+        assert!(notes[0].user.contains("still WORKING, no action needed"));
+        assert!(notes[1].user.contains("still WORKING, no action needed"));
+        assert!(notes[2].user.contains("is now IDLE"));
+
+        // `off` mode: nothing notifies, but the boundary still lands
+        // delegation_completed in progress.jsonl.
+        let (parent2, child2) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(&child, &parent, ccteam_harness::NotifyMode::Off, None, None);
+            (parent, child)
+        };
+        {
+            let mut gw = gateway.lock().await;
+            gw.deliver_delegation_signal(crate::delegation::DelegationSignal {
+                child_sid: child2.clone(),
+                turn_id: format!("{child2}-1"),
+                tail: "done".into(),
+                vendor: AgentVendor::Codex,
+                host: "local".into(),
+                boundary: true,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child2}-1")],
+            })
+            .await;
+        }
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent2).is_empty(),
+            "off-mode must never notify"
         );
     }
 
@@ -15779,7 +16235,7 @@ mod tests {
             child_sid,
             &ccteam_harness::DelegationWatch::armed(
                 &parent_sid,
-                true,
+                ccteam_harness::NotifyMode::Final,
                 Some("research".into()),
                 Some(format!("{child_sid}-1")),
             ),
@@ -15818,6 +16274,92 @@ mod tests {
             count_notifications(&project_dir, &parent_sid),
             1,
             "a second reconcile is a no-op (exactly-once)"
+        );
+    }
+
+    /// v0.9.5 feedback fix — a restart reconcile FOLDS a chatty child's missed
+    /// backlog (N un-notified turns) into ONE idle-marked notification carrying
+    /// the latest text, instead of replaying the narration turn by turn; a
+    /// second reconcile stays a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_reconcile_folds_missed_backlog_into_one_notification() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s98";
+        for n in 1..=3 {
+            append_turn(
+                &project_dir,
+                child_sid,
+                &TurnRecord {
+                    turn_id: format!("{child_sid}-{n}"),
+                    ts: chrono::Utc::now(),
+                    vendor: "codex".into(),
+                    role: String::new(),
+                    user: String::new(),
+                    assistant: format!("checkpoint {n}"),
+                    usage: serde_json::Value::Null,
+                    tool_calls: vec![],
+                },
+            )
+            .unwrap();
+        }
+        ccteam_harness::write_delegation_watch(
+            &project_dir,
+            child_sid,
+            &ccteam_harness::DelegationWatch::armed(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Final,
+                None,
+                Some(format!("{child_sid}-1")),
+            ),
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let notifications = |dir: &std::path::Path, psid: &str| {
+            read_all_turns(dir, psid)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .collect::<Vec<_>>()
+        };
+        let mut got: Vec<TurnRecord> = vec![];
+        for _ in 0..200 {
+            got = notifications(&project_dir, &parent_sid);
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(got.len(), 1, "backlog folds into ONE notification");
+        assert!(
+            got[0].user.contains("checkpoint 3"),
+            "the folded notification carries the LATEST text: {}",
+            got[0].user
+        );
+        assert!(got[0].user.contains("2 interim note(s)"));
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            notifications(&project_dir, &parent_sid).len(),
+            1,
+            "a second reconcile is a no-op (covered turns all recorded)"
         );
     }
 

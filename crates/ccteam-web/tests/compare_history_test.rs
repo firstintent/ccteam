@@ -72,6 +72,7 @@ fn meta(
         title_source: None,
         turn_count: 1,
         cost_usd: cost,
+        tokens_total: None,
         role_sha: None,
         skills_sha: None,
         trigger: Some("compare".into()),

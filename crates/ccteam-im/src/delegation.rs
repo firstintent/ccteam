@@ -14,14 +14,25 @@ use ccteam_core::CcteamPaths;
 use ccteam_harness::AgentVendor;
 
 /// The pump signals the delegation notifier after it durably appends a child's
-/// completed turn. The notifier (which owns a `GatewayHandle`) then checks the
-/// child's watch and, if armed + not-yet-notified, submits the notification to
-/// the parent. Carries the exact `turn_id` the pump wrote so dedup is precise.
+/// assistant message. The notifier (which owns a `GatewayHandle`) then checks
+/// the child's watch and, per its [`ccteam_harness::NotifyMode`], submits the
+/// notification to the parent. Carries the exact `turn_id` the pump wrote so
+/// dedup is precise.
+///
+/// Two shapes flow on this channel (v0.9.5 feedback fix — the notification
+/// unit is the TASK, not each mirrored message):
+/// - `boundary: false` — an interim assistant message inside a still-running
+///   vendor turn (codex narrates checkpoints this way). Only an `all` watch
+///   ever notifies on these.
+/// - `boundary: true` — the vendor turn finished (`TurnCompleted` /
+///   `TurnFailed` / `Error`): the child is now IDLE, waiting for the next
+///   dispatch. This is the default (`final`) notification point.
 #[derive(Debug, Clone)]
 pub struct DelegationSignal {
-    /// The child session whose turn just completed.
+    /// The child session whose message/turn just completed.
     pub child_sid: String,
-    /// The exact turn id the pump durably appended (the dedup key).
+    /// The mirrored turn id carrying this signal's `tail` (the dedup key;
+    /// for a boundary signal this is the turn holding the FINAL answer).
     pub turn_id: String,
     /// Full assistant text. The notification builder applies its own bounded
     /// head/tail excerpt; the durable session ledger retains this verbatim.
@@ -30,6 +41,23 @@ pub struct DelegationSignal {
     pub vendor: AgentVendor,
     /// The child's host (`local` or a satellite id).
     pub host: String,
+    /// True = the vendor turn boundary (child idle); false = interim message.
+    pub boundary: bool,
+    /// Interim assistant messages that preceded this boundary within the same
+    /// vendor turn (0 for interim signals and single-message turns).
+    pub interim_notes: usize,
+    /// Every mirrored turn id this signal covers (self included). On a
+    /// boundary these are recorded into `notified_turns` in one batch so a
+    /// daemon-restart reconcile never re-delivers folded interim messages.
+    pub covered_turns: Vec<String>,
+}
+
+/// The `notified_turns` key recording that a turn's BOUNDARY notification was
+/// handled. Distinct from the plain turn-id key (used by interim/`all`
+/// notifications) so an `all`-mode watch still gets its "task finished, child
+/// idle" wake-up after having been notified of the same turn's text.
+pub fn final_dedup_key(turn_id: &str) -> String {
+    format!("{turn_id}#final")
 }
 
 /// Result of a Unicode-safe character cap.
@@ -110,12 +138,51 @@ pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
     )
 }
 
-/// Build the completion-notification text delivered to the parent. English,
-/// `[ccteam]`-prefixed, names the child sid + vendor + optional title + turn
-/// id, includes a truncated tail, and hints at `session_collect` for the full
-/// output. This is a routed user-role message (NOT a system-prompt injection);
-/// `title` is a label only.
+/// Build the task-completion notification delivered to the parent when the
+/// child's vendor turn finishes. English, `[ccteam]`-prefixed, names the child
+/// sid + vendor + optional title + turn id, includes a truncated final answer,
+/// and — the v0.9.5 feedback fix — states EXPLICITLY that the child is now
+/// idle and waiting, so a parent can always tell "task done / child stopped"
+/// from mere progress narration. This is a routed user-role message (NOT a
+/// system-prompt injection); `title` is a label only.
 pub fn build_notification_text(
+    child_sid: &str,
+    vendor: AgentVendor,
+    title: Option<&str>,
+    turn_id: &str,
+    assistant_text: &str,
+    interim_notes: usize,
+) -> String {
+    let label = title
+        .filter(|t| !t.is_empty())
+        .map(|t| format!(" \"{t}\""))
+        .unwrap_or_default();
+    let excerpt = truncate_head_tail_with_marker(
+        assistant_text.trim(),
+        NOTIFICATION_ANSWER_MAX_CHARS,
+        |omitted| full_answer_marker(omitted, child_sid),
+    );
+    let folded = if interim_notes > 0 {
+        format!(
+            " {interim_notes} interim note(s) from this turn stayed in the ledger \
+             (session_collect{{sid:{child_sid}}} pages the full trail)."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "[ccteam] delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
+         --- final answer ---\n{}\n\
+         (child is idle: if the task is not actually finished, follow up with session_dispatch{{sid:{child_sid}, task:…}}; run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
+        vendor_key(vendor),
+        excerpt.text,
+    )
+}
+
+/// Build the interim-note notification (an `all`-mode watch only): the child
+/// posted an assistant message but its vendor turn is STILL RUNNING — labeled
+/// so the parent can safely skim it without mistaking it for completion.
+pub fn build_interim_notification_text(
     child_sid: &str,
     vendor: AgentVendor,
     title: Option<&str>,
@@ -132,9 +199,8 @@ pub fn build_notification_text(
         |omitted| full_answer_marker(omitted, child_sid),
     );
     format!(
-        "[ccteam] delegated session {child_sid} ({}{label}) completed turn {turn_id}.\n\
-         --- answer ---\n{}\n\
-         (run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
+        "[ccteam] delegated session {child_sid} ({}{label}) posted an interim note (turn {turn_id}) — still WORKING, no action needed.\n\
+         --- note ---\n{}",
         vendor_key(vendor),
         excerpt.text,
     )
@@ -384,13 +450,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notification_text_shape() {
-        let t = build_notification_text("s7", AgentVendor::Grok, Some("research"), "s7-3", "hello");
-        assert!(
-            t.starts_with("[ccteam] delegated session s7 (grok \"research\") completed turn s7-3.")
+    fn notification_text_states_task_done_and_idle() {
+        let t = build_notification_text(
+            "s7",
+            AgentVendor::Grok,
+            Some("research"),
+            "s7-3",
+            "hello",
+            0,
         );
+        assert!(t.starts_with(
+            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE"
+        ));
         assert!(t.contains("hello"));
         assert!(t.contains("session_collect{sid:s7, tail:true}"));
+        // Single-message turn → no interim-fold sentence.
+        assert!(!t.contains("interim note(s)"));
+    }
+
+    #[test]
+    fn notification_text_folds_interim_notes() {
+        let t = build_notification_text("s69", AgentVendor::Codex, None, "s69-54", "wave done", 53);
+        assert!(t.contains("is now IDLE, waiting for the next dispatch"));
+        assert!(t.contains("53 interim note(s) from this turn stayed in the ledger"));
+        assert!(t.contains("session_dispatch{sid:s69"));
+    }
+
+    #[test]
+    fn interim_notification_text_states_still_working() {
+        let t = build_interim_notification_text(
+            "s69",
+            AgentVendor::Codex,
+            Some("wave"),
+            "s69-3",
+            "reading queue",
+        );
+        assert!(t.starts_with("[ccteam] delegated session s69 (codex \"wave\") posted an interim note (turn s69-3) — still WORKING"));
+        assert!(t.contains("no action needed"));
+        assert!(t.contains("reading queue"));
+    }
+
+    #[test]
+    fn final_dedup_key_is_distinct_from_plain_turn_id() {
+        assert_eq!(final_dedup_key("s7-3"), "s7-3#final");
+        assert_ne!(final_dedup_key("s7-3"), "s7-3");
     }
 
     #[test]
@@ -399,17 +502,17 @@ mod tests {
             "HEAD{}TAIL",
             "x".repeat(NOTIFICATION_ANSWER_MAX_CHARS + 500)
         );
-        let t = build_notification_text("s1", AgentVendor::Claude, None, "s1-1", &long);
+        let t = build_notification_text("s1", AgentVendor::Claude, None, "s1-1", &long, 0);
         assert!(t.contains("HEAD"));
         assert!(t.contains("TAIL"));
         assert!(t.contains("truncated"));
         assert!(t.contains("session_collect{sid:s1, tail:true}"));
         assert!(t.contains("(claude)"));
         let embedded = t
-            .split_once("--- answer ---\n")
+            .split_once("--- final answer ---\n")
             .unwrap()
             .1
-            .split_once("\n(run session_collect")
+            .split_once("\n(child is idle:")
             .unwrap()
             .0;
         assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);

@@ -95,6 +95,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            tokens_total: None,
             role_sha: None,
             skills_sha: None,
             trigger: None,

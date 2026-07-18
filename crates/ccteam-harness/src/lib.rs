@@ -65,6 +65,7 @@ pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT
 pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::delegation::{
     read_delegation_watch, scan_delegation_watches, write_delegation_watch, DelegationWatch,
+    NotifyMode,
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};

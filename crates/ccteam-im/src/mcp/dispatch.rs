@@ -973,9 +973,34 @@ async fn execute_session_tool(
         }
     }
 
-    match run_session_tool(&name, &args, gateway, caller).await {
-        Ok(text) => session_tool_response(id, text, false),
-        Err(text) => session_tool_response(id, text, true),
+    // v0.9.5 feedback fix — every session_* call carries a hard server-side
+    // deadline so a busy daemon (lock contention, a slow spawn/submit) returns
+    // a READABLE error instead of hanging the caller's whole turn on a
+    // never-resolving tool call. spawn/dispatch budget for process startup +
+    // any explicit inline wait; the read-only tools are short.
+    let wait_secs = args
+        .get("wait_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(600);
+    let budget = std::time::Duration::from_secs(match name.as_str() {
+        "session_spawn" | "session_dispatch" => 60 + wait_secs,
+        "session_stop" => 30,
+        _ => 15,
+    });
+    match tokio::time::timeout(budget, run_session_tool(&name, &args, gateway, caller)).await {
+        Ok(Ok(text)) => session_tool_response(id, text, false),
+        Ok(Err(text)) => session_tool_response(id, text, true),
+        Err(_) => session_tool_response(
+            id,
+            format!(
+                "{name}: timed out after {}s — the daemon is busy (lock contention or a slow \
+                 spawn/submit); the operation may still complete in the background. Retry, and \
+                 check session_list / session_collect before assuming it failed.",
+                budget.as_secs()
+            ),
+            true,
+        ),
     }
 }
 
@@ -991,7 +1016,7 @@ async fn run_session_tool(
         "session_spawn" => run_session_spawn(args, gateway, caller).await,
         "session_dispatch" => run_session_dispatch(args, gateway, caller).await,
         "session_collect" => run_session_collect(args, gateway, caller).await,
-        "session_list" => run_session_list(gateway).await,
+        "session_list" => run_session_list(args, gateway).await,
         "session_stop" => run_session_stop(args, gateway, caller).await,
         other => Err(format!("unknown session tool: {other}")),
     }
@@ -1118,12 +1143,18 @@ async fn run_session_spawn(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
+    // v0.9.5 feedback fix — a title-less child renders as `title: null`
+    // everywhere (session_list, team view, notifications). When the spawn
+    // carries a first task, derive a short label from its first line. Ledger/
+    // display only (task → label, never label → prompt; the injection red line
+    // is untouched).
+    let title = title.or_else(|| task.as_deref().map(derive_title_from_task));
     let wait_seconds = args
         .get("wait_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         .min(600);
-    let notify = args.get("notify").and_then(|v| v.as_bool()).unwrap_or(true);
+    let notify = parse_notify_mode("session_spawn", args)?;
     // Owner = the shared ops pool (`web-api`): MCP-spawned children stay visible
     // to the owner's console + IM. Owner is NOT inherited from the caller — the
     // parent link is a `meta.parent_sid` property (v0.9.0 W2), not an owner change.
@@ -1377,7 +1408,7 @@ async fn run_session_dispatch(
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         .min(600);
-    let notify = args.get("notify").and_then(|v| v.as_bool()).unwrap_or(true);
+    let notify = parse_notify_mode("session_dispatch", args)?;
     let title = args
         .get("title")
         .and_then(|v| v.as_str())
@@ -1500,6 +1531,35 @@ async fn run_session_dispatch(
 }
 
 /// v0.9.1 delegation-ergonomics — the shared submit half of a dispatch, used
+/// Parse the optional `notify` arg shared by `session_spawn`/`session_dispatch`:
+/// `"final"` (default — notify once the child's vendor turn completes and it
+/// goes idle) / `"all"` (every mirrored assistant message; debug firehose) /
+/// `"off"` (ledger-only). The pre-v0.9.5 boolean form still parses
+/// (`true`→final, `false`→off).
+fn parse_notify_mode(
+    tool: &str,
+    args: &serde_json::Value,
+) -> std::result::Result<ccteam_harness::NotifyMode, String> {
+    match args.get("notify") {
+        None | Some(serde_json::Value::Null) => Ok(ccteam_harness::NotifyMode::Final),
+        Some(v) => ccteam_harness::NotifyMode::parse_value(v).map_err(|e| format!("{tool}: {e}")),
+    }
+}
+
+/// Derive a short ledger/display label from a spawn's first task: first
+/// non-empty line, capped at 60 chars (with an ellipsis when cut). Display
+/// only — never fed back into any prompt.
+fn derive_title_from_task(task: &str) -> String {
+    let line = task.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = line.trim();
+    if line.chars().count() <= 60 {
+        line.to_string()
+    } else {
+        let head: String = line.chars().take(59).collect();
+        format!("{head}…")
+    }
+}
+
 /// by BOTH `session_dispatch` and `session_spawn{task}` (one-call
 /// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
 /// submit the task as a verbatim user turn → arm the delegation watch (agent
@@ -1515,7 +1575,7 @@ async fn dispatch_task(
     sid: &str,
     task: String,
     wait_seconds: u64,
-    notify: bool,
+    notify: ccteam_harness::NotifyMode,
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
@@ -1584,6 +1644,14 @@ async fn dispatch_task(
 /// for a delegation, disarms the watch (the caller already has the result
 /// inline — suppress the redundant notification). On timeout it returns
 /// `pending` and leaves the watch armed (the child is not cancelled).
+///
+/// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion: codex
+/// mirrors interim narration as separate answers inside one still-running
+/// vendor turn, so returning on the first frame handed back "completed" with
+/// the child's first checkpoint note (and disarmed the real completion's
+/// watch). After a frame arrives, completion additionally requires the child's
+/// turn to no longer be in flight (`session_turn_in_flight`, the same cell the
+/// pump clears on `TurnCompleted`), re-checked on a short poll tick.
 async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
@@ -1593,24 +1661,45 @@ async fn dispatch_wait_for_completion(
     is_delegation: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
+    // Re-check cadence for "answer seen, is the turn still in flight?".
+    const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut saw_answer = false;
     let completed = loop {
+        if saw_answer {
+            let in_flight = {
+                let gw = gateway.lock().await;
+                gw.session_turn_in_flight(child_sid)
+            };
+            if !in_flight {
+                break true;
+            }
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break false;
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
+        // While mid-turn with an answer already seen, wake at least every
+        // BOUNDARY_POLL to re-check the in-flight cell (the pump clears it on
+        // `TurnCompleted`, which emits no Answer frame of its own).
+        let wait_slice = if saw_answer {
+            remaining.min(BOUNDARY_POLL)
+        } else {
+            remaining
+        };
+        match tokio::time::timeout(wait_slice, rx.recv()).await {
             Ok(Ok(ev)) => {
                 let hit = ev.sid.as_deref() == Some(child_sid)
                     && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer);
                 if hit {
-                    break true;
+                    saw_answer = true;
                 }
             }
             // Broadcast lag → keep waiting (we may have missed unrelated frames).
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            // Sender gone (daemon shutdown) or deadline → pending.
+            // Sender gone (daemon shutdown) → pending.
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break false,
-            Err(_) => break false,
+            // Poll tick (or deadline) → loop re-checks in-flight / remaining.
+            Err(_) => {}
         }
     };
 
@@ -1900,6 +1989,7 @@ async fn run_session_collect(
         .map(|m| m.vendor_uuid.clone())
         .unwrap_or_default();
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
+    let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
 
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
@@ -1928,6 +2018,10 @@ async fn run_session_collect(
     });
     if let Some(c) = cost_usd {
         body["cost_usd"] = serde_json::json!(c);
+    }
+    if let Some(t) = tokens_total {
+        // v0.9.5 — honest token ledger for vendors with no USD price table.
+        body["tokens_total"] = serde_json::json!(t);
     }
     // v0.9.1 — honest per-sid activity (same classifier the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
@@ -1960,8 +2054,46 @@ async fn run_session_collect(
     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// Default row cap for `session_list` (rows are already sorted most-recent
+/// first by `session_views`; pass `limit` to widen/narrow).
+const SESSION_LIST_DEFAULT_LIMIT: usize = 30;
+
 /// `session_list` — snapshot the gateway's live sessions.
-async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String, String> {
+///
+/// v0.9.5 feedback fix — a fleet of tens of live sessions dumped verbatim
+/// flooded the caller's context (most rows stale, every null field spelled
+/// out). The listing now accepts `project` / `activity` / `limit` filters,
+/// caps at [`SESSION_LIST_DEFAULT_LIMIT`] most-recently-active rows by
+/// default (explicit `truncated`/`total` fields say when a cap bit), and
+/// omits null/empty row fields.
+async fn run_session_list(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+) -> std::result::Result<String, String> {
+    let filter_project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let filter_activity = args
+        .get("activity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "all");
+    if let Some(a) = filter_activity.as_deref() {
+        if !matches!(a, "working" | "idle" | "stale" | "stuck") {
+            return Err(format!(
+                "session_list: invalid `activity` filter `{a}` (expected `working` | `idle` | `stale` | `stuck` | `all`)"
+            ));
+        }
+    }
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, 500))
+        .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
+
     let views = {
         let gw = gateway.lock().await;
         gw.session_views()
@@ -1984,7 +2116,9 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
         }
     }
     let now = chrono::Utc::now();
-    let rows: Vec<serde_json::Value> = views
+    // Classify once per view, then filter (project + activity), keeping the
+    // most-recently-active-first order `session_views` already established.
+    let classified: Vec<(&crate::gateway::SessionView, Option<String>)> = views
         .iter()
         .map(|v| {
             let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
@@ -1993,32 +2127,81 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
                     .activity
                     .to_string()
             });
-            serde_json::json!({
-                "sid": v.sid,
-                "project": v.project,
-                "role": v.role,
-                "vendor": v.vendor,
-                "current": v.current,
-                "status": v.status,
-                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`)
-                // + the hitl blocked-on-human flag.
-                "activity": activity,
-                "waiting_approval": v.waiting_approval,
-                // v0.9.0 W2 (F2) — delegation topology + attribution.
-                "parent_sid": v.parent_sid,
-                "delegation_depth": v.delegation_depth,
-                "host": v.host,
-                "cost_usd": v.cost_usd,
-                "title": v.title,
-            })
+            (v, activity)
+        })
+        .filter(|(v, activity)| {
+            if let Some(p) = filter_project.as_deref() {
+                if v.project != p {
+                    return false;
+                }
+            }
+            if let Some(want) = filter_activity.as_deref() {
+                return activity.as_deref() == Some(want);
+            }
+            true
+        })
+        .collect();
+    let total = classified.len();
+    let truncated = total > limit;
+    let rows: Vec<serde_json::Value> = classified
+        .iter()
+        .take(limit)
+        .map(|(v, activity)| {
+            // Slim rows: null/empty/default fields are omitted rather than
+            // spelled out (the caller reads these into its context).
+            let mut row = serde_json::Map::new();
+            row.insert("sid".into(), serde_json::json!(v.sid));
+            row.insert("project".into(), serde_json::json!(v.project));
+            if !v.role.is_empty() {
+                row.insert("role".into(), serde_json::json!(v.role));
+            }
+            row.insert("vendor".into(), serde_json::json!(v.vendor));
+            if v.current {
+                row.insert("current".into(), serde_json::json!(true));
+            }
+            if let Some(a) = activity {
+                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`).
+                row.insert("activity".into(), serde_json::json!(a));
+            }
+            if !v.last_active.is_empty() {
+                row.insert("last_active".into(), serde_json::json!(v.last_active));
+            }
+            if v.waiting_approval {
+                row.insert("waiting_approval".into(), serde_json::json!(true));
+            }
+            // v0.9.0 W2 (F2) — delegation topology + attribution.
+            if let Some(p) = &v.parent_sid {
+                row.insert("parent_sid".into(), serde_json::json!(p));
+                row.insert(
+                    "delegation_depth".into(),
+                    serde_json::json!(v.delegation_depth),
+                );
+            }
+            if v.host != "local" {
+                row.insert("host".into(), serde_json::json!(v.host));
+            }
+            if let Some(c) = v.cost_usd {
+                row.insert("cost_usd".into(), serde_json::json!(c));
+            }
+            if let Some(t) = v.tokens_total {
+                // v0.9.5 — honest token ledger for unpriced vendors.
+                row.insert("tokens_total".into(), serde_json::json!(t));
+            }
+            if let Some(t) = &v.title {
+                row.insert("title".into(), serde_json::json!(t));
+            }
+            serde_json::Value::Object(row)
         })
         .collect();
     // v0.9.0 W2 (F2) — a `tree` view (roots → children by `parent_sid`) so a
-    // caller sees the delegation topology without recomputing it. Roots =
-    // sessions whose parent isn't in this list (a true root, or a parent in
+    // caller sees the delegation topology without recomputing it. Built over
+    // the FILTERED set (not the limit cut) so topology stays whole. Roots =
+    // sessions whose parent isn't in this set (a true root, or a parent in
     // another project the caller can't see).
-    let sids: std::collections::HashSet<&str> = views.iter().map(|v| v.sid.as_str()).collect();
-    let tree: Vec<serde_json::Value> = views
+    let filtered: Vec<crate::gateway::SessionView> =
+        classified.iter().map(|(v, _)| (*v).clone()).collect();
+    let sids: std::collections::HashSet<&str> = filtered.iter().map(|v| v.sid.as_str()).collect();
+    let tree: Vec<serde_json::Value> = filtered
         .iter()
         .filter(|v| {
             v.parent_sid
@@ -2026,14 +2209,21 @@ async fn run_session_list(gateway: &GatewayHandle) -> std::result::Result<String
                 .map(|p| !sids.contains(p))
                 .unwrap_or(true)
         })
-        .map(|v| session_tree_node(v, &views))
+        .map(|v| session_tree_node(v, &filtered))
         .collect();
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    let mut body = serde_json::json!({
         "ok": true,
         "sessions": rows,
         "tree": tree,
-    }))
-    .unwrap_or_else(|_| "{}".to_string()))
+        "total": total,
+    });
+    if truncated {
+        body["truncated"] = serde_json::json!(true);
+        body["hint"] = serde_json::json!(format!(
+            "{total} sessions matched but only the {limit} most recently active are shown — narrow with project/activity or raise `limit`."
+        ));
+    }
+    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// v0.9.0 W2 (F2) — build one node of the `session_list` delegation tree:
@@ -2403,6 +2593,10 @@ mod session_tool_tests {
         /// the pump folds into an `Answer` (for the dispatch-wait tests).
         /// Default false = empty event stream (existing principal tests).
         answer: bool,
+        /// v0.9.5 — when true (with `answer`), `submit_turn` prepends an
+        /// interim narration message BEFORE the echo answer + boundary
+        /// (models a codex child narrating checkpoints inside one turn).
+        narrate: bool,
         /// Delay (ms) before `events()` yields — forces a `wait` timeout.
         event_delay_ms: u64,
         events: std::sync::Arc<
@@ -2447,7 +2641,21 @@ mod session_tool_tests {
                     ccteam_harness::TurnInput::UserText(t) => t,
                     _ => String::new(),
                 };
-                self.events.lock().await.push_back((
+                let mut q = self.events.lock().await;
+                if self.narrate {
+                    q.push_back((
+                        h.identity.clone(),
+                        ccteam_harness::ThreadEvent::ItemCompleted {
+                            item: ccteam_harness::ThreadItem {
+                                id: "msg-0".into(),
+                                details: ccteam_harness::ThreadItemDetails::AgentMessage(
+                                    "interim narration checkpoint".into(),
+                                ),
+                            },
+                        },
+                    ));
+                }
+                q.push_back((
                     h.identity.clone(),
                     ccteam_harness::ThreadEvent::ItemCompleted {
                         item: ccteam_harness::ThreadItem {
@@ -2458,6 +2666,18 @@ mod session_tool_tests {
                         },
                     },
                 ));
+                // Every REAL adapter follows the answer with a turn boundary —
+                // required since v0.9.5: a `wait_seconds` dispatch completes on
+                // the boundary (turn no longer in flight), not the first frame.
+                q.push_back((
+                    h.identity.clone(),
+                    ccteam_harness::ThreadEvent::TurnCompleted {
+                        turn_id: format!("turn-{}", h.identity),
+                        usage: Default::default(),
+                        model: None,
+                    },
+                ));
+                drop(q);
                 self.notify.notify_one();
             }
             Ok(ccteam_harness::TurnId::new(format!("turn-{}", h.identity)))
@@ -3109,6 +3329,16 @@ mod session_tool_tests {
         delay_ms: u64,
         project_dir: &std::path::Path,
     ) -> (GatewayHandle, String) {
+        dispatch_gateway_opts(answer, false, delay_ms, project_dir).await
+    }
+
+    /// [`dispatch_gateway`] with the narration knob (v0.9.5 wait-boundary test).
+    async fn dispatch_gateway_opts(
+        answer: bool,
+        narrate: bool,
+        delay_ms: u64,
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String) {
         let factory: std::sync::Arc<
             dyn Fn(
                     ccteam_harness::AgentVendor,
@@ -3120,6 +3350,7 @@ mod session_tool_tests {
         > = std::sync::Arc::new(move |_, _| {
             std::sync::Arc::new(StubAdapter {
                 answer,
+                narrate,
                 event_delay_ms: delay_ms,
                 ..Default::default()
             }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
@@ -3190,7 +3421,7 @@ mod session_tool_tests {
             "first is not a replay"
         );
         // Exactly ONE child was created (principal + 1 child = 2 sessions).
-        let list = parse(&run_session_list(&gw).await.unwrap());
+        let list = parse(&run_session_list(&serde_json::json!({}), &gw).await.unwrap());
         let children = list["sessions"]
             .as_array()
             .unwrap()
@@ -3198,6 +3429,126 @@ mod session_tool_tests {
             .filter(|s| s["parent_sid"] == json!(principal))
             .count();
         assert_eq!(children, 1, "no double-spawn: {list}");
+    }
+
+    /// v0.9.5 feedback fix — `session_list` accepts `project`/`activity`/
+    /// `limit` filters, caps rows (flagging `truncated` + `total`), slims
+    /// null/empty fields out of each row, and rejects a bogus activity value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_filters_limit_and_slim_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        for _ in 0..3 {
+            run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        }
+        // Unfiltered: principal + 3 children.
+        let all = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert_eq!(all["total"], json!(4));
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 4);
+        assert!(all.get("truncated").is_none(), "under the cap: {all}");
+        // Slim rows: empty role / absent title / false current are omitted.
+        let row = &all["sessions"].as_array().unwrap()[0];
+        assert!(row.get("role").is_none(), "empty role omitted: {row}");
+        assert!(row.get("status").is_none(), "static status omitted: {row}");
+
+        // limit=2 → truncated + hint, total still 4.
+        let capped = parse(&run_session_list(&json!({"limit": 2}), &gw).await.unwrap());
+        assert_eq!(capped["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(capped["total"], json!(4));
+        assert_eq!(capped["truncated"], json!(true));
+        assert!(capped["hint"]
+            .as_str()
+            .unwrap()
+            .contains("most recently active"));
+
+        // project filter: a non-existent slug matches nothing.
+        let none = parse(
+            &run_session_list(&json!({"project": "nope"}), &gw)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(none["total"], json!(0));
+
+        // bogus activity value → readable error.
+        let err = run_session_list(&json!({"activity": "busy"}), &gw)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid `activity` filter"), "{err}");
+    }
+
+    /// v0.9.5 feedback fix — a title-less `session_spawn{task}` derives a
+    /// short display label from the task's first line (ledger only), and the
+    /// `notify` arg accepts the mode strings while rejecting garbage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_derives_title_from_task_and_notify_modes_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let long_line = format!("Refactor the harness layer {}", "x".repeat(80));
+        run_session_spawn(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "vendor": "claude", "task": format!("{long_line}\nsecond line"), "notify": "off" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let title = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|s| s.get("title").and_then(|t| t.as_str().map(String::from)))
+            .expect("spawned child carries a derived title");
+        assert!(title.starts_with("Refactor the harness layer"));
+        assert_eq!(title.chars().count(), 60, "capped at 60 chars: {title}");
+        assert!(title.ends_with('…'));
+
+        // Explicit titles are never overridden by the derivation.
+        run_session_spawn(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "vendor": "claude", "task": "some task", "title": "my label", "notify": "all" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert!(
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.get("title").and_then(|t| t.as_str()) == Some("my label")),
+            "explicit title wins: {list}"
+        );
+
+        // Garbage notify → readable error, no spawn side effect.
+        let before = gw.lock().await.session_views().len();
+        let err = run_session_spawn(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "vendor": "claude", "task": "t", "notify": "sometimes" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("invalid notify mode"), "{err}");
+        assert_eq!(gw.lock().await.session_views().len(), before);
     }
 
     /// v0.9.1 — `session_spawn{task}`: one call spawns AND dispatches (the
@@ -3504,6 +3855,108 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(r2["status"], json!("pending"), "timeout: {r2}");
+    }
+
+    /// v0.9.5 feedback fix — a `wait_seconds` dispatch to a NARRATING child
+    /// (codex posts interim messages inside one running turn) must NOT return
+    /// on the first interim frame: it completes at the turn boundary with the
+    /// FINAL answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn dispatch_wait_skips_interim_narration_and_returns_final_answer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway_opts(true, true, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // `notify:"off"` — the wait itself must not depend on the watch, and
+        // it keeps this leg's boundary from racing a notification into the
+        // async leg's assertion below.
+        let r = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": child, "task": "do the wave", "wait_seconds": 6, "notify": "off" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r["status"], json!("completed"), "narrated: {r}");
+        let result = r["result_text"].as_str().unwrap();
+        assert!(
+            result.contains("echo: do the wave"),
+            "wait returns the FINAL answer, not the interim note: {result}"
+        );
+        assert!(
+            !result.contains("interim narration checkpoint"),
+            "the interim note must not be mistaken for the result: {result}"
+        );
+
+        // Async leg (notify path) on a FRESH narrating child: exactly ONE
+        // notification at the turn boundary — idle-marked, folding the
+        // interim note — proving the pump's per-turn fold end-to-end. (A
+        // fresh child keeps this assertion independent of the wait leg's
+        // already-consumed watch.)
+        let child2 = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run_session_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": child2, "task": "second wave" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let project_dir = {
+            let g = gw.lock().await;
+            g.session_resolve(&principal).unwrap().project_dir
+        };
+        let mut notes = vec![];
+        for _ in 0..200 {
+            notes =
+                ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| t.user.contains("[ccteam] delegated session"))
+                    .collect();
+            if !notes.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(notes.len(), 1, "one boundary notification, no flood");
+        assert!(notes[0].user.contains("is now IDLE"), "{}", notes[0].user);
+        assert!(
+            notes[0].user.contains("1 interim note(s)"),
+            "pump folds the narration count: {}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains("echo: second wave"));
     }
 
     /// LOCK DISCIPLINE: the gateway lock is acquirable while a dispatch `wait`

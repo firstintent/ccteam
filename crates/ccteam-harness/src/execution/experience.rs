@@ -600,6 +600,7 @@ mod tests {
             title_source: None,
             turn_count: 1,
             cost_usd: None,
+            tokens_total: None,
             role_sha: Some("deadbeef0001".into()),
             skills_sha: None,
             trigger: None,

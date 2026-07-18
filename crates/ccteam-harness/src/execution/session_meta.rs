@@ -153,6 +153,13 @@ pub struct SessionMeta {
     /// (never a faked `0.0`). `#[serde(default)]` for old metas.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// v0.9.5 feedback fix — accrued RAW token count across this session's
+    /// turns (every usage bucket summed). Unlike [`Self::cost_usd`] this
+    /// accrues for vendors with no price table (codex/grok/opencode/kimi),
+    /// so a non-claude session still shows an honest ledger number. `None`
+    /// when no turn reported usage yet. `#[serde(default)]` for old metas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_total: Option<u64>,
     /// v0.9 T5 — first 12 hex of sha256(`.claude/agents/<role>.md`)
     /// captured at (re)spawn. Snapshot semantics: mid-session role-file
     /// edits are intentionally NOT re-hashed. `None` for roleless /
@@ -450,6 +457,7 @@ mod title_tests {
             title_source: None,
             turn_count: 0,
             cost_usd: None,
+            tokens_total: None,
             role_sha: None,
             skills_sha: None,
             trigger: None,
