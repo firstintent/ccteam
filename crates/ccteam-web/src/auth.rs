@@ -20,8 +20,10 @@
 //!
 //! 1. extracts `token` from the query string,
 //! 2. validates it (constant-time) against the loaded token,
-//! 3. sets a HttpOnly `ccteam_token` cookie + 302-redirects to the
-//!    same path minus the `token` query parameter,
+//! 3. sets a HttpOnly `ccteam_token` cookie (persistent — `Max-Age` =
+//!    [`COOKIE_MAX_AGE_DAYS`] so it survives a browser restart yet forces a
+//!    re-login after at most that long) + 302-redirects to the same path
+//!    minus the `token` query parameter,
 //! 4. subsequent GETs / SSE include the cookie automatically.
 //!
 //! ## CSRF defense (SameSite=Strict cookie)
@@ -81,6 +83,14 @@ pub const TOKEN_PREFIX: &str = "ccteam:";
 
 /// Cookie name set by the URL shim. HttpOnly + SameSite=Strict.
 pub const COOKIE_NAME: &str = "ccteam_token";
+
+/// How long the session cookie survives after a `?token=` login, in days.
+/// Set as `Max-Age` so the cookie is **persistent** (written to disk →
+/// survives a browser restart) yet self-expiring: the user stays logged in
+/// across browser closes but is forced to re-authenticate after at most this
+/// long. The SPA's localStorage Bearer mirror (`web/src/lib/token.ts`) carries
+/// the same TTL so neither path outlives the other.
+pub const COOKIE_MAX_AGE_DAYS: i64 = 7;
 
 /// Query-string parameter parsed by the URL shim.
 pub const QUERY_PARAM: &str = "token";
@@ -455,6 +465,9 @@ pub async fn auth_layer(
                         .http_only(true)
                         .same_site(SameSite::Strict)
                         .path("/")
+                        // Persistent (survives a browser restart) + self-expiring
+                        // after COOKIE_MAX_AGE_DAYS — the "stay logged in ≤ 7d" contract.
+                        .max_age(cookie::time::Duration::days(COOKIE_MAX_AGE_DAYS))
                         .build();
                     let jar = jar.add(cookie);
                     return (jar, Redirect::to(&clean)).into_response();

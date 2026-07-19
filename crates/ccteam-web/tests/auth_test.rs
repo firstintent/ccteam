@@ -205,6 +205,13 @@ async fn url_shim_sets_cookie_and_redirects_to_clean_uri() {
         set_cookie.contains("SameSite=Strict") || set_cookie.contains("samesite=strict"),
         "cookie must be SameSite=Strict: {set_cookie}"
     );
+    // Persistent + self-expiring: Max-Age must be present (survives browser
+    // restart) and equal 7 days (the "stay logged in ≤ 7d" contract). A
+    // session cookie (no Max-Age) would log the user out on browser close.
+    assert!(
+        set_cookie.to_lowercase().contains("max-age=604800"),
+        "cookie must carry a 7-day Max-Age: {set_cookie}"
+    );
 }
 
 #[tokio::test]

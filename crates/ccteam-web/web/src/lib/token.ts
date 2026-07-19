@@ -14,6 +14,26 @@
 
 const STORAGE_KEY = "aoe_auth_token";
 
+// Companion expiry (epoch ms). This token is a Bearer mirror of the HttpOnly
+// `ccteam_token` cookie; we cap its localStorage lifetime to the SAME 7-day
+// window as the cookie's `Max-Age` (see `crates/ccteam-web/src/auth.rs`
+// `COOKIE_MAX_AGE_DAYS`) so neither auth path can outlive the other and the
+// user is re-prompted for a token after at most 7 days. Persistence across a
+// browser restart comes for free: localStorage survives it, and the expiry is
+// absolute wall-clock, not a session marker.
+const EXPIRY_KEY = "aoe_auth_token_exp";
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Write the token's absolute expiry = now + 7d. Best-effort (private mode /
+ *  quota); callers already tolerate a missing token. */
+function stampExpiry(): void {
+  try {
+    window.localStorage.setItem(EXPIRY_KEY, String(Date.now() + TOKEN_TTL_MS));
+  } catch {
+    // Private mode / quota: the token still works this session via cookie.
+  }
+}
+
 /** Pure parser: pull `?token=...` out of an arbitrary URL string. Returns
  *  null when absent. Doesn't touch localStorage or history. Exposed for
  *  TokenEntryPage (V0.3.2 F58) so it can accept either a raw token or a
@@ -40,6 +60,7 @@ function captureFromUrl(): void {
 
   try {
     window.localStorage.setItem(STORAGE_KEY, token);
+    stampExpiry();
   } catch {
     // Private mode / storage disabled: fall back to the token staying in the
     // URL and cookie for this session only. Nothing else to do.
@@ -56,7 +77,21 @@ captureFromUrl();
 
 export function getToken(): string | null {
   try {
-    return window.localStorage.getItem(STORAGE_KEY);
+    const token = window.localStorage.getItem(STORAGE_KEY);
+    if (!token) return null;
+    const rawExp = window.localStorage.getItem(EXPIRY_KEY);
+    if (rawExp === null) {
+      // Legacy token predating the TTL: grandfather it into a fresh 7-day
+      // window rather than logging the user out on the upgrade.
+      stampExpiry();
+      return token;
+    }
+    const exp = Number(rawExp);
+    if (!Number.isFinite(exp) || Date.now() > exp) {
+      clearToken();
+      return null;
+    }
+    return token;
   } catch {
     return null;
   }
@@ -69,6 +104,7 @@ export function saveToken(token: string): void {
   if (!trimmed) return;
   try {
     window.localStorage.setItem(STORAGE_KEY, trimmed);
+    stampExpiry();
   } catch {
     // Private mode or quota exceeded: nothing to do. The request that
     // prompted this save still succeeded on its cookie/header, so the
@@ -79,6 +115,7 @@ export function saveToken(token: string): void {
 export function clearToken(): void {
   try {
     window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(EXPIRY_KEY);
   } catch {
     // nothing to do
   }

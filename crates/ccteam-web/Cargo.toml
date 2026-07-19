@@ -94,6 +94,11 @@ subtle = { workspace = true }
 # - `rand` 0.8 generates the 32-byte token persisted at
 #   `~/.ccteam/web-token` mode 0600.
 axum-extra = { version = "0.10", features = ["cookie"] }
+# Same `cookie` crate `axum-extra` re-exports (single 0.18 in the tree, so
+# the `Cookie` types unify) — declared directly only to reach
+# `cookie::time::Duration` for the session cookie's `Max-Age` (7-day
+# persistent login; axum-extra re-exports `Cookie`/`SameSite` but not `time`).
+cookie = "0.18"
 rand = "0.8"
 
 # V0.3.2 F53 — embed the vite-built SPA bundle (`web/dist/`) into the

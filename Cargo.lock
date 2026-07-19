@@ -558,6 +558,7 @@ dependencies = [
  "ccteam-hooks",
  "ccteam-im",
  "chrono",
+ "cookie",
  "dirs",
  "futures",
  "futures-util",
