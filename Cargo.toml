@@ -56,6 +56,11 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 # agents. `croner` is maintained (3.x), lightweight, and depends only
 # on `chrono` (already a workspace dep) + build-time derive macros.
 croner = "3"
+# tg-6955 — display-cell width (CJK wide = 2) for the IM picker button
+# labels: width-based trim + tail padding so Telegram's centre-aligned
+# button text reads left-aligned. Already in the graph transitively
+# (0.1.14); pinning the same minor adds no new crate.
+unicode-width = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

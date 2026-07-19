@@ -2643,7 +2643,8 @@ impl Gateway {
     /// dropped (a pathologically long slug still shows in the text list).
     fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat);
-        self.project_slugs()
+        let mut options: Vec<MessageOption> = self
+            .project_slugs()
             .into_iter()
             .map(|slug| {
                 // A consistent leading glyph (✓ current / ▸ others) lines the
@@ -2661,7 +2662,9 @@ impl Gateway {
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect()
+            .collect();
+        left_align_option_labels(&mut options);
+        options
     }
 
     /// One "switch session" button per live, chat-visible session
@@ -2684,7 +2687,7 @@ impl Gateway {
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
         let current_sid = self.current_session.read().unwrap().get(chat).cloned();
-        visible
+        let mut options: Vec<MessageOption> = visible
             .into_iter()
             .map(|s| {
                 // Consistent leading glyph (✓ current / ▸ others) so the picker
@@ -2695,26 +2698,24 @@ impl Gateway {
                 } else {
                     "▸ "
                 };
+                // Roleless sessions (the default) OMIT the role segment — the
+                // old `· —` placeholder read as a broken field on every row
+                // (owner feedback tg-6955); a named role keeps its ` · role`.
                 let role = if s.role.is_empty() {
-                    "—"
+                    String::new()
                 } else {
-                    s.role.as_str()
+                    format!(" · {}", s.role)
                 };
                 let title = self
                     .session_title(s)
                     .map(|t| format!(" 「{t}」"))
                     .unwrap_or_default();
-                let mut label = format!(
-                    "{mark}{} · {} · {}{}",
-                    s.id,
-                    vendor_str(s.vendor),
-                    role,
-                    title
+                // Readability trim by display width (callback_data, below, is
+                // the hard 64B cap).
+                let label = trim_label_to_width(
+                    &format!("{mark}{} · {}{role}{title}", s.id, vendor_str(s.vendor)),
+                    PICKER_LABEL_MAX_WIDTH,
                 );
-                // Readability trim (callback_data, below, is the hard 64B cap).
-                if label.chars().count() > 48 {
-                    label = format!("{}…", label.chars().take(47).collect::<String>());
-                }
                 MessageOption {
                     data: format!("nav:use:{}", s.id),
                     label,
@@ -2722,7 +2723,9 @@ impl Gateway {
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect()
+            .collect();
+        left_align_option_labels(&mut options);
+        options
     }
 
     /// Emit a picker message (a project/session list) carrying inline `options`
@@ -8644,6 +8647,53 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 /// guards a pathological slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
 
+/// Readability cap on a picker button label, in DISPLAY cells (CJK wide = 2)
+/// — not chars: a 48-char all-CJK title is ~2× the visual length of a Latin
+/// one, which both overflows phones harder and defeats the tail-padding
+/// alignment below.
+const PICKER_LABEL_MAX_WIDTH: usize = 48;
+
+/// Trim `label` to at most `max` display cells, ellipsized. Cell widths come
+/// from `unicode-width` (CJK = 2, else mostly 1) — approximate for Telegram's
+/// proportional fonts, where exact alignment is impossible cross-client.
+fn trim_label_to_width(label: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if label.width() <= max {
+        return label.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in label.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Right-pad every picker label to the set's widest row so Telegram's
+/// centre-aligned button text reads as a LEFT-aligned list (owner req,
+/// tg-6955). Telegram strips ordinary trailing whitespace from button
+/// labels, so the pad is U+2800 BRAILLE PATTERN BLANK — renders blank,
+/// survives the trim, ~1 cell wide.
+fn left_align_option_labels(options: &mut [MessageOption]) {
+    use unicode_width::UnicodeWidthStr;
+    let max = options
+        .iter()
+        .map(|o| o.label.as_str().width())
+        .max()
+        .unwrap_or(0);
+    for o in options.iter_mut() {
+        for _ in 0..max.saturating_sub(o.label.as_str().width()) {
+            o.label.push('\u{2800}');
+        }
+    }
+}
+
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
 /// IM callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
 /// 64-byte `callback_data` cap; the IM click resolves by idx (reverse-resolved
@@ -12467,6 +12517,88 @@ mod tests {
             .unwrap();
         assert_eq!(mock.len(), 1);
         assert!(mock[0].contains("s2:alpha:Claude:reviewer"), "{}", mock[0]);
+    }
+
+    /// tg-6955 (owner req) — session-picker button labels: a roleless
+    /// session (the v0.9.0 default) drops the old `· —` role placeholder
+    /// entirely, and the option set is tail-padded to ONE display width with
+    /// U+2800 braille blanks (Telegram strips real trailing spaces) so the
+    /// centre-aligned button text reads as a left-aligned list.
+    #[tokio::test]
+    async fn session_picker_labels_align_and_omit_empty_role() {
+        use unicode_width::UnicodeWidthStr;
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        // One roleless session (short label) + one with a role (wider label).
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let opts = gateway.session_switch_options(&chat, false);
+        assert_eq!(opts.len(), 2, "{opts:?}");
+        let s1 = opts.iter().find(|o| o.id == "s1").unwrap();
+        let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
+        // Roleless → `sid · vendor`, no `· —` placeholder.
+        let s1_text = s1.label.trim_end_matches('\u{2800}');
+        assert!(!s1_text.contains('—'), "no role placeholder: {s1_text:?}");
+        assert!(s1_text.ends_with("s1 · claude"), "bare row: {s1_text:?}");
+        // A named role keeps its segment.
+        assert!(
+            s2.label.contains(" · reviewer"),
+            "role kept: {:?}",
+            s2.label
+        );
+        // Both labels padded to the same display width, with braille blanks.
+        assert_eq!(
+            s1.label.as_str().width(),
+            s2.label.as_str().width(),
+            "equal width: {opts:?}"
+        );
+        assert!(
+            s1.label.ends_with('\u{2800}'),
+            "shorter row is tail-padded: {:?}",
+            s1.label
+        );
+    }
+
+    /// The picker-label helpers: the trim counts CJK as two display cells
+    /// (so an all-CJK title trims commensurately with Latin), and the
+    /// padding equalizes display width across an option set.
+    #[test]
+    fn picker_label_width_helpers() {
+        use unicode_width::UnicodeWidthStr;
+        // 26 CJK chars = 52 cells → trimmed under the 48-cell cap + ellipsis.
+        let long = "调".repeat(26);
+        let trimmed = trim_label_to_width(&long, 48);
+        assert!(trimmed.ends_with('…'), "{trimmed:?}");
+        assert!(trimmed.as_str().width() <= 48, "{trimmed:?}");
+        // Under the cap → untouched (48 chars of Latin is exactly 48 cells).
+        let latin = "a".repeat(48);
+        assert_eq!(trim_label_to_width(&latin, 48), latin);
+        // Padding: mixed CJK/Latin rows end up the same display width.
+        let mut opts = vec![
+            MessageOption {
+                data: "a".into(),
+                label: "▸ s39 · grok · 「当前是什么模型」".into(),
+                id: "s39".into(),
+            },
+            MessageOption {
+                data: "b".into(),
+                label: "▸ s43 · claude · 「Completed the full reques…".into(),
+                id: "s43".into(),
+            },
+        ];
+        left_align_option_labels(&mut opts);
+        assert_eq!(
+            opts[0].label.as_str().width(),
+            opts[1].label.as_str().width()
+        );
     }
 
     /// Tapping a picker button switches project / session through the SAME

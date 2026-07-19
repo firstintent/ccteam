@@ -35,6 +35,8 @@ chrono.workspace = true
 dirs.workspace = true
 notify.workspace = true
 regex.workspace = true
+# tg-6955 — picker button label alignment (display-cell trim + tail padding).
+unicode-width.workspace = true
 # HTTP client for Telegram getUpdates + Slack chat.postMessage + Discord REST.
 reqwest = { workspace = true, features = ["json", "multipart"] }
 # v0.8.9 Phase 2 — sha256 integrity verification of ccteam-hub plugin bodies
