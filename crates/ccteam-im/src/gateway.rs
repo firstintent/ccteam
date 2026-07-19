@@ -1108,6 +1108,28 @@ pub struct GatewayCommandSpec {
 /// The gateway's own commands. Everything else `/…` is forwarded to the
 /// current session's agent via `handle_directive`.
 pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
+    // v0.9.x (owner req) — high-frequency fleet views lead the Telegram command
+    // menu (/status · /sessions · /projects), then session lifecycle, then the
+    // rarer verbs. Dispatch is a `match` on the name (below), so this order only
+    // drives the menu + /help; reordering is presentation-only.
+    GatewayCommandSpec {
+        name: "/status",
+        arg_hint: None,
+        help: "fleet health — per-session idle/working/stuck + model·ctx",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/sessions",
+        arg_hint: Some("[all]"),
+        help: "list this project's sessions (`all` = every project)",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/projects",
+        arg_hint: None,
+        help: "list projects",
+        in_menu: true,
+    },
     GatewayCommandSpec {
         name: "/new",
         arg_hint: Some("[vendor] [role] [hitl]"),
@@ -1130,6 +1152,18 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/cd",
+        arg_hint: Some("<project>"),
+        help: "switch project",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/role",
+        arg_hint: Some("<role>"),
+        help: "switch the current session to a fresh agent role",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>"),
         help: "stop (destroy) a session by id",
@@ -1144,44 +1178,17 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/screen",
         arg_hint: Some("[id]"),
+        // v0.9.x (owner req) — dropped from the menu: the terminal protocol is
+        // frozen/deprecated and default stream-json sessions have no pane, so
+        // /screen is niche. Still works if typed for a terminal session.
         help: "screenshot a session's pane (bare = current)",
-        in_menu: true,
-    },
-    GatewayCommandSpec {
-        name: "/role",
-        arg_hint: Some("<role>"),
-        help: "switch the current session to a fresh agent role",
-        in_menu: true,
+        in_menu: false,
     },
     GatewayCommandSpec {
         name: "/rename",
         arg_hint: Some("<title>"),
         help: "rename the current session's title (rule-based, no LLM)",
         in_menu: false,
-    },
-    GatewayCommandSpec {
-        name: "/cd",
-        arg_hint: Some("<project>"),
-        help: "switch project",
-        in_menu: true,
-    },
-    GatewayCommandSpec {
-        name: "/sessions",
-        arg_hint: Some("[all]"),
-        help: "list this project's sessions (`all` = every project)",
-        in_menu: true,
-    },
-    GatewayCommandSpec {
-        name: "/status",
-        arg_hint: None,
-        help: "fleet health — per-session idle/working/stuck + model·ctx",
-        in_menu: true,
-    },
-    GatewayCommandSpec {
-        name: "/projects",
-        arg_hint: None,
-        help: "list projects",
-        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/newproject",
@@ -1238,6 +1245,23 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
         Some(hint) => format!("{hint} — {}", c.help),
         None => c.help.to_string(),
     }
+}
+
+/// v0.9.x (owner req) — the recommended next command appended as the last line
+/// of a slash-command reply on IM, so each action teaches the natural next step
+/// (e.g. `/use s62` → `using session s62` → `↓ 查看状态 → /status`). Format:
+/// `↓ <描述> → /<cmd>`. Returns `None` for self-contained commands: `/status`
+/// bakes its own `/projects` tail and the list commands (`/sessions`,
+/// `/projects`) carry their own navigation, so appending here would double up;
+/// vendor passthroughs (`/model`, `/compact`, …) are not gateway commands and
+/// never reach this. Web is unaffected — its control face (`submit_web_sid`)
+/// does not call this, and web navigates by GUI.
+fn command_next_hint(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "/new" | "/use" | "/role" | "/interrupt" => "↓ 查看状态 → /status",
+        "/stop" | "/rename" | "/cd" | "/newproject" => "↓ 本项目会话 → /sessions",
+        _ => return None,
+    })
 }
 
 impl Gateway {
@@ -1916,7 +1940,20 @@ impl Gateway {
             }
         }
         // Commands parse on the raw text; attachments don't apply to them.
-        if let Some(reply) = self.handle_command(&chat, text).await? {
+        if let Some(mut reply) = self.handle_command(&chat, text).await? {
+            // Owner req — teach the next step: append a recommended-command
+            // footer as the reply's last line (see `command_next_hint`). IM only
+            // — the web console navigates by GUI and reaches commands via
+            // `submit_web_sid` in production, so it never gets the text footer.
+            if chat.channel != "web" {
+                if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
+                {
+                    if !reply.is_empty() {
+                        reply.push('\n');
+                    }
+                    reply.push_str(hint);
+                }
+            }
             return Ok(vec![reply]);
         }
         // A gateway command may handle itself ENTIRELY via the event sink and
@@ -2609,10 +2646,13 @@ impl Gateway {
         self.project_slugs()
             .into_iter()
             .map(|slug| {
+                // A consistent leading glyph (✓ current / ▸ others) lines the
+                // labels up on the left, so the picker reads as a tidy list
+                // rather than centre-floating text (owner req).
                 let label = if slug == cur {
                     format!("✓ {slug}")
                 } else {
-                    slug.clone()
+                    format!("▸ {slug}")
                 };
                 MessageOption {
                     data: format!("nav:cd:{slug}"),
@@ -2647,20 +2687,28 @@ impl Gateway {
         visible
             .into_iter()
             .map(|s| {
+                // Consistent leading glyph (✓ current / ▸ others) so the picker
+                // reads as a left-aligned list; ` · ` separators instead of the
+                // old colon-jammed `sid:vendor:role` (owner req).
                 let mark = if Some(&s.id) == current_sid.as_ref() {
                     "✓ "
                 } else {
-                    ""
+                    "▸ "
+                };
+                let role = if s.role.is_empty() {
+                    "—"
+                } else {
+                    s.role.as_str()
                 };
                 let title = self
                     .session_title(s)
                     .map(|t| format!(" 「{t}」"))
                     .unwrap_or_default();
                 let mut label = format!(
-                    "{mark}{}:{}:{}{}",
+                    "{mark}{} · {} · {}{}",
                     s.id,
                     vendor_str(s.vendor),
-                    s.role,
+                    role,
                     title
                 );
                 // Readability trim (callback_data, below, is the hard 64B cap).
@@ -5959,15 +6007,13 @@ impl Gateway {
             .iter()
             .filter(|o| o.project == s.project && o.id != s.id)
             .count();
-        let other_proj = visible.iter().filter(|o| o.project != s.project).count();
         if same > 0 {
             out.push_str(&format!("\n   ↓ 本项目其他 {same} 个会话 → /sessions"));
         }
-        if other_proj > 0 {
-            out.push_str(&format!(
-                "\n   ↓ 其他项目 {other_proj} 个会话 → /sessions all"
-            ));
-        }
+        // Owner req — the last line points at the full project list (with a live
+        // count), replacing the old cross-project `/sessions all` fleet pointer.
+        let nproj = self.project_slugs().len();
+        out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
         out
     }
 
@@ -9088,7 +9134,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap(),
-            vec!["created session s1"]
+            vec!["created session s1\n↓ 查看状态 → /status"]
         );
         let warn = events.recv().await.unwrap();
         assert_eq!(warn.sid.as_deref(), Some("s1"));
@@ -9110,7 +9156,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
                 .unwrap(),
-            vec!["created session s2"]
+            vec!["created session s2\n↓ 查看状态 → /status"]
         );
         assert!(
             matches!(
@@ -9639,7 +9685,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(created, vec!["created session s1"]);
+        assert_eq!(created, vec!["created session s1\n↓ 查看状态 → /status"]);
 
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "hi")
@@ -10461,7 +10507,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1"]);
+        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
 
         // Bare `/interrupt` targets the CURRENT session (s1) — non-destructive,
         // so no explicit sid is required (unlike /stop).
@@ -10483,7 +10529,10 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "/interrupt s1")
             .await
             .unwrap();
-        assert_eq!(foreign, vec!["unknown session for this chat: s1"]);
+        assert_eq!(
+            foreign,
+            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+        );
         assert_eq!(
             fake.interrupts.lock().await.len(),
             2,
@@ -11905,7 +11954,8 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.len(), 1);
         assert_eq!(
-            receipt[0], "created session s2 (hitl: non-allowlist tools need IM approval)",
+            receipt[0],
+            "created session s2 (hitl: non-allowlist tools need IM approval)\n↓ 查看状态 → /status",
             "F1: a fresh hitl session is spawned + honestly reported, got: {receipt:?}"
         );
 
@@ -12736,6 +12786,13 @@ mod tests {
             idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
             "model·effort·ctx·resume line: {idle:?}"
         );
+        // Owner req — /status ends by pointing at the full project list with a
+        // live count (this gateway has one project, `alpha`), replacing the old
+        // `/sessions all` cross-project pointer.
+        assert!(
+            idle[0].contains("↓ 所有 1 个项目 → /projects"),
+            "/status footer points at /projects with a count: {idle:?}"
+        );
 
         // (2) A turn in flight with a RECENT event → 🔵 working.
         let now = Instant::now();
@@ -13260,7 +13317,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             denied,
-            vec!["unknown session for this chat: s1".to_string()]
+            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status".to_string()]
         );
         assert!(
             !gateway.session_views().iter().any(|v| v.sid == "s1"),
@@ -13272,7 +13329,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(resumed, vec!["resumed session s1".to_string()]);
+        assert_eq!(
+            resumed,
+            vec!["resumed session s1\n↓ 查看状态 → /status".to_string()]
+        );
         assert!(
             gateway.session_views().iter().any(|v| v.sid == "s1"),
             "owner cold-resumed s1 from meta.json"
@@ -13297,7 +13357,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use @reviewer")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1".to_string()]);
+        assert_eq!(
+            used,
+            vec!["using session s1\n↓ 查看状态 → /status".to_string()]
+        );
     }
 
     /// v0.8.23 review §3.2-5 (item 2b) — two sessions share a role: `/use
@@ -13323,7 +13386,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["using session s2".to_string()],
+            vec!["using session s2\n↓ 查看状态 → /status".to_string()],
             "ambiguous role resolves to the most-recently-active session"
         );
     }
@@ -13457,7 +13520,10 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["unknown session for this chat: s1"]);
+        assert_eq!(
+            used,
+            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+        );
 
         // The OWNER still sees + uses its own session.
         let owner_sees = gateway
@@ -13472,7 +13538,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1"]);
+        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
     }
 
     /// v0.8.18 柱2 档0 (regression fix) — the web console is a SHARED operator
@@ -13516,7 +13582,7 @@ mod tests {
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1"]);
+        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
     }
 
     /// v0.8.20 web↔IM convergence — a tenant's web console and their OWN IM bot
@@ -13667,7 +13733,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd,
-            vec!["project set to beta (next message starts a session there)"]
+            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
         );
 
         gateway
@@ -13693,7 +13759,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(use_first, vec!["using session s1"]);
+        assert_eq!(use_first, vec!["using session s1\n↓ 查看状态 → /status"]);
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "ping")
             .await
@@ -14191,7 +14257,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1"]
+            vec!["using session s1\n↓ 查看状态 → /status"]
         );
         let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
@@ -14204,7 +14270,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s2")
                 .await
                 .unwrap(),
-            vec!["using session s2"]
+            vec!["using session s2\n↓ 查看状态 → /status"]
         );
         let reply_s2 = restored
             .handle_text("mock", "chat-1", "alice", "after restart two")
@@ -14265,7 +14331,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1"]
+            vec!["using session s1\n↓ 查看状态 → /status"]
         );
         let reply = restored
             .handle_text("mock", "chat-1", "alice", "after routing.json loss")
@@ -14733,7 +14799,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd,
-            vec!["project set to beta (next message starts a session there)"]
+            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
         );
 
         // The next plain message must route into a beta session, not back s1.
@@ -14787,7 +14853,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/cd alpha")
             .await
             .unwrap();
-        assert_eq!(cd_back, vec!["project set to alpha (switched to s1)"]);
+        assert_eq!(
+            cd_back,
+            vec!["project set to alpha (switched to s1)\n↓ 本项目会话 → /sessions"]
+        );
 
         let reply = gateway
             .handle_text("mock", "chat-1", "alice", "ping")
@@ -14995,7 +15064,7 @@ mod tests {
             .handle_text("telegram", "tg-1", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1"]);
+        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
     }
 
     #[tokio::test]
@@ -15018,7 +15087,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(first, vec!["created session s1"]);
+        assert_eq!(first, vec!["created session s1\n↓ 查看状态 → /status"]);
         // Same project + role → a SECOND, distinct session s2 (no reuse).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
@@ -15026,7 +15095,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             again,
-            vec!["created session s2"],
+            vec!["created session s2\n↓ 查看状态 → /status"],
             "F1: a repeat /new of the same role must mint a NEW sid, not reuse s1"
         );
         // A third /new (different role) → s3.
@@ -15034,7 +15103,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(other_role, vec!["created session s3"]);
+        assert_eq!(other_role, vec!["created session s3\n↓ 查看状态 → /status"]);
 
         // Three sessions tracked — two same-role (s1, s2) + one (s3).
         let listing = gateway
@@ -15092,7 +15161,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/role reviewer")
             .await
             .unwrap();
-        assert_eq!(switched, vec!["switched session s1 to role reviewer"]);
+        assert_eq!(
+            switched,
+            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+        );
 
         // A follow-up turn now routes to the reviewer pane under the SAME sid.
         let after = gateway
@@ -15119,7 +15191,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1"]);
+        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
 
         // /help advertises /role.
         assert!(
@@ -15198,7 +15270,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/role reviewer")
             .await
             .unwrap();
-        assert_eq!(switched, vec!["switched session s1 to role reviewer"]);
+        assert_eq!(
+            switched,
+            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+        );
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
             2,
@@ -15273,7 +15348,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/rename  my   custom title  ")
             .await
             .unwrap();
-        assert_eq!(renamed, vec!["已重命名 s1 → my custom title"]);
+        assert_eq!(
+            renamed,
+            vec!["已重命名 s1 → my custom title\n↓ 本项目会话 → /sessions"]
+        );
 
         // /sessions shows the rename.
         let listing = gateway
