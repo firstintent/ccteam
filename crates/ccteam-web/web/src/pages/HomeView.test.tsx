@@ -142,20 +142,44 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain('disabled=""');
   });
 
-  it("renders the 快速开始 template grid (6 cards, prompt in the title attr)", () => {
+  it("renders the 快速开始 grid: 6 cards showcasing multi-vendor strengths", () => {
     const html = render();
     expect(html).toContain('data-testid="template-grid"');
     expect(html).toContain("快速开始");
-    for (const id of ["tour", "bug", "feat", "review", "test", "docs"]) {
+    for (const id of ["team", "plan", "code", "fast", "bulk", "tour"]) {
       expect(html).toContain(`data-testid="tpl-${id}"`);
     }
+    expect(html).toContain("多 agent 协作");
+    expect(html).toContain("规划拆解");
+    expect(html).toContain("稳定编码");
+    expect(html).toContain("极速排查");
+    expect(html).toContain("批量任务");
     expect(html).toContain("项目速览");
-    expect(html).toContain("修复 Bug");
-    expect(html).toContain("代码审查");
-    // The card carries its composer prompt as the hover title.
+    // The card carries its composer prompt as the hover title; the 协作
+    // flagship's prompt drives real A2A delegation (session_spawn/dispatch).
+    expect(html).toContain("session_spawn");
     expect(html).toContain("带我快速了解这个项目");
     // The old recents grid is gone (recents live in the sidebar rail).
     expect(html).not.toContain('data-testid="recent-grid"');
+  });
+
+  it("vendor-strength cards wear their harness brand chips", () => {
+    const html = render();
+    const grid = html.slice(html.indexOf('data-testid="template-grid"'));
+    for (const vendor of ["claude", "codex", "grok", "kimi"]) {
+      expect(grid).toContain(`data-vendor="${vendor}"`);
+    }
+    // The 协作 flagship wears all four chips (claude brain + 3 specialists).
+    const team = grid.slice(
+      grid.indexOf('data-testid="tpl-team"'),
+      grid.indexOf('data-testid="tpl-plan"'),
+    );
+    for (const vendor of ["claude", "codex", "grok", "kimi"]) {
+      expect(team).toContain(`data-vendor="${vendor}"`);
+    }
+    // The generic 项目速览 card is vendor-neutral (no chip, draft untouched).
+    const tour = grid.slice(grid.indexOf('data-testid="tpl-tour"'));
+    expect(tour.slice(0, tour.indexOf("</button>"))).not.toContain("data-vendor=");
   });
 
   it("template cards speak the shell language (en)", () => {
@@ -170,7 +194,8 @@ describe("HomeView (landing page)", () => {
       />,
     );
     expect(html).toContain("Quick start");
+    expect(html).toContain("Multi-agent team");
+    expect(html).toContain("Solid coding");
     expect(html).toContain("Project tour");
-    expect(html).toContain("Fix a bug");
   });
 });

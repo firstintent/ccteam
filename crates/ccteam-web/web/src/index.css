@@ -535,8 +535,9 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .tpl-card:hover { box-shadow: var(--shadow-card); border-color: var(--text-faint); }
 .tpl-card .t { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; }
-.tpl-card .t svg { width: 15px; height: 15px; color: var(--text-muted); flex: none; }
+.tpl-card .t > svg { width: 15px; height: 15px; color: var(--text-muted); flex: none; }
 .tpl-card .t .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tpl-card .t .vs { margin-left: auto; display: inline-flex; gap: 4px; flex: none; }
 .tpl-card .d { font-size: 12px; color: var(--text-faint); line-height: 1.5; }
 .chip {
   font-size: 11px; padding: 1.5px 8px; border-radius: 999px;

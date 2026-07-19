@@ -15,18 +15,19 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  BookOpen,
-  Bug,
-  ClipboardCheck,
+  ClipboardList,
+  Code,
   Compass,
-  FlaskConical,
   Folder,
   GitBranch,
   Globe,
-  Hammer,
+  Layers,
+  Users,
+  Zap,
 } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import type { TurnAttachment } from "../lib/attachmentsApi";
+import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
 import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
 import {
@@ -37,6 +38,7 @@ import {
   wireEffort,
   wireProtocol,
   type ComposerDraft,
+  type VendorId,
 } from "../lib/vendors";
 import { createProject as apiCreateProject } from "../lib/dashboardApi";
 import {
@@ -48,17 +50,28 @@ import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../l
 import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
 
 /** 快速开始 template cards (the grid replacing the old 最近会话 recents —
- *  those live in the sidebar rail). `key` indexes the i18n table:
- *  `<key>T` = title, `<key>D` = description, `<key>P` = the composer prompt
- *  a click prefills (lazy-create untouched — the session is born on send). */
-const TEMPLATES = [
-  { id: "tour", key: "tplTour", Icon: Compass },
-  { id: "bug", key: "tplBug", Icon: Bug },
-  { id: "feat", key: "tplFeat", Icon: Hammer },
-  { id: "review", key: "tplReview", Icon: ClipboardCheck },
-  { id: "test", key: "tplTest", Icon: FlaskConical },
-  { id: "docs", key: "tplDocs", Icon: BookOpen },
-] as const;
+ *  those live in the sidebar rail). The set showcases ccteam's headline
+ *  feature — multi-vendor delegation, each harness on its strength (claude
+ *  plans / codex codes steady / grok is fastest / kimi is cost-effective):
+ *  a click prefills the composer with `<key>P` from the i18n table (`<key>T`
+ *  = title, `<key>D` = description) AND switches the model draft to
+ *  `vendors[0]` so the session really spawns on that harness (lazy-create
+ *  untouched — the session is born on send). `vendors` also renders as
+ *  brand chips on the card; the 协作 flagship wears all four and leaves the
+ *  actual fan-out to session_spawn/dispatch from the claude brain. */
+const TEMPLATES: ReadonlyArray<{
+  id: string;
+  key: string;
+  Icon: typeof Compass;
+  vendors: readonly VendorId[];
+}> = [
+  { id: "team", key: "tplTeam", Icon: Users, vendors: ["claude", "codex", "grok", "kimi"] },
+  { id: "plan", key: "tplPlan", Icon: ClipboardList, vendors: ["claude"] },
+  { id: "code", key: "tplCode", Icon: Code, vendors: ["codex"] },
+  { id: "fast", key: "tplFast", Icon: Zap, vendors: ["grok"] },
+  { id: "bulk", key: "tplBulk", Icon: Layers, vendors: ["kimi"] },
+  { id: "tour", key: "tplTour", Icon: Compass, vendors: [] },
+];
 
 export interface ProjectHostIdentity {
   host: string;
@@ -573,20 +586,31 @@ export default function HomeView({
         <div className="quickstart">
           <h3>{t("quickStart")}</h3>
           <div className="tpl-grid" data-testid="template-grid">
-            {TEMPLATES.map(({ id, key, Icon }) => (
+            {TEMPLATES.map(({ id, key, Icon, vendors }) => (
               <button
                 key={id}
                 type="button"
                 className="tpl-card"
                 data-testid={`tpl-${id}`}
                 title={t(`${key}P`)}
-                onClick={() =>
-                  setPrefill((cur) => ({ text: t(`${key}P`), nonce: cur.nonce + 1 }))
-                }
+                onClick={() => {
+                  setPrefill((cur) => ({ text: t(`${key}P`), nonce: cur.nonce + 1 }));
+                  // Vendor-strength cards also aim the spawn at their harness
+                  // (host binding may still normalize, same as a manual pick).
+                  const vendor = vendors[0];
+                  if (vendor) setDraft((cur) => normalizeDraft({ ...cur, vendor }));
+                }}
               >
                 <div className="t">
                   <Icon />
                   <span className="name">{t(`${key}T`)}</span>
+                  {vendors.length > 0 ? (
+                    <span className="vs">
+                      {vendors.map((v) => (
+                        <VendorChip key={v} vendor={v} />
+                      ))}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="d">{t(`${key}D`)}</div>
               </button>
