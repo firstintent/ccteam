@@ -406,16 +406,69 @@ fn uri_without_token(uri: &Uri) -> String {
     }
 }
 
-/// Pull `?token=<value>` out of a query string (no decoding —
-/// presented value is already a base set of ASCII hex + `ccteam:`
-/// literal).
-fn query_token(query: &str) -> Option<&str> {
+/// Pull `?token=<value>` out of a query string.
+///
+/// Values are **percent-decoded**. The SPA login form navigates to
+/// `/?token=${encodeURIComponent("ccteam:<hex>")}`, which yields
+/// `token=ccteam%3A…` on the wire. Without decoding, [`bare_hex`] fails
+/// (it looks for a literal `ccteam:` prefix), the URL shim never sets the
+/// cookie, and the request falls through to the public-shell 301
+/// `/` → `/app/` — leaving the user on the login page. Unencoded
+/// `ccteam:<hex>` (CLI-printed links, hand-pasted) still works.
+fn query_token(query: &str) -> Option<String> {
     for part in query.split('&') {
         if let Some(rest) = part.strip_prefix("token=") {
-            return Some(rest);
+            return percent_decode_token(rest);
         }
     }
     None
+}
+
+/// Percent-decode a `token` query value into a UTF-8 string.
+///
+/// Accepts both the SPA form (`ccteam%3A` + hex) and the unencoded CLI
+/// form (`ccteam:` + hex). Invalid percent sequences / non-UTF-8 → `None`
+/// (fail closed; a garbage token must not authenticate).
+fn percent_decode_token(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                // Incomplete or non-hex escape → fail closed (do not treat
+                // a dangling `%` as a literal — callers must present a
+                // well-formed wire token).
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = from_hex_nibble(bytes[i + 1])?;
+                let lo = from_hex_nibble(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            // application/x-www-form-urlencoded spaces (not used by our
+            // SPA, but harmless if a proxy rewrites the query that way).
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn from_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The middleware itself, plumbed via `from_fn_with_state`.
@@ -456,9 +509,11 @@ pub async fn auth_layer(
     //    (re)establishes the session cookie so a fresh login replaces a stale
     //    one. The cookie stores the BARE hex presented (admin OR per-user), so
     //    the carry-over below resolves to the SAME identity.
+    //    `query_token` percent-decodes so SPA `encodeURIComponent` (`ccteam%3A…`)
+    //    and CLI unencoded links both resolve.
     if let Some(q) = req.uri().query() {
         if let Some(presented) = query_token(q) {
-            if let Some(bare) = bare_hex(presented) {
+            if let Some(bare) = bare_hex(&presented) {
                 if resolve_identity(bare, expected, &tenants).is_some() {
                     let clean = uri_without_token(req.uri());
                     let cookie = Cookie::build((COOKIE_NAME, bare.to_string()))
@@ -592,9 +647,41 @@ mod tests {
 
     #[test]
     fn query_token_extracts_value() {
-        assert_eq!(query_token("token=ccteam:abc"), Some("ccteam:abc"));
-        assert_eq!(query_token("other=x&token=ccteam:abc"), Some("ccteam:abc"));
+        assert_eq!(
+            query_token("token=ccteam:abc").as_deref(),
+            Some("ccteam:abc")
+        );
+        assert_eq!(
+            query_token("other=x&token=ccteam:abc").as_deref(),
+            Some("ccteam:abc")
+        );
         assert_eq!(query_token("other=x"), None);
+    }
+
+    #[test]
+    fn query_token_percent_decodes_spa_encode_uri_component() {
+        // TokenEntryPage: `/?token=${encodeURIComponent("ccteam:<hex>")}`
+        // → wire query `token=ccteam%3A…`. Must become wire-format again.
+        assert_eq!(
+            query_token("token=ccteam%3Adeadbeef").as_deref(),
+            Some("ccteam:deadbeef")
+        );
+        assert_eq!(
+            query_token("token=ccteam%3adeadbeef").as_deref(),
+            Some("ccteam:deadbeef"),
+            "hex digits in percent-escapes are case-insensitive"
+        );
+        assert_eq!(
+            query_token("other=1&token=ccteam%3Aabc&x=y").as_deref(),
+            Some("ccteam:abc")
+        );
+    }
+
+    #[test]
+    fn percent_decode_token_rejects_garbage() {
+        assert!(percent_decode_token("ccteam%ZZ").is_none());
+        assert!(percent_decode_token("ccteam%").is_none());
+        assert!(percent_decode_token("ccteam%3").is_none());
     }
 
     #[test]

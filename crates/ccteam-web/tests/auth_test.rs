@@ -214,6 +214,48 @@ async fn url_shim_sets_cookie_and_redirects_to_clean_uri() {
     );
 }
 
+/// Regression: TokenEntryPage does `/?token=${encodeURIComponent(token)}`,
+/// so the colon in `ccteam:<hex>` arrives as `%3A`. Before percent-decode
+/// the shim failed open-shell → 301 `/app/` with no cookie, and the user
+/// bounced back to the login UI.
+#[tokio::test]
+async fn url_shim_accepts_percent_encoded_token_from_spa_login() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+    let client = nofollow();
+    // Mimic the browser wire form of encodeURIComponent("ccteam:<hex>").
+    let resp = client
+        .get(format!("http://{addr}/?token=ccteam%3A{TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        303,
+        "percent-encoded SPA login must hit the URL shim (303), not the public-shell 301; got {}",
+        resp.status()
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .expect("Location header")
+        .to_str()
+        .unwrap();
+    assert_eq!(loc, "/", "redirect strips the token query");
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("Set-Cookie must be set for encoded SPA login")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
+        "cookie must store bare hex after decoding: {set_cookie}"
+    );
+}
+
 #[tokio::test]
 async fn cookie_carries_subsequent_request() {
     let tmp = TempDir::new().unwrap();
