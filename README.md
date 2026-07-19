@@ -16,22 +16,19 @@
 
 Claude Code plans deepest, Codex grinds long jobs without wobbling, Grok answers fastest, Kimi does bulk work on a tiny bill. Alone, each is one terminal with one context and no colleagues. ccteam bridges them with what a team needs underneath — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves how the team organizes itself to prompts you version.
 
-## Tools
+## Scenarios
 
-The bridge is eight MCP tools, available to every session (and to your plain local Claude Code / Codex, once registered). The daemon underneath is a router, not an orchestrator — no scheduler, no tick loop; *when* to delegate lives in prompts you version, not in ccteam config.
-
-| Tool | When | What it does |
+| Scenario | You | What happens |
 | --- | --- | --- |
-| `session_spawn` | You need another pair of hands | Starts a session — any vendor, model, optional persona — first task in the same call; it runs wherever its project lives |
-| `session_dispatch` | More work for an existing member | Sends a follow-up task; async with a completion notification, or waits inline |
-| `session_collect` | You want the result | Pages the transcript with an honest `working`/`idle` signal; `tail:true` grabs the final answer without flooding your context |
-| `session_list` | Who's doing what | The live delegation tree — sessions, parents, vendors, hosts |
-| `session_stop` | A job is done | Winds a descendant session down cleanly |
-| `status` | Morning coffee | Daemon health, live sessions, today's spend per vendor |
-| `chat_send_file` | Ship the artifact | Sends any file straight to your IM chat |
-| `screenshot` | Trust but verify | Renders a live terminal session to an image |
+| **Code from your pocket** | `@s2 fix the flaky test, run the suite` from Telegram | The session picks it up mid-context; the answer, the diff summary and the cost land back in the chat — laptop optional |
+| **One brain, many hands** | Tell claude to plan and delegate | It spawns codex to implement, grok to probe, kimi for the bulk — parallel sessions in one delegation tree, each reporting back when done |
+| **Rival-model merge gate** | "codex implements, claude reviews before merge" | Two vendors check each other's work; you read one verdict instead of every diff |
+| **Overnight long jobs** | Dispatch a migration at midnight, close the laptop | The turn keeps running on the daemon; the completion notification — and the artifact — is waiting in your IM at breakfast |
+| **Right machine for the job** | Spawn into the GPU-box project | The session runs on that satellite; code, tests and GPUs stay there, transcripts and cost come home to your daemon |
+| **Approvals without a terminal** | Spawn a session in approval mode | Permission requests arrive in IM as `[approve] [deny]` buttons; deny blocks the one call, never kills the turn |
+| **Know what it costs** | `/status`, any time | Live sessions, the delegation tree, today's per-vendor spend — with daily budget caps as the automatic brake |
 
-Every hop is recorded — who spawned whom, what it cost, what came back: at-least-once completion notifications across restarts, idempotency keys, a child's turn on disk before its parent is told. Guardrails refuse runaway fan-out with a reason (delegation depth, fan-out and per-project ceilings, cycle rejection, per-session identity scoped to its own project) instead of letting you discover it on the invoice. The [orchestration guide](docs/orchestration.md) is the plain-language walkthrough; the manual has every command ([English](docs/usage.md) · [中文](docs/usage-cn.md)).
+Underneath, every scenario is the same eight MCP tools — `session_spawn` / `session_dispatch` / `session_collect` / `session_list` / `session_stop`, plus `status`, `chat_send_file`, `screenshot` — available to every session, and to your plain hand-started CLIs once registered. The daemon routes and records (at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told, guardrails that refuse runaway fan-out with a reason); it never schedules — *when* to delegate lives in prompts you version. The [orchestration guide](docs/orchestration.md) is the plain-language walkthrough; the manual has every command ([English](docs/usage.md) · [中文](docs/usage-cn.md)).
 
 ## Install
 
