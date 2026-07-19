@@ -3,7 +3,8 @@
 //
 // 「开工吧!」 + ctx-bar (项目 · 主机 · 分支(只读, v0.8.24 Q7 — hidden for
 // non-git projects, never mocked) · 角色) sitting flush on the composer, and
-// the 最近会话 two-column card grid.
+// the 快速开始 two-column template grid (picking a card prefills the
+// composer — recents live in the sidebar rail, not here).
 //
 // LAZY-CREATE: the session is created when the FIRST message is sent —
 // POST /projects (only for an inline 「＋ 新建项目…」 path) → POST
@@ -13,10 +14,19 @@
 // first turn → navigate to the Conversation view.
 
 import { useEffect, useRef, useState } from "react";
-import { Folder, GitBranch, Globe } from "lucide-react";
+import {
+  BookOpen,
+  Bug,
+  ClipboardCheck,
+  Compass,
+  FlaskConical,
+  Folder,
+  GitBranch,
+  Globe,
+  Hammer,
+} from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import type { TurnAttachment } from "../lib/attachmentsApi";
-import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
 import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
 import {
@@ -24,7 +34,6 @@ import {
   modelSwitchFor,
   normalizeDraft,
   slugFromPath,
-  statusDotClass,
   wireEffort,
   wireProtocol,
   type ComposerDraft,
@@ -37,19 +46,19 @@ import {
 } from "../lib/sessionsApi";
 import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../lib/hostsApi";
 import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
-import { relativeTime } from "./railHelpers";
 
-/** One 最近会话 card (live or resumable history) the shell feeds in. */
-export interface RecentEntry {
-  sid: string;
-  label: string;
-  project: string;
-  vendor: string;
-  host?: string;
-  status?: string | null;
-  history?: boolean;
-  lastActive?: string;
-}
+/** 快速开始 template cards (the grid replacing the old 最近会话 recents —
+ *  those live in the sidebar rail). `key` indexes the i18n table:
+ *  `<key>T` = title, `<key>D` = description, `<key>P` = the composer prompt
+ *  a click prefills (lazy-create untouched — the session is born on send). */
+const TEMPLATES = [
+  { id: "tour", key: "tplTour", Icon: Compass },
+  { id: "bug", key: "tplBug", Icon: Bug },
+  { id: "feat", key: "tplFeat", Icon: Hammer },
+  { id: "review", key: "tplReview", Icon: ClipboardCheck },
+  { id: "test", key: "tplTest", Icon: FlaskConical },
+  { id: "docs", key: "tplDocs", Icon: BookOpen },
+] as const;
 
 export interface ProjectHostIdentity {
   host: string;
@@ -175,10 +184,8 @@ export default function HomeView({
   projectPaths,
   projectHosts = {},
   projectBranches = {},
-  recents,
   initialProject,
   onLaunched,
-  onOpenRecent,
   onOpenSettings,
 }: {
   lang: Lang;
@@ -188,11 +195,9 @@ export default function HomeView({
   projectHosts?: Record<string, ProjectHostIdentity>;
   /** v0.8.24 Q7 — current git branch per slug (absent ⇒ hide the dimension). */
   projectBranches?: Record<string, string>;
-  recents: RecentEntry[];
   /** Pre-picked project (sidebar 「在此工作区新建」). */
   initialProject?: string | null;
   onLaunched: (sid: string) => void;
-  onOpenRecent: (entry: RecentEntry) => void;
   onOpenSettings: (tab: string) => void;
 }) {
   const t = makeT(lang);
@@ -218,6 +223,8 @@ export default function HomeView({
   const [host, setHost] = useState<string>("local");
   const [draft, setDraft] = useState<ComposerDraft>(() => loadModelDraft());
   const [pending, setPending] = useState(false);
+  // 快速开始 template pick → composer draft text (bump-nonce channel).
+  const [prefill, setPrefill] = useState({ text: "", nonce: 0 });
 
   // Persist the model/effort/protocol/hitl draft.
   useEffect(() => {
@@ -542,6 +549,7 @@ export default function HomeView({
             onSend={launch}
             sendTestId="home-send"
             uploadSlug={isNewProject ? undefined : project || undefined}
+            prefill={prefill}
             topSlot={
               <NewProjectFields
                 lang={lang}
@@ -562,29 +570,25 @@ export default function HomeView({
           ) : null}
         </div>
 
-        <div className="recent">
-          <h3>{t("recent")}</h3>
-          <div className="recent-grid" data-testid="recent-grid">
-            {recents.slice(0, 4).map((c) => (
+        <div className="quickstart">
+          <h3>{t("quickStart")}</h3>
+          <div className="tpl-grid" data-testid="template-grid">
+            {TEMPLATES.map(({ id, key, Icon }) => (
               <button
-                key={c.sid}
+                key={id}
                 type="button"
-                className="conv-card"
-                onClick={() => onOpenRecent(c)}
-                title={c.history ? t("resumeTip") : c.sid}
+                className="tpl-card"
+                data-testid={`tpl-${id}`}
+                title={t(`${key}P`)}
+                onClick={() =>
+                  setPrefill((cur) => ({ text: t(`${key}P`), nonce: cur.nonce + 1 }))
+                }
               >
                 <div className="t">
-                  <span className={statusDotClass(c.status, { off: c.history })} />
-                  <span className="name">{c.label}</span>
+                  <Icon />
+                  <span className="name">{t(`${key}T`)}</span>
                 </div>
-                <div className="m">
-                  <span>{c.project}</span>
-                  <VendorChip vendor={c.vendor} />
-                  <span className="chip sid">{c.sid}</span>
-                  <span style={{ marginLeft: "auto" }} className="mono">
-                    {c.host ?? "local"} · {relativeTime(lang, c.lastActive)}
-                  </span>
-                </div>
+                <div className="d">{t(`${key}D`)}</div>
               </button>
             ))}
           </div>

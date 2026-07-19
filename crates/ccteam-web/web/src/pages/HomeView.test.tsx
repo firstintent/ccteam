@@ -3,7 +3,7 @@
 // modelSwitchFor) are unit-tested in lib/vendors.test.ts; here we prove the
 // page structure: 开工吧! + ctx-bar (项目/角色; 主机 hidden until real host
 // data resolves; 分支 hidden — no backend data, never mocked) + composer +
-// 最近会话 grid.
+// the 快速开始 template grid (recents live in the sidebar rail).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -20,39 +20,17 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 
-import HomeView, { NewProjectFields, type RecentEntry } from "./HomeView";
+import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
 
-const RECENTS: RecentEntry[] = [
-  {
-    sid: "s41",
-    label: "修复 SSE 断线重连",
-    project: "ccteam",
-    vendor: "claude",
-    host: "dev01",
-    status: "working",
-    lastActive: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-  },
-  {
-    sid: "s35",
-    label: "grok ACP 冒烟",
-    project: "ccteam",
-    vendor: "grok",
-    history: true,
-    lastActive: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString(),
-  },
-];
-
-function render(recents: RecentEntry[] = RECENTS, isAdmin = true) {
+function render(isAdmin = true) {
   return renderToString(
     <HomeView
       lang="zh"
       isAdmin={isAdmin}
       projects={["ccteam", "demo"]}
       projectPaths={{ ccteam: "~/rob/ccteam" }}
-      recents={recents}
       onLaunched={() => {}}
-      onOpenRecent={() => {}}
       onOpenSettings={() => {}}
     />,
   );
@@ -92,9 +70,7 @@ describe("HomeView (landing page)", () => {
         projects={["ccteam"]}
         projectPaths={{ ccteam: "~/rob/ccteam" }}
         projectBranches={{ ccteam: "dev" }}
-        recents={[]}
         onLaunched={() => {}}
-        onOpenRecent={() => {}}
         onOpenSettings={() => {}}
       />,
     );
@@ -106,7 +82,7 @@ describe("HomeView (landing page)", () => {
   });
 
   it("角色 picker is an admin-only beta surface (tenant launches roleless)", () => {
-    const tenant = render(RECENTS, false);
+    const tenant = render(false);
     expect(tenant).not.toContain('data-testid="ctx-role"');
     expect(tenant).toContain('data-testid="ctx-project"');
   });
@@ -157,9 +133,7 @@ describe("HomeView (landing page)", () => {
         projects={["remote-proj"]}
         projectPaths={{ "remote-proj": "/srv/remote-proj" }}
         projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
-        recents={[]}
         onLaunched={() => {}}
-        onOpenRecent={() => {}}
         onOpenSettings={() => {}}
       />,
     );
@@ -168,29 +142,35 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain('disabled=""');
   });
 
-  it("renders 最近会话 cards (4-way vendor chips + sid + host·time)", () => {
+  it("renders the 快速开始 template grid (6 cards, prompt in the title attr)", () => {
     const html = render();
-    expect(html).toContain('data-testid="recent-grid"');
-    expect(html).toContain("修复 SSE 断线重连");
-    expect(html).toContain("chip claude");
-    expect(html).toContain("chip grok");
-    expect(html).toContain('data-vendor="claude"');
-    expect(html).toContain('data-vendor="grok"');
-    expect(html).toContain(">s41<");
-    expect(html).toContain("dev01");
-    // A stopped session card shows the off dot.
-    expect(html).toContain("dot off");
+    expect(html).toContain('data-testid="template-grid"');
+    expect(html).toContain("快速开始");
+    for (const id of ["tour", "bug", "feat", "review", "test", "docs"]) {
+      expect(html).toContain(`data-testid="tpl-${id}"`);
+    }
+    expect(html).toContain("项目速览");
+    expect(html).toContain("修复 Bug");
+    expect(html).toContain("代码审查");
+    // The card carries its composer prompt as the hover title.
+    expect(html).toContain("带我快速了解这个项目");
+    // The old recents grid is gone (recents live in the sidebar rail).
+    expect(html).not.toContain('data-testid="recent-grid"');
   });
 
-  it("caps the grid at 4 cards", () => {
-    const many = Array.from({ length: 6 }, (_, i) => ({
-      ...RECENTS[0]!,
-      sid: `s${i}`,
-      label: `卡片 ${i}`,
-    }));
-    const html = render(many);
-    expect(html).toContain("卡片 0");
-    expect(html).toContain("卡片 3");
-    expect(html).not.toContain("卡片 4");
+  it("template cards speak the shell language (en)", () => {
+    const html = renderToString(
+      <HomeView
+        lang="en"
+        isAdmin
+        projects={["ccteam"]}
+        projectPaths={{ ccteam: "~/rob/ccteam" }}
+        onLaunched={() => {}}
+        onOpenSettings={() => {}}
+      />,
+    );
+    expect(html).toContain("Quick start");
+    expect(html).toContain("Project tour");
+    expect(html).toContain("Fix a bug");
   });
 });

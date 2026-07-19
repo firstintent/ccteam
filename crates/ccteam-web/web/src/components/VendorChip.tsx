@@ -67,7 +67,7 @@ function VendorMark({ vendor }: { vendor: string }) {
 }
 
 /** Shared compact harness badge. Shows a small brand icon (not the vendor
- *  name string) so dense lists (sidebar / recent cards / conv head) stay
+ *  name string) so dense lists (sidebar / conv head) stay
  *  short. `title` + `aria-label` keep the vendor name available on hover
  *  and for screen readers. */
 export function VendorChip({ vendor }: { vendor: string }) {

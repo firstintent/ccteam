@@ -21,7 +21,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { Menu } from "lucide-react";
-import HomeView, { type RecentEntry } from "./HomeView";
+import HomeView from "./HomeView";
 import SessionView from "./SessionView";
 import WorkflowView from "./WorkflowView";
 import SettingsView from "./SettingsView";
@@ -58,7 +58,7 @@ export function shellViewFor(pathname: string): ShellView {
 }
 
 /** How many stopped (history) sessions each project contributes to the rail
- *  + recents — enough to resume recent work without drowning the live rows. */
+ *  — enough to resume recent work without drowning the live rows. */
 const HISTORY_PER_PROJECT = 6;
 
 export default function ChatConsole() {
@@ -174,32 +174,6 @@ export default function ChatConsole() {
         history: true,
       }));
     return [...live, ...hist];
-  }, [railSessions, historyByProject, liveSids]);
-
-  // ---- Home recents: live + stopped, most recent first ---------------------
-  const recents: RecentEntry[] = useMemo(() => {
-    const live: RecentEntry[] = railSessions.map((s) => ({
-      sid: s.sid,
-      label: railSessionLabel(s),
-      project: s.project,
-      vendor: s.vendor,
-      host: s.host,
-      status: s.status,
-      lastActive: s.last_active ?? s.created_at,
-    }));
-    const hist: RecentEntry[] = Object.values(historyByProject)
-      .flat()
-      .filter((h) => !liveSids.has(h.sid))
-      .map((h) => ({
-        sid: h.sid,
-        label: railSessionLabel(h),
-        project: h.slug,
-        vendor: h.vendor,
-        history: true,
-        lastActive: h.last_active || h.created_at,
-      }));
-    const ts = (e: RecentEntry) => (e.lastActive ? Date.parse(e.lastActive) || 0 : 0);
-    return [...live, ...hist].sort((a, b) => ts(b) - ts(a));
   }, [railSessions, historyByProject, liveSids]);
 
   // ---- sidebar chrome state -------------------------------------------------
@@ -389,13 +363,11 @@ export default function ChatConsole() {
             projectPaths={projectPaths}
             projectHosts={projectHosts}
             projectBranches={projectBranches}
-            recents={recents}
             initialProject={homeProject}
             onLaunched={(newSid) => {
               void refreshSessions();
               navigate(`/chat/s/${encodeURIComponent(newSid)}`);
             }}
-            onOpenRecent={(entry) => openRow(entry)}
             onOpenSettings={(t) => navigate(`/settings/${t}`)}
           />
         )}

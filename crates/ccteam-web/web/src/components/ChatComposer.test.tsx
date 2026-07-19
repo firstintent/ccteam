@@ -2,13 +2,28 @@
 // IME guard (the owner-reported #1 bug: pressing Enter to confirm a Chinese
 // candidate must NOT send a half-typed message).
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = globalThis as any;
+  if (typeof g.window === "undefined") {
+    g.window = { innerWidth: 1024, addEventListener() {}, removeEventListener() {} };
+  }
+  if (typeof g.localStorage === "undefined") {
+    g.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  }
+});
+
+import { renderToString } from "react-dom/server";
 import {
   attachmentsBlockSend,
   attachmentsPayload,
+  ChatComposer,
   shouldSubmitOnEnter,
   type ComposerAttachment,
 } from "./ChatComposer";
+import { defaultDraft } from "../lib/vendors";
 
 const base = { key: "Enter", shiftKey: false, isComposing: false, keyCode: 13 };
 
@@ -81,5 +96,30 @@ describe("attachmentsBlockSend", () => {
       false,
     );
     expect(attachmentsBlockSend([])).toBe(false);
+  });
+});
+
+// ── prefill (Home 快速开始 templates) ──────────────────────────────────────────
+
+describe("prefill", () => {
+  const renderComposer = (prefill?: { text: string; nonce: number }) =>
+    renderToString(
+      <ChatComposer
+        draftKey="test"
+        lang="zh"
+        isAdmin
+        draft={defaultDraft()}
+        onDraftChange={() => {}}
+        onSend={() => {}}
+        prefill={prefill}
+      />,
+    );
+
+  it("a bumped nonce replaces the draft text", () => {
+    expect(renderComposer({ text: "帮我修一个 bug。", nonce: 1 })).toContain("帮我修一个 bug。");
+  });
+
+  it("nonce 0 means no prefill (draft untouched)", () => {
+    expect(renderComposer({ text: "不该出现", nonce: 0 })).not.toContain("不该出现");
   });
 });

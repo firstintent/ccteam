@@ -45,7 +45,7 @@ describe("I18N dictionary", () => {
 
   it("makeT curries the language", () => {
     const tt = makeT("en");
-    expect(tt("recent")).toBe("Recent sessions");
+    expect(tt("quickStart")).toBe("Quick start");
     expect(t("zh", "setOps")).toBe("运维总览");
     expect(tt("setOps")).toBe("Ops & Hosts");
   });

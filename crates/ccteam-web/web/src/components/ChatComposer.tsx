@@ -125,6 +125,7 @@ export function ChatComposer({
   topSlot,
   sendTestId = "composer-send",
   uploadSlug,
+  prefill,
 }: {
   /** localStorage draft scope — `"home"` or the sid. */
   draftKey: string;
@@ -155,6 +156,9 @@ export function ChatComposer({
   /** Project slug uploads + the skill picker target. Omit (e.g. while the
    *  Home new-project row is open) to disable attaching with a hint. */
   uploadSlug?: string;
+  /** Home 快速开始 templates: bump `nonce` to replace the draft text with
+   *  `text` and focus the textarea (nonce 0 = no prefill). */
+  prefill?: { text: string; nonce: number };
 }) {
   const t = makeT(lang);
   const [text, setText] = useState(() => loadDraft(draftKey));
@@ -189,6 +193,17 @@ export function ChatComposer({
     setSkills(null);
     if (attachments.length > 0) setAttachments([]);
   }
+
+  // Quick-start template pick: a bumped nonce replaces the draft text
+  // (render-phase derived state, same pattern as the attachSlug reset above).
+  const [appliedPrefill, setAppliedPrefill] = useState(0);
+  if (prefill && prefill.nonce !== appliedPrefill) {
+    setAppliedPrefill(prefill.nonce);
+    setText(prefill.text);
+  }
+  useEffect(() => {
+    if (prefill?.nonce) taRef.current?.focus();
+  }, [prefill?.nonce]);
 
   // Auto-grow the textarea (52 → 260px, then scroll).
   const autoGrow = useCallback(() => {

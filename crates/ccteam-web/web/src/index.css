@@ -525,18 +525,19 @@ html.dark .dot.off { background: #4b4e57; }
 .newproj .x { color: var(--text-faint); font-size: 15px; padding: 2px 6px; border-radius: 5px; background: none; border: none; }
 .newproj .x:hover { background: var(--bg-hover); color: var(--text); }
 
-.recent h3 { font-size: 12.5px; font-weight: 500; color: var(--text-faint); letter-spacing: .6px; text-transform: uppercase; margin-bottom: 12px; }
-.recent-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.conv-card {
+.quickstart h3 { font-size: 12.5px; font-weight: 500; color: var(--text-faint); letter-spacing: .6px; text-transform: uppercase; margin-bottom: 12px; }
+.tpl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tpl-card {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--radius-card); padding: 13px 16px;
-  display: flex; flex-direction: column; gap: 8px; text-align: left;
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
   transition: box-shadow .15s, border-color .15s;
 }
-.conv-card:hover { box-shadow: var(--shadow-card); border-color: var(--text-faint); }
-.conv-card .t { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; }
-.conv-card .t .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.conv-card .m { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-faint); flex-wrap: wrap; }
+.tpl-card:hover { box-shadow: var(--shadow-card); border-color: var(--text-faint); }
+.tpl-card .t { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500; }
+.tpl-card .t svg { width: 15px; height: 15px; color: var(--text-muted); flex: none; }
+.tpl-card .t .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tpl-card .d { font-size: 12px; color: var(--text-faint); line-height: 1.5; }
 .chip {
   font-size: 11px; padding: 1.5px 8px; border-radius: 999px;
   border: 1px solid var(--border); color: var(--text-muted);
@@ -740,7 +741,7 @@ html.dark .dot.off { background: #4b4e57; }
   .ops-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 900px) {
-  .recent-grid, .mk-grid { grid-template-columns: 1fr; }
+  .tpl-grid, .mk-grid { grid-template-columns: 1fr; }
   .stat-grid { grid-template-columns: 1fr 1fr; }
   .agent-row { grid-template-columns: 110px 1fr auto; }
   .agent-row .bin { display: none; }
