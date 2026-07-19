@@ -243,7 +243,10 @@ async fn url_shim_accepts_percent_encoded_token_from_spa_login() {
         .expect("Location header")
         .to_str()
         .unwrap();
-    assert_eq!(loc, "/", "redirect strips the token query");
+    assert_eq!(
+        loc, "/app/",
+        "root login must land on the SPA in one hop (no / → 301 /app/)"
+    );
     let set_cookie = resp
         .headers()
         .get("set-cookie")
@@ -253,6 +256,32 @@ async fn url_shim_accepts_percent_encoded_token_from_spa_login() {
     assert!(
         set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
         "cookie must store bare hex after decoding: {set_cookie}"
+    );
+}
+
+/// Bare hex (no `ccteam:` prefix) — what the login form's label asks for.
+#[tokio::test]
+async fn url_shim_accepts_bare_hex_token() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+    let client = nofollow();
+    let resp = client
+        .get(format!("http://{addr}/?token={TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303, "bare hex must hit the URL shim");
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("Set-Cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
+        "cookie stores bare hex: {set_cookie}"
     );
 }
 

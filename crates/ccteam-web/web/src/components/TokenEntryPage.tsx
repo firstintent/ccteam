@@ -13,7 +13,8 @@
 // copy-paste of either keeps working, but the UI asks only for the hex.
 
 import { useState, useRef, useEffect } from "react";
-import { extractTokenFromQuery } from "../lib/token";
+import { resetTokenExpired } from "../lib/fetchInterceptor";
+import { extractTokenFromQuery, saveToken } from "../lib/token";
 import { CcLogo } from "./Logo";
 
 interface Props {
@@ -71,9 +72,18 @@ export function TokenEntryPage({ onSubmit }: Props) {
     setError(null);
     onSubmit?.();
 
-    // Server's auth_layer validates the token, sets the persistent
-    // ccteam_token cookie, and 302 → `/` (no token param). The browser then
-    // reloads the SPA and `useAuthState` re-probes.
+    // Dual-path login (cookie + Bearer):
+    // 1. Stash the wire token in localStorage NOW so the SPA fetch interceptor
+    //    can send `Authorization: Bearer` after reload — the server URL shim
+    //    303-strips `?token=` before the SPA ever mounts, so `captureFromUrl`
+    //    never sees it (the bug that left cookie-only sessions wedged when a
+    //    stale/empty localStorage Bearer was expected by PWA / concurrent
+    //    fetches that raced the cookie).
+    // 2. Reset the 401-dedup flag so a previous failed probe doesn't keep the
+    //    gate open after a successful re-auth.
+    // 3. Navigate to the URL shim so the server sets the HttpOnly cookie.
+    saveToken(token);
+    resetTokenExpired();
     window.location.href = `/?token=${encodeURIComponent(token)}`;
   };
 

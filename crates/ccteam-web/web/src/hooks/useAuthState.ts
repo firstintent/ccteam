@@ -27,7 +27,7 @@ import {
   TOKEN_EXPIRED_EVENT,
   resetTokenExpired,
 } from "../lib/fetchInterceptor";
-import { clearToken } from "../lib/token";
+import { clearToken, saveToken } from "../lib/token";
 
 export interface AuthState {
   /** `undefined` while bootstrap probe is in flight, `null` when auth
@@ -56,7 +56,15 @@ export function useAuthState(): AuthState {
       // undefined; the SPA renders, and a subsequent /api/* 401 (which
       // will happen if auth is required) trips `saw401` and the gate
       // shows TokenEntryPage anyway.
-      if (res) setWireToken(res.wire_token);
+      if (res) {
+        setWireToken(res.wire_token);
+        // Cookie-only login (CLI personal link / URL shim) never runs the
+        // SPA's `captureFromUrl` — the server strips `?token=` before the
+        // bundle mounts. Mirror the caller's token into localStorage so the
+        // Bearer path stays in sync with the HttpOnly cookie (PWA + any
+        // fetch that prefers the Authorization header).
+        if (res.wire_token) saveToken(res.wire_token);
+      }
     });
     return () => {
       cancelled = true;

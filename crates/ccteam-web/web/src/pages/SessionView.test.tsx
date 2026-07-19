@@ -63,9 +63,10 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(html).toContain("Enter 发送"); // conv composer placeholder
     expect(html).toContain(">s9<"); // sid chip
     expect(html).toContain(">demo<"); // project chip
-    expect(html).toContain(">claude<"); // vendor chip
+    // Vendor chip is an icon-only mark (no text label) with data-vendor.
     expect(html).toContain('class="chip claude vendor-chip"');
     expect(html).toContain('data-vendor="claude"');
+    expect(html).toContain('aria-label="claude"');
     // …but there are NO transcript bubbles: rows seeded empty and the
     // SSE/history seeds can't run under SSR.
     expect(html).not.toContain('class="msg user');

@@ -471,6 +471,31 @@ fn from_hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Extract the bare hex from a presented `?token=` value.
+/// Accepts wire form `ccteam:<hex>` OR bare hex (the login UI asks for hex
+/// only; CLI personal links use the wire form).
+fn presented_token_hex(presented: &str) -> Option<&str> {
+    if let Some(bare) = bare_hex(presented) {
+        return Some(bare);
+    }
+    if !presented.is_empty() && presented.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(presented);
+    }
+    None
+}
+
+/// Where the URL shim should send the browser after setting the cookie.
+/// `/` is rewritten to `/app/` so login lands on the SPA in one hop
+/// (avoids `/` → 301 `/app/` losing cookies on some proxies).
+fn login_redirect_path(uri: &Uri) -> String {
+    let clean = uri_without_token(uri);
+    if clean == "/" {
+        "/app/".to_string()
+    } else {
+        clean
+    }
+}
+
 /// The middleware itself, plumbed via `from_fn_with_state`.
 ///
 /// Order of checks (v0.8.20 — cookie BEFORE header, the ownership-leak fix):
@@ -505,17 +530,21 @@ pub async fn auth_layer(
     // v0.8.18 档1 — the bootstrap token → admin; per-user tokens → their tenant.
     let tenants = app.paths.users_dir();
 
-    // 1. URL shim — an explicit `?token=ccteam:<hex>` login link ALWAYS wins: it
-    //    (re)establishes the session cookie so a fresh login replaces a stale
-    //    one. The cookie stores the BARE hex presented (admin OR per-user), so
-    //    the carry-over below resolves to the SAME identity.
+    // 1. URL shim — an explicit `?token=ccteam:<hex>` (or bare hex) login link
+    //    ALWAYS wins: it (re)establishes the session cookie so a fresh login
+    //    replaces a stale one. The cookie stores the BARE hex presented (admin
+    //    OR per-user), so the carry-over below resolves to the SAME identity.
     //    `query_token` percent-decodes so SPA `encodeURIComponent` (`ccteam%3A…`)
-    //    and CLI unencoded links both resolve.
+    //    and CLI unencoded links both resolve. Bare hex is accepted too (the
+    //    login form asks for hex only; a hand-pasted `?token=<hex>` must work).
     if let Some(q) = req.uri().query() {
         if let Some(presented) = query_token(q) {
-            if let Some(bare) = bare_hex(&presented) {
+            if let Some(bare) = presented_token_hex(&presented) {
                 if resolve_identity(bare, expected, &tenants).is_some() {
-                    let clean = uri_without_token(req.uri());
+                    // Prefer landing on the SPA shell after login: bare `/`
+                    // would 301 → `/app/` as a second hop, which some
+                    // browser/proxy stacks drop Set-Cookie across.
+                    let clean = login_redirect_path(req.uri());
                     let cookie = Cookie::build((COOKIE_NAME, bare.to_string()))
                         .http_only(true)
                         .same_site(SameSite::Strict)
@@ -682,6 +711,25 @@ mod tests {
         assert!(percent_decode_token("ccteam%ZZ").is_none());
         assert!(percent_decode_token("ccteam%").is_none());
         assert!(percent_decode_token("ccteam%3").is_none());
+    }
+
+    #[test]
+    fn presented_token_hex_accepts_wire_and_bare() {
+        assert_eq!(presented_token_hex("ccteam:deadbeef"), Some("deadbeef"));
+        assert_eq!(presented_token_hex("deadbeef"), Some("deadbeef"));
+        assert_eq!(presented_token_hex("Bearer deadbeef"), None);
+        assert_eq!(presented_token_hex(""), None);
+        assert_eq!(presented_token_hex("not-hex!"), None);
+    }
+
+    #[test]
+    fn login_redirect_path_lands_on_spa_from_root() {
+        let root: Uri = "/?token=ccteam:abc".parse().unwrap();
+        assert_eq!(login_redirect_path(&root), "/app/");
+        let nested: Uri = "/project/demo?token=ccteam:abc".parse().unwrap();
+        assert_eq!(login_redirect_path(&nested), "/project/demo");
+        let app: Uri = "/app/?token=ccteam:abc".parse().unwrap();
+        assert_eq!(login_redirect_path(&app), "/app/");
     }
 
     #[test]
