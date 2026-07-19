@@ -13,7 +13,7 @@
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1448/0**(a646d45 +1:`stopped`/`killed` 终态回归 —— TaskStop 掉的 workflow 不再在 `/status` 里僵尸「在跑」)
+- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1450/0**(8f4654e +2:TG picker 对齐/roleless 无 `· —` 占位;前 a646d45 +1 `stopped`/`killed` 终态回归)
 - `ccteam-web` 全量 **320**(本机 317 过 + 3 `ws_*` env-flake,干净环境应全绿;+4 sessions_api e2e +2 lib)· vitest **388**(SPA,+10)· Playwright **7**
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
