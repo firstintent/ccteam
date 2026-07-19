@@ -353,10 +353,26 @@ fn task_outlives_turn(t: &crate::RunningTask) -> bool {
 /// True for a task `status` that means the task is no longer running, so it
 /// must leave the running-subagent list. Anything else (`running`,
 /// `in_progress`, …) keeps it.
+///
+/// claude speaks TWO status vocabularies here: `task_notification` closes
+/// with `completed`/`failed`/`stopped` (TaskStop and cancel paths emit
+/// `stopped`), while `task_updated` patches carry the internal task state
+/// whose terminal values are `completed`/`failed`/`killed`. Both kill-words
+/// must be in this set: a background workflow has no turn-end eviction (it
+/// outlives turns by design), so dropping its one terminal event shows it
+/// "running" forever in `/status`.
 fn task_status_is_terminal(s: &str) -> bool {
     matches!(
         s,
-        "completed" | "failed" | "cancelled" | "canceled" | "error" | "aborted" | "timed_out"
+        "completed"
+            | "failed"
+            | "stopped"
+            | "killed"
+            | "cancelled"
+            | "canceled"
+            | "error"
+            | "aborted"
+            | "timed_out"
     )
 }
 
@@ -1805,6 +1821,36 @@ mod effort_tests {
         note.status = "completed".into();
         reflect_task_event(&tasks, &note);
         assert!(tasks.lock().unwrap().is_empty());
+    }
+
+    /// TaskStop closes a task with `task_notification{status:"stopped"}`, and
+    /// `task_updated` patches carry the internal terminal state `killed`. Both
+    /// must evict: a background workflow survives turn-end by design, so
+    /// missing either kill-word left a TaskStop'd workflow displayed as
+    /// "running" forever (observed as a `/status` zombie aging past 14h).
+    #[test]
+    fn stopped_and_killed_are_terminal_statuses() {
+        let tasks = Mutex::new(Vec::new());
+        let mut wf = task_sys("task_started", "w1");
+        wf.task_type = "local_workflow".into();
+        reflect_task_event(&tasks, &wf);
+        let mut note = task_sys("task_notification", "w1");
+        note.status = "stopped".into();
+        reflect_task_event(&tasks, &note);
+        assert!(
+            tasks.lock().unwrap().is_empty(),
+            "task_notification stopped must evict"
+        );
+        let mut wf2 = task_sys("task_started", "w2");
+        wf2.task_type = "local_workflow".into();
+        reflect_task_event(&tasks, &wf2);
+        let mut patch = task_sys("task_updated", "w2");
+        patch.patch = Some(serde_json::json!({"status": "killed"}));
+        reflect_task_event(&tasks, &patch);
+        assert!(
+            tasks.lock().unwrap().is_empty(),
+            "task_updated killed must evict"
+        );
     }
 
     #[test]

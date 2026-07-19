@@ -145,7 +145,8 @@ pub struct SystemMsg {
     /// `task_started.task_type` (e.g. `local_agent`).
     #[serde(default, deserialize_with = "de_null_string")]
     pub task_type: String,
-    /// `task_notification.status` (terminal, e.g. `completed`/`failed`). claude
+    /// `task_notification.status` (terminal: `completed`/`failed`/`stopped` —
+    /// TaskStop and cancel paths close with `stopped`). claude
     /// also ships `status: null` on a non-task `system:status` line (e.g.
     /// `/compact` completion) — `de_null_string` maps that to `""` so the frame
     /// parses instead of failing the whole transport line.
