@@ -1,6 +1,6 @@
 # ccteam User Manual
 
-**ccteam is a self-hosted, always-on background agent team: drive Claude Code / Codex / Grok Build / OpenCode / Kimi Code on your own machine from the web console, Telegram, or Lark/Feishu.**
+**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, or a browser tab.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 

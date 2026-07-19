@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="ccteam mascot — a juggler bot keeping codex, grok and kimi in the air" />
   <h1>ccteam</h1>
-  <p><b>The coding agents you already run, turned into one team you can drive from anywhere.</b></p>
+  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi…) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, or a browser tab.</b></p>
   <p>
     <a href="https://github.com/firstintent/ccteam/actions/workflows/check.yml"><img src="https://github.com/firstintent/ccteam/actions/workflows/check.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/made%20with-Rust-b7410e" alt="Made with Rust" />
@@ -14,7 +14,7 @@
   <img src="assets/orchestration.svg" width="1000" alt="you, from any device, drive a claude brain that spawns and dispatches codex, grok and kimi on their strengths — each on its own machine" />
 </p>
 
-Claude Code plans deepest, Codex grinds long jobs without wobbling, Grok answers fastest, Kimi does bulk work on a tiny bill. Alone, each is one terminal with one context and no colleagues. ccteam is the bridge that lets any session **hire** the others — spawn a session on any vendor and any machine, dispatch work to it, collect the result — while you watch and steer the whole team from Telegram, Lark, or a browser tab.
+Claude Code plans deepest, Codex grinds long jobs without wobbling, Grok answers fastest, Kimi does bulk work on a tiny bill. Alone, each is one terminal with one context and no colleagues. ccteam bridges them with what a team needs underneath — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves how the team organizes itself to prompts you version.
 
 ## Tools
 

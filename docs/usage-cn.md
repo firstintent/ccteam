@@ -1,6 +1,6 @@
 # ccteam 使用手册
 
-**ccteam —— 自托管、7×24 常驻的后台智能体团队:从网页端、Telegram、飞书远程驱动你机器上的 Claude Code / Codex / Grok Build / OpenCode。**
+**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书或浏览器里统一指挥。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
