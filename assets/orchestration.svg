@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" fill="none">
+  <!-- ccteam in one picture: you, from any device → the claude brain →
+       codex / grok / kimi, each on its strength, each on its own machine. -->
+  <defs>
+    <filter id="card" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="3.5" flood-color="#0B1220" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+  <style>
+    .name  { font: 600 17px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #1F2328; }
+    .brain { font: 650 20px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #1F2328; }
+    .cap   { font: 12.5px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #6E7781; }
+    .wire  { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #8A8F98; }
+    .chip  { font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #7A808A; }
+    .you   { font: 600 13px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #8A8F98; }
+    .you2  { font: 11.5px ui-sans-serif, -apple-system, "Segoe UI", sans-serif; fill: #9AA0AA; }
+  </style>
+
+  <!-- ── you: phone, anywhere ─────────────────────────────────────────── -->
+  <rect x="48" y="110" width="118" height="220" rx="20" fill="#FFFFFF" stroke="#E4E4EA" stroke-width="1.5" filter="url(#card)"/>
+  <rect x="88" y="118" width="38" height="6" rx="3" fill="#E9E9EE"/>
+  <rect x="58" y="132" width="98" height="176" rx="10" fill="#F7F7F9"/>
+  <rect x="66" y="150" width="62" height="20" rx="8" fill="#ECECF1"/>
+  <rect x="92" y="180" width="56" height="20" rx="8" fill="#D97757" opacity="0.92"/>
+  <rect x="66" y="210" width="74" height="20" rx="8" fill="#ECECF1"/>
+  <circle cx="78" cy="220" r="2" fill="#B9BDC7"/>
+  <circle cx="86" cy="220" r="2" fill="#B9BDC7"/>
+  <circle cx="94" cy="220" r="2" fill="#B9BDC7"/>
+  <text x="107" y="356" text-anchor="middle" class="you">you</text>
+  <text x="107" y="374" text-anchor="middle" class="you2">Telegram · Lark · web</text>
+
+  <!-- you → claude -->
+  <path d="M172 220 H284" stroke="#B9BDC7" stroke-width="2" stroke-linecap="round"/>
+  <polygon points="287,215 296,220 287,225" fill="#B9BDC7"/>
+  <text x="233" y="206" text-anchor="middle" class="wire">from anywhere</text>
+
+  <!-- ── claude: the brain ────────────────────────────────────────────── -->
+  <rect x="300" y="150" width="210" height="140" rx="16" fill="#FFFFFF" stroke="#E4E4EA" stroke-width="1.5" filter="url(#card)"/>
+  <rect x="301.5" y="168" width="4.5" height="104" rx="2.25" fill="#D97757"/>
+  <g transform="translate(386.6,164) scale(2.3)">
+    <path fill="#D97757" d="M8 1.2 9.4 5.4 13.8 6 10.5 8.9l1 4.3L8 11.1 4.5 13.2l1-4.3L2.2 6l4.4-.6L8 1.2z"/>
+  </g>
+  <text x="405" y="231" text-anchor="middle" class="brain">claude</text>
+  <text x="405" y="256" text-anchor="middle" class="cap">plans · delegates · reviews</text>
+
+  <!-- claude ⇄ the team -->
+  <path d="M512 196 C610 196 620 88 704 88" stroke="#10A37F" stroke-width="2.5" stroke-linecap="round"/>
+  <polygon points="707,83 717,88 707,93" fill="#10A37F"/>
+  <path d="M512 220 C580 220 640 220 704 220" stroke="#8B5CF6" stroke-width="2.5" stroke-linecap="round"/>
+  <polygon points="707,215 717,220 707,225" fill="#8B5CF6"/>
+  <path d="M512 244 C610 244 620 352 704 352" stroke="#DB2777" stroke-width="2.5" stroke-linecap="round"/>
+  <polygon points="707,347 717,352 707,357" fill="#DB2777"/>
+  <text x="608" y="200" text-anchor="middle" class="wire">spawn · dispatch ▸</text>
+  <text x="608" y="248" text-anchor="middle" class="wire">◂ results · notify</text>
+
+  <!-- ── codex: steady hands ──────────────────────────────────────────── -->
+  <rect x="720" y="40" width="250" height="96" rx="14" fill="#FFFFFF" stroke="#E4E4EA" stroke-width="1.5" filter="url(#card)"/>
+  <rect x="721.5" y="52" width="4.5" height="72" rx="2.25" fill="#10A37F"/>
+  <g transform="translate(744,74) scale(1.65)">
+    <path fill="#10A37F" d="M8 1.5 13 4.4v7.2L8 14.5 3 11.6V4.4L8 1.5zm0 2.2L5 5.4v5.2l3 1.7 3-1.7V5.4L8 3.7z"/>
+  </g>
+  <text x="790" y="90" class="name">codex</text>
+  <text x="790" y="112" class="cap">steady hands, long jobs</text>
+  <rect x="882" y="53" width="70" height="19" rx="9.5" fill="#F4F5F7" stroke="#E7E7EC"/>
+  <text x="917" y="66" text-anchor="middle" class="chip">@ macbook</text>
+
+  <!-- ── grok: fastest ────────────────────────────────────────────────── -->
+  <rect x="720" y="172" width="250" height="96" rx="14" fill="#FFFFFF" stroke="#E4E4EA" stroke-width="1.5" filter="url(#card)"/>
+  <rect x="721.5" y="184" width="4.5" height="72" rx="2.25" fill="#8B5CF6"/>
+  <g transform="translate(744,206) scale(1.65)">
+    <path fill="#8B5CF6" d="M3.2 2.5h2.4L8 6.2l2.4-3.7h2.4L9.4 8l3.6 5.5h-2.4L8 9.8l-2.6 3.7H3.2L6.6 8 3.2 2.5z"/>
+  </g>
+  <text x="790" y="222" class="name">grok</text>
+  <text x="790" y="244" class="cap">fastest turnaround</text>
+  <rect x="884" y="185" width="68" height="19" rx="9.5" fill="#F4F5F7" stroke="#E7E7EC"/>
+  <text x="918" y="198" text-anchor="middle" class="chip">@ gpu-box</text>
+
+  <!-- ── kimi: tiny bill ──────────────────────────────────────────────── -->
+  <rect x="720" y="304" width="250" height="96" rx="14" fill="#FFFFFF" stroke="#E4E4EA" stroke-width="1.5" filter="url(#card)"/>
+  <rect x="721.5" y="316" width="4.5" height="72" rx="2.25" fill="#DB2777"/>
+  <g transform="translate(744,338) scale(1.65)">
+    <path fill="#DB2777" d="M10.2 2.2a6.4 6.4 0 1 0 3.4 11.4 5.2 5.2 0 1 1-3.4-11.4z"/>
+  </g>
+  <text x="790" y="354" class="name">kimi</text>
+  <text x="790" y="376" class="cap">bulk work, tiny bill</text>
+  <rect x="908" y="317" width="44" height="19" rx="9.5" fill="#F4F5F7" stroke="#E7E7EC"/>
+  <text x="930" y="330" text-anchor="middle" class="chip">@ nas</text>
+</svg>
