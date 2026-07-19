@@ -16,19 +16,41 @@
 
 Claude Code plans deepest, Codex grinds long jobs without wobbling, Grok answers fastest, Kimi does bulk work on a tiny bill. Alone, each is one terminal with one context and no colleagues. ccteam bridges them with what a team needs underneath — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves how the team organizes itself to prompts you version.
 
-## Scenarios
+## Usage
 
-| Scenario | You | What happens |
-| --- | --- | --- |
-| **Code from your pocket** | `@s2 fix the flaky test, run the suite` from Telegram | The session picks it up mid-context; the answer, the diff summary and the cost land back in the chat — laptop optional |
-| **One brain, many hands** | Tell claude to plan and delegate | It spawns codex to implement, grok to probe, kimi for the bulk — parallel sessions in one delegation tree, each reporting back when done |
-| **Rival-model merge gate** | "codex implements, claude reviews before merge" | Two vendors check each other's work; you read one verdict instead of every diff |
-| **Overnight long jobs** | Dispatch a migration at midnight, close the laptop | The turn keeps running on the daemon; the completion notification — and the artifact — is waiting in your IM at breakfast |
-| **Right machine for the job** | Spawn into the GPU-box project | The session runs on that satellite; code, tests and GPUs stay there, transcripts and cost come home to your daemon |
-| **Approvals without a terminal** | Spawn a session in approval mode | Permission requests arrive in IM as `[approve] [deny]` buttons; deny blocks the one call, never kills the turn |
-| **Know what it costs** | `/status`, any time | Live sessions, the delegation tree, today's per-vendor spend — with daily budget caps as the automatic brake |
+**1 · Remote control from Telegram / Lark**
 
-Underneath, every scenario is the same eight MCP tools — `session_spawn` / `session_dispatch` / `session_collect` / `session_list` / `session_stop`, plus `status`, `chat_send_file`, `screenshot` — available to every session, and to your plain hand-started CLIs once registered. The daemon routes and records (at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told, guardrails that refuse runaway fan-out with a reason); it never schedules — *when* to delegate lives in prompts you version. The [orchestration guide](docs/orchestration.md) is the plain-language walkthrough; the manual has every command ([English](docs/usage.md) · [中文](docs/usage-cn.md)).
+Paste a bot token once (Settings → IM) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons and shipped files land in the same thread. Dispatch at midnight, close the laptop; the result is waiting at breakfast:
+
+```text
+/cd demo                        # pick a project; your next message talks to it
+/new codex                      # more sessions: /new [vendor] [role]
+@s2 run the test suite          # address any session directly
+/status  /sessions  /stop s3    # health · fleet · cost · stop
+```
+
+**2 · Remote control from the web console**
+
+`ccteam start` prints a token link — open it from any device on your LAN. It's a chat shell, not a dashboard: quick-start templates aimed at each vendor's strength, a Chat tab per session (plus a byte-faithful terminal where applicable), the live delegation tree, a cost pill with daily budget caps, marketplace and settings. Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
+
+**3 · Orchestrate a team from inside a claude session**
+
+Any registered session can hire the others — say it in plain language, and `session_spawn` / `dispatch` / `collect` run under the hood (with an honest `working`/`idle` signal, so nobody guesses from silence). Prompts that just work:
+
+```text
+Spawn a codex session, have it implement RFC-12 and run the tests; report back when green.
+
+Plan this refactor, then delegate: codex implements, grok profiles the hot path in
+parallel, kimi sweeps the rename across the repo. Collect everything into one summary.
+
+Spawn a claude reviewer on s2's diff — I'm not merging until it signs off.
+```
+
+**4 · Many machines, one console**
+
+Register a satellite with a join token (Settings → Hosts); it dials out to your daemon, so a laptop behind NAT is a perfectly good satellite. Projects are bound to a host and sessions run where their project lives — spawn into the GPU-box project and the tests run on the GPU box, while transcripts, cost and the team view stay in the one console. Switching machines is just switching projects. (Satellite execution currently runs Claude sessions; the other vendors run on the daemon's machine.)
+
+Underneath, every one of these is the same eight MCP tools — `session_spawn` / `session_dispatch` / `session_collect` / `session_list` / `session_stop`, plus `status`, `chat_send_file`, `screenshot` — available to every session, and to your plain hand-started CLIs once registered. The daemon routes and records (at-least-once notifications across restarts, idempotency keys, a child's turn on disk before its parent is told, guardrails that refuse runaway fan-out with a reason); it never schedules — *when* to delegate lives in prompts you version. The [orchestration guide](docs/orchestration.md) is the plain-language walkthrough; the manual has every command ([English](docs/usage.md) · [中文](docs/usage-cn.md)).
 
 ## Install
 
@@ -73,27 +95,12 @@ Async by default: the completion notification lands in the parent's chat like a 
 - **Plan → build → gate** — claude decomposes and sets constraints; codex implements; claude reviews the diff before you merge. A rival model gates the merge.
 - **Grind + probe** — codex holds the long job while grok answers the quick question before codex finishes a step.
 - **Bulk on a budget** — fan the repetitive 80% out to kimi; keep the judgment calls on claude.
-- **Run where the environment is** — projects are bound to hosts and sessions run where their project lives: spawn into the GPU-box project and the tests run on the GPU box, while transcripts and cost stay on your daemon. Satellites dial in over one outbound channel — a laptop behind NAT is a perfectly good satellite. (Satellite execution currently runs Claude sessions; the other vendors run on the daemon's machine.)
-- **Stay in the loop** — `@s2 …` from Telegram talks to any member directly; `session_collect` says `working` or `idle` honestly, so nobody guesses from silence.
 
 ## Project context
 
 ccteam adds a team to your repo without taking it over. Sessions are roleless by default: the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism — project knowledge stays vendor-native, and ccteam never rewrites it. The footprint is exactly `.ccteam/` (state), `.claude/agents/` (personas you choose to install), and ccteam's own section of `.claude/settings.local.json` — never your `settings.json`. Sessions have durable ids (`s1`, `s2`, …) that survive daemon restarts and cold-resume from disk; state is plain files in your repo.
 
 ## Extras
-
-**Web console**
-
-A chat shell, not a dashboard: quick-start templates aim each card at the vendor that's best at it, every session gets a Chat tab (and a byte-faithful terminal tab where applicable), the team view shows the live delegation tree, and a cost pill keeps the day's spend in sight. Everything is also scriptable: `/api/v1`, OpenAPI at `/api/docs`.
-
-**IM**
-
-```text
-/cd demo                        # pick a project; your next message talks to it
-/new codex                      # more sessions: /new [vendor] [role]
-@s2 run the test suite          # address any session directly
-/status  /sessions  /stop s3    # health · fleet · cost · stop
-```
 
 **Marketplace**
 
