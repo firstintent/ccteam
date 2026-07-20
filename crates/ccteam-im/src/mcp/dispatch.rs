@@ -134,6 +134,8 @@ impl McpDispatch {
             Some(execute_chat_send_file(&req, self.sink.as_ref(), self.gateway.as_ref()).await)
         } else if is_session_tool_call(&req) {
             Some(execute_session_tool(&req, self.gateway.as_ref(), caller).await)
+        } else if is_status_call(&req) {
+            Some(execute_status(&req, self.gateway.as_ref(), caller, &self.paths).await)
         } else if is_reload_call(&req) {
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let ok = if let Some(gw) = self.gateway.as_ref() {
@@ -884,6 +886,80 @@ fn is_session_tool_call(req: &serde_json::Value) -> bool {
             .is_some_and(|n| n.starts_with("session_"))
 }
 
+/// True for a `tools/call` whose tool name is `status`.
+fn is_status_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("status")
+}
+
+/// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
+/// vendor panel + routing notes appended for the caller's project's bound
+/// host. Ambient (session principal) is scoped to its OWN project — any
+/// self-reported `project`/`_caller_slug` is ignored (the panel would
+/// otherwise leak another project's host). Admin (HTTP `/mcp`, or the local
+/// main-session admin token) may name a `project`, else defaults to the
+/// cwd-resolved slug the forwarder injected (like `session_spawn`). The
+/// vendor panel probes + reads fs, so it runs off the async runtime.
+async fn execute_status(
+    req: &serde_json::Value,
+    gateway: Option<&GatewayHandle>,
+    caller: McpCaller,
+    paths: &CcteamPaths,
+) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let args = req
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Base body (projects + orchestrator + daemon health), reused verbatim
+    // from the protocol core so the daemon-aware path never drifts from the
+    // local fallback.
+    let base = super::protocol::tool_ls(paths).unwrap_or_else(|_| "{}".to_string());
+
+    // Resolve the caller's project scope (server-side; never trust a
+    // self-reported project on the Ambient path).
+    let ctx = if caller == McpCaller::Ambient {
+        let sid = args
+            .get("_caller_sid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secret = args
+            .get("_caller_secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match gateway {
+            Some(gw) => gw.lock().await.verify_session_principal(sid, secret),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let project = match super::vendor_panel::resolve_status_project(
+        caller,
+        args.get("project").and_then(|v| v.as_str()),
+        args.get("_caller_slug").and_then(|v| v.as_str()),
+        ctx.as_ref(),
+    ) {
+        Ok(p) => p,
+        Err(msg) => {
+            // Ambient caller not authenticated: base status + honest note, NO
+            // panel (we won't render another project's host).
+            return session_tool_response(id, format!("{base}\n\n{msg}"), false);
+        }
+    };
+
+    let paths_owned = paths.clone();
+    let slug_owned = project.clone();
+    let section = tokio::task::spawn_blocking(move || {
+        super::vendor_panel::render_section(&paths_owned, slug_owned.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
+
+    session_tool_response(id, format!("{base}\n\n{section}"), false)
+}
+
 /// Build a tools/call-shaped JSON-RPC response carrying one text block.
 fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
     serde_json::json!({
@@ -1211,6 +1287,73 @@ async fn run_session_spawn(
         (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
         (McpCaller::Ambient, None) => "ambient".to_string(),
     };
+
+    // v0.10 T1 — availability discovery: before minting a sid, fail fast when
+    // the vendor is not installed on the project's BOUND host, listing the
+    // vendors that ARE installed there (from the same probe/report snapshot)
+    // + freshness. A host-offline satellite is NOT handled here — it stays
+    // "host offline" via `prepare_host_for_spawn` (never a local fallback).
+    // Auth is never checked; model ids stay opaque passthrough (no catalog
+    // validation). A resolve/probe miss never blocks (the existing gates own
+    // the unknown-host/offline cases).
+    let vendor_wire = session_vendor_wire(vendor);
+    {
+        let (bound_host, sat_snapshot) = {
+            let gw = gateway.lock().await;
+            let host = gw.project_bound_host(&project);
+            let snap = if host == ccteam_core::LOCAL_HOST {
+                None
+            } else {
+                gw.satellite_agent_snapshot(&host)
+            };
+            (host, snap)
+        };
+        if bound_host == ccteam_core::LOCAL_HOST {
+            // Probe OFF the gateway lock (cached; shells out only on a cold
+            // cache), so we never hold the mutex across a `<bin> --version`.
+            let avail = tokio::task::spawn_blocking(|| {
+                ccteam_core::host_registry::probe_availability(false)
+            })
+            .await
+            .unwrap_or_default();
+            if let Some(row) = avail.iter().find(|a| a.vendor == vendor_wire) {
+                if !row.installed {
+                    let installed: Vec<String> = avail
+                        .iter()
+                        .filter(|a| a.installed)
+                        .map(|a| a.vendor.to_string())
+                        .collect();
+                    return Err(super::vendor_panel::spawn_unavailable_message(
+                        vendor_wire,
+                        &bound_host,
+                        &installed,
+                        "just now",
+                    ));
+                }
+            }
+        } else if let Some((online, age, agents)) = sat_snapshot {
+            // Only an ONLINE satellite's report is authoritative for "not
+            // installed"; offline defers to the host-offline gate.
+            if online {
+                if let Some(a) = agents.iter().find(|a| a.vendor.as_str() == vendor_wire) {
+                    if !a.installed {
+                        let installed: Vec<String> = agents
+                            .iter()
+                            .filter(|a| a.installed)
+                            .map(|a| a.vendor.clone())
+                            .collect();
+                        return Err(super::vendor_panel::spawn_unavailable_message(
+                            vendor_wire,
+                            &bound_host,
+                            &installed,
+                            &format!("{age}s ago"),
+                        ));
+                    }
+                }
+                // Vendor absent from the report → unknown; do not block.
+            }
+        }
+    }
 
     // Check idempotency + create under ONE lock so a concurrent same-key retry
     // can never race past the replay into a second spawn.

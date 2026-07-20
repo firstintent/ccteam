@@ -320,7 +320,10 @@ fn text_content(body: String) -> Vec<Value> {
     vec![json!({ "type": "text", "text": body })]
 }
 
-fn tool_ls(paths: &CcteamPaths) -> Result<String> {
+/// Base `status` JSON body (projects + orchestrator + daemon health). The
+/// daemon-aware dispatch path reuses this verbatim, then appends the vendor
+/// panel + routing notes (see [`super::dispatch`]).
+pub(crate) fn tool_ls(paths: &CcteamPaths) -> Result<String> {
     let projects = collect_projects(paths)?;
     // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
     // with the phase state machine deleted F66 will recompute this from

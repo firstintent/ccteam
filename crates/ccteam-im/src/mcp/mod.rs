@@ -14,6 +14,8 @@ pub mod dispatch;
 pub mod groups;
 /// Transport-agnostic JSON-RPC protocol core (local tools + schemas).
 pub mod protocol;
+/// v0.10 T1 — MCP `status` vendor panel + routing-notes transport.
+mod vendor_panel;
 
 pub use dispatch::{GatewayEventSink, GatewayHandle, McpCaller, McpDispatch, PendingRegistry};
 pub use groups::{

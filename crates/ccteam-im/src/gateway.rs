@@ -1793,6 +1793,37 @@ impl Gateway {
         Ok((host, wire_slug))
     }
 
+    /// v0.10 T1 — the execution host bound to a project (sync, no shellout),
+    /// for the `session_spawn` availability pre-check. Any resolve miss → the
+    /// local host (the overwhelming common case). Read-only, holds no
+    /// `.await`.
+    pub(crate) fn project_bound_host(&self, slug: &str) -> String {
+        self.project_host_binding(slug)
+            .map(|(host, _wire)| host)
+            .unwrap_or_else(|_| ccteam_core::LOCAL_HOST.to_string())
+    }
+
+    /// v0.10 T1 — a satellite host's last control-channel agent report for the
+    /// `session_spawn` availability discovery: `(online, heartbeat_age_secs,
+    /// agents)`. `None` when the daemon has no home / registry, or the host is
+    /// not registered (the caller then does not block — the existing
+    /// offline/unknown-host gate in `prepare_host_for_spawn` owns those). Reads
+    /// the on-disk registry (a quick fs read, like `prepare_host_for_spawn`);
+    /// holds no `.await`.
+    pub(crate) fn satellite_agent_snapshot(
+        &self,
+        host: &str,
+    ) -> Option<(bool, u64, Vec<ccteam_core::HostAgentReport>)> {
+        let root = self.project_paths.as_ref().map(|p| p.root.as_path())?;
+        let reg =
+            ccteam_core::HostRegistry::load(&ccteam_core::host_registry::registry_path_in(root))
+                .ok()?;
+        let rec = reg.get(host)?;
+        let online = rec.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS);
+        let age = ccteam_core::now_unix().saturating_sub(rec.last_heartbeat_unix);
+        Some((online, age, rec.agents.clone()))
+    }
+
     fn ensure_session_host_binding(
         &self,
         slug: &str,
