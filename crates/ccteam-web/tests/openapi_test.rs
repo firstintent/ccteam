@@ -129,9 +129,6 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/projects/{slug}/sessions/{sid}/resume"),
         ("GET", "/api/v1/projects/{slug}/external-sessions"),
         ("POST", "/api/v1/projects/{slug}/sessions/import"),
-        // v0.8.24 C2 — multi-vendor /compare (+ history from session meta)
-        ("POST", "/api/v1/projects/{slug}/compare"),
-        ("GET", "/api/v1/projects/{slug}/compare/history"),
         // v0.8.8 F4 — IM credential config (masked read + validate-before-persist).
         ("GET", "/api/v1/config/im"),
         ("PUT", "/api/v1/config/im/telegram"),

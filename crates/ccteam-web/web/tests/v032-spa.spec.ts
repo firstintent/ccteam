@@ -397,7 +397,7 @@ test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts re
   await mockCcteamApi(page);
   await page.goto("/app/flow");
   await expect(page.getByTestId("workflow-view")).toBeVisible();
-  await expect(page.getByTestId("workflow-tab-compare")).toBeVisible();
+  await expect(page.getByTestId("workflow-tab-evolution")).toBeVisible();
 
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/app/settings/status");

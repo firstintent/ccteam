@@ -98,7 +98,6 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             role_sha: None,
             skills_sha: None,
             trigger: None,
-            compare_group: None,
             parent_sid: None,
             spawned_by_role: None,
             delegation_depth: 0,

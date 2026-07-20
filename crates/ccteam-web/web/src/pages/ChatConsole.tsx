@@ -6,7 +6,7 @@
 //                               the first message (HomeView).
 //   Conversation (`/chat/s/:sid`) — the per-sid chat/terminal (SessionView,
 //                               keyed by sid → atomic per-sid state reset).
-//   工作流 (`/flow/:tab?`)     — Skills / Roles / MCP / 自进化 / Compare
+//   工作流 (`/flow/:tab?`)     — Skills / Roles / MCP / 自进化
 //                               (WorkflowView, set-nav layout).
 //   设置 (`/settings/:tab?`)   — 主机 / 插件市场 / Status / IM / 通用 / 账号
 //                               (SettingsView, set-nav layout; admin-gated

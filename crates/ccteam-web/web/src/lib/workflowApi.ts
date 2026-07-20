@@ -1,21 +1,4 @@
-// v0.8.24 A3 — Workflow APIs: compare fan-out + evolution read panel.
-
-export interface CompareSlot {
-  vendor: string;
-  sid: string;
-  answer: string;
-  cost_usd: number | null;
-  status: string;
-  error?: string | null;
-}
-
-export interface CompareResult {
-  compare_group: string;
-  prompt: string;
-  slots: CompareSlot[];
-  cost_subtotal_usd: number | null;
-  timeout_secs: number;
-}
+// v0.8.24 A3 — Workflow APIs: evolution and project MCP panels.
 
 export interface EvolutionBucket {
   kind: string;
@@ -35,27 +18,6 @@ export interface EvolutionSummary {
   roles: EvolutionBucket[];
   skills: EvolutionBucket[];
   empty: boolean;
-}
-
-// ── compare history (v0.8.24) ────────────────────────────────────────────────
-
-export interface CompareHistoryMember {
-  sid: string;
-  vendor: string;
-  cost_usd?: number | null;
-  title?: string | null;
-}
-
-export interface CompareHistoryGroup {
-  group: string;
-  created_at: string;
-  prompt: string;
-  members: CompareHistoryMember[];
-  cost_subtotal_usd?: number | null;
-}
-
-export interface CompareHistoryResponse {
-  groups: CompareHistoryGroup[];
 }
 
 // ── project MCP servers (v0.8.24 F1.12) ──────────────────────────────────────
@@ -83,10 +45,6 @@ export interface RegisterMcpServerForm {
   url?: string;
   command?: string;
   args?: string[];
-}
-
-export function compareUrl(slug: string): string {
-  return `/api/v1/projects/${encodeURIComponent(slug)}/compare`;
 }
 
 export function evolutionUrl(slug: string): string {
@@ -124,23 +82,8 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return (await res.json()) as T;
 }
 
-export function runCompare(
-  slug: string,
-  prompt: string,
-  vendors?: string[],
-): Promise<CompareResult> {
-  const body: Record<string, unknown> = { prompt };
-  if (vendors && vendors.length > 0) body.vendors = vendors;
-  return postJson<CompareResult>(compareUrl(slug), body);
-}
-
 export function getEvolution(slug: string): Promise<EvolutionSummary> {
   return getJson<EvolutionSummary>(evolutionUrl(slug));
-}
-
-/** `GET .../compare/history` — past compare groups (newest first). */
-export function getCompareHistory(slug: string): Promise<CompareHistoryResponse> {
-  return getJson<CompareHistoryResponse>(`${compareUrl(slug)}/history`);
 }
 
 export function mcpServersUrl(slug: string): string {

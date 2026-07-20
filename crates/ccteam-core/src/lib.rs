@@ -13,8 +13,7 @@ pub mod actions;
 // change-persona` + `add-tool` MCP admin tools. Pure IO over a chat
 // bot's `.claude/agents/<bot>.md` definition file.
 pub mod admin_actions;
-// Budget-ledger helpers only (v0.8.24 C2 — advise product surface removed;
-// multi-vendor `/compare` replaces advise_vote / advise_parallel). Ledger
+// Budget-ledger helpers only (the advise product surface was removed). Ledger
 // file still used by codex critic + doctor cost-orphan rollups.
 pub mod advise;
 // V0.6.0 Wave 2 F114 — scientist nickname pool used when minting bot

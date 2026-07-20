@@ -1,9 +1,8 @@
-// v0.8.24 gap-fill — workflowApi client: mcp-servers + compare history
-// (fetch-spy, node env; same pattern as hostsApi.test.ts).
+// v0.8.24 gap-fill — workflowApi MCP-server client.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getCompareHistory, getMcpServers, registerMcpServer } from "./workflowApi";
+import { getMcpServers, registerMcpServer } from "./workflowApi";
 
 const realFetch = globalThis.fetch;
 
@@ -14,7 +13,7 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
-describe("workflowApi mcp-servers + compare history", () => {
+describe("workflowApi mcp-servers", () => {
   beforeEach(() => {
     globalThis.fetch = vi.fn();
   });
@@ -74,31 +73,5 @@ describe("workflowApi mcp-servers + compare history", () => {
     await expect(registerMcpServer("demo", { name: "ccteam", url: "https://x" })).rejects.toThrow(
       "reserved",
     );
-  });
-
-  it("getCompareHistory GETs the history path and returns groups", async () => {
-    const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse(200, {
-        groups: [
-          {
-            group: "cmp-1",
-            created_at: "2026-07-10T10:00:00Z",
-            prompt: "why flaky?",
-            members: [
-              { sid: "s1", vendor: "claude", cost_usd: 0.02 },
-              { sid: "s2", vendor: "codex", cost_usd: null },
-            ],
-            cost_subtotal_usd: 0.02,
-          },
-        ],
-      }),
-    );
-    const got = await getCompareHistory("demo");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/projects/demo/compare/history",
-      expect.objectContaining({ credentials: "same-origin" }),
-    );
-    expect(got.groups[0].members.map((m) => m.vendor)).toEqual(["claude", "codex"]);
   });
 });

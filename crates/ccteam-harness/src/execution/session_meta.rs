@@ -173,15 +173,9 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
     /// v0.8.24 F5 — which surface triggered session creation:
-    /// `im` | `web` | `mcp` | `session_spawn` | `compare`. Legacy metas
-    /// parse as `None`.
+    /// `im` | `web` | `mcp` | `session_spawn`. Legacy metas parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
-    /// v0.8.24 C2 — multi-vendor `/compare` group id. Sessions spawned by
-    /// one compare share the same id so `/sessions` can fold them. Legacy
-    /// metas parse as `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compare_group: Option<String>,
     /// v0.9.0 W2 (F2) — delegation parent: the sid of the session whose
     /// principal spawned this one via `session_spawn`. `None` for a
     /// human-created (root) session. Legacy metas parse as `None`.
@@ -461,7 +455,6 @@ mod title_tests {
             role_sha: None,
             skills_sha: None,
             trigger: None,
-            compare_group: None,
             parent_sid: None,
             spawned_by_role: None,
             delegation_depth: 0,

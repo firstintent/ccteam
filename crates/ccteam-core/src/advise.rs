@@ -1,5 +1,5 @@
-//! **REMOVED product surface (v0.8.24 C2)** — multi-vendor `/compare` replaces
-//! `advise_vote` / `advise_parallel`. MCP tools were culled in v0.9-T1.
+//! **REMOVED product surface (v0.8.24 C2)** — `advise_vote` /
+//! `advise_parallel` are gone. MCP tools were culled in v0.9-T1.
 //!
 //! This module keeps thin re-exports of the shared **budget ledger** helpers
 //! still used by `codex_exec` critic accounting and doctor cost-orphan

@@ -1,41 +1,30 @@
 // v0.8.24 Track A — 工作流 top-level view (prototype `#view-flow`):
-// a set-nav second column (232px, 「工作流」) with five sub-pages —
-// Skills / Roles / MCP Servers / 自进化 / Compare — each a prototype-styled
-// detail page (flow-rows lists, stat cards, compare launcher). Data wiring
-// unchanged: listProjectRoles / getProjectMarketplace / getEvolution /
-// runCompare (lib/workflowApi).
+// a set-nav second column (232px, 「工作流」) with four sub-pages —
+// Skills / Roles / MCP Servers / 自进化 — each a prototype-styled detail page.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, GitCompareArrows, Package, Server, User } from "lucide-react";
-import { getHistory, listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
+import { Activity, Package, Server, User } from "lucide-react";
+import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
 import {
-  getCompareHistory,
   getEvolution,
   getMcpServers,
   registerMcpServer,
-  runCompare,
-  type CompareHistoryGroup,
-  type CompareResult,
   type EvolutionSummary,
   type McpServersResponse,
 } from "../lib/workflowApi";
 import { fetchDashboard } from "../lib/dashboardApi";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
-import { vendorDotClass } from "../lib/vendors";
 
-type TabId = "skills" | "roles" | "mcp" | "evolution" | "compare";
+type TabId = "skills" | "roles" | "mcp" | "evolution";
 
 const TABS: { id: TabId; label: string; labelKey?: string; subKey: string; icon: React.ReactNode }[] = [
   { id: "skills", label: "Skills", subKey: "skillsSub", icon: <Package /> },
   { id: "roles", label: "Roles", subKey: "rolesSub", icon: <User /> },
   { id: "mcp", label: "MCP Servers", subKey: "mcpSub", icon: <Server /> },
   { id: "evolution", label: "自进化", labelKey: "evolve", subKey: "evolveSub", icon: <Activity /> },
-  { id: "compare", label: "Compare", subKey: "compareSub", icon: <GitCompareArrows /> },
 ];
-
-const COMPARE_VENDORS = ["claude", "codex", "grok", "opencode", "kimi"] as const;
 
 function isTab(v: string | undefined): v is TabId {
   return !!v && TABS.some((t) => t.id === v);
@@ -71,18 +60,10 @@ export default function WorkflowView({
   const [skills, setSkills] = useState<DecoratedPlugin[]>([]);
   const [evolution, setEvolution] = useState<EvolutionSummary | null>(null);
   const [loading, setLoading] = useState(false);
-  const [comparePrompt, setComparePrompt] = useState("");
-  const [compareVendors, setCompareVendors] = useState<string[]>(["claude", "codex"]);
-  const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
-  const [compareBusy, setCompareBusy] = useState(false);
-  // v0.8.24 gap-fill — MCP servers page + compare history.
+  // v0.8.24 gap-fill — MCP servers page.
   const [mcp, setMcp] = useState<McpServersResponse | null>(null);
   const [mcpForm, setMcpForm] = useState({ name: "", url: "", command: "", args: "" });
   const [mcpBusy, setMcpBusy] = useState(false);
-  const [compareGroups, setCompareGroups] = useState<CompareHistoryGroup[]>([]);
-  const [openGroup, setOpenGroup] = useState<string | null>(null);
-  /** Per-sid replayed answer for the expanded group (existing history pipeline). */
-  const [groupAnswers, setGroupAnswers] = useState<Record<string, string>>({});
 
   useEffect(() => {
     void fetchDashboard()
@@ -107,8 +88,6 @@ export default function WorkflowView({
         setEvolution(await getEvolution(slug));
       } else if (tab === "mcp") {
         setMcp(await getMcpServers(slug));
-      } else if (tab === "compare") {
-        setCompareGroups((await getCompareHistory(slug)).groups);
       }
     } catch (e) {
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
@@ -126,33 +105,6 @@ export default function WorkflowView({
       cancelled = true;
     };
   }, [refreshTab]);
-
-  const toggleVendor = (v: string) => {
-    setCompareVendors((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
-  };
-
-  const onCompare = async () => {
-    if (!slug || !comparePrompt.trim() || compareVendors.length < 2) {
-      toastBus.handler?.error(
-        tr(lang, "请选择项目、至少 2 个 vendor，并填写问题", "Pick project, ≥2 vendors, and a prompt"),
-      );
-      return;
-    }
-    setCompareBusy(true);
-    setCompareResult(null);
-    try {
-      const res = await runCompare(slug, comparePrompt.trim(), compareVendors);
-      setCompareResult(res);
-      // The fresh group is now in session meta — refresh the history list.
-      void getCompareHistory(slug)
-        .then((h) => setCompareGroups(h.groups))
-        .catch(() => {});
-    } catch (e) {
-      toastBus.handler?.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setCompareBusy(false);
-    }
-  };
 
   // v0.8.24 F1.12 — register a third-party MCP server (idempotent config
   // write server-side; ccteam never executes/downloads it). Templates below
@@ -185,30 +137,6 @@ export default function WorkflowView({
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
     } finally {
       setMcpBusy(false);
-    }
-  };
-
-  // v0.8.24 — expand one history group: replay each member's answer via the
-  // EXISTING per-sid history pipeline (GET /api/v1/sessions/{sid}).
-  const onOpenGroup = async (g: CompareHistoryGroup) => {
-    if (openGroup === g.group) {
-      setOpenGroup(null);
-      return;
-    }
-    setOpenGroup(g.group);
-    for (const m of g.members) {
-      if (groupAnswers[m.sid] !== undefined) continue;
-      void getHistory(m.sid)
-        .then((h) => {
-          const last = [...h.events].reverse().find((e) => e.assistant.trim());
-          setGroupAnswers((prev) => ({
-            ...prev,
-            [m.sid]: last ? last.assistant : "",
-          }));
-        })
-        .catch(() => {
-          setGroupAnswers((prev) => ({ ...prev, [m.sid]: "" }));
-        });
     }
   };
 
@@ -563,160 +491,6 @@ export default function WorkflowView({
             </>
           ) : null}
 
-          {tab === "compare" ? (
-            <>
-              {detailHeader(
-                "Compare",
-                zh
-                  ? "同一道题多 agent 并行(/compare),对比产出并给结论 —— 选型、方案评审用。"
-                  : "Run the same task across agents in parallel (/compare), compare outputs.",
-              )}
-              <div className="form">
-                <textarea
-                  value={comparePrompt}
-                  onChange={(e) => setComparePrompt(e.target.value)}
-                  rows={3}
-                  data-testid="compare-prompt"
-                  placeholder={zh ? "同一问题投递给多个 agent…" : "Same prompt to multiple agents…"}
-                  style={{
-                    border: "1px solid var(--border)",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 14,
-                    fontFamily: "inherit",
-                    color: "var(--text)",
-                    background: "var(--bg-card)",
-                    outline: "none",
-                    resize: "vertical",
-                  }}
-                />
-                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  {COMPARE_VENDORS.map((v) => (
-                    <label
-                      key={v}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                        fontSize: 13,
-                        color: "var(--text-muted)",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={compareVendors.includes(v)}
-                        onChange={() => toggleVendor(v)}
-                      />
-                      <span className={vendorDotClass(v)} />
-                      {v}
-                    </label>
-                  ))}
-                </div>
-                <div>
-                  <button
-                    type="button"
-                    className="btn primary"
-                    disabled={compareBusy}
-                    data-testid="compare-run"
-                    style={compareBusy ? { opacity: 0.5 } : undefined}
-                    onClick={() => void onCompare()}
-                  >
-                    {compareBusy ? (zh ? "对比中…" : "Comparing…") : t("newCompare")}
-                  </button>
-                </div>
-              </div>
-              <h2 style={{ fontSize: 14, margin: "10px 0 0" }}>{tr(lang, "历史对比", "History")}</h2>
-              {compareGroups.length === 0 && !loading ? (
-                <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="compare-history-empty">
-                  {tr(lang, "还没有对比记录。", "No compare runs yet.")}
-                </p>
-              ) : (
-                <div className="flow-rows" data-testid="compare-history">
-                  {compareGroups.map((g) => (
-                    <div key={g.group}>
-                      <div className="flow-row">
-                        <span className="n" title={g.group}>
-                          {g.prompt || g.group}
-                        </span>
-                        <span className="d">
-                          {g.created_at.slice(0, 16).replace("T", " ")} ·{" "}
-                          {g.members.map((m) => `${m.vendor}(${m.sid})`).join(" vs ")} · Σ{" "}
-                          {g.cost_subtotal_usd != null ? `$${g.cost_subtotal_usd.toFixed(4)}` : "—"}
-                        </span>
-                        <span className="end">
-                          <button
-                            type="button"
-                            className="btn ghost mini"
-                            data-testid={`compare-open-${g.group}`}
-                            onClick={() => void onOpenGroup(g)}
-                          >
-                            {openGroup === g.group ? tr(lang, "收起", "Close") : tr(lang, "并排查看", "Open")}
-                          </button>
-                        </span>
-                      </div>
-                      {openGroup === g.group ? (
-                        <div
-                          data-testid={`compare-group-${g.group}`}
-                          style={{ display: "flex", gap: 10, padding: "10px 0", flexWrap: "wrap" }}
-                        >
-                          {g.members.map((m) => (
-                            <div
-                              key={m.sid}
-                              style={{
-                                flex: "1 1 260px",
-                                border: "1px solid var(--border)",
-                                borderRadius: "var(--radius-card)",
-                                padding: "10px 14px",
-                                background: "var(--bg-card)",
-                              }}
-                            >
-                              <div className="mono" style={{ fontSize: 12, marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
-                                <span className={vendorDotClass(m.vendor)} />
-                                {m.vendor} · {m.sid}
-                                {m.cost_usd != null ? ` · $${m.cost_usd.toFixed(4)}` : ""}
-                              </div>
-                              <pre style={{ whiteSpace: "pre-wrap", fontSize: 13, fontFamily: "inherit", color: "var(--text-muted)", margin: 0 }}>
-                                {groupAnswers[m.sid] === undefined
-                                  ? t("loading")
-                                  : groupAnswers[m.sid] || tr(lang, "(无回放内容)", "(no replay)")}
-                              </pre>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {compareResult ? (
-                <div className="form" data-testid="compare-result">
-                  <p className="mono" style={{ fontSize: 11.5, color: "var(--text-faint)" }}>
-                    group={compareResult.compare_group} · cost={compareResult.cost_subtotal_usd ?? "—"}
-                  </p>
-                  {compareResult.slots.map((s) => (
-                    <div
-                      key={s.sid}
-                      style={{
-                        border: "1px solid var(--border)",
-                        borderRadius: "var(--radius-card)",
-                        padding: "12px 16px",
-                        background: "var(--bg-card)",
-                      }}
-                    >
-                      <div className="mono" style={{ fontSize: 12, marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
-                        <span className={vendorDotClass(s.vendor)} />
-                        {s.vendor} · {s.sid} · {s.status}
-                      </div>
-                      <pre style={{ whiteSpace: "pre-wrap", fontSize: 13, fontFamily: "inherit", color: "var(--text-muted)" }}>
-                        {s.answer || s.error || "(empty)"}
-                      </pre>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </>
-          ) : null}
         </div>
       </div>
     </section>

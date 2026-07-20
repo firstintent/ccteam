@@ -296,11 +296,6 @@ pub struct Gateway {
     /// v0.8.24 Track D — optional satellite agent proxy for remote-host
     /// stdio spawn. `None` ⇒ production [`crate::remote_host::HttpRemoteHostProxy`].
     remote_host_proxy: Option<std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>>,
-    /// v0.8.24 C2 — sid → answer tap for /compare (pump steals ANSWER).
-    compare_taps: std::collections::HashMap<
-        String,
-        tokio::sync::mpsc::UnboundedSender<crate::compare::CompareAnswer>,
-    >,
     /// v0.9.0 W2 (F2/F7) — in-memory mirror of the durable delegation watches
     /// (`child_sid → mirror`). The SoT is each child's
     /// `<project>/.ccteam/chat/<child_sid>/delegation.json`; this mirror keeps
@@ -943,10 +938,6 @@ struct NewSessionPlan {
     /// default — same lifetime as an explicit web model choice).
     effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
-    /// v0.8.24 C2 — optional `/compare` group id written to session meta.
-    compare_group: Option<String>,
-    /// Override meta `trigger` (e.g. `"compare"`); None → derive from owner.
-    trigger_override: Option<String>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawning principal). `None`
     /// for a human/root spawn. Threaded into `meta.parent_sid` + the live
     /// `GatewaySession.parent_sid`.
@@ -964,8 +955,7 @@ struct NewSessionPlan {
     /// BEFORE `plan_new_session` mints the sid (a fresh spawn must never
     /// burn an sid on a host that turns out offline). `None` for every
     /// caller that hardcodes `host = "local"` (the implicit first-message
-    /// spawn, bot templates, `/compare` — see their `plan_new_session`
-    /// call sites). Threaded verbatim into `SpawnCtx::remote`.
+    /// spawn and bot templates). Threaded verbatim into `SpawnCtx::remote`.
     remote: Option<ccteam_harness::RemoteExecTarget>,
     ccteam_root: Option<PathBuf>,
     remote_proxy: Option<Arc<dyn crate::remote_host::RemoteHostProxy>>,
@@ -1187,12 +1177,6 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
-        name: "/compare",
-        arg_hint: Some("<question>"),
-        help: "ask all available vendors the same question (roleless one-shot sessions)",
-        in_menu: true,
-    },
-    GatewayCommandSpec {
         name: "/help",
         arg_hint: None,
         help: "show gateway commands",
@@ -1311,7 +1295,6 @@ impl Gateway {
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             remote_host_proxy: None,
-            compare_taps: std::collections::HashMap::new(),
             delegations: std::collections::HashMap::new(),
             spawn_idem: crate::delegation::IdemCache::default(),
             dispatch_idem: crate::delegation::IdemCache::default(),
@@ -2115,7 +2098,7 @@ impl Gateway {
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
                 let sid = {
                     let mut g = gateway.lock().await;
-                    let outcome = g.apply_new_session(*plan, thread).await?;
+                    let outcome = g.apply_new_session(*plan, thread, None).await?;
                     let sid = outcome.id.clone();
                     g.drain_and_dispatch_pending_turns(&sid).await;
                     sid
@@ -2472,28 +2455,6 @@ impl Gateway {
                     Ok(Some(self.render_projects()))
                 }
             }
-            "/compare" => {
-                // Remainder after the command (question may contain spaces).
-                let mut it = trimmed.splitn(2, char::is_whitespace);
-                let _cmd = it.next();
-                let question = it.next().unwrap_or("").trim();
-                if question.is_empty() {
-                    return Err(anyhow!(
-                        "用法: /compare <问题>(并发问 claude/codex/grok/opencode/kimi)"
-                    ));
-                }
-                let project = self.current_project_for(chat);
-                let result = self
-                    .run_compare(
-                        chat.clone(),
-                        project,
-                        question.to_string(),
-                        crate::compare::default_compare_vendors(),
-                        crate::compare::DEFAULT_COMPARE_TIMEOUT,
-                    )
-                    .await?;
-                Ok(Some(crate::compare::render_compare_markdown(&result)))
-            }
             "/help" => Ok(Some(format!(
                 "📁 当前项目: {}\n\n{}",
                 self.current_project_for(chat),
@@ -2819,7 +2780,7 @@ impl Gateway {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
             EnsureSessionOutcome::Spawn(plan) => {
                 let thread = Self::spawn_for_new_session_plan(&plan).await?;
-                let outcome = self.apply_new_session(*plan, thread).await?;
+                let outcome = self.apply_new_session(*plan, thread, None).await?;
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
@@ -3062,7 +3023,7 @@ impl Gateway {
         )?;
         plan.remote = host_target.remote;
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
-        let outcome = self.apply_new_session(plan, thread).await?;
+        let outcome = self.apply_new_session(plan, thread, None).await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
         Ok(outcome)
     }
@@ -3160,8 +3121,6 @@ impl Gateway {
             model_id,
             effort,
             adapter,
-            compare_group: None,
-            trigger_override: None,
             parent_sid: None,
             spawned_by_role: None,
             delegation_depth: 0,
@@ -3248,6 +3207,7 @@ impl Gateway {
         &mut self,
         plan: NewSessionPlan,
         thread: ThreadHandle,
+        trigger: Option<&str>,
     ) -> Result<StartOutcome> {
         let NewSessionPlan {
             id,
@@ -3265,8 +3225,6 @@ impl Gateway {
             model_id: _,
             effort: _,
             adapter,
-            compare_group,
-            trigger_override,
             parent_sid,
             spawned_by_role,
             delegation_depth,
@@ -3346,11 +3304,9 @@ impl Gateway {
                     )
                 })
                 .unwrap_or((None, None));
-            // v0.8.24 F5 — surface attribution from owner channel
-            // (or explicit override, e.g. compare fan-out).
-            let trigger = if let Some(t) = trigger_override.as_deref() {
-                t.to_string()
-            } else {
+            // v0.8.24 F5 — surface attribution from owner channel. MCP
+            // `session_spawn` supplies its explicit trigger at the apply seam.
+            let trigger = trigger.map(str::to_string).unwrap_or_else(|| {
                 let ch = owner_channel.as_str();
                 if ch == "web" || ch == "user" {
                     "web".to_string()
@@ -3359,7 +3315,7 @@ impl Gateway {
                 } else {
                     "im".to_string()
                 }
-            };
+            });
             let meta = SessionMeta {
                 sid: id.clone(),
                 slug: meta_project.clone(),
@@ -3383,7 +3339,6 @@ impl Gateway {
                 role_sha,
                 skills_sha,
                 trigger: Some(trigger),
-                compare_group: compare_group.clone(),
                 parent_sid: parent_sid.clone(),
                 spawned_by_role: spawned_by_role.clone(),
                 delegation_depth,
@@ -3669,9 +3624,6 @@ impl Gateway {
             .unwrap_or((None, None));
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
-        // v0.8.24 C2 — optional /compare tap: steal this sid's ANSWER off the
-        // IM stream (coordinator aggregates into one card).
-        let compare_tap = self.compare_taps.remove(&session_id);
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
         // detached pump can label out-of-band answers/errors (events from a
         // session that is no longer the chat's current focus).
@@ -4116,22 +4068,6 @@ impl Gateway {
                                     session.vendor,
                                     progress_path.as_deref(),
                                 );
-                            }
-                            // v0.8.24 C2 — compare coordinator tap: deliver answer
-                            // and SKIP user-level Answer emit (aggregated card
-                            // comes from run_compare). turns.jsonl already wrote.
-                            if let Some(ref tap) = compare_tap {
-                                let cost_usd = project_dir
-                                    .as_ref()
-                                    .and_then(|dir| read_session_meta(dir, &session_id).ok())
-                                    .and_then(|m| m.cost_usd);
-                                let _ = tap.send(crate::compare::CompareAnswer {
-                                    sid: session_id.clone(),
-                                    vendor: session.vendor,
-                                    text: text.clone(),
-                                    cost_usd,
-                                });
-                                continue;
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
                             // fallback, same as pump_target) and reuse it for the
@@ -6274,7 +6210,6 @@ impl Gateway {
             role_sha: None,
             skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
             trigger: None,
-            compare_group: None,
             // Adopting an external vendor session = a human/root session.
             parent_sid: None,
             spawned_by_role: None,
@@ -6929,14 +6864,15 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
-        plan.trigger_override = Some("session_spawn".into());
         plan.parent_sid = parent_sid.clone();
         plan.spawned_by_role = spawned_by_role;
         plan.delegation_depth = child_depth;
         plan.title = title.clone();
         let child_sid = plan.id.clone();
         let thread = Self::spawn_for_new_session_plan(&plan).await?;
-        let outcome = self.apply_new_session(plan, thread).await?;
+        let outcome = self
+            .apply_new_session(plan, thread, Some("session_spawn"))
+            .await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
 
         // ---- delegation_spawned (only when it IS a delegation) ----
@@ -7396,178 +7332,6 @@ impl Gateway {
             }
         }
         self.submit_to_sid(sid, text).await
-    }
-
-    /// v0.8.24 C2 — multi-vendor compare: roleless one-shot sessions, same
-    /// prompt, wait up to `timeout` (default 300s), return aggregated result
-    /// with real sids + cost subtotal. Partial failures are labeled, not fatal.
-    async fn run_compare(
-        &mut self,
-        owner: ChatKey,
-        project: String,
-        prompt: String,
-        vendors: Vec<AgentVendor>,
-        timeout: std::time::Duration,
-    ) -> Result<crate::compare::CompareResult> {
-        let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
-            return Err(anyhow!("compare prompt must not be empty"));
-        }
-        let vendors = if vendors.is_empty() {
-            crate::compare::default_compare_vendors()
-        } else {
-            vendors
-        };
-        let compare_group = crate::compare::mint_compare_group();
-        let title_snip = {
-            let chars: Vec<char> = prompt.chars().take(40).collect();
-            let s: String = chars.into_iter().collect();
-            format!("compare: {s}")
-        };
-
-        // Ensure event pump can start (compare taps live in the pump).
-        // When no sink is wired (some unit tests), register a throwaway
-        // consumer so the channel stays open for the duration.
-        if self.event_sink.is_none() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            self.set_event_sink(tx);
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        }
-
-        let mut slots_meta: Vec<(
-            AgentVendor,
-            String,
-            tokio::sync::mpsc::UnboundedReceiver<crate::compare::CompareAnswer>,
-        )> = Vec::new();
-        let mut spawn_errors: Vec<(AgentVendor, String)> = Vec::new();
-
-        for vendor in vendors {
-            let protocol = crate::compare::protocol_for_vendor(vendor);
-            let plan = match self.plan_new_session(
-                owner.clone(),
-                project.clone(),
-                vendor,
-                String::new(), // roleless
-                String::new(),
-                PermissionMode::Skip,
-                protocol,
-                SpawnTuning::default(),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    spawn_errors.push((vendor, e.to_string()));
-                    continue;
-                }
-            };
-            let mut plan = plan;
-            plan.compare_group = Some(compare_group.clone());
-            plan.trigger_override = Some("compare".into());
-            let sid = plan.id.clone();
-            let (tap_tx, tap_rx) = tokio::sync::mpsc::unbounded_channel();
-            self.compare_taps.insert(sid.clone(), tap_tx);
-            match Self::spawn_for_new_session_plan(&plan).await {
-                Ok(thread) => {
-                    if let Err(e) = self.apply_new_session(plan, thread).await {
-                        self.compare_taps.remove(&sid);
-                        spawn_errors.push((vendor, e.to_string()));
-                        continue;
-                    }
-                    // Best-effort auto title so /sessions shows the question.
-                    if let Some(cwd) = self.projects.get(&project).cloned() {
-                        if let Ok(mut meta) = read_session_meta(&cwd, &sid) {
-                            let _ = apply_title(&mut meta, title_snip.clone(), TitleSource::Auto);
-                            let _ = write_session_meta(&cwd, &meta);
-                        }
-                    }
-                    if let Err(e) = self.submit_resolved(&owner, &sid, "", prompt.clone()).await {
-                        spawn_errors.push((vendor, format!("submit failed: {e}")));
-                        // keep session + wait may still yield nothing
-                    }
-                    slots_meta.push((vendor, sid, tap_rx));
-                }
-                Err(e) => {
-                    self.compare_taps.remove(&sid);
-                    spawn_errors.push((vendor, e.to_string()));
-                }
-            }
-        }
-
-        // Collect answers with timeout.
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut slots: Vec<crate::compare::CompareSlot> = Vec::new();
-
-        for (vendor, sid, mut rx) in slots_meta {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let got = tokio::time::timeout(remaining, rx.recv()).await;
-            match got {
-                Ok(Some(ans)) => {
-                    slots.push(crate::compare::CompareSlot {
-                        vendor: crate::compare::vendor_label(vendor).to_string(),
-                        sid,
-                        answer: ans.text,
-                        cost_usd: ans.cost_usd,
-                        status: "ok".into(),
-                        error: None,
-                    });
-                }
-                Ok(None) => {
-                    slots.push(crate::compare::CompareSlot {
-                        vendor: crate::compare::vendor_label(vendor).to_string(),
-                        sid,
-                        answer: String::new(),
-                        cost_usd: None,
-                        status: "error".into(),
-                        error: Some("answer channel closed".into()),
-                    });
-                }
-                Err(_) => {
-                    // drop tap registration if still present
-                    self.compare_taps.remove(&sid);
-                    slots.push(crate::compare::CompareSlot {
-                        vendor: crate::compare::vendor_label(vendor).to_string(),
-                        sid,
-                        answer: String::new(),
-                        cost_usd: None,
-                        status: "timeout".into(),
-                        error: Some(format!("timed out after {}s", timeout.as_secs())),
-                    });
-                }
-            }
-        }
-
-        for (vendor, err) in spawn_errors {
-            slots.push(crate::compare::CompareSlot {
-                vendor: crate::compare::vendor_label(vendor).to_string(),
-                sid: String::new(),
-                answer: String::new(),
-                cost_usd: None,
-                status: "error".into(),
-                error: Some(err),
-            });
-        }
-
-        let cost_subtotal_usd = crate::compare::cost_subtotal(&slots);
-        Ok(crate::compare::CompareResult {
-            compare_group,
-            prompt,
-            slots,
-            cost_subtotal_usd,
-            timeout_secs: timeout.as_secs(),
-        })
-    }
-
-    /// Web/REST entry for [`Self::run_compare`] (ChatKey is private).
-    pub async fn run_compare_for_web(
-        &mut self,
-        owner_id: String,
-        project: String,
-        prompt: String,
-        vendors: Vec<AgentVendor>,
-        timeout: std::time::Duration,
-    ) -> Result<crate::compare::CompareResult> {
-        let owner = ChatKey::new("web", &owner_id, &owner_id);
-        self.run_compare(owner, project, prompt, vendors, timeout)
-            .await
     }
 
     /// Deliver one synchronous directive receipt to a web session's SSE stream
@@ -10134,7 +9898,6 @@ mod tests {
             .unwrap();
         let meta = read_session_meta(tmp.path(), &sid).unwrap();
         assert_eq!(meta.trigger.as_deref(), Some("web"));
-        assert!(meta.compare_group.is_none());
     }
 
     /// v0.8.24 F5 — when `thread_is_live` is false, `submit_resolved` must
@@ -10587,52 +10350,6 @@ mod tests {
             envs.contains(&sec1) && envs.contains(&sec2),
             "both minted secrets must have been injected into the spawn ctx: {envs:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn run_compare_fans_out_roleless_sessions_and_aggregates() {
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
-        let tmp = tempfile::tempdir().unwrap();
-        let mut gw = Gateway::new(fake.clone(), "demo", tmp.path());
-        let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel();
-        gw.set_event_sink(tx);
-        // Single-vendor compare via explicit list (factory is one fake for all).
-        let result = gw
-            .run_compare(
-                ChatKey::new("web", "u1", "u1"),
-                "demo".into(),
-                "why is this flaky?".into(),
-                vec![AgentVendor::Claude, AgentVendor::Codex],
-                std::time::Duration::from_secs(5),
-            )
-            .await
-            .expect("compare ok");
-        assert_eq!(result.slots.len(), 2, "{result:?}");
-        assert!(
-            result
-                .slots
-                .iter()
-                .all(|s| !s.sid.is_empty() || s.status == "error"),
-            "sids present or error: {result:?}"
-        );
-        // At least the first vendor should succeed with FakeAdapter echo.
-        let ok = result.slots.iter().filter(|s| s.status == "ok").count();
-        assert!(ok >= 1, "expected at least one ok slot: {result:?}");
-        // meta has compare_group
-        let sid = result
-            .slots
-            .iter()
-            .find(|s| s.status == "ok")
-            .unwrap()
-            .sid
-            .clone();
-        let meta = read_session_meta(tmp.path(), &sid).unwrap();
-        assert_eq!(
-            meta.compare_group.as_deref(),
-            Some(result.compare_group.as_str())
-        );
-        assert_eq!(meta.trigger.as_deref(), Some("compare"));
-        assert!(meta.role.is_empty(), "roleless");
     }
 
     #[tokio::test]
@@ -13163,7 +12880,6 @@ mod tests {
             role_sha: None,
             skills_sha: None,
             trigger: None,
-            compare_group: None,
             parent_sid: None,
             spawned_by_role: None,
             delegation_depth: 0,

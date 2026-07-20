@@ -23,7 +23,6 @@ pub mod api_v1;
 pub mod assets;
 // v0.8.6 W5b ResDisk — resource API: capabilities probe.
 pub mod capabilities;
-pub mod compare;
 // v0.8.18 柱1 — host-keyed agent report (`GET /api/v1/hosts` + `/{host}` +
 // the only writable endpoint `POST .../register-mcp`). The host-first
 // successor to the flat `capabilities` probe; shares `hosts::probe_bin`.

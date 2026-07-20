@@ -43,7 +43,7 @@ describe("shellViewFor routes the four views", () => {
     expect(shellViewFor("/")).toBe("home");
     expect(shellViewFor("/chat/s/s9")).toBe("conv");
     expect(shellViewFor("/flow")).toBe("flow");
-    expect(shellViewFor("/flow/compare")).toBe("flow");
+    expect(shellViewFor("/flow/evolution")).toBe("flow");
     expect(shellViewFor("/settings")).toBe("settings");
     expect(shellViewFor("/settings/market")).toBe("settings");
     expect(shellViewFor("/anything-else")).toBe("home");

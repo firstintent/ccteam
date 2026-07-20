@@ -604,7 +604,6 @@ mod tests {
             role_sha: Some("deadbeef0001".into()),
             skills_sha: None,
             trigger: None,
-            compare_group: None,
             parent_sid: None,
             spawned_by_role: None,
             delegation_depth: 0,

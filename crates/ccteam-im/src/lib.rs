@@ -27,7 +27,6 @@
 #![warn(missing_docs)]
 
 pub mod acl;
-pub mod compare;
 pub mod credentials;
 pub mod daemon;
 pub mod delegation;
