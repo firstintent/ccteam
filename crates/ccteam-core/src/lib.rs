@@ -260,10 +260,11 @@ pub use roles::{
 pub use host::read_hostname;
 pub use host_registry::{
     apply_join, apply_report, gate_remote_spawn, gate_remote_spawn_project, join_tokens_path_in,
-    normalize_host_id, now_unix, probe_agents, registry_path_in, AgentProbeSpec, HostAgentReport,
-    HostJoinRequest, HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport,
-    JoinToken, JoinTokenStore, SatelliteSelf, AGENT_PROBE_SPECS, DEFAULT_HEARTBEAT_TTL_SECS,
-    LOCAL_HOST, LOCAL_HOST as REGISTRY_LOCAL_HOST,
+    normalize_host_id, now_unix, probe_agents, probe_availability, probe_bin_cached,
+    registry_path_in, resolve_bin, AgentProbeSpec, HostAgentReport, HostJoinRequest,
+    HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport, JoinToken,
+    JoinTokenStore, SatelliteSelf, VendorAvailability, AGENT_PROBE_SPECS,
+    DEFAULT_HEARTBEAT_TTL_SECS, LOCAL_HOST, LOCAL_HOST as REGISTRY_LOCAL_HOST,
 };
 pub use screenshot::{
     probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,

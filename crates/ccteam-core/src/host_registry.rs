@@ -54,47 +54,157 @@ pub struct HostProjectReport {
 }
 
 /// One vendor this host can run + the env override / default binary name
-/// used to resolve it. Shared by the satellite report loop
-/// (`ccteam-web::satellite`, riding the control channel) and
-/// `ccteam-web::routes::hosts` (which wraps [`probe_bin_version`] with its
-/// own process-lifetime cache + MCP-registration status for the LOCAL
-/// admin host-detail page). Single source of truth for
-/// "which vendors ccteam knows how to probe".
+/// used to resolve it. **The single source of truth for "which vendors
+/// ccteam knows how to probe"** — shared by every consumer so a sixth
+/// vendor is one edit here, never a scatter of parallel tables:
+/// - the satellite report loop (`ccteam-web::satellite`, over the control
+///   channel) via [`probe_agents`];
+/// - `ccteam-web::routes::{hosts,capabilities}` (wrap [`probe_bin_cached`]
+///   for the LOCAL admin host-detail / capability matrix, plus the
+///   MCP-registration state keyed off [`Self::mcp_registrable`]);
+/// - the MCP `status` vendor panel + `session_spawn` availability discovery
+///   (`ccteam-im`) via [`probe_availability`].
 #[derive(Debug, Clone, Copy)]
 pub struct AgentProbeSpec {
+    /// Stable vendor token (`claude` / `codex`) — matches `AgentVendor`'s
+    /// lowercase serde form and what `POST .../sessions` accepts.
     pub vendor: &'static str,
+    /// Harness id label (`claude-code` / `codex`).
+    pub harness_id: &'static str,
+    /// Env override for the binary path (`CCTEAM_CLAUDE_BIN` / `_CODEX_BIN`).
     pub bin_env: &'static str,
+    /// Default binary name resolved on `PATH` when the env override is unset.
     pub default_bin: &'static str,
+    /// Whether ccteam registers its MCP server into a persistent vendor
+    /// config file for this vendor (claude `~/.claude.json` / codex
+    /// `config.toml` / kimi `mcp.json`). `false` for vendors whose MCP rides
+    /// the session protocol (grok/opencode ACP): nothing to register on the
+    /// host page, no `needs_config` state, and `register-mcp` rejects it.
+    pub mcp_registrable: bool,
 }
 
 /// The five vendor harnesses ccteam probes for. Extend here to add one.
 pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
     AgentProbeSpec {
         vendor: "claude",
+        harness_id: "claude-code",
         bin_env: ccteam_harness::CLAUDE_BIN_ENV,
         default_bin: "claude",
+        mcp_registrable: true,
     },
     AgentProbeSpec {
         vendor: "codex",
+        harness_id: "codex",
         bin_env: ccteam_harness::CODEX_BIN_ENV,
         default_bin: "codex",
+        mcp_registrable: true,
     },
     AgentProbeSpec {
         vendor: "grok",
+        harness_id: "grok",
         bin_env: ccteam_harness::GROK_BIN_ENV,
         default_bin: "grok",
+        // grok/ACP has no config-file MCP seam — nothing to register here.
+        mcp_registrable: false,
     },
     AgentProbeSpec {
         vendor: "opencode",
+        harness_id: "opencode",
         bin_env: ccteam_harness::OPENCODE_BIN_ENV,
         default_bin: "opencode",
+        mcp_registrable: false,
     },
     AgentProbeSpec {
         vendor: "kimi",
+        harness_id: "kimi",
         bin_env: ccteam_harness::KIMI_BIN_ENV,
         default_bin: "kimi",
+        // Kimi has a config-file MCP seam: `$KIMI_CODE_HOME/mcp.json`.
+        mcp_registrable: true,
     },
 ];
+
+impl AgentProbeSpec {
+    /// Look up a probe spec by its vendor token (`claude` / `codex` / …).
+    pub fn by_vendor(vendor: &str) -> Option<&'static AgentProbeSpec> {
+        AGENT_PROBE_SPECS.iter().find(|s| s.vendor == vendor)
+    }
+}
+
+/// Resolve a vendor's binary path: the `CCTEAM_*_BIN` override, else the
+/// `PATH` name. The single resolver every probe call site shares.
+pub fn resolve_bin(spec: &AgentProbeSpec) -> String {
+    std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
+}
+
+/// One vendor's availability on THIS machine — the normalized snapshot the
+/// MCP `status` panel and the `session_spawn` discovery error render from.
+/// Deliberately carries only machine facts (`installed` + `--version`);
+/// auth / budget / host-online are layered on by the panel from other
+/// sources, never faked here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorAvailability {
+    pub vendor: &'static str,
+    pub harness_id: &'static str,
+    pub installed: bool,
+    pub version: Option<String>,
+}
+
+/// One cached probe result (`installed`, first `--version` line).
+type ProbeCacheEntry = (bool, Option<String>);
+
+/// Process-lifetime probe cache keyed by resolved binary path (not vendor,
+/// so a test pointing `CCTEAM_*_BIN` at a fake script gets an independent
+/// entry). A `refresh` probe bypasses + overwrites the entry — the manual
+/// re-probe that breaks the daemon-lifetime cache when a vendor is installed
+/// after the daemon started.
+fn probe_cache() -> &'static std::sync::Mutex<BTreeMap<String, ProbeCacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, ProbeCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Cached wrapper over [`probe_bin_version`]: probe `<bin> --version` once
+/// per process (per resolved path), returning the cached result on
+/// subsequent calls. `refresh` bypasses the cache and re-runs, overwriting
+/// the entry. The satellite report loop calls the UNcached
+/// [`probe_bin_version`] (fresh every beat); the daemon-resident consumers
+/// (web host page, MCP status panel, spawn discovery) use this so the common
+/// case never re-spawns a child.
+pub fn probe_bin_cached(bin: &str, refresh: bool) -> (bool, Option<String>) {
+    if !refresh {
+        if let Ok(cache) = probe_cache().lock() {
+            if let Some(hit) = cache.get(bin) {
+                return hit.clone();
+            }
+        }
+    }
+    let result = probe_bin_version(bin);
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.insert(bin.to_string(), result.clone());
+    }
+    result
+}
+
+/// Probe every [`AGENT_PROBE_SPECS`] vendor on THIS machine (cached), folding
+/// to the [`VendorAvailability`] snapshot. Blocking (shells out once per
+/// vendor on a cold cache) — call via `spawn_blocking` from async. `refresh`
+/// forces a re-probe of every vendor.
+pub fn probe_availability(refresh: bool) -> Vec<VendorAvailability> {
+    AGENT_PROBE_SPECS
+        .iter()
+        .map(|spec| {
+            let bin = resolve_bin(spec);
+            let (installed, version) = probe_bin_cached(&bin, refresh);
+            VendorAvailability {
+                vendor: spec.vendor,
+                harness_id: spec.harness_id,
+                installed,
+                version,
+            }
+        })
+        .collect()
+}
 
 /// Resolve + run `<bin> --version`; any spawn error (binary not on PATH)
 /// folds to not-installed. The single shellout impl — both the web
@@ -882,5 +992,41 @@ mod tests {
     fn agent_probe_specs_covers_five_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+    }
+
+    #[test]
+    fn agent_probe_specs_carry_harness_id_and_mcp_registrable() {
+        // The web host page + capabilities matrix now read these off the
+        // shared spec (no parallel table). claude/codex/kimi register into a
+        // config file; grok/opencode ride the ACP session protocol.
+        let by = |v: &str| AgentProbeSpec::by_vendor(v).unwrap();
+        assert_eq!(by("claude").harness_id, "claude-code");
+        assert!(by("claude").mcp_registrable);
+        assert!(by("codex").mcp_registrable);
+        assert!(by("kimi").mcp_registrable);
+        assert!(!by("grok").mcp_registrable);
+        assert!(!by("opencode").mcp_registrable);
+        assert!(AgentProbeSpec::by_vendor("gemini").is_none());
+    }
+
+    #[test]
+    fn probe_bin_cached_missing_binary_is_not_installed() {
+        // A path that cannot exist → not installed, both cold + cached read.
+        let cold = probe_bin_cached("/nonexistent/ccteam-fake-cache-zzz", true);
+        assert!(!cold.0 && cold.1.is_none());
+        let warm = probe_bin_cached("/nonexistent/ccteam-fake-cache-zzz", false);
+        assert_eq!(cold, warm);
+    }
+
+    #[test]
+    fn probe_availability_returns_one_row_per_spec() {
+        // No env mutation: whatever the host has installed, the SHAPE holds —
+        // one snapshot row per probe spec, vendor tokens in registry order.
+        let avail = probe_availability(true);
+        assert_eq!(avail.len(), AGENT_PROBE_SPECS.len());
+        let vendors: Vec<&str> = avail.iter().map(|a| a.vendor).collect();
+        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+        // harness_id is carried through from the spec.
+        assert_eq!(avail[0].harness_id, "claude-code");
     }
 }
