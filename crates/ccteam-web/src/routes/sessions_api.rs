@@ -11,7 +11,7 @@
 //! Routes (all `/api/v1`, behind the shared `auth_layer`):
 //!
 //! - `GET    /api/v1/projects/{slug}/sessions`        → `[SessionView]` for the slug
-//! - `POST   /api/v1/projects/{slug}/sessions`        → create → 201 `{sid, model_warning?}`
+//! - `POST   /api/v1/projects/{slug}/sessions`        → create → 201 `{sid}`
 //! - `GET    /api/v1/sessions/{sid}`                  → `{sid, events}` history
 //! - `POST   /api/v1/sessions/{sid}/turn`             → submit → 202 `{accepted:true}`
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
@@ -311,7 +311,7 @@ fn spawn_tuning_from_form(
 /// Creates a new session via the spine. v0.8.8 F1 — ALWAYS mints a fresh sid
 /// (no `(project, role)` dedup), so a project can run multiple same-role
 /// sessions side by side. v0.8.8 F2-web — an empty `role` is a valid roleless
-/// session (bare claude). 201 `{sid, model_warning?}` on success. 400 on a bad vendor token or
+/// session (bare claude). 201 `{sid}` on success. 400 on a bad vendor token or
 /// bad permission_mode. 422 when a NAMED role has no `.claude/agents/<role>.md`
 /// (a caller mistake, R-M6; an empty role is NOT this case). 503 with no
 /// gateway. 500 if the gateway create fails for a genuine internal reason
@@ -323,7 +323,7 @@ fn spawn_tuning_from_form(
     params(("slug" = String, Path, description = "Project slug")),
     request_body(content = CreateSessionForm, description = "Session to create (JSON or x-www-form-urlencoded)"),
     responses(
-        (status = 201, description = "Created; `{sid, model_warning?}`", body = serde_json::Value),
+        (status = 201, description = "Created; `{sid}`", body = serde_json::Value),
         (status = 400, description = "Bad vendor / bad permission_mode"),
         (status = 422, description = "Unknown NAMED role (no `.claude/agents/<role>.md`); empty role is allowed (roleless)"),
         (status = 503, description = "No live gateway (standalone web)"),
@@ -401,13 +401,7 @@ pub(crate) async fn handle_create_session(
             .await
     };
     match created {
-        Ok(created) => {
-            let mut body = json!({"sid": created.sid});
-            if let Some(model_warning) = created.model_warning {
-                body["model_warning"] = json!(model_warning);
-            }
-            (StatusCode::CREATED, Json(body)).into_response()
-        }
+        Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
         // role has no `.claude/agents/<role>.md`) from a real internal failure
         // (adapter spawn / fs error). A bad role is a client error → 422

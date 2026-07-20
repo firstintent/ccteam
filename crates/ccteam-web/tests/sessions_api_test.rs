@@ -170,55 +170,6 @@ async fn create_session_rejects_removed_host_parameter() {
 }
 
 #[tokio::test]
-async fn create_session_returns_model_warning_in_body() {
-    let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    let project_dir = paths.projects_root.join("demo");
-    std::fs::create_dir_all(&project_dir).unwrap();
-    seed_role_with_model(&project_dir, "reviewer", Some("deepseek-via-claude"));
-    seed_role_with_model(&project_dir, "sonnet", Some("sonnet[1m]"));
-
-    let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
-    });
-    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
-    let client = reqwest::Client::new();
-
-    let warned = client
-        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
-        .json(&serde_json::json!({"role": "reviewer", "vendor": "claude"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(warned.status(), 201);
-    let body: Value = warned.json().await.unwrap();
-    assert_eq!(body["sid"], "s1");
-    assert!(
-        body["model_warning"]
-            .as_str()
-            .is_some_and(|msg| msg.contains("deepseek-via-claude")),
-        "expected model_warning in 201 body, got {body}"
-    );
-
-    let ok = client
-        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
-        .json(&serde_json::json!({"role": "sonnet", "vendor": "claude"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), 201);
-    let body: Value = ok.json().await.unwrap();
-    assert_eq!(body["sid"], "s2");
-    assert!(
-        body.get("model_warning").is_none(),
-        "Claude-family model must not warn: {body}"
-    );
-}
-
-#[tokio::test]
 async fn session_history_no_gateway_is_503() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;

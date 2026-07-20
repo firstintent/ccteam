@@ -1214,11 +1214,11 @@ async fn run_session_spawn(
 
     // Check idempotency + create under ONE lock so a concurrent same-key retry
     // can never race past the replay into a second spawn.
-    let (sid, model_warning, resolved, replay) = {
+    let (sid, resolved, replay) = {
         let mut gw = gateway.lock().await;
         if let Some(key) = idem_key.as_deref() {
             if let Some(body) = gw.spawn_idem_replay(&project, key) {
-                (String::new(), None, None, Some(body))
+                (String::new(), None, Some(body))
             } else {
                 let created = gw
                     .create_delegated_session(
@@ -1236,7 +1236,7 @@ async fn run_session_spawn(
                     .map_err(|e| format!("session_spawn: {e}"))?;
                 let sid = created.sid.clone();
                 let resolved = gw.session_resolve(&sid);
-                (sid, created.model_warning, resolved, None)
+                (sid, resolved, None)
             }
         } else {
             let created = gw
@@ -1255,7 +1255,7 @@ async fn run_session_spawn(
                 .map_err(|e| format!("session_spawn: {e}"))?;
             let sid = created.sid.clone();
             let resolved = gw.session_resolve(&sid);
-            (sid, created.model_warning, resolved, None)
+            (sid, resolved, None)
         }
     };
     // Idempotent replay: return the ORIGINAL body verbatim (+ a replay flag).
@@ -1298,9 +1298,6 @@ async fn run_session_spawn(
     });
     if let Some(t) = &title {
         body["title"] = serde_json::json!(t);
-    }
-    if let Some(model_warning) = model_warning {
-        body["model_warning"] = serde_json::json!(model_warning);
     }
     // v0.9.1 — dispatch the optional first task through the SAME submit path
     // session_dispatch uses; its outcome (turn_id / status / inline result /

@@ -282,10 +282,6 @@ pub struct Gateway {
     /// registered after daemon start without a restart — config.yaml is the
     /// source of truth, `projects` is just a cache. `None` in unit tests.
     config: Option<HotConfig<CcteamConfig>>,
-    /// v0.8.10 D9 — warn once per Claude-routed non-Claude model family.
-    /// This is an honesty label only: it never blocks spawn and never changes
-    /// adapter/model behavior.
-    model_warned: HashSet<(AgentVendor, String)>,
     /// Signal to the daemon's IM-reload task that `credentials.json` changed
     /// and the credential-driven channel listeners should be rebuilt in place
     /// (no daemon restart, no agent-session restart). Wired by the daemon via
@@ -724,9 +720,6 @@ pub struct StartOutcome {
     /// The session's permission posture (always the requested mode on a fresh
     /// spawn).
     pub permission_mode: PermissionMode,
-    /// Optional model-support warning emitted when the role declares a
-    /// Claude-routed model outside the verified Claude family.
-    pub model_warning: Option<String>,
 }
 
 /// v0.8.24 A-U3 — optional explicit model / reasoning-effort chosen at
@@ -760,9 +753,6 @@ impl SpawnTuning {
 pub struct CreateSessionOutcome {
     /// The freshly minted gateway session id (`s{n}`).
     pub sid: String,
-    /// Optional human warning for a Claude-routed role model that ccteam has
-    /// not verified as part of the Claude model family.
-    pub model_warning: Option<String>,
 }
 
 impl CreateSessionOutcome {
@@ -1318,7 +1308,6 @@ impl Gateway {
             )),
             project_paths: None,
             config: None,
-            model_warned: HashSet::new(),
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             remote_host_proxy: None,
@@ -3273,7 +3262,7 @@ impl Gateway {
             wire_slug: _,
             secret,
             cwd: _,
-            model_id,
+            model_id: _,
             effort: _,
             adapter,
             compare_group,
@@ -3332,8 +3321,6 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        let model_warning =
-            self.maybe_emit_model_support_warning(&owner, &id, vendor, model_id.as_deref());
         self.current_session
             .write()
             .unwrap()
@@ -3426,7 +3413,6 @@ impl Gateway {
             id,
             // Fresh spawn ran with exactly the requested posture.
             permission_mode,
-            model_warning,
         })
     }
 
@@ -3589,44 +3575,7 @@ impl Gateway {
             let _ = write_session_meta(&meta_dir, &meta);
         }
         self.spawn_event_pump(&sid);
-        let _ = self.maybe_emit_model_support_warning(chat, &sid, vendor, model_id.as_deref());
         Ok(sid)
-    }
-
-    fn maybe_emit_model_support_warning(
-        &mut self,
-        chat: &ChatKey,
-        sid: &str,
-        vendor: AgentVendor,
-        model: Option<&str>,
-    ) -> Option<String> {
-        if vendor != AgentVendor::Claude {
-            return None;
-        }
-        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
-        if ccteam_core::is_claude_family(model) {
-            return None;
-        }
-        let key = (vendor, model_warn_key(model));
-        if !self.model_warned.insert(key) {
-            return None;
-        }
-        let content = format!(
-            "模型提示: 这个 Claude session 的角色声明了 model `{model}`。ccteam 目前只验证 Claude 家族模型；如果会话长时间空转，请改用 sonnet/opus/haiku，或在角色文件里调整 model 后重新 /new。"
-        );
-        self.emit_user_signal(GatewayEvent {
-            id: format!("gateway-model-warn-{sid}-{}", model_warn_key(model)),
-            channel: chat.channel.clone(),
-            chat_id: chat.chat_id.clone(),
-            thread_ts: None,
-            content: content.clone(),
-            kind: GatewayEventKind::Answer,
-            attachments: Vec::new(),
-            options: Vec::new(),
-            sid: Some(sid.to_string()),
-            slug: self.sessions.get(sid).map(|s| s.project.clone()),
-        });
-        Some(content)
     }
 
     fn emit_user_signal(&self, event: GatewayEvent) {
@@ -6573,10 +6522,7 @@ impl Gateway {
             tuning,
         )
         .await
-        .map(|o| CreateSessionOutcome {
-            sid: o.id,
-            model_warning: o.model_warning,
-        })
+        .map(|o| CreateSessionOutcome { sid: o.id })
     }
 
     // ── live-session capacity (v0.9.2) ──────────────────────────────────────
@@ -7007,10 +6953,7 @@ impl Gateway {
                 None,
             );
         }
-        Ok(CreateSessionOutcome {
-            sid: outcome.id,
-            model_warning: outcome.model_warning,
-        })
+        Ok(CreateSessionOutcome { sid: outcome.id })
     }
 
     /// v0.9.0 W2 (F7) — idempotent-spawn replay: return the recorded response
@@ -8240,14 +8183,6 @@ fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn model_warn_key(model: &str) -> String {
-    model
-        .trim()
-        .split_once('[')
-        .map_or_else(|| model.trim(), |(head, _)| head.trim())
-        .to_ascii_lowercase()
-}
-
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
 /// honoring a `/cd`-updated `reply_to` and falling back to the owner.
 fn pump_target(session: &GatewaySession) -> (String, String) {
@@ -9171,90 +9106,6 @@ mod tests {
         assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
     }
 
-    #[tokio::test]
-    async fn claude_non_family_role_model_warns_once_to_event_stream() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        let mut events = gateway.subscribe_events();
-
-        assert_eq!(
-            gateway
-                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
-                .await
-                .unwrap(),
-            vec!["created session s1\n↓ 查看状态 → /status"]
-        );
-        let warn = events.recv().await.unwrap();
-        assert_eq!(warn.sid.as_deref(), Some("s1"));
-        assert!(warn.content.contains("模型提示"), "{}", warn.content);
-        assert!(
-            warn.content.contains("deepseek-via-claude"),
-            "{}",
-            warn.content
-        );
-        assert!(
-            warn.content.contains("sonnet/opus/haiku"),
-            "{}",
-            warn.content
-        );
-        assert!(warn.content.contains("/new"), "{}", warn.content);
-
-        assert_eq!(
-            gateway
-                .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
-                .await
-                .unwrap(),
-            vec!["created session s2\n↓ 查看状态 → /status"]
-        );
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "same model family should warn once"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_session_api_returns_model_warning_once_in_band() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_role_with_model(tmp.path(), "reviewer", Some("deepseek-via-claude"));
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-
-        let first = gateway
-            .create_session_api(
-                "alpha".into(),
-                "reviewer".into(),
-                AgentVendor::Claude,
-                PermissionMode::Skip,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.sid, "s1");
-        assert!(
-            first
-                .model_warning
-                .as_deref()
-                .is_some_and(|msg| msg.contains("deepseek-via-claude")),
-            "first API create must return the warning in-band: {first:?}"
-        );
-
-        let second = gateway
-            .create_session_api(
-                "alpha".into(),
-                "reviewer".into(),
-                AgentVendor::Claude,
-                PermissionMode::Skip,
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.sid, "s2");
-        assert_eq!(second.model_warning, None);
-    }
-
     /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)
     /// reaches the adapter's `SpawnCtx`, and the explicit model beats the
     /// role's `model:` frontmatter; without tuning the role default holds
@@ -9276,7 +9127,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
-                    model: Some("opus-4.8".into()),
+                    model: Some("future-model-from-vendor".into()),
                     effort: Some("max".into()),
                 },
             )
@@ -9319,57 +9170,10 @@ mod tests {
         assert_eq!(
             tunings,
             vec![
-                (Some("opus-4.8".into()), Some("max".into())),
+                (Some("future-model-from-vendor".into()), Some("max".into())),
                 (Some("sonnet".into()), None),
                 (Some("sonnet".into()), None),
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn claude_family_role_models_do_not_warn() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_role_with_model(tmp.path(), "sonnetrole", Some("sonnet[1m]"));
-        seed_role_with_model(tmp.path(), "future", Some("claude-future-99"));
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        let mut events = gateway.subscribe_events();
-
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude sonnetrole")
-            .await
-            .unwrap();
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude future")
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "Claude-family role models must not warn"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_route_with_non_claude_role_model_does_not_warn() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        seed_role_with_model(tmp.path(), "api", Some("deepseek-via-claude"));
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Codex));
-        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        let mut events = gateway.subscribe_events();
-
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new codex api")
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "non-Claude vendor must not emit Claude model warning"
         );
     }
 

@@ -249,9 +249,7 @@ describe("sessionsApi", () => {
 
   it("createSession POSTs role+vendor+permission_mode to the project list", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse(201, { sid: "s4", model_warning: "模型提示: deepseek" }),
-    );
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, { sid: "s4" }));
     const got = await createSession("dex-ui", {
       role: "cto",
       vendor: "claude",
@@ -264,7 +262,6 @@ describe("sessionsApi", () => {
       body: JSON.stringify({ role: "cto", vendor: "claude", permission_mode: "hitl" }),
     });
     expect(got.sid).toBe("s4");
-    expect(got.model_warning).toContain("deepseek");
   });
 
   it("createSession carries explicit model/effort in the body (A-U3)", async () => {

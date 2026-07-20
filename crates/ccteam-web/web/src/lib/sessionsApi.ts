@@ -327,11 +327,9 @@ export interface CreateSessionOpts {
 
 export interface CreateSessionResult {
   sid: string;
-  model_warning?: string;
 }
 
-/** `POST /api/v1/projects/{slug}/sessions` — mint a fresh session sid.
- *  201 `{sid}` with optional `{model_warning}` for honest model support. */
+/** `POST /api/v1/projects/{slug}/sessions` — mint a fresh session sid. */
 export function createSession(
   slug: string,
   opts: CreateSessionOpts,

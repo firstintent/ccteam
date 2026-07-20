@@ -69,7 +69,6 @@ pub mod migration;
 // V0.6.0 Wave 2 F114 — rule-based NL intent → ExecutionMode inferrer
 // used during project creation (mode inference for new workflows).
 pub mod mode_inferrer;
-pub mod model_support;
 pub mod paths;
 pub mod pending_inject;
 // V0.6.1 F98 — plan-approval ↔ outbox engine. Pure state machine over
@@ -233,7 +232,6 @@ pub use ccteam_cost::{
     UnifiedTokenUsage as Usage, Vendor,
 };
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
-pub use model_support::is_claude_family;
 pub use paths::{
     agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,
     teams_progress_path,

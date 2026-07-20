@@ -361,7 +361,7 @@ export default function HomeView({
       // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
       // (vendor-native spawn seam), replacing the old post-spawn `/model`
       // control turn.
-      const { sid, model_warning: warning } = await apiCreateSession(slug, {
+      const { sid } = await apiCreateSession(slug, {
         role,
         vendor: effectiveDraft.vendor,
         permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
@@ -369,7 +369,6 @@ export default function HomeView({
         model: modelSwitchFor(effectiveDraft) ?? undefined,
         effort: wireEffort(effectiveDraft) ?? undefined,
       });
-      if (warning) toastBus.handler?.info(warning);
       await submitTurn(sid, text, attachments);
       return sid;
     };
