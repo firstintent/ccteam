@@ -165,6 +165,64 @@ async fn forward_as_local_admin(
     }
 }
 
+/// v0.10 T1 — forward the daemon-aware `status` call so the caller gets the
+/// vendor panel + routing notes scoped to its project. Injects the SAME
+/// identity as the session tools: a ccteam session forwards its
+/// `(sid, secret)` principal (daemon scopes the panel to its own project);
+/// a plain main session forwards the admin web token + the cwd-resolved slug
+/// (Admin semantics). Returns `None` on ANY miss (no principal AND no token,
+/// or the daemon socket is unreachable) so the caller falls back to the LOCAL
+/// status — the base health JSON with no panel. `status` must always succeed.
+pub async fn forward_status(paths: &CcteamPaths, args: &Value) -> Option<String> {
+    let caller_sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
+    let secret = std::env::var("CCTEAM_CHAT_SECRET").unwrap_or_default();
+    let mut fwd_args = args.clone();
+    if !caller_sid.is_empty() && !secret.is_empty() {
+        // ccteam-spawned session: forward the principal (daemon scopes to the
+        // caller's OWN project; self-reported project args are ignored).
+        if let Some(obj) = fwd_args.as_object_mut() {
+            obj.insert("_caller_sid".to_string(), json!(caller_sid));
+            obj.insert("_caller_secret".to_string(), json!(secret));
+        }
+    } else {
+        // Plain main session: admin web token + cwd-resolved default project.
+        let token = read_web_token(paths)?;
+        if let Some(obj) = fwd_args.as_object_mut() {
+            for k in [
+                "_caller_sid",
+                "_caller_secret",
+                "_caller_role",
+                "_caller_depth",
+            ] {
+                obj.remove(k);
+            }
+            obj.insert("_caller_admin_token".to_string(), json!(token));
+            let explicit = obj
+                .get("project")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !explicit {
+                if let Some(slug) = project_slug_for_cwd(paths) {
+                    obj.insert("_caller_slug".to_string(), json!(slug));
+                }
+            }
+        }
+    }
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "status", "arguments": fwd_args },
+    });
+    let socket = ccteam_core::daemon_socket_path(paths);
+    let resp = crate::mcp_serve::forward_to_socket(&socket, &req)
+        .await
+        .ok()?;
+    resp.pointer("/result/content/0/text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Read the admin web token (`~/.ccteam/secrets/web-token`). `None` when the
 /// file is missing/empty — the caller then soft-degrades, fail-closed.
 fn read_web_token(paths: &CcteamPaths) -> Option<String> {

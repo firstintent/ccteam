@@ -213,6 +213,27 @@ pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<V
             };
             return Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
         }
+        // v0.10 T1 — `status` becomes daemon-aware: forward to the daemon so
+        // the caller gets the vendor panel + routing notes (scoped to its
+        // project). On ANY miss (no daemon reachable / no identity) fall
+        // THROUGH to the local base status below — status always succeeds.
+        if name == "status" {
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(json!({}));
+            if let Some(body) = mcp_session_tools::forward_status(paths, &args).await {
+                let id = req.get("id").cloned()?;
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": body }],
+                        "isError": false,
+                    },
+                }));
+            }
+        }
     }
     ccteam_im::mcp::handle_request(paths, req).await
 }

@@ -175,8 +175,23 @@ async fn mcp_tools_call_status_succeeds() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["result"]["isError"], false);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    // v0.10 T1 — the daemon-aware `status` returns the base health JSON, then
+    // the vendor panel + routing notes appended as trailing plain text
+    // (separated by a blank line). The JSON is the first `\n\n`-delimited
+    // chunk; the appended panel is the new observability surface.
+    let json_chunk = text.split("\n\n").next().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json_chunk).unwrap();
     assert!(parsed.get("projects").is_some() || parsed.get("orchestrator").is_some());
+    // Admin caller with no `project` arg and no cwd project → the panel falls
+    // back to the local host with a note, but the vendor section is present.
+    assert!(
+        text.contains("vendors (project="),
+        "status must append the vendor panel, got: {text}"
+    );
+    assert!(
+        text.contains("routing notes"),
+        "status must append the routing-notes transport, got: {text}"
+    );
 }
 
 // ── ④ no/bad bearer → 401 (auth enabled AND disabled) ───────────────
