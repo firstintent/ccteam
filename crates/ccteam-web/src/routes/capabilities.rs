@@ -5,21 +5,21 @@
 //! this to grey out a "create session with vendor X" affordance when the
 //! binary isn't installed.
 //!
-//! v0.8.18 柱1 — the probe is now the SINGLE implementation in
-//! [`super::hosts`] (`probe_bin`, keyed by binary path + cached), shared
-//! with the host-keyed `GET /api/v1/hosts` report, so this legacy flat
-//! surface and the host page can't drift apart. The wire shape here is
-//! unchanged (`{harnesses:[{id, vendor, available, providers}]}`);
+//! The probe is the SINGLE implementation in
+//! [`ccteam_core::host_registry`] (`probe_bin_cached`, path-keyed and cached,
+//! over the shared `AGENT_PROBE_SPECS` registry), shared with the host-keyed
+//! `GET /api/v1/hosts` report, the satellite report loop, and the MCP
+//! `status` panel, so none of them can drift apart. The wire shape here is
+//! unchanged (`harnesses` of `id, vendor, available, providers`), and
 //! `providers` stays reserved (empty).
 //!
 //! Auth: merged into [`super::stateful_router`] via the `/api/v1`
 //! `OpenApiRouter`, so the existing `auth_layer` gate applies for free.
 
 use axum::{response::IntoResponse, Json};
+use ccteam_core::host_registry::{probe_bin_cached, resolve_bin, AGENT_PROBE_SPECS};
 use serde::Serialize;
 use utoipa::ToSchema;
-
-use super::hosts::{probe_bin, resolve_bin, PROBE_SPECS};
 
 /// One harness entry in the capabilities response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -54,12 +54,12 @@ pub(crate) async fn handle_capabilities() -> impl IntoResponse {
     // Probe each spec off the async runtime (each shells out; cached, so the
     // common case never spawns a child). Reuses the SINGLE `hosts::probe_bin`.
     let harnesses = tokio::task::spawn_blocking(|| {
-        PROBE_SPECS
+        AGENT_PROBE_SPECS
             .iter()
             .map(|spec| HarnessCapability {
                 id: spec.harness_id,
                 vendor: spec.vendor,
-                available: probe_bin(&resolve_bin(spec), false).installed,
+                available: probe_bin_cached(&resolve_bin(spec), false).0,
                 providers: Vec::new(),
             })
             .collect::<Vec<_>>()

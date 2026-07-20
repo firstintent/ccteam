@@ -20,16 +20,15 @@
 //! Merged into the `/api/v1` [`OpenApiRouter`] (see [`super::openapi`]) so
 //! the shared web-token gate applies for free.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use ccteam_harness::{CLAUDE_BIN_ENV, CODEX_BIN_ENV, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV};
+use ccteam_core::host_registry::{
+    probe_bin_cached, resolve_bin, AgentProbeSpec, AGENT_PROBE_SPECS,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -40,71 +39,11 @@ use crate::state::AppState;
 /// satellites.
 pub const LOCAL_HOST: &str = "local";
 
-/// A vendor ccteam can probe + register its MCP into. **Vendor-extensible**:
-/// add a row to [`PROBE_SPECS`] to surface a new agent on the host page —
-/// no other code changes. `bin_env` mirrors the `CCTEAM_*_BIN` overrides the
-/// harness adapters honor, so a test points the probe at a fake script.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ProbeSpec {
-    /// Stable vendor token (`claude` / `codex`) — matches `AgentVendor`'s
-    /// lowercase serde form and what `POST .../sessions` accepts.
-    pub vendor: &'static str,
-    /// Harness id label (`claude-code` / `codex`).
-    pub harness_id: &'static str,
-    /// Env override for the binary path (`CCTEAM_CLAUDE_BIN` / `_CODEX_BIN`).
-    pub bin_env: &'static str,
-    /// Default binary name resolved on `PATH` when the env override is unset.
-    pub default_bin: &'static str,
-    /// Whether ccteam registers its MCP server into a persistent vendor config
-    /// file for this vendor (claude `~/.claude.json` / codex `config.toml`).
-    /// `false` for vendors with no config-file MCP seam (grok/ACP passes
-    /// `mcpServers` per-session over the wire, so there is nothing to register
-    /// on the host page): such a vendor never shows `needs_config` or a
-    /// register CTA, and `register-mcp` rejects it with 400.
-    pub mcp_registrable: bool,
-}
-
-/// The agent vendors surfaced on the host page. Extend here to add a vendor.
-pub(crate) const PROBE_SPECS: &[ProbeSpec] = &[
-    ProbeSpec {
-        vendor: "claude",
-        harness_id: "claude-code",
-        bin_env: CLAUDE_BIN_ENV,
-        default_bin: "claude",
-        mcp_registrable: true,
-    },
-    ProbeSpec {
-        vendor: "codex",
-        harness_id: "codex",
-        bin_env: CODEX_BIN_ENV,
-        default_bin: "codex",
-        mcp_registrable: true,
-    },
-    ProbeSpec {
-        vendor: "grok",
-        harness_id: "grok",
-        bin_env: GROK_BIN_ENV,
-        default_bin: "grok",
-        // grok/ACP has no config-file MCP seam — nothing to register here.
-        mcp_registrable: false,
-    },
-    ProbeSpec {
-        vendor: "opencode",
-        harness_id: "opencode",
-        bin_env: OPENCODE_BIN_ENV,
-        default_bin: "opencode",
-        mcp_registrable: false,
-    },
-    ProbeSpec {
-        vendor: "kimi",
-        harness_id: "kimi",
-        bin_env: KIMI_BIN_ENV,
-        default_bin: "kimi",
-        // Kimi has a config-file MCP seam: `$KIMI_CODE_HOME/mcp.json`
-        // (`mcpServers.ccteam` HTTP entry) — registrable from the host page.
-        mcp_registrable: true,
-    },
-];
+// The per-vendor probe spec registry (`AgentProbeSpec` / `AGENT_PROBE_SPECS`)
+// now lives in `ccteam_core::host_registry` — the SINGLE source of truth
+// shared by the satellite report loop, this host page, the capabilities
+// matrix, and the MCP `status` panel. Adding a sixth vendor is one edit
+// there; there is no parallel web-local table to keep in sync.
 
 /// One agent's health on a host.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -201,54 +140,6 @@ pub struct HostProjectView {
     pub catalog_slug: Option<String>,
 }
 
-/// Result of one `<bin> --version` probe.
-#[derive(Debug, Clone)]
-pub(crate) struct ProbeResult {
-    pub installed: bool,
-    pub version: Option<String>,
-}
-
-/// Process-lifetime probe cache keyed by resolved binary path. Keyed by
-/// path (not vendor) so a test pointing `CCTEAM_*_BIN` at a fake script gets
-/// an independent entry. A `refresh` probe bypasses + overwrites the entry —
-/// the manual re-probe that breaks the daemon-lifetime cache (a vendor
-/// installed after the daemon started flips `installed` without a restart).
-fn probe_cache() -> &'static Mutex<HashMap<String, ProbeResult>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, ProbeResult>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Resolve a vendor's binary path: `CCTEAM_*_BIN` override, else the `PATH`
-/// name.
-pub(crate) fn resolve_bin(spec: &ProbeSpec) -> String {
-    std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
-}
-
-/// Probe `<bin> --version`: capture exit status + the first stdout line as
-/// the version string. Cached by path; `refresh` bypasses the cache and
-/// re-runs. Any spawn error (binary not on PATH) folds to
-/// `{installed:false, version:None}`. This is the SINGLE probe impl —
-/// [`super::capabilities`] reuses it (no second `--version` shell-out path).
-pub(crate) fn probe_bin(bin: &str, refresh: bool) -> ProbeResult {
-    if !refresh {
-        if let Ok(cache) = probe_cache().lock() {
-            if let Some(hit) = cache.get(bin) {
-                return hit.clone();
-            }
-        }
-    }
-    // v0.9.0 W3 — the raw `<bin> --version` shellout is shared with the
-    // satellite report loop (`crate::satellite`, over the control channel)
-    // via `ccteam_core::host_registry::probe_bin_version`; this wrapper adds
-    // ONLY the process-lifetime cache (a satellite probes fresh per report).
-    let (installed, version) = ccteam_core::host_registry::probe_bin_version(bin);
-    let result = ProbeResult { installed, version };
-    if let Ok(mut cache) = probe_cache().lock() {
-        cache.insert(bin.to_string(), result.clone());
-    }
-    result
-}
-
 /// Is the ccteam MCP server registered in this vendor's config? Read-only,
 /// best-effort (a missing / unreadable config reads as `false`).
 fn mcp_registered(vendor: &str) -> bool {
@@ -270,12 +161,12 @@ fn mcp_registered(vendor: &str) -> bool {
 }
 
 /// Build one agent's health row (probe + MCP-registration check + tri-state).
-fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
+fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
     let bin = resolve_bin(spec);
-    let probe = probe_bin(&bin, refresh);
+    let (installed, version) = probe_bin_cached(&bin, refresh);
     // A non-registrable vendor has no config-file seam → never "registered".
     let registered = spec.mcp_registrable && mcp_registered(spec.vendor);
-    let status = classify_status(probe.installed, registered, spec.mcp_registrable);
+    let status = classify_status(installed, registered, spec.mcp_registrable);
     let hint: Option<String> = match status {
         "not_installed" => Some(format!(
             "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
@@ -290,8 +181,8 @@ fn agent_health(spec: &ProbeSpec, refresh: bool) -> AgentHealth {
     AgentHealth {
         vendor: spec.vendor.to_string(),
         harness_id: spec.harness_id.to_string(),
-        installed: probe.installed,
-        version: probe.version,
+        installed,
+        version,
         bin,
         mcp_registered: registered,
         mcp_registrable: spec.mcp_registrable,
@@ -324,7 +215,7 @@ fn local_hostname() -> String {
 /// Probe every spec (off the async runtime — each shells out).
 async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
     tokio::task::spawn_blocking(move || {
-        PROBE_SPECS
+        AGENT_PROBE_SPECS
             .iter()
             .map(|spec| agent_health(spec, refresh))
             .collect::<Vec<_>>()
@@ -558,7 +449,7 @@ pub(crate) async fn handle_register_mcp(
         // explicitly rather than silently no-op, so the UI/API never presents
         // a register action that does nothing.
         Some(v)
-            if PROBE_SPECS
+            if AGENT_PROBE_SPECS
                 .iter()
                 .any(|s| s.vendor == v && !s.mcp_registrable) =>
         {
@@ -572,7 +463,7 @@ pub(crate) async fn handle_register_mcp(
             )
                 .into_response();
         }
-        Some(v) if PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
+        Some(v) if AGENT_PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
         Some(other) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1153,9 +1044,9 @@ mod tests {
 
     #[test]
     fn probe_bin_missing_binary_is_not_installed() {
-        let r = probe_bin("/nonexistent/ccteam-fake-binary-zzz", true);
-        assert!(!r.installed);
-        assert!(r.version.is_none());
+        let (installed, version) = probe_bin_cached("/nonexistent/ccteam-fake-binary-zzz", true);
+        assert!(!installed);
+        assert!(version.is_none());
     }
 
     #[test]
@@ -1163,8 +1054,8 @@ mod tests {
         // `/bin/true --version` exits 0 (GNU coreutils ignores the flag) — a
         // stand-in for a runnable vendor binary.
         if std::path::Path::new("/bin/true").exists() {
-            let r = probe_bin("/bin/true", true);
-            assert!(r.installed);
+            let (installed, _) = probe_bin_cached("/bin/true", true);
+            assert!(installed);
         }
     }
 
@@ -1190,15 +1081,21 @@ mod tests {
 
     #[test]
     fn grok_spec_is_not_mcp_registrable() {
-        let grok = PROBE_SPECS.iter().find(|s| s.vendor == "grok").unwrap();
+        let grok = AGENT_PROBE_SPECS
+            .iter()
+            .find(|s| s.vendor == "grok")
+            .unwrap();
         assert!(!grok.mcp_registrable);
-        let claude = PROBE_SPECS.iter().find(|s| s.vendor == "claude").unwrap();
+        let claude = AGENT_PROBE_SPECS
+            .iter()
+            .find(|s| s.vendor == "claude")
+            .unwrap();
         assert!(claude.mcp_registrable);
     }
 
     #[test]
     fn agent_health_status_is_not_installed_for_missing_bin() {
-        let spec = ProbeSpec {
+        let spec = AgentProbeSpec {
             vendor: "claude",
             harness_id: "claude-code",
             // Point at a path that cannot exist so the probe fails regardless
@@ -1215,12 +1112,12 @@ mod tests {
 
     #[test]
     fn register_mcp_query_rejects_unknown_vendor_token() {
-        // The handler validates against PROBE_SPECS; assert the membership
+        // The handler validates against AGENT_PROBE_SPECS; assert the membership
         // check that gates the 400.
-        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "claude"));
-        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "codex"));
-        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "grok"));
-        assert!(PROBE_SPECS.iter().any(|s| s.vendor == "opencode"));
-        assert!(!PROBE_SPECS.iter().any(|s| s.vendor == "gemini"));
+        assert!(AGENT_PROBE_SPECS.iter().any(|s| s.vendor == "claude"));
+        assert!(AGENT_PROBE_SPECS.iter().any(|s| s.vendor == "codex"));
+        assert!(AGENT_PROBE_SPECS.iter().any(|s| s.vendor == "grok"));
+        assert!(AGENT_PROBE_SPECS.iter().any(|s| s.vendor == "opencode"));
+        assert!(!AGENT_PROBE_SPECS.iter().any(|s| s.vendor == "gemini"));
     }
 }
