@@ -487,7 +487,7 @@ You are a reviewer agent. ...
 
 #### 提供的 MCP:`ccteam`(**15 工具**,0 STUB)
 
-MCP 工具共 **15**(早期瘦身退役了推后编排的 `workflow_*` 套件 + `chat_reset`,后为 cto 调度补 `session_` group 5 工具;v0.8.9 删 DEAD 的 `chat_send_input`/`chat_history` —— 死写入/死读取路径 → chat 6→4、总数 17→15)。所有工具加 group 子前缀,**server name 不变**(`ccteam`):
+MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_tool / chat bot 3,`admin_ls`→`status`;`STUB_TOOLS` const + `ccteam doctor --verify-mcp` 自检守恒)。wire 名裸(`session_spawn` 等),客户端按 server key 加命名空间(模型见 `mcp__ccteam__session_spawn`),**server name 不变**(`ccteam`):
 
 | Group(子前缀) | 工具数 | 工具 |
 |---|---|---|
