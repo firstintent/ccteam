@@ -79,7 +79,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ## 一、Web 控制台(推荐)
 
-打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / MCP / 自进化(只读) / Compare。**设置**收编主机 / 插件市场 / Status / IM 凭据。主题**默认浅色**(可切深色)。
+打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / MCP / 自进化(只读)。**设置**收编主机 / 插件市场 / Status / IM 凭据。主题**默认浅色**(可切深色)。
 
 > **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
 
@@ -190,7 +190,6 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 # 会话
 /new [vendor] [role] [hitl]  新建会话 → 回一个句柄 s<N>
                              · vendor = claude(默认)| codex | grok | opencode | kimi
-/compare <问题>              多 vendor 同题并行对比
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
                              · grok / opencode / kimi = 无角色 ACP 会话(忽略 role 参数)
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
@@ -235,6 +234,17 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ```
 
 日常用法建议把这句话包成 skill(比如用户级的 `cct-codex`:替你 spawn、盯进度、拿简短汇报回来),一句话可靠跑完整个闭环。人话版指南——该说什么、最佳实践、附录给 skill 作者的工具速查——见 [orchestration-cn.md](orchestration-cn.md)。
+
+### 模型路由
+
+会话决定叫谁干活时不必猜。一次 `status` 调用(MCP 工具)就返回**厂商面板**——按你当前项目绑定的主机出:各 vendor 装没装、版本、诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录)、预算态、快照新鲜还是过期。面板旁边还有一份 **advisory 模型目录**(runtime 最近所见 + hub `models.json`,来源分开标注,永不当 spawn 白名单),以及你的**分工笔记**,原文透传。
+
+你的分工是你自己写的 dumb markdown;ccteam 负责把它带给任何开口问的会话(在任何主机上都拿到同一份),但永不解析、不合并、不执行:
+
+- `~/.ccteam/routing.md` —— 全局偏好。
+- `~/.ccteam/routing/projects/<slug>.md` —— 可选的项目级覆盖。
+
+写法就是一张朴素的表:任务类型 → vendor/model/effort → 理由。默认姿态:**spawn 时不传 `model`**,吃 vendor 默认值(厂商发新模型你自动升级);路由表里只写例外和升档。完整套路——能力核对、扇出对比、综合、成本——见编排指南的[模型路由章](orchestration-cn.md)。
 
 ---
 

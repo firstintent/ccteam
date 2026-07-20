@@ -98,6 +98,8 @@ Async by default: the completion notification lands in the parent's chat like a 
 - **Grind + probe** — codex holds the long job while grok answers the quick question before codex finishes a step.
 - **Bulk on a budget** — fan the repetitive 80% out to kimi; keep the judgment calls on claude.
 
+Picking who gets what starts from facts, not guesses: one `status` call is the roster — which vendors are installed, authenticated and in-budget on the project's host, an advisory model catalog, and your own `~/.ccteam/routing.md` notes carried verbatim. Omit `model` and each spawn simply rides the vendor's default.
+
 ## Project context
 
 ccteam adds a team to your repo without taking it over. Sessions are roleless by default: the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism — project knowledge stays vendor-native, and ccteam never rewrites it. The footprint is exactly `.ccteam/` (state), `.claude/agents/` (personas you choose to install), and ccteam's own section of `.claude/settings.local.json` — never your `settings.json`. Sessions have durable ids (`s1`, `s2`, …) that survive daemon restarts and cold-resume from disk; state is plain files in your repo.

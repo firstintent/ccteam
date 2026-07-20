@@ -79,7 +79,7 @@ Open that link to enter the console.
 
 ## 1. Web Console (Recommended)
 
-Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / MCP / Evolution (read-only) / Compare. **Settings** links Hosts, Marketplace, Status, and IM credentials (admin). Theme defaults to **light** (dark remains available).
+Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / MCP / Evolution (read-only). **Settings** links Hosts, Marketplace, Status, and IM credentials (admin). Theme defaults to **light** (dark remains available).
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
@@ -193,7 +193,6 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 # Sessions
 /new [vendor] [role] [hitl]  Create a session and return handle s<N>.
                              vendor = claude (default) | codex | grok | opencode | kimi
-/compare <question>          Fan the same question across available vendors
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
                              grok/opencode/kimi = roleless ACP session (role arg ignored)
                              add hitl = approve tools in IM; default skip runs directly
@@ -238,6 +237,17 @@ start a codex session, implement the RFC under docs/rfc-12.md, and report back w
 ```
 
 For everyday use, wrap the phrasing in a skill (e.g. a user-level `cct-codex` that spawns, supervises, and reports back with a short summary) so one sentence does the whole loop reliably. The plain-language guide — what to say, best practices, plus a tool appendix for skill authors — is [orchestration.md](orchestration.md).
+
+### Model Routing
+
+A session deciding whom to spawn never has to guess. One `status` call (the MCP tool) answers with a **vendor panel** for the host your current project is bound to: which vendors are installed and their versions, an honest auth signal (`ready` / `not_ready` / `unknown` — sitting on PATH never masquerades as logged in), budget state, and whether the snapshot is fresh or stale. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
+
+Your division of labor is plain markdown you own; ccteam carries it to any session that asks, on any host, and never parses, merges, or executes it:
+
+- `~/.ccteam/routing.md` — global preferences.
+- `~/.ccteam/routing/projects/<slug>.md` — optional per-project overrides.
+
+Write it as a dumb table of task type → vendor/model/effort → reason. Default posture: **omit `model` at spawn** and ride the vendor default (free upgrades as vendors ship new models); the routing table only lists exceptions and upgrades. The full recipe — capability check, fan-out compare, synthesis, cost — is the [Model routing chapter](orchestration.md) of the orchestration guide.
 
 ---
 

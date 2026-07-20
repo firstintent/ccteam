@@ -12,7 +12,7 @@
 
 | 你在哪 | 怎么用 |
 |---|---|
-| **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;`/compare 这段代码为什么慢` 一次问三个模型。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
+| **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;说一句「也问问 codex 和 grok」,它自己把问题扇给几个 vendor,再把几份答案比出结论。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
 | **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi(本文重点) | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
 
@@ -43,7 +43,7 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 | 「现在**有哪些会话**在跑?」 | 列出团队树:谁是谁的下属、在忙还是空、花了多少钱 |
 | 「把 **s47 停了**」 | 显式关掉某个会话(状态留着,以后能恢复) |
 
-**cct-codex** 管长活(后台跑 + 轮询),**cct-grok** 管快问快答(等着拿答案)。装好后(见 §6),在你日常的 Claude 会话里直接说这些话即可。
+**cct-codex** 管长活(后台跑 + 轮询),**cct-grok** 管快问快答(等着拿答案)。装好后(见 §7),在你日常的 Claude 会话里直接说这些话即可。
 
 ## 4. 让委派值回票价(最佳实践,人话)
 
@@ -69,15 +69,48 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 **组长全程只说了两句话。** 两个不同厂商的会话干活 + 互审,每一跳都在账本和团队视图里。
 
-## 6. 装一次
+## 6. 模型路由(谁干什么,不靠猜)
+
+挑谁干活靠三层,刻意分开:
+
+- **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
+- **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。
+- **观点,你的文本。** 你的分工写在 `~/.ccteam/routing.md`,外加可选的项目级 `~/.ccteam/routing/projects/<slug>.md`。dumb markdown,无 schema。`status` 把它原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不合并、不执行。
+
+**流程 = 一次调用,然后 spawn。** 调 `status`,读面板和笔记,然后带显式 `vendor` / `model` / `effort` 去 `session_spawn`。真撞上没装的 vendor,spawn 会快速失败并附上那台主机**装了什么**——失败本身也是发现。
+
+`routing.md` 长这样——只写例外:
+
+```markdown
+# 分工笔记
+
+默认:不传 `model` —— vendor 默认值跟着厂商最新发布走。
+
+| 任务类型 | vendor / model / effort | 为什么 |
+|---|---|---|
+| 长重构、迁移 | codex / sol-max / high | 能磨不晃 |
+| 快速第二意见 | grok /(vendor 默认)/ low | 分钟级出答案 |
+| 合并前终审 | claude / opus / high | 抓 builder 自己盖过章的坑 |
+```
+
+**多 vendor 对比是会话内动作,** 不是单独的产品功能。要把一个问题丢给全队:
+
+1. **扇出** —— 同一个自足的问题 `session_spawn` 给 2+ 个 vendor(异步、一次一事、`title` 标注这场对局)。
+2. **各自独立作答** —— 各自独立会话,互不串味。
+3. **在 turn 边界收集** —— 每个子会话转 idle 时完成通知各来一条;还缺的用 `session_collect` 补(缺席/失败的成员标记出来,绝不 kill)。
+4. **综合裁决你自己来** —— 共识、分歧、你的拍板。可选:把收来的答案回投给某个子会话互驳,或再起一个会话当裁判。
+
+**账单始终可见。** `session_list` / `session_collect` 每行带 model 和累计 `cost_usd` / `tokens_total`,一场扇出花多少钱是可加总的数字,不是惊喜。
+
+## 7. 装一次
 
 `cct-codex` / `cct-grok` 是**插件市场里的第一方配方**——从 web 插件市场一键装进项目(落 `.claude/skills/`,ccteam 托管的会话也会加载),或放一份用户级副本在 `~/.claude/skills/` 让你所有会话可用。前提:
 
 - 本机 `ccteam start` 起着 daemon;`ccteam config mcp` 已把 ccteam 注册进**全部四个 vendor**——Claude / Codex / Grok / OpenCode(装一次;任何 vendor 的普通会话都能当指挥)。
 - 你在一个**已注册的 ccteam 项目**目录里(skill 从当前目录认出项目)。
-- 用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证)。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §7。)
+- 用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证)。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §8。)
 
-## 7. 出问题时(人话)
+## 8. 出问题时(人话)
 
 | 现象 | 怎么回事 → 怎么办 |
 |---|---|
@@ -93,11 +126,11 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 平时你不碰这些——skill 替你调。但如果你在**写 skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
-- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`(grok/opencode/kimi 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
+- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`(grok/opencode/kimi 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知里明确写「已 idle、在等下一个 dispatch」——任务没真完,这就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi 不再一片空白)。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本/token、`parent_sid`),按最近活跃排序。支持 `{project?, activity?, limit?}` 过滤(默认最多 30 行,截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
 - **`session_stop`** — 显式关掉一个 `sid`(状态留盘,可冷恢复)。ccteam 只有两个自动刹车:每日预算触顶拒新活、live 容量超限优雅挤停最闲的会话——**创建永不因容量失败**。
-- 另加 **`status`**(daemon 健康 + 会话 + 今日成本)、**`chat_send_file`**、**`screenshot`**。
+- 另加 **`status`**(daemon 健康 + 会话 + 今日成本,外加 caller 项目绑定主机的厂商面板——各 vendor 安装/auth/预算、advisory 模型目录、原文透传的分工笔记;见 §6)、**`chat_send_file`**、**`screenshot`**。
 
 **身份 & 信任(说实话):** ccteam 拉起的会话带 per-session `(sid, secret)`,只能操作自己项目;你自己的主会话走 admin token fallback,能管全舰队。per-session secret 是**单 OS 用户下的纵深防御,不是硬边界**——同 uid 进程终归能读到彼此的 env。它买到的是:agent 不会*误*跨项目、每个动作都归因到已认证的调用方。真隔离(per-agent OS 用户 / sandbox)当前刻意不做。

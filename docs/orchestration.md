@@ -12,7 +12,7 @@ This is Claude Code's Task tool, except the "subagent" is a full vendor session 
 
 | Where you are | How you use the team |
 |---|---|
-| **Phone / IM** (Telegram, Lark) | just message your session; `/compare why is this code slow` asks three models at once. Install the `team-brain` persona (marketplace) and one session becomes your chief of staff |
+| **Phone / IM** (Telegram, Lark) | just message your session; say "ask codex and grok too" and it fans the question out to several vendors, then weighs the answers itself. Install the `team-brain` persona (marketplace) and one session becomes your chief of staff |
 | **Web console** | open sessions in the browser, watch the team tree, review diffs, track cost |
 | **Inside your coding agent** — Claude, Codex, Grok, OpenCode or Kimi (this guide's focus) | delegate with one sentence, via **skills like cct-codex / cct-grok** that drive the tools for you |
 
@@ -43,7 +43,7 @@ The skills hide the tool calls. You say the left column; the right column happen
 | "**what sessions** are running?" | the team tree: who reports to whom, busy or idle, cost so far |
 | "**stop s47**" | explicitly closes that session (state stays on disk, resumable later) |
 
-**cct-codex** is for long work (background + poll); **cct-grok** is for quick Q&A (wait inline). Once installed (§6), you just say these things in your everyday Claude session.
+**cct-codex** is for long work (background + poll); **cct-grok** is for quick Q&A (wait inline). Once installed (§7), you just say these things in your everyday Claude session.
 
 ## 4. Making delegation pay (best practices, in plain language)
 
@@ -69,13 +69,46 @@ The lead says: "merge the settings 'Hosts' and 'Status' pages into one adaptive 
 
 **The lead said two sentences in total.** Two sessions from different vendors did the work and reviewed each other, every hop on the ledger and in the team view.
 
-## 6. Install once
+## 6. Model routing (who does what, without guessing)
+
+Picking the right colleague for a task rests on three layers, kept deliberately separate:
+
+- **Facts, probed.** One `status` call returns a **vendor panel** for the host your project is bound to: installed/version per vendor, an honest auth signal (`ready` / `not_ready` / `unknown` — being on PATH never masquerades as logged in, and `unknown` never blocks a spawn), budget state, and whether the host is online or the snapshot is stale. Remote hosts report over their satellite channel; an offline host shows its last snapshot marked `stale`, never the local machine's abilities in disguise.
+- **Catalog, advisory.** Model ids, display names, and alias tiers from two sources kept separate and labeled: **runtime last-seen** (catalogs the adapters already capture, with an observed-at) and the hub **`models.json`** (community-maintained). The catalog is a reference, never a spawn allowlist: `model`/`effort` pass through verbatim at spawn, a model absent from the catalog spawns all the same, and a stale catalog can at worst recommend something outdated — it blocks nothing.
+- **Opinions, your text.** Your division of labor lives in `~/.ccteam/routing.md`, plus optional per-project `~/.ccteam/routing/projects/<slug>.md`. Plain markdown, no schema. `status` transports it verbatim (source/sha/truncation noted) to whichever session asks — identical text for a planner on any vendor, on any host — and ccteam never parses, merges, or executes it.
+
+**The workflow is one call, then spawn.** Call `status`, read the panel and the notes, then `session_spawn` with explicit `vendor` / `model` / `effort`. If you do aim at a vendor that isn't there, the spawn fails fast with the list of what that host *does* have — failure is discovery too.
+
+A `routing.md` looks like this — write only the exceptions:
+
+```markdown
+# Routing notes
+
+Default: omit `model` — vendor defaults track their latest releases.
+
+| Task type | Vendor / model / effort | Why |
+|---|---|---|
+| Long refactors, migrations | codex / sol-max / high | grinds without wobbling |
+| Quick second opinion | grok / (vendor default) / low | minute-scale answers |
+| Final review before merge | claude / opus / high | catches what the builder rubber-stamps |
+```
+
+**Comparing vendors is an in-session move,** not a separate product feature. To put a question to the team:
+
+1. **Fan out** — `session_spawn` the same self-contained question to 2+ vendors (async, one task each, `title` labels the matchup).
+2. **Let each answer independently** — separate sessions, no cross-contamination.
+3. **Collect at the turn boundary** — the completion notification fires as each child goes idle; `session_collect` picks up anything you're still missing (an absent or failed member is noted, never killed).
+4. **Synthesize the verdict yourself** — consensus, disagreements, and your call. Optionally dispatch the collected answers back to one child for rebuttal, or spawn a third session as tie-breaker.
+
+**The bill stays visible.** `session_list` and `session_collect` rows carry the model and the accrued `cost_usd` / `tokens_total` per member, so a fan-out's cost is a sum you can read, not a surprise.
+
+## 7. Install once
 
 `cct-codex` and `cct-grok` are first-party recipes on the **marketplace** — install them into a project from the web marketplace page (they land in `.claude/skills/`, so ccteam-managed sessions get them too), or keep personal copies user-level in `~/.claude/skills/` so every session of yours can use them. Prerequisites:
 
 - `ccteam start` is running on this machine; `ccteam config mcp` has registered ccteam with **all four vendors** — Claude, Codex, Grok, OpenCode (one-time; any vendor's plain session can orchestrate).
 - You're inside a **registered ccteam project** directory (the skill resolves the project from the working directory).
-- You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §7.)
+- You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §8.)
 
 Verify in 60 seconds:
 
@@ -85,7 +118,7 @@ claude mcp list                  # server `ccteam` — ✔ Connected
 grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discovered
 ```
 
-## 7. When something's off
+## 8. When something's off
 
 | Symptom | What it is → what to do |
 |---|---|
@@ -101,11 +134,11 @@ grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discover
 
 You normally never touch these — the skills do. But if you're **writing a skill** or orchestrating by hand, ccteam exposes eight tools under the `ccteam` MCP server, visible in Claude as `mcp__ccteam__<name>`:
 
-- **`session_spawn`** — hire a colleague (and hand over the first task in the same call). `{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`. `vendor` = `claude` (default) / `codex` / `grok` / `opencode` / `kimi`; grok/opencode/kimi force `protocol:"acp"`. `role` names a `.claude/agents/<role>.md` persona — omit for roleless (the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, the right default more often than not). `title` ≤80 chars, ledger/team-view label only — never enters any prompt. `permission_mode:"hitl"` pops approve/deny to the bound IM chat. **There is no `host` parameter** — the execution machine is inherited from the project's binding; passing one is a hard error. `wait_seconds>0` waits inline for the first answer; default is async. Always returns a **new** `sid`; the response's `caller` names the authenticated spawner — `ambient:<sid>` (a ccteam session called it; it becomes the child's `parent_sid`) or `admin` (the owner front door / main-session fallback — always a **root** spawn, `parent_sid: null`). If you expected a parent edge and see `caller: "admin"`, your call rode an admin-authenticated MCP server instead of your session's own bearer.
+- **`session_spawn`** — hire a colleague (and hand over the first task in the same call). `{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`. `vendor` = `claude` (default) / `codex` / `grok` / `opencode` / `kimi`; grok/opencode/kimi force `protocol:"acp"`. `role` names a `.claude/agents/<role>.md` persona — omit for roleless (the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, the right default more often than not). `model`/`effort` pass through verbatim to the vendor — omit them to ride the vendor default; the model catalog is advisory and never gates what you may pass. `title` ≤80 chars, ledger/team-view label only — never enters any prompt. `permission_mode:"hitl"` pops approve/deny to the bound IM chat. **There is no `host` parameter** — the execution machine is inherited from the project's binding; passing one is a hard error. `wait_seconds>0` waits inline for the first answer; default is async. Always returns a **new** `sid`; the response's `caller` names the authenticated spawner — `ambient:<sid>` (a ccteam session called it; it becomes the child's `parent_sid`) or `admin` (the owner front door / main-session fallback — always a **root** spawn, `parent_sid: null`). If you expected a parent edge and see `caller: "admin"`, your call rode an admin-authenticated MCP server instead of your session's own bearer.
 - **`session_dispatch`** — send another task to an existing session (`{sid, task, wait_seconds?, notify?, idempotency_key?}`). Forwarded verbatim as a user turn, zero injection. Async by default: when the child's **vendor turn completes and it goes idle** you get ONE notification that says so explicitly (a chatty child's mid-turn narration never notifies — it stays in the ledger). `notify` selects the mode: `"final"` (default) / `"all"` (every assistant message, debug firehose) / `"off"` (ledger-only; booleans still parse). The notification marks the child **idle/waiting** — if the task isn't actually done, that's your cue to dispatch the next step (the "silently stalled child" failure mode is gone: idle always signals). `wait_seconds` (≤600) blocks until the turn actually finishes and returns the FINAL `result_text` (interim narration never ends the wait), or `status:"pending"` on timeout — the child keeps running, never cancelled. Dispatching to yourself or an ancestor is rejected (cycle guard).
 - **`session_collect`** — read a session's output without joining it (`{sid, tail?, n?, since?, max_chars?}`). Watch `activity`: `working` = mid-turn (poll again, pass `since:<last turn_id>` for the delta) / `idle` = turn done (read). Returns are bounded (`max_chars` default 10 000): long turns keep a 70 % head / 30 % tail excerpt with an explicit marker; the full text is always in the ledger. Also carries the accrued ledger: `cost_usd` (priced vendors) and `tokens_total` (raw token count — present for every vendor that reports usage, so codex/grok/opencode/kimi sessions are not blank).
 - **`session_list`** — the delegation tree (who reports to whom, busy/idle, cost/tokens, `parent_sid`), most recently active first. Accepts `{project?, activity?, limit?}` filters (default cap 30 rows with an explicit `truncated`/`total`; null/empty fields are omitted) so a big fleet never floods your context. The web team view renders the same graph live.
 - **`session_stop`** — explicitly stop one `sid` (state stays on disk, cold-resumable). ccteam has exactly two automatic brakes: the daily per-vendor budget cap refuses *new* work, and live-session capacity gracefully evicts the least-recently-active idle session — **creation never fails for capacity**.
-- Plus **`status`** (daemon health + sessions + today's cost), **`chat_send_file`**, **`screenshot`**.
+- Plus **`status`** (daemon health + sessions + today's cost, and the vendor panel for the caller project's host — installed/auth/budget per vendor, advisory model catalog, routing notes verbatim; see §6), **`chat_send_file`**, **`screenshot`**.
 
 **Identity & trust (honestly):** a ccteam-spawned session carries a per-session `(sid, secret)` principal and can only act within its own project, with delegation guardrails (depth 2, fan-out 10 per parent, 50 delegated per project, cycle rejection, budgets) enforced by the daemon with a stated reason. Your own main session rides the same-user admin fallback and can manage the whole fleet; it is not itself a ccteam session, so completion notifications have nowhere to land — use `wait_seconds` for short tasks or poll `session_collect`, and pass `project:"<slug>"` when outside a registered repo. The per-session secret is **defense in depth under a single OS user, not a hard boundary** — same-uid processes can ultimately read each other's env. What it buys: agents can't *accidentally* act cross-project or as each other, and every action is attributed to an authenticated caller. Hard isolation (per-agent OS users / sandboxes) is deliberately out of scope for now.
