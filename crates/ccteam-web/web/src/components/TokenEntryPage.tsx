@@ -27,8 +27,8 @@ interface Props {
 /** The CLIs ccteam orchestrates — shown as chips under the tagline. */
 const VENDORS = ["Claude Code", "Codex", "Grok", "Kimi", "OpenCode"];
 
-/** Brand gradient (matches the CcLogo mark). */
-const BRAND_GRADIENT = "linear-gradient(135deg, #6D6AF6 0%, #22D3EE 100%)";
+/** Brand gradient — the mascot's palette (claude-orange body → kimi-pink ball). */
+const BRAND_GRADIENT = "linear-gradient(135deg, #D97757 0%, #DB2777 100%)";
 
 /** Normalise user input to a wire-format token (`ccteam:<hex>`).
  *  Accepts, most-to-least expected:
@@ -106,7 +106,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
           {/* Brand mark + wordmark */}
           <div className="flex flex-col items-center mb-6">
             <CcLogo
-              className="h-14 w-14 mb-3"
+              className="h-20 w-20 mb-3"
               title="ccteam"
             />
             <span className="font-semibold text-2xl text-text-primary tracking-tight">
@@ -173,7 +173,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
               background: BRAND_GRADIENT,
               opacity: canSubmit ? 1 : 0.45,
               boxShadow: canSubmit
-                ? "0 10px 30px -10px rgba(109,106,246,0.7)"
+                ? "0 10px 30px -10px rgba(217,119,87,0.65)"
                 : "none",
             }}
           >

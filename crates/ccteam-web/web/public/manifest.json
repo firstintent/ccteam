@@ -1,11 +1,11 @@
 {
-  "name": "Agent of Empires",
-  "short_name": "AoE",
-  "description": "AI agent session manager",
+  "name": "ccteam",
+  "short_name": "ccteam",
+  "description": "Drive your multi-vendor AI agent team from anywhere",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0f172a",
-  "theme_color": "#0f172a",
+  "background_color": "#faf5f0",
+  "theme_color": "#fafafb",
   "icons": [
     { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }

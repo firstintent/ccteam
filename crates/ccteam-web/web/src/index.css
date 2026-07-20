@@ -215,8 +215,9 @@ button { font-family: inherit; cursor: pointer; }
 .app { display: flex; height: 100vh; height: 100dvh; }
 
 /* ============ logo ============ */
-.logo-mark { width: 32px; height: 32px; flex: none; }
-.logo-mark.lg { width: 36px; height: 36px; }
+.logo-mark { width: 32px; height: 32px; flex: none; transition: transform 0.18s ease; }
+.logo-mark.lg { width: 38px; height: 38px; }
+.logo-mark.clickable:hover { transform: scale(1.08); }
 
 /* ============ 侧边栏(单列;可折叠;移动端抽屉) ============ */
 .side {
