@@ -31,7 +31,7 @@ Paste a bot token once (Settings → IM) and the chat becomes a full console —
 
 **2 · Remote control from the web console**
 
-`ccteam start` prints a token link — open it from any device on your LAN. It's a chat shell, not a dashboard: quick-start templates aimed at each vendor's strength, a Chat tab per session (plus a byte-faithful terminal where applicable), the live delegation tree, a cost pill with daily budget caps, marketplace and settings. Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
+The installer already runs the daemon — `ccteam status` reprints your link, `http://<lan-ip>:7331/?token=…`; open it from any device on your LAN. It's a chat shell, not a dashboard: quick-start templates aimed at each vendor's strength, a Chat tab per session (plus a byte-faithful terminal where applicable), the live delegation tree, a cost pill with daily budget caps, marketplace and settings. Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
 
 **3 · Orchestrate a team from inside a claude session**
 
