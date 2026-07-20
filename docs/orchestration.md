@@ -41,7 +41,7 @@ Your session hides the tool calls. You say the left column; the right column hap
 | "**ask grok** for a quick second opinion on this stack trace — wait for the answer" | a grok session spins up, waits a minute or two inline, pastes the answer back |
 | "put this design question to **codex and grok independently**, then give me consensus / disagreements / your verdict" | the fan-out compare: two sessions answer blind, your session weighs the evidence and rules |
 | "before merge, have a **different vendor review** this diff — MERGE / BLOCK with reasons" | a cross-vendor review gate: the builder never rubber-stamps its own work |
-| "**which vendors** are available here, and what do my routing notes say?" | one `status` call: the vendor panel for this project's bound host, plus your `~/.ccteam/routing.md` carried verbatim |
+| "**which vendors** are available here, and what do my routing notes say?" | one `status` call: the vendor panel for this project's bound host, plus the selected project override/global fallback carried verbatim |
 | "**what sessions** are running? what did that fan-out cost?" | the team tree: who reports to whom, busy or idle, per-member model and cost |
 | "**stop s47**" | explicitly closes that session (state stays on disk, resumable later) |
 
@@ -77,7 +77,9 @@ Picking the right colleague for a task rests on three layers, kept deliberately 
 
 - **Facts, probed.** One `status` call returns a **vendor panel** for the host your project is bound to: installed/version per vendor, an honest auth signal (`ready` / `not_ready` / `unknown` — being on PATH never masquerades as logged in, and `unknown` never blocks a spawn), budget state, and whether the host is online or the snapshot is stale. Remote hosts report over their satellite channel; an offline host shows its last snapshot marked `stale`, never the local machine's abilities in disguise.
 - **Catalog, advisory.** Model ids, display names, and alias tiers from two sources kept separate and labeled: **runtime last-seen** (catalogs the adapters already capture, with an observed-at) and the hub **`models.json`** (community-maintained). The catalog is a reference, never a spawn allowlist: `model`/`effort` pass through verbatim at spawn, a model absent from the catalog spawns all the same, and a stale catalog can at worst recommend something outdated — it blocks nothing.
-- **Opinions, your text.** Your division of labor lives in `~/.ccteam/routing.md`, plus optional per-project `~/.ccteam/routing/projects/<slug>.md`. Plain markdown, no schema. `status` transports it verbatim (source/sha/truncation noted) to whichever session asks — identical text for a planner on any vendor, on any host — and ccteam never parses, merges, or executes it.
+- **Opinions, your text.** Global routing lives in `~/.ccteam/routing.md` (the shared home initializer creates a neutral starter when missing and never overwrites it); an optional project override lives in `<project>/.ccteam/routing.md`. When the project file exists it replaces the global file completely—the two are not merged. Both are plain markdown with no schema. `status` transports the selected file verbatim (source/sha/truncation noted) to whichever session asks—identical text for a planner on any vendor, on any host—and ccteam never parses or executes it.
+
+For a remote project, routing remains main-daemon control-plane configuration: `<project>` means the daemon-side project data home recorded in the catalog. ccteam does not silently synchronize or read routing files from a satellite worktree.
 
 **The workflow is one call, then spawn.** Call `status`, read the panel and the notes, then `session_spawn` with explicit `vendor` / `model` / `effort`. If you do aim at a vendor that isn't there, the spawn fails fast with the list of what that host *does* have — failure is discovery too.
 

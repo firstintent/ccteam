@@ -12,7 +12,7 @@
 //!   (offline → `host_online=false, stale=true`, last snapshot, NEVER the
 //!   local machine's capabilities substituted).
 //! - **Routing notes** — the user's advisory markdown
-//!   (`~/.ccteam/routing/projects/<slug>.md`, else `~/.ccteam/routing.md`),
+//!   (`<project>/.ccteam/routing.md`, else `~/.ccteam/routing.md`),
 //!   wrapped with `source`/`sha256`/`updated_at`/`truncated` and capped;
 //!   ccteam passes it through verbatim and never parses/interprets it.
 //!
@@ -356,13 +356,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// line telling the planner it can create one. The content is wrapped with
 /// `source`/`sha256`/`updated_at`/`truncated` then the (capped) raw markdown;
 /// ccteam never parses it.
-pub(crate) fn render_routing_notes(found: Option<&RoutingFile>, slug: &str) -> String {
+pub(crate) fn render_routing_notes(found: Option<&RoutingFile>) -> String {
     let Some(file) = found else {
-        return format!(
+        return String::from(
             "routing notes: none configured — create ~/.ccteam/routing.md \
-             (or the project-specific ~/.ccteam/routing/projects/{slug}.md) with your \
+             (or the project-specific <project>/.ccteam/routing.md) with your \
              vendor/model routing preferences; ccteam passes it through verbatim (advisory user \
-             text, never parsed). No hub default guide is wired yet — just be explicit."
+             text, never parsed). No hub default guide is wired yet — just be explicit.",
         );
     };
     let sha = sha256_hex(&file.bytes);
@@ -406,23 +406,16 @@ pub(crate) fn spawn_unavailable_message(
 
 // ── gather helpers (blocking: probe / read fs) ──────────────────────────────
 
-/// Read the routing-notes file for `slug`: project-specific first
-/// (`~/.ccteam/routing/projects/<slug>.md`), then the global
-/// `~/.ccteam/routing.md`. `None` when neither exists.
-pub(crate) fn read_routing_file(paths: &CcteamPaths, slug: &str) -> Option<RoutingFile> {
-    let project_specific = paths
-        .root
-        .join("routing")
-        .join("projects")
-        .join(format!("{slug}.md"));
-    let global = paths.root.join("routing.md");
-    let path = if project_specific.is_file() {
-        project_specific
-    } else if global.is_file() {
-        global
-    } else {
-        return None;
-    };
+/// Read routing notes for an optional project: project-owned first
+/// (`<project>/.ccteam/routing.md`), then the global `~/.ccteam/routing.md`.
+/// A fleet-level caller (`slug = None`) reads only the global file. The two
+/// files are alternatives, never merged.
+pub(crate) fn read_routing_file(paths: &CcteamPaths, slug: Option<&str>) -> Option<RoutingFile> {
+    let project_specific = slug.map(|slug| paths.project_routing_notes(slug));
+    let global = paths.global_routing_notes();
+    let path = project_specific
+        .filter(|path| path.is_file())
+        .or_else(|| global.is_file().then_some(global))?;
     let bytes = std::fs::read(&path).ok()?;
     let updated_at = std::fs::metadata(&path)
         .and_then(|m| m.modified())
@@ -543,14 +536,13 @@ pub(crate) fn render_section(
         Some(slug) => build_project_panel(paths, slug),
         None => build_local_panel(paths, None, Some("no project resolved — showing the local host; pass `project` or run inside a registered project directory".to_string())),
     };
-    let notes_slug = slug.unwrap_or("<slug>");
-    let notes = read_routing_file(paths, notes_slug);
+    let notes = read_routing_file(paths, slug);
     let runtime = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
     format!(
         "{}\n\n{}\n\n{}",
         render_panel(&header, &rows),
         render_catalog(&runtime, hub),
-        render_routing_notes(notes.as_ref(), notes_slug),
+        render_routing_notes(notes.as_ref()),
     )
 }
 
@@ -850,11 +842,45 @@ mod tests {
 
     #[test]
     fn routing_notes_missing_gives_pointer() {
-        let out = render_routing_notes(None, "demo");
+        let out = render_routing_notes(None);
         assert!(out.contains("none configured"));
         assert!(out.contains("~/.ccteam/routing.md"));
-        assert!(out.contains("routing/projects/demo.md"));
+        assert!(out.contains("<project>/.ccteam/routing.md"));
         assert!(out.contains("never parsed"));
+    }
+
+    #[test]
+    fn routing_notes_prefer_project_file_then_global_and_ignore_retired_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let global = paths.root.join("routing.md");
+        let retired = paths.root.join("routing").join("projects").join("demo.md");
+        let project = paths
+            .projects_root
+            .join("demo")
+            .join(".ccteam")
+            .join("routing.md");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        std::fs::write(&global, "global").unwrap();
+        std::fs::write(&retired, "retired").unwrap();
+
+        let found = read_routing_file(&paths, Some("demo")).unwrap();
+        assert_eq!(found.path, global.display().to_string());
+        assert_eq!(found.bytes, b"global");
+
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "project").unwrap();
+        let found = read_routing_file(&paths, Some("demo")).unwrap();
+        assert_eq!(found.path, project.display().to_string());
+        assert_eq!(found.bytes, b"project");
+
+        let fleet_found = read_routing_file(&paths, None).unwrap();
+        assert_eq!(fleet_found.path, global.display().to_string());
+        assert_eq!(fleet_found.bytes, b"global");
     }
 
     #[test]
@@ -864,7 +890,7 @@ mod tests {
             bytes: b"# Routing\nUI -> fable\nrefactor -> opus\n".to_vec(),
             updated_at: "2026-07-21T00:00:00+00:00".to_string(),
         };
-        let out = render_routing_notes(Some(&file), "demo");
+        let out = render_routing_notes(Some(&file));
         assert!(out.contains("source=/home/u/.ccteam/routing.md"));
         assert!(out.contains("sha256="));
         assert!(out.contains("updated_at=2026-07-21T00:00:00+00:00"));
@@ -880,7 +906,7 @@ mod tests {
             bytes: big.into_bytes(),
             updated_at: String::new(),
         };
-        let out = render_routing_notes(Some(&file), "demo");
+        let out = render_routing_notes(Some(&file));
         assert!(out.contains("truncated=true"));
         assert!(out.contains("chars omitted — full note at /home/u/.ccteam/routing.md"));
         // The whole section stays bounded (header + cap + marker), not 3x cap.

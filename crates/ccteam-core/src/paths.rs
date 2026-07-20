@@ -2,11 +2,23 @@
 //! project-local (`~/projects/<slug>/.ccteam/`) layouts documented in
 //! `docs/interfaces.md` §1 so hooks, orchestrator, and CLI agree.
 
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::state::ProjectState;
+
+/// Neutral starter for the global, user-owned routing notes. The file is
+/// transported verbatim by MCP `status`, so keep this descriptive rather than
+/// embedding a ccteam opinion about which vendor should handle which work.
+const DEFAULT_ROUTING_NOTES: &str = "# ccteam routing notes\n\n\
+No routing exceptions configured. Omit `model` to use the selected vendor's default.\n\n\
+<!--\n\
+Add only your vendor/model/effort exceptions here. A project can replace these\n\
+global notes with <project>/.ccteam/routing.md. Never store secrets in either\n\
+file: ccteam returns the selected file verbatim to sessions that call status.\n\
+-->\n";
 
 #[derive(Debug, Clone)]
 pub struct CcteamPaths {
@@ -119,6 +131,12 @@ impl CcteamPaths {
         self.cache_dir().join("hub")
     }
 
+    /// Global user-authored routing notes. They are an advisory fallback for
+    /// projects without their own `.ccteam/routing.md`.
+    pub fn global_routing_notes(&self) -> PathBuf {
+        self.root.join("routing.md")
+    }
+
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join("inbox")
     }
@@ -181,6 +199,14 @@ impl CcteamPaths {
 
     pub fn project_ccteam_dir(&self, slug: &str) -> PathBuf {
         self.project_dir(slug).join(".ccteam")
+    }
+
+    /// Project-owned routing notes. For a local project this is its worktree's
+    /// `<project>/.ccteam/routing.md`. A remote catalog entry resolves to the
+    /// daemon-side project data home, keeping this control-plane preference
+    /// available without adding a satellite filesystem-sync protocol.
+    pub fn project_routing_notes(&self, slug: &str) -> PathBuf {
+        self.project_ccteam_dir(slug).join("routing.md")
     }
 
     pub fn project_state(&self, slug: &str) -> PathBuf {
@@ -319,7 +345,7 @@ pub fn canonical_home_dirs() -> &'static [&'static str] {
 /// Idempotently materialize the global `~/.ccteam/` home so any
 /// downstream session a project references can actually run.
 ///
-/// Two steps, both idempotent and cheap:
+/// Three steps, all idempotent and cheap:
 ///
 /// 1. Create exactly the [`canonical_home_dirs`] manifest under
 ///    `paths.root` (`std::fs::create_dir_all` — a no-op when present).
@@ -328,6 +354,8 @@ pub fn canonical_home_dirs() -> &'static [&'static str] {
 ///    project-level `.claude/settings.local.json` SessionStart hook
 ///    commands point at. Re-running returns
 ///    [`InstallHooksAction::Unchanged`](crate::hooks_dispatcher::InstallHooksAction::Unchanged).
+/// 3. Create `~/.ccteam/routing.md` with neutral starter text when absent.
+///    Existing user content is never overwritten.
 ///
 /// This is the single home-ensure every create/start path calls so the
 /// home is never half-built. Historically only `ccteam init`, the
@@ -355,7 +383,26 @@ pub fn ensure_ccteam_home(paths: &CcteamPaths) -> Result<()> {
     }
     crate::hooks_dispatcher::install_hooks(paths)
         .context("install ~/.ccteam/hooks/hook.sh dispatcher")?;
+    ensure_global_routing_notes(paths)?;
     Ok(())
+}
+
+/// Create the global routing-notes starter exactly once. `create_new` is the
+/// no-clobber primitive: concurrent init/start calls may race, but only one can
+/// create the file and neither can overwrite a user's edit.
+fn ensure_global_routing_notes(paths: &CcteamPaths) -> Result<()> {
+    let path = paths.global_routing_notes();
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),
+    };
+    file.write_all(DEFAULT_ROUTING_NOTES.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// V0.5.0 F95 — resolve the **global** Anthropic Agent Teams progress
@@ -621,6 +668,43 @@ mod tests {
         assert_eq!(
             paths.project_dir("unregistered"),
             paths.projects_root.join("unregistered"),
+        );
+    }
+
+    #[test]
+    fn routing_notes_paths_are_global_and_project_owned() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+
+        assert_eq!(paths.global_routing_notes(), paths.root.join("routing.md"));
+        assert_eq!(
+            paths.project_routing_notes("demo"),
+            paths
+                .projects_root
+                .join("demo")
+                .join(".ccteam")
+                .join("routing.md")
+        );
+    }
+
+    #[test]
+    fn ensure_home_creates_default_routing_notes_without_overwriting() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+
+        ensure_ccteam_home(&paths).unwrap();
+        let routing = paths.global_routing_notes();
+        assert!(routing.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&routing).unwrap(),
+            DEFAULT_ROUTING_NOTES
+        );
+
+        std::fs::write(&routing, "# My routing\nkeep this\n").unwrap();
+        ensure_ccteam_home(&paths).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&routing).unwrap(),
+            "# My routing\nkeep this\n"
         );
     }
 }

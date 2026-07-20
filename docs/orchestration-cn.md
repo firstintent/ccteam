@@ -41,7 +41,7 @@
 | 「**问下 grok** 这个堆栈是怎么回事——等它答完」 | 起一个 grok 会话,等一两分钟,把答案直接贴回来 |
 | 「这个设计问题**分别问 codex 和 grok**,各答各的,然后给我一致点 / 分歧 / 你的裁决」 | 扇出对比:两个会话背对背作答,你的会话权衡证据下结论 |
 | 「合并前找**另一家 vendor 审**这个 diff:MERGE / BLOCK 加理由」 | 跨厂商审稿门:实现者永远不给自己盖章 |
-| 「这台机器**有哪些 vendor 能用**?我的路由表怎么说?」 | 一次 `status`:本项目绑定主机的 vendor 面板 + 你的 `~/.ccteam/routing.md` 原文 |
+| 「这台机器**有哪些 vendor 能用**?我的路由表怎么说?」 | 一次 `status`:本项目绑定主机的 vendor 面板 + 项目覆盖/全局 fallback 中选中的路由原文 |
 | 「现在**有哪些会话**在跑?刚才那波扇出花了多少?」 | 列出团队树:谁是谁的下属、在忙还是空、每个成员的模型和花费 |
 | 「把 **s47 停了**」 | 显式关掉某个会话(状态留着,以后能恢复) |
 
@@ -77,7 +77,9 @@
 
 - **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
 - **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。
-- **观点,你的文本。** 你的分工写在 `~/.ccteam/routing.md`,外加可选的项目级 `~/.ccteam/routing/projects/<slug>.md`。dumb markdown,无 schema。`status` 把它原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不合并、不执行。
+- **观点,你的文本。** 全局分工写在 `~/.ccteam/routing.md`(缺失时由统一 home 初始化生成中立模板,绝不覆盖),可选的项目级覆盖写在 `<project>/.ccteam/routing.md`。项目文件存在时完整取代全局文件,二者不合并。它们都是 dumb markdown,无 schema。`status` 把选中的一份原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不执行。
+
+远程项目的 routing 仍是主 daemon 控制面配置:`<project>` 指 catalog 中的 daemon-side project data home;ccteam 不会偷偷同步或读取卫星工作树文件。
 
 **流程 = 一次调用,然后 spawn。** 调 `status`,读面板和笔记,然后带显式 `vendor` / `model` / `effort` 去 `session_spawn`。真撞上没装的 vendor,spawn 会快速失败并附上那台主机**装了什么**——失败本身也是发现。
 

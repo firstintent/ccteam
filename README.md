@@ -98,7 +98,7 @@ Async by default: the completion notification lands in the parent's chat like a 
 - **Grind + probe** — codex holds the long job while grok answers the quick question before codex finishes a step.
 - **Bulk on a budget** — fan the repetitive 80% out to kimi; keep the judgment calls on claude.
 
-Picking who gets what starts from facts, not guesses: one `status` call is the roster — which vendors are installed, authenticated and in-budget on the project's host, an advisory model catalog, and your own `~/.ccteam/routing.md` notes carried verbatim. Omit `model` and each spawn simply rides the vendor's default.
+Picking who gets what starts from facts, not guesses: one `status` call is the roster — which vendors are installed, authenticated and in-budget on the project's host, an advisory model catalog, and your selected routing notes (`<project>/.ccteam/routing.md` over the global fallback) carried verbatim. Omit `model` and each spawn simply rides the vendor's default.
 
 ## Project context
 

@@ -15,6 +15,14 @@
 
 ## 当前卡
 
+### V096-R1 routing notes 归位项目根 + 全局默认文件
+- **状态**:进行中(Codex·2026-07-21) · **冲突域**:`crates/ccteam-core + crates/ccteam-im(mcp/vendor_panel) + Makefile + docs/` · **入口**:owner 直驱
+- **背景**:v0.9.6 初版把项目级路由放在 `~/.ccteam/routing/projects/<slug>.md`,与 project 一等实体的归属不一致;全局 `routing.md` 也只读不生成。
+- **规格**:项目覆盖改为 `<project>/.ccteam/routing.md`,项目级 > `~/.ccteam/routing.md` 全局 fallback,二者不合并;统一 home ensure 仅在全局文件缺失时生成中立默认,绝不覆盖;不为每个项目自动生成覆盖,不留旧路径兼容分支。
+- **DoD**:先红后绿定向测试覆盖路径优先级/旧路径退役/全局生成不覆盖;Rust 门禁 + docs 同步 + writeback 绿;提交并推送远程 `dev`。
+- **验证**:先红(`ccteam-core` 缺统一 path/default API 编译失败)后绿;routing 定向 2+4/0;`make check` 绿(clippy 0 warnings);`cargo test --workspace --exclude ccteam-web --lib --locked` **1472/0**(1469+3);fmt/diff-check 干净。
+- **偏差**:`make test` 非零仅见已有无关失败:remove_test t03/t17(已立 P1-3)、resume/inbound env-flake 族,以及 CLI web-chat timeout;后者在本改动前 `3e6bca1` 临时 worktree 同用例同样失败,证非本卡回归。本卡不越域修旧测试。
+
 ### A2A-W5 A2A 线收尾:三场景真机 smoke + README/usage 重写
 - **状态**:待排 · **冲突域**:`README.md + docs/`(smoke 零代码)· **建议入口**:规划(控制)会话(涉治理面写权)
 - **背景**:v0.9.0–0.9.2 A2A 底座已落,W5 是 ship gate 前最后一步;hub 示例配方 = `team-brain` agent(grok 跨模型 review 已跑通;cct-codex/cct-grok wrapper skill 已于 2026-07-21 退役 —— MCP server instructions 原生覆盖,owner 拍板)。

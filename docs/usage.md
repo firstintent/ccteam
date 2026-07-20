@@ -244,8 +244,8 @@ A session deciding whom to spawn never has to guess. One `status` call (the MCP 
 
 Your division of labor is plain markdown you own; ccteam carries it to any session that asks, on any host, and never parses, merges, or executes it:
 
-- `~/.ccteam/routing.md` — global preferences.
-- `~/.ccteam/routing/projects/<slug>.md` — optional per-project overrides.
+- `~/.ccteam/routing.md` — the global fallback. The shared home initializer creates a neutral starter when it is missing and never overwrites your content.
+- `<project>/.ccteam/routing.md` — an optional project override. When present it replaces the global file completely; the two are not merged.
 
 Write it as a dumb table of task type → vendor/model/effort → reason. Default posture: **omit `model` at spawn** and ride the vendor default (free upgrades as vendors ship new models); the routing table only lists exceptions and upgrades. The full recipe — capability check, fan-out compare, synthesis, cost — is the [Model routing chapter](orchestration.md) of the orchestration guide.
 

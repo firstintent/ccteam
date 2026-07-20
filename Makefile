@@ -6,7 +6,7 @@
 #                        #   on macOS: starts at boot/login, restarts on crash) +
 #                        #   first-run next steps
 #   make start           # run the daemon in the FOREGROUND (dev / one-off)
-#   make wipe            # reset runtime state (keeps secrets + config)
+#   make wipe            # reset runtime state (keeps secrets + config + routing)
 #
 # Override locations:  make BIN_DIR=/usr/local/bin install
 #                       make WEB_PORT=8080 start
@@ -26,8 +26,8 @@ WEB_PORT     ?= 7331
 WEB_BIND     ?= 0.0.0.0:$(WEB_PORT)
 
 # Runtime dirs reset by `make wipe` (~/.ccteam/{state,run,cache}). Kept:
-# secrets/ (web-token, IM creds, per-user files), config.yaml, hooks/ — so
-# creds + prefs survive a reset.
+# secrets/ (web-token, IM creds, per-user files), config.yaml, routing.md,
+# hooks/ — so creds + prefs survive a reset.
 WIPE_DIRS    := state run cache
 
 # systemd --user supervision (see the "Daemon" section).
@@ -82,7 +82,7 @@ help:
 	@printf '  make daemon-stop       stop (Linux keeps boot-start; macOS unloads until daemon-start)\n'
 	@printf '  make daemon-start      start it again\n\n'
 	@printf '\033[1mState reset (destructive)\033[0m\n'
-	@printf '  make wipe          rm %s/{%s} (keeps secrets/, hooks/, config.yaml)\n' '$(CCTEAM_HOME)' 'state,run,cache'
+	@printf '  make wipe          rm %s/{%s} (keeps secrets/, hooks/, config.yaml, routing.md)\n' '$(CCTEAM_HOME)' 'state,run,cache'
 	@printf '  make nuke          rm -rf %s   (requires CONFIRM=1)\n' '$(CCTEAM_HOME)'
 
 # --- Build & test ------------------------------------------------------------

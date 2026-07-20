@@ -241,8 +241,8 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 你的分工是你自己写的 dumb markdown;ccteam 负责把它带给任何开口问的会话(在任何主机上都拿到同一份),但永不解析、不合并、不执行:
 
-- `~/.ccteam/routing.md` —— 全局偏好。
-- `~/.ccteam/routing/projects/<slug>.md` —— 可选的项目级覆盖。
+- `~/.ccteam/routing.md` —— 全局 fallback;统一 home 初始化会在缺失时生成一份中立模板,绝不覆盖你的内容。
+- `<project>/.ccteam/routing.md` —— 可选的项目级覆盖;只要存在就完整取代全局文件,二者不合并。
 
 写法就是一张朴素的表:任务类型 → vendor/model/effort → 理由。默认姿态:**spawn 时不传 `model`**,吃 vendor 默认值(厂商发新模型你自动升级);路由表里只写例外和升档。完整套路——能力核对、扇出对比、综合、成本——见编排指南的[模型路由章](orchestration-cn.md)。
 
