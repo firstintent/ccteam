@@ -31,15 +31,28 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ccteam calls the Claude Code, Codex, Grok Build, OpenCode, and Kimi Code CLIs already installed and logged in on your machine. It does not bundle them.
 
+**1 · Let an agent do it**
+
+Paste into any agent you already have:
+
+> Install https://github.com/firstintent/ccteam — follow `INSTALL.md` in the repo.
+
+**2 · From source** — recommended; requires Rust + Node.js (for the web console bundle):
+
 ```bash
-# Recommended: build from source and install as a service.
-# Requires Rust and Node.js (for the web console bundle).
 git clone https://github.com/firstintent/ccteam && cd ccteam
 make install
+```
 
-# Alternative: prebuilt binary, no toolchain required (also offers systemd setup).
+**3 · One-click script** — prebuilt binary, no toolchain required (also offers systemd setup):
+
+```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+```
 
+Then verify:
+
+```bash
 ccteam --version
 claude --version   # required; log in if prompted
 codex --version    # optional; only needed for Codex sessions

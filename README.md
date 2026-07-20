@@ -54,23 +54,25 @@ Underneath, every one of these is the same eight MCP tools — `session_spawn` /
 
 ## Install
 
-```bash
-curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
-```
+**1 · Let an agent do it**
 
-One static binary into `~/.local/bin`, no sudo; the daemon starts and prints your web console link (`http://<lan-ip>:7331/?token=…`). `ccteam config` registers the MCP tools into the vendor CLIs you have — Claude Code, Codex, Grok, OpenCode, Kimi — so even your everyday, hand-started sessions can hire the team.
+Paste into any agent you already have:
 
-**From source**
+> Install https://github.com/firstintent/ccteam — follow `INSTALL.md` in the repo.
+
+**2 · From source**
 
 ```bash
 git clone https://github.com/firstintent/ccteam && cd ccteam && make install   # Rust + Node
 ```
 
-**Let an agent do it**
+**3 · One-click script**
 
-Paste into any agent you already have:
+```bash
+curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+```
 
-> Install ccteam: `git clone https://github.com/firstintent/ccteam && cd ccteam && make install`, then run `ccteam status` and give me the web console link.
+One static binary into `~/.local/bin`, no sudo; the daemon starts and prints your web console link (`http://<lan-ip>:7331/?token=…`). `ccteam config` registers the MCP tools into the vendor CLIs you have — Claude Code, Codex, Grok, OpenCode, Kimi — so even your everyday, hand-started sessions can hire the team.
 
 **Configure in the browser**
 

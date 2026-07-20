@@ -31,14 +31,28 @@
 
 ccteam 调用你机器上**已装好并登录的** Claude Code(必需)/ Codex(可选),自己不打包它们。
 
+**1 · 让 agent 装**
+
+粘贴给你在用的任意 agent:
+
+> Install https://github.com/firstintent/ccteam —— 按仓库里的 `INSTALL.md` 执行。
+
+**2 · 源码安装** —— 推荐;需要 Rust 工具链 + Node.js(用于 web 控制台打包):
+
 ```bash
-# 推荐:从源码构建并装成服务(需要 Rust 工具链 + Node.js 用于 web 控制台打包)
 git clone https://github.com/firstintent/ccteam && cd ccteam
 make install
+```
 
-# 备用:预编译二进制(无需工具链;linux + macOS arm/x64,Windows 走 WSL2;同样会问装 systemd)
+**3 · 一键脚本** —— 预编译二进制,无需工具链(linux + macOS arm/x64,Windows 走 WSL2;同样会问装 systemd):
+
+```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
+```
 
+装完验证:
+
+```bash
 ccteam --version
 claude --version   # 必需,需要时按提示登录
 codex --version    # 可选,用 Codex 会话才需要
