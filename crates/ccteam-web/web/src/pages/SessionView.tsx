@@ -434,7 +434,7 @@ export default function SessionView({
                 onDraftChange={() => {}}
                 locked
                 isAdmin={isAdmin}
-                modelLabel={statusModel ?? vendor}
+                modelLabel={statusModel ?? ""}
                 uploadSlug={session?.project}
               />
             </div>

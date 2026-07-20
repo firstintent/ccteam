@@ -99,6 +99,56 @@ describe("attachmentsBlockSend", () => {
   });
 });
 
+// ── model button label (vendor always spelled out) ────────────────────────────
+
+describe("model button label", () => {
+  const renderBtn = (over: Partial<Parameters<typeof ChatComposer>[0]> = {}) =>
+    renderToString(
+      <ChatComposer
+        draftKey="test"
+        lang="zh"
+        isAdmin
+        draft={defaultDraft()}
+        onDraftChange={() => {}}
+        onSend={() => {}}
+        {...over}
+      />,
+    );
+
+  it("new-session draft: the vendor prefixes the default/picked model", () => {
+    expect(renderBtn()).toContain("<span>claude · 默认</span>");
+    expect(renderBtn({ draft: { ...defaultDraft(), model: "opus" } })).toContain(
+      "<span>claude · opus</span>",
+    );
+    expect(
+      renderBtn({
+        draft: { ...defaultDraft(), vendor: "codex", model: "默认", protocol: "app-server" },
+      }),
+    ).toContain("<span>codex · 默认</span>");
+  });
+
+  it("conversation: the live model rides after the vendor; an unreported model leaves the vendor alone", () => {
+    expect(
+      renderBtn({
+        modelLabel: "gpt-5.5",
+        draft: { ...defaultDraft(), vendor: "codex", model: "", protocol: "app-server" },
+      }),
+    ).toContain("<span>codex · gpt-5.5</span>");
+    const html = renderBtn({ modelLabel: "" });
+    expect(html).toContain("<span>claude</span>");
+    expect(html).not.toContain("<span>claude · ");
+  });
+
+  it("conversation: a live kimi session shows the same vendor · model · effort shape", () => {
+    const html = renderBtn({
+      modelLabel: "kimi-code/k3",
+      draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
+    });
+    expect(html).toContain("<span>Kimi · kimi-code/k3</span>");
+    expect(html).toContain('<span class="eff">默认</span>');
+  });
+});
+
 // ── prefill (Home 快速开始 templates) ──────────────────────────────────────────
 
 describe("prefill", () => {

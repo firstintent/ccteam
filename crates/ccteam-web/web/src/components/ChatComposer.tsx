@@ -142,7 +142,9 @@ export function ChatComposer({
   /** The model/effort/protocol/HITL draft the menu edits. */
   draft: ComposerDraft;
   onDraftChange: (next: ComposerDraft) => void;
-  /** Conversation override for the model button label (live session model). */
+  /** Conversation override for the button's model segment (live session
+   *  model). The vendor name always prefixes it; an empty/omitted model
+   *  segment leaves the vendor name standing alone. */
   modelLabel?: string;
   /** Conversation: spawn parameters are fixed → picking toasts instead. */
   locked?: boolean;
@@ -405,6 +407,9 @@ export function ChatComposer({
   };
 
   const spec = vendorSpec(draft.vendor);
+  // Vendor is ALWAYS spelled out next to the model — a bare "默认"/"opus"
+  // plus a colored dot left the harness unreadable (owner feedback).
+  const modelText = modelLabel ?? draft.model;
   const showStop = !!busy && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor, isAdmin);
   const sendable = !!text.trim() || attachments.length > 0;
@@ -579,7 +584,7 @@ export function ChatComposer({
               }}
             >
               <span className={`dot ${spec.id}`} />
-              <span>{modelLabel ?? draft.model}</span>
+              <span>{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
               <span className="eff">{t(draft.effortKey)}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
