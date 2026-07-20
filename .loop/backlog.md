@@ -16,7 +16,7 @@
 ## 当前卡
 
 ### V096-R1 routing notes 归位项目根 + 全局默认文件
-- **状态**:进行中(Codex·2026-07-21) · **冲突域**:`crates/ccteam-core + crates/ccteam-im(mcp/vendor_panel) + Makefile + docs/` · **入口**:owner 直驱
+- **状态**:完成(9c5f895) · **冲突域**:`crates/ccteam-core + crates/ccteam-im(mcp/vendor_panel) + Makefile + docs/` · **入口**:owner 直驱
 - **背景**:v0.9.6 初版把项目级路由放在 `~/.ccteam/routing/projects/<slug>.md`,与 project 一等实体的归属不一致;全局 `routing.md` 也只读不生成。
 - **规格**:项目覆盖改为 `<project>/.ccteam/routing.md`,项目级 > `~/.ccteam/routing.md` 全局 fallback,二者不合并;统一 home ensure 仅在全局文件缺失时生成中立默认,绝不覆盖;不为每个项目自动生成覆盖,不留旧路径兼容分支。
 - **DoD**:先红后绿定向测试覆盖路径优先级/旧路径退役/全局生成不覆盖;Rust 门禁 + docs 同步 + writeback 绿;提交并推送远程 `dev`。
