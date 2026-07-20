@@ -73,7 +73,9 @@ fn reject_unknown_project(
 ///   type (e.g. `workflow`); also covers a bad install stem surfaced as a
 ///   client error.
 /// - [`HubError::ShaMismatch`] / [`HubError::Http`] / [`HubError::BadStatus`] /
-///   [`HubError::BadIndex`] / [`HubError::EmptyBody`] / [`HubError::TooLarge`]
+///   [`HubError::BadIndex`] / [`HubError::BadModels`] /
+///   [`HubError::ModelsCacheShaMismatch`] / [`HubError::EmptyBody`] /
+///   [`HubError::TooLarge`]
 ///   → `502` — the upstream hub failed us (transport, non-success status,
 ///   malformed/empty/oversized body, or a failed integrity check). Bad Gateway
 ///   is the honest code: ccteam is healthy, its upstream is not.
@@ -90,6 +92,8 @@ fn hub_error_status(err: &HubError) -> StatusCode {
         | HubError::BadStatus { .. }
         | HubError::HostNotAllowed { .. }
         | HubError::BadIndex(_)
+        | HubError::BadModels(_)
+        | HubError::ModelsCacheShaMismatch { .. }
         // A malformed `type:"plugin"` row (missing marketplace pointer) is bad
         // upstream catalog data, like BadIndex.
         | HubError::InvalidPlugin(_)

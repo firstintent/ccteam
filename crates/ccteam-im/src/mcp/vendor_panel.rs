@@ -70,6 +70,12 @@ pub(crate) fn resolve_status_project(
 /// truncation family). ~4k chars keeps the whole `status` output ~1–2k tokens.
 pub(crate) const ROUTING_NOTES_MAX_CHARS: usize = 4000;
 
+/// Per-vendor caps keep the full status response within its one-screen budget.
+const CATALOG_IDS_PER_VENDOR: usize = 4;
+const CATALOG_ALIASES_PER_VENDOR: usize = 4;
+const CATALOG_VENDOR_LIMIT: usize = 5;
+const CATALOG_TOKEN_CHARS: usize = 32;
+
 /// Vendors ccteam bundles a price table for (`anthropic`/`openai`/`xai`).
 /// Everything else is `unpriced` — a USD budget can't be metered, never $0.
 fn vendor_is_priced(vendor: &str) -> bool {
@@ -204,6 +210,120 @@ pub(crate) fn render_panel(header: &PanelHeader, rows: &[PanelRow]) -> String {
             auth,
             row.budget.render(),
         ));
+    }
+    out
+}
+
+// ── advisory model catalogs (pure) ─────────────────────────────────────────
+
+fn compact_token(value: &str) -> String {
+    let mut out: String = value.chars().take(CATALOG_TOKEN_CHARS).collect();
+    if value.chars().count() > CATALOG_TOKEN_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+fn compact_list(values: &[String], limit: usize) -> String {
+    let mut rendered: Vec<String> = values
+        .iter()
+        .take(limit)
+        .map(|value| compact_token(value))
+        .collect();
+    if values.len() > limit {
+        rendered.push(format!("… +{}", values.len() - limit));
+    }
+    rendered.join(", ")
+}
+
+fn compact_timestamp(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|ts| {
+            ts.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%MZ")
+                .to_string()
+        })
+        .unwrap_or_else(|_| compact_token(value))
+}
+
+/// Render the runtime and hub catalogs as explicitly separate advisory
+/// sources. The third source — user aliases/preferences — remains the
+/// separately-labelled routing-notes block immediately below this one.
+pub(crate) fn render_catalog(
+    runtime: &ccteam_core::model_catalog::ModelCatalog,
+    hub: &crate::hub::HubModelsState,
+) -> String {
+    let mut out =
+        String::from("catalog (advisory, never a spawn allowlist; sources kept separate):");
+    let runtime_rows: Vec<_> = runtime
+        .0
+        .iter()
+        .filter(|(_, entry)| !entry.models.is_empty())
+        .collect();
+    if runtime_rows.is_empty() {
+        out.push_str("\n  runtime: unavailable (no vendor catalog observed yet)");
+    } else {
+        for (vendor, entry) in runtime_rows.iter().take(CATALOG_VENDOR_LIMIT) {
+            let ids: Vec<String> = entry.models.iter().map(|model| model.id.clone()).collect();
+            out.push_str(&format!(
+                "\n  runtime(last-seen {}): {}=[{}]",
+                compact_timestamp(&entry.observed_at),
+                compact_token(vendor),
+                compact_list(&ids, CATALOG_IDS_PER_VENDOR),
+            ));
+        }
+        if runtime_rows.len() > CATALOG_VENDOR_LIMIT {
+            out.push_str(&format!(
+                "\n  runtime: … +{} vendors",
+                runtime_rows.len() - CATALOG_VENDOR_LIMIT
+            ));
+        }
+    }
+
+    match hub {
+        crate::hub::HubModelsState::Unavailable => out.push_str("\n  hub: unavailable"),
+        crate::hub::HubModelsState::Available(snapshot) => {
+            let revision: String = snapshot.revision.chars().take(7).collect();
+            let stale = if snapshot.stale { ", stale=true" } else { "" };
+            if snapshot.catalog.vendors.is_empty() {
+                out.push_str(&format!(
+                    "\n  hub(models.json@{revision}{stale}): no vendor entries"
+                ));
+            } else {
+                for (vendor, entry) in snapshot.catalog.vendors.iter().take(CATALOG_VENDOR_LIMIT) {
+                    let ids: Vec<String> =
+                        entry.models.iter().map(|model| model.id.clone()).collect();
+                    let aliases: Vec<String> = entry
+                        .models
+                        .iter()
+                        .flat_map(|model| {
+                            model.aliases.iter().map(|alias| {
+                                format!("{}={}", compact_token(alias), compact_token(&model.id))
+                            })
+                        })
+                        .collect();
+                    let default = entry.default.as_deref().unwrap_or("unspecified");
+                    let aliases = if aliases.is_empty() {
+                        "none".to_string()
+                    } else {
+                        compact_list(&aliases, CATALOG_ALIASES_PER_VENDOR)
+                    };
+                    out.push_str(&format!(
+                        "\n  hub(models.json@{revision}{stale}): {}: default={}; ids=[{}]; aliases {}",
+                        compact_token(vendor),
+                        compact_token(default),
+                        compact_list(&ids, CATALOG_IDS_PER_VENDOR),
+                        aliases,
+                    ));
+                }
+                if snapshot.catalog.vendors.len() > CATALOG_VENDOR_LIMIT {
+                    out.push_str(&format!(
+                        "\n  hub(models.json@{revision}{stale}): … +{} vendors",
+                        snapshot.catalog.vendors.len() - CATALOG_VENDOR_LIMIT
+                    ));
+                }
+            }
+        }
     }
     out
 }
@@ -414,16 +534,22 @@ fn unix_to_rfc3339(secs: u64) -> String {
 /// resolved project slug. `slug = None` → no project resolved (admin/local
 /// caller outside any registered project): render the LOCAL host with a note,
 /// and the global routing notes. BLOCKING (probes + fs reads).
-pub(crate) fn render_section(paths: &CcteamPaths, slug: Option<&str>) -> String {
+pub(crate) fn render_section(
+    paths: &CcteamPaths,
+    slug: Option<&str>,
+    hub: &crate::hub::HubModelsState,
+) -> String {
     let (header, rows) = match slug {
         Some(slug) => build_project_panel(paths, slug),
         None => build_local_panel(paths, None, Some("no project resolved — showing the local host; pass `project` or run inside a registered project directory".to_string())),
     };
     let notes_slug = slug.unwrap_or("<slug>");
     let notes = read_routing_file(paths, notes_slug);
+    let runtime = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
     format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         render_panel(&header, &rows),
+        render_catalog(&runtime, hub),
         render_routing_notes(notes.as_ref(), notes_slug),
     )
 }
@@ -662,6 +788,64 @@ mod tests {
         assert!(out.contains("stale=true"));
         assert!(out.contains("offline"));
         assert!(out.contains("no vendor snapshot available"));
+    }
+
+    #[test]
+    fn catalog_absent_renders_two_honest_source_lines() {
+        let out = render_catalog(
+            &ccteam_core::model_catalog::ModelCatalog::default(),
+            &crate::hub::HubModelsState::Unavailable,
+        );
+        assert!(out.contains("advisory, never a spawn allowlist"));
+        assert!(out.contains("runtime: unavailable"));
+        assert!(out.contains("hub: unavailable"));
+    }
+
+    #[test]
+    fn catalog_present_keeps_runtime_and_hub_separate_and_bounded() {
+        let runtime = ccteam_core::model_catalog::ModelCatalog(BTreeMap::from([(
+            "codex".to_string(),
+            ccteam_core::model_catalog::VendorModelCatalog {
+                observed_at: "2026-07-19T10:30:00Z".to_string(),
+                source: "codex model/list".to_string(),
+                models: ["a", "b", "c", "d", "e", "f"]
+                    .iter()
+                    .map(|id| ccteam_core::model_catalog::CatalogModel {
+                        id: (*id).to_string(),
+                        display_name: None,
+                        efforts: Vec::new(),
+                    })
+                    .collect(),
+            },
+        )]));
+        let hub = crate::hub::HubModelsState::Available(crate::hub::HubModelsSnapshot {
+            catalog: crate::hub::HubModelsCatalog {
+                schema: "ccteam.models/v1".to_string(),
+                updated_at: "2026-07-20T00:00:00Z".to_string(),
+                vendors: BTreeMap::from([(
+                    "claude".to_string(),
+                    crate::hub::HubVendorModels {
+                        default: Some("sonnet".to_string()),
+                        models: vec![crate::hub::HubModel {
+                            id: "opus".to_string(),
+                            display_name: Some("Claude Opus".to_string()),
+                            aliases: vec!["deep".to_string(), "refactor".to_string()],
+                            context_window: Some(200_000),
+                        }],
+                    },
+                )]),
+            },
+            revision: "abcdef0123456789".to_string(),
+            stale: true,
+        });
+
+        let out = render_catalog(&runtime, &hub);
+        assert!(out.contains("runtime(last-seen 2026-07-19T10:30Z): codex=[a, b, c, d, … +2]"));
+        assert!(out.contains("hub(models.json@abcdef0, stale=true): claude:"));
+        assert!(out.contains("default=sonnet"));
+        assert!(out.contains("aliases deep=opus, refactor=opus"));
+        assert_eq!(out.matches("runtime(last-seen").count(), 1);
+        assert_eq!(out.matches("hub(models.json@").count(), 1);
     }
 
     #[test]

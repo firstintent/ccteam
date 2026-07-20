@@ -97,6 +97,77 @@ impl HubIndex {
     }
 }
 
+/// Advisory hub-wide model catalog (`models.json`, schema
+/// `ccteam.models/v1`). It is never consulted by session spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubModelsCatalog {
+    /// Exact schema discriminator (`ccteam.models/v1`).
+    pub schema: String,
+    /// Hub maintainer's RFC3339 update timestamp.
+    pub updated_at: String,
+    /// Vendor wire name to its advisory catalog.
+    pub vendors: std::collections::BTreeMap<String, HubVendorModels>,
+}
+
+/// One vendor block in [`HubModelsCatalog`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubVendorModels {
+    /// Hub-advertised default model id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Advisory model rows in hub order.
+    #[serde(default)]
+    pub models: Vec<HubModel>,
+}
+
+/// One advisory hub model row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubModel {
+    /// Opaque vendor model id.
+    pub id: String,
+    /// Human-readable vendor/community label, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Small advisory alias set maintained by the hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Confirmed context window, when the hub has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// Verified hub snapshot handed to the status panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubModelsSnapshot {
+    /// Parsed and schema-validated catalog.
+    pub catalog: HubModelsCatalog,
+    /// SHA-256 of the exact `models.json` bytes.
+    pub revision: String,
+    /// True when a verified cache is being used after refresh failed or its
+    /// TTL expired.
+    pub stale: bool,
+}
+
+/// Honest advisory source state. The upstream file is optional, so every
+/// fetch/cache failure degrades to `Unavailable` instead of failing `status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubModelsState {
+    /// A verified fresh or stale snapshot.
+    Available(HubModelsSnapshot),
+    /// No verified source is available.
+    Unavailable,
+}
+
+/// Refresh cadence for `models.json`. A fresh verified cache avoids network;
+/// an expired one is returned as stale if refresh cannot complete.
+pub const HUB_MODELS_TTL_SECS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HubModelsCacheMeta {
+    sha256: String,
+    fetched_at: String,
+}
+
 /// One file of a multi-file skill (PRD §二): a path relative to the skill
 /// dir + the sha256 of its body. The engine derives the file's fetch URL from
 /// the plugin's `upstream` dir + `relpath`, verifies the sha, and writes it
@@ -261,6 +332,19 @@ pub enum HubError {
     /// The fetched / cached index failed to parse as the expected schema.
     #[error("hub index is malformed: {0}")]
     BadIndex(String),
+    /// The optional `models.json` exists but is not valid
+    /// `ccteam.models/v1`.
+    #[error("hub models catalog is malformed: {0}")]
+    BadModels(String),
+    /// Cached `models.json` bytes do not match the sidecar SHA written when
+    /// they were fetched; the cache is refused rather than displayed.
+    #[error("hub models cache integrity check failed: expected sha256 {expected}, got {actual}")]
+    ModelsCacheShaMismatch {
+        /// SHA stored alongside the last successful fetch.
+        expected: String,
+        /// SHA computed over the cached bytes.
+        actual: String,
+    },
     /// The fetched body was empty — refuse to install a content-less file.
     #[error("fetched plugin `{0}` is empty — refusing to install a content-less file")]
     EmptyBody(String),
@@ -468,6 +552,137 @@ pub async fn load_catalog(
     let index = parse_index(&bytes)?;
     write_cache_atomic(&cache_path, &bytes)?;
     Ok(index)
+}
+
+/// Parse and validate `models.json`. Unknown fields are tolerated for forward
+/// compatibility, but the schema tag and every vendor/model id are required.
+fn parse_models_catalog(bytes: &[u8]) -> Result<HubModelsCatalog, HubError> {
+    let catalog: HubModelsCatalog =
+        serde_json::from_slice(bytes).map_err(|err| HubError::BadModels(err.to_string()))?;
+    if catalog.schema != "ccteam.models/v1" {
+        return Err(HubError::BadModels(format!(
+            "unsupported schema `{}`",
+            catalog.schema
+        )));
+    }
+    for (vendor, entry) in &catalog.vendors {
+        if vendor.trim().is_empty() {
+            return Err(HubError::BadModels("vendor key is empty".to_string()));
+        }
+        if entry.models.iter().any(|model| model.id.trim().is_empty()) {
+            return Err(HubError::BadModels(format!(
+                "vendor `{vendor}` contains an empty model id"
+            )));
+        }
+    }
+    Ok(catalog)
+}
+
+fn models_cache_paths(paths: &ccteam_core::CcteamPaths) -> (PathBuf, PathBuf) {
+    let dir = paths.hub_cache_dir();
+    (dir.join("models.json"), dir.join("models.meta.json"))
+}
+
+fn read_models_cache(
+    paths: &ccteam_core::CcteamPaths,
+) -> Result<Option<(HubModelsSnapshot, chrono::DateTime<chrono::Utc>)>, HubError> {
+    let (body_path, meta_path) = models_cache_paths(paths);
+    if !body_path.exists() && !meta_path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&body_path).map_err(|err| {
+        HubError::Write(format!(
+            "read hub models cache {}: {err}",
+            body_path.display()
+        ))
+    })?;
+    let meta_bytes = std::fs::read(&meta_path).map_err(|err| {
+        HubError::Write(format!(
+            "read hub models cache metadata {}: {err}",
+            meta_path.display()
+        ))
+    })?;
+    let meta: HubModelsCacheMeta = serde_json::from_slice(&meta_bytes)
+        .map_err(|err| HubError::BadModels(format!("cache metadata: {err}")))?;
+    let actual = sha256_hex(&bytes);
+    if !sha_eq(&actual, &meta.sha256) {
+        return Err(HubError::ModelsCacheShaMismatch {
+            expected: meta.sha256,
+            actual,
+        });
+    }
+    let fetched_at = chrono::DateTime::parse_from_rfc3339(&meta.fetched_at)
+        .map_err(|err| HubError::BadModels(format!("cache fetched_at: {err}")))?
+        .with_timezone(&chrono::Utc);
+    Ok(Some((
+        HubModelsSnapshot {
+            catalog: parse_models_catalog(&bytes)?,
+            revision: actual,
+            stale: false,
+        },
+        fetched_at,
+    )))
+}
+
+/// Load advisory hub `models.json` with a verified TTL cache.
+///
+/// A fresh cache is returned without network. Otherwise `{base}/models.json`
+/// is fetched through the same host allowlist, redirect refusal, timeout, and
+/// byte cap as `index.json`; valid bytes replace the cache atomically. A 404,
+/// offline host, malformed body, or cache integrity failure never fails the
+/// caller: a previously verified cache is returned with `stale=true`, else the
+/// state is honestly [`HubModelsState::Unavailable`].
+pub async fn load_models_catalog(
+    base: &str,
+    paths: &ccteam_core::CcteamPaths,
+    force_refresh: bool,
+) -> HubModelsState {
+    let now = chrono::Utc::now();
+    let cached = read_models_cache(paths).ok().flatten();
+    if !force_refresh {
+        if let Some((snapshot, fetched_at)) = &cached {
+            let age = now.signed_duration_since(*fetched_at).num_seconds();
+            if (0..=HUB_MODELS_TTL_SECS).contains(&age) {
+                return HubModelsState::Available(snapshot.clone());
+            }
+        }
+    }
+
+    let url = ccteam_core::catalog_raw_url(base, "models.json");
+    let fetched = match hardened_client("models.json", &url) {
+        Ok(client) => fetch_bytes(&client, &url, "models.json").await,
+        Err(err) => Err(err),
+    };
+    if let Ok(bytes) = fetched {
+        if let Ok(catalog) = parse_models_catalog(&bytes) {
+            let revision = sha256_hex(&bytes);
+            let (body_path, meta_path) = models_cache_paths(paths);
+            let meta = HubModelsCacheMeta {
+                sha256: revision.clone(),
+                fetched_at: now.to_rfc3339(),
+            };
+            // Cache writes decorate a successful advisory fetch. A local disk
+            // failure must not turn a usable in-memory catalog into unavailable.
+            if write_cache_atomic(&body_path, &bytes).is_ok() {
+                if let Ok(meta_bytes) = serde_json::to_vec_pretty(&meta) {
+                    let _ = write_cache_atomic(&meta_path, &meta_bytes);
+                }
+            }
+            return HubModelsState::Available(HubModelsSnapshot {
+                catalog,
+                revision,
+                stale: false,
+            });
+        }
+    }
+
+    match cached {
+        Some((mut snapshot, _)) => {
+            snapshot.stale = true;
+            HubModelsState::Available(snapshot)
+        }
+        None => HubModelsState::Unavailable,
+    }
 }
 
 /// Atomic tmp + rename write of the index cache (mirrors
@@ -977,5 +1192,77 @@ mod tests {
         // `source == "ccteam"` first (original relative order preserved), then
         // every other source (also order-preserving) — a stable sort.
         assert_eq!(order, vec!["x-ccteam", "y-ccteam", "a-agency", "b-agency"]);
+    }
+
+    const MODELS_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/hub_models_v1.json");
+    const BAD_SHA_META_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/hub_models_bad_sha.meta.json");
+
+    fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {
+        ccteam_core::CcteamPaths {
+            root: root.to_path_buf(),
+            projects_root: root.join("projects"),
+        }
+    }
+
+    #[test]
+    fn models_fixture_parses_v1_schema() {
+        let catalog = parse_models_catalog(MODELS_FIXTURE).unwrap();
+        assert_eq!(catalog.schema, "ccteam.models/v1");
+        assert_eq!(catalog.vendors["claude"].default.as_deref(), Some("sonnet"));
+        assert_eq!(
+            catalog.vendors["claude"].models[0].aliases,
+            ["deep", "refactor"]
+        );
+        assert_eq!(
+            catalog.vendors["codex"].models[0].display_name.as_deref(),
+            Some("GPT 5.6 Sol Medium")
+        );
+    }
+
+    #[tokio::test]
+    async fn models_absent_degrades_to_unavailable_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let state = load_models_catalog(
+            "https://example.invalid/ccteam-hub",
+            &test_paths(root.path()),
+            false,
+        )
+        .await;
+        assert_eq!(state, HubModelsState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn models_bad_sha_cache_is_refused_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let (body_path, meta_path) = models_cache_paths(&paths);
+        std::fs::create_dir_all(body_path.parent().unwrap()).unwrap();
+        std::fs::write(body_path, MODELS_FIXTURE).unwrap();
+        std::fs::write(meta_path, BAD_SHA_META_FIXTURE).unwrap();
+
+        let state = load_models_catalog("https://example.invalid/ccteam-hub", &paths, false).await;
+        assert_eq!(state, HubModelsState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn expired_verified_models_cache_survives_refresh_as_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let (body_path, meta_path) = models_cache_paths(&paths);
+        std::fs::create_dir_all(body_path.parent().unwrap()).unwrap();
+        std::fs::write(&body_path, MODELS_FIXTURE).unwrap();
+        let meta = HubModelsCacheMeta {
+            sha256: sha256_hex(MODELS_FIXTURE),
+            fetched_at: "2020-01-01T00:00:00Z".to_string(),
+        };
+        std::fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let state = load_models_catalog("https://example.invalid/ccteam-hub", &paths, false).await;
+        let HubModelsState::Available(snapshot) = state else {
+            panic!("verified stale cache should render");
+        };
+        assert!(snapshot.stale);
+        assert_eq!(snapshot.catalog.vendors["claude"].models[0].id, "opus");
     }
 }

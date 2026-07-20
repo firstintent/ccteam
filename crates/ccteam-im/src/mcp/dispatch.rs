@@ -949,10 +949,11 @@ async fn execute_status(
         }
     };
 
+    let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
     let paths_owned = paths.clone();
     let slug_owned = project.clone();
     let section = tokio::task::spawn_blocking(move || {
-        super::vendor_panel::render_section(&paths_owned, slug_owned.as_deref())
+        super::vendor_panel::render_section(&paths_owned, slug_owned.as_deref(), &hub_models)
     })
     .await
     .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
@@ -2130,6 +2131,7 @@ async fn run_session_collect(
         .unwrap_or_default();
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
     let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
+    let model = meta.as_ref().and_then(|m| m.model.as_deref());
 
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
@@ -2162,6 +2164,9 @@ async fn run_session_collect(
     if let Some(t) = tokens_total {
         // v0.9.5 — honest token ledger for vendors with no USD price table.
         body["tokens_total"] = serde_json::json!(t);
+    }
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        body["model"] = serde_json::json!(model);
     }
     // v0.9.1 — honest per-sid activity (same classifier the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
@@ -2326,6 +2331,9 @@ async fn run_session_list(
             if let Some(t) = v.tokens_total {
                 // v0.9.5 — honest token ledger for unpriced vendors.
                 row.insert("tokens_total".into(), serde_json::json!(t));
+            }
+            if let Some(model) = v.model.as_deref().filter(|model| !model.trim().is_empty()) {
+                row.insert("model".into(), serde_json::json!(model));
             }
             if let Some(t) = &v.title {
                 row.insert("title".into(), serde_json::json!(t));
@@ -3622,6 +3630,45 @@ mod session_tool_tests {
         assert!(err.contains("invalid `activity` filter"), "{err}");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_surfaces_requested_model_and_omits_vendor_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let spawned = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({"vendor": "claude", "model": "future-model-verbatim"}),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        let child_sid = spawned["sid"].as_str().unwrap();
+
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let child = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["sid"] == child_sid)
+            .unwrap();
+        assert_eq!(child["model"], json!("future-model-verbatim"));
+        let parent = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["sid"] == principal)
+            .unwrap();
+        assert!(
+            parent.get("model").is_none(),
+            "vendor default is omitted: {parent}"
+        );
+    }
+
     /// v0.9.5 feedback fix — a title-less `session_spawn{task}` derives a
     /// short display label from the task's first line (ledger only), and the
     /// `notify` arg accepts the mode strings while rejecting garbage.
@@ -3757,7 +3804,11 @@ mod session_tool_tests {
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let child = parse(
             &run_session_spawn(
-                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "model": "collect-model" }),
+                ),
                 &gw,
                 McpCaller::Ambient,
             )
@@ -3799,6 +3850,7 @@ mod session_tool_tests {
         );
         assert_eq!(response["total_chars"], 1_208);
         assert_eq!(response["truncated"], true);
+        assert_eq!(response["model"], "collect-model");
         let content = response["turns"][0]["content"].as_str().unwrap();
         assert_eq!(content.chars().count(), 500);
         assert!(content.starts_with("HEAD"));
