@@ -1125,6 +1125,7 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
             "initialize",
             "initialized",
             "thread/start",
+            "model/list",
             "turn/start",
             "thread/compact/start",
             "review/start"
@@ -2899,6 +2900,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         permission_mode: ccteam_harness::PermissionMode::Skip,
         owner: "user:web-api".into(),
         vendor_uuid: "t-prior".into(),
+        model: None,
         host: "local".into(),
         created_at: String::new(),
         last_active: String::new(),

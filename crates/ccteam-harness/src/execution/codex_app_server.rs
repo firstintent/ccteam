@@ -1710,6 +1710,17 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 (tid, result)
             }
         };
+        // Advisory catalog capture: one cheap RPC on this thread's EXISTING
+        // app-server connection. Older servers may not implement model/list;
+        // either RPC or cache failures are deliberately silent and never alter
+        // the successful thread start/resume above.
+        if let Ok(catalog) = client.call("model/list", json!({})).await {
+            crate::model_catalog::record_vendor_models_best_effort(
+                "codex",
+                "codex model/list",
+                catalog_models(&catalog),
+            );
+        }
         // The started / resumed thread is now resident + subscribed on this
         // connection — record it so subsequent turns skip the resume.
         self.mark_loaded(&thread_id).await;
@@ -2469,6 +2480,51 @@ fn model_options(result: &Value) -> Vec<ChoiceOption> {
         }
     }
     out
+}
+
+/// Map the same vendor `model/list` response into the neutral last-seen cache.
+/// This is presentation-only; ids remain opaque and are never validated.
+fn catalog_models(result: &Value) -> Vec<crate::model_catalog::CatalogModel> {
+    let Some(models) = result.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let display_name = model
+                .get("displayName")
+                .or_else(|| model.get("display_name"))
+                .or_else(|| model.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            let efforts = model
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(|effort| {
+                            effort
+                                .get("reasoningEffort")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(crate::model_catalog::CatalogModel {
+                id: id.to_string(),
+                display_name,
+                efforts,
+            })
+        })
+        .collect()
 }
 
 /// v0.8.5 D4 — map a `collaborationMode/list` response (EXPERIMENTAL,
@@ -4320,6 +4376,27 @@ mod tests {
         assert_eq!(pluck_model(&json!({ "model": "" })), None);
         assert_eq!(pluck_effort(&json!({ "model": "gpt-5.5" })), None);
         assert_eq!(pluck_effort(&json!({ "reasoningEffort": "" })), None);
+    }
+
+    #[test]
+    fn catalog_models_keeps_vendor_ids_labels_and_efforts() {
+        let rows = catalog_models(&json!({"data": [
+            {
+                "id": "gpt-future",
+                "displayName": "GPT Future",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low"},
+                    {"reasoningEffort": "high"}
+                ]
+            },
+            {"id": "plain"},
+            {"displayName": "missing id"}
+        ]}));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "gpt-future");
+        assert_eq!(rows[0].display_name.as_deref(), Some("GPT Future"));
+        assert_eq!(rows[0].efforts, ["low", "high"]);
+        assert_eq!(rows[1].id, "plain");
     }
 
     #[test]

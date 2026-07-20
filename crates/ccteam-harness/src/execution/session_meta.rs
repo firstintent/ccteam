@@ -126,6 +126,11 @@ pub struct SessionMeta {
     /// Anthropic session UUID (stream-json: deterministic FNV; TUI: from
     /// `active-session-id`; Codex: empty; adopted: the foreign uuid).
     pub vendor_uuid: String,
+    /// Opaque model requested when the session was spawned. `None` means the
+    /// vendor default was requested. It is advisory/display state only and is
+    /// always passed back to the vendor verbatim on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub host: String,
     pub created_at: String,
     /// Updated only on turn completion — not on every event.
@@ -443,6 +448,7 @@ mod title_tests {
             permission_mode: PermissionMode::Skip,
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
+            model: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),

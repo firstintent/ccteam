@@ -680,6 +680,10 @@ pub struct SessionView {
     /// keeps older clients tolerant.
     #[serde(default)]
     pub tokens_total: Option<u64>,
+    /// Opaque model requested at spawn; omitted when the vendor default was
+    /// requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// v0.8.23 review §1.3-D item 9 — true when a HITL approval is currently
     /// outstanding for this sid ([`crate::pending::PendingInteractions::pending_for_sid`]).
     /// Drives the "等待批准" attention badge (web rail/history rows) and the
@@ -1446,7 +1450,10 @@ impl Gateway {
     ) -> Result<MetaRebuildPlan> {
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
-        let model_id = role_model_id(role_detail.as_ref());
+        let model_id = meta
+            .model
+            .clone()
+            .or_else(|| role_model_id(role_detail.as_ref()));
         let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| reply_to.clone());
         // Empty role ⇒ roleless: fall back to sid so @handle addressing stays
         // unique + non-empty (mirrors start_session / switch_current_role).
@@ -3253,7 +3260,7 @@ impl Gateway {
             wire_slug: _,
             secret,
             cwd: _,
-            model_id: _,
+            model_id,
             effort: _,
             adapter,
             parent_sid,
@@ -3356,6 +3363,7 @@ impl Gateway {
                 permission_mode,
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
+                model: model_id,
                 host: host.clone(),
                 created_at: now.clone(),
                 last_active: now,
@@ -3554,6 +3562,7 @@ impl Gateway {
         // v0.9 T5 — re-snapshot role_sha for the new role (spawn-time semantics).
         if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
             meta.role = meta_role.clone();
+            meta.model = model_id;
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -4619,7 +4628,11 @@ impl Gateway {
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
-        let model_id = role_model_id(ensure_role_exists(&cwd, &role)?.as_ref());
+        let role_detail = ensure_role_exists(&cwd, &role)?;
+        let model_id = read_session_meta(&cwd, session_id)
+            .ok()
+            .and_then(|meta| meta.model)
+            .or_else(|| role_model_id(role_detail.as_ref()));
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
@@ -6052,6 +6065,7 @@ impl Gateway {
                 let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
                 let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
                 let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
+                let model = meta.as_ref().and_then(|m| m.model.clone());
                 // v0.8.23 review item 9 — best-effort (never blocks): a
                 // `try_lock` failure (rare, momentary registry contention)
                 // just reports "not waiting" for this one snapshot rather
@@ -6082,6 +6096,7 @@ impl Gateway {
                     turn_count,
                     cost_usd,
                     tokens_total,
+                    model,
                     waiting_approval,
                     parent_sid: s.parent_sid.clone(),
                     delegation_depth: s.delegation_depth,
@@ -6228,6 +6243,7 @@ impl Gateway {
             permission_mode: PermissionMode::Skip,
             owner: owner_tag,
             vendor_uuid: vendor_uuid.to_string(),
+            model: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,
@@ -12899,6 +12915,7 @@ mod tests {
             permission_mode: PermissionMode::Skip,
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
+            model: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),

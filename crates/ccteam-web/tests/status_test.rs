@@ -87,6 +87,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
             permission_mode: ccteam_harness::PermissionMode::Skip,
             owner: "user:outside-chat".to_string(),
             vendor_uuid: String::new(),
+            model: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,

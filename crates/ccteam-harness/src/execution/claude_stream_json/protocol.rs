@@ -88,12 +88,14 @@ where
 /// capability ships on the initialize control_response). `value` is exactly
 /// the `/model <value>` id form; `efforts` is the model's
 /// `supportedEffortLevels` (empty for a no-effort model like haiku). Only
-/// these two fields are typed; everything else (displayName, description,
-/// supportsEffort) is presentation we don't drive the picker from.
+/// The display name is retained for the advisory last-seen catalog; picker
+/// behavior remains driven only by the opaque id + vendor effort values.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeModelOption {
     /// The `/model <value>` id (e.g. `"opus[1m]"`, `"sonnet"`, `"haiku"`).
     pub value: String,
+    /// Vendor presentation label when supplied.
+    pub display_name: Option<String>,
     /// `supportedEffortLevels` (e.g. `["low","medium","high","xhigh","max"]`);
     /// empty when the model has no effort axis (e.g. haiku).
     pub efforts: Vec<String>,
@@ -232,7 +234,17 @@ fn de_model_options(models: &[Value]) -> Vec<ClaudeModelOption> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(ClaudeModelOption { value, efforts })
+            let display_name = m
+                .get("displayName")
+                .or_else(|| m.get("display_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|name| !name.trim().is_empty());
+            Some(ClaudeModelOption {
+                value,
+                display_name,
+                efforts,
+            })
         })
         .collect()
 }
@@ -471,6 +483,7 @@ mod tests {
         // Full list captured, in order, with efforts (haiku has none).
         assert_eq!(s.models.len(), 4);
         assert_eq!(s.models[0].value, "default");
+        assert_eq!(s.models[0].display_name.as_deref(), Some("Default"));
         assert_eq!(
             s.models[0].efforts,
             vec!["low", "medium", "high", "xhigh", "max"]

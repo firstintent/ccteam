@@ -1226,6 +1226,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 }
             }
         }
+        crate::model_catalog::record_vendor_models_best_effort(
+            "claude",
+            "claude initialize.models",
+            init.models
+                .iter()
+                .filter(|model| !model.value.trim().is_empty())
+                .map(|model| crate::model_catalog::CatalogModel {
+                    id: model.value.clone(),
+                    display_name: model.display_name.clone(),
+                    efforts: model.efforts.clone(),
+                })
+                .collect(),
+        );
         let live = LiveSession {
             identity: identity.clone(),
             transport,
@@ -1947,6 +1960,7 @@ mod effort_tests {
         let models = vec![
             ClaudeModelOption {
                 value: "default".to_string(),
+                display_name: Some("Default".to_string()),
                 efforts: ["low", "medium", "high", "xhigh", "max"]
                     .iter()
                     .map(|s| s.to_string())
@@ -1954,10 +1968,12 @@ mod effort_tests {
             },
             ClaudeModelOption {
                 value: "opus[1m]".to_string(),
+                display_name: None,
                 efforts: vec!["low".to_string(), "max".to_string()],
             },
             ClaudeModelOption {
                 value: "haiku".to_string(),
+                display_name: None,
                 efforts: vec![],
             },
         ];

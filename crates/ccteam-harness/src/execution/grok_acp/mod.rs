@@ -203,6 +203,19 @@ impl GrokAcpAdapter {
         cwd: PathBuf,
         info: ModelInfo,
     ) -> Arc<LiveSession> {
+        crate::model_catalog::record_vendor_models_best_effort(
+            "grok",
+            "ACP session availableModels",
+            info.available
+                .iter()
+                .filter(|model| !model.model_id.trim().is_empty())
+                .map(|model| crate::model_catalog::CatalogModel {
+                    id: model.model_id.clone(),
+                    display_name: (!model.name.trim().is_empty()).then(|| model.name.clone()),
+                    efforts: model.efforts.clone(),
+                })
+                .collect(),
+        );
         let state = Arc::new(StdMutex::new(SessionTranslateState {
             model: info.model,
             window_tokens: info.window,

@@ -382,6 +382,7 @@ mod tests {
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
+            model: None,
             waiting_approval: false,
             parent_sid: None,
             delegation_depth: 0,

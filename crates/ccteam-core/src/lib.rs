@@ -49,6 +49,7 @@ pub mod host_registry;
 pub mod hub;
 // Delegated vendor-plugin install (marketplace pointer → settings.local.json).
 pub mod marketplace_plugin;
+pub mod model_catalog;
 // v0.8.18 柱1 — ccteam's own MCP-server registration into vendor configs
 // (Claude `~/.claude.json` + Codex `config.toml`). The ONE allowed write to
 // a vendor footprint; the CLI's `mcp_serve` re-exports these seams and the

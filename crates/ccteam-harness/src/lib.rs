@@ -37,6 +37,7 @@ pub mod enriched_event;
 pub mod execution;
 pub mod hook_sink;
 pub mod inproc_backend;
+pub mod model_catalog;
 pub mod patterns;
 pub mod rmux_backend;
 pub mod tmux_backend;
