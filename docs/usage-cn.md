@@ -233,7 +233,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 起一个 codex 会话,按 docs/rfc-12.md 实现,测试全过后汇报给我
 ```
 
-日常用法建议把这句话包成 skill(比如用户级的 `cct-codex`:替你 spawn、盯进度、拿简短汇报回来),一句话可靠跑完整个闭环。人话版指南——该说什么、最佳实践、附录给 skill 作者的工具速查——见 [orchestration-cn.md](orchestration-cn.md)。
+不需要装任何 skill——ccteam 的 MCP server 自带使用说明,任何连上的会话天生就会整个闭环(spawn、盯进度、拿汇报)。想要常驻指挥官 persona,从插件市场装 `team-brain`。人话版指南——该说什么、最佳实践、附录给 persona/skill 作者的工具速查——见 [orchestration-cn.md](orchestration-cn.md)。
 
 ### 模型路由
 

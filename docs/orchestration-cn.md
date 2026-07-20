@@ -2,7 +2,7 @@
 
 > English version: [orchestration.md](orchestration.md)（同构英文版,附录含 skill 作者工具速查)
 
-**你不用记工具名。** 你说一句「用 cct-codex 把这个页面重构了」,一个 skill 就替你把活派给 codex、盯着它跑完、把「改了哪些文件、测试过没过」的结论拿回来给你审。合上笔记本它也接着跑,每一跳都有账。
+**你不用记工具名——直接说就行。** 对你的会话说一句「这个重构交给 codex,完了汇报」,它就替你雇一个 codex 会话、盯着跑完、把「改了哪些文件、测试过没过」的结论拿回来给你审。**没有安装步骤**:ccteam 的 MCP server 自带使用说明,任何连上的会话天生就会带队。合上笔记本它也接着跑,每一跳都有账。
 
 这就是 Claude Code 里的 Task 工具——只不过被你指挥的「subagent」是一个完整的 vendor 会话:可以是 Codex、Grok、另一个 Claude,可以在另一台机器上,而且它做的每件事都记在账本里、随时能查。
 
@@ -14,7 +14,7 @@
 |---|---|
 | **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;说一句「也问问 codex 和 grok」,它自己把问题扇给几个 vendor,再把几份答案比出结论。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi(本文重点) | 用一句话委派,靠 **cct-codex / cct-grok 这类 skill** 替你调度 |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具,**零安装** |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -29,25 +29,27 @@
 
 每个同事是一个**会话**,有个编号(`s47`)。会话跑在它所属**项目**绑定的机器上(本机或一台卫星)。关掉你的笔记本,它照跑;它花了多少钱、改了什么,全记在主账本上。
 
-**一条铁律:** 想「叫另一个 agent」时,**永远不要**自己去敲 `codex exec` / `claude -p`。那样跑出来的东西没有编号、不记账、干完你也不知道、团队视图里根本看不见。值得委派的事,就值得上账本——让 skill 走正规通道。
+**一条铁律:** 想「叫另一个 agent」时,**永远不要**自己去敲 `codex exec` / `claude -p`。那样跑出来的东西没有编号、不记账、干完你也不知道、团队视图里根本看不见。值得委派的事,就值得上账本——说出来,会话自己会走正规通道(`session_*`)。
 
 ## 3. 你只需要会说这几句话
 
-skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
+你的会话把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 | 你说 | 发生什么 |
 |---|---|
-| 「**用 cct-codex** 实现 / 重构 / 修一下 X」 | 起一个 codex 会话在后台干;干完把「STATUS / 改了哪些文件 / 测试结果」的**简短结论**发给你,diff 你自己 `git diff` 审 |
-| 「**用 cct-grok** 快速看看 X」「问下 grok……」 | 起一个 grok 会话,等一两分钟,把答案直接贴回来 |
-| 「让 **claude 审一下**这个 diff 能不能合」 | 跨模型审稿门:另一个模型读 diff,给 MERGE / BLOCK 裁决 |
-| 「现在**有哪些会话**在跑?」 | 列出团队树:谁是谁的下属、在忙还是空、花了多少钱 |
+| 「RFC-12 的实现**交给 codex**,后台跑,完了给我 diff 摘要 + 测试结果」 | 起一个 codex 会话在后台干;任务完成、子会话转空闲时来**一条**通知,diff 你自己 `git diff` 审 |
+| 「**问下 grok** 这个堆栈是怎么回事——等它答完」 | 起一个 grok 会话,等一两分钟,把答案直接贴回来 |
+| 「这个设计问题**分别问 codex 和 grok**,各答各的,然后给我一致点 / 分歧 / 你的裁决」 | 扇出对比:两个会话背对背作答,你的会话权衡证据下结论 |
+| 「合并前找**另一家 vendor 审**这个 diff:MERGE / BLOCK 加理由」 | 跨厂商审稿门:实现者永远不给自己盖章 |
+| 「这台机器**有哪些 vendor 能用**?我的路由表怎么说?」 | 一次 `status`:本项目绑定主机的 vendor 面板 + 你的 `~/.ccteam/routing.md` 原文 |
+| 「现在**有哪些会话**在跑?刚才那波扇出花了多少?」 | 列出团队树:谁是谁的下属、在忙还是空、每个成员的模型和花费 |
 | 「把 **s47 停了**」 | 显式关掉某个会话(状态留着,以后能恢复) |
 
-**cct-codex** 管长活(后台跑 + 轮询),**cct-grok** 管快问快答(等着拿答案)。装好后(见 §7),在你日常的 Claude 会话里直接说这些话即可。
+经验法则:**长活 → 后台 + 完成通知**(合上笔记本没关系);**快问 → 内联等答案**。这些话在你日常会话里张口就说——什么都不用装(见 §7)。
 
 ## 4. 让委派值回票价(最佳实践,人话)
 
-这几条是把「能用」变成「好用」的关键。写进了 skill,但你自己也该知道:
+这几条是把「能用」变成「好用」的关键。每条就一句话,揉进你的原话里说:
 
 1. **把活说清楚,并要求「简短汇报、别贴代码」。** 最大的杠杆。一句「≤25 行,分 STATUS / 改了哪些文件 / 测试结果 / 待定问题,别贴 diff」,能让同事的回复精炼十倍——否则它会把满屏日志灌进**你自己的**上下文。
 2. **长活后台跑,快问快答等着拿。** 实现类交给 codex 异步跑(像同事干完来汇报);只有下一句话就要用的分钟级答案,才用 grok 内联等。
@@ -104,10 +106,10 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 
 ## 7. 装一次
 
-`cct-codex` / `cct-grok` 是**插件市场里的第一方配方**——从 web 插件市场一键装进项目(落 `.claude/skills/`,ccteam 托管的会话也会加载),或放一份用户级副本在 `~/.claude/skills/` 让你所有会话可用。前提:
+编排本身**无需安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进**全部五个 vendor**——Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
-- 本机 `ccteam start` 起着 daemon;`ccteam config mcp` 已把 ccteam 注册进**全部四个 vendor**——Claude / Codex / Grok / OpenCode(装一次;任何 vendor 的普通会话都能当指挥)。
-- 你在一个**已注册的 ccteam 项目**目录里(skill 从当前目录认出项目)。
+- 本机 `ccteam start` 起着 daemon。
+- 你在一个**已注册的 ccteam 项目**目录里(会话从当前目录认出项目)。
 - 用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证)。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §8。)
 
 ## 8. 出问题时(人话)
@@ -116,15 +118,15 @@ skill 把工具调用藏在背后。你说左边的话,右边的事就发生:
 |---|---|
 | 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;或 `ccteam status` 看 daemon 在不在。SDK 会话可退回 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam:<hex>`(hex = `~/.ccteam/secrets/web-token`)——同一套工具,admin 身份(spawn 是根)。 |
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
-| 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或让 skill 带上项目名。 |
+| 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或把项目名说出来让会话带上 `project:"<slug>"`。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
-| 「派活翻车 / 想确认没重复派」 | skill 会带幂等键;超时重试不会重复创建。 |
+| 「派活翻车 / 想确认没重复派」 | `session_spawn`/`session_dispatch` 支持 `idempotency_key`,同键重试永不重复创建;链路不稳时要求带上,或重试前先 `session_list` 看一眼。 |
 
 ---
 
-## 附录:工具速查(给 skill 作者 / 想手搓的人)
+## 附录:工具速查(给 persona / skill 作者与想手搓的人)
 
-平时你不碰这些——skill 替你调。但如果你在**写 skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
+平时你不用报工具名——会话听懂人话自己调。但如果你在**写 persona / skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
 - **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`(grok/opencode/kimi 强制 `protocol:"acp"`);`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知里明确写「已 idle、在等下一个 dispatch」——任务没真完,这就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。

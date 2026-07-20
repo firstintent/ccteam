@@ -236,7 +236,7 @@ Every session can spawn colleagues, dispatch tasks, and collect results through 
 start a codex session, implement the RFC under docs/rfc-12.md, and report back when tests pass
 ```
 
-For everyday use, wrap the phrasing in a skill (e.g. a user-level `cct-codex` that spawns, supervises, and reports back with a short summary) so one sentence does the whole loop reliably. The plain-language guide — what to say, best practices, plus a tool appendix for skill authors — is [orchestration.md](orchestration.md).
+There is no skill to install — the ccteam MCP server ships its own instructions, so any connected session already knows the whole loop (spawn, supervise, report back). For a standing orchestrator persona, install `team-brain` from the marketplace. The plain-language guide — what to say, best practices, plus a tool appendix for persona/skill authors — is [orchestration.md](orchestration.md).
 
 ### Model Routing
 

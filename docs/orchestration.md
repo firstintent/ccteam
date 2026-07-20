@@ -2,7 +2,7 @@
 
 > 中文版: [orchestration-cn.md](orchestration-cn.md)
 
-**You don't memorize tool names.** You say "use cct-codex to refactor this page" and a skill hands the work to a Codex session, supervises it to completion, and brings back a short report — status, files changed, tests pass/fail — for you to review. The work keeps running after you close your laptop, and every hop is on the ledger.
+**You don't memorize tool names — you just say it.** Tell your session "hand this refactor to codex and report back", and it hires a Codex session, supervises it to completion, and brings back a short report — status, files changed, tests pass/fail — for you to review. There is no install step: the ccteam MCP server ships its own instructions, so any connected session already knows how to run the team. The work keeps running after you close your laptop, and every hop is on the ledger.
 
 This is Claude Code's Task tool, except the "subagent" is a full vendor session — Codex, Grok, another Claude — possibly on another machine, and everything it does is recorded and inspectable.
 
@@ -14,7 +14,7 @@ This is Claude Code's Task tool, except the "subagent" is a full vendor session 
 |---|---|
 | **Phone / IM** (Telegram, Lark) | just message your session; say "ask codex and grok too" and it fans the question out to several vendors, then weighs the answers itself. Install the `team-brain` persona (marketplace) and one session becomes your chief of staff |
 | **Web console** | open sessions in the browser, watch the team tree, review diffs, track cost |
-| **Inside your coding agent** — Claude, Codex, Grok, OpenCode or Kimi (this guide's focus) | delegate with one sentence, via **skills like cct-codex / cct-grok** that drive the tools for you |
+| **Inside your coding agent** — Claude, Codex, Grok, OpenCode or Kimi (this guide's focus) | delegate with one sentence, in plain language — every MCP-connected session already knows the team tools; nothing to install |
 
 The full manual for the human surfaces is [usage.md](usage.md). This guide is about the third row — **commanding a whole team from inside your everyday AI session.**
 
@@ -29,25 +29,27 @@ Think of a small team where you are the lead:
 
 Each colleague is a **session** with a durable id (`s47`). A session runs on whatever machine its **project** is bound to (local or a satellite). Close your laptop and it keeps working; what it spent and what it changed is all on your daemon's ledger.
 
-**One iron rule:** when you want to "call another agent", **never** shell out to `codex exec` / `claude -p` yourself. That run has no session id, no cost accounting, no completion signal, and is invisible in the team view. If it's worth delegating, it's worth being on the ledger — let the skill go through the proper channel.
+**One iron rule:** when you want to "call another agent", **never** shell out to `codex exec` / `claude -p` yourself. That run has no session id, no cost accounting, no completion signal, and is invisible in the team view. If it's worth delegating, it's worth being on the ledger — say it, and the session goes through the proper channel (`session_*`).
 
 ## 3. The phrases you say
 
-The skills hide the tool calls. You say the left column; the right column happens:
+Your session hides the tool calls. You say the left column; the right column happens:
 
 | You say | What happens |
 |---|---|
-| "**use cct-codex** to implement / refactor / fix X" | a codex session grinds in the background; when done you get a **short report** (STATUS / files changed / test results) and review the diff yourself with `git diff` |
-| "**use cct-grok** for a quick look at X", "ask grok …" | a grok session spins up, waits a minute or two inline, pastes the answer back |
-| "have **claude review** whether this diff can merge" | a cross-model review gate: a different model reads the diff and returns MERGE / BLOCK |
-| "**what sessions** are running?" | the team tree: who reports to whom, busy or idle, cost so far |
+| "**hand codex** the RFC-12 implementation — work in the background, report back with a diff summary and test results" | a codex session grinds in the background; ONE notification when the task completes and the child goes idle, then you review the diff yourself with `git diff` |
+| "**ask grok** for a quick second opinion on this stack trace — wait for the answer" | a grok session spins up, waits a minute or two inline, pastes the answer back |
+| "put this design question to **codex and grok independently**, then give me consensus / disagreements / your verdict" | the fan-out compare: two sessions answer blind, your session weighs the evidence and rules |
+| "before merge, have a **different vendor review** this diff — MERGE / BLOCK with reasons" | a cross-vendor review gate: the builder never rubber-stamps its own work |
+| "**which vendors** are available here, and what do my routing notes say?" | one `status` call: the vendor panel for this project's bound host, plus your `~/.ccteam/routing.md` carried verbatim |
+| "**what sessions** are running? what did that fan-out cost?" | the team tree: who reports to whom, busy or idle, per-member model and cost |
 | "**stop s47**" | explicitly closes that session (state stays on disk, resumable later) |
 
-**cct-codex** is for long work (background + poll); **cct-grok** is for quick Q&A (wait inline). Once installed (§7), you just say these things in your everyday Claude session.
+Rule of thumb: **long work → background + completion notification** (close the laptop); **quick questions → wait inline**. These phrases work as-is in your everyday session — nothing to install first (§7).
 
 ## 4. Making delegation pay (best practices, in plain language)
 
-These turn "it works" into "it's good". The skills encode them, but you should know them too:
+These turn "it works" into "it's good". They're one sentence each — fold them into how you phrase the ask:
 
 1. **Brief clearly, and demand a short report with no code dumps.** The single biggest lever. One line — "reply in ≤25 lines: STATUS / files changed / test results / open questions, no diffs" — makes the reply ten times denser; otherwise a screenful of logs floods **your own** context.
 2. **Long work runs in the background; quick answers wait inline.** Implementation goes to codex async (it reports back like a colleague); only minute-scale answers you need for your next sentence are worth an inline grok wait.
@@ -102,12 +104,12 @@ Default: omit `model` — vendor defaults track their latest releases.
 
 **The bill stays visible.** `session_list` and `session_collect` rows carry the model and the accrued `cost_usd` / `tokens_total` per member, so a fan-out's cost is a sum you can read, not a surprise.
 
-## 7. Install once
+## 7. Wire up once
 
-`cct-codex` and `cct-grok` are first-party recipes on the **marketplace** — install them into a project from the web marketplace page (they land in `.claude/skills/`, so ccteam-managed sessions get them too), or keep personal copies user-level in `~/.claude/skills/` so every session of yours can use them. Prerequisites:
+There is nothing to install for orchestration itself: `ccteam config mcp` (one-time) registers the ccteam server with **all five vendors** — Claude, Codex, Grok, OpenCode, Kimi — and the server's own instructions teach any connected session the delegation flow. Want a standing orchestrator persona on top (routing habits and review gates baked in)? Install `team-brain` from the **marketplace** — a persona choice, not a prerequisite. What you do need:
 
-- `ccteam start` is running on this machine; `ccteam config mcp` has registered ccteam with **all four vendors** — Claude, Codex, Grok, OpenCode (one-time; any vendor's plain session can orchestrate).
-- You're inside a **registered ccteam project** directory (the skill resolves the project from the working directory).
+- `ccteam start` is running on this machine.
+- You're inside a **registered ccteam project** directory (the session resolves the project from the working directory).
 - You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §8.)
 
 Verify in 60 seconds:
@@ -124,15 +126,15 @@ grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discover
 |---|---|
 | "tool not available / no such tool" | this session didn't load ccteam. Use a plain vendor CLI session; check `ccteam status`. SDK sessions can fall back to `POST http://localhost:7331/mcp` with `Authorization: Bearer ccteam:<hex>` (hex = `~/.ccteam/secrets/web-token`) — same tools, admin identity (spawns are roots). |
 | "it's been silent forever" | it's **working**, not stuck. Go do something else and come back for the report. |
-| "project not found" | you're not in a registered project directory. `cd` into one, or have the skill pass the project name. |
+| "project not found" | you're not in a registered project directory. `cd` into one, or say the project name so the session passes `project:"<slug>"`. |
 | "grok doesn't work" | that machine doesn't have the grok CLI. `ccteam status` / capabilities shows which vendors this machine actually has. |
-| "did the delegation double-fire?" | the skills set an idempotency key; a timeout-retry never creates a duplicate. |
+| "did the delegation double-fire?" | `session_spawn`/`session_dispatch` take an `idempotency_key` — a retry with the same key never creates a duplicate. Ask for one on flaky links, or check `session_list` before retrying. |
 
 ---
 
 ## Appendix: tool reference (for skill authors / manual orchestration)
 
-You normally never touch these — the skills do. But if you're **writing a skill** or orchestrating by hand, ccteam exposes eight tools under the `ccteam` MCP server, visible in Claude as `mcp__ccteam__<name>`:
+You normally never spell these out — your session drives them from your plain-language ask. But if you're **writing a persona or skill** or orchestrating by hand, ccteam exposes eight tools under the `ccteam` MCP server, visible in Claude as `mcp__ccteam__<name>`:
 
 - **`session_spawn`** — hire a colleague (and hand over the first task in the same call). `{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, protocol?, permission_mode?, project?}`. `vendor` = `claude` (default) / `codex` / `grok` / `opencode` / `kimi`; grok/opencode/kimi force `protocol:"acp"`. `role` names a `.claude/agents/<role>.md` persona — omit for roleless (the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`, the right default more often than not). `model`/`effort` pass through verbatim to the vendor — omit them to ride the vendor default; the model catalog is advisory and never gates what you may pass. `title` ≤80 chars, ledger/team-view label only — never enters any prompt. `permission_mode:"hitl"` pops approve/deny to the bound IM chat. **There is no `host` parameter** — the execution machine is inherited from the project's binding; passing one is a hard error. `wait_seconds>0` waits inline for the first answer; default is async. Always returns a **new** `sid`; the response's `caller` names the authenticated spawner — `ambient:<sid>` (a ccteam session called it; it becomes the child's `parent_sid`) or `admin` (the owner front door / main-session fallback — always a **root** spawn, `parent_sid: null`). If you expected a parent edge and see `caller: "admin"`, your call rode an admin-authenticated MCP server instead of your session's own bearer.
 - **`session_dispatch`** — send another task to an existing session (`{sid, task, wait_seconds?, notify?, idempotency_key?}`). Forwarded verbatim as a user turn, zero injection. Async by default: when the child's **vendor turn completes and it goes idle** you get ONE notification that says so explicitly (a chatty child's mid-turn narration never notifies — it stays in the ledger). `notify` selects the mode: `"final"` (default) / `"all"` (every assistant message, debug firehose) / `"off"` (ledger-only; booleans still parse). The notification marks the child **idle/waiting** — if the task isn't actually done, that's your cue to dispatch the next step (the "silently stalled child" failure mode is gone: idle always signals). `wait_seconds` (≤600) blocks until the turn actually finishes and returns the FINAL `result_text` (interim narration never ends the wait), or `status:"pending"` on timeout — the child keeps running, never cancelled. Dispatching to yourself or an ancestor is rejected (cycle guard).

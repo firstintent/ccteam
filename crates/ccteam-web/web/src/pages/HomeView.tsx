@@ -15,13 +15,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  ClipboardList,
   Code,
-  Compass,
   Folder,
   GitBranch,
   Globe,
   Layers,
+  Scale,
+  ShieldCheck,
   Users,
   Zap,
 } from "lucide-react";
@@ -51,8 +51,9 @@ import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
 
 /** 快速开始 template cards (the grid replacing the old 最近会话 recents —
  *  those live in the sidebar rail). The set showcases ccteam's headline
- *  feature — multi-vendor delegation, each harness on its strength (claude
- *  plans / codex codes steady / grok is fastest / kimi is cost-effective):
+ *  feature — multi-vendor delegation: the 协作 flagship, the face-off and
+ *  cross-review moves, plus each harness on its strength (codex codes
+ *  steady / grok is fastest / kimi is cost-effective):
  *  a click prefills the composer with `<key>P` from the i18n table (`<key>T`
  *  = title, `<key>D` = description) AND switches the model draft to
  *  `vendors[0]` so the session really spawns on that harness (lazy-create
@@ -62,15 +63,15 @@ import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
 const TEMPLATES: ReadonlyArray<{
   id: string;
   key: string;
-  Icon: typeof Compass;
+  Icon: typeof Users;
   vendors: readonly VendorId[];
 }> = [
   { id: "team", key: "tplTeam", Icon: Users, vendors: ["claude", "codex", "grok", "kimi"] },
-  { id: "plan", key: "tplPlan", Icon: ClipboardList, vendors: ["claude"] },
+  { id: "compare", key: "tplCompare", Icon: Scale, vendors: ["claude", "codex", "grok"] },
+  { id: "review", key: "tplReview", Icon: ShieldCheck, vendors: ["claude", "codex"] },
   { id: "code", key: "tplCode", Icon: Code, vendors: ["codex"] },
   { id: "fast", key: "tplFast", Icon: Zap, vendors: ["grok"] },
   { id: "bulk", key: "tplBulk", Icon: Layers, vendors: ["kimi"] },
-  { id: "tour", key: "tplTour", Icon: Compass, vendors: [] },
 ];
 
 export interface ProjectHostIdentity {

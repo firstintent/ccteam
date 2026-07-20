@@ -7,7 +7,7 @@
 
 ## 当前焦点
 
-- **版本线**:workspace `0.9.6` 已落 **`dev` 分支**(owner 直驱 2026-07-21:多 vendor 编排发现面 T1/T2 + compare 全链退役 T4 + 全局文档 T3 + 吉祥物 logo;设计 SoT = gitignored `docs-local/notes/orchestrate-final.md`;opus/codex/kimi 三 agent 分工,fable5 规划 review 合并),**未合 main、未 tag、未部署**;`0.9.5` 仍是 main HEAD 版本。
+- **版本线**:workspace `0.9.6` 已落 **`dev` 分支**(owner 直驱 2026-07-21:多 vendor 编排发现面 T1/T2 + compare 全链退役 T4 + 全局文档 T3 + 吉祥物 logo;设计 SoT = gitignored `docs-local/notes/orchestrate-final.md`;opus/codex/kimi 三 agent 分工,fable5 规划 review 合并;增量:cct-codex/cct-grok wrapper skill 退役(hub 8024ec4)+ 快速开始模板重设),**未合 main、未 tag、未部署**;`0.9.5` 仍是 main HEAD 版本。
 - **在做**:A2A-W5(三场景真机 smoke + README/usage 重写 —— **注意:usage/orchestration 已在 dev 按 compare 退役后语义改写,W5 勿按旧语义重写**);P1-1(缩范围)/2/3 + P1-4/P2-1 待排 —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 

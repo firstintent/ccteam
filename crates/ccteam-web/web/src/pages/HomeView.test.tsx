@@ -146,19 +146,19 @@ describe("HomeView (landing page)", () => {
     const html = render();
     expect(html).toContain('data-testid="template-grid"');
     expect(html).toContain("快速开始");
-    for (const id of ["team", "plan", "code", "fast", "bulk", "tour"]) {
+    for (const id of ["team", "compare", "review", "code", "fast", "bulk"]) {
       expect(html).toContain(`data-testid="tpl-${id}"`);
     }
     expect(html).toContain("多 agent 协作");
-    expect(html).toContain("规划拆解");
+    expect(html).toContain("多模型对比");
+    expect(html).toContain("跨 vendor 互审");
     expect(html).toContain("稳定编码");
     expect(html).toContain("极速排查");
     expect(html).toContain("批量任务");
-    expect(html).toContain("项目速览");
     // The card carries its composer prompt as the hover title; the 协作
     // flagship's prompt drives real A2A delegation (session_spawn/dispatch).
     expect(html).toContain("session_spawn");
-    expect(html).toContain("带我快速了解这个项目");
+    expect(html).toContain("给出你的裁决和置信度");
     // The old recents grid is gone (recents live in the sidebar rail).
     expect(html).not.toContain('data-testid="recent-grid"');
   });
@@ -172,14 +172,19 @@ describe("HomeView (landing page)", () => {
     // The 协作 flagship wears all four chips (claude brain + 3 specialists).
     const team = grid.slice(
       grid.indexOf('data-testid="tpl-team"'),
-      grid.indexOf('data-testid="tpl-plan"'),
+      grid.indexOf('data-testid="tpl-compare"'),
     );
     for (const vendor of ["claude", "codex", "grok", "kimi"]) {
       expect(team).toContain(`data-vendor="${vendor}"`);
     }
-    // The generic 项目速览 card is vendor-neutral (no chip, draft untouched).
-    const tour = grid.slice(grid.indexOf('data-testid="tpl-tour"'));
-    expect(tour.slice(0, tour.indexOf("</button>"))).not.toContain("data-vendor=");
+    // The 多模型对比 card fans across three brains (claude referee + two contestants).
+    const compare = grid.slice(
+      grid.indexOf('data-testid="tpl-compare"'),
+      grid.indexOf('data-testid="tpl-review"'),
+    );
+    for (const vendor of ["claude", "codex", "grok"]) {
+      expect(compare).toContain(`data-vendor="${vendor}"`);
+    }
   });
 
   it("template cards speak the shell language (en)", () => {
@@ -195,7 +200,8 @@ describe("HomeView (landing page)", () => {
     );
     expect(html).toContain("Quick start");
     expect(html).toContain("Multi-agent team");
+    expect(html).toContain("Model face-off");
+    expect(html).toContain("Cross-vendor review");
     expect(html).toContain("Solid coding");
-    expect(html).toContain("Project tour");
   });
 });
