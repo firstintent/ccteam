@@ -60,23 +60,23 @@
 - **规格**:改两测试期望为「purge 保留 cto.md(用户 role 文件)」;顺带核 purge 实现与 §三红线一致,不改产品行为。
 - **DoD**:t03/t17 绿;`make test` 基线只增;writeback 绿。
 
-### P1-4 systemd unit PATH 纳入 kimi 安装路径
-- **状态**:待排 · **冲突域**:`Makefile(systemd unit 段)` · **建议入口**:dev 会话(小改)
-- **背景**:V095 偏差 3:unit `Environment=PATH` 不含 `~/.kimi-code/bin`,daemon 找不到 kimi;本机临时以 `~/.local/bin/kimi` 软链绕过(与其余 vendor 同款)。
-- **规格**:unit PATH(或注释指引)纳入 kimi 默认安装路径;不改其它运行时契约。
-- **DoD**:最低门(fmt + writeback)+ 本机 daemon 重启后 `kimi` 可解析留痕。
-
 ### V094 npm 分发 · daemon 管理 · 自更新
 - **状态**:gated(owner 2026-07-17 暂缓,v0.9.5 先行) · **冲突域**:`install.sh + crates/ccteam-cli + Makefile` · **建议入口**:版本波(doc-first)
 - **背景**:PRD 已成文 `docs-local/versions/v0-9-4/prd.md`(DRAFT)。2026-07-22 起其 daemon/update 范围由 V097 PRD 承接深化,本卡剩余主体 = npm 分发面(拍板时二者收敛)。
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
 
-### V097 daemon 生命周期重构(Codex 方案)+ 按渠道自更新(PRD DRAFT v4)
-- **状态**:gated(PRD DRAFT v4 2026-07-22,剩余决策 D1–D8 待 owner 拍板) · **冲突域**:`crates/ccteam-core(daemon) + crates/ccteam-cli + install.sh + Makefile` · **建议入口**:版本波(doc-first)
-- **背景**:owner 2026-07-22 指示按 `docs-local/research/codex-daemon-and-update.md` 重构 daemon 管理与 update,并同日拍板:**全线废除 systemd/launchd,Codex pid-detach(setsid + pidfile 权属 + socket 探测)是唯一 daemon 管理方式**(动因:macOS 无 systemd、WSL 默认没开;接受无崩溃自拉起/开机自启的 Codex 同款取舍)。存量 systemctl 用户走**一次性自动接管**(v4:install.sh 升级现场检测 + daemon start/update 前置 + doctor 兜底;迁移逻辑单一实现住 Rust;指纹白名单只动 ccteam 安装器所写 unit,手写永不代删)。PRD 落 `docs-local/versions/v0-9-7/prd.md`(v4;承接 v0.9.4 PRD F2/F3,npm 留 V094;§四 = Codex 代码函数级借鉴地图,pid.rs+测试直接搬,attribution 进 LICENSES.md)。现状痛点:`ccteam stop` 被 `Restart=always` 弹回、unit 双源漂移、无 restart/update/InstallChannel、pid 记录无 start_time、probe 不带版本 —— unit 面整体删除后 **P1-4 面随之消亡**(其临时软链已顶住本机)。
-- **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
-- **DoD**:—(gated)
+### V097-W12 daemon 生命周期核 + systemd 退场(PRD W1+W2)
+- **状态**:进行中(规划调度 subagent·2026-07-22) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + Makefile` · **入口**:规划会话调度(owner 直驱 dev+PR)
+- **背景**:owner 2026-07-22 拍板 V097 进入开发(废 systemd + D1–D8 按 PRD v4 默认,登记 `state.md` 人工门)。规格 SoT = `docs-local/versions/v0-9-7/prd.md` §三 F1/F2/F4 + §四 Codex 借鉴地图(pid.rs+测试直接搬,Apache-2.0 attribution 进 LICENSES.md)。工作树 `/tmp/ccteam-v097`(branch `dev`),PR 目标 `main`,tag/部署 HELD。
+- **规格**:F1 生命周期核(pid JSON + `daemon.lock` + 双判定 + versioned probe)+ F2 `daemon start/stop/restart/status/logs`(全 `--json`;trigger-file 全链退役;`ccteam stop` 委托 alias;前台 start 加 probe 实例守卫)+ F4 legacy 自动接管(Rust 单一实现;install.sh 只检测+调用;指纹白名单,手写 unit 永不代删)+ W2 删 unit 面(Makefile/install.sh 零 unit 文本;`make install` = build+`daemon restart`)+ doctor 残留 WARN。
+- **DoD**:PRD 验收 A1–A6;确定性 lib 基线只增(≥1472/0);clippy 0;fmt 干净;writeback 绿。
+
+### V097-W3 update + InstallChannel + 版本外显(PRD W3)
+- **状态**:待排 · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + docs/` · **建议入口**:规划会话调度
+- **背景**:同 V097-W12,在其之上叠加(**依赖 W12,同域串行**);PRD §三 F3 + §六 W3。P1-4(unit PATH 补 kimi)已按 D7 随 unit 面删除而取代,细节见 state.md 人工门 + V097-W12 卡。
+- **规格**:InstallChannel(env 预留/marker/路径启发)+ `ccteam update`(standalone 臂转发非交互 install.sh、source 臂只指引 + 升级重启合同:in-flight 等 5min/`--now`/`--no-restart` + 版本核对)+ `state/version.json` 轻量检查(≥20h,lazy,不进 daemon loop)+ doctor updates 段 + fleet 版本偏差外显 + workspace 版本 bump `0.9.7` + docs 同步(usage/README/tech-design 指针)。
+- **DoD**:PRD 验收 A7–A10;基线只增;writeback 绿;PR 就绪。
 
 ### P2-1 CI 增确定性测试 job
 - **状态**:待排 · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)

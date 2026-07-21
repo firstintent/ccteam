@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace `0.9.6` 已落 **`main`**(2026-07-21 owner 指示合并,dev=main 对齐;owner 直驱:多 vendor 编排发现面 T1/T2 + compare 全链退役 T4 + 全局文档 T3 + 吉祥物 logo;设计 SoT = gitignored `docs-local/notes/orchestrate-final.md`;opus/codex/kimi 三 agent 分工,fable5 规划 review 合并;增量:cct-codex/cct-grok wrapper skill 退役(hub 8024ec4)+ 快速开始模板重设 + routing notes 项目归位/全局默认生成 + composer vendor·model 外显 3e6bca1),**未 tag、未部署**。
-- **在做**:A2A-W5(三场景真机 smoke + README/usage 重写 —— **注意:usage/orchestration 已在 dev 按 compare 退役后语义改写,W5 勿按旧语义重写**);P1-1(缩范围)/2/3 + P1-4/P2-1 待排 —— 队列 = `.loop/backlog.md`。
+- **在做**:**V097(v0.9.7 daemon 生命周期重构 Codex 方案 + update)已进入开发** —— owner 2026-07-22 直驱「进入开发,提交 dev,发 PR」,规划调度 subagent 在 `/tmp/ccteam-v097`(branch `dev`)落地,PRD SoT = `docs-local/versions/v0-9-7/prd.md`(v4);A2A-W5(三场景真机 smoke + README/usage 重写)仍挂起;P1-1(缩范围)/2/3 + P2-1 待排(P1-4 已按 D7 作废)—— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
@@ -22,6 +22,7 @@
 | 事项 | 状态 |
 |---|---|
 | **tag + 部署** | **HELD** —— push 到 `main` 不等于发布,等 owner 显式「部署」 |
+| V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);开发走 `dev` 分支 + PR 人工审核,tag/部署仍 HELD |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
 | v0.9.6 docs 写权一次性授权(kimi 改 usage/orchestration/tech-design/README) | **已签核消耗** —— owner 2026-07-21 指定 kimi 更新全局文档、fable5 review;仅本版有效,写权常态仍归规划会话 |
 | v0.9.6 合 main | **已签核消耗** —— owner 2026-07-21「review 后合并 main,让 dev 和 main 保持一致」;fable5 review 三提交(3e6bca1/9c5f895/86b9788)后 ff 合并 |
