@@ -72,9 +72,9 @@
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
 
-### V097 daemon 生命周期收编 + 按渠道自更新(PRD DRAFT)
-- **状态**:gated(PRD DRAFT 2026-07-22 待 owner 拍板) · **冲突域**:`crates/ccteam-core(daemon) + crates/ccteam-cli + install.sh + Makefile` · **建议入口**:版本波(doc-first)
-- **背景**:owner 2026-07-22 指示按 `docs-local/research/codex-daemon-and-update.md` 重构 daemon 管理与 update;PRD 落 `docs-local/versions/v0-9-7/prd.md`(承接 v0.9.4 PRD F2/F3 并深化;npm 留 V094)。现状痛点:`ccteam stop` 对 systemd 托管 daemon 被 `Restart=always` 弹回、unit 定义双源漂移(Makefile vs install.sh,P1-4 属此类,拆卡时收编)、无 restart/update/InstallChannel、pid 记录无 start_time 防复用、ready probe 不带版本。
+### V097 daemon 生命周期重构(Codex 方案)+ 按渠道自更新(PRD DRAFT v3)
+- **状态**:gated(PRD DRAFT v3 2026-07-22,剩余决策 D1–D6 待 owner 拍板) · **冲突域**:`crates/ccteam-core(daemon) + crates/ccteam-cli + install.sh + Makefile` · **建议入口**:版本波(doc-first)
+- **背景**:owner 2026-07-22 指示按 `docs-local/research/codex-daemon-and-update.md` 重构 daemon 管理与 update,并同日拍板:**全线废除 systemd/launchd,Codex pid-detach(setsid + pidfile 权属 + socket 探测)是唯一 daemon 管理方式**(动因:macOS 无 systemd、WSL 默认没开;接受无崩溃自拉起/开机自启的 Codex 同款取舍)。PRD 落 `docs-local/versions/v0-9-7/prd.md`(v3;承接 v0.9.4 PRD F2/F3,npm 留 V094;§四 = Codex 代码函数级借鉴地图,pid.rs+测试直接搬,attribution 进 LICENSES.md)。现状痛点:`ccteam stop` 被 `Restart=always` 弹回、unit 双源漂移、无 restart/update/InstallChannel、pid 记录无 start_time、probe 不带版本 —— unit 面整体删除后 **P1-4 面随之消亡**(其临时软链已顶住本机)。
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
 
