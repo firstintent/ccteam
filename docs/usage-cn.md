@@ -260,7 +260,7 @@ ccteam init --in /path/to/repo # 在别处初始化
 ccteam init --slug demo        # 覆盖自动推断的 slug
 ccteam init --owner user:u123  # 多用户:把项目归属给某租户
 ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot ③ 偏好(交互菜单)
-ccteam config mcp              # 注册/刷新 ccteam MCP(四个 vendor 全写:Claude/Codex/Grok/OpenCode;无 TTY 用这个)
+ccteam config mcp              # 注册/刷新 ccteam MCP(五个 vendor 全写:Claude/Codex/Grok/OpenCode/Kimi;无 TTY 用这个)
 ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
 ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web
@@ -276,7 +276,7 @@ ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP �
 ```bash
 ccteam project ls                  # 列已知项目
 ccteam project show demo           # 项目完整状态 + 近期事件
-ccteam project new demo --team dev # 在 <projects_root>/dev-demo/ 下新建并 init
+ccteam project new demo            # 在 <projects_root>/demo/ 下新建并 init(撞名累加 demo2、demo3…)
 ccteam project stop demo           # 停该项目所有会话(可按 id 恢复;非删除)
 ccteam project rm demo             # 注销项目(仅摘登记 + 清 ccteam 状态)
 ccteam project rm demo --dry-run   # 先预览会停什么、删什么
@@ -285,18 +285,14 @@ ccteam project rm demo --purge     # 注销 + 删 ccteam 在项目里建的痕�
 
 `rm --purge` 只删 ccteam 建的(项目 `.ccteam/` + settings.local.json 里 ccteam 的 hook 段);**永远保留**你的 work-role、`CLAUDE.md`/`AGENTS.md`、`.env`、业务代码、你的 `.claude/settings.json`。
 
-### `session`(会话 + bot 注册)
+### `session`(会话)
 
 ```bash
-ccteam session ls                          # 列网关会话(SLUG·SID·ROLE·VENDOR·STATUS),标出 orphan
-ccteam session attach demo reviewer        # attach 到一个会话
-ccteam session pause demo / resume demo    # 暂停 / 恢复某项目派工(永不 kill 长会话)
-ccteam session persona demo reviewer -     # 用 stdin 整文件替换某角色的 .md
-ccteam session add-tool demo reviewer "Bash(git*)"   # 给角色加一条工具
-ccteam session register / bots / unregister …        # 脚本/无 daemon 时管 bot 注册
+ccteam session ls                # 列网关会话(SLUG·SID·ROLE·VENDOR·STATUS),标出 orphan
+ccteam session attach demo [sid] # attach 到 terminal 协议会话的 tmux pane
 ```
 
-> 换某会话的角色走 IM `/role <role>`(需要 daemon 内存态);CLI 的 `session role` 只打印这条指引。
+> `attach` 只对 `terminal` 协议会话有意义(有 tmux pane);默认 `stream-json` 会话无 pane——用 web 聊天台或 IM 驱动。换某会话的角色走 IM `/role <role>`。
 
 ### `role`(从插件市场装角色)
 
