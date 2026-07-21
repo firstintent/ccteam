@@ -99,7 +99,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     // surfacing as a silent timeout.
     let stderr_log = ccteam_home.join("daemon-case1.stderr.log");
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--tick-seconds", "1"])
+        .args(["start", "--no-web"])
         .env("HOME", fake_home)
         .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)
@@ -154,7 +154,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let _ = std::fs::remove_file(&heartbeat);
     let _ = std::fs::remove_file(&mcp_socket);
     let mut child2 = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
+        .args(["start", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)

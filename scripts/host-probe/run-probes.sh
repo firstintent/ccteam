@@ -374,7 +374,7 @@ STUB
         # Without this `ccteam init` call the project is invisible to
         # the daemon (it scans the registry, not projects_root
         # directly). V0.6.1 F127 manual-prover fix.
-        "$CCTEAM_BIN" init --in $PROJ --slug overnight-probe --team dev \
+        "$CCTEAM_BIN" init --in $PROJ --slug overnight-probe \
             >$ROOT/init.stdout 2>$ROOT/init.stderr || {
             echo "[probe/overnight] FAIL: ccteam init exit=$?"
             tail -20 $ROOT/init.stderr
@@ -405,7 +405,7 @@ YAML
         # the overnight probe stays strictly orchestrator-only and the
         # supervisor's `~/.ccteam/state/imd.heartbeat` doesn't touch
         # the real $HOME during the probe.
-        nohup "$CCTEAM_BIN" start --no-web --no-imd --tick-seconds 1 \
+        nohup "$CCTEAM_BIN" start --no-web --no-imd \
             >$ROOT/start.stdout 2>$ROOT/start.stderr &
         ORCH_PID=$!
         echo $ORCH_PID > $ROOT/orch.pid

@@ -92,10 +92,10 @@ fn t01_help_user_facing_only() {
     }
 }
 
-/// `t02` — `ccteam internal --help` enumerates the subcommands that
-/// previously lived at the top level (hook / mcp-serve / attach / peek /
-/// progress / resume / send / spawn) plus the v0.8.6 W4a additions
-/// (mux / probe-project / web).
+/// `t02` — `ccteam internal --help` enumerates the surviving internal
+/// subcommands (hook / mcp-serve / attach / peek / progress / mux / web /
+/// experience). The de-legacy pass removed `resume` / `send` / `spawn` /
+/// `probe-project` outright (pre-v1.0 = no back-compat shims).
 #[test]
 fn t02_internal_help_lists_subcommands() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
@@ -116,18 +116,23 @@ fn t02_internal_help_lists_subcommands() {
         "attach",
         "peek",
         "progress",
-        "resume",
-        "send",
-        "spawn",
-        // v0.8.6 W4a folded `mux` / `probe-project` / `web` into the
-        // hidden `internal` group too.
+        // v0.8.6 W4a folded `mux` / `web` into the hidden `internal` group.
         "mux",
-        "probe-project",
         "web",
     ] {
         assert!(
             stdout.contains(required),
             "ccteam internal --help should advertise `{required}`; got: {stdout}",
+        );
+    }
+
+    // Removed internal subcommands must NOT appear anymore.
+    for gone in ["resume", "send", "spawn", "probe-project"] {
+        let pattern = format!("  {gone} ");
+        assert!(
+            !stdout.contains(&pattern),
+            "ccteam internal --help should not list `{gone}` (de-legacy pass removed it); \
+             got: {stdout}",
         );
     }
 }

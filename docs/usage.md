@@ -263,7 +263,7 @@ ccteam init --in /path/to/repo # Initialize elsewhere.
 ccteam init --slug demo        # Override inferred slug.
 ccteam init --owner user:u123  # Multi-user: assign project ownership.
 ccteam config                  # One-time setup: MCP, IM bot, preferences.
-ccteam config mcp              # Register/refresh ccteam MCP for all four vendors; useful without TTY.
+ccteam config mcp              # Register/refresh ccteam MCP for all five vendors; useful without TTY.
 ccteam start                   # Start resident service; add & for background.
 ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token.
 ccteam start --no-web | --no-imd         # Gateway only / web only.
@@ -279,7 +279,7 @@ ccteam doctor                  # Install/dependency checks; --verify-mcp checks 
 ```bash
 ccteam project ls                  # List known projects.
 ccteam project show demo           # Full project status and recent events.
-ccteam project new demo --team dev # Create under <projects_root>/dev-demo/ and init.
+ccteam project new demo            # Create under <projects_root>/demo/ and init (collision appends demo2, demo3, …).
 ccteam project stop demo           # Stop all project sessions; resumable by id.
 ccteam project rm demo             # Deregister project and clear ccteam state.
 ccteam project rm demo --dry-run   # Preview what would stop/delete.
@@ -288,18 +288,14 @@ ccteam project rm demo --purge     # Deregister and remove ccteam-owned project 
 
 `rm --purge` removes only ccteam-owned traces: project `.ccteam/` and ccteam hook entries in `settings.local.json`. It **always keeps** your work roles, `CLAUDE.md` / `AGENTS.md`, `.env`, product code, and `.claude/settings.json`.
 
-### `session` (Sessions and Bot Registration)
+### `session` (Sessions)
 
 ```bash
-ccteam session ls                          # List gateway sessions; marks orphans.
-ccteam session attach demo reviewer        # Attach to a session.
-ccteam session pause demo / resume demo    # Pause/resume project dispatch; never kills long sessions.
-ccteam session persona demo reviewer -     # Replace a role .md with stdin.
-ccteam session add-tool demo reviewer "Bash(git*)"   # Add one tool rule to a role.
-ccteam session register / bots / unregister ...      # Manage bot registration for scripts/no daemon.
+ccteam session ls                # List gateway sessions; marks orphans.
+ccteam session attach demo [sid] # Attach to a terminal-protocol session's pane.
 ```
 
-> Change a live session's role from IM with `/role <role>` because it needs daemon in-memory state. CLI `session role` only prints this guidance.
+> `attach` only applies to `terminal`-protocol sessions (they have a tmux pane). Default `stream-json` sessions have no pane — drive them from the web chat console or IM. Change a live session's role from IM with `/role <role>`.
 
 ### `role` (Install Roles from the Marketplace)
 

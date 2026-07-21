@@ -53,7 +53,7 @@ fn spawn_test_daemon_with(
     let pidfile = ccteam_home.join("state").join("orchestrator.pid");
 
     let child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
+        .args(["start", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -270,7 +270,7 @@ fn shutdown_does_not_kill_tmux_sessions() {
 
     // Capture stderr so we can inspect it for unwanted tmux-kill messages.
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
+        .args(["start", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -464,7 +464,7 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
     let pidfile = ccteam_home.join("state").join("orchestrator.pid");
 
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd", "--tick-seconds", "1"])
+        .args(["start", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
