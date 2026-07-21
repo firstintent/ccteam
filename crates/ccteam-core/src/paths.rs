@@ -9,14 +9,33 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::state::ProjectState;
 
-/// Neutral starter for the global, user-owned routing notes. The file is
-/// transported verbatim by MCP `status`, so keep this descriptive rather than
-/// embedding a ccteam opinion about which vendor should handle which work.
+/// Starter for the global, user-owned routing notes. The file is transported
+/// verbatim by MCP `status`; the table below is explicitly marked as a SAMPLE
+/// to edit (owner decision 2026-07-21: a worked example beats a blank page),
+/// so ccteam still asserts no routing opinion — the user's edit is the point,
+/// and sample model names are expected to age in the user's hands.
 const DEFAULT_ROUTING_NOTES: &str = "# ccteam routing notes\n\n\
-No routing exceptions configured. Omit `model` to use the selected vendor's default.\n\n\
+Your division of labor, in your own words. Sessions that call `status` receive\n\
+this file verbatim; ccteam never parses, merges, or acts on it. Default\n\
+posture: omit `model` at spawn and ride the vendor's default — list only the\n\
+exceptions and upgrades below.\n\n\
+The table is a SAMPLE to edit, not a recommendation: model names age fast, and\n\
+your taste is the point. Cross-check exact model ids against the advisory\n\
+catalog in `status` before pinning one.\n\n\
+| Task type | vendor / model / effort | Why |\n\
+|---|---|---|\n\
+| Daily coding | codex / gpt-5.6-sol / medium | steady everyday grind |\n\
+| Hard problems | codex / gpt-5.6-sol / max | deep, long reasoning |\n\
+| Speed & search | grok / grok-4.5 / — | minute-scale answers |\n\
+| UI & interface work | claude / fable-5 / — | strongest design taste |\n\
+| Planning & architecture | claude / fable-5 / high | deepest decomposition |\n\
+| Vulnerabilities & security | claude / fable-5 / high | careful adversarial eye |\n\
+| Large refactors | claude / opus-4.8 / high | long-haul stability |\n\
+| Frontend games & 3D | kimi / kimi-k3 / — | strong spatial/visual work |\n\
+| Budget / open-model work | kimi / kimi-k3 / — | best cost-effectiveness |\n\n\
 <!--\n\
-Add only your vendor/model/effort exceptions here. A project can replace these\n\
-global notes with <project>/.ccteam/routing.md. Never store secrets in either\n\
+A project replaces these global notes entirely with its own\n\
+<project>/.ccteam/routing.md (never merged). Never store secrets in either\n\
 file: ccteam returns the selected file verbatim to sessions that call status.\n\
 -->\n";
 
