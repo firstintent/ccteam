@@ -35,6 +35,13 @@
 - **落地**:通知时机改 vendor turn 边界(pump 聚合中途叙述,`TurnCompleted/TurnFailed/Error` 才发,文案明示 child 已 idle+折叠计数);`notify: final(默认)/all/off`(bool 兼容);wait 等真边界不被叙述提前结束;session_* 全带服务端超时;ACP 也 mirror `chat_turn_completed` + meta `tokens_total`;list 加 `project/activity/limit` + 行瘦身 + task 首行派生 title;重启 reconcile 卷总。
 - **验证**:lib 基线 1435→1447/0;clippy 0;web 与 origin/main 同基线(3 `ws_*` env-flake 族不变);+12 定向测试(边界折叠 e2e / all·off 模式 / dedup 重放 / reconcile 卷总 / wait-vs-叙述 / list 过滤 / 派生 title / NotifyMode wire / 旧 bool watch 兼容);writeback 绿。未部署(tag+部署 HELD 不变)。
 
+### FB-2 subagent 事件污染 live model 外显与计费捕获
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness(claude_stream_json)` · **建议入口**:dev 会话
+- **背景**:owner 2026-07-22 实测(s106,spawn `--model fable`):主循环跑 Task subagent 期间 web 模型外显漂成 opus,subagent 结束后回落 fable;meta.json 与回落后的 status.json 均为 fable(污染瞬时)。stream-json 流里 subagent 的 assistant 事件与主循环同流,仅 `parent_tool_use_id` 可区分(`protocol.rs:261` 已解析,消费端零使用)。
+- **根因**:两处消费端不过滤:① status tap `claude_stream_json/mod.rs:228` Assistant 分支把任意 assistant 事件的 `message.model` 盖进 live status(→ status.json → /sessions + web statusline/composer 外显);② `claude_stream_json/translate.rs:120-126` `turn_model` 计费捕获同源,turn 尾事件若来自 subagent 会错价整 turn。
+- **规格**:model 身份只认主循环 —— 两处跳过 `parent_tool_use_id.is_some()` 的 assistant 事件;usage/token 聚合语义不动;开工时核 ACP 路(kimi/opencode)有无同类洞,有则同修。
+- **DoD**:先红后绿定向测试(带 parent_tool_use_id 的 assistant 事件不改 status.model / turn_model);`make test` 基线只增;writeback 绿。
+
 ### P1-1 codex turn 粒度折叠(范围已缩:仅记账/展示面)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(codex adapter)` · **建议入口**:dev 会话
 - **背景**:codex 叙述消息被当独立 turn 记账/展示(v0.9.2 遗留 P1)。**通知面已由 FB-1(e96bf56)按 turn 边界修复**;本卡余量 = turns.jsonl/展示侧的叙述折叠是否仍值得做,开工时先核现值再定。
@@ -59,8 +66,15 @@
 - **规格**:unit PATH(或注释指引)纳入 kimi 默认安装路径;不改其它运行时契约。
 - **DoD**:最低门(fmt + writeback)+ 本机 daemon 重启后 `kimi` 可解析留痕。
 
+### V094 npm 分发 · daemon 管理 · 自更新
 - **状态**:gated(owner 2026-07-17 暂缓,v0.9.5 先行) · **冲突域**:`install.sh + crates/ccteam-cli + Makefile` · **建议入口**:版本波(doc-first)
-- **背景**:PRD 已成文 `docs-local/versions/v0-9-4/prd.md`(DRAFT)。
+- **背景**:PRD 已成文 `docs-local/versions/v0-9-4/prd.md`(DRAFT)。2026-07-22 起其 daemon/update 范围由 V097 PRD 承接深化,本卡剩余主体 = npm 分发面(拍板时二者收敛)。
+- **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
+- **DoD**:—(gated)
+
+### V097 daemon 生命周期收编 + 按渠道自更新(PRD DRAFT)
+- **状态**:gated(PRD DRAFT 2026-07-22 待 owner 拍板) · **冲突域**:`crates/ccteam-core(daemon) + crates/ccteam-cli + install.sh + Makefile` · **建议入口**:版本波(doc-first)
+- **背景**:owner 2026-07-22 指示按 `docs-local/research/codex-daemon-and-update.md` 重构 daemon 管理与 update;PRD 落 `docs-local/versions/v0-9-7/prd.md`(承接 v0.9.4 PRD F2/F3 并深化;npm 留 V094)。现状痛点:`ccteam stop` 对 systemd 托管 daemon 被 `Restart=always` 弹回、unit 定义双源漂移(Makefile vs install.sh,P1-4 属此类,拆卡时收编)、无 restart/update/InstallChannel、pid 记录无 start_time 防复用、ready probe 不带版本。
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
 
