@@ -1778,16 +1778,18 @@ pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'stat
     ccteam_core::stall::classify_progress_stall(last_event, silent_s).verdict
 }
 
-/// One actionable hint line for a warn-or-higher project: where to check
-/// in on it (web chat console / IM), matching the stream-json default
-/// path — no pane to peek or attach.
-pub(crate) fn stall_takeover_hint(slug: &str, silent: &str) -> String {
-    format!("{slug} silent {silent} — open the web console or message it from IM to check in")
-}
-
-pub(crate) fn stall_takeover_hint_for_session(slug: &str, sid: &str, silent: &str) -> String {
+/// One check-in hint line for a stuck/stale session: where to look (web
+/// chat console / IM), matching the stream-json default path — no pane to
+/// peek or attach. Idle sessions never earn one (resume-by-sid: idle is
+/// the normal resting state).
+pub(crate) fn stall_takeover_hint_for_session(
+    slug: &str,
+    sid: &str,
+    activity: &str,
+    silent: &str,
+) -> String {
     format!(
-        "{slug} session {sid} silent {silent} — open /chat/s/{sid} on the web console \
+        "{slug} session {sid} {activity} {silent} — open /chat/s/{sid} on the web console \
          or message it from IM to check in"
     )
 }
@@ -3282,17 +3284,18 @@ mod tests {
             "stuck": true,
         });
         assert_eq!(stall_verdict(Some(&timeout), 0), "STUCK");
-        let hint = stall_takeover_hint("dev-checkout", "31m");
-        assert!(hint.contains("dev-checkout"), "hint names the slug: {hint}");
-        assert!(hint.contains("silent 31m"), "hint shows silence: {hint}");
+        let shint = stall_takeover_hint_for_session("dev-checkout", "s42", "stuck", "31m");
         assert!(
-            !hint.contains("ccteam internal"),
-            "hint must not point at the retired peek/attach takeover: {hint}",
+            shint.contains("dev-checkout") && shint.contains("stuck 31m"),
+            "session hint names slug + activity + silence: {shint}",
         );
-        let shint = stall_takeover_hint_for_session("dev-checkout", "s42", "31m");
         assert!(
             shint.contains("/chat/s/s42"),
             "session hint points at the web chat console: {shint}",
+        );
+        assert!(
+            !shint.contains("ccteam internal"),
+            "hint must not point at the retired peek/attach takeover: {shint}",
         );
     }
 

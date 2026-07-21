@@ -2114,30 +2114,30 @@ fn run_status() -> Result<()> {
         println!("  projects: (none — `ccteam project new <slug>` to create one, e.g. `ccteam project new demo`)");
     } else {
         println!("  projects ({}):", projects.len());
-        // Classify each project from the same file-backed progress truth that
-        // the JSON status and web Status rail read.
-        let mut needs_attention: Vec<(String, Option<String>, String)> = Vec::new();
+        // Session activity comes from the same file-backed progress truth the
+        // JSON status and web Status rail read. Aggregation here follows the
+        // resume-by-sid architecture: an idle session silent for days is the
+        // NORMAL resting state, never an alarm. Only a `stuck` session (the
+        // watchdog wrote a timeout event) or a `stale` one (turn started,
+        // no boundary, long silence) escalates the project verdict or earns
+        // a check-in hint.
+        let mut needs_attention: Vec<(String, String, &'static str, String)> = Vec::new();
         for p in &projects {
             let age = humanize_secs(p.age_seconds);
             let events =
                 ccteam_core::progress::read_all_events(&paths.progress_jsonl(&p.state.slug))
                     .unwrap_or_default();
             let now = chrono::Utc::now();
-            let project_fallback = events
+            // `last-event` = the project's most recent progress event, any
+            // session (what the label naturally means to a reader).
+            let last_event_h = events
                 .last()
-                .filter(|event| ccteam_core::progress::event_sid(event).is_none());
-            let fallback_activity = ccteam_core::stall::classify_progress_activity(
-                project_fallback,
-                p.stall_silent_seconds,
-                now,
-            );
-            let mut project_status = fallback_activity.status;
-            let mut attention_sid: Option<String> = None;
-            let mut attention_silent_seconds = fallback_activity
-                .event_age_seconds
-                .unwrap_or(p.stall_silent_seconds);
+                .and_then(|e| ccteam_core::stall::progress_event_age_seconds(e, now))
+                .map(humanize_secs)
+                .unwrap_or_else(|| "-".to_string());
 
-            let mut session_lines: Vec<(String, String, String, String, String)> = Vec::new();
+            let mut verdict = "OK";
+            let mut session_lines: Vec<(u64, String, String, String, String, String)> = Vec::new();
             if let Some(rows) = sessions_by_project.get(&p.state.slug) {
                 for s in rows {
                     let activity = ccteam_core::stall::classify_progress_activity_for_sid(
@@ -2146,16 +2146,21 @@ fn run_status() -> Result<()> {
                         p.stall_silent_seconds,
                         now,
                     );
-                    if progress_status_rank(activity.status) > progress_status_rank(project_status)
-                    {
-                        project_status = activity.status;
-                        attention_sid = Some(s.sid.clone());
-                        attention_silent_seconds =
-                            activity.event_age_seconds.unwrap_or(p.stall_silent_seconds);
+                    let act = activity.status.activity;
+                    if act == "stuck" || act == "stale" {
+                        let silent = humanize_secs(
+                            activity.event_age_seconds.unwrap_or(p.stall_silent_seconds),
+                        );
+                        needs_attention.push((p.state.slug.clone(), s.sid.clone(), act, silent));
+                        if act == "stuck" {
+                            verdict = "STUCK";
+                        } else if verdict == "OK" {
+                            verdict = "warn";
+                        }
                     }
                     let role = if s.role.is_empty() { "-" } else { &s.role };
                     let session_status = if daemon_up {
-                        activity.status.activity.to_string()
+                        act.to_string()
                     } else {
                         "registered (daemon down)".to_string()
                     };
@@ -2164,6 +2169,7 @@ fn run_status() -> Result<()> {
                         .map(humanize_secs)
                         .unwrap_or_else(|| "-".to_string());
                     session_lines.push((
+                        activity.event_age_seconds.unwrap_or(u64::MAX),
                         role.to_string(),
                         s.vendor.clone(),
                         session_status,
@@ -2172,31 +2178,25 @@ fn run_status() -> Result<()> {
                     ));
                 }
             }
+            // Most recently active first; never-seen sessions sink to the end.
+            session_lines.sort_by_key(|l| l.0);
 
-            let verdict = project_status.verdict;
-            let silent = humanize_secs(attention_silent_seconds);
-            if verdict != "OK" {
-                needs_attention.push((p.state.slug.clone(), attention_sid, silent.clone()));
-            }
             println!(
                 "    {:<32}  age {:>8}  last-event {:>8}  {}",
-                p.state.slug, age, silent, verdict
+                p.state.slug, age, last_event_h, verdict
             );
 
-            for (role, vendor, session_status, sid, last_event) in session_lines {
+            for (_, role, vendor, session_status, sid, last_event) in session_lines {
                 println!(
                     "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
                     role, vendor, session_status, sid, last_event
                 );
             }
         }
-        // One actionable hint line per warn-or-higher project pointing at
-        // the web chat console / IM (stream-json sessions have no pane).
-        for (slug, sid, silent) in &needs_attention {
-            let hint = match sid {
-                Some(sid) => commands::stall_takeover_hint_for_session(slug, sid, silent),
-                None => commands::stall_takeover_hint(slug, silent),
-            };
+        // One check-in hint per stuck/stale SESSION (idle projects and idle
+        // sessions are fine and stay quiet).
+        for (slug, sid, act, silent) in &needs_attention {
+            let hint = commands::stall_takeover_hint_for_session(slug, sid, act, silent);
             println!("    {hint}");
         }
     }
@@ -2246,14 +2246,6 @@ fn run_status() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn progress_status_rank(status: ccteam_core::stall::ProgressStallStatus) -> u8 {
-    match status.level {
-        "stuck" => 3,
-        "warn" => 2,
-        _ => 1,
-    }
 }
 
 /// v0.8.8 F3 — predicate for a LAN-reachable IPv4: a private

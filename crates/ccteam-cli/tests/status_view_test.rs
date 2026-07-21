@@ -253,8 +253,48 @@ fn status_classifies_nested_sessions_by_sid() {
         "project verdict must still escalate:\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("{slug} session s2 silent")),
-        "takeover hint must identify the stuck sid:\n{stdout}"
+        stdout.contains(&format!("{slug} session s2 stuck")),
+        "check-in hint must identify the stuck sid + activity:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("session s1 "),
+        "healthy session must not earn a check-in hint:\n{stdout}"
+    );
+}
+
+/// Resume-by-sid architecture: an idle session silent for days is the NORMAL
+/// resting state — the project stays OK and no check-in hint is printed.
+#[test]
+fn status_idle_silence_never_alarms() {
+    let (_tmp, root, projects_root, slug) = ephemeral_home("statusproj-idle");
+    let _daemon = fake_healthy_daemon(&root);
+    let paths = ccteam_core::CcteamPaths {
+        root: root.clone(),
+        projects_root: projects_root.clone(),
+    };
+    // s1's last event is an idle boundary (turn completed) six days ago.
+    ccteam_core::progress::append_event(
+        &paths.progress_jsonl(&slug),
+        &json!({
+            "event": ccteam_core::progress::CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "ts": (chrono::Utc::now() - chrono::Duration::days(6)).to_rfc3339(),
+        }),
+    )
+    .unwrap();
+
+    let stdout = run_status(&root, &projects_root);
+    let project_line = stdout
+        .lines()
+        .find(|line| line.contains(&slug) && !line.contains("session"))
+        .expect("project line");
+    assert!(
+        project_line.contains("OK") && project_line.contains("last-event"),
+        "idle-for-days project must stay OK:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("check in"),
+        "idle sessions must not produce check-in hints:\n{stdout}"
     );
 }
 
