@@ -33,7 +33,7 @@
 | Workspace version | `0.9.6` |
 | 测试 baseline | **口径**:确定性 `cargo test --workspace --exclude ccteam-web --lib` + `ccteam-web` 全量 + vitest + Playwright;**当前数字与 env-flake 族 = `.loop/state.md` + `.loop/verify/README.md`**(基线只增不减) |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.9.6 已落 `dev`(多 vendor 编排发现面:status vendor 面板(probe 下沉 `host_registry` + daemon-aware)+ advisory 模型目录三源(runtime last-seen/hub `models.json`/用户注释,永不当 spawn 白名单)+ routing notes(`<project>/.ccteam/routing.md` 覆盖 global、global 缺失生成不覆盖)透传 + spawn 失败发现面 + **compare 全链退役** + `is_claude_family`/`model_warning` 删除 + README 吉祥物入 web;未合 main、未 tag、未部署)**;v0.9.5 已落 main。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
+| 当前在做 | **v0.9.6 已落 `main`(多 vendor 编排发现面:status vendor 面板(probe 下沉 `host_registry` + daemon-aware)+ advisory 模型目录三源(runtime last-seen/hub `models.json`/用户注释,永不当 spawn 白名单)+ routing notes(`<project>/.ccteam/routing.md` 覆盖 global、global 缺失生成不覆盖)透传 + spawn 失败发现面 + **compare 全链退役** + `is_claude_family`/`model_warning` 删除 + README 吉祥物入 web + composer vendor·model 外显;未 tag、未部署)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
 
 > 主分支 HEAD 以 `git rev-parse origin/main` 为准(开发直落 `main`;`dev` 分支已滞后停用);历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 
@@ -90,7 +90,7 @@
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
 | **ccteam repo 零提示词类型插件(v0.9.0 起零例外)** | role/agent/skill/workflow 的**内容**一律不进 ccteam repo —— **零例外**(v0.9.0 废除 cto 内置工作流,删 `cto_role.md` 模板 + `CTO_ROLE_MD` 导出 + 一切种子路径)。所有 persona(自建 + agency-agents 等开源 + `fable-advisor`/`team-brain` 示例配方)住 **ccteam-hub**(`firstintent/ccteam-hub`),ccteam 从 hub 读 `index.json` + 取内容 + 装进用户项目 `.claude/{agents,skills}/`;编排智能 100% 用户空间(项目 `CLAUDE.md` vendor 原生随 vendor 进化白拿 + 用户/hub role)。既有用户项目里的 `.claude/agents/cto.md` 是**用户文件**,ccteam 不删不改 |
 | **跨项目记忆走官方接口** | Claude `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex `~/.codex/AGENTS.md` —— ccteam 只**读**,不代项目生成 |
-| **init 布局(v0.9.0:不种任何 role)** | 项目 `.ccteam/` 只 `state.json` + `workflow.yaml`;**`ccteam init` / IM `/newproject` / API create 不再种任何 role**,`.claude/agents/` 留空(默认会话 = roleless 裸 vendor 读项目 `CLAUDE.md`);ccteam 托管设置(hook + base)写 `.claude/settings.local.json`(**绝不碰用户 `.claude/settings.json`**);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor home-drift 检查)|
+| **init 布局(v0.9.0:不种任何 role)** | 项目 `.ccteam/` 由 init 只种 `state.json` + `workflow.yaml`(用户可选追加 `routing.md` 路由覆盖 —— init 不种,`status` 原文透传,v0.9.6);**`ccteam init` / IM `/newproject` / API create 不再种任何 role**,`.claude/agents/` 留空(默认会话 = roleless 裸 vendor 读项目 `CLAUDE.md`);ccteam 托管设置(hook + base)写 `.claude/settings.local.json`(**绝不碰用户 `.claude/settings.json`**);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor home-drift 检查)|
 | **新建项目 slug = 目录名 + 数字累加** | `slugify(目录名)`,撞名累加 `demo`/`demo2`/`demo3`(弃 `-{4hex}`);`ccteam init` 可在任意现有目录**就地**初始化;`--slug` 显式覆盖 |
 | **root README.md 必须英文 + 不含版本进展/状态** | README 始终反映当前能力,不夹版本时间轴 / baseline / shipped 日期 |
 
