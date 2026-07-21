@@ -207,7 +207,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
 
           <p className="mt-5 text-center text-[11px] text-text-dim leading-relaxed">
             令牌由终端运行{" "}
-            <code className="font-mono text-text-muted">ccteam web</code>{" "}
+            <code className="font-mono text-text-muted">ccteam status</code>{" "}
             时打印 · 登录状态保留 7 天
           </p>
         </form>
