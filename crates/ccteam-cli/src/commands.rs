@@ -1778,20 +1778,17 @@ pub(crate) fn stall_verdict(last_event: Option<&Value>, silent_s: u64) -> &'stat
     ccteam_core::stall::classify_progress_stall(last_event, silent_s).verdict
 }
 
-/// One check-in hint line for a stuck/stale session: where to look (web
-/// chat console / IM), matching the stream-json default path — no pane to
-/// peek or attach. Idle sessions never earn one (resume-by-sid: idle is
-/// the normal resting state).
+/// One terse attention line for a stuck/stale session: the fact plus the
+/// direct web-chat path (no repeated boilerplate — the `attention:` section
+/// header carries the "go look" meaning). Idle sessions never earn one
+/// (resume-by-sid: idle is the normal resting state).
 pub(crate) fn stall_takeover_hint_for_session(
     slug: &str,
     sid: &str,
     activity: &str,
     silent: &str,
 ) -> String {
-    format!(
-        "{slug} session {sid} {activity} {silent} — open /chat/s/{sid} on the web console \
-         or message it from IM to check in"
-    )
+    format!("{slug} {sid} {activity} {silent} → /chat/s/{sid}")
 }
 
 fn truncate(s: &str, n: usize) -> &str {
@@ -3285,17 +3282,9 @@ mod tests {
         });
         assert_eq!(stall_verdict(Some(&timeout), 0), "STUCK");
         let shint = stall_takeover_hint_for_session("dev-checkout", "s42", "stuck", "31m");
-        assert!(
-            shint.contains("dev-checkout") && shint.contains("stuck 31m"),
-            "session hint names slug + activity + silence: {shint}",
-        );
-        assert!(
-            shint.contains("/chat/s/s42"),
-            "session hint points at the web chat console: {shint}",
-        );
-        assert!(
-            !shint.contains("ccteam internal"),
-            "hint must not point at the retired peek/attach takeover: {shint}",
+        assert_eq!(
+            shint, "dev-checkout s42 stuck 31m → /chat/s/s42",
+            "terse attention line: fact + direct web-chat path, no boilerplate",
         );
     }
 

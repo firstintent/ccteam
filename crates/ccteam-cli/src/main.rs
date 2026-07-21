@@ -2193,11 +2193,15 @@ fn run_status() -> Result<()> {
                 );
             }
         }
-        // One check-in hint per stuck/stale SESSION (idle projects and idle
-        // sessions are fine and stay quiet).
-        for (slug, sid, act, silent) in &needs_attention {
-            let hint = commands::stall_takeover_hint_for_session(slug, sid, act, silent);
-            println!("    {hint}");
+        // An `attention:` section appears only when a session is stuck or
+        // stale — one terse line each (idle projects and sessions stay quiet).
+        if !needs_attention.is_empty() {
+            println!();
+            println!("  attention:");
+            for (slug, sid, act, silent) in &needs_attention {
+                let hint = commands::stall_takeover_hint_for_session(slug, sid, act, silent);
+                println!("    {hint}");
+            }
         }
     }
     println!();

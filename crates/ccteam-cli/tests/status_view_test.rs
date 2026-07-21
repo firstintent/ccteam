@@ -253,12 +253,12 @@ fn status_classifies_nested_sessions_by_sid() {
         "project verdict must still escalate:\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("{slug} session s2 stuck")),
-        "check-in hint must identify the stuck sid + activity:\n{stdout}"
+        stdout.contains("attention:") && stdout.contains(&format!("{slug} s2 stuck")),
+        "attention section must identify the stuck sid + activity:\n{stdout}"
     );
     assert!(
-        !stdout.contains("session s1 "),
-        "healthy session must not earn a check-in hint:\n{stdout}"
+        !stdout.contains("/chat/s/s1"),
+        "healthy session must not earn an attention line:\n{stdout}"
     );
 }
 
@@ -293,8 +293,8 @@ fn status_idle_silence_never_alarms() {
         "idle-for-days project must stay OK:\n{stdout}"
     );
     assert!(
-        !stdout.contains("check in"),
-        "idle sessions must not produce check-in hints:\n{stdout}"
+        !stdout.contains("attention:"),
+        "idle sessions must not produce an attention section:\n{stdout}"
     );
 }
 
