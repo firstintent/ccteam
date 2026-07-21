@@ -212,8 +212,9 @@ impl ProjectState {
     }
 
     /// Like `initial` but lets the caller pin the team. Used by
-    /// `bootstrap_project` so `ccteam project new --team <name>` carries
-    /// through to state.json.
+    /// `bootstrap_project` so a caller-chosen team carries through to
+    /// state.json (the CLI/gateway/web always pass the `dev` default; the
+    /// team is no longer a `project new` flag).
     pub fn initial_for_team(slug: String, team: String) -> Self {
         let now = Utc::now();
         // V0.4.6 F91 — `cost_used_usd` is deprecated but still required

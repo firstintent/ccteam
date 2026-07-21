@@ -208,9 +208,9 @@ fn doctor_help_hides_migration_flags_but_keeps_verify_mcp_visible() {
     assert!(out.status.success(), "ccteam doctor --help should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Historical one-shot migration / repair flags must no longer clutter
-    // bare `--help` (they still work when passed explicitly — see
-    // doctor_codex_test.rs / doctor_cost_orphan_test.rs / etc.).
+    // Historical one-shot migration / repair flags were removed outright
+    // (pre-v1.0 = no back-compat shims), so `--help` must not advertise
+    // any of them.
     for hidden in [
         "--tool-surface",
         "--install-memory-bridge",

@@ -87,7 +87,7 @@ smoke. It now:
    prints `backgrounded · <id>` + writes a synthetic
    `state.json`, so the orchestrator's `poll_completions` emits
    `agent_done` without burning real LLM cost.
-3. Backgrounds `ccteam start --no-web --tick-seconds 1`, drops a
+3. Backgrounds `ccteam start --no-web`, drops a
    trigger marker, polls `progress.jsonl` for both `agent_spawn`
    and `agent_done` (60s deadline).
 4. Exit codes: `0` = both events, `2` = spawn only (partial), `1` =

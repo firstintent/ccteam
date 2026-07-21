@@ -1,14 +1,13 @@
-//! v0.8.22 — bare `ccteam doctor` readiness checkup.
+//! Bare `ccteam doctor` readiness checkup.
 //!
-//! Before this module existed, a bare `ccteam doctor` (no flags) only ran
-//! the implicit pricing-staleness check (`commands::run_doctor`'s
-//! `any_mode == false` branch) plus a daemon-health line, while the
-//! genuinely useful "is my machine ready to run ccteam" checks (claude /
-//! codex binaries, tmux, MCP registration) hid behind ~20 opt-in flags
-//! that also cluttered `--help` (review: `docs/research/` v0.8.21 CLI
-//! audit §二 item 3). This module gives bare `ccteam doctor` one
-//! `[PASS]/[WARN]/[FAIL]/[SKIP]` line per readiness check + a summary
-//! line, and reports exit code 1 iff any check is FAIL.
+//! A bare `ccteam doctor` (no flags) reports the "is my machine ready to
+//! run ccteam" checks — the five vendor binaries (claude / codex / grok /
+//! opencode / kimi) and their auth, tmux, MCP registration, daemon
+//! health, pricing staleness, and `~/.ccteam` home-layout drift — as one
+//! `[PASS]/[WARN]/[FAIL]/[SKIP]` line per check plus a summary line, and
+//! reports exit code 1 iff any check is FAIL. `main::run_doctor` calls
+//! [`run_readiness_checkup`] for every invocation that is not
+//! `--verify-mcp`.
 //!
 //! Every probe here is read-only: it never starts/stops/restarts the
 //! daemon (`ccteam_core::check_daemon_health` is a read-only socket
@@ -19,12 +18,11 @@
 //! only when asked" red line).
 //!
 //! The historical one-shot migration / repair flags (`--migrate-*`,
-//! `--install-*`, `--reset-shipped-teams`, `--gc-claude-jobs`, ...) still
-//! dispatch through `commands::run_doctor` completely unchanged — this
-//! module only intercepts the *bare* invocation (see
-//! [`is_bare_invocation`]). `--verify-mcp` (the MCP tool-surface / STUB
-//! invariant self-check CLAUDE.md calls out by name) is a different
-//! concern (dev/CI invariant, not end-user readiness) and is left alone.
+//! `--install-*`, `--reset-shipped-teams`, `--gc-claude-jobs`, ...) were
+//! removed outright (pre-v1.0 = no back-compat shims). `--verify-mcp`
+//! (the MCP tool-surface / STUB invariant self-check CLAUDE.md calls out
+//! by name) is a different concern (dev/CI invariant, not end-user
+//! readiness) and short-circuits in `main::run_doctor` before this.
 
 use std::process::Command;
 
@@ -65,36 +63,6 @@ impl CheckLine {
             detail: detail.into(),
         }
     }
-}
-
-/// Mirrors `commands::run_doctor`'s own `any_mode` boolean (kept in sync
-/// by hand — `commands.rs` is the SoT for `DoctorOptions`, this is a
-/// read-only re-derivation so `ccteam-cli::main` can decide, BEFORE
-/// calling into `commands::run_doctor`, whether to run the new readiness
-/// checkup instead of the legacy dispatch). `verify_mcp` /
-/// `check_codex_auto_critic` are included defensively even though
-/// `main::run_doctor` already short-circuits on those before reaching
-/// this check.
-pub fn is_bare_invocation(opts: &crate::commands::DoctorOptions) -> bool {
-    let any_mode = opts.tool_surface
-        || opts.install_memory_bridge
-        || opts.reset_shipped_teams
-        || opts.validate_team.is_some()
-        || opts.migrate_recommended_agents
-        || opts.screenshot_smoke.is_some()
-        || opts.migrate_v041_to_v042
-        || opts.migrate_workflow_to_ccteam_dir
-        || opts.gc_claude_jobs
-        || opts.update_hooks
-        || opts.check_pricing_version
-        || opts.check_codex_version
-        || opts.check_codex_auth
-        || opts.check_codex_auto_critic
-        || opts.check_cost_orphan
-        || opts.install_hooks
-        || opts.migrate_hook_commands
-        || opts.verify_mcp;
-    !any_mode
 }
 
 /// Run the full readiness checkup and render it. Returns `(report,
@@ -516,9 +484,7 @@ fn check_daemon(paths: &CcteamPaths) -> CheckLine {
 }
 
 /// V0.5.0 F92's staleness threshold (>180 days) re-derived per vendor —
-/// pure readout, always WARN-max (never fails the checkup). The
-/// detailed per-vendor breakdown remains available via the (now hidden
-/// but still functional) `ccteam doctor --check-pricing-version` flag.
+/// pure readout, always WARN-max (never fails the checkup).
 fn check_pricing() -> CheckLine {
     const WARN_DAYS: i64 = 180;
     let today = chrono::Utc::now().date_naive();
@@ -538,7 +504,7 @@ fn check_pricing() -> CheckLine {
             "pricing tables",
             format!(
                 "embedded rate sheet is {age}d old (>{WARN_DAYS}d) — upgrade ccteam for \
-                 current pricing (details: `ccteam doctor --check-pricing-version`)"
+                 current pricing"
             ),
         ),
         Some(age) => CheckLine::new(
@@ -555,10 +521,10 @@ fn check_pricing() -> CheckLine {
 }
 
 /// `~/.ccteam` home-layout drift, re-derived from
-/// `ccteam_core::canonical_home_dirs()` (same manifest
-/// `commands::render_home_drift_line` uses). SKIP when the home doesn't
-/// exist yet (fresh install — nothing to compare); otherwise WARN on any
-/// top-level dir the current architecture no longer writes.
+/// `ccteam_core::canonical_home_dirs()` (the init-time directory
+/// manifest). SKIP when the home doesn't exist yet (fresh install —
+/// nothing to compare); otherwise WARN on any top-level dir the current
+/// architecture no longer writes.
 fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
     if !paths.root.exists() {
         return CheckLine::new(
@@ -612,44 +578,13 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bare_invocation_is_true_for_default_options() {
-        assert!(is_bare_invocation(
-            &crate::commands::DoctorOptions::default()
-        ));
-    }
-
-    #[test]
-    fn bare_invocation_is_false_when_any_flag_set() {
-        let opts = crate::commands::DoctorOptions {
-            check_pricing_version: true,
-            ..Default::default()
-        };
-        assert!(!is_bare_invocation(&opts));
-
-        let opts = crate::commands::DoctorOptions {
-            verify_mcp: true,
-            ..Default::default()
-        };
-        assert!(!is_bare_invocation(&opts));
-
-        let opts = crate::commands::DoctorOptions {
-            validate_team: Some("dev".to_string()),
-            ..Default::default()
-        };
-        assert!(!is_bare_invocation(&opts));
-    }
-
-    // `run_readiness_checkup` itself is exercised end-to-end (with full
-    // `CCTEAM_CLAUDE_BIN` / `CLAUDE_CONFIG_HOME` / `CCTEAM_HOME` / `HOME`
-    // sandboxing) by `crates/ccteam-cli/tests/doctor_readiness_test.rs` —
-    // deliberately NOT here: several of its probes (claude/codex/tmux
-    // binaries, `~/.claude.json`, `~/.ccteam`) read ambient process env /
-    // the real filesystem when not overridden, which a lib `#[cfg(test)]
-    // mod tests` unit test (sharing the test binary's real env with every
-    // other lib test) cannot safely sandbox. See CLAUDE.md §六.
-}
+// `run_readiness_checkup` (the only public entry here now that the bare
+// invocation is decided inline in `main::run_doctor`) is exercised
+// end-to-end (with full `CCTEAM_CLAUDE_BIN` / `CLAUDE_CONFIG_HOME` /
+// `CCTEAM_HOME` / `HOME` sandboxing) by
+// `crates/ccteam-cli/tests/doctor_readiness_test.rs` — deliberately NOT
+// as a lib `#[cfg(test)] mod tests` here: several of its probes
+// (claude/codex/tmux binaries, `~/.claude.json`, `~/.ccteam`) read
+// ambient process env / the real filesystem when not overridden, which a
+// lib unit test (sharing the test binary's real env with every other lib
+// test) cannot safely sandbox. See CLAUDE.md §六.
