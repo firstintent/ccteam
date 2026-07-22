@@ -2698,32 +2698,14 @@ impl Gateway {
         let mut options: Vec<MessageOption> = visible
             .into_iter()
             .map(|s| {
-                // Consistent leading glyph (✓ current / ▸ others) so the picker
-                // reads as a left-aligned list; ` · ` separators instead of the
-                // old colon-jammed `sid:vendor:role` (owner req).
-                let mark = if Some(&s.id) == current_sid.as_ref() {
-                    "✓ "
+                // The text rows already carry vendor / role / model / title.
+                // Buttons are action-only: sid, plus a marker for the current
+                // session. Their callback payload remains unchanged.
+                let label = if Some(&s.id) == current_sid.as_ref() {
+                    format!("✓ {}", s.id)
                 } else {
-                    "▸ "
+                    s.id.clone()
                 };
-                // Roleless sessions (the default) OMIT the role segment — the
-                // old `· —` placeholder read as a broken field on every row
-                // (owner feedback tg-6955); a named role keeps its ` · role`.
-                let role = if s.role.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", s.role)
-                };
-                let title = self
-                    .session_title(s)
-                    .map(|t| format!(" 「{t}」"))
-                    .unwrap_or_default();
-                // Readability trim by display width (callback_data, below, is
-                // the hard 64B cap).
-                let label = trim_label_to_width(
-                    &format!("{mark}{} · {}{role}{title}", s.id, vendor_str(s.vendor)),
-                    PICKER_LABEL_MAX_WIDTH,
-                );
                 MessageOption {
                     data: format!("nav:use:{}", s.id),
                     label,
@@ -5664,6 +5646,11 @@ impl Gateway {
             };
             return Self::append_history_section(head, &history);
         }
+        let activity_by_sid = if is_web {
+            std::collections::HashMap::new()
+        } else {
+            self.session_activity_snapshot(&visible)
+        };
         // Render each visible session's row (async `thread_status`) once,
         // keyed by sid for the IM tree; web keeps the flat bare-row feed.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
@@ -5691,7 +5678,11 @@ impl Gateway {
                 continue;
             }
             let vendor_tag = format!("[{}]", vendor_str(s.vendor));
-            row = format!("{vendor_tag:<10} {row}");
+            let activity = activity_by_sid
+                .get(&s.id)
+                .map(String::as_str)
+                .unwrap_or("idle");
+            row = format!("{vendor_tag:<10} {} · {row}", activity_marker(activity));
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host…
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
@@ -5802,6 +5793,64 @@ impl Gateway {
             .get(&s.project)
             .and_then(|dir| read_session_meta(dir, &s.id).ok())
             .and_then(|m| m.title)
+    }
+
+    /// Classify live sessions from the same file-backed progress truth and
+    /// with the same `working|idle|stale|stuck` semantics as MCP
+    /// `session_list`. Reads each distinct project's progress stream once.
+    fn session_activity_snapshot(
+        &self,
+        sessions: &[&GatewaySession],
+    ) -> std::collections::HashMap<String, String> {
+        let fallback_by_project: std::collections::HashMap<String, u64> = self
+            .project_paths
+            .as_ref()
+            .and_then(|paths| ccteam_core::collect_projects(paths).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|project| (project.state.slug, project.stall_silent_seconds))
+            .collect();
+        let mut project_events: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
+            std::collections::HashMap::new();
+        for session in sessions {
+            project_events
+                .entry(session.project.clone())
+                .or_insert_with(|| {
+                    let events = self
+                        .project_paths
+                        .as_ref()
+                        .map(|paths| {
+                            ccteam_core::progress::read_all_events(
+                                &paths.progress_jsonl(&session.project),
+                            )
+                            .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    let silent = fallback_by_project
+                        .get(&session.project)
+                        .copied()
+                        .unwrap_or(0);
+                    (events, silent)
+                });
+        }
+        let now = chrono::Utc::now();
+        sessions
+            .iter()
+            .map(|session| {
+                let (events, silent) = project_events
+                    .get(&session.project)
+                    .expect("every requested project was classified");
+                let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+                    events,
+                    &session.id,
+                    *silent,
+                    now,
+                )
+                .status
+                .activity;
+                (session.id.clone(), activity.to_string())
+            })
+            .collect()
     }
 
     /// Up to `limit` most-recently-ended sessions across `slugs` that `chat`
@@ -6050,6 +6099,57 @@ impl Gateway {
             if !usage.is_empty() {
                 out.push_str("\n   ");
                 out.push_str(&usage);
+            }
+        }
+
+        // Direct delegated children belong on the root's deep status card:
+        // their work explains why an otherwise-idle parent is still waiting.
+        // Only live, chat-visible children participate. Deeper descendants
+        // are intentionally collapsed to a count to keep the phone card small.
+        let mut direct_children: Vec<&GatewaySession> = visible
+            .iter()
+            .copied()
+            .filter(|child| child.parent_sid.as_deref() == Some(s.id.as_str()))
+            .collect();
+        if !direct_children.is_empty() {
+            direct_children.sort_by_key(|child| session_index(&child.id));
+            let child_activity = self.session_activity_snapshot(&direct_children);
+            out.push_str("\n   👥 直接子会话:");
+            for child in &direct_children {
+                let activity = child_activity
+                    .get(&child.id)
+                    .map(String::as_str)
+                    .unwrap_or("idle");
+                let title = self
+                    .session_title(child)
+                    .and_then(|title| truncate_title(&title))
+                    .unwrap_or_else(|| "—".to_string());
+                out.push_str(&format!(
+                    "\n      · {} · {} · {} · {title}",
+                    child.id,
+                    vendor_str(child.vendor),
+                    activity_marker(activity)
+                ));
+            }
+
+            let mut descendants: HashSet<String> = direct_children
+                .iter()
+                .map(|child| child.id.clone())
+                .collect();
+            let mut frontier: Vec<String> = descendants.iter().cloned().collect();
+            while let Some(parent) = frontier.pop() {
+                for descendant in &visible {
+                    if descendant.id != s.id
+                        && descendant.parent_sid.as_deref() == Some(parent.as_str())
+                        && descendants.insert(descendant.id.clone())
+                    {
+                        frontier.push(descendant.id.clone());
+                    }
+                }
+            }
+            let deeper = descendants.len().saturating_sub(direct_children.len());
+            if deeper > 0 {
+                out.push_str(&format!("\n      … 另有 {deeper} 个更深后代"));
             }
         }
 
@@ -7710,6 +7810,16 @@ fn vendor_str(v: AgentVendor) -> &'static str {
     }
 }
 
+fn activity_marker(activity: &str) -> &'static str {
+    match activity {
+        "working" => "🟡 working",
+        "idle" => "🟢 idle",
+        "stale" => "🟠 stale",
+        "stuck" => "🔴 stuck",
+        _ => "⚪ unknown",
+    }
+}
+
 /// v0.8.23 review §3.2-5 (item 2a) — the compact "which session just spoke"
 /// context line (`→ <slug>/<sid> (<role>)`), shared by the turn-answer echo
 /// (the detached event pump, IM only) and the `/status` "you are here"
@@ -8659,34 +8769,6 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 /// button whose payload would exceed it; slugs/sids are short, so this only
 /// guards a pathological slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
-
-/// Readability cap on a picker button label, in DISPLAY cells (CJK wide = 2)
-/// — not chars: a 48-char all-CJK title is ~2× the visual length of a Latin
-/// one, which both overflows phones harder and defeats the tail-padding
-/// alignment below.
-const PICKER_LABEL_MAX_WIDTH: usize = 48;
-
-/// Trim `label` to at most `max` display cells, ellipsized. Cell widths come
-/// from `unicode-width` (CJK = 2, else mostly 1) — approximate for Telegram's
-/// proportional fonts, where exact alignment is impossible cross-client.
-fn trim_label_to_width(label: &str, max: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if label.width() <= max {
-        return label.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0usize;
-    for c in label.chars() {
-        let cw = c.width().unwrap_or(0);
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('…');
-    out
-}
 
 /// Right-pad every picker label to the set's widest row so Telegram's
 /// centre-aligned button text reads as a LEFT-aligned list (owner req,
@@ -12681,18 +12763,17 @@ mod tests {
         assert!(mock[0].contains("s2:alpha:Claude:reviewer"), "{}", mock[0]);
     }
 
-    /// tg-6955 (owner req) — session-picker button labels: a roleless
-    /// session (the v0.9.0 default) drops the old `· —` role placeholder
-    /// entirely, and the option set is tail-padded to ONE display width with
-    /// U+2800 braille blanks (Telegram strips real trailing spaces) so the
-    /// centre-aligned button text reads as a left-aligned list.
+    /// `/sessions` text owns the session information; picker buttons are a
+    /// complementary action surface with only the sid and a current marker.
+    /// Tail-padding remains visual-only so Telegram left-aligns the labels.
     #[tokio::test]
-    async fn session_picker_labels_align_and_omit_empty_role() {
+    async fn session_picker_labels_are_compact_actions() {
         use unicode_width::UnicodeWidthStr;
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
-        // One roleless session (short label) + one with a role (wider label).
+        // One roleless session + one named/title-bearing session. Neither
+        // button should repeat the facets/title carried by the text rows.
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -12701,21 +12782,30 @@ mod tests {
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
+        gateway.rename_session("s2", "A long review title").unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let opts = gateway.session_switch_options(&chat, false);
         assert_eq!(opts.len(), 2, "{opts:?}");
         let s1 = opts.iter().find(|o| o.id == "s1").unwrap();
         let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
-        // Roleless → `sid · vendor`, no `· —` placeholder.
         let s1_text = s1.label.trim_end_matches('\u{2800}');
-        assert!(!s1_text.contains('—'), "no role placeholder: {s1_text:?}");
-        assert!(s1_text.ends_with("s1 · claude"), "bare row: {s1_text:?}");
-        // A named role keeps its segment.
-        assert!(
-            s2.label.contains(" · reviewer"),
-            "role kept: {:?}",
-            s2.label
-        );
+        let s2_text = s2.label.trim_end_matches('\u{2800}');
+        assert_eq!(s1_text, "s1");
+        assert_eq!(s2_text, "✓ s2");
+        for label in [s1_text, s2_text] {
+            assert!(
+                !label.contains("claude"),
+                "no vendor duplication: {label:?}"
+            );
+            assert!(
+                !label.contains("reviewer"),
+                "no role duplication: {label:?}"
+            );
+            assert!(
+                !label.contains("review title"),
+                "no title duplication: {label:?}"
+            );
+        }
         // Both labels padded to the same display width, with braille blanks.
         assert_eq!(
             s1.label.as_str().width(),
@@ -12729,20 +12819,30 @@ mod tests {
         );
     }
 
-    /// The picker-label helpers: the trim counts CJK as two display cells
-    /// (so an all-CJK title trims commensurately with Latin), and the
-    /// padding equalizes display width across an option set.
+    #[tokio::test]
+    async fn gateway_sessions_rows_show_activity_marker() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let listing = gateway
+            .handle_text("mock", "chat-1", "alice", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            listing[0].contains("[claude]   🟢 idle · s1:alpha:Claude:reviewer"),
+            "activity marker belongs in the information-rich text row: {listing:?}"
+        );
+    }
+
+    /// Picker-label padding equalizes display width across an option set.
     #[test]
-    fn picker_label_width_helpers() {
+    fn picker_label_padding_equalizes_display_width() {
         use unicode_width::UnicodeWidthStr;
-        // 26 CJK chars = 52 cells → trimmed under the 48-cell cap + ellipsis.
-        let long = "调".repeat(26);
-        let trimmed = trim_label_to_width(&long, 48);
-        assert!(trimmed.ends_with('…'), "{trimmed:?}");
-        assert!(trimmed.as_str().width() <= 48, "{trimmed:?}");
-        // Under the cap → untouched (48 chars of Latin is exactly 48 cells).
-        let latin = "a".repeat(48);
-        assert_eq!(trim_label_to_width(&latin, 48), latin);
         // Padding: mixed CJK/Latin rows end up the same display width.
         let mut opts = vec![
             MessageOption {
@@ -12867,7 +12967,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             bare,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
 
         // Now report a model + usage → suffix appears, rendered the same
@@ -12888,7 +12988,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -12908,7 +13008,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
     }
 
@@ -12969,7 +13069,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\n[claude]   s2:alpha:Claude:qa\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s2:alpha:Claude:qa\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -12989,7 +13089,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ [claude]   s1:alpha:Claude:reviewer\n[claude]   s2:alpha:Claude:qa"],
+            vec!["📁 当前项目: alpha\n⏳ [claude]   🟢 idle · s1:alpha:Claude:reviewer\n[claude]   🟢 idle · s2:alpha:Claude:qa"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -13131,6 +13231,79 @@ mod tests {
             "stuck state: {stuck:?}"
         );
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
+    }
+
+    #[tokio::test]
+    async fn gateway_status_lists_a_working_direct_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+        let progress = ccteam_core::progress::build_chat_turn_user_prompt_event(
+            "researcher",
+            &child,
+            "child-turn",
+            "investigate",
+        );
+        ccteam_core::progress::append_event(&paths.progress_jsonl("alpha"), &progress).unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains(
+                "👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation"
+            ),
+            "working child is visible from its root status: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_without_children_keeps_existing_card() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![format!(
+                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                proj.path().display()
+            )]
+        );
     }
 
     /// v0.8.19 `/status` — a roleless session shows `—` for the role, and a
@@ -13991,7 +14164,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner_sees,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -14035,7 +14208,7 @@ mod tests {
         .await;
         assert_eq!(
             seen,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
@@ -14211,7 +14384,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude:reviewer\n[codex]    s1:beta:Codex:api"]
+            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[codex]    🟢 idle · s1:beta:Codex:api"]
         );
 
         let use_first = gateway
@@ -14285,7 +14458,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\n[claude]   s4:beta:Claude:qa\n[codex]    s3:beta:Codex:api\n[codex]    s2:alpha:Codex:docs\n[claude]   s1:alpha:Claude:reviewer"
+                "📁 当前项目: beta\n[claude]   🟢 idle · s4:beta:Claude:qa\n[codex]    🟢 idle · s3:beta:Codex:api\n[codex]    🟢 idle · s2:alpha:Codex:docs\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"
             ]
         );
         let projects = gateway
@@ -14708,7 +14881,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude:reviewer\n[claude]   s1:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -14782,7 +14955,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\n[claude]   s1:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -15248,7 +15421,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
 
         // /cd to beta, where no session exists yet, clears the active session.
@@ -15283,7 +15456,7 @@ mod tests {
         // empty role field (`s2:beta:Claude:` + title).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\n[claude]   s2:beta:Claude: 「where am i」\n[claude]   s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude: 「where am i」\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
     }
 
@@ -15642,7 +15815,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:reviewer 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer 「hi」"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -15715,7 +15888,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「hi」"]
         );
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
@@ -15819,7 +15992,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「my custom title」"]
+            vec![
+                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
+            ]
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -15833,7 +16008,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing2,
-            vec!["📁 当前项目: alpha\n[claude]   s1:alpha:Claude:cto 「my custom title」"],
+            vec![
+                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
+            ],
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -16946,8 +17123,8 @@ mod tests {
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
         // Parent row precedes the indented child row.
-        let pline = format!("[claude]   {parent}:alpha:Claude:");
-        let cline = format!("└─ [claude]   {child}:alpha:Claude:");
+        let pline = format!("[claude]   🟢 idle · {parent}:alpha:Claude:");
+        let cline = format!("└─ [claude]   🟢 idle · {child}:alpha:Claude:");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
