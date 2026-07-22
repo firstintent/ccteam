@@ -119,3 +119,162 @@ describe("effortKeyOf (backend effort token → dictionary key)", () => {
     expect(effortKeyOf("weird")).toBeNull();
   });
 });
+
+type HookStateSetter = (value: unknown | ((previous: unknown) => unknown)) => void;
+
+function createHookHarness() {
+  const slots: unknown[] = [];
+  const dependencies: Array<readonly unknown[] | undefined> = [];
+  let cursor = 0;
+  let pendingEffects: Array<() => void | (() => void)> = [];
+
+  const changed = (index: number, next: readonly unknown[] | undefined) => {
+    const previous = dependencies[index];
+    dependencies[index] = next;
+    if (!next || !previous || next.length !== previous.length) return true;
+    return next.some((value, offset) => !Object.is(value, previous[offset]));
+  };
+
+  const useState = (initial: unknown) => {
+    const index = cursor++;
+    if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
+    const setState: HookStateSetter = (value) => {
+      slots[index] = typeof value === "function" ? value(slots[index]) : value;
+    };
+    return [slots[index], setState];
+  };
+  const useRef = (initial: unknown) => {
+    const index = cursor++;
+    if (!(index in slots)) slots[index] = { current: initial };
+    return slots[index];
+  };
+  const useEffect = (effect: () => void | (() => void), deps?: readonly unknown[]) => {
+    const index = cursor++;
+    if (changed(index, deps)) pendingEffects.push(effect);
+  };
+  const useMemo = (factory: () => unknown, deps?: readonly unknown[]) => {
+    const index = cursor++;
+    if (changed(index, deps)) slots[index] = factory();
+    return slots[index];
+  };
+  const useCallback = (callback: unknown, deps?: readonly unknown[]) => {
+    const index = cursor++;
+    if (changed(index, deps)) slots[index] = callback;
+    return slots[index];
+  };
+
+  return {
+    hooks: {
+      useState,
+      useRef,
+      useEffect,
+      useLayoutEffect: useEffect,
+      useMemo,
+      useCallback,
+    },
+    render<T>(component: () => T): T {
+      cursor = 0;
+      pendingEffects = [];
+      const tree = component();
+      const effects = pendingEffects;
+      pendingEffects = [];
+      for (const effect of effects) effect();
+      return tree;
+    },
+  };
+}
+
+function collectElementText(value: unknown): string[] {
+  if (typeof value === "string" || typeof value === "number") return [String(value)];
+  if (Array.isArray(value)) return value.flatMap(collectElementText);
+  if (!value || typeof value !== "object") return [];
+  const props = (value as { props?: Record<string, unknown> }).props;
+  if (!props) return [];
+  const ownContent = typeof props.content === "string" ? [props.content] : [];
+  return [...ownContent, ...collectElementText(props.children)];
+}
+
+describe("SessionView reconnect history reseed", () => {
+  it("refetches authoritative history and restores an answer never delivered by SSE", async () => {
+    const harness = createHookHarness();
+    let stream = {
+      events: [{ id: "seen", kind: "answer" as const, content: "already-seen" }],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t1", ts: "now", role: "cto", user: "prompt", assistant: "already-seen" },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t1", ts: "now", role: "cto", user: "prompt", assistant: "already-seen" },
+          {
+            turn_id: "t2",
+            ts: "later",
+            role: "cto",
+            user: "internal wakeup",
+            assistant: "never-delivered-via-sse",
+          },
+        ],
+      });
+
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", () => ({ useSessionEvents: () => stream }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: history,
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+
+    try {
+      const ReconnectSessionView = (await import("./SessionView")).default;
+      const renderReconnectView = () =>
+        harness.render(() => ReconnectSessionView({ sid: "s9", session: SESSION }));
+
+      renderReconnectView();
+      await Promise.resolve();
+      let tree = renderReconnectView();
+      expect(history).toHaveBeenCalledTimes(1);
+      expect(collectElementText(tree)).toContain("already-seen");
+
+      stream = { ...stream, connectionEpoch: 2 };
+      renderReconnectView();
+      await Promise.resolve();
+      tree = renderReconnectView();
+
+      expect(history).toHaveBeenCalledTimes(2);
+      expect(collectElementText(tree)).toContain("never-delivered-via-sse");
+
+      stream = {
+        ...stream,
+        events: [...stream.events, { id: "live", kind: "answer", content: "live-after-reseed" }],
+      };
+      renderReconnectView();
+      tree = renderReconnectView();
+      expect(collectElementText(tree).filter((text) => text === "already-seen")).toHaveLength(1);
+      expect(collectElementText(tree).filter((text) => text === "live-after-reseed")).toHaveLength(1);
+    } finally {
+      vi.doUnmock("react");
+      vi.doUnmock("../hooks/useSessionEvents");
+      vi.doUnmock("../lib/sessionsApi");
+      vi.resetModules();
+    }
+  });
+});
