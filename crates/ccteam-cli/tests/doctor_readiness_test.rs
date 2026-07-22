@@ -99,6 +99,7 @@ fn bare_doctor_renders_every_check_line_and_a_summary() {
         "MCP (claude)",
         "MCP (codex)",
         "daemon",
+        "updates",
         "pricing tables",
         "home layout",
         "summary:",
