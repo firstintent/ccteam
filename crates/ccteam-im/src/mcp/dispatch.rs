@@ -335,7 +335,7 @@ async fn execute_chat_send_file(
 /// No tool argument participates in addressing. A durable `linked_chat` wins;
 /// otherwise a configured per-tenant bot may supply its first allowlisted
 /// recipient. A bot without a known recipient is not deliverable yet.
-fn user_delivery_target(
+pub(crate) fn user_delivery_target(
     paths: &CcteamPaths,
     user_id: &str,
 ) -> std::result::Result<(String, String), String> {

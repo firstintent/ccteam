@@ -75,6 +75,12 @@ impl ChatKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOrigin {
+    User,
+    Internal,
+}
+
 #[derive(Clone)]
 struct GatewaySession {
     id: String,
@@ -169,6 +175,11 @@ struct GatewaySession {
     /// never touch that field, but DID get a watchdog before this fold — this
     /// preserves that).
     watched_turn: Arc<std::sync::Mutex<Option<(String, u64)>>>,
+    /// Origin of submitted vendor turns, keyed by the vendor's turn id. Human
+    /// IM/web submit paths record `User`; A2A/delegation/pending-drain paths
+    /// record `Internal`. The event pump consumes the entry at the vendor turn
+    /// boundary; an untracked harness wake-up therefore defaults to internal.
+    turn_origins: Arc<std::sync::Mutex<BTreeMap<String, TurnOrigin>>>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawner's principal). `None`
     /// for a human-created (root) session. Mirrors `meta.parent_sid`, kept
     /// in-memory so the guardrail child/delegated counts + the stop-descendant
@@ -553,6 +564,14 @@ impl GatewayEventSink {
         // Broadcast first (cheap clone); a `SendError` here just means no SSE
         // subscriber is attached, which is normal.
         let _ = self.broadcast.send(event.clone());
+        self.mpsc.send(event).is_ok()
+    }
+
+    /// Send a delivery-only event to the daemon egress without publishing it
+    /// to either web SSE ring. Async web-answer IM mirrors use this path: the
+    /// original sid-keyed Answer already feeds SSE, while the duplicate is a
+    /// phone notification only.
+    fn send_delivery_only(&self, event: GatewayEvent) -> bool {
         self.mpsc.send(event).is_ok()
     }
 }
@@ -1593,6 +1612,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
                 parent_sid: plan.parent_sid,
                 delegation_depth: plan.delegation_depth,
             },
@@ -3313,6 +3333,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
                 parent_sid: parent_sid.clone(),
                 delegation_depth,
             },
@@ -3546,6 +3567,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
+                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
                 parent_sid,
                 delegation_depth,
             },
@@ -3617,7 +3639,15 @@ impl Gateway {
             // Box::pin: drain ↔ submit_resolved are mutually recursive when
             // a not-live submit enqueues then drains (async recursion needs
             // indirection for a finite future type).
-            match Box::pin(self.submit_resolved(&chat, session_id, "", turn.text)).await {
+            match Box::pin(self.submit_resolved(
+                &chat,
+                session_id,
+                "",
+                turn.text,
+                TurnOrigin::Internal,
+            ))
+            .await
+            {
                 Ok(SubmitResult::Turn { id, .. }) => ids.push(id),
                 Ok(SubmitResult::Directive(_)) => {}
                 Err(e) => {
@@ -3655,6 +3685,7 @@ impl Gateway {
             .project_paths
             .as_ref()
             .map(|paths| paths.progress_jsonl(&session.project));
+        let mirror_paths = self.project_paths.clone();
         // v0.9 T5 — spawn-time fingerprints for experience.jsonl (do NOT re-read
         // meta.json per turn). Missing meta → None digests.
         let (pump_role_sha, pump_skills_sha) = project_dir
@@ -3700,6 +3731,10 @@ impl Gateway {
             let mut turn_last_answer: Option<(String, String)> = None;
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
+            // The final text + the reply target used by its ordinary web
+            // Answer. Held independently from delegation bookkeeping so an
+            // IM mirror never depends on the turns.jsonl append succeeding.
+            let mut mirror_last_answer: Option<(String, ChatKey)> = None;
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog,
             // folded from a detached per-turn `tokio::spawn` into THIS
             // per-session pump's own `tokio::select!` loop (one fewer task per
@@ -3842,6 +3877,8 @@ impl Gateway {
                             model,
                         } = &evt
                         {
+                            let completed_origin = take_turn_origin(&session, Some(turn_id));
+                            let mirror_answer = mirror_last_answer.take();
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -3932,18 +3969,30 @@ impl Gateway {
                             let notes = turn_notes;
                             turn_notes = 0;
                             if let (Some(dtx), Some((final_turn, final_text))) =
-                                (delegation_tx.as_ref(), finished)
+                                (delegation_tx.as_ref(), finished.as_ref())
                             {
                                 let _ = dtx.send(crate::delegation::DelegationSignal {
                                     child_sid: session_id.clone(),
-                                    turn_id: final_turn,
-                                    tail: final_text,
+                                    turn_id: final_turn.clone(),
+                                    tail: final_text.clone(),
                                     vendor: pump_vendor,
                                     host: pump_host.clone(),
                                     boundary: true,
                                     interim_notes: notes.saturating_sub(1),
                                     covered_turns: covered,
                                 });
+                            }
+                            if let Some((final_text, reply_to)) = mirror_answer {
+                                mirror_internal_web_answer(
+                                    &tx,
+                                    mirror_paths.as_ref(),
+                                    &session,
+                                    &reply_to,
+                                    completed_origin,
+                                    &session_id,
+                                    seq,
+                                    &final_text,
+                                );
                             }
                         }
                         // v0.8.11 E4 — for a paneless session (no hooks:
@@ -3986,6 +4035,13 @@ impl Gateway {
                             }
                         }
                         if let Some(text) = async_event_text(&evt) {
+                            let boundary_origin = match &evt {
+                                ThreadEvent::TurnFailed { turn_id, .. } => {
+                                    Some(take_turn_origin(&session, Some(turn_id)))
+                                }
+                                ThreadEvent::Error(_) => Some(take_turn_origin(&session, None)),
+                                _ => None,
+                            };
                             // ----- ANSWER (or error) -----
                             // Finalize this turn's status epoch first.
                             if progress_on && fold.has_activity() && !fold.done() {
@@ -4117,6 +4173,11 @@ impl Gateway {
                                 .lock()
                                 .map(|k| k.clone())
                                 .unwrap_or_else(|_| session.owner.clone());
+                            if boundary_origin.is_some() {
+                                mirror_last_answer = None;
+                            } else {
+                                mirror_last_answer = Some((text.clone(), chat_key.clone()));
+                            }
                             let channel = chat_key.channel.clone();
                             let chat_id = chat_key.chat_id.clone();
                             // v0.8.10 routing-isolation — when this session is NOT the
@@ -4143,7 +4204,7 @@ impl Gateway {
                             // refreshed above.
                             let content = if is_focused {
                                 if channel == "web" {
-                                    text
+                                    text.clone()
                                 } else {
                                     let title = project_dir
                                         .as_ref()
@@ -4160,13 +4221,12 @@ impl Gateway {
                                     )
                                 }
                             } else {
-                                format!(
-                                    "[{} {} {} {}] {}",
-                                    session_id,
-                                    session.project,
-                                    vendor_str(session.vendor),
-                                    session.role,
-                                    text
+                                contextual_answer(
+                                    &session_id,
+                                    &session.project,
+                                    session.vendor,
+                                    &session.role,
+                                    &text,
                                 )
                             };
                             // `GatewayEventSink::send` returns false only when the
@@ -4184,6 +4244,18 @@ impl Gateway {
                                 slug: Some(session.project.clone()),
                             }) {
                                 break;
+                            }
+                            if let Some(origin) = boundary_origin {
+                                mirror_internal_web_answer(
+                                    &tx,
+                                    mirror_paths.as_ref(),
+                                    &session,
+                                    &chat_key,
+                                    origin,
+                                    &session_id,
+                                    seq,
+                                    &text,
+                                );
                             }
                         } else if progress_on {
                             // ----- PROGRESS (IM, unchanged) -----
@@ -4527,7 +4599,7 @@ impl Gateway {
         // `message_id` (the inbound IM message) seeds the 👀 ack reaction when a
         // real turn is submitted (empty for the web leg → no reaction).
         match self
-            .submit_resolved(chat, &session_id, message_id, payload)
+            .submit_resolved(chat, &session_id, message_id, payload, TurnOrigin::User)
             .await?
         {
             SubmitResult::Directive(replies) => Ok(replies),
@@ -4898,13 +4970,16 @@ impl Gateway {
         session_id: &str,
         message_id: &str,
         payload: String,
+        origin: TurnOrigin,
     ) -> Result<SubmitResult> {
         if let Some(directive) = parse_session_directive(&payload) {
             // Directive path: PROBE-and-resume a dead child before dispatching
             // (a directive may have side effects → never blindly retried). The
             // turn path below uses the race-free reactive shape instead.
             self.ensure_session_live(session_id, chat).await?;
-            let replies = self.dispatch_directive(chat, session_id, directive).await?;
+            let replies = self
+                .dispatch_directive(chat, session_id, directive, origin)
+                .await?;
             return Ok(SubmitResult::Directive(replies));
         }
 
@@ -5065,6 +5140,9 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        if let Ok(mut origins) = session.turn_origins.lock() {
+            origins.insert(turn_id.0.clone(), origin);
+        }
         self.mirror_user_turn(session, &user_text, &turn_id.0);
         let drained = self
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
@@ -5082,6 +5160,7 @@ impl Gateway {
         chat: &ChatKey,
         session_id: &str,
         directive: Directive,
+        origin: TurnOrigin,
     ) -> Result<Vec<String>> {
         let session = self
             .sessions
@@ -5103,6 +5182,9 @@ impl Gateway {
         .map_err(|_| anyhow!("directive timed out after {submit_wait:?} for {session_id}"))??;
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
+                if let Ok(mut origins) = session.turn_origins.lock() {
+                    origins.insert(turn_id.0.clone(), origin);
+                }
                 self.after_turn_submitted(session, start_visible_events, &turn_id.0)
                     .await
             }
@@ -5288,7 +5370,8 @@ impl Gateway {
                 mut directive,
             } => {
                 directive.choice = Some(selection);
-                self.dispatch_directive(chat, &session_id, directive).await
+                self.dispatch_directive(chat, &session_id, directive, TurnOrigin::User)
+                    .await
             }
             InteractionOrigin::External { reply } => {
                 let _ = reply.send(selection);
@@ -7371,13 +7454,26 @@ impl Gateway {
     /// send-keys / RPC; the long turn streams asynchronously through the
     /// event pump. Returns the submitted [`TurnId`]'s inner string.
     pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
+        self.submit_to_sid_with_origin(sid, text, TurnOrigin::Internal)
+            .await
+    }
+
+    async fn submit_to_sid_with_origin(
+        &mut self,
+        sid: &str,
+        text: String,
+        origin: TurnOrigin,
+    ) -> Result<String> {
         // Same core as the IM `submit_to_current` path (parity by construction):
         // a single-line `/command` is a session directive, everything else a
         // turn. The synthetic web `reply_to` routes async answers / progress
         // back to the per-`sid` SSE subscriber. An empty `message_id` (the web
         // has no inbound IM message) + the `web` channel both suppress the 👀
         // ack reaction — web has its own UI.
-        match self.submit_resolved(&web_api_chat(), sid, "", text).await? {
+        match self
+            .submit_resolved(&web_api_chat(), sid, "", text, origin)
+            .await?
+        {
             // A turn's answer streams over the pump → SSE; hand back the turn id
             // so a `session_dispatch` caller can `session_collect{since: id}`.
             SubmitResult::Turn { id, .. } => Ok(id),
@@ -7438,7 +7534,8 @@ impl Gateway {
                 return Ok(format!("command:{sid}"));
             }
         }
-        self.submit_to_sid(sid, text).await
+        self.submit_to_sid_with_origin(sid, text, TurnOrigin::User)
+            .await
     }
 
     /// Deliver one synchronous directive receipt to a web session's SSE stream
@@ -8079,6 +8176,88 @@ fn pump_target(session: &GatewaySession) -> (String, String) {
         Ok(target) => (target.channel.clone(), target.chat_id.clone()),
         Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
     }
+}
+
+fn take_turn_origin(session: &GatewaySession, turn_id: Option<&str>) -> TurnOrigin {
+    let Ok(mut origins) = session.turn_origins.lock() else {
+        return TurnOrigin::Internal;
+    };
+    match turn_id {
+        Some(id) => origins.remove(id).unwrap_or(TurnOrigin::Internal),
+        None if origins.len() == 1 => {
+            let id = origins.keys().next().cloned();
+            id.and_then(|id| origins.remove(&id))
+                .unwrap_or(TurnOrigin::Internal)
+        }
+        None => TurnOrigin::Internal,
+    }
+}
+
+fn contextual_answer(
+    sid: &str,
+    project: &str,
+    vendor: AgentVendor,
+    role: &str,
+    text: &str,
+) -> String {
+    format!("[{sid} {project} {} {role}] {text}", vendor_str(vendor))
+}
+
+fn web_owner_im_target(paths: &CcteamPaths, owner: &ChatKey) -> Option<(String, String)> {
+    if owner.channel != "user" {
+        return None;
+    }
+    if owner.chat_id == "web-api" {
+        let credentials = crate::credentials::load(Some(&paths.im_credentials_path())).ok()?;
+        let telegram = credentials.telegram?;
+        if telegram.bot_token.trim().is_empty() {
+            return None;
+        }
+        let chat_id = telegram
+            .allowed_chat_ids
+            .first()
+            .filter(|chat_id| !chat_id.trim().is_empty())?;
+        return Some(("telegram".to_string(), chat_id.clone()));
+    }
+    crate::mcp::dispatch::user_delivery_target(paths, &owner.chat_id).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mirror_internal_web_answer(
+    tx: &GatewayEventSink,
+    paths: Option<&CcteamPaths>,
+    session: &GatewaySession,
+    reply_to: &ChatKey,
+    origin: TurnOrigin,
+    session_id: &str,
+    seq: u64,
+    text: &str,
+) {
+    if origin != TurnOrigin::Internal || reply_to.channel != "web" || session.parent_sid.is_some() {
+        return;
+    }
+    let Some((channel, chat_id)) = paths.and_then(|p| web_owner_im_target(p, &session.owner))
+    else {
+        return;
+    };
+    let _ = tx.send_delivery_only(GatewayEvent {
+        id: format!("gateway-mirror-{session_id}-{seq}"),
+        channel,
+        chat_id,
+        thread_ts: None,
+        content: contextual_answer(
+            session_id,
+            &session.project,
+            session.vendor,
+            &session.role,
+            text,
+        ),
+        kind: GatewayEventKind::Answer,
+        attachments: Vec::new(),
+        options: Vec::new(),
+        sid: Some(session_id.to_string()),
+        slug: Some(session.project.clone()),
+    });
 }
 
 /// Send one `Progress` gateway event with the given rendered `content`.
@@ -8875,6 +9054,59 @@ mod tests {
         })
         .await
         .expect("an Answer event arrives")
+    }
+
+    async fn recv_sink_answers(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+        count: usize,
+    ) -> Vec<GatewayEvent> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut answers = Vec::new();
+            while answers.len() < count {
+                let event = events.recv().await.expect("gateway sink remains open");
+                if matches!(event.kind, GatewayEventKind::Answer) {
+                    answers.push(event);
+                }
+            }
+            answers
+        })
+        .await
+        .expect("expected Answer events arrive")
+    }
+
+    async fn wait_for_turn_idle(gateway: &Gateway, sid: &str) {
+        for _ in 0..100 {
+            if !gateway.session_turn_in_flight(sid) {
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn {sid} did not reach its boundary");
+    }
+
+    fn mirror_test_paths(tmp: &tempfile::TempDir) -> (CcteamPaths, PathBuf) {
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = paths.projects_root.join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        (paths, project_dir)
+    }
+
+    fn seed_global_telegram(paths: &CcteamPaths, allowed_chat_ids: Vec<String>) {
+        crate::credentials::save(
+            &paths.im_credentials_path(),
+            &crate::credentials::Credentials {
+                telegram: Some(crate::credentials::TelegramCreds {
+                    bot_token: "123:test".into(),
+                    allowed_chat_ids,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     /// Fetch a `/sessions` or `/projects` list as the user SEES it, regardless
@@ -11082,6 +11314,280 @@ mod tests {
             !web_ev.content.contains('→'),
             "web answers must not carry the IM-only context echo: {:?}",
             web_ev.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_web_turn_mirrors_once_to_admin_telegram() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_global_telegram(&paths, vec!["chat-42".into(), "chat-99".into()]);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let mut broadcast = gateway.subscribe_events();
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // No gateway submit at all: model a harness-internal background wakeup
+        // with narration + final text inside one vendor turn. Unknown origin
+        // must default to internal, and only the final boundary may mirror.
+        let identity = format!("alpha-reviewer-{sid}");
+        {
+            let mut queued = fake.events.lock().await;
+            queued.push_back((
+                identity.clone(),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "background checkpoint",
+                ),
+            ));
+            queued.push_back((
+                identity.clone(),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "background final",
+                ),
+            ));
+            queued.push_back((
+                identity,
+                ThreadEvent::TurnCompleted {
+                    turn_id: "background-turn".into(),
+                    usage: Default::default(),
+                    model: None,
+                },
+            ));
+        }
+        fake.events_notify.notify_one();
+
+        let answers = recv_sink_answers(&mut events, 3).await;
+        assert_eq!(answers.len(), 3, "two web answers + one final IM mirror");
+        let web: Vec<_> = answers
+            .iter()
+            .filter(|event| event.channel == "web")
+            .collect();
+        assert_eq!(web.len(), 2, "web delivery remains byte-for-byte complete");
+        assert_eq!(web[0].chat_id, "web-api");
+        assert_eq!(web[0].content, "background checkpoint");
+        assert_eq!(web[1].content, "background final");
+        let mirror = answers
+            .iter()
+            .find(|event| event.channel == "telegram")
+            .unwrap();
+        assert_eq!(mirror.chat_id, "chat-42", "first allowlisted chat wins");
+        assert_eq!(
+            mirror.content,
+            "[s1 alpha claude reviewer] background final"
+        );
+        assert_eq!(mirror.sid.as_deref(), Some("s1"));
+        assert!(
+            events.try_recv().is_err(),
+            "completed turn emits exactly one mirror"
+        );
+        let web_broadcast = [
+            recv_answer(&mut broadcast).await,
+            recv_answer(&mut broadcast).await,
+        ];
+        assert!(web_broadcast.iter().all(|event| event.channel == "web"));
+        while let Ok(event) = broadcast.try_recv() {
+            assert!(
+                !matches!(event.kind, GatewayEventKind::Answer),
+                "delivery-only mirror must not duplicate either web SSE ring: {event:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_delegated_child_web_turn_does_not_mirror_to_admin_telegram() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_global_telegram(&paths, vec!["chat-42".into()]);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let parent = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let sid = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent,
+                    depth: 0,
+                    role: String::new(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "delegated task done".into())
+            .await
+            .unwrap();
+        fake.events_notify.notify_waiters();
+
+        let answers = recv_sink_answers(&mut events, 1).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(answers[0].channel, "web");
+        assert!(
+            events.try_recv().is_err(),
+            "a delegated child's final answer must reach only its parent notification path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_web_turn_does_not_mirror_to_admin_telegram() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_global_telegram(&paths, vec!["chat-42".into()]);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_web_sid(&sid, "human typed this".into(), true)
+            .await
+            .unwrap();
+
+        let answers = recv_sink_answers(&mut events, 1).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(answers[0].channel, "web");
+        assert!(
+            events.try_recv().is_err(),
+            "a human web turn must not ping Telegram"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_web_turn_without_global_telegram_is_silent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "background done".into())
+            .await
+            .unwrap();
+
+        let answers = recv_sink_answers(&mut events, 1).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(answers[0].channel, "web");
+        assert!(
+            events.try_recv().is_err(),
+            "missing creds are a silent skip"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_tenant_web_turn_mirrors_to_its_linked_im() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let mut tenants = ccteam_core::tenants::TenantRegistry::default();
+        let alice = tenants.add("alice");
+        tenants.link_chat(&alice.id, "telegram:alice-chat");
+        tenants.set_telegram(
+            &alice.id,
+            Some(ccteam_core::tenants::TenantTelegram {
+                bot_token: "456:alice".into(),
+                allowed_chat_ids: Vec::new(),
+            }),
+        );
+        tenants.save(&paths.users_dir()).unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir);
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                alice.id.clone(),
+                SpawnTuning::default(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "tenant background done".into())
+            .await
+            .unwrap();
+
+        let answers = recv_sink_answers(&mut events, 2).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        let mirror = answers
+            .iter()
+            .find(|event| event.channel == format!("telegram@{}", alice.id))
+            .expect("tenant mirror uses its own bot channel");
+        assert_eq!(mirror.chat_id, "alice-chat");
+        assert_eq!(
+            mirror.content,
+            "[s1 alpha claude reviewer] alpha-reviewer-s1 echo: tenant background done"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "tenant receives exactly one mirror"
         );
     }
 
