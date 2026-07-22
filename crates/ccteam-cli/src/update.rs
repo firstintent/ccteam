@@ -389,7 +389,11 @@ fn stderr_stdio() -> Stdio {
 /// its compiled version is stale). `None` on any failure → caller falls
 /// back to the updater's own compiled version.
 fn installed_binary_version() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
+    // Route through `current_ccteam_bin()` (not raw `current_exe()`): the
+    // atomic swap just replaced the running updater's inode, so
+    // `current_exe()` reports `<path> (deleted)` and probing it would fail —
+    // masking the real (new) version behind the updater's stale compiled one.
+    let exe = ccteam_core::current_ccteam_bin().ok()?;
     let out = Command::new(&exe)
         .arg("--version")
         .stdin(Stdio::null())
