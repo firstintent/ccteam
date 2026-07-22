@@ -186,11 +186,14 @@ pub(crate) fn project_not_visible(slug: &str) -> Response {
 
 /// v0.8.18 档1 — gate a by-`sid` endpoint by the session's PROJECT (project is
 /// the unit of ownership; a session inherits its project's owner). Resolves
-/// `sid` → project via the gateway, then checks the caller may see it. Returns
-/// `Some(404)` when the sid is unknown OR its project isn't visible (the two
-/// are indistinguishable, so sids in other users' projects can't be probed).
+/// `sid` → project via the gateway (live map first, then a stopped session's
+/// on-disk `meta.json`), then checks the caller may see it. Returns `Some(404)`
+/// when the sid is unknown OR its project isn't visible (the two are
+/// indistinguishable, so sids in other users' projects can't be probed).
 /// `None` = allowed (admin, no-gateway → the handler does its own check, or a
-/// visible project).
+/// visible project). Resolving *stopped* sessions here (not just live ones)
+/// lets an authorised caller reach a since-evicted session so the turn handler
+/// can cold-resume it (resume-by-sid) instead of 404-ing.
 async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -> Option<Response> {
     if identity.is_admin {
         return None;
@@ -199,11 +202,7 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     let gw = app.gateway.as_ref()?;
     let project = {
         let guard = gw.lock().await;
-        guard
-            .session_views()
-            .into_iter()
-            .find(|v| v.sid == sid)
-            .map(|v| v.project)
+        guard.project_slug_for_sid(sid)
     };
     match project {
         Some(p) if crate::routes::api_v1::can_see_project(app, identity, &p) => None,
@@ -782,8 +781,12 @@ fn build_turn_text_with_attachments(
 /// Submits a user-text turn to the session via the spine. The turn
 /// executes asynchronously — the reply + progress arrive over
 /// `GET /api/v1/sessions/{sid}/events` — so success is 202
-/// `{accepted:true}`. 404 for an unknown sid (the gateway returns `Err`),
-/// 503 with no gateway, 400 on empty text.
+/// `{accepted:true}`. 404 only for a genuinely unknown sid (no live session
+/// AND no `meta.json`); a session that was evicted for capacity, dropped by a
+/// daemon restart whose rebuild failed, or explicitly stopped is COLD-RESUMED
+/// on demand (resume-by-sid — the same contract IM `/use` + the sidebar resume
+/// button honour) instead of 404-ing. 503 with no gateway, 400 on empty text,
+/// 502 when a resumable session fails to re-spawn.
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{sid}/turn",
@@ -820,6 +823,33 @@ pub(crate) async fn handle_session_turn(
     }
     let result = {
         let mut guard = gw.lock().await;
+        // Resume-by-sid (红线「会话 = resume-by-session-id」): a session evicted
+        // for capacity, dropped by a daemon restart whose rebuild failed, or
+        // explicitly stopped is not in the live map — but its `meta.json`
+        // persists on disk. Cold-resume it on demand rather than 404, so a chat
+        // whose session "disappeared" out from under it accepts the next turn
+        // (the same path the sidebar resume button + IM `/use` take). A
+        // genuinely unknown sid (no live session, no meta) still 404s below.
+        if !guard.is_session_live(&sid) {
+            let Some(slug) = guard.project_slug_for_sid(&sid) else {
+                return unknown_session(&sid);
+            };
+            // `gate_sid` already project-gated the caller (admin bypasses it);
+            // bind the resume to the resolved owning project so `resume_stopped_
+            // session`'s own ACL guard is satisfied (`exp == slug` holds).
+            let caller_identity = identity.owner_tag();
+            if let Err(err) = guard
+                .resume_stopped_session(&sid, &caller_identity, Some(&slug))
+                .await
+            {
+                tracing::warn!(%sid, %err, "auto-resume on web turn failed");
+                return create_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("session {sid} could not be resumed: {err}"),
+                    mode,
+                );
+            }
+        }
         let Some(view) = guard
             .session_views()
             .into_iter()

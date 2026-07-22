@@ -6297,6 +6297,28 @@ impl Gateway {
         anyhow::bail!("no meta.json found for session {sid}")
     }
 
+    /// True when `sid` is currently in the live session map (spawned + tracked).
+    /// A `false` result means the session was evicted for capacity, dropped by a
+    /// daemon restart whose rebuild failed, or explicitly stopped — its
+    /// `meta.json` may still exist on disk (see [`Self::project_slug_for_sid`]),
+    /// making it resumable by sid.
+    pub fn is_session_live(&self, sid: &str) -> bool {
+        self.sessions.contains_key(sid)
+    }
+
+    /// Resolve the project slug that owns `sid`, whether it is currently live or
+    /// a *stopped* session with an on-disk `meta.json`. Checks the live map
+    /// first (O(1)); only a non-live sid pays the `meta.json` scan. Returns
+    /// `None` only when the sid has neither a live session nor any `meta.json` —
+    /// a genuinely unknown id. Unlike the capped history list the web rail
+    /// loads, this always finds a stopped session's project.
+    pub fn project_slug_for_sid(&self, sid: &str) -> Option<String> {
+        if let Some(session) = self.sessions.get(sid) {
+            return Some(session.project.clone());
+        }
+        self.find_meta_for_sid(sid).ok().map(|(slug, _, _)| slug)
+    }
+
     /// Resolve a session id to the data a collector needs to tail its
     /// transcript (v0.8.7 W1 — cto `session_collect`). Returns the role
     /// (the `<bot>` segment of `.ccteam/chat/<bot>/turns.jsonl`) and the
@@ -13005,6 +13027,83 @@ mod tests {
             fake.starts.load(Ordering::SeqCst),
             1,
             "correct slug spawns once"
+        );
+    }
+
+    /// Web send-resume-by-sid — the two helpers the web turn handler leans on to
+    /// cold-resume a session that "disappeared" (evicted for capacity, dropped
+    /// by a daemon restart whose rebuild failed, or stopped) instead of 404-ing:
+    /// `is_session_live` tracks live-map membership, and `project_slug_for_sid`
+    /// resolves the owning project of a STOPPED session from its on-disk
+    /// `meta.json` (uncapped — unlike the web rail's history list) so `gate_sid`
+    /// admits the caller and the turn can resume it.
+    #[tokio::test]
+    async fn stopped_session_still_resolves_its_project_for_send_resume() {
+        let alpha_dir = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha_dir.path());
+
+        // A stopped session s1 (meta.json on disk, never spawned → not live).
+        let meta = SessionMeta {
+            sid: "s1".into(),
+            slug: "alpha".into(),
+            vendor: AgentVendor::Claude,
+            protocol: SessionProtocol::StreamJson,
+            role: String::new(),
+            permission_mode: PermissionMode::Skip,
+            owner: "user:web-api".into(),
+            vendor_uuid: String::new(),
+            model: None,
+            host: "local".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_active: "2026-01-01T00:00:00Z".into(),
+            origin: SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
+            tokens_total: None,
+            role_sha: None,
+            skills_sha: None,
+            trigger: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
+        };
+        write_session_meta(alpha_dir.path(), &meta).unwrap();
+
+        // Not in the live map...
+        assert!(
+            !gateway.is_session_live("s1"),
+            "a stopped session is not live"
+        );
+        // ...but the turn handler can still resolve its project from meta.json
+        // (the fix: resolve → cold-resume rather than 404 the "vanished" sid).
+        assert_eq!(
+            gateway.project_slug_for_sid("s1").as_deref(),
+            Some("alpha"),
+            "a stopped session still resolves its owning project from meta.json"
+        );
+        // A genuinely unknown sid resolves to nothing → a real 404.
+        assert!(
+            gateway.project_slug_for_sid("s999").is_none(),
+            "an unknown sid resolves to no project"
+        );
+
+        // Resuming it (what the web turn now does before submitting) re-admits
+        // it into the live map, so the subsequent submit finds a live session.
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .unwrap();
+        assert!(
+            gateway.is_session_live("s1"),
+            "resume re-admits s1 into the live map, so the turn can proceed"
+        );
+        assert_eq!(
+            gateway.project_slug_for_sid("s1").as_deref(),
+            Some("alpha"),
+            "a live session resolves its project from the live map"
         );
     }
 
