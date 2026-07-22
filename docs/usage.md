@@ -150,6 +150,18 @@ The console is built on a token-authenticated HTTP API you can use directly:
 - Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
 - Auth uses the same web token. Session endpoints require the daemon to be online.
 
+### External agents over MCP (`POST /mcp`)
+
+Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same eight tools a managed session has:
+
+```
+POST http://<host>:7331/mcp
+Authorization: Bearer ccteam:<hex>
+```
+
+- The **admin token** (the one `ccteam status` prints) is the owner's front door, fleet-wide. A **per-user token** (issued under Settings → Users) resolves to that user: every tool is scoped to the user's own projects — `session_spawn` requires an explicit `project` and only accepts the user's own, `dispatch/collect/stop` authorize by the target sid's project, and `session_list`/`status` aggregate only visible projects.
+- Unknown and forbidden projects/sessions return the same error (anti-enumeration). Bearer-only: cookies and query tokens are never accepted.
+
 ---
 
 ## 2. Telegram / Lark

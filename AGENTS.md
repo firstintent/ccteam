@@ -30,10 +30,10 @@
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.7` |
+| Workspace version | `0.9.8` |
 | 测试 baseline | **口径**:确定性 `cargo test --workspace --exclude ccteam-web --lib` + `ccteam-web` 全量 + vitest + Playwright;**当前数字与 env-flake 族 = `.loop/state.md` + `.loop/verify/README.md`**(基线只增不减) |
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
-| 当前在做 | **v0.9.7 已落 `main`(#165):daemon 生命周期重构 —— Codex pid-detach(`ccteam daemon start/stop/restart/status/logs` 全 `--json`;setsid detach + JSON pid 记录 + `daemon.lock` + ready×managed 双判定 + versioned probe + SIGTERM/`--force`)取代 systemd/launchd(借鉴 codex `app-server-daemon`,legacy unit 一次性自动接管 + 零 unit 生成 + trigger-file 退役)+ `ccteam update` 按渠道重放安装 + 升级重启合同 + InstallChannel + lazy version-check + doctor/fleet 版本外显;未 tag、pre-release rc 先行人肉测)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
+| 当前在做 | **v0.9.8(dev→main PR #166,owner 合并中):外部 Agent MCP Phase 1(tenant web token 调 `/mcp` = 独立 `McpCaller::User` principal + 全 8 工具 project ACL + 防枚举,身份策略下沉 `ccteam-core::identity` 单源)+ 异步可见性三连(web SSE 重连权威回填 + visibility 复活 / root 会话异步收尾镜像 owner IM / IM `/status` 子会话外显 + `/sessions` activity + 按钮互补)+ v0.9.7 售后(update inode/版本门两 fix、resume 阶梯补全、daemon 关停泵泄漏、CI 去 rmux smoke、基线口径 `--lib --bins`)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
 
 > 主分支 HEAD 以 `git rev-parse origin/main` 为准;**开发一律落 `dev` 分支 + dev→main PR 攒版本**(owner 决策 2026-07-22,见 §五「分支与推送」);历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 

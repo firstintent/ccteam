@@ -69,14 +69,14 @@ Register a satellite with a join token (Settings → Hosts) — it dials out to 
 
 ---
 
-Under all four modes are the same **eight MCP tools**, available to every session (and to your plain hand-started CLIs once registered):
+Under all four modes are the same **eight MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents a ccteam web token over `POST /mcp` — a per-user token scopes every tool to that user's own projects:
 
 ```text
 session_spawn · session_dispatch · session_collect · session_list · session_stop
 status · chat_send_file · screenshot
 ```
 
-The daemon routes and records — at-least-once notifications across restarts, idempotency keys, a child's turn written to disk before its parent is told, guardrails that refuse runaway fan-out with a reason. It never schedules; *when* to delegate lives in prompts you version.
+The daemon routes and records — at-least-once notifications across restarts, idempotency keys, a child's turn written to disk before its parent is told, guardrails that refuse runaway fan-out with a reason. When a web-driven session finishes autonomous work while nobody is watching the console, the final answer is mirrored to your IM; the IM `/status` card shows your session's working children at a glance. It never schedules; *when* to delegate lives in prompts you version.
 
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
