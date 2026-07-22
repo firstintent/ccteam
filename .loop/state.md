@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.7` 已合 `main`**(2026-07-22 owner merge PR #165,squash `825ae7d`)。V097 全三波:W1 daemon 生命周期核(Codex pid-detach)+ W2 systemd/launchd 退场 + W3 `ccteam update`/InstallChannel/版本外显;随车 2 个 ccm 提交(Grok 托管不 spawn stdio mcp-serve + idle 后台任务 /status 外显)。**tag+部署 = pre-release rc 先行人肉测**(release.yml 加 `--prerelease`(tag 带 `-` 即 pre-release,不进 /latest);已推 `v0.9.7-rc1` 触发工作流,owner `CCTEAM_VERSION=v0.9.7-rc1` 装测 → 满意后打 `v0.9.7` 正式 tag = latest)。
-- **在做**:V097 已 ship 到 main,收尾中(ship-gate 回填 + pre-release rc)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
+- **在做**:**V097 已发布(v0.9.7 正式 tag,latest)** —— 完结。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
@@ -21,7 +21,7 @@
 
 | 事项 | 状态 |
 |---|---|
-| **tag + 部署** | **部分消耗** —— owner 2026-07-22「发release」;pre-release `v0.9.7-rc1` 已授权推(工作流建 pre-release,**不进 /latest、不发全体用户**,供人肉测);**正式 `v0.9.7` tag(= latest 发全体)仍 HELD,等 owner 测完显式发话**。此后常态回归「push main ≠ 发布」 |
+| **tag + 部署** | **已消耗(v0.9.7 已发布)** —— owner 2026-07-22:「发release」→ pre-release `v0.9.7-rc1` 人肉测 →「发正式版」→ 正式 `v0.9.7` tag(commit `2922f7a`,= rc 同一构建)推送,工作流建 latest release 四平台;`/releases/latest` → v0.9.7,全体用户经 `install.sh`/`ccteam update` 可拿到。**此后常态回归「push main ≠ 发布」,下个版本 tag 仍需 owner 显式发话** |
 | V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);merge PR #165 = owner 2026-07-22「已经合并」;`825ae7d` squash 落 main |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
 | v0.9.6 docs 写权一次性授权(kimi 改 usage/orchestration/tech-design/README) | **已签核消耗** —— owner 2026-07-21 指定 kimi 更新全局文档、fable5 review;仅本版有效,写权常态仍归规划会话 |
