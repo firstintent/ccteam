@@ -5,7 +5,7 @@
   <p>
     <a href="https://github.com/firstintent/ccteam/actions/workflows/check.yml"><img src="https://github.com/firstintent/ccteam/actions/workflows/check.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/made%20with-Rust-b7410e" alt="Made with Rust" />
-    <img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS-4c8dae" alt="Linux · macOS" />
+    <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20WSL-4c8dae" alt="macOS · Linux · WSL" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT" /></a>
   </p>
 </div>
@@ -83,38 +83,27 @@ The daemon routes and records — at-least-once notifications across restarts, i
 
 ## Install
 
-**1 · Let an agent do it** — paste into any agent you already have:
+Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 
-> Install https://github.com/firstintent/ccteam — follow `INSTALL.md` in the repo.
-
-**2 · From source** (Rust + Node):
-
-```bash
-git clone https://github.com/firstintent/ccteam && cd ccteam && make install
-```
-
-**3 · One-click script** (prebuilt binary, no toolchain):
+**1 · One-click script**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
-One static binary into `~/.local/bin`, no sudo. Then:
+One static binary into `~/.local/bin`, no sudo.
 
-- `ccteam daemon start` — run the daemon in the background; prints your web console link (`http://<lan-ip>:7331/?token=…`)
-- `ccteam config` — register the MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team
+**2 · Let an agent do it** — paste into any agent you already have:
 
-**Configure in the browser** — create a project and just type; the session is born on your first message. Then:
+> Install https://github.com/firstintent/ccteam — follow `INSTALL.md` in the repo.
 
-- **Settings → IM** — paste a Telegram/Lark bot token (chat id captured automatically)
-- **Settings → Hosts** — register MCP into your CLIs; mint join tokens for new machines
-- **Marketplace** — install personas and skills, checksum-verified
+**3 · From source** (Rust + Node):
 
-> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN, or use `ccteam start --web-bind 127.0.0.1:7331`.
+```bash
+git clone https://github.com/firstintent/ccteam && cd ccteam && make install
+```
 
-## Daemon
-
-`ccteam daemon start` runs ccteam in the background and keeps it running after you close the terminal. Manage it with:
+**Start it** — `ccteam daemon start` runs ccteam in the background and keeps it running after you close the terminal (`make install` already did this for you). Manage it any time:
 
 ```bash
 ccteam daemon start          # start in the background; prints your web console link
@@ -125,6 +114,14 @@ ccteam daemon logs -f        # watch the logs live
 ```
 
 After you reboot your computer, run `ccteam daemon start` again to bring ccteam back.
+
+**Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
+
+- **Settings → Hosts** — register the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team; and mint join tokens for new machines
+- **Settings → IM** — paste a Telegram/Lark bot token (chat id captured automatically)
+- **Marketplace** — install personas and skills, checksum-verified
+
+> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN, or use `ccteam start --web-bind 127.0.0.1:7331`.
 
 ## Chaining sessions
 
