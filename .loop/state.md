@@ -8,13 +8,13 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.7` 已合 `main`**(2026-07-22 owner merge PR #165,squash `825ae7d`)。V097 全三波:W1 daemon 生命周期核(Codex pid-detach)+ W2 systemd/launchd 退场 + W3 `ccteam update`/InstallChannel/版本外显;随车 2 个 ccm 提交(Grok 托管不 spawn stdio mcp-serve + idle 后台任务 /status 外显)。**tag+部署 = pre-release rc 先行人肉测**(release.yml 加 `--prerelease`(tag 带 `-` 即 pre-release,不进 /latest);已推 `v0.9.7-rc1` 触发工作流,owner `CCTEAM_VERSION=v0.9.7-rc1` 装测 → 满意后打 `v0.9.7` 正式 tag = latest)。
-- **在做**:**V097 已发布(v0.9.7 正式 tag,latest)** —— 完结。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
+- **在做**:**dev+PR 攒版本第一轮(PR #166,等 owner 合并)** —— v0.9.7 发布后修复:update 两 fix(inode 交换 + 版本门)+ resume 阶梯补全(IM/web/MCP 对称)+ daemon 关停泵泄漏(修活 restart flaky)+ CI 去 rmux smoke + 基线口径修正(`make test-baseline`,`--lib --bins`);全量门禁绿(2026-07-23 规划复核)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1497/0**(v0.9.7:1472 +6 daemon 核心 +16 install_channel/version_check/preferences 定向 +3 随车 ccm 提交;W1+W2+W3 全 fake/tempdir 隔离)
-- `ccteam-web` 全量 **0 失败**(本机通过数 321–325 随 tmux 环境波动,差值 = 已知 `ws_*` env-flake 族)· vitest **392**(SPA:−2 compare 按设计 +3 模板重设 +3 vendor 外显)· Playwright **7**(v0.9.6 未重跑,上轮口径)
+- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1604/0**(= 旧 --lib 1497 + bins 107,含 2be1ebc 修活的 web_chat_bridge 重启测试;2026-07-23 规划实测)
+- `ccteam-web` 全量:干净环境 **0 失败**;本机 live-daemon 宿主下 `pty_ws_test` 3 个 `ws_*` 红(2026-07-23 实测 **main=dev 同红**,环境层非回归,家族已登记 verify/README)· vitest **392**(SPA:−2 compare 按设计 +3 模板重设 +3 vendor 外显)· Playwright **7**(v0.9.6 未重跑,上轮口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)
