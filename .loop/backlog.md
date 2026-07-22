@@ -75,10 +75,12 @@
 - **偏差**:W3(update/InstallChannel/版本外显 + workspace 版本 bump 0.9.7)独立卡 V097-W3 承接,本 PR 不含;版本号仍 0.9.6(W3 bump)。pre-existing env-flake `web_chat_bridge::…survives_restart`(WS/tmux,非 `--lib` 口径,文件未碰)不受影响。
 
 ### V097-W3 update + InstallChannel + 版本外显(PRD W3)
-- **状态**:待排 · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + docs/` · **建议入口**:规划会话调度
+- **状态**:进行中(PR #165·2026-07-22,与 W12 同 PR 待 owner review/merge) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + docs/` · **入口**:规划会话调度(subagent 实现 + Fable5/opus orchestrator 收尾)
 - **背景**:同 V097-W12,在其之上叠加(**依赖 W12,同域串行**);PRD §三 F3 + §六 W3。P1-4(unit PATH 补 kimi)已按 D7 随 unit 面删除而取代,细节见 state.md 人工门 + V097-W12 卡。
 - **规格**:InstallChannel(env 预留/marker/路径启发)+ `ccteam update`(standalone 臂转发非交互 install.sh、source 臂只指引 + 升级重启合同:in-flight 等 5min/`--now`/`--no-restart` + 版本核对)+ `state/version.json` 轻量检查(≥20h,lazy,不进 daemon loop)+ doctor updates 段 + fleet 版本偏差外显 + workspace 版本 bump `0.9.7` + docs 同步(usage/README/tech-design 指针)。
 - **DoD**:PRD 验收 A7–A10;基线只增;writeback 绿;PR 就绪。
+- **验证**(PR #165,commits eac77e9/532fbe6/4640bf9 subagent + bcb021f/481739c orchestrator):subagent 交付 F3.1–F3.6(install_channel/version_check/update/doctor/fleet skew,restart 合同 fake-injected 状态机测试),规划(opus)收尾 = 版本 bump 0.9.7 + 接真实 `fetch_latest_version`(curl `-sI` redirect 解析,镜像 install.sh)+ docs(usage 新增 Updating 段/README/tech-design 指针×2)。lib 1478→**1494/0**(+16 subagent +0 orchestrator);clippy 0;fmt 干净。**真机 live**:Source 渠道 `update --json`→`{status:guidance}` 不下载;`status` 触发 20h gate 真拉 GitHub `releases/latest`→version.json 缓存 `v0.9.5`(v 前缀 semver 比较正确、不误报新于 0.9.7);doctor `updates` 段渲染(channel/exe/binary version/latest)。**A7 全链**(standalone 真装+重启)未 live 跑(会覆盖 operator binary),install.sh 下载+sha256 未改属既证、重启合同 fake 测试覆盖。
+- **偏差**:①版本核对比「新装 binary 的 `--version`」非 updater 自身编译版本(updater 是旧 binary,自比会误报 skew);②in-flight「active」只认 `working` 态(`stale`/`stuck` 是卡死会白烧 5min cap);③`--json` 词汇用 `restarted/binarySwapped/guidance/error`(install.sh exit code 无法区分「已最新」故不设 `upToDate`);④doctor 只读 cache 不联网(status 驱动 20h 刷新)。`fetch_latest_version` subagent 留 stub、orchestrator 已接真实实现。
 
 ### P2-1 CI 增确定性测试 job
 - **状态**:待排 · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)
