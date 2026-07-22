@@ -112,6 +112,22 @@ One static binary into `~/.local/bin`, no sudo. Then:
 
 > The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN, or use `ccteam start --web-bind 127.0.0.1:7331`.
 
+## Daemon
+
+The daemon is self-managed — one mechanism on Linux, macOS, and WSL (no systemd or launchd to wire up). All verbs take `--json` for scripting.
+
+```bash
+ccteam daemon start          # background (setsid; survives your shell closing) + prints the web link
+ccteam daemon status         # pid · ready · running-vs-installed version
+ccteam daemon restart        # graceful stop + restart onto the current binary
+ccteam daemon stop           # graceful stop; sessions resume by id on next start
+ccteam daemon logs -f        # follow ~/.ccteam/daemon.log
+```
+
+- **No boot-autostart or crash-restart** — after a reboot, run `ccteam daemon start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam daemon start` cron line covers boot-start if you want it).
+- `ccteam start` still runs in the **foreground** — for dev, containers, or your own supervisor's `ExecStart`.
+- **Upgrading from a pre-v0.9.7 install?** systemd/launchd are retired; the first `ccteam daemon start` (or `install.sh`) auto-migrates the old unit and takes over — a unit you wrote by hand is left untouched.
+
 ## Chaining sessions
 
 Delegation is explicit — an agent (or you) says who does what, and the bridge handles identity, routing, delivery, and the ledger:
