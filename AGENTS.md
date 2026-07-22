@@ -35,7 +35,7 @@
 | Clippy | 0 errors + 0 warnings(`cargo clippy --workspace --all-targets -- -D warnings`,含 `ccteam-web`)|
 | 当前在做 | **v0.9.7 已落 `main`(#165):daemon 生命周期重构 —— Codex pid-detach(`ccteam daemon start/stop/restart/status/logs` 全 `--json`;setsid detach + JSON pid 记录 + `daemon.lock` + ready×managed 双判定 + versioned probe + SIGTERM/`--force`)取代 systemd/launchd(借鉴 codex `app-server-daemon`,legacy unit 一次性自动接管 + 零 unit 生成 + trigger-file 退役)+ `ccteam update` 按渠道重放安装 + 升级重启合同 + InstallChannel + lazy version-check + doctor/fleet 版本外显;未 tag、pre-release rc 先行人肉测)**。铁律:**只做单 harness 做不到的**(跨 vendor 身份/路由/账本/观测 + 跨机执行),**永不做厂商能力**。当前焦点/基线/人工门 = `.loop/state.md`;任务队列唯一来源 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md`(详档 `git log` + gitignored `docs-local/versions/`);**协议一律以代码为准** |
 
-> 主分支 HEAD 以 `git rev-parse origin/main` 为准(开发直落 `main`;`dev` 分支已滞后停用);历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
+> 主分支 HEAD 以 `git rev-parse origin/main` 为准;**开发一律落 `dev` 分支 + dev→main PR 攒版本**(owner 决策 2026-07-22,见 §五「分支与推送」);历史里程碑见 `docs-local/versions/v0-X-Y/README.md`(冻结归档,gitignored)。
 
 **ccteam 是 Claude Code(+ Codex)之上的元工具** —— 云端常驻的元 AI 团队,从 IM 和 web 驱动。架构 5 块:
 
@@ -143,12 +143,12 @@
 
 ### 多 session 并行编辑同一仓库
 
-主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/ccteam-<name> origin/main` 起独立工作树,完事 `git worktree remove`。**并行的唯一合法形态 = 不同冲突域**(backlog 卡面字段判定,同域串行)+ 一 worktree 一写者。**主仓不变 dirty**。跨 session 见主仓 dirty:`git stash push -m "<owner> WIP"` 再切;**别盲目 `git checkout -- .`**。
+主仓工作树绑定一个 session,并行用 `git worktree add -b <branch> /tmp/ccteam-<name> origin/dev` 起独立工作树(基线 = `origin/dev`,非 main),完事 `git worktree remove`。**并行的唯一合法形态 = 不同冲突域**(backlog 卡面字段判定,同域串行)+ 一 worktree 一写者。**主仓不变 dirty**。跨 session 见主仓 dirty:`git stash push -m "<owner> WIP"` 再切;**别盲目 `git checkout -- .`**。
 
 ### 版本开发流程(版本化迭代不变;`.loop/` 只是承载)
 
 - **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review;拍板后**规划把 PRD 拆成卡进 `.loop/backlog.md`**(冲突域/规格/DoD/建议入口),wave = 一组卡。owner `/goal` 直驱的小/中改 = 独立卡可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(**briefing 自包含**:规格/坐标/验收直接写进 brief)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ §五.7 ship gate 回填。
-- **推送 = direct-on-main no-PR 是常态**(`gh` 不能开 firstintent PR,见 §六 → SSH push);PR 仅当远端支持时。**tag + 部署 HELD,等 owner 显式「部署」**(push 到 main 不等于发布)。
+- **分支与推送 = dev + PR 攒版本**(owner 决策 2026-07-22,取代旧「direct-on-main no-PR」):新功能/修复一律提交并推送 `dev`;开一个 dev→main PR,多个提交累计组成一个版本;**merge 仅由 owner 执行**(合并 = 版本落 main),合并后**复用 `dev`** 开启下一轮。**main 不直推**;`gh pr create` 可用(改 `.github/workflows/*` 仍需 SSH push,见 §六)。**tag + 部署 HELD,等 owner 显式「部署」**(merge 到 main 不等于发布)。
 - **wave 范式**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 commit;subagent briefing 必含 wave acceptance gate + 上 wave handoff link。**红线:每 wave baseline ≥ 上 wave**(test pass count + clippy 0 warnings),否则不推。架构级大改可把 tier-1 文档**全量重写**放最后一 wave(docs 反映已落地代码)。
 
 ## 六、易踩的坑(实战累积)
