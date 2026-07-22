@@ -7,13 +7,13 @@
 
 ## 当前焦点
 
-- **版本线**:workspace `0.9.6` 已落 **`main`**(2026-07-21 owner 指示合并,dev=main 对齐;owner 直驱:多 vendor 编排发现面 T1/T2 + compare 全链退役 T4 + 全局文档 T3 + 吉祥物 logo;设计 SoT = gitignored `docs-local/notes/orchestrate-final.md`;opus/codex/kimi 三 agent 分工,fable5 规划 review 合并;增量:cct-codex/cct-grok wrapper skill 退役(hub 8024ec4)+ 快速开始模板重设 + routing notes 项目归位/全局默认生成 + composer vendor·model 外显 3e6bca1),**未 tag、未部署**。
-- **在做**:**V097 全三波(W1 生命周期核 + W2 systemd 退场 + W3 update/InstallChannel/版本外显)= PR #165 待 owner review/merge** —— owner 2026-07-22 直驱「进入开发→提交 dev→发 PR→继续 W3」;两轮 subagent 撞会话限额均由规划(Fable5/opus)接手收尾。7 commits 全落 `dev`,workspace bump **0.9.7**;lib **1494/0**(+22 over 1472 baseline)、clippy 0、fmt 干净;真机隔离 e2e:生命周期五项(A1/A4/A5/managed-stop/doctor)+ update 三项(Source 不下载/status 真拉 GitHub 缓存 version.json/doctor updates 段)通过;A7 全链真装未 live(会覆盖 operator binary,重启合同 fake 测试覆盖)。**tag+部署 HELD**。下一步 = owner review #165 → merge。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废)—— 队列 = `.loop/backlog.md`。
+- **版本线**:workspace **`0.9.7` 已合 `main`**(2026-07-22 owner merge PR #165,squash `825ae7d`)。V097 全三波:W1 daemon 生命周期核(Codex pid-detach)+ W2 systemd/launchd 退场 + W3 `ccteam update`/InstallChannel/版本外显;随车 2 个 ccm 提交(Grok 托管不 spawn stdio mcp-serve + idle 后台任务 /status 外显)。**tag+部署 = pre-release rc 先行人肉测**(release.yml 加 `--prerelease`(tag 带 `-` 即 pre-release,不进 /latest);已推 `v0.9.7-rc1` 触发工作流,owner `CCTEAM_VERSION=v0.9.7-rc1` 装测 → 满意后打 `v0.9.7` 正式 tag = latest)。
+- **在做**:V097 已 ship 到 main,收尾中(ship-gate 回填 + pre-release rc)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1472/0**(v0.9.6:1450 −9 compare/model 按设计删 +16 T1 面板 +12 T2 目录 +3 routing 归位)
+- 确定性口径 `cargo test --workspace --exclude ccteam-web --lib` = **1497/0**(v0.9.7:1472 +6 daemon 核心 +16 install_channel/version_check/preferences 定向 +3 随车 ccm 提交;W1+W2+W3 全 fake/tempdir 隔离)
 - `ccteam-web` 全量 **0 失败**(本机通过数 321–325 随 tmux 环境波动,差值 = 已知 `ws_*` env-flake 族)· vitest **392**(SPA:−2 compare 按设计 +3 模板重设 +3 vendor 外显)· Playwright **7**(v0.9.6 未重跑,上轮口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
@@ -21,8 +21,8 @@
 
 | 事项 | 状态 |
 |---|---|
-| **tag + 部署** | **HELD** —— push 到 `main` 不等于发布,等 owner 显式「部署」 |
-| V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);开发走 `dev` 分支 + PR 人工审核,tag/部署仍 HELD |
+| **tag + 部署** | **部分消耗** —— owner 2026-07-22「发release」;pre-release `v0.9.7-rc1` 已授权推(工作流建 pre-release,**不进 /latest、不发全体用户**,供人肉测);**正式 `v0.9.7` tag(= latest 发全体)仍 HELD,等 owner 测完显式发话**。此后常态回归「push main ≠ 发布」 |
+| V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);merge PR #165 = owner 2026-07-22「已经合并」;`825ae7d` squash 落 main |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
 | v0.9.6 docs 写权一次性授权(kimi 改 usage/orchestration/tech-design/README) | **已签核消耗** —— owner 2026-07-21 指定 kimi 更新全局文档、fable5 review;仅本版有效,写权常态仍归规划会话 |
 | v0.9.6 合 main | **已签核消耗** —— owner 2026-07-21「review 后合并 main,让 dev 和 main 保持一致」;fable5 review 三提交(3e6bca1/9c5f895/86b9788)后 ff 合并 |

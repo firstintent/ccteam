@@ -66,22 +66,6 @@
 - **规格**:占位指针卡,**不含实现授权**;拍板后由规划拆 wave 卡替换本卡。
 - **DoD**:—(gated)
 
-### V097-W12 daemon 生命周期核 + systemd 退场(PRD W1+W2)
-- **状态**:进行中(PR #165·2026-07-22,待 owner review/merge) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + Makefile` · **入口**:规划会话调度(owner 直驱 dev+PR)
-- **背景**:owner 2026-07-22 拍板 V097 进入开发(废 systemd + D1–D8 按 PRD v4 默认,登记 `state.md` 人工门)。规格 SoT = `docs-local/versions/v0-9-7/prd.md` §三 F1/F2/F4 + §四 Codex 借鉴地图(pid.rs+测试直接搬,Apache-2.0 attribution 进 LICENSES.md)。工作树 `/tmp/ccteam-v097`(branch `dev`),PR 目标 `main`,tag/部署 HELD。
-- **规格**:F1 生命周期核(pid JSON + `daemon.lock` + 双判定 + versioned probe)+ F2 `daemon start/stop/restart/status/logs`(全 `--json`;trigger-file 全链退役;`ccteam stop` 委托 alias;前台 start 加 probe 实例守卫)+ F4 legacy 自动接管(Rust 单一实现;install.sh 只检测+调用;指纹白名单,手写 unit 永不代删)+ W2 删 unit 面(Makefile/install.sh 零 unit 文本;`make install` = build+`daemon restart`)+ doctor 残留 WARN。
-- **DoD**:PRD 验收 A1–A6;确定性 lib 基线只增(≥1472/0);clippy 0;fmt 干净;writeback 绿。
-- **验证**(PR #165,commits 898f553 W1 + bc77fe8 W2):lib 基线 1472→**1478/0**(+6 daemon-core 定向测试);clippy 0;`cargo fmt --all --check` 干净;subagent 撞会话限额中断于测试收尾,规划(Fable5/opus)接手修 `matches!`→`if let` 编译错 + 删 trigger 退役后 dead helper,补 W2 全量(install.sh/Makefile 零 unit 文本 grep 断言过 + LICENSES attribution)。**真机隔离 e2e**(tempdir HOME+CCTEAM_HOME+loopback):A1 幂等(started→alreadyRunning)· 干净 managed stop(stopped→ready:false)· A4 死 pid stale 记录→start 干净接管拿新 pid+managed:true · A5 前台实例→daemon stop 拒绝(notManaged 可读指引)· doctor 无 legacy WARN。集成 graceful_shutdown 7 + start_with_imd 3 绿。未部署(HELD)。
-- **偏差**:W3(update/InstallChannel/版本外显 + workspace 版本 bump 0.9.7)独立卡 V097-W3 承接,本 PR 不含;版本号仍 0.9.6(W3 bump)。pre-existing env-flake `web_chat_bridge::…survives_restart`(WS/tmux,非 `--lib` 口径,文件未碰)不受影响。
-
-### V097-W3 update + InstallChannel + 版本外显(PRD W3)
-- **状态**:进行中(PR #165·2026-07-22,与 W12 同 PR 待 owner review/merge) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + docs/` · **入口**:规划会话调度(subagent 实现 + Fable5/opus orchestrator 收尾)
-- **背景**:同 V097-W12,在其之上叠加(**依赖 W12,同域串行**);PRD §三 F3 + §六 W3。P1-4(unit PATH 补 kimi)已按 D7 随 unit 面删除而取代,细节见 state.md 人工门 + V097-W12 卡。
-- **规格**:InstallChannel(env 预留/marker/路径启发)+ `ccteam update`(standalone 臂转发非交互 install.sh、source 臂只指引 + 升级重启合同:in-flight 等 5min/`--now`/`--no-restart` + 版本核对)+ `state/version.json` 轻量检查(≥20h,lazy,不进 daemon loop)+ doctor updates 段 + fleet 版本偏差外显 + workspace 版本 bump `0.9.7` + docs 同步(usage/README/tech-design 指针)。
-- **DoD**:PRD 验收 A7–A10;基线只增;writeback 绿;PR 就绪。
-- **验证**(PR #165,commits eac77e9/532fbe6/4640bf9 subagent + bcb021f/481739c orchestrator):subagent 交付 F3.1–F3.6(install_channel/version_check/update/doctor/fleet skew,restart 合同 fake-injected 状态机测试),规划(opus)收尾 = 版本 bump 0.9.7 + 接真实 `fetch_latest_version`(curl `-sI` redirect 解析,镜像 install.sh)+ docs(usage 新增 Updating 段/README/tech-design 指针×2)。lib 1478→**1494/0**(+16 subagent +0 orchestrator);clippy 0;fmt 干净。**真机 live**:Source 渠道 `update --json`→`{status:guidance}` 不下载;`status` 触发 20h gate 真拉 GitHub `releases/latest`→version.json 缓存 `v0.9.5`(v 前缀 semver 比较正确、不误报新于 0.9.7);doctor `updates` 段渲染(channel/exe/binary version/latest)。**A7 全链**(standalone 真装+重启)未 live 跑(会覆盖 operator binary),install.sh 下载+sha256 未改属既证、重启合同 fake 测试覆盖。
-- **偏差**:①版本核对比「新装 binary 的 `--version`」非 updater 自身编译版本(updater 是旧 binary,自比会误报 skew);②in-flight「active」只认 `working` 态(`stale`/`stuck` 是卡死会白烧 5min cap);③`--json` 词汇用 `restarted/binarySwapped/guidance/error`(install.sh exit code 无法区分「已最新」故不设 `upToDate`);④doctor 只读 cache 不联网(status 驱动 20h 刷新)。`fetch_latest_version` subagent 留 stub、orchestrator 已接真实实现。
-
 ### P2-1 CI 增确定性测试 job
 - **状态**:待排 · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)
 - **背景**:V095 复核发现 `check.yml` 只跑 fmt + clippy,**测试完全不在 CI** —— 基线只增当前全靠会话自律 + 复核(P1-3 的测试陈化即因此漏网)。确定性口径(`--lib`)本就为免 env-flake 设计,适合上 CI。
@@ -90,4 +74,4 @@
 
 ## 历史波指针
 
-- v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
+- v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
