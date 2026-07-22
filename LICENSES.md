@@ -26,6 +26,22 @@ The Apache-2.0 license permits use, modification, and redistribution under
 the terms of the license, including in MIT-licensed projects, provided the
 attribution and license notice above are retained.
 
+### OpenAI Codex — install channel + self-update
+
+- **Adapted into**: `crates/ccteam-core/src/install_channel.rs` (install-method
+  enum + `detect()` priority ladder) and `crates/ccteam-cli/src/update.rs`
+  (`ccteam update` channel→action mapping), introduced in v0.9.7.
+- **Derived from**: `codex-rs/install-context/src/lib.rs` (`InstallMethod`
+  enum + `current()` env/path detection) and `codex-rs/tui/src/update_action.rs`
+  (`UpdateAction` enum + per-channel command mapping). The managed-package /
+  releases machinery was dropped, a marker-file layer was added, the command
+  table was replaced with ccteam's install.sh pipeline, and the upgrade-restart
+  contract (probe → drain → graceful restart → version verify) is
+  ccteam-specific — this is a rewrite, not a verbatim copy.
+- **Upstream**: <https://github.com/openai/codex>
+- **License**: [Apache License, Version 2.0](https://github.com/openai/codex/blob/main/LICENSE)
+- **Copyright**: OpenAI Codex, Copyright 2025 OpenAI (see the upstream `NOTICE`).
+
 ## Fonts
 
 ### JetBrains Mono Regular

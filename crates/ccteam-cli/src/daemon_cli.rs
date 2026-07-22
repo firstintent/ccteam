@@ -26,6 +26,10 @@ use crate::legacy_takeover;
 /// (default `canonicalize(current_exe())`). Same convention as
 /// `CCTEAM_{CLAUDE,CODEX}_BIN`.
 pub const DAEMON_BIN_ENV: &str = "CCTEAM_DAEMON_BIN";
+/// Default embedded-web bind, shared by the daemon verbs' clap defaults
+/// and `ccteam update`'s upgrade-restart (which has no `--web-bind` of its
+/// own — same posture as `daemon restart`).
+pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:7331";
 /// Hidden test hooks: shrink the ready-wait / stop-wait budgets so
 /// failure-path integration tests don't burn the production timeouts.
 const READY_TIMEOUT_ENV: &str = "CCTEAM_DAEMON_READY_TIMEOUT_MS";
@@ -104,7 +108,10 @@ fn stop_tuning() -> dcore::StopTuning {
 /// Run the legacy systemd/launchd takeover pre-step (idempotent; PRD
 /// F4). Best-effort: a takeover hiccup is reported but never blocks the
 /// start itself. All output → stderr (diagnostics, both modes).
-fn takeover_pre_step() {
+///
+/// `pub(crate)` so `ccteam update`'s upgrade-restart contract runs the
+/// same takeover pre-step before it restarts (PRD F4 layer ③).
+pub(crate) fn takeover_pre_step() {
     match legacy_takeover::run_takeover_from_env() {
         Ok(legacy_takeover::TakeoverOutcome::NothingToDo) => {}
         Ok(legacy_takeover::TakeoverOutcome::Migrated { unit, actions }) => {
@@ -221,46 +228,88 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of the reusable managed-restart core ([`restart_managed`]).
+/// Refusals / timeouts are verdicts (not panics) so both callers
+/// (`daemon restart`, `ccteam update`) own their own exit-code / JSON
+/// mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestartOutcome {
+    /// Was running → SIGTERM'd → started again.
+    Restarted { pid: u32, version: Option<String> },
+    /// Nothing was running → freshly started.
+    Started { pid: u32, version: Option<String> },
+    /// A ready but not-managed instance holds the socket — refused.
+    NotManaged { hint: String },
+    /// The managed daemon did not exit within the stop wait.
+    StopTimedOut { pid: u32 },
+    /// After the stop, an unmanaged instance already serves the socket.
+    AlreadyServing { version: Option<String> },
+}
+
+/// Reusable restart core: acquire the operation lock, then stop (if
+/// managed) + start under that ONE lock so no concurrent lifecycle op can
+/// interleave. The CALLER runs any takeover pre-step first
+/// (`daemon start/restart` and `ccteam update` all do). Shared by
+/// [`run_daemon_restart`] and the `ccteam update` upgrade-restart contract
+/// so the lock/stop/start logic lives in exactly one place.
+pub(crate) fn restart_managed(paths: &CcteamPaths, web_bind: &str) -> Result<RestartOutcome> {
+    // ONE lock across stop + start.
+    let _lock = dcore::acquire_operation_lock(paths)?;
+    let was_running = match dcore::stop_managed_with(paths, false, stop_tuning())? {
+        dcore::StopVerdict::Stopped { .. } => true,
+        dcore::StopVerdict::NotRunning => false,
+        dcore::StopVerdict::RefusedNotManaged { hint } => {
+            return Ok(RestartOutcome::NotManaged { hint })
+        }
+        dcore::StopVerdict::TimedOut { pid } => return Ok(RestartOutcome::StopTimedOut { pid }),
+    };
+    let spec = start_spec(paths, web_bind)?;
+    match dcore::start_managed(paths, &spec)? {
+        dcore::StartVerdict::Started { pid, version } => Ok(if was_running {
+            RestartOutcome::Restarted { pid, version }
+        } else {
+            RestartOutcome::Started { pid, version }
+        }),
+        dcore::StartVerdict::AlreadyRunning { version } => {
+            Ok(RestartOutcome::AlreadyServing { version })
+        }
+    }
+}
+
+/// Shared success emit for `daemon restart` (status = `restarted` when a
+/// daemon was running, `started` when none was).
+fn emit_restart_started(
+    json: bool,
+    status: &str,
+    pid: u32,
+    version: Option<String>,
+    web_bind: &str,
+) {
+    let v = version.clone().unwrap_or_else(|| "unknown".into());
+    emit(
+        json,
+        serde_json::json!({ "status": status, "pid": pid, "version": version }),
+        &format!(
+            "ccteam daemon {status} (pid {pid}, version {v}).\n{}",
+            web_hint(web_bind)
+        ),
+    );
+}
+
 pub fn run_daemon_restart(web_bind: &str, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     // Restart is the verb `make install` runs on upgraded dev boxes, so
     // it carries the same takeover pre-step as start.
     takeover_pre_step();
-    // ONE lock across stop + start: no concurrent lifecycle op can
-    // interleave between the two phases.
-    let _lock = match dcore::acquire_operation_lock(&paths) {
-        Ok(lock) => lock,
-        Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
-    };
-    let was_running = match dcore::stop_managed_with(&paths, false, stop_tuning()) {
-        Ok(dcore::StopVerdict::Stopped { .. }) => true,
-        Ok(dcore::StopVerdict::NotRunning) => false,
-        Ok(dcore::StopVerdict::RefusedNotManaged { hint }) => fail(json, "notManaged", &hint),
-        Ok(dcore::StopVerdict::TimedOut { pid }) => fail(
-            json,
-            "stopTimeout",
-            &format!(
-                "daemon pid {pid} did not exit within the stop wait; restart aborted \
-                 (`ccteam daemon stop --force` can escalate)"
-            ),
-        ),
-        Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
-    };
-    let spec = start_spec(&paths, web_bind)?;
-    match dcore::start_managed(&paths, &spec) {
-        Ok(dcore::StartVerdict::Started { pid, version }) => {
-            let status = if was_running { "restarted" } else { "started" };
-            let v = version.clone().unwrap_or_else(|| "unknown".into());
-            emit(
-                json,
-                serde_json::json!({ "status": status, "pid": pid, "version": version }),
-                &format!(
-                    "ccteam daemon {status} (pid {pid}, version {v}).\n{}",
-                    web_hint(web_bind)
-                ),
-            );
+    match restart_managed(&paths, web_bind) {
+        Ok(RestartOutcome::Restarted { pid, version }) => {
+            emit_restart_started(json, "restarted", pid, version, web_bind);
         }
-        Ok(dcore::StartVerdict::AlreadyRunning { version }) => {
+        Ok(RestartOutcome::Started { pid, version }) => {
+            // Nothing was running before this restart — it was a plain start.
+            emit_restart_started(json, "started", pid, version, web_bind);
+        }
+        Ok(RestartOutcome::AlreadyServing { version }) => {
             // Only reachable if an unmanaged instance grabbed the socket
             // between our stop and start — surface it honestly.
             emit(
@@ -269,6 +318,15 @@ pub fn run_daemon_restart(web_bind: &str, json: bool) -> Result<()> {
                 "a daemon is already serving the socket (not spawned by this restart).",
             );
         }
+        Ok(RestartOutcome::NotManaged { hint }) => fail(json, "notManaged", &hint),
+        Ok(RestartOutcome::StopTimedOut { pid }) => fail(
+            json,
+            "stopTimeout",
+            &format!(
+                "daemon pid {pid} did not exit within the stop wait; restart aborted \
+                 (`ccteam daemon stop --force` can escalate)"
+            ),
+        ),
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     }
     Ok(())

@@ -212,6 +212,19 @@ start_daemon() {
     fi
 }
 
+# Write the install-channel marker (~/.ccteam/install-channel) so
+# `ccteam update` / `ccteam status` / doctor detect the standalone channel
+# authoritatively (the ~/.local/bin path heuristic is only the fallback).
+# Best-effort: a failure here never fails the install. Honors CCTEAM_HOME.
+write_install_marker() {
+    _tag="$1"
+    _home="${CCTEAM_HOME:-$HOME/.ccteam}"
+    _now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
+    mkdir -p "$_home" 2>/dev/null || return 0
+    printf '{\n  "channel": "standalone",\n  "tag": "%s",\n  "installed_at": "%s"\n}\n' \
+        "$_tag" "$_now" > "$_home/install-channel" 2>/dev/null || true
+}
+
 # Print the fresh-install next step without launching (装包 ≠ 启服).
 print_start_hint() {
     info "Installed. Start the daemon when ready:"
@@ -384,6 +397,7 @@ main() {
 
     mv "$_extracted" "$INSTALL_DIR/ccteam"
     chmod +x "$INSTALL_DIR/ccteam"
+    write_install_marker "$TAG"
     info "${GREEN}Installed:${RESET} $INSTALL_DIR/ccteam ($TAG)"
 
     # ---- PATH hint ----

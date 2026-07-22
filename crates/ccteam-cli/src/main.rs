@@ -8,6 +8,9 @@ mod commands;
 mod daemon_cli;
 mod legacy_takeover;
 mod mcp_serve;
+// v0.9.7 — `ccteam update`: channel-aware self-update (standalone replays
+// install.sh + upgrade-restart contract; source/npm print guidance).
+mod update;
 // ToolGroup enum + CCTEAM_DISABLE_TOOLS filter + chat send_file schema.
 // v0.8.7 W1 — `session_*` tools (agent scheduling). Stdio side
 // forwards to the daemon over mcp.sock; the daemon-side handler
@@ -177,6 +180,29 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCommand,
+    },
+    /// Update ccteam to the latest release, by install channel
+    /// (`ccteam status` / `ccteam doctor` show when one is available).
+    ///
+    /// A standalone install (the `curl … | sh` prebuilt in `~/.local/bin`)
+    /// replays `install.sh` non-interactively — it downloads, verifies the
+    /// sha256, and swaps the binary atomically — then gracefully restarts a
+    /// running daemon onto the new binary (waiting up to 5 min for in-flight
+    /// turns to go idle first; `--now` skips the wait, `--no-restart` swaps
+    /// the binary only). A source build prints `git pull && make install`;
+    /// the npm channels aren't published yet.
+    Update {
+        /// Skip the in-flight drain and restart the daemon immediately.
+        #[arg(long, default_value_t = false)]
+        now: bool,
+        /// Swap the binary only — do not restart the running daemon (it
+        /// keeps running the old version until `ccteam daemon restart`).
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+        /// Emit exactly one machine-readable JSON line on stdout (human
+        /// prose moves to stderr).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Project lifecycle group: `ccteam project <ls|show|new|stop|rm>`.
     ///
@@ -797,6 +823,12 @@ fn main() -> Result<()> {
             DaemonCommand::Status { json } => daemon_cli::run_daemon_status(json),
             DaemonCommand::Logs { n, follow, json } => daemon_cli::run_daemon_logs(n, follow, json),
         },
+        // v0.9.7 — `ccteam update`: channel-aware self-update + upgrade-restart.
+        Command::Update {
+            now,
+            no_restart,
+            json,
+        } => update::run_update(now, no_restart, json),
         // v0.8.6 W3/W4a — `ccteam project <ls|show|new|stop|rm>` group.
         Command::Project { cmd } => match cmd {
             ProjectCommand::Ls { format } => run_ls(format),
@@ -2089,6 +2121,40 @@ fn run_status() -> Result<()> {
     let daemon_up = health.is_healthy();
     println!("  daemon:  {}", health.describe());
     println!();
+
+    // ①b v0.9.7 (F3.4) — lazy "a newer ccteam is available" line. The
+    // ≥20h-gated refresh uses the injected GitHub-latest fetcher (stubbed
+    // until the orchestrator wires it; a failure degrades silently to the
+    // cache), and display reads the (possibly refreshed) cache. Gated by
+    // the `check_for_update` preference.
+    let binary_version = env!("CARGO_PKG_VERSION");
+    let prefs = ccteam_core::preferences::load_or_default(&paths.root);
+    let version_cache = ccteam_core::version_check::maybe_refresh_latest(
+        &paths,
+        prefs.check_for_update,
+        chrono::Utc::now(),
+        update::fetch_latest_version,
+    );
+    if let Some(latest) =
+        ccteam_core::version_check::update_available(&version_cache, binary_version)
+    {
+        println!(
+            "  update:  a newer ccteam is available ({binary_version} → {latest}); run `ccteam update`"
+        );
+        println!();
+    }
+
+    // ①c v0.9.7 (F3.6) — fleet version skew: one line per registered
+    // satellite whose ccteam version differs from this daemon's. The
+    // common no-satellite / all-aligned case stays silent.
+    let host_skew = update::fleet_version_skew(&paths, binary_version);
+    if !host_skew.is_empty() {
+        println!("  hosts ({} with version skew):", host_skew.len());
+        for line in &host_skew {
+            println!("    {line}");
+        }
+        println!();
+    }
 
     // ② Projects, each with its tracked sessions nested underneath.
     //
