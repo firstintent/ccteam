@@ -35,6 +35,14 @@
 - **落地**:通知时机改 vendor turn 边界(pump 聚合中途叙述,`TurnCompleted/TurnFailed/Error` 才发,文案明示 child 已 idle+折叠计数);`notify: final(默认)/all/off`(bool 兼容);wait 等真边界不被叙述提前结束;session_* 全带服务端超时;ACP 也 mirror `chat_turn_completed` + meta `tokens_total`;list 加 `project/activity/limit` + 行瘦身 + task 首行派生 title;重启 reconcile 卷总。
 - **验证**:lib 基线 1435→1447/0;clippy 0;web 与 origin/main 同基线(3 `ws_*` env-flake 族不变);+12 定向测试(边界折叠 e2e / all·off 模式 / dedup 重放 / reconcile 卷总 / wait-vs-叙述 / list 过滤 / 派生 title / NotifyMode wire / 旧 bool watch 兼容);writeback 绿。未部署(tag+部署 HELD 不变)。
 
+### EXT-MCP-1 外部 Agent MCP 接入 Phase 1(WebUser project ACL)
+- **状态**:完成(e25544d) · **冲突域**:`crates/ccteam-web(routes/mcp,auth) + crates/ccteam-im(mcp) + crates/ccteam-core(identity)` · **入口**:codex dev 会话(s118 派工,规划 review 把关)
+- **背景**:研究稿 `docs-local/research/external-agent-mcp-symmetric-architecture.md`(2026-07-23);owner 同日拍板按推荐默认(D1–D10)实现 **Phase 1**。缺口已逐条核实:①`/mcp` 拒 tenant web token(`routes/mcp.rs::require_mcp_auth` 只收 admin+session bearer)②`McpCaller` 只有 `Ambient|Admin` ③ MCP 面无 project ACL choke point ④ spawn owner 硬编码 `"web-api"`(`dispatch.rs:1238`)⑤ `chat_send_file`/`screenshot` dispatch 不带 caller。
+- **规格**:仅 Phase 1(主 daemon 单 Authority):`/mcp` 经 `resolve_identity` 族收 tenant token → 新 `McpCaller::User{user_id}`(`Copy`→`Clone`);身份策略纯函数(owner_tag/can_see_owner)下沉 `ccteam-core`,web `Identity` 与 im 共用;User 调 session_*:spawn 必带显式 `project` + ACL(仅自有项目),owner/reply_to 归 `user:<id>`(与 REST create_session 同路),root spawn(无 parent edge);dispatch/collect/stop 先 sid→project 再 ACL,unknown 与 forbidden 错误不可区分(防枚举);list/status 只聚合该用户可见项目;screenshot 先 slug ACL;chat_send_file 投递本人 linked IM、无绑定可读错误、零收件人参数。**不改 8-tool wire schema;不加 `host` 参数;tenant 绝不映射 Admin;Ambient/Admin 现行为零回归;Phase 2–4 不做**。
+- **DoD**:定向测试先红后绿(tenant bearer 认证/ACL 允許+拒绝/防枚举统一错误/owner 归属/防 `_caller_*` 伪造);`make test-baseline` ≥1604 + `ccteam-web` 全量不退;clippy 0 warnings;fmt 干净;writeback 绿;落 `dev` 汇入 PR #166。
+- **验证**:规划独立复跑门禁(不信转述):fmt 干净;clippy 0 warnings;确定性基线 **1615/0**(1604+11);web 全量 0 失败(`pty_ws_test` 3 `ws_*` = 已登记 env-flake 族,main=dev 同红且相关文件零 diff);逐块 diff review 通过(tenant 绝不映射 Admin/Ambient、`_caller_*` 前缀全量剥离 fail-closed、unknown/forbidden 错误逐字节相同、spawn owner 归 `user:<id>` 与 REST 同种子、策略单源 `ccteam-core::identity`)。ff 合入 dev(e25544d)。
+- **偏差**:无。遗留观察(非阻塞):`_caller_visible_projects` 服务端注入搭 args 便车,Ambient 客户端可自带但只能收窄列表、无扩权面;后续整洁度改进可立小卡。
+
 ### FB-2 subagent 事件污染 live model 外显与计费捕获
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(claude_stream_json)` · **建议入口**:dev 会话
 - **背景**:owner 2026-07-22 实测(s106,spawn `--model fable`):主循环跑 Task subagent 期间 web 模型外显漂成 opus,subagent 结束后回落 fable;meta.json 与回落后的 status.json 均为 fable(污染瞬时)。stream-json 流里 subagent 的 assistant 事件与主循环同流,仅 `parent_tool_use_id` 可区分(`protocol.rs:261` 已解析,消费端零使用)。

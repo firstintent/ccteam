@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.7` 已合 `main`**(2026-07-22 owner merge PR #165,squash `825ae7d`)。V097 全三波:W1 daemon 生命周期核(Codex pid-detach)+ W2 systemd/launchd 退场 + W3 `ccteam update`/InstallChannel/版本外显;随车 2 个 ccm 提交(Grok 托管不 spawn stdio mcp-serve + idle 后台任务 /status 外显)。**tag+部署 = pre-release rc 先行人肉测**(release.yml 加 `--prerelease`(tag 带 `-` 即 pre-release,不进 /latest);已推 `v0.9.7-rc1` 触发工作流,owner `CCTEAM_VERSION=v0.9.7-rc1` 装测 → 满意后打 `v0.9.7` 正式 tag = latest)。
-- **在做**:**dev+PR 攒版本第一轮(PR #166,等 owner 合并)** —— v0.9.7 发布后修复:update 两 fix(inode 交换 + 版本门)+ resume 阶梯补全(IM/web/MCP 对称)+ daemon 关停泵泄漏(修活 restart flaky)+ CI 去 rmux smoke + 基线口径修正(`make test-baseline`,`--lib --bins`);全量门禁绿(2026-07-23 规划复核)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
+- **在做**:**dev+PR 攒版本第一轮(PR #166,等 owner 合并)** —— v0.9.7 发布后修复:update 两 fix(inode 交换 + 版本门)+ resume 阶梯补全(IM/web/MCP 对称)+ daemon 关停泵泄漏(修活 restart flaky)+ CI 去 rmux smoke + 基线口径修正(`make test-baseline`,`--lib --bins`)+ **EXT-MCP-1 外部 Agent MCP Phase 1(e25544d:tenant web token 调 `/mcp`,`McpCaller::User` + project ACL,基线 1604→1615)**;全量门禁绿(2026-07-23 规划复核)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
@@ -29,6 +29,7 @@
 | AGENTS §三 init 布局红线行澄清(注明用户可选 `.ccteam/routing.md`,init 不种) | **已消耗** —— 随 owner ship 9c5f895 的语义校准,非新增红线 |
 | v0.9.4 动代码 | gated —— owner 暂缓(2026-07-17,v0.9.5 先行;v0.9.5 已于同日完成落 main,授权已消耗) |
 | 分支治理 = dev + PR 攒版本(常态规则,非一次性) | **已生效** —— owner 2026-07-22:「后续新功能开发一律在 dev 分支开发,提交 PR;多个提交累计组成一个版本,owner 合并 PR 后复用 dev 重复」;取代旧 direct-on-main,已固化 AGENTS.md §五「分支与推送」 |
+| 外部 Agent MCP 接入 Phase 1(研究稿 `docs-local/research/external-agent-mcp-symmetric-architecture.md` 待拍板 D1–D10) | **已签核消耗** —— owner 2026-07-23「实现这个需求」= 按稿内推荐默认拍板,授权范围仅 Phase 1(主 daemon WebUser MCP,tenant token 直用为 MVP);Phase 2(独立 MCP token)/3(卫星 relay)/4(多 Authority)未授权;8-tool wire schema 不变 |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训
