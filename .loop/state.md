@@ -7,7 +7,7 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.8` 已合 `main`**(2026-07-23 owner merge PR #166,squash `ad1c7c2`);tag+部署未发(owner 显式发话才动,§人工门);上一版 v0.9.7 = PR #165 `825ae7d`,已发布 latest。dev 复用开下一轮(下一个 dev→main PR 由首个新提交自动攒起)。
+- **版本线**:workspace **`0.9.8` 已合 `main` 并发布**(2026-07-23 owner merge PR #166 squash `ad1c7c2` → 同日 tag `v0.9.8` + release 全绿,`/releases/latest` → v0.9.8);上一版 v0.9.7 = PR #165 `825ae7d`,已发布 latest。dev 复用开下一轮(下一个 dev→main PR 由首个新提交自动攒起)。
 - **在做**:v0.9.8 已收官(合并记录见版本线;逐项明细 = `.loop/history.md` v0.9.8 行);队列现势卡 = A2A-W5 / FB-2 / P1-1/2/3 / P2-1(V094 gated)—— 唯一来源 `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
@@ -21,7 +21,7 @@
 
 | 事项 | 状态 |
 |---|---|
-| **tag + 部署** | **已消耗(v0.9.7 已发布)** —— owner 2026-07-22:「发release」→ pre-release `v0.9.7-rc1` 人肉测 →「发正式版」→ 正式 `v0.9.7` tag(commit `2922f7a`,= rc 同一构建)推送,工作流建 latest release 四平台;`/releases/latest` → v0.9.7,全体用户经 `install.sh`/`ccteam update` 可拿到。**此后常态回归「push main ≠ 发布」,下个版本 tag 仍需 owner 显式发话** |
+| **tag + 部署** | **已消耗(v0.9.8 已发布)** —— owner 2026-07-23「人肉测过了,打tag、发release」→ 正式 `v0.9.8` tag(main squash `ad1c7c2`)推送,release.yml 全绿(四平台 tarball + SHA256SUMS);`/releases/latest` → v0.9.8,全体用户经 `install.sh`/`ccteam update` 可拿到(v0.9.8 无 rc,owner 已先行人肉测)。上一次 = v0.9.7(`2922f7a`,rc 先行)。**常态不变:push main ≠ 发布,下个版本 tag 仍需 owner 显式发话** |
 | V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);merge PR #165 = owner 2026-07-22「已经合并」;`825ae7d` squash 落 main |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
 | v0.9.6 docs 写权一次性授权(kimi 改 usage/orchestration/tech-design/README) | **已签核消耗** —— owner 2026-07-21 指定 kimi 更新全局文档、fable5 review;仅本版有效,写权常态仍归规划会话 |
