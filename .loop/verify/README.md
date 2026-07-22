@@ -11,6 +11,7 @@
 |---|---|---|
 | **任何收口(最低门)** | `cargo fmt --all -- --check` + `.loop/verify/writeback.sh` | fmt 是 CI required;writeback 见其头注 |
 | Rust(非 ccteam-web) | 最低门 + `make check` + `make test` | clippy `-D warnings`;test = workspace 除 web,`--no-fail-fast` |
+| 记基线数字时 | `make test-baseline` | 确定性口径(`--lib --bins`,排 `tests/*.rs` env-flake);**命令的家 = Makefile,勿在 `.loop/` 复制** |
 | `crates/ccteam-web/src` | 上行 + `make test-web` | web 的 WS/PTY 测试需真终端 |
 | SPA(`crates/ccteam-web/web`) | 最低门 + `make web-check` | vitest + tsc |
 | docs / `.loop/` only(零代码 diff) | 最低门即可(免 cargo test) | 免跑失效条件:换机 / 换 toolchain / 动依赖解析后首轮必真跑 |
@@ -20,7 +21,10 @@
 
 ## 通过判据
 
-- 基线**只增不减**(当前数字 = `.loop/state.md`);clippy 0 warnings;fmt 干净。
+- 基线**只增不减**(口径 = `make test-baseline`,当前数字 = `.loop/state.md`);clippy 0 warnings;fmt 干净。
+- **口径必须覆盖 binary-only crate**:`ccteam-cli` 没有 lib target,旧口径的裸 `--lib` 因此覆盖它**零个**测试 ——
+  `web_chat_bridge` 的重启测试就这样在 main 上烂了很久没人发现(pump 泄漏 + 断言随架构漂移)。故口径固定为
+  `--lib --bins`;**新增 binary-only crate 时必须确认它进了这个口径**。
 - **新校验 / 新门必须先证有牙**:先造缺陷态、定向测试红(留痕于卡面「验证」段),再修绿——恒绿的门 = 空洞,不算验收。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
