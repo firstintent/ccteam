@@ -125,6 +125,14 @@ It stays deliberately underneath:
 - **Local first** — `~/.ccteam` and your repos; no cloud in the loop.
 - **Budgets guard, never kill** — daily per-vendor caps are the only automatic brake.
 
+## Update
+
+```bash
+ccteam update                # update in place, then restart the daemon onto the new binary
+```
+
+`ccteam update` re-runs the install path it detects (the prebuilt install replays `install.sh` — same download + SHA-256 verify + atomic swap; a from-source checkout is told to `git pull && make install`, never silently recompiled). After the binary swaps, a running daemon drains its in-flight turns (up to 5 min; `--now` skips, `--no-restart` defers), restarts onto the new binary, and verifies the version. `ccteam status` and `ccteam doctor` show the running-vs-installed version and whether a newer release exists. Satellites update themselves — run it on each; the console flags any host whose version lags the daemon.
+
 ## Uninstall
 
 ```bash
