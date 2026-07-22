@@ -480,6 +480,39 @@ fn active_session_count(paths: &CcteamPaths) -> usize {
 /// `/tag/<v>` segment of the `Location:` header (e.g. via
 /// `curl -sI --max-time 3 <url>` or a short-timeout reqwest client).
 pub(crate) fn fetch_latest_version() -> Option<String> {
+    // Mirror install.sh's redirect parse (no GitHub API rate limit): a
+    // short-timeout HEAD of releases/latest, then the `/tag/<v>` segment of
+    // the `Location:` header. Shelling out to curl matches the installer's
+    // own resolution exactly and sidesteps any blocking-in-async concern; it
+    // is also already an update-path dependency. Any failure (curl absent, no
+    // network, parse miss) folds to `None` — the caller keeps the cache.
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sI",
+            "--max-time",
+            "3",
+            "https://github.com/firstintent/ccteam/releases/latest",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let headers = String::from_utf8_lossy(&out.stdout);
+    for line in headers.lines() {
+        // Header names are case-insensitive; the value keeps the tag's case.
+        if line.len() >= 9 && line[..9].eq_ignore_ascii_case("location:") {
+            let value = line[9..].trim();
+            if let Some(idx) = value.rfind("/tag/") {
+                let tag = value[idx + "/tag/".len()..].trim();
+                if !tag.is_empty() {
+                    return Some(tag.to_string());
+                }
+            }
+        }
+    }
     None
 }
 
