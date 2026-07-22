@@ -67,10 +67,12 @@
 - **DoD**:—(gated)
 
 ### V097-W12 daemon 生命周期核 + systemd 退场(PRD W1+W2)
-- **状态**:进行中(规划调度 subagent·2026-07-22) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + Makefile` · **入口**:规划会话调度(owner 直驱 dev+PR)
+- **状态**:进行中(PR #165·2026-07-22,待 owner review/merge) · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + Makefile` · **入口**:规划会话调度(owner 直驱 dev+PR)
 - **背景**:owner 2026-07-22 拍板 V097 进入开发(废 systemd + D1–D8 按 PRD v4 默认,登记 `state.md` 人工门)。规格 SoT = `docs-local/versions/v0-9-7/prd.md` §三 F1/F2/F4 + §四 Codex 借鉴地图(pid.rs+测试直接搬,Apache-2.0 attribution 进 LICENSES.md)。工作树 `/tmp/ccteam-v097`(branch `dev`),PR 目标 `main`,tag/部署 HELD。
 - **规格**:F1 生命周期核(pid JSON + `daemon.lock` + 双判定 + versioned probe)+ F2 `daemon start/stop/restart/status/logs`(全 `--json`;trigger-file 全链退役;`ccteam stop` 委托 alias;前台 start 加 probe 实例守卫)+ F4 legacy 自动接管(Rust 单一实现;install.sh 只检测+调用;指纹白名单,手写 unit 永不代删)+ W2 删 unit 面(Makefile/install.sh 零 unit 文本;`make install` = build+`daemon restart`)+ doctor 残留 WARN。
 - **DoD**:PRD 验收 A1–A6;确定性 lib 基线只增(≥1472/0);clippy 0;fmt 干净;writeback 绿。
+- **验证**(PR #165,commits 898f553 W1 + bc77fe8 W2):lib 基线 1472→**1478/0**(+6 daemon-core 定向测试);clippy 0;`cargo fmt --all --check` 干净;subagent 撞会话限额中断于测试收尾,规划(Fable5/opus)接手修 `matches!`→`if let` 编译错 + 删 trigger 退役后 dead helper,补 W2 全量(install.sh/Makefile 零 unit 文本 grep 断言过 + LICENSES attribution)。**真机隔离 e2e**(tempdir HOME+CCTEAM_HOME+loopback):A1 幂等(started→alreadyRunning)· 干净 managed stop(stopped→ready:false)· A4 死 pid stale 记录→start 干净接管拿新 pid+managed:true · A5 前台实例→daemon stop 拒绝(notManaged 可读指引)· doctor 无 legacy WARN。集成 graceful_shutdown 7 + start_with_imd 3 绿。未部署(HELD)。
+- **偏差**:W3(update/InstallChannel/版本外显 + workspace 版本 bump 0.9.7)独立卡 V097-W3 承接,本 PR 不含;版本号仍 0.9.6(W3 bump)。pre-existing env-flake `web_chat_bridge::…survives_restart`(WS/tmux,非 `--lib` 口径,文件未碰)不受影响。
 
 ### V097-W3 update + InstallChannel + 版本外显(PRD W3)
 - **状态**:待排 · **冲突域**:`crates/ccteam-core + crates/ccteam-cli + install.sh + docs/` · **建议入口**:规划会话调度

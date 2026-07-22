@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace `0.9.6` 已落 **`main`**(2026-07-21 owner 指示合并,dev=main 对齐;owner 直驱:多 vendor 编排发现面 T1/T2 + compare 全链退役 T4 + 全局文档 T3 + 吉祥物 logo;设计 SoT = gitignored `docs-local/notes/orchestrate-final.md`;opus/codex/kimi 三 agent 分工,fable5 规划 review 合并;增量:cct-codex/cct-grok wrapper skill 退役(hub 8024ec4)+ 快速开始模板重设 + routing notes 项目归位/全局默认生成 + composer vendor·model 外显 3e6bca1),**未 tag、未部署**。
-- **在做**:**V097(v0.9.7 daemon 生命周期重构 Codex 方案 + update)已进入开发** —— owner 2026-07-22 直驱「进入开发,提交 dev,发 PR」,规划调度 subagent 在 `/tmp/ccteam-v097`(branch `dev`)落地,PRD SoT = `docs-local/versions/v0-9-7/prd.md`(v4);A2A-W5(三场景真机 smoke + README/usage 重写)仍挂起;P1-1(缩范围)/2/3 + P2-1 待排(P1-4 已按 D7 作废)—— 队列 = `.loop/backlog.md`。
+- **在做**:**V097-W12(daemon 生命周期核 Codex pid-detach + systemd 退场)= PR #165 待 owner review/merge** —— owner 2026-07-22 直驱「进入开发,提交 dev,发 PR」;subagent 撞会话限额,规划(Fable5/opus)接手收尾:W1+W2 全落 `dev`(898f553+bc77fe8),lib 1478/0、clippy 0、真机隔离 e2e 五项验收过(A1/A4/A5/managed-stop/doctor);tag+部署 HELD。**下一步 = V097-W3(update/InstallChannel/版本外显 + 版本 bump 0.9.7),依赖 W12 merge 后开工**;A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废)—— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
