@@ -114,19 +114,17 @@ One static binary into `~/.local/bin`, no sudo. Then:
 
 ## Daemon
 
-The daemon is self-managed — one mechanism on Linux, macOS, and WSL (no systemd or launchd to wire up). All verbs take `--json` for scripting.
+`ccteam daemon start` runs ccteam in the background and keeps it running after you close the terminal. Manage it with:
 
 ```bash
-ccteam daemon start          # background (setsid; survives your shell closing) + prints the web link
-ccteam daemon status         # pid · ready · running-vs-installed version
-ccteam daemon restart        # graceful stop + restart onto the current binary
-ccteam daemon stop           # graceful stop; sessions resume by id on next start
-ccteam daemon logs -f        # follow ~/.ccteam/daemon.log
+ccteam daemon start          # start in the background; prints your web console link
+ccteam daemon status         # is it running, and on which version?
+ccteam daemon restart        # restart it
+ccteam daemon stop           # stop it (your sessions come back next time you start)
+ccteam daemon logs -f        # watch the logs live
 ```
 
-- **No boot-autostart or crash-restart** — after a reboot, run `ccteam daemon start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam daemon start` cron line covers boot-start if you want it).
-- `ccteam start` still runs in the **foreground** — for dev, containers, or your own supervisor's `ExecStart`.
-- **Upgrading from a pre-v0.9.7 install?** systemd/launchd are retired; the first `ccteam daemon start` (or `install.sh`) auto-migrates the old unit and takes over — a unit you wrote by hand is left untouched.
+After you reboot your computer, run `ccteam daemon start` again to bring ccteam back.
 
 ## Chaining sessions
 
