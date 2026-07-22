@@ -4842,16 +4842,45 @@ impl Gateway {
     /// resume + retry once): a turn is idempotent on a dead-before-delivery
     /// signal, so reacting to the failure closes the probe→send TOCTOU window a
     /// pre-check inherently leaves open.
-    async fn ensure_session_live(&mut self, session_id: &str) -> Result<()> {
+    async fn ensure_session_live(&mut self, session_id: &str, chat: &ChatKey) -> Result<()> {
+        // Deepest rung: a session absent from the live map entirely (evicted /
+        // restart-rebuild-failed / stopped) is cold-resumed from meta.json, so a
+        // directive (`/model`, …) revives a "disappeared" session exactly like a
+        // turn does. Err for a genuinely unknown sid.
+        self.cold_resume_absent_sid(session_id, chat).await?;
         let alive = match self.sessions.get(session_id) {
             Some(s) => s.adapter.thread_is_live(&s.thread),
-            // Missing → let the caller surface its own missing-session error.
+            // Vanished post-resume (race) → let the caller surface its error.
             None => return Ok(()),
         };
         if !alive {
             self.resume_dead_session(session_id).await?;
         }
         Ok(())
+    }
+
+    /// Resume-by-sid, deepest rung: if `sid` is ABSENT from the live map —
+    /// evicted for capacity, dropped by a daemon restart whose rebuild failed,
+    /// or explicitly stopped — cold-resume it from its on-disk `meta.json` (a
+    /// fresh live thread), binding replies to `reply_to`. A no-op when the sid
+    /// is already in the map (a live / in-map-dead session is handled by the
+    /// caller's own live/dead ladder). `Err` only for a genuinely unknown sid
+    /// (no meta). This is the deeper twin of [`resume_dead_session`]: keeping
+    /// BOTH rungs in the shared submit core ([`submit_resolved`] + the directive
+    /// path's [`ensure_session_live`]) means every submit-by-sid path — IM
+    /// current-session, `@handle`, MCP `session_dispatch`, the web turn — revives
+    /// a session that left the live map identically, rather than each frontend
+    /// special-casing it. ACL is the caller's concern (each frontend gates who
+    /// may address a sid before reaching the submit core).
+    async fn cold_resume_absent_sid(&mut self, sid: &str, reply_to: &ChatKey) -> Result<()> {
+        if self.sessions.contains_key(sid) {
+            return Ok(());
+        }
+        let (slug, cwd, meta) = self
+            .find_meta_for_sid(sid)
+            .map_err(|_| anyhow!("unknown session: {sid}"))?;
+        self.rebuild_session_from_meta(&slug, cwd, &meta, reply_to.clone())
+            .await
     }
 
     /// Shared submit core (sid already resolved). A single-line `/command` is a
@@ -4874,11 +4903,18 @@ impl Gateway {
             // Directive path: PROBE-and-resume a dead child before dispatching
             // (a directive may have side effects → never blindly retried). The
             // turn path below uses the race-free reactive shape instead.
-            self.ensure_session_live(session_id).await?;
+            self.ensure_session_live(session_id, chat).await?;
             let replies = self.dispatch_directive(chat, session_id, directive).await?;
             return Ok(SubmitResult::Directive(replies));
         }
 
+        // Resume-by-sid (deepest rung): a session ABSENT from the live map —
+        // evicted for capacity, dropped by a daemon restart whose rebuild failed,
+        // or stopped — is cold-resumed from meta.json here, so the turn revives
+        // it exactly as the in-map dead-child case below does (and symmetric with
+        // the web turn / MCP dispatch, which funnel through this same core). Err
+        // (→ caller) for a genuinely unknown sid; a no-op when already in the map.
+        self.cold_resume_absent_sid(session_id, chat).await?;
         // v0.8.24 F5 — if the child is not live (starting/resuming/dead),
         // enqueue the user text (FIFO, file-backed) and revive; drain after
         // live so turns are not lost. Gateway remains the sole turns writer
@@ -13179,6 +13215,62 @@ mod tests {
         assert!(
             gateway.session_views().iter().any(|v| v.sid == "s1"),
             "owner cold-resumed s1 from meta.json"
+        );
+    }
+
+    /// Send-resume symmetry (the architectural twin of the web-turn fix) — the
+    /// shared `submit_to_sid` core (which the web turn, MCP `session_dispatch`
+    /// and the `@handle` mirror all funnel through) COLD-RESUMES a session that
+    /// left the live map, instead of erroring "current session missing". This is
+    /// the deepest resume-by-sid rung now living in the submit core alongside the
+    /// in-map dead-child revive — so every frontend revives a "disappeared"
+    /// session identically, not just the web handler.
+    #[tokio::test]
+    async fn submit_to_sid_cold_resumes_a_stopped_session() {
+        let proj = tempfile::TempDir::new().unwrap();
+        let agents = proj.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\n---\nbody\n",
+        )
+        .unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+
+        // Create s1, then stop it — live thread gone, meta.json kept.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert!(gateway.is_session_live("s1"), "created s1");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/stop s1")
+            .await
+            .unwrap();
+        assert!(
+            !gateway.is_session_live("s1"),
+            "s1 stopped (left the live map)"
+        );
+        let starts_before = fake.starts.load(Ordering::SeqCst);
+
+        // A turn addressed by sid must revive it (not "current session missing").
+        let turn = gateway.submit_to_sid("s1", "back to work".into()).await;
+        assert!(
+            turn.is_ok(),
+            "submit_to_sid must cold-resume a stopped session: {turn:?}"
+        );
+        assert!(gateway.is_session_live("s1"), "the send revived s1");
+        assert!(
+            fake.starts.load(Ordering::SeqCst) > starts_before,
+            "cold-resume re-spawned the child"
+        );
+
+        // A genuinely unknown sid still errors (no meta → nothing to resume).
+        assert!(
+            gateway.submit_to_sid("s404", "x".into()).await.is_err(),
+            "an unknown sid has no meta to resume from"
         );
     }
 
