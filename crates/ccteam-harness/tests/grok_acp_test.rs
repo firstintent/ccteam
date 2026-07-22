@@ -629,3 +629,51 @@ async fn start_thread_rejects_remote_ctx_readable() {
     let msg = err.to_string();
     assert!(msg.contains("not yet supported for grok"), "got: {msg}");
 }
+
+/// stdio-leak fix — managed grok spawns must disable Grok's Claude MCP compat
+/// scan (`GROK_CLAUDE_MCPS_ENABLED=false` on the child env, and only there):
+/// with the scan on (vendor default), grok imports ccteam's global stdio
+/// registration from `~/.claude.json` on top of the ACP-injected HTTP server —
+/// one orphan `ccteam internal mcp-serve` child per session plus a same-name
+/// double registration whose winner (admin stdio vs session-principal HTTP)
+/// depends on the grok version. The fake dumps the toggle it inherited to
+/// $CCTEAM_ACP_ENV_DUMP; asserting on it proves the env reaches the child.
+#[tokio::test]
+#[serial]
+async fn spawn_disables_claude_mcp_compat_scan() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let dump = tmp.path().join("env-dump.txt");
+    let prev = std::env::var("CCTEAM_ACP_ENV_DUMP").ok();
+    unsafe {
+        std::env::set_var("CCTEAM_ACP_ENV_DUMP", &dump);
+    }
+
+    let adapter = GrokAcpAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s1"),
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let recorded = std::fs::read_to_string(&dump).expect("fake wrote env dump");
+    assert_eq!(
+        recorded.trim(),
+        "GROK_CLAUDE_MCPS_ENABLED=false",
+        "managed grok child must see the Claude MCP compat scan disabled"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    match prev {
+        Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_ENV_DUMP", v) },
+        None => unsafe { std::env::remove_var("CCTEAM_ACP_ENV_DUMP") },
+    }
+    clear_fake();
+}

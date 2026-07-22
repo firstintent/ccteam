@@ -29,7 +29,10 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+// `anyhow!` is only used by the linux-only `/proc` parsing branch.
+#[cfg(target_os = "linux")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::CcteamPaths;

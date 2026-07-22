@@ -34,9 +34,9 @@ use protocol::{
     acp_model_picker_options, known_efforts, pluck_model_info, pluck_session_id,
     split_trailing_effort, AcpModelOption, ModelInfo,
 };
-use spawn_spec::{build_argv, grok_bin, GrokSpawnInput};
+use spawn_spec::{build_argv, build_envs, grok_bin, GrokSpawnInput};
 use translate::{apply_notification, SessionTranslateState};
-use transport::AcpTransport;
+use transport::{AcpTransport, InboundPolicy};
 
 /// Max wait for the dispatcher to reach the turn boundary after the prompt
 /// response, before finalizing anyway (best-effort if `turn_completed` is
@@ -357,6 +357,10 @@ impl HarnessAdapter for GrokAcpAdapter {
         );
         let program = argv[0].clone();
         let args: Vec<String> = argv.into_iter().skip(1).collect();
+        // Child-only env: kill Grok's Claude MCP compat scan so the managed
+        // session doesn't import ccteam's global stdio `mcp-serve` entry on
+        // top of the ACP-injected HTTP server (see `spawn_spec::build_envs`).
+        let envs = build_envs();
         let cwd = if ctx.cwd.as_os_str().is_empty() {
             ctx.project_dir.clone()
         } else {
@@ -385,11 +389,15 @@ impl HarnessAdapter for GrokAcpAdapter {
         let try_load = prior_uuid.clone();
         let (transport, session_id, info) = match try_load {
             Some(uuid) => {
-                let transport = AcpTransport::spawn_command(&program, &args, &cwd)
-                    .await
-                    .map_err(|e| {
-                        HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}"))
-                    })?;
+                let transport = AcpTransport::spawn_command_full(
+                    &program,
+                    &args,
+                    &cwd,
+                    &envs,
+                    InboundPolicy::DefaultDecline,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
                 let transport = Arc::new(transport);
                 match Self::handshake_and_load(&transport, &cwd, &uuid, mcp_servers.clone()).await {
                     Ok(info) => (transport, uuid, info),
@@ -399,13 +407,17 @@ impl HarnessAdapter for GrokAcpAdapter {
                             "grok session/load failed; falling back to session/new"
                         );
                         let _ = transport.shutdown().await;
-                        let transport = AcpTransport::spawn_command(&program, &args, &cwd)
-                            .await
-                            .map_err(|e| {
-                                HarnessError::SpawnFailed(format!(
-                                    "spawn grok after load fail: {e}"
-                                ))
-                            })?;
+                        let transport = AcpTransport::spawn_command_full(
+                            &program,
+                            &args,
+                            &cwd,
+                            &envs,
+                            InboundPolicy::DefaultDecline,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SpawnFailed(format!("spawn grok after load fail: {e}"))
+                        })?;
                         let transport = Arc::new(transport);
                         let (sid, info) =
                             Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
@@ -414,11 +426,15 @@ impl HarnessAdapter for GrokAcpAdapter {
                 }
             }
             None => {
-                let transport = AcpTransport::spawn_command(&program, &args, &cwd)
-                    .await
-                    .map_err(|e| {
-                        HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}"))
-                    })?;
+                let transport = AcpTransport::spawn_command_full(
+                    &program,
+                    &args,
+                    &cwd,
+                    &envs,
+                    InboundPolicy::DefaultDecline,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
                 let transport = Arc::new(transport);
                 let (sid, info) =
                     Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;

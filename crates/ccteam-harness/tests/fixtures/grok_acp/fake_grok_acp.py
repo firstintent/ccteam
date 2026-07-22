@@ -73,6 +73,19 @@ def main() -> None:
         sys.stderr.write("fake_grok_acp: expected stdio mode\n")
         sys.exit(2)
 
+    # stdio-leak fix — dump the Claude MCP compat toggle this child actually
+    # inherited to $CCTEAM_ACP_ENV_DUMP so a test can assert the managed spawn
+    # disables Grok's ~/.claude.json scan (real grok would import ccteam's
+    # global stdio registration and spawn an orphan `mcp-serve` per session).
+    dump = os.environ.get("CCTEAM_ACP_ENV_DUMP")
+    if dump:
+        with open(dump, "w") as f:
+            f.write(
+                "GROK_CLAUDE_MCPS_ENABLED="
+                + os.environ.get("GROK_CLAUDE_MCPS_ENABLED", "MISSING")
+                + "\n"
+            )
+
     # Spontaneous string-id frame (skills-reload) — transport must tolerate.
     emit({"jsonrpc": "2.0", "id": "skills-reload", "result": {"ok": True}})
 
