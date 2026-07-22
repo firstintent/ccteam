@@ -80,7 +80,6 @@ fn standalone_ccteam_im_binary_no_longer_exists() {
 fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let fake_home = tmp.path();
-    let trigger_user = format!("ccteam-start-{}", std::process::id());
     // Need at least an empty projects dir so `ccteam start` doesn't
     // bail early on missing config.
     let ccteam_home = fake_home.join(".ccteam");
@@ -101,7 +100,6 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let mut child = Command::new(ccteam_bin())
         .args(["start", "--no-web"])
         .env("HOME", fake_home)
-        .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
@@ -115,27 +113,12 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
 
     let observed_mcp = await_mcp_socket_reachable(&mut child, &mcp_socket, READY_TIMEOUT);
     // Record whether the daemon exited on its own (crash / early bail)
-    // before we issue the teardown trigger — folded into the assertion
-    // message so a real boot failure is obvious rather than looking
-    // like a slow socket bind.
+    // before teardown — folded into the assertion message so a real
+    // boot failure is obvious rather than looking like a slow bind.
     let early_exit = child.try_wait().ok().flatten();
 
-    // Tear down — write the F86 shutdown trigger.
-    let trigger = trigger_path(&trigger_user);
-    let _ = std::fs::write(&trigger, format!("{child_pid}\n"));
-    let drain_deadline = Instant::now() + Duration::from_secs(35);
-    while Instant::now() < drain_deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(_) => break,
-        }
-    }
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let _ = std::fs::remove_file(&trigger);
+    // Tear down — SIGTERM, the (only) graceful stop signal since v0.9.7.
+    sigterm_and_drain(&mut child, child_pid);
 
     let daemon_stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
     assert!(
@@ -156,7 +139,6 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let mut child2 = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
-        .env("USER", &trigger_user)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
         .env("RUST_LOG", "warn")
@@ -168,20 +150,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
 
     let observed_no_imd_mcp = await_mcp_socket_reachable(&mut child2, &mcp_socket, READY_TIMEOUT);
 
-    let _ = std::fs::write(&trigger, format!("{child2_pid}\n"));
-    let drain_deadline = Instant::now() + Duration::from_secs(35);
-    while Instant::now() < drain_deadline {
-        match child2.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(_) => break,
-        }
-    }
-    if child2.try_wait().ok().flatten().is_none() {
-        let _ = child2.kill();
-        let _ = child2.wait();
-    }
-    let _ = std::fs::remove_file(&trigger);
+    sigterm_and_drain(&mut child2, child2_pid);
 
     assert!(
         observed_no_imd_mcp,
@@ -191,6 +160,27 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         !heartbeat.exists(),
         "--no-imd must not create the retired global IMD heartbeat"
     );
+}
+
+/// SIGTERM the daemon and wait for it to drain (≤35s), escalating to a
+/// hard kill only as test cleanup of last resort.
+#[cfg(unix)]
+fn sigterm_and_drain(child: &mut Child, pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(35);
+    while Instant::now() < drain_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => break,
+        }
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Generous, load-insensitive budget for the daemon to publish its MCP
@@ -231,10 +221,4 @@ fn mcp_socket_reachable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn mcp_socket_reachable(_path: &Path) -> bool {
     false
-}
-
-/// Mirror of `crates/ccteam-cli/src/main.rs::shutdown_trigger_path` so
-/// the test doesn't need to depend on internal CLI items.
-fn trigger_path(user: &str) -> PathBuf {
-    PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"))
 }

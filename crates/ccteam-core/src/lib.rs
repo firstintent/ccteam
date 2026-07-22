@@ -160,11 +160,17 @@ pub use cron::{Schedule, ScheduleError};
 // `classify(cost, soft_warn, hard_kill)` (primitives, not `&ProjectState`).
 pub use ccteam_cost::{classify as classify_cost, CostLevel, COST_MID_WARN_USD};
 pub use daemon::{
+    acquire_operation_lock, acquire_operation_lock_with_timeout,
     check_health as check_daemon_health, check_health_at as check_daemon_health_at,
-    daemon_reachable, daemon_socket_path, heartbeat_path, pidfile_path, read_pidfile,
-    remove_heartbeat, remove_pidfile, send_sigterm_to_pidfile, write_heartbeat, write_pidfile,
-    DaemonHealth, DAEMON_CONNECT_TIMEOUT, HEARTBEAT_GRACE, HEARTBEAT_INTERVAL, HEARTBEAT_NAME,
-    MCP_SOCKET_NAME, PIDFILE_NAME,
+    daemon_log_path, daemon_reachable, daemon_socket_path, daemon_status, heartbeat_path,
+    operation_lock_path, pidfile_path, probe_daemon, probe_daemon_at, process_exists,
+    process_matches_record, read_log_tail, read_pid_record, read_process_start_time,
+    remove_heartbeat, start_managed, stop_managed, stop_managed_with, write_heartbeat,
+    write_pid_record, DaemonHealth, DaemonProbe, DaemonStartSpec, DaemonStatusReport,
+    LifecycleError, OperationLock, PidRecord, StartVerdict, StopTuning, StopVerdict,
+    DAEMON_CONNECT_TIMEOUT, DAEMON_LOG_NAME, DAEMON_PROBE_TIMEOUT, HEARTBEAT_GRACE,
+    HEARTBEAT_INTERVAL, HEARTBEAT_NAME, MCP_SOCKET_NAME, OPERATION_LOCK_NAME, PIDFILE_NAME,
+    START_READY_TIMEOUT, STOP_TERM_WAIT,
 };
 pub use defaults::{
     claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,

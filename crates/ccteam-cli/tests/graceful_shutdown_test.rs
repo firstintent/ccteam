@@ -1,19 +1,23 @@
-//! F163 — `ccteam start` graceful SIGTERM/SIGINT shutdown tests.
+//! F163 (+ v0.9.7) — `ccteam start` graceful SIGTERM/SIGINT shutdown tests.
 //!
 //! Verifies:
-//! 1. SIGTERM causes the daemon to exit within 5s (not hang).
-//! 2. Pidfile is removed on clean exit.
-//! 3. SIGINT (ctrl_c equivalent via kill -INT) also triggers exit.
-//! 4. tmux sessions are NOT killed (verified by checking that the
-//!    daemon's exit does not invoke `tmux kill-session`; we confirm
-//!    this structurally since no tmux sessions exist in the test
-//!    env — the daemon must exit without erroring on their absence).
+//! 1. SIGTERM causes the daemon to exit within the deadline (not hang).
+//! 2. SIGINT (ctrl_c equivalent via kill -INT) also triggers exit.
+//! 3. The foreground daemon NEVER writes `state/orchestrator.pid` —
+//!    since v0.9.7 the pid record is launcher-written only
+//!    (`ccteam daemon start`), so "managed" stays an honest signal.
+//! 4. tmux sessions are NOT killed on shutdown.
 //!
-//! We point CCTEAM_HOME at a tempdir so these tests don't race with
-//! the operator's real daemon. Tests use `--no-web --no-imd` to avoid
-//! port conflicts and network I/O in CI.
+//! Daemon readiness is observed via the MCP socket (`run/mcp.sock`
+//! accepting connections) — the same liveness signal production uses.
+//! The v0.4.6 trigger-file stop channel is retired (SIGTERM only), so
+//! its test case is gone with it.
+//!
+//! We point HOME + CCTEAM_HOME at a tempdir so these tests don't race
+//! with the operator's real daemon. Tests use `--no-web --no-imd` to
+//! avoid port conflicts and network I/O in CI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,7 +26,7 @@ fn ccteam_bin() -> &'static str {
 }
 
 /// Spawn a minimal `ccteam start` daemon in an isolated tempdir.
-/// Returns (child, ccteam_home, pidfile_path).
+/// Returns (child, ccteam_home, mcp_socket_path).
 fn spawn_test_daemon(tmp_dir: &tempfile::TempDir) -> (std::process::Child, PathBuf, PathBuf) {
     spawn_test_daemon_with(
         tmp_dir,
@@ -50,7 +54,7 @@ fn spawn_test_daemon_with(
     if with_agent_teams_root {
         std::fs::create_dir_all(fake_home.join(".claude").join("teams")).unwrap();
     }
-    let pidfile = ccteam_home.join("state").join("orchestrator.pid");
+    let mcp_socket = ccteam_home.join("run").join("mcp.sock");
 
     let child = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--no-imd"])
@@ -63,26 +67,33 @@ fn spawn_test_daemon_with(
         .spawn()
         .expect("spawn ccteam start");
 
-    (child, ccteam_home, pidfile)
+    (child, ccteam_home, mcp_socket)
 }
 
-/// Wait until the pidfile appears (daemon has written it and is running).
-/// Returns Ok(pid) or Err if the deadline is exceeded.
-fn wait_for_pidfile(pidfile: &PathBuf, deadline: Instant) -> Result<u32, String> {
+#[cfg(unix)]
+fn mcp_socket_reachable(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// Wait until the daemon's MCP socket accepts a connection (daemon is
+/// serving). Fails fast if the child exits during boot.
+fn wait_for_ready(
+    child: &mut std::process::Child,
+    socket: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
     while Instant::now() < deadline {
-        if let Ok(content) = std::fs::read_to_string(pidfile) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                if let Ok(pid) = trimmed.parse::<u32>() {
-                    return Ok(pid);
-                }
-            }
+        if mcp_socket_reachable(socket) {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("daemon exited during boot: {status}"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(format!(
-        "pidfile {} did not appear within deadline",
-        pidfile.display()
+        "MCP socket {} did not accept connections within deadline",
+        socket.display()
     ))
 }
 
@@ -117,40 +128,38 @@ fn send_signal(pid: u32, sig: libc::c_int) -> Result<(), String> {
     }
 }
 
-/// F163 case 1 — SIGTERM causes clean exit within 5s + pidfile removed.
+/// F163 case 1 — SIGTERM causes clean exit; foreground never wrote a
+/// pid record.
 #[test]
 #[cfg(unix)]
-fn sigterm_causes_graceful_exit_and_pidfile_cleanup() {
+fn sigterm_causes_graceful_exit_without_pidfile() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, _ccteam_home, pidfile) = spawn_test_daemon(&tmp);
+    let (mut child, ccteam_home, socket) = spawn_test_daemon(&tmp);
+    let pidfile = ccteam_home.join("state").join("orchestrator.pid");
 
-    // Wait up to 10s for the daemon to start and write its pidfile.
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163: {msg}");
-        }
-    };
+    let ready = wait_for_ready(
+        &mut child,
+        &socket,
+        Instant::now() + Duration::from_secs(15),
+    );
+    if let Err(msg) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("F163: {msg}");
+    }
 
-    // Sanity: process is alive.
+    // v0.9.7: the FOREGROUND daemon must not write the managed pid
+    // record — that file is launcher-written only.
     assert!(
-        ccteam_core_pid_alive(daemon_pid),
-        "F163: daemon pid {daemon_pid} should be alive after pidfile appears"
+        !pidfile.exists(),
+        "foreground `ccteam start` must not write {}",
+        pidfile.display()
     );
 
-    // Send SIGTERM.
-    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+    send_signal(child.id(), libc::SIGTERM).expect("send SIGTERM");
 
-    // Wait up to 10s for the process to exit (signal + 30s orch drain +
-    // 5s web/imd drain = at most 35s; but with --no-web --no-imd the
-    // orch has no project tasks so it exits almost instantly).
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exited = wait_for_exit(&mut child, exit_deadline);
-
-    // Regardless of exit result, ensure child is cleaned up.
     if exited.is_err() {
         let _ = child.kill();
     }
@@ -160,38 +169,35 @@ fn sigterm_causes_graceful_exit_and_pidfile_cleanup() {
         exited.is_ok(),
         "F163: daemon should exit within 10s of SIGTERM; still running after deadline"
     );
-
-    // Pidfile must be gone after graceful shutdown.
     assert!(
         !pidfile.exists(),
-        "F163: pidfile {} should be removed after graceful SIGTERM exit",
-        pidfile.display()
+        "no pid record may appear at any point in a foreground run"
     );
 }
 
-/// F163 case 2 — SIGINT also causes clean exit + pidfile removed.
+/// F163 case 2 — SIGINT also causes clean exit.
 #[test]
 #[cfg(unix)]
-fn sigint_causes_graceful_exit_and_pidfile_cleanup() {
+fn sigint_causes_graceful_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, _ccteam_home, pidfile) = spawn_test_daemon(&tmp);
+    let (mut child, _ccteam_home, socket) = spawn_test_daemon(&tmp);
 
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163: {msg}");
-        }
-    };
+    let ready = wait_for_ready(
+        &mut child,
+        &socket,
+        Instant::now() + Duration::from_secs(15),
+    );
+    if let Err(msg) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("F163: {msg}");
+    }
 
     // Send SIGINT (equivalent to Ctrl-C).
-    send_signal(daemon_pid, libc::SIGINT).expect("send SIGINT");
+    send_signal(child.id(), libc::SIGINT).expect("send SIGINT");
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exited = wait_for_exit(&mut child, exit_deadline);
-
     if exited.is_err() {
         let _ = child.kill();
     }
@@ -200,54 +206,6 @@ fn sigint_causes_graceful_exit_and_pidfile_cleanup() {
     assert!(
         exited.is_ok(),
         "F163: daemon should exit within 10s of SIGINT; still running after deadline"
-    );
-
-    assert!(
-        !pidfile.exists(),
-        "F163: pidfile {} should be removed after graceful SIGINT exit",
-        pidfile.display()
-    );
-}
-
-/// F163 case 3 — shutdown via trigger file (ccteam stop path) still
-/// exits cleanly and removes the pidfile.
-#[test]
-fn trigger_file_shutdown_exits_cleanly_and_cleans_pidfile() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, _ccteam_home, pidfile) = spawn_test_daemon(&tmp);
-
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163: {msg}");
-        }
-    };
-
-    // Write the F86 trigger file to simulate `ccteam stop`.
-    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
-    let trigger = PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"));
-    std::fs::write(&trigger, format!("{daemon_pid}\n")).expect("write shutdown trigger");
-
-    let exit_deadline = Instant::now() + Duration::from_secs(10);
-    let exited = wait_for_exit(&mut child, exit_deadline);
-
-    if exited.is_err() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&trigger); // cleanup trigger
-
-    assert!(
-        exited.is_ok(),
-        "F163: daemon should exit within 10s of trigger-file shutdown"
-    );
-    assert!(
-        !pidfile.exists(),
-        "F163: pidfile {} should be removed after trigger-file shutdown",
-        pidfile.display()
     );
 }
 
@@ -266,7 +224,7 @@ fn shutdown_does_not_kill_tmux_sessions() {
     std::fs::create_dir_all(ccteam_home.join("phases")).unwrap();
     std::fs::create_dir_all(ccteam_home.join("state")).unwrap();
     std::fs::create_dir_all(fake_home.join("projects")).unwrap();
-    let pidfile = ccteam_home.join("state").join("orchestrator.pid");
+    let socket = ccteam_home.join("run").join("mcp.sock");
 
     // Capture stderr so we can inspect it for unwanted tmux-kill messages.
     let mut child = Command::new(ccteam_bin())
@@ -280,18 +238,18 @@ fn shutdown_does_not_kill_tmux_sessions() {
         .spawn()
         .expect("spawn ccteam start");
 
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163: {msg}");
-        }
-    };
+    let ready = wait_for_ready(
+        &mut child,
+        &socket,
+        Instant::now() + Duration::from_secs(15),
+    );
+    if let Err(msg) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("F163: {msg}");
+    }
 
-    // Send SIGTERM and wait for exit.
-    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+    send_signal(child.id(), libc::SIGTERM).expect("send SIGTERM");
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let exited = wait_for_exit(&mut child, exit_deadline);
@@ -319,15 +277,7 @@ fn shutdown_does_not_kill_tmux_sessions() {
     );
 }
 
-/// Portable `kill -0` analog: returns true if a process with the given
-/// pid is still alive. Uses `kill(pid, 0)` on Unix.
-#[cfg(unix)]
-fn ccteam_core_pid_alive(pid: u32) -> bool {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    ret == 0
-}
-
-/// F163 retro case 5 — SIGTERM exits within 5s **even when the
+/// F163 retro case 5 — SIGTERM exits within 6s **even when the
 /// AgentTeamsWatcher path is fully wired** (`~/.claude/teams/`
 /// present, so the F95 watcher installs its inotify watch + spawns
 /// the blocking discovery loop).
@@ -337,31 +287,26 @@ fn ccteam_core_pid_alive(pid: u32) -> bool {
 /// `spawn_blocking` thread blocked inside `recv_timeout(60s)` and
 /// never noticed runtime tear-down, so `Runtime::drop` waited a full
 /// TEAMS_DISCOVERY_INTERVAL (>60s) and the process required SIGKILL.
-///
-/// Acceptance: process exits within 6s of SIGTERM (5s pool ceiling +
-/// 1s wall-clock slack for the orchestrator/web/imd drain dance + OS
-/// scheduling jitter). The unit-test deadline is intentionally tighter
-/// than the user-facing 10s contract so a regression that re-introduces
-/// even a partial hang surfaces here loudly.
 #[test]
 #[cfg(unix)]
 fn sigterm_exits_within_5s_with_agent_teams_watcher_active() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut child, _ccteam_home, pidfile) =
+    let (mut child, _ccteam_home, socket) =
         spawn_test_daemon_with(&tmp, /* with_agent_teams_root = */ true, Stdio::null);
 
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163 retro: {msg}");
-        }
-    };
+    let ready = wait_for_ready(
+        &mut child,
+        &socket,
+        Instant::now() + Duration::from_secs(15),
+    );
+    if let Err(msg) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("F163 retro: {msg}");
+    }
 
     let signal_sent_at = Instant::now();
-    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+    send_signal(child.id(), libc::SIGTERM).expect("send SIGTERM");
 
     // 6s ceiling — tighter than the 10s user-facing contract to catch
     // any regression that re-introduces a partial BlockingPool hang.
@@ -380,12 +325,6 @@ fn sigterm_exits_within_5s_with_agent_teams_watcher_active() {
          elapsed={:?} (was the cancel-handle wiring removed?)",
         exit_elapsed,
     );
-
-    assert!(
-        !pidfile.exists(),
-        "F163 retro: pidfile {} should be removed even when the BlockingPool path was exercised",
-        pidfile.display()
-    );
 }
 
 /// F163 retro case 6 — five consecutive `start → SIGTERM` cycles all
@@ -393,29 +332,27 @@ fn sigterm_exits_within_5s_with_agent_teams_watcher_active() {
 /// non-deterministic shutdown flake (e.g. a race where the cancel
 /// flag flip lands AFTER the discovery thread already entered
 /// recv_timeout for the next 60s window).
-///
-/// This is the unit-test analog of the F163 NAS re-probe acceptance
-/// loop (`for run in 1..5; do ccteam start & sleep 5; kill -TERM; ...`).
 #[test]
 #[cfg(unix)]
 fn sigterm_exits_fast_across_five_consecutive_runs() {
     for run in 1..=5 {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (mut child, _ccteam_home, pidfile) =
+        let (mut child, _ccteam_home, socket) =
             spawn_test_daemon_with(&tmp, /* with_agent_teams_root = */ true, Stdio::null);
 
-        let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-        let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-            Ok(pid) => pid,
-            Err(msg) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("F163 retro run #{run}: {msg}");
-            }
-        };
+        let ready = wait_for_ready(
+            &mut child,
+            &socket,
+            Instant::now() + Duration::from_secs(15),
+        );
+        if let Err(msg) = ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("F163 retro run #{run}: {msg}");
+        }
 
         let signal_sent_at = Instant::now();
-        send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+        send_signal(child.id(), libc::SIGTERM).expect("send SIGTERM");
 
         let exit_deadline = signal_sent_at + Duration::from_secs(6);
         let exited = wait_for_exit(&mut child, exit_deadline);
@@ -430,11 +367,6 @@ fn sigterm_exits_fast_across_five_consecutive_runs() {
             exited.is_ok(),
             "F163 retro run #{run}: daemon should exit within 6s of SIGTERM; elapsed={:?}",
             exit_elapsed,
-        );
-        assert!(
-            !pidfile.exists(),
-            "F163 retro run #{run}: pidfile {} should be removed",
-            pidfile.display()
         );
     }
 }
@@ -461,7 +393,7 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
     std::fs::create_dir_all(ccteam_home.join("state")).unwrap();
     std::fs::create_dir_all(fake_home.join("projects")).unwrap();
     std::fs::create_dir_all(fake_home.join(".claude").join("teams")).unwrap();
-    let pidfile = ccteam_home.join("state").join("orchestrator.pid");
+    let socket = ccteam_home.join("run").join("mcp.sock");
 
     let mut child = Command::new(ccteam_bin())
         .args(["start", "--no-web", "--no-imd"])
@@ -474,17 +406,18 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
         .spawn()
         .expect("spawn ccteam start");
 
-    let pidfile_deadline = Instant::now() + Duration::from_secs(10);
-    let daemon_pid = match wait_for_pidfile(&pidfile, pidfile_deadline) {
-        Ok(pid) => pid,
-        Err(msg) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("F163 retro telemetry: {msg}");
-        }
-    };
+    let ready = wait_for_ready(
+        &mut child,
+        &socket,
+        Instant::now() + Duration::from_secs(15),
+    );
+    if let Err(msg) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("F163 retro telemetry: {msg}");
+    }
 
-    send_signal(daemon_pid, libc::SIGTERM).expect("send SIGTERM");
+    send_signal(child.id(), libc::SIGTERM).expect("send SIGTERM");
 
     let exit_deadline = Instant::now() + Duration::from_secs(6);
     let exited = wait_for_exit(&mut child, exit_deadline);
@@ -509,12 +442,6 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
     assert!(
         merged.contains("graceful shutdown complete"),
         "F163 retro telemetry: expected 'graceful shutdown complete' line; got:\n{merged}",
-    );
-
-    assert!(
-        !pidfile.exists(),
-        "F163 retro telemetry: pidfile {} should be removed",
-        pidfile.display()
     );
 }
 

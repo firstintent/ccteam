@@ -2,6 +2,11 @@
 
 mod clipboard;
 mod commands;
+// v0.9.7 — `ccteam daemon <start|stop|restart|status|logs>` handlers
+// (pid-detach lifecycle over `ccteam_core::daemon`) + the one-time
+// legacy systemd/launchd takeover (PRD F4; single Rust implementation).
+mod daemon_cli;
+mod legacy_takeover;
 mod mcp_serve;
 // ToolGroup enum + CCTEAM_DISABLE_TOOLS filter + chat send_file schema.
 // v0.8.7 W1 — `session_*` tools (agent scheduling). Stdio side
@@ -152,11 +157,27 @@ enum Command {
         #[command(subcommand)]
         cmd: InternalCommand,
     },
-    /// Stop the running gateway daemon: write the per-user graceful
-    /// shutdown trigger; the daemon drains web / IM gateway / MCP socket /
-    /// hook sink gracefully. Live sessions are NOT killed. To stop one
-    /// project's sessions, use `ccteam project stop <slug>`.
+    /// Stop the running gateway daemon (alias for `ccteam daemon stop`):
+    /// SIGTERM to the managed daemon, wait for a clean exit. A ready but
+    /// NOT managed instance (foreground `ccteam start` / self-supervised)
+    /// is refused with guidance. Live agent sessions are NOT killed. To
+    /// stop one project's sessions, use `ccteam project stop <slug>`.
     Stop,
+    /// Daemon lifecycle group: `ccteam daemon <start|stop|restart|status|logs>`.
+    ///
+    /// `start` detaches the daemon (setsid; stdout+stderr →
+    /// `~/.ccteam/daemon.log`), writes the managed pid record, and waits
+    /// for readiness — idempotent, and it auto-takes-over a legacy
+    /// installer-written systemd/launchd unit first. `stop` SIGTERMs the
+    /// managed daemon (`--force` escalates to SIGKILL after the wait —
+    /// daemon only, never agent sessions). `restart` = stop + start under
+    /// one operation lock. `status` reports ready/managed plus the
+    /// running-vs-binary version. `logs` tails `~/.ccteam/daemon.log`.
+    /// All verbs support `--json` (one machine-readable line on stdout).
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCommand,
+    },
     /// Project lifecycle group: `ccteam project <ls|show|new|stop|rm>`.
     ///
     /// `ls`/`show` inspect registered projects; `new` scaffolds a fresh
@@ -242,6 +263,76 @@ enum Command {
         /// non-keyword word is treated as `get <key>`.
         #[arg(value_name = "ARGS", num_args = 0..=2)]
         args: Vec<String>,
+    },
+}
+
+/// v0.9.7 — `ccteam daemon` lifecycle group. Codex-style pure-userland
+/// daemon management: setsid detach + pid-record ownership + versioned
+/// socket probe. The single mechanism on Linux / macOS / WSL (systemd /
+/// launchd retired).
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Start the daemon in the background: legacy-unit takeover →
+    /// operation lock → readiness probe (already ready = idempotent
+    /// `alreadyRunning`) → setsid-detached spawn of this binary's
+    /// `start` (full env/PATH inherited; stdout+stderr append to
+    /// `~/.ccteam/daemon.log`) → pid record → wait ready (≤15s; failure
+    /// = non-zero exit with the log tail).
+    Start {
+        /// Embedded web UI bind address, forwarded to the detached
+        /// `ccteam start`.
+        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
+        web_bind: String,
+        /// Emit exactly one machine-readable JSON line on stdout
+        /// (human prose moves to stderr).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Stop the managed daemon: SIGTERM + wait (≤40s). Refuses a ready
+    /// but not-managed instance (foreground / self-supervised) with
+    /// guidance. Nothing running → `notRunning`, exit 0.
+    Stop {
+        /// After the SIGTERM wait, escalate to SIGKILL — the daemon
+        /// process ONLY; agent sessions are never touched (owner-gated
+        /// red-line exception D2).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Emit exactly one machine-readable JSON line on stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Stop (if managed) + start under ONE operation lock, so no
+    /// concurrent lifecycle operation can interleave.
+    Restart {
+        /// Embedded web UI bind address, forwarded to the detached
+        /// `ccteam start`.
+        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
+        web_bind: String,
+        /// Emit exactly one machine-readable JSON line on stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Dual-verdict snapshot: ready? (versioned MCP probe) × managed?
+    /// (pid record ↔ live process), plus running-daemon version vs this
+    /// binary's version.
+    Status {
+        /// Emit exactly one machine-readable JSON line on stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print the tail of `~/.ccteam/daemon.log` (the only log surface —
+    /// journald left with systemd).
+    Logs {
+        /// Number of trailing lines to print.
+        #[arg(short = 'n', long = "lines", default_value_t = 50)]
+        n: usize,
+        /// Keep following appended output (like `tail -f`).
+        #[arg(short = 'f', long = "follow", default_value_t = false)]
+        follow: bool,
+        /// Emit one JSON line (`{path, lines}`) instead of raw lines.
+        /// Not combinable with `--follow`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -692,7 +783,20 @@ fn main() -> Result<()> {
         ),
         Command::Status => run_status(),
         Command::Internal { cmd } => run_internal(cmd),
-        Command::Stop => run_stop(),
+        // v0.9.7 — `ccteam stop` is a delegating alias for `daemon stop`
+        // (the trigger-file channel is retired).
+        Command::Stop => daemon_cli::run_daemon_stop(false, false),
+        Command::Daemon { cmd } => match cmd {
+            DaemonCommand::Start { web_bind, json } => {
+                daemon_cli::run_daemon_start(&web_bind, json)
+            }
+            DaemonCommand::Stop { force, json } => daemon_cli::run_daemon_stop(force, json),
+            DaemonCommand::Restart { web_bind, json } => {
+                daemon_cli::run_daemon_restart(&web_bind, json)
+            }
+            DaemonCommand::Status { json } => daemon_cli::run_daemon_status(json),
+            DaemonCommand::Logs { n, follow, json } => daemon_cli::run_daemon_logs(n, follow, json),
+        },
         // v0.8.6 W3/W4a — `ccteam project <ls|show|new|stop|rm>` group.
         Command::Project { cmd } => match cmd {
             ProjectCommand::Ls { format } => run_ls(format),
@@ -1118,11 +1222,6 @@ fn run_mux_hook_emit(
     }
 }
 
-// V0.6.1 F130 — `ccteam daemon {start,stop,status}` removed. The IMD
-// supervisor now lives inside `ccteam start` as one tokio task, so
-// lifecycle = `ccteam start` / `ccteam stop` (same as orchestrator +
-// web). Status check is `ccteam doctor` (heartbeat file probe).
-
 /// `ccteam session attach <slug> [sid]` / `ccteam internal attach <slug>
 /// [sid]` — reach gateway chat-mode bot
 /// sessions first (the project-oriented [`commands::run_attach`] cannot see
@@ -1139,73 +1238,6 @@ fn run_internal_attach(slug: &str, sid: Option<&str>) -> Result<()> {
 fn run_progress(slug: &str, tail: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     commands::run_progress(&paths, slug, tail)
-}
-
-/// V0.4.6 F86 — per-user shutdown trigger file. `ccteam stop` writes
-/// here; `ccteam start`'s daemon polls for its existence and routes
-/// the signal through the orchestrator's cancel-token path (graceful
-/// `workflow_done reason="shutdown"` per project) instead of the
-/// V0.4.5 SIGTERM + `JoinSet::abort_all()` hard cut.
-///
-/// Per-user namespace keeps two operators on the same host from
-/// stepping on each other's daemons.
-fn shutdown_trigger_path() -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
-    PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"))
-}
-
-fn run_stop() -> Result<()> {
-    let paths = CcteamPaths::from_env()?;
-    // V0.4.6 F86 — write the trigger file first; the daemon's main
-    // loop polls for it and routes through the orchestrator's
-    // graceful cancel path. SIGTERM stays as the legacy fallback for
-    // systemd / docker stop (the daemon installs the same handler),
-    // but `ccteam stop` no longer needs a process signal — the file
-    // is enough.
-    let pidfile = ccteam_core::pidfile_path(&paths);
-    let pid = match ccteam_core::read_pidfile(&pidfile) {
-        Ok(pid) if ccteam_core::daemon::pid_alive(pid) => pid,
-        _ => {
-            println!("ccteam stop: no running gateway daemon (pidfile absent or stale).");
-            return Ok(());
-        }
-    };
-
-    let trigger = shutdown_trigger_path();
-    std::fs::write(&trigger, format!("{pid}\n"))
-        .with_context(|| format!("write shutdown trigger {}", trigger.display()))?;
-    println!(
-        "ccteam stop: graceful shutdown trigger written to {}",
-        trigger.display()
-    );
-    println!("ccteam stop: gateway daemon pid {pid} will drain (≤ 5s per task)…");
-
-    // Block until the gateway daemon actually exits — docker-stop style.
-    // The daemon removes its pidfile on graceful shutdown, so
-    // either an absent pidfile OR `kill -0 <pid>` returning false is
-    // proof of exit. V0.4.6 bumps the wait to 35s so the daemon's
-    // own 30s graceful timeout + abort-fallback path can complete
-    // before we surface a warning. We never escalate to SIGKILL —
-    // CLAUDE.md §三 "永不主动 kill 长 session" applies to ccteam's
-    // own daemon too.
-    let deadline = std::time::Instant::now() + Duration::from_secs(35);
-    while std::time::Instant::now() < deadline {
-        if !pidfile.exists() || !ccteam_core::daemon::pid_alive(pid) {
-            println!("ccteam stop: gateway daemon exited.");
-            // Best-effort: tidy the trigger file so the next start
-            // doesn't instantly shut itself down on a stale flag.
-            let _ = std::fs::remove_file(&trigger);
-            println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    eprintln!(
-        "ccteam stop: pid {pid} still alive after 35s. Check the daemon log; \
-         resend with `kill -TERM {pid}` or inspect with `ps -p {pid}`."
-    );
-    println!("tmux sessions are NOT killed — `ccteam start` will reattach to them.");
-    Ok(())
 }
 
 fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
@@ -1373,18 +1405,13 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         );
     }
 
-    // Drain only clearly-stale triggers. The trigger path is per-user,
-    // so integration tests can have several daemons alive at once; a
-    // daemon starting after another test wrote a fresh trigger must not
-    // erase that fresh shutdown request before the target sees it.
-    let trigger = shutdown_trigger_path();
-    let stale_trigger = std::fs::metadata(&trigger)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-        .is_some_and(|age| age > Duration::from_secs(2));
-    if stale_trigger {
-        let _ = std::fs::remove_file(&trigger);
+    // v0.9.7 — the trigger-file stop channel is retired (SIGTERM is the
+    // only stop signal). Sweep a stale legacy trigger left by a pre-0.9.7
+    // `ccteam stop` so nothing on disk suggests it still does anything.
+    {
+        let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
+        let legacy_trigger = PathBuf::from("/tmp").join(format!("ccteam-{user}.shutdown"));
+        let _ = std::fs::remove_file(&legacy_trigger);
     }
 
     // Re-publish the Telegram command menu (`setMyCommands`) on EVERY
@@ -1419,12 +1446,23 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         }
     }
 
-    // v8.1: no-slug `ccteam start` is the resident gateway daemon, not
-    // the flow/orchestrator loop. The legacy tick/claude-argv flags are
-    // accepted by clap for compatibility but are intentionally ignored
-    // here; agent process settings live in the harness adapters.
-    let pidfile = ccteam_core::write_pidfile(&paths)?;
-    tracing::info!(pidfile = %pidfile.display(), "ccteam gateway pidfile written");
+    // v0.9.7 (F1.6) — double-instance guard: if an instance already
+    // serves the MCP socket (managed, foreground, or user-supervised),
+    // exit loudly instead of fighting over sockets. This replaces the
+    // retired pidfile mutex: the daemon process itself never writes the
+    // pid record — `state/orchestrator.pid` is launcher-written ONLY
+    // (`ccteam daemon start`), so "managed" means exactly "spawned by
+    // the launcher". Deliberately AFTER the Telegram menu refresh above
+    // (that refresh must run even when a daemon is already up).
+    let preflight = ccteam_core::check_daemon_health(&paths);
+    if preflight.is_healthy() {
+        anyhow::bail!(
+            "ccteam start: another ccteam daemon is already serving {} — \
+             use `ccteam daemon status` to inspect it, `ccteam daemon stop` to stop a \
+             managed one, or Ctrl-C the other foreground instance first.",
+            ccteam_core::daemon_socket_path(&paths).display()
+        );
+    }
 
     // Print a single banner up front so the operator can paste the web
     // URL into a browser without grepping mid-log noise. Skip when
@@ -1435,9 +1473,6 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         print_web_banner(&paths, &web);
     }
 
-    // We need the paths for final pidfile cleanup after the async
-    // runtime has drained the gateway tasks.
-    let cleanup_paths = paths.clone();
     let hook_sink_paths = paths.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1801,7 +1836,6 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     // Keep runtime teardown bounded even if a blocking hook dispatch is
     // mid-flight during shutdown.
     runtime.shutdown_timeout(Duration::from_secs(5));
-    ccteam_core::remove_pidfile(&cleanup_paths);
     result
 }
 
@@ -1914,35 +1948,9 @@ async fn handle_mcp_socket_connection(
 }
 
 async fn wait_for_shutdown_signal() {
-    // V0.4.6 F86 — `ccteam stop` writes `/tmp/ccteam-<user>.shutdown`
-    // instead of sending SIGTERM. The daemon polls for the file and
-    // collapses to the same shutdown path as SIGTERM (orchestrator
-    // graceful cancel via Notify channel). SIGTERM is retained for
-    // systemd / docker-stop callers; either trigger is sufficient.
-    let trigger = shutdown_trigger_path();
-    let self_pid = std::process::id();
-    let trigger_poll = async {
-        let mut ticker = tokio::time::interval(Duration::from_millis(250));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if trigger.exists() {
-                let targeted_pid = std::fs::read_to_string(&trigger)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok());
-                if targeted_pid.is_some_and(|pid| pid != self_pid) {
-                    continue;
-                }
-                tracing::info!(
-                    path = %trigger.display(),
-                    "shutdown trigger file observed (ccteam stop)"
-                );
-                let _ = std::fs::remove_file(&trigger);
-                return;
-            }
-        }
-    };
-
+    // v0.9.7 — SIGTERM (`ccteam daemon stop` / `ccteam stop`) and Ctrl-C
+    // are the only shutdown signals; the historical trigger-file poll is
+    // retired with the trigger channel.
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1950,25 +1958,20 @@ async fn wait_for_shutdown_signal() {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(?err, "could not install SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
-                    _ = trigger_poll => tracing::info!("shutdown via trigger file"),
-                }
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("ctrl+c received");
                 return;
             }
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
             _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
-            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
-            _ = trigger_poll => tracing::info!("shutdown via trigger file"),
-        }
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("ctrl+c received");
     }
 }
 

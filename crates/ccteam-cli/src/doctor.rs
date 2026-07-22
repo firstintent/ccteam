@@ -79,6 +79,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let mcp_codex = check_mcp_codex(codex_present);
     let mcp_kimi = check_mcp_kimi();
     let daemon = check_daemon(paths);
+    let legacy_service = check_legacy_service();
     let pricing = check_pricing();
     let home = check_home_layout(paths);
     let auth_claude = check_vendor_auth_claude();
@@ -98,6 +99,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
         mcp_codex,
         mcp_kimi,
         daemon,
+        legacy_service,
         pricing,
         home,
         auth_claude,
@@ -472,7 +474,7 @@ fn check_mcp_kimi() -> CheckLine {
 
 /// Read-only daemon liveness ping — NEVER starts/stops/restarts the
 /// daemon (CLAUDE.md red line). A down daemon WARNs (perfectly normal
-/// before the first `ccteam start`), it doesn't fail the checkup.
+/// before the first `ccteam daemon start`), it doesn't fail the checkup.
 fn check_daemon(paths: &CcteamPaths) -> CheckLine {
     let health = ccteam_core::check_daemon_health(paths);
     let status = if health.is_healthy() {
@@ -481,6 +483,42 @@ fn check_daemon(paths: &CcteamPaths) -> CheckLine {
         CheckStatus::Warn
     };
     CheckLine::new(status, "daemon", health.describe())
+}
+
+/// v0.9.7 — residual legacy systemd/launchd unit detection (read-only;
+/// the actual migration lives in `ccteam daemon start`'s takeover
+/// pre-step, never in doctor). Installer-written unit → WARN with the
+/// one-command migration; hand-written unit → WARN with guidance only
+/// (ccteam never deletes it).
+fn check_legacy_service() -> CheckLine {
+    let paths = crate::legacy_takeover::LegacyServicePaths::from_env();
+    match crate::legacy_takeover::detect_legacy_unit(&paths) {
+        None => CheckLine::new(
+            CheckStatus::Pass,
+            "legacy service",
+            "no legacy systemd/launchd ccteam unit (pid-detach self-management)",
+        ),
+        Some((path, true)) => CheckLine::new(
+            CheckStatus::Warn,
+            "legacy service",
+            format!(
+                "legacy installer-written ccteam unit at {} — systemd/launchd management is \
+                 retired; migrate with `ccteam daemon start` (auto-takeover: stops + removes \
+                 the unit, restarts detached)",
+                path.display()
+            ),
+        ),
+        Some((path, false)) => CheckLine::new(
+            CheckStatus::Warn,
+            "legacy service",
+            format!(
+                "service unit at {} was not written by the ccteam installer — ccteam will not \
+                 manage or delete it; its instance counts as \"not managed\" for \
+                 `ccteam daemon stop`. Remove it manually if you want ccteam self-management",
+                path.display()
+            ),
+        ),
+    }
 }
 
 /// V0.5.0 F92's staleness threshold (>180 days) re-derived per vendor —
