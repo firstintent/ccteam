@@ -85,14 +85,27 @@ export default function SessionView({
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
 
-  const { events, connected, lastError, gatewayUnavailable } = useSessionEvents(sid);
+  const { events, connected, lastError, gatewayUnavailable, connectionEpoch } =
+    useSessionEvents(sid);
+
+  // The SSE buffer survives reconnects. Keep both the fold cursor and a live
+  // view of its current length so an authoritative history reseed can install
+  // a precise barrier: everything already buffered is represented by history;
+  // only frames arriving after the reseed append from then on.
+  const foldedRef = useRef(0);
+  const eventsRef = useRef(events);
+  const historyRequestRef = useRef(0);
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
 
   // ---- authoritative seed: mirrored history (mount-scoped) -----------------
   useEffect(() => {
     let cancelled = false;
+    const request = ++historyRequestRef.current;
     getHistory(sid)
       .then((h) => {
-        if (cancelled) return;
+        if (cancelled || request !== historyRequestRef.current) return;
         const seeded = historyToRows(h.events);
         if (seeded.length > 0) setRows(seeded);
       })
@@ -104,8 +117,29 @@ export default function SessionView({
     };
   }, [sid]);
 
+  // The first successful open races the mount seed above, so epoch 1 needs no
+  // second fetch. Every later open follows a real disconnect: the server's
+  // turns.jsonl mirror is authoritative even when the SSE replay ring no
+  // longer contains every missed answer.
+  useEffect(() => {
+    if (connectionEpoch <= 1) return;
+    let cancelled = false;
+    const request = ++historyRequestRef.current;
+    getHistory(sid)
+      .then((h) => {
+        if (cancelled || request !== historyRequestRef.current) return;
+        foldedRef.current = eventsRef.current.length;
+        setRows(historyToRows(h.events));
+      })
+      .catch(() => {
+        /* best-effort — keep the current transcript on reseed failure */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sid, connectionEpoch]);
+
   // ---- live SSE → append into this sid's transcript ------------------------
-  const foldedRef = useRef(0);
   useEffect(() => {
     if (events.length <= foldedRef.current) return;
     const fresh = events.slice(foldedRef.current);

@@ -99,12 +99,55 @@ pub const PROJECT_SETTINGS_JSON: &str = include_str!("settings.json");
 /// const so future helpers can be added back in one place.
 pub const HELPER_TEMPLATES: &[(&str, &str)] = &[];
 
-/// Resolve the path to the running ccteam binary. Falls back from
-/// canonicalized to raw `current_exe()` because `canonicalize` rejects
-/// some `/proc/self/exe`-style paths in container test environments.
+/// Resolve the path to the running ccteam binary, suitable for spawning /
+/// re-exec. Delegates to [`resolve_spawnable_exe`] over `current_exe()`.
+///
+/// Any caller that launches a **child** ccteam process (daemon detach,
+/// MCP server registration, version probe) MUST route through this rather
+/// than raw `current_exe()`: after `install.sh` atomically replaces the
+/// running binary, `current_exe()` reports the deleted inode and spawning
+/// it fails with ENOENT.
 pub fn current_ccteam_bin() -> Result<std::path::PathBuf> {
     let raw = std::env::current_exe().context("std::env::current_exe")?;
-    Ok(raw.canonicalize().unwrap_or(raw))
+    resolve_spawnable_exe(&raw)
+}
+
+/// Resolve a `current_exe()`-style `raw` path to an on-disk executable the
+/// process can spawn. Pure over `raw` so it is unit-testable without
+/// self-replacing the test runner's own ELF.
+///
+/// Order:
+/// 1. `canonicalize(raw)` — the live path (a symlinked launcher pins the
+///    real binary; canonicalize also normalizes `/proc/self/exe`).
+/// 2. If `raw` ends in the Linux `" (deleted)"` suffix (the kernel appends
+///    it to `/proc/self/exe` once the mapped inode is unlinked by an atomic
+///    replace), retry against the stripped path — the NEW binary already
+///    lives there.
+/// 3. `raw` still on disk under its own name (canonicalize rejected a
+///    `/proc`-style path in some container test envs, but the file exists).
+/// 4. Otherwise a clear error (a bare deleted path would only ENOENT at
+///    spawn) — set `CCTEAM_DAEMON_BIN` or re-run from a fresh shell.
+pub fn resolve_spawnable_exe(raw: &Path) -> Result<std::path::PathBuf> {
+    if let Ok(canon) = raw.canonicalize() {
+        return Ok(canon);
+    }
+    if let Some(stripped) = raw.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        let candidate = std::path::PathBuf::from(stripped);
+        if let Ok(canon) = candidate.canonicalize() {
+            return Ok(canon);
+        }
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if raw.is_file() {
+        return Ok(raw.to_path_buf());
+    }
+    Err(anyhow!(
+        "cannot resolve an on-disk ccteam binary (current_exe={}); \
+         set CCTEAM_DAEMON_BIN or re-run from a fresh shell",
+        raw.display()
+    ))
 }
 
 /// Extra `env` keys to inject into the rendered settings.json. Used to
@@ -348,7 +391,38 @@ pub fn write_global_helper_templates(global_dir: &Path, force: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_spawnable_exe_prefers_live_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("ccteam");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let got = resolve_spawnable_exe(&bin).unwrap();
+        assert_eq!(got, bin.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_spawnable_exe_strips_linux_deleted_suffix() {
+        // Simulate the post-atomic-swap state: `current_exe()` returns
+        // `<path> (deleted)` while the NEW binary already sits at `<path>`.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("ccteam");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", real.display()));
+        let got = resolve_spawnable_exe(&deleted).unwrap();
+        assert_eq!(got, real.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_spawnable_exe_errors_when_stripped_target_missing() {
+        // Deleted-and-not-replaced: a bare deleted path with no on-disk
+        // file must be a clear error, not a silent fall-back that ENOENTs
+        // later at spawn time.
+        let dir = tempfile::tempdir().unwrap();
+        let deleted = PathBuf::from(format!("{}/gone (deleted)", dir.path().display()));
+        assert!(resolve_spawnable_exe(&deleted).is_err());
+    }
 
     #[test]
     fn template_is_valid_json_with_expected_hook_keys() {

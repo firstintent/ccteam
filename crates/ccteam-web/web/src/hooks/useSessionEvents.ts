@@ -74,6 +74,11 @@ export interface UseSessionEventsResult {
   /** True when the server reported it has no live gateway (the one-shot
    *  `gateway_unavailable` SSE frame on the no-daemon path). */
   gatewayUnavailable: boolean;
+  /** Successful-open generation for this sid. `1` is the initial stream;
+   *  every later value marks a reconnect that consumers can use as an
+   *  authoritative-reseed barrier. Resets to `0` when the sid changes or
+   *  streaming is disabled. */
+  connectionEpoch: number;
 }
 
 export const SESSION_RING_CAP = 500;
@@ -198,6 +203,145 @@ export function appendSessionEvent(
   return [...prev, event];
 }
 
+interface SessionEventSource {
+  addEventListener(type: string, listener: EventListener): void;
+  close(): void;
+}
+
+/** Browser dependencies for the reconnect controller. Exported so the real
+ *  lifecycle (including retry exhaustion + visibility revival) is testable
+ *  in Vitest's dependency-free node environment. */
+export interface SessionEventStreamEnvironment {
+  createEventSource(url: string): SessionEventSource;
+  document: {
+    readonly visibilityState: DocumentVisibilityState;
+    addEventListener(type: string, listener: EventListener): void;
+    removeEventListener(type: string, listener: EventListener): void;
+  };
+  window: {
+    addEventListener(type: string, listener: EventListener): void;
+    removeEventListener(type: string, listener: EventListener): void;
+  };
+  setTimer(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
+  clearTimer(timer: ReturnType<typeof setTimeout>): void;
+}
+
+export interface SessionEventStreamCallbacks {
+  onOpen(connectionEpoch: number): void;
+  onEvent(event: SessionEvent): void;
+  onDisconnected(): void;
+  onError(error: string | null): void;
+  onGatewayUnavailable(): void;
+}
+
+/** Own one sid's EventSource + bounded retry lifecycle. The hook below is a
+ *  thin React-state adapter around this controller; keeping the browser
+ *  lifecycle here prevents the retry and visibility paths from drifting. */
+export function startSessionEventStream(
+  sid: string,
+  lastSeenSeqRef: { current: number },
+  callbacks: SessionEventStreamCallbacks,
+  environment?: SessionEventStreamEnvironment,
+): () => void {
+  const env: SessionEventStreamEnvironment = environment ?? {
+    createEventSource: (url) => new EventSource(url),
+    document,
+    window,
+    setTimer: (callback, delay) => setTimeout(callback, delay),
+    clearTimer: (timer) => clearTimeout(timer),
+  };
+  let source: SessionEventSource | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let retryCount = 0;
+  let connectionEpoch = 0;
+  let connected = false;
+  let cancelled = false;
+
+  function scheduleReconnect(reason: string): void {
+    connected = false;
+    callbacks.onDisconnected();
+    if (retryCount >= MAX_RETRIES) {
+      callbacks.onError(`SSE max retries reached (${reason})`);
+      return;
+    }
+    retryCount += 1;
+    retryTimer = env.setTimer(() => {
+      retryTimer = null;
+      connect();
+    }, retryDelayMs(retryCount));
+  }
+
+  function connect(): void {
+    if (cancelled) return;
+    const es = env.createEventSource(sessionEventsUrl(sid, lastSeenSeqRef.current));
+    source = es;
+    const current = () => !cancelled && source === es;
+
+    es.addEventListener("open", () => {
+      if (!current()) return;
+      retryCount = 0;
+      connected = true;
+      connectionEpoch += 1;
+      callbacks.onOpen(connectionEpoch);
+    });
+    es.addEventListener("progress", (event) => {
+      if (!current()) return;
+      const message = event as MessageEvent;
+      const decision = shouldAcceptEventSeq(message.lastEventId, lastSeenSeqRef.current);
+      lastSeenSeqRef.current = decision.nextHighest;
+      if (!decision.accept) return;
+      const parsed = parseSessionEvent(message.data);
+      if (parsed) callbacks.onEvent(parsed);
+    });
+    es.addEventListener("gateway_unavailable", () => {
+      if (current()) callbacks.onGatewayUnavailable();
+    });
+    es.addEventListener("reconnect_hint", () => {
+      if (!current()) return;
+      es.close();
+      source = null;
+      scheduleReconnect("server requested reconnect");
+    });
+    es.addEventListener("error", () => {
+      if (!current()) return;
+      es.close();
+      source = null;
+      scheduleReconnect("connection lost");
+    });
+  }
+
+  function reconnectNow(): void {
+    if (cancelled || connected) return;
+    if (retryTimer) {
+      env.clearTimer(retryTimer);
+      retryTimer = null;
+    }
+    source?.close();
+    source = null;
+    retryCount = 0;
+    callbacks.onError(null);
+    connect();
+  }
+
+  const onVisibilityChange: EventListener = () => {
+    if (env.document.visibilityState === "visible") reconnectNow();
+  };
+  const onOnline: EventListener = () => reconnectNow();
+  env.document.addEventListener("visibilitychange", onVisibilityChange);
+  env.window.addEventListener("online", onOnline);
+  connect();
+
+  return () => {
+    cancelled = true;
+    if (retryTimer) env.clearTimer(retryTimer);
+    retryTimer = null;
+    source?.close();
+    source = null;
+    env.document.removeEventListener("visibilitychange", onVisibilityChange);
+    env.window.removeEventListener("online", onOnline);
+  };
+}
+
 export function useSessionEvents(
   sid: string | null,
   enabled: boolean = true,
@@ -206,6 +350,7 @@ export function useSessionEvents(
   const [connected, setConnected] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [gatewayUnavailable, setGatewayUnavailable] = useState(false);
+  const [connectionEpoch, setConnectionEpoch] = useState(0);
 
   // Reset the event buffer SYNCHRONOUSLY when the sid changes (React's
   // "adjust state during render" pattern). The subscribe effect below also
@@ -228,11 +373,8 @@ export function useSessionEvents(
   if (sid !== streamedSid) {
     setStreamedSid(sid);
     setEvents([]);
+    setConnectionEpoch(0);
   }
-
-  const esRef = useRef<EventSource | null>(null);
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const retryCountRef = useRef(0);
 
   useEffect(() => {
     // A new sid starts its own seq watermark; carrying over the PREVIOUS
@@ -248,19 +390,13 @@ export function useSessionEvents(
     // No sid (or disabled) — tear the stream down and reset state so the
     // pane renders empty rather than stale events from the previous sid.
     if (!sid || !enabled) {
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      esRef.current?.close();
-      esRef.current = null;
-      retryCountRef.current = 0;
       let cancelled = false;
       queueMicrotask(() => {
         if (cancelled) return;
         setConnected(false);
         setLastError(null);
         setGatewayUnavailable(false);
+        setConnectionEpoch(0);
       });
       return () => {
         cancelled = true;
@@ -273,89 +409,36 @@ export function useSessionEvents(
       if (cancelled) return;
       setEvents([]);
       setGatewayUnavailable(false);
+      setConnectionEpoch(0);
     });
 
-    const connect = () => {
-      if (cancelled) return;
-      // v0.8.22 P1 (review §3.1-3) — build the URL AT CONNECT TIME (not once
-      // per effect run): a reconnect must carry the watermark accumulated so
-      // far, and this closure runs again on every `scheduleReconnect` retry
-      // — a genuinely NEW `EventSource`, not the browser's own auto-retry
-      // (which would resend `Last-Event-ID` on its own but never fires here
-      // since we always `.close()` first).
-      const es = new EventSource(sessionEventsUrl(sid, lastSeenSeqRef.current));
-      esRef.current = es;
-
-      es.addEventListener("open", () => {
+    const stop = startSessionEventStream(sid, lastSeenSeqRef, {
+      onOpen: (epoch) => {
         if (cancelled) return;
-        retryCountRef.current = 0;
         setConnected(true);
         setLastError(null);
-      });
-
-      es.addEventListener("progress", (ev) => {
-        if (cancelled) return;
-        const msgEvent = ev as MessageEvent;
-        // v0.8.22 P1 — dedupe a replayed/reseeded frame this hook already
-        // rendered (the ring-replay/reseed catchup batch can legitimately
-        // repeat a frame at a reconnect boundary — see `ring.rs`'s module
-        // doc); a frame with no parseable seq always passes through.
-        const decision = shouldAcceptEventSeq(msgEvent.lastEventId, lastSeenSeqRef.current);
-        lastSeenSeqRef.current = decision.nextHighest;
-        if (!decision.accept) return;
-        const parsed = parseSessionEvent(msgEvent.data);
-        if (parsed) setEvents((prev) => appendSessionEvent(prev, parsed));
-      });
-
-      // No live gateway: server emits one `gateway_unavailable` frame and
-      // keeps the stream open (no 503 retry-loop). Surface it instead of
-      // hammering reconnects.
-      es.addEventListener("gateway_unavailable", () => {
-        if (cancelled) return;
-        setGatewayUnavailable(true);
-      });
-
-      es.addEventListener("reconnect_hint", () => {
-        if (cancelled) return;
-        es.close();
-        scheduleReconnect("server requested reconnect");
-      });
-
-      es.addEventListener("error", () => {
-        if (cancelled) return;
-        es.close();
-        scheduleReconnect("connection lost");
-      });
-    };
-
-    const scheduleReconnect = (reason: string) => {
-      setConnected(false);
-      if (retryCountRef.current >= MAX_RETRIES) {
-        setLastError(`SSE max retries reached (${reason})`);
-        return;
-      }
-      retryCountRef.current += 1;
-      const delay = retryDelayMs(retryCountRef.current);
-      retryTimerRef.current = setTimeout(() => {
-        retryTimerRef.current = null;
-        connect();
-      }, delay);
-    };
-
-    connect();
+        setConnectionEpoch(epoch);
+      },
+      onEvent: (event) => {
+        if (!cancelled) setEvents((previous) => appendSessionEvent(previous, event));
+      },
+      onDisconnected: () => {
+        if (!cancelled) setConnected(false);
+      },
+      onError: (error) => {
+        if (!cancelled) setLastError(error);
+      },
+      onGatewayUnavailable: () => {
+        if (!cancelled) setGatewayUnavailable(true);
+      },
+    });
 
     return () => {
       cancelled = true;
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      esRef.current?.close();
-      esRef.current = null;
-      retryCountRef.current = 0;
+      stop();
     };
     // `sid` keys the subscription; `enabled` toggles the whole effect.
   }, [sid, enabled]);
 
-  return { events, connected, lastError, gatewayUnavailable };
+  return { events, connected, lastError, gatewayUnavailable, connectionEpoch };
 }

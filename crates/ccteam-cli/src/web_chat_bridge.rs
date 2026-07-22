@@ -725,14 +725,40 @@ mod tests {
         drop(socket);
         stop_stack(second).await;
 
-        assert_eq!(adapter_state.starts.load(Ordering::SeqCst), 2);
-        assert!(
-            adapter_state.resumes.load(Ordering::SeqCst) >= 2,
-            "restart should resume persisted Claude and Codex sessions"
+        // A daemon restart kills every child process, so there is nothing to
+        // re-attach to: since v0.8.21 the restore RE-SPAWNS each persisted
+        // session through the resume-aware `start_thread` (same sid →
+        // deterministic vendor uuid → `--resume`, conversation preserved),
+        // and `HarnessAdapter::resume_thread` is NOT on that path. So the
+        // evidence that "restart resumed both sessions" is two MORE starts —
+        // exactly one per persisted session — not a `resume_thread` count.
+        assert_eq!(
+            adapter_state.starts.load(Ordering::SeqCst),
+            4,
+            "2 fresh spawns + exactly 1 re-spawn per persisted session on restart"
         );
+        assert_eq!(
+            adapter_state.resumes.load(Ordering::SeqCst),
+            0,
+            "restore goes through start_thread, never resume_thread"
+        );
+        // Each vendor started exactly twice (once fresh, once restored) — this
+        // is what proves the restart revived BOTH sessions rather than, say,
+        // re-spawning one of them twice.
         let vendors = adapter_state.started_vendors.lock().await.clone();
-        assert!(vendors.contains(&AgentVendor::Claude));
-        assert!(vendors.contains(&AgentVendor::Codex));
+        assert_eq!(
+            vendors
+                .iter()
+                .filter(|v| **v == AgentVendor::Claude)
+                .count(),
+            2,
+            "claude session spawned fresh + restored once: {vendors:?}"
+        );
+        assert_eq!(
+            vendors.iter().filter(|v| **v == AgentVendor::Codex).count(),
+            2,
+            "codex session spawned fresh + restored once: {vendors:?}"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]

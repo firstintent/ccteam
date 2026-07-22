@@ -75,14 +75,16 @@ fn error_code(err: &anyhow::Error) -> &'static str {
 }
 
 /// Resolve what to detach: `CCTEAM_DAEMON_BIN` override (tests) or the
-/// canonicalized current executable (so a symlinked launcher pins the
-/// real binary for the daemon's lifetime).
+/// on-disk current executable (so a symlinked launcher pins the real
+/// binary for the daemon's lifetime). Routed through
+/// `current_ccteam_bin()` so that when `ccteam update` swaps the binary
+/// under the running updater, we detach the NEW file on disk rather than
+/// the deleted inode `current_exe()` reports as `<path> (deleted)`.
 fn spawn_program() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os(DAEMON_BIN_ENV) {
         return Ok(PathBuf::from(p));
     }
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    ccteam_core::current_ccteam_bin().context("resolve daemon binary to detach")
 }
 
 fn start_spec(paths: &CcteamPaths, web_bind: &str) -> Result<dcore::DaemonStartSpec> {

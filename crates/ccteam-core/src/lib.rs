@@ -62,6 +62,7 @@ pub mod mcp_register;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;
+pub mod identity;
 // V0.6.1 F139 — embedded `~/.ccteam/hooks/hook.sh` dispatcher + install
 // helper. Routes Claude Code hooks through the long-running daemon's
 // HTTP server for a ~20× latency reduction.
@@ -314,10 +315,11 @@ pub use templates::{
     apply_probe_defaults_to_workflow_ctx, current_ccteam_bin, default_workflow_ctx,
     merge_named_mcp_server, merge_project_mcp_json, probe_project, render_project_mcp_json,
     render_project_settings, render_workflow_agents_block, render_workflow_template,
-    validate_mcp_server_name, write_global_helper_templates, write_project_settings,
-    EnabledPluginsSetting, Language, ProjectKind, ProjectProbe, SettingsEnv, WorkflowAgentEntry,
-    WorkflowPreset, WorkflowTemplateCtx, WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY,
-    CCTEAM_MCP_SERVE_ARGS, HELPER_TEMPLATES, PROJECT_SETTINGS_JSON,
+    resolve_spawnable_exe, validate_mcp_server_name, write_global_helper_templates,
+    write_project_settings, EnabledPluginsSetting, Language, ProjectKind, ProjectProbe,
+    SettingsEnv, WorkflowAgentEntry, WorkflowPreset, WorkflowTemplateCtx,
+    WorkflowTemplateRenderError, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS, HELPER_TEMPLATES,
+    PROJECT_SETTINGS_JSON,
 };
 pub use tmux::{
     capture_pane_tail, capture_pane_tail_from_session, capture_pane_with_ansi,

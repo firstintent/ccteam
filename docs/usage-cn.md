@@ -134,6 +134,18 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - 资源:`/api/v1/projects`、`…/projects/{slug}/sessions`、`/sessions/{sid}/{turn,events,stop}`、`/marketplace`、`/status`、`/hosts`、`/capabilities`。
 - 鉴权与 Web 同一令牌;会话类端点需要 daemon 在线。
 
+### 外部 Agent 直连 MCP(`POST /mcp`)
+
+任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
+
+```
+POST http://<host>:7331/mcp
+Authorization: Bearer ccteam:<hex>
+```
+
+- **admin token**(`ccteam status` 输出的那枚)= owner 前门,fleet 级;**per-user token**(Settings → 用户 里签发)= 该用户身份,所有工具收窄到其自有项目:`session_spawn` 必须显式传 `project` 且只能是自己的项目,`dispatch/collect/stop` 按目标 sid 的归属项目做 ACL,`session_list`/`status` 只聚合可见项目。
+- 无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数。
+
 ---
 
 ## 二、Telegram / 飞书

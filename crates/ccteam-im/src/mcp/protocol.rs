@@ -324,6 +324,21 @@ fn text_content(body: String) -> Vec<Value> {
 /// daemon-aware dispatch path reuses this verbatim, then appends the vendor
 /// panel + routing notes (see [`super::dispatch`]).
 pub(crate) fn tool_ls(paths: &CcteamPaths) -> Result<String> {
+    tool_ls_matching(paths, |_| true)
+}
+
+/// Tenant-scoped base `status` body. This is intentionally the same renderer
+/// as [`tool_ls`], with only the shared owner-policy filter applied.
+pub(crate) fn tool_ls_for_user(paths: &CcteamPaths, user_id: &str) -> Result<String> {
+    tool_ls_matching(paths, |state| {
+        ccteam_core::identity::can_see_owner(user_id, false, state.owner.as_deref())
+    })
+}
+
+fn tool_ls_matching(
+    paths: &CcteamPaths,
+    mut visible: impl FnMut(&ccteam_core::ProjectState) -> bool,
+) -> Result<String> {
     let projects = collect_projects(paths)?;
     // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
     // with the phase state machine deleted F66 will recompute this from
@@ -331,6 +346,7 @@ pub(crate) fn tool_ls(paths: &CcteamPaths) -> Result<String> {
     let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
+        .filter(|project| visible(&project.state))
         .map(|p| {
             let cost = cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
                 .unwrap_or_default();
@@ -742,6 +758,49 @@ mod tests {
         ] {
             assert!(!names.contains(&gone), "culled tool present: {gone}");
         }
+    }
+
+    #[test]
+    fn tenant_status_base_contains_only_owned_projects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        for (slug, owner) in [
+            ("alice", "user:ualice"),
+            ("bob", "user:ubob"),
+            ("admin", "user:web-api"),
+        ] {
+            let dir = paths.projects_root.join(slug);
+            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+            state.owner = Some(owner.to_string());
+            state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+            ccteam_core::config::upsert_project(
+                &paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: slug.to_string(),
+                    path: dir,
+                    host: ccteam_core::LOCAL_HOST.to_string(),
+                    remote_slug: None,
+                    remote_path: None,
+                    team: "dev".into(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+
+        let body: Value = serde_json::from_str(&tool_ls_for_user(&paths, "ualice").unwrap())
+            .expect("tenant status base is JSON");
+        let slugs: Vec<&str> = body["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|project| project["slug"].as_str())
+            .collect();
+        assert_eq!(slugs, vec!["alice"]);
     }
 
     #[tokio::test]

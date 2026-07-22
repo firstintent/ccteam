@@ -5,16 +5,136 @@
 // the pure pieces: the SSE URL, the W2-shape parser, and the ring-buffer
 // append. These are what the hook is built from.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   appendSessionEvent,
   parseSessionEvent,
   sessionEventsUrl,
+  startSessionEventStream,
   shouldAcceptEventSeq,
   SESSION_RING_CAP,
   type SessionEvent,
 } from "./useSessionEvents";
+
+class FakeEventSource {
+  readonly listeners = new Map<string, Array<(event: Event) => void>>();
+  closed = false;
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const callback =
+      typeof listener === "function" ? listener : (event: Event) => listener.handleEvent(event);
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(callback);
+    this.listeners.set(type, listeners);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  emit(type: string): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(new Event(type));
+  }
+}
+
+function streamHarness() {
+  const sources: FakeEventSource[] = [];
+  const documentListeners = new Map<string, EventListener>();
+  const windowListeners = new Map<string, EventListener>();
+  let visibilityState: DocumentVisibilityState = "hidden";
+  const errors: Array<string | null> = [];
+  const epochs: number[] = [];
+  const stop = startSessionEventStream(
+    "s1",
+    { current: 0 },
+    {
+      onOpen: (epoch) => epochs.push(epoch),
+      onEvent: () => {},
+      onDisconnected: () => {},
+      onError: (error) => errors.push(error),
+      onGatewayUnavailable: () => {},
+    },
+    {
+      createEventSource: () => {
+        const source = new FakeEventSource();
+        sources.push(source);
+        return source;
+      },
+      document: {
+        get visibilityState() {
+          return visibilityState;
+        },
+        addEventListener: (type, listener) => {
+          documentListeners.set(type, listener as EventListener);
+        },
+        removeEventListener: (type) => {
+          documentListeners.delete(type);
+        },
+      },
+      window: {
+        addEventListener: (type, listener) => {
+          windowListeners.set(type, listener as EventListener);
+        },
+        removeEventListener: (type) => {
+          windowListeners.delete(type);
+        },
+      },
+      setTimer: (callback, delay) => setTimeout(callback, delay),
+      clearTimer: (timer) => clearTimeout(timer),
+    },
+  );
+  return {
+    sources,
+    errors,
+    epochs,
+    stop,
+    showDocument() {
+      visibilityState = "visible";
+      documentListeners.get("visibilitychange")?.(new Event("visibilitychange"));
+    },
+  };
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("session event stream reconnect lifecycle", () => {
+  it("increments the connection epoch on the second successful open", () => {
+    vi.useFakeTimers();
+    const stream = streamHarness();
+
+    stream.sources[0].emit("open");
+    stream.sources[0].emit("error");
+    vi.runOnlyPendingTimers();
+    stream.sources[1].emit("open");
+
+    expect(stream.epochs).toEqual([1, 2]);
+    stream.stop();
+  });
+
+  it("revives a given-up stream when the document becomes visible", () => {
+    vi.useFakeTimers();
+    const stream = streamHarness();
+
+    // Initial source + seven scheduled retries; the eighth error exhausts
+    // the retry budget and leaves the stream permanently idle until a
+    // browser-lifecycle signal revives it.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      stream.sources[attempt].emit("error");
+      vi.runOnlyPendingTimers();
+    }
+    expect(stream.sources).toHaveLength(8);
+    expect(stream.errors.at(-1)).toContain("SSE max retries reached");
+
+    stream.showDocument();
+
+    expect(stream.sources).toHaveLength(9);
+    expect(stream.errors.at(-1)).toBeNull();
+    stream.stop();
+  });
+});
 
 describe("sessionEventsUrl", () => {
   it("targets the W2 per-sid SSE endpoint under /api/v1", () => {

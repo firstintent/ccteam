@@ -61,6 +61,31 @@ export function shellViewFor(pathname: string): ShellView {
  *  — enough to resume recent work without drowning the live rows. */
 const HISTORY_PER_PROJECT = 6;
 
+/** Synthesize a live-shaped `SessionSummary` from a stopped/history row so a
+ *  directly-navigated session that is no longer live still renders its REAL
+ *  vendor / protocol / role / title (not the "claude" default a `null` session
+ *  falls back to). The server cold-resumes it on the next send (resume-by-sid),
+ *  after which the live row takes over. */
+function historyToSummary(h: HistorySessionView): SessionSummary {
+  return {
+    sid: h.sid,
+    project: h.slug,
+    role: h.role,
+    vendor: h.vendor,
+    permission_mode: h.permission_mode,
+    protocol: h.protocol,
+    host: "local",
+    current: false,
+    status: "off",
+    created_at: h.created_at,
+    last_active: h.last_active,
+    title: h.title ?? null,
+    turn_count: h.turn_count,
+    cost_usd: h.cost_usd ?? null,
+    waiting_approval: false,
+  };
+}
+
 export default function ChatConsole() {
   const { sid: routeSid, tab: routeTab } = useParams<{ sid: string; tab: string }>();
   const sid = routeSid ?? null;
@@ -266,10 +291,19 @@ export default function ChatConsole() {
     [refreshSessions, lang, sid, navigate],
   );
 
-  const activeSession = useMemo(
-    () => railSessions.find((s) => s.sid === sid) ?? null,
-    [railSessions, sid],
-  );
+  const activeSession = useMemo(() => {
+    const live = railSessions.find((s) => s.sid === sid);
+    if (live) return live;
+    if (!sid) return null;
+    // Not in the live list → fall back to the stopped/history row (when loaded)
+    // so the head + composer reflect the session's real vendor/protocol instead
+    // of the claude default. The next send cold-resumes it server-side.
+    for (const list of Object.values(historyByProject)) {
+      const h = list.find((x) => x.sid === sid);
+      if (h) return historyToSummary(h);
+    }
+    return null;
+  }, [railSessions, historyByProject, sid]);
 
   const displayName = (settings.displayName || "").trim() || me?.handle || "user";
   const initial = displayName.slice(0, 1).toUpperCase() || "C";

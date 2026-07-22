@@ -43,7 +43,7 @@ pub struct McpDispatch {
 
 /// Who is invoking the dispatch — decides how the privileged intercepts
 /// authenticate (v0.9 T4 review fix).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum McpCaller {
     /// mcp.sock / stdio-forwarder path: `session_*` authenticates via the
     /// env-injected `_caller_role`/`_caller_secret` args (cto gate); the
@@ -55,6 +55,26 @@ pub enum McpCaller {
     /// internal-bus methods are NOT exposed (in-band/daemon-internal
     /// responsibility, not front-door API).
     Admin,
+    /// HTTP `/mcp` behind a verified per-user tenant web bearer. This is a
+    /// human/root caller like Admin, but every project/sid operation is scoped
+    /// to projects owned by `user:<user_id>`.
+    User {
+        /// Stable tenant identity id resolved from the bearer registry.
+        user_id: String,
+    },
+}
+
+impl McpCaller {
+    fn user_id(&self) -> Option<&str> {
+        match self {
+            Self::User { user_id } => Some(user_id),
+            Self::Ambient | Self::Admin => None,
+        }
+    }
+
+    fn is_front_door(&self) -> bool {
+        !matches!(self, Self::Ambient)
+    }
 }
 
 impl McpDispatch {
@@ -103,9 +123,15 @@ impl McpDispatch {
     /// `handle_mcp_socket_connection` intercept chain exactly:
     /// `interaction/ask` → `permission/ask` → `chat_send_file` →
     /// `session_*` → `ccteam/reload` → protocol core.
-    pub async fn dispatch_as(&self, req: Value, caller: McpCaller) -> Option<Value> {
+    pub async fn dispatch_as(&self, mut req: Value, caller: McpCaller) -> Option<Value> {
+        // A tenant web bearer is the sole identity source. Strip every private
+        // caller field before routing so no tool can mistake client-supplied
+        // `_caller_*` metadata for a managed-session principal or project scope.
+        if caller.user_id().is_some() {
+            strip_untrusted_caller_args(&mut req);
+        }
         if is_interaction_ask_call(&req) {
-            if caller == McpCaller::Admin {
+            if caller.is_front_door() {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -118,7 +144,7 @@ impl McpDispatch {
                 .await,
             )
         } else if is_permission_ask_call(&req) {
-            if caller == McpCaller::Admin {
+            if caller.is_front_door() {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -131,12 +157,34 @@ impl McpDispatch {
                 .await,
             )
         } else if is_chat_send_file_call(&req) {
-            Some(execute_chat_send_file(&req, self.sink.as_ref(), self.gateway.as_ref()).await)
+            Some(
+                execute_chat_send_file(
+                    &req,
+                    self.sink.as_ref(),
+                    self.gateway.as_ref(),
+                    &caller,
+                    &self.paths,
+                )
+                .await,
+            )
         } else if is_session_tool_call(&req) {
-            Some(execute_session_tool(&req, self.gateway.as_ref(), caller).await)
+            Some(
+                execute_session_tool_with_paths(
+                    &req,
+                    self.gateway.as_ref(),
+                    caller.clone(),
+                    &self.paths,
+                )
+                .await,
+            )
         } else if is_status_call(&req) {
-            Some(execute_status(&req, self.gateway.as_ref(), caller, &self.paths).await)
+            Some(execute_status(&req, self.gateway.as_ref(), caller.clone(), &self.paths).await)
+        } else if is_screenshot_call(&req) && caller.user_id().is_some() {
+            Some(execute_user_screenshot(&req, &caller, &self.paths).await)
         } else if is_reload_call(&req) {
+            if caller.user_id().is_some() {
+                return Some(internal_bus_not_exposed(&req));
+            }
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let ok = if let Some(gw) = self.gateway.as_ref() {
                 gw.lock().await.request_im_reload()
@@ -152,6 +200,39 @@ impl McpDispatch {
             protocol::handle_request(&self.paths, &req).await
         }
     }
+}
+
+/// Remove every private caller field from an external user's tool arguments.
+/// Known fields are not enumerated deliberately: future `_caller_*` additions
+/// are fail-closed automatically.
+fn strip_untrusted_caller_args(req: &mut Value) {
+    if let Some(args) = req
+        .pointer_mut("/params/arguments")
+        .and_then(Value::as_object_mut)
+    {
+        strip_caller_args(args);
+    }
+}
+
+fn strip_caller_args(args: &mut serde_json::Map<String, Value>) {
+    args.retain(|key, _| !key.starts_with("_caller_"));
+}
+
+fn user_can_see_project(paths: &CcteamPaths, user_id: &str, slug: &str) -> bool {
+    ccteam_core::ProjectState::load(&paths.project_state(slug))
+        .map(|state| ccteam_core::identity::can_see_owner(user_id, false, state.owner.as_deref()))
+        .unwrap_or(false)
+}
+
+fn visible_user_projects(paths: &CcteamPaths, user_id: &str) -> Vec<String> {
+    ccteam_core::collect_projects(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|project| {
+            ccteam_core::identity::can_see_owner(user_id, false, project.state.owner.as_deref())
+        })
+        .map(|project| project.state.slug)
+        .collect()
 }
 
 /// v0.8.7 W1 — cap on how many child turns `session_collect` returns when the
@@ -215,6 +296,8 @@ async fn execute_chat_send_file(
     req: &serde_json::Value,
     sink: Option<&GatewayEventSink>,
     gateway: Option<&GatewayHandle>,
+    caller: &McpCaller,
+    paths: &CcteamPaths,
 ) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let args = req
@@ -227,7 +310,13 @@ async fn execute_chat_send_file(
     // live (project, role) session is tracked → run_chat_send_file falls back
     // to the on-disk registry. We resolve here (async) and inject the result
     // into the sync builder so build_send_file_event stays unit-testable.
-    let live_target = resolve_live_reply_target(&args, gateway).await;
+    let live_target = match caller.user_id() {
+        Some(user_id) => match user_delivery_target(paths, user_id) {
+            Ok(target) => Some(target),
+            Err(text) => return session_tool_response(id, text, true),
+        },
+        None => resolve_live_reply_target(&args, gateway).await,
+    };
     let (text, is_error) = match run_chat_send_file(&args, sink, live_target) {
         Ok(text) => (text, false),
         Err(text) => (text, true),
@@ -240,6 +329,58 @@ async fn execute_chat_send_file(
             "isError": is_error,
         },
     })
+}
+
+/// Resolve an external tenant's own IM destination from the tenant registry.
+/// No tool argument participates in addressing. A durable `linked_chat` wins;
+/// otherwise a configured per-tenant bot may supply its first allowlisted
+/// recipient. A bot without a known recipient is not deliverable yet.
+pub(crate) fn user_delivery_target(
+    paths: &CcteamPaths,
+    user_id: &str,
+) -> std::result::Result<(String, String), String> {
+    let registry = ccteam_core::tenants::TenantRegistry::load(&paths.users_dir());
+    let tenant = registry.by_id(user_id).ok_or_else(|| {
+        "chat_send_file: authenticated user is no longer registered; refresh the MCP credential"
+            .to_string()
+    })?;
+
+    if let Some(linked) = tenant.linked_chat.as_deref() {
+        let (platform, chat_id) = linked.split_once(':').ok_or_else(|| {
+            "chat_send_file: linked IM is invalid; expected `channel:chat_id`".to_string()
+        })?;
+        if platform.is_empty() || chat_id.is_empty() || platform == "web" {
+            return Err(
+                "chat_send_file: no linked IM destination is configured for this user".to_string(),
+            );
+        }
+        let channel = match platform {
+            "telegram" if tenant.telegram.is_some() => format!("telegram@{user_id}"),
+            "lark" if tenant.lark.is_some() => format!("lark@{user_id}"),
+            other => other.to_string(),
+        };
+        return Ok((channel, chat_id.to_string()));
+    }
+
+    if let Some(chat_id) = tenant
+        .telegram
+        .as_ref()
+        .and_then(|telegram| telegram.allowed_chat_ids.first())
+    {
+        return Ok((format!("telegram@{user_id}"), chat_id.clone()));
+    }
+    if let Some(open_id) = tenant
+        .lark
+        .as_ref()
+        .and_then(|lark| lark.allowed_user_ids.first())
+    {
+        return Ok((format!("lark@{user_id}"), open_id.clone()));
+    }
+
+    Err(
+        "chat_send_file: no linked IM destination is configured for this user; link an IM chat or configure the tenant bot recipient first"
+            .to_string(),
+    )
 }
 
 /// v0.8.7 (FIX-1) — resolve the live `(channel, chat_id)` for the firing
@@ -892,6 +1033,41 @@ fn is_status_call(req: &serde_json::Value) -> bool {
         && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("status")
 }
 
+fn is_screenshot_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|method| method.as_str()) == Some("tools/call")
+        && req.pointer("/params/name").and_then(|name| name.as_str()) == Some("screenshot")
+}
+
+async fn execute_user_screenshot(
+    req: &serde_json::Value,
+    caller: &McpCaller,
+    paths: &CcteamPaths,
+) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let Some(slug) = req
+        .pointer("/params/arguments/slug")
+        .and_then(|slug| slug.as_str())
+        .filter(|slug| !slug.is_empty())
+    else {
+        return session_tool_response(id, "screenshot: missing `slug`".to_string(), true);
+    };
+    let Some(user_id) = caller.user_id() else {
+        return session_tool_response(id, "screenshot: project not found".to_string(), true);
+    };
+    if !user_can_see_project(paths, user_id, slug) {
+        return session_tool_response(id, "screenshot: project not found".to_string(), true);
+    }
+    protocol::handle_request(paths, req)
+        .await
+        .unwrap_or_else(|| {
+            session_tool_response(
+                id,
+                "screenshot: request produced no response".to_string(),
+                true,
+            )
+        })
+}
+
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
 /// vendor panel + routing notes appended for the caller's project's bound
 /// host. Ambient (session principal) is scoped to its OWN project — any
@@ -911,6 +1087,10 @@ async fn execute_status(
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(user_id) = caller.user_id() {
+        return execute_user_status(id, &args, paths, user_id).await;
+    }
 
     // Base body (projects + orchestrator + daemon health), reused verbatim
     // from the protocol core so the daemon-aware path never drifts from the
@@ -961,6 +1141,60 @@ async fn execute_status(
     session_tool_response(id, format!("{base}\n\n{section}"), false)
 }
 
+async fn execute_user_status(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    paths: &CcteamPaths,
+    user_id: &str,
+) -> serde_json::Value {
+    let explicit = args
+        .get("project")
+        .and_then(|project| project.as_str())
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        .map(str::to_string);
+    if let Some(project) = explicit.as_deref() {
+        if !user_can_see_project(paths, user_id, project) {
+            return session_tool_response(id, "status: project not found".to_string(), true);
+        }
+    }
+
+    let base =
+        super::protocol::tool_ls_for_user(paths, user_id).unwrap_or_else(|_| "{}".to_string());
+    let projects = explicit
+        .map(|project| vec![project])
+        .unwrap_or_else(|| visible_user_projects(paths, user_id));
+    if projects.is_empty() {
+        return session_tool_response(
+            id,
+            format!(
+                "{base}\n\nvendors: no projects are visible to this user; project-scoped host, budget, and routing details are withheld"
+            ),
+            false,
+        );
+    }
+
+    let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
+    let paths_owned = paths.clone();
+    let sections = tokio::task::spawn_blocking(move || {
+        projects
+            .iter()
+            .map(|project| {
+                super::vendor_panel::render_section(
+                    &paths_owned,
+                    Some(project.as_str()),
+                    &hub_models,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    })
+    .await
+    .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
+
+    session_tool_response(id, format!("{base}\n\n{sections}"), false)
+}
+
 /// Build a tools/call-shaped JSON-RPC response carrying one text block.
 fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) -> serde_json::Value {
     serde_json::json!({
@@ -977,10 +1211,11 @@ fn session_tool_response(id: serde_json::Value, text: String, is_error: bool) ->
 /// the caller by its `(sid, secret)` PRINCIPAL (Ambient path), then dispatches
 /// to the gateway. Returns a JSON-RPC response (the caller side propagates
 /// `isError` to the agent).
-async fn execute_session_tool(
+async fn execute_session_tool_with_paths(
     req: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
     caller: McpCaller,
+    paths: &CcteamPaths,
 ) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let name = req
@@ -1017,37 +1252,49 @@ async fn execute_session_tool(
     // `McpCaller::Admin` (HTTP `/mcp`, admin bearer already verified at the
     // transport layer) skips the principal gate: it names its target with an
     // explicit `project` arg (fleet-wide, same as the web admin Identity).
-    if caller == McpCaller::Ambient {
-        let caller_sid = args
-            .get("_caller_sid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let caller_secret = args
-            .get("_caller_secret")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let ctx = {
-            let gw = gateway.lock().await;
-            gw.verify_session_principal(caller_sid, caller_secret)
-        };
-        let Some(ctx) = ctx else {
-            return session_tool_response(
-                id,
-                format!(
-                    "{name}: permission denied — caller could not be authenticated (no live session holds the presented (sid, secret) principal)"
-                ),
-                true,
-            );
-        };
-        if let Some(obj) = args.as_object_mut() {
-            obj.insert("_caller_slug".to_string(), serde_json::json!(ctx.slug));
-            obj.insert("_caller_sid".to_string(), serde_json::json!(ctx.sid));
-            obj.insert("_caller_role".to_string(), serde_json::json!(ctx.role));
-            // v0.9.0 W2 (F2/F5) — the caller's delegation depth (server-resolved
-            // from CallerCtx, never caller-supplied): a child's depth = this + 1,
-            // the input to the `delegation.max_depth` guardrail.
-            obj.insert("_caller_depth".to_string(), serde_json::json!(ctx.depth));
+    match &caller {
+        McpCaller::Ambient => {
+            let caller_sid = args
+                .get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let caller_secret = args
+                .get("_caller_secret")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ctx = {
+                let gw = gateway.lock().await;
+                gw.verify_session_principal(caller_sid, caller_secret)
+            };
+            let Some(ctx) = ctx else {
+                return session_tool_response(
+                    id,
+                    format!(
+                        "{name}: permission denied — caller could not be authenticated (no live session holds the presented (sid, secret) principal)"
+                    ),
+                    true,
+                );
+            };
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("_caller_slug".to_string(), serde_json::json!(ctx.slug));
+                obj.insert("_caller_sid".to_string(), serde_json::json!(ctx.sid));
+                obj.insert("_caller_role".to_string(), serde_json::json!(ctx.role));
+                // v0.9.0 W2 (F2/F5) — the caller's delegation depth
+                // (server-resolved from CallerCtx, never caller-supplied).
+                obj.insert("_caller_depth".to_string(), serde_json::json!(ctx.depth));
+            }
         }
+        McpCaller::User { user_id } => {
+            if let Some(obj) = args.as_object_mut() {
+                strip_caller_args(obj);
+            }
+            if let Err(message) =
+                authorize_user_session_tool(&name, &mut args, gateway, paths, user_id).await
+            {
+                return session_tool_response(id, message, true);
+            }
+        }
+        McpCaller::Admin => {}
     }
 
     // v0.9.5 feedback fix — every session_* call carries a hard server-side
@@ -1065,7 +1312,12 @@ async fn execute_session_tool(
         "session_stop" => 30,
         _ => 15,
     });
-    match tokio::time::timeout(budget, run_session_tool(&name, &args, gateway, caller)).await {
+    match tokio::time::timeout(
+        budget,
+        run_session_tool(&name, &args, gateway, caller, paths),
+    )
+    .await
+    {
         Ok(Ok(text)) => session_tool_response(id, text, false),
         Ok(Err(text)) => session_tool_response(id, text, true),
         Err(_) => session_tool_response(
@@ -1081,6 +1333,84 @@ async fn execute_session_tool(
     }
 }
 
+#[cfg(test)]
+async fn execute_session_tool(
+    req: &serde_json::Value,
+    gateway: Option<&GatewayHandle>,
+    caller: McpCaller,
+) -> serde_json::Value {
+    let paths = CcteamPaths {
+        root: std::path::PathBuf::new(),
+        projects_root: std::path::PathBuf::new(),
+    };
+    execute_session_tool_with_paths(req, gateway, caller, &paths).await
+}
+
+async fn authorize_user_session_tool(
+    name: &str,
+    args: &mut serde_json::Value,
+    gateway: &GatewayHandle,
+    paths: &CcteamPaths,
+    user_id: &str,
+) -> std::result::Result<(), String> {
+    match name {
+        "session_spawn" => {
+            let project = args
+                .get("project")
+                .and_then(|project| project.as_str())
+                .map(str::trim)
+                .filter(|project| !project.is_empty())
+                .ok_or_else(|| {
+                    "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
+                        .to_string()
+                })?;
+            if !user_can_see_project(paths, user_id, project) {
+                return Err("session_spawn: project not found".to_string());
+            }
+        }
+        "session_dispatch" | "session_collect" | "session_stop" => {
+            let sid = args
+                .get("sid")
+                .and_then(|sid| sid.as_str())
+                .filter(|sid| !sid.is_empty())
+                .ok_or_else(|| format!("{name}: missing required `sid`"))?;
+            let project = {
+                let gateway = gateway.lock().await;
+                gateway
+                    .session_resolve(sid)
+                    .map(|resolved| resolved.project)
+            };
+            if project
+                .as_deref()
+                .is_none_or(|project| !user_can_see_project(paths, user_id, project))
+            {
+                return Err(format!("{name}: session not found"));
+            }
+        }
+        "session_list" => {
+            let visible = visible_user_projects(paths, user_id);
+            if let Some(project) = args
+                .get("project")
+                .and_then(|project| project.as_str())
+                .map(str::trim)
+                .filter(|project| !project.is_empty())
+            {
+                if !visible.iter().any(|candidate| candidate == project) {
+                    return Err("session_list: project not found".to_string());
+                }
+            }
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    "_caller_visible_projects".to_string(),
+                    serde_json::json!(visible),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Dispatch a privileged `session_*` call to the gateway. Returns `Ok(body)`
 /// (a pretty JSON string) on success, `Err(msg)` on a tool-level error.
 async fn run_session_tool(
@@ -1088,12 +1418,13 @@ async fn run_session_tool(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
+    paths: &CcteamPaths,
 ) -> std::result::Result<String, String> {
     match name {
         "session_spawn" => run_session_spawn(args, gateway, caller).await,
         "session_dispatch" => run_session_dispatch(args, gateway, caller).await,
         "session_collect" => run_session_collect(args, gateway, caller).await,
-        "session_list" => run_session_list(args, gateway).await,
+        "session_list" => run_session_list_at(args, gateway, Some(paths)).await,
         "session_stop" => run_session_stop(args, gateway, caller).await,
         other => Err(format!("unknown session tool: {other}")),
     }
@@ -1128,7 +1459,7 @@ async fn run_session_spawn(
     // Project scope: Ambient = the caller's server-resolved slug (overwritten
     // in `execute_session_tool` from CallerCtx — never caller-supplied); Admin
     // = explicit `project` (fleet-wide).
-    let project = match caller {
+    let project = match &caller {
         McpCaller::Ambient => args
             .get("_caller_slug")
             .and_then(|v| v.as_str())
@@ -1145,6 +1476,16 @@ async fn run_session_spawn(
                 "session_spawn: missing `project` — pass the target project slug explicitly, \
                  or run from inside a registered project directory (cwd is resolved for local \
                  main-session callers)"
+                    .to_string()
+            })?,
+        McpCaller::User { .. } => args
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| {
+                "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
                     .to_string()
             })?,
     };
@@ -1232,10 +1573,13 @@ async fn run_session_spawn(
         .unwrap_or(0)
         .min(600);
     let notify = parse_notify_mode("session_spawn", args)?;
-    // Owner = the shared ops pool (`web-api`): MCP-spawned children stay visible
-    // to the owner's console + IM. Owner is NOT inherited from the caller — the
-    // parent link is a `meta.parent_sid` property (v0.9.0 W2), not an owner change.
-    let owner_id = "web-api".to_string();
+    // Admin/managed-session spawns retain the shared ops pool. A tenant web
+    // bearer uses the same bare web chat-id seed as REST session creation; the
+    // gateway canonicalizes it to the persisted owner `user:<tenant>`.
+    let owner_id = match &caller {
+        McpCaller::User { user_id } => user_id.clone(),
+        McpCaller::Ambient | McpCaller::Admin => "web-api".to_string(),
+    };
     // v0.9.0 W2 (F7) — optional idempotency key: a client retry with the same
     // key replays the original spawn (same sid) with zero side effects.
     let idem_key = args
@@ -1249,7 +1593,7 @@ async fn run_session_spawn(
     // from CallerCtx — never caller-supplied). Admin (HTTP front door) = a
     // human/root spawn (no parent, unrestricted). Guardrails apply only when a
     // real parent is present.
-    let parent = match caller {
+    let parent = match &caller {
         McpCaller::Ambient => {
             let caller_sid = args
                 .get("_caller_sid")
@@ -1273,7 +1617,7 @@ async fn run_session_spawn(
                 })
             }
         }
-        McpCaller::Admin => None,
+        McpCaller::Admin | McpCaller::User { .. } => None,
     };
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
@@ -1283,10 +1627,11 @@ async fn run_session_spawn(
     // ambient caller is the delegation parent. This is the diagnostic for the
     // "my agent's children lost their parent edge" class of misconfiguration
     // (e.g. the agent's calls silently riding an admin-authenticated server).
-    let caller_label = match (caller, parent.as_ref()) {
+    let caller_label = match (&caller, parent.as_ref()) {
         (McpCaller::Admin, _) => "admin".to_string(),
         (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
         (McpCaller::Ambient, None) => "ambient".to_string(),
+        (McpCaller::User { user_id }, _) => format!("user:{user_id}"),
     };
 
     // v0.10 T1 — availability discovery: before minting a sid, fail fast when
@@ -1542,7 +1887,7 @@ async fn run_session_dispatch(
         .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
         .to_string();
     // R-M3 — only operate sessions in the caller's own project.
-    assert_caller_owns_session("session_dispatch", args, gateway, &sid, caller).await?;
+    assert_caller_owns_session("session_dispatch", args, gateway, &sid, &caller).await?;
 
     let wait_seconds = args
         .get("wait_seconds")
@@ -1572,13 +1917,13 @@ async fn run_session_dispatch(
         .map(String::from);
     // The dispatcher's server-resolved principal (Ambient only; injected in
     // `execute_session_tool`). A delegation is armed only for an agent caller.
-    let caller_sid = match caller {
+    let caller_sid = match &caller {
         McpCaller::Ambient => args
             .get("_caller_sid")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        McpCaller::Admin => String::new(),
+        McpCaller::Admin | McpCaller::User { .. } => String::new(),
     };
     let caller_slug = args
         .get("_caller_slug")
@@ -2097,7 +2442,7 @@ async fn run_session_collect(
     let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
-    assert_caller_owns_session("session_collect", args, gateway, &sid, caller).await?;
+    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller).await?;
 
     // Resolve under the lock (sync), then DROP the guard before the fs read.
     let resolved = {
@@ -2211,10 +2556,28 @@ const SESSION_LIST_DEFAULT_LIMIT: usize = 30;
 /// caps at [`SESSION_LIST_DEFAULT_LIMIT`] most-recently-active rows by
 /// default (explicit `truncated`/`total` fields say when a cap bit), and
 /// omits null/empty row fields.
+#[cfg(test)]
 async fn run_session_list(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
 ) -> std::result::Result<String, String> {
+    run_session_list_at(args, gateway, None).await
+}
+
+async fn run_session_list_at(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    paths: Option<&CcteamPaths>,
+) -> std::result::Result<String, String> {
+    let caller_visible_projects: Option<std::collections::HashSet<String>> = args
+        .get("_caller_visible_projects")
+        .and_then(|projects| projects.as_array())
+        .map(|projects| {
+            projects
+                .iter()
+                .filter_map(|project| project.as_str().map(str::to_string))
+                .collect()
+        });
     let filter_project = args
         .get("project")
         .and_then(|v| v.as_str())
@@ -2247,9 +2610,15 @@ async fn run_session_list(
     // list): one progress read per DISTINCT project, not per session.
     let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
         std::collections::HashMap::new();
-    if let Ok(paths) = ccteam_core::CcteamPaths::from_env() {
-        if let Ok(projects) = ccteam_core::collect_projects(&paths) {
+    if let Some(paths) = paths {
+        if let Ok(projects) = ccteam_core::collect_projects(paths) {
             for p in projects {
+                if caller_visible_projects
+                    .as_ref()
+                    .is_some_and(|visible| !visible.contains(&p.state.slug))
+                {
+                    continue;
+                }
                 if views.iter().any(|v| v.project == p.state.slug) {
                     let events = ccteam_core::progress::read_all_events(
                         &paths.progress_jsonl(&p.state.slug),
@@ -2275,6 +2644,12 @@ async fn run_session_list(
             (v, activity)
         })
         .filter(|(v, activity)| {
+            if caller_visible_projects
+                .as_ref()
+                .is_some_and(|visible| !visible.contains(&v.project))
+            {
+                return false;
+            }
             if let Some(p) = filter_project.as_deref() {
                 if v.project != p {
                     return false;
@@ -2404,17 +2779,17 @@ async fn run_session_stop(
     let sid = arg_session_sid(args)?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
-    assert_caller_owns_session("session_stop", args, gateway, &sid, caller).await?;
+    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller).await?;
     // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
     // descendants (walk the target's parent chain; it must reach the caller).
     // Admin/human callers are unrestricted (fleet-wide).
-    let caller_sid = match caller {
+    let caller_sid = match &caller {
         McpCaller::Ambient => args
             .get("_caller_sid")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        McpCaller::Admin => String::new(),
+        McpCaller::Admin | McpCaller::User { .. } => String::new(),
     };
     let mut gw = gateway.lock().await;
     if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
@@ -2477,32 +2852,50 @@ async fn assert_caller_owns_session(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     sid: &str,
-    caller: McpCaller,
+    caller: &McpCaller,
 ) -> std::result::Result<(), String> {
     // v0.9 T4 review fix — the HTTP front door's verified admin operates
     // fleet-wide (same semantics as the web admin Identity): no ambient slug
     // to bind to. Unknown sids still fail inside the op itself.
-    if caller == McpCaller::Admin {
-        return Ok(());
-    }
-    let caller_slug = args
-        .get("_caller_slug")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{name}: no project scope (ambient slug unset)"))?
-        .to_string();
     let resolved = {
         let gw = gateway.lock().await;
         gw.session_resolve(sid)
     };
-    let resolved = resolved.ok_or_else(|| format!("{name}: unknown session: {sid}"))?;
-    if resolved.project != caller_slug {
-        return Err(format!(
-            "{name}: permission denied — session {sid} runs in project `{}`, but the caller is bound to project `{caller_slug}`",
-            resolved.project
-        ));
+    match caller {
+        McpCaller::Admin => Ok(()),
+        McpCaller::User { user_id } => {
+            let Some(resolved) = resolved else {
+                return Err(format!("{name}: session not found"));
+            };
+            let state_path = CcteamPaths::project_state_in(&resolved.project_dir);
+            let allowed = ccteam_core::ProjectState::load(&state_path)
+                .map(|state| {
+                    ccteam_core::identity::can_see_owner(user_id, false, state.owner.as_deref())
+                })
+                .unwrap_or(false);
+            if allowed {
+                Ok(())
+            } else {
+                Err(format!("{name}: session not found"))
+            }
+        }
+        McpCaller::Ambient => {
+            let caller_slug = args
+                .get("_caller_slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{name}: no project scope (ambient slug unset)"))?
+                .to_string();
+            let resolved = resolved.ok_or_else(|| format!("{name}: unknown session: {sid}"))?;
+            if resolved.project != caller_slug {
+                return Err(format!(
+                    "{name}: permission denied — session {sid} runs in project `{}`, but the caller is bound to project `{caller_slug}`",
+                    resolved.project
+                ));
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Parse the optional `vendor` arg (default `claude`), lowercasing first so a
@@ -2641,6 +3034,48 @@ mod chat_send_file_tests {
         });
         let err = build_send_file_event(&args, 0, None).unwrap_err();
         assert!(err.contains("too large"), "got: {err}");
+    }
+
+    #[test]
+    fn tenant_delivery_uses_own_linked_im_and_never_client_addressing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let mut tenants = ccteam_core::tenants::TenantRegistry::default();
+        let alice = tenants.add("alice");
+        tenants.link_chat(&alice.id, "telegram:chat-42");
+        tenants.set_telegram(
+            &alice.id,
+            Some(ccteam_core::tenants::TenantTelegram {
+                bot_token: "123:test".into(),
+                allowed_chat_ids: Vec::new(),
+            }),
+        );
+        tenants.save(&paths.users_dir()).unwrap();
+
+        assert_eq!(
+            user_delivery_target(&paths, &alice.id).unwrap(),
+            (format!("telegram@{}", alice.id), "chat-42".to_string())
+        );
+        assert!(user_delivery_target(&paths, "ubob")
+            .unwrap_err()
+            .contains("no longer registered"));
+    }
+
+    #[test]
+    fn tenant_delivery_without_link_or_bot_recipient_is_readable_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let mut tenants = ccteam_core::tenants::TenantRegistry::default();
+        let alice = tenants.add("alice");
+        tenants.save(&paths.users_dir()).unwrap();
+        let error = user_delivery_target(&paths, &alice.id).unwrap_err();
+        assert!(error.contains("no linked IM destination"), "{error}");
     }
 }
 
@@ -2955,6 +3390,103 @@ mod session_tool_tests {
         )
     }
 
+    fn seed_owned_project(paths: &CcteamPaths, slug: &str, owner: &str) -> std::path::PathBuf {
+        let dir = paths.projects_root.join(slug);
+        std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+        let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+        state.owner = Some(owner.to_string());
+        state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+        ccteam_core::config::upsert_project(
+            &paths.root,
+            ccteam_core::ProjectEntry {
+                slug: slug.to_string(),
+                path: dir.clone(),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Tenant-scope fixture with Alice/Bob/admin projects and one live root in
+    /// each. Every path is inside the caller's tempdir; no environment lookup or
+    /// project bootstrap is involved.
+    async fn gateway_with_tenant_projects(
+        tmp: &std::path::Path,
+    ) -> (CcteamPaths, GatewayHandle, String, String, String) {
+        let paths = CcteamPaths {
+            root: tmp.join("home"),
+            projects_root: tmp.join("projects"),
+        };
+        let alice_dir = seed_owned_project(&paths, "alice", "user:ualice");
+        let bob_dir = seed_owned_project(&paths, "bob", "user:ubob");
+        let admin_dir = seed_owned_project(&paths, "admin", "user:web-api");
+
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter::default())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alice", alice_dir);
+        gateway.register_project("bob", bob_dir);
+        gateway.register_project("admin", admin_dir);
+
+        let alice_sid = gateway
+            .create_session_api_proto(
+                "alice".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                ccteam_harness::SessionProtocol::StreamJson,
+                "ualice".into(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        let bob_sid = gateway
+            .create_session_api_proto(
+                "bob".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                ccteam_harness::SessionProtocol::StreamJson,
+                "ubob".into(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        let admin_sid = gateway
+            .create_session_api_proto(
+                "admin".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+                ccteam_harness::SessionProtocol::StreamJson,
+                "web-api".into(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        (
+            paths,
+            std::sync::Arc::new(tokio::sync::Mutex::new(gateway)),
+            alice_sid,
+            bob_sid,
+            admin_sid,
+        )
+    }
+
     /// v0.9.0 W1 (F1) — end-to-end: a caller presenting the WRONG secret for a
     /// real sid is rejected by `execute_session_tool` (the `(sid, secret)`
     /// principal is the authoritative check; a forged role arg is irrelevant).
@@ -3167,6 +3699,191 @@ mod session_tool_tests {
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"sessions\""), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn user_spawn_is_root_owned_by_tenant_and_spoofed_caller_fields_are_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let req = call(
+            "session_spawn",
+            json!({
+                "project": "alice",
+                "vendor": "claude",
+                "_caller_sid": "s999",
+                "_caller_slug": "bob",
+                "_caller_role": "forged",
+                "_caller_depth": 99,
+            }),
+        );
+        let response = execute_session_tool_with_paths(
+            &req,
+            Some(&gateway),
+            McpCaller::User {
+                user_id: "ualice".into(),
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(body["project"], "alice");
+        assert!(
+            body["parent_sid"].is_null(),
+            "tenant spawn is a root: {body}"
+        );
+        assert_eq!(body["delegation_depth"], 0);
+        assert_eq!(body["caller"], "user:ualice");
+
+        let sid = body["sid"].as_str().unwrap();
+        let meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            sid,
+        )
+        .unwrap();
+        assert_eq!(meta.owner, "user:ualice");
+        assert!(meta.parent_sid.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_spawn_requires_own_explicit_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let caller = McpCaller::User {
+            user_id: "ualice".into(),
+        };
+
+        let missing = execute_session_tool_with_paths(
+            &call("session_spawn", json!({"vendor": "claude"})),
+            Some(&gateway),
+            caller.clone(),
+            &paths,
+        )
+        .await;
+        assert_eq!(missing["result"]["isError"], true);
+        assert!(missing["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing `project`"));
+
+        for project in ["bob", "admin", "unknown"] {
+            let denied = execute_session_tool_with_paths(
+                &call("session_spawn", json!({"project": project})),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(denied["result"]["isError"], true, "{project}: {denied}");
+            assert_eq!(
+                denied["result"]["content"][0]["text"],
+                "session_spawn: project not found"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_foreign_and_unknown_sid_errors_are_identical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let caller = McpCaller::User {
+            user_id: "ualice".into(),
+        };
+
+        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+            let invoke = |sid: &str| {
+                let mut args = json!({"sid": sid});
+                if tool == "session_dispatch" {
+                    args["task"] = json!("do not leak");
+                }
+                call(tool, args)
+            };
+            let foreign = execute_session_tool_with_paths(
+                &invoke(&bob_sid),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            let unknown = execute_session_tool_with_paths(
+                &invoke("s999999"),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(foreign["result"]["isError"], true, "{tool}: {foreign}");
+            assert_eq!(unknown["result"]["isError"], true, "{tool}: {unknown}");
+            assert_eq!(
+                foreign["result"]["content"][0]["text"], unknown["result"]["content"][0]["text"],
+                "{tool}: forbidden and unknown sids must be indistinguishable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_session_list_filters_to_owned_projects_and_overwrites_spoofed_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, bob_sid, admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_list",
+                json!({"_caller_visible_projects": ["alice", "bob", "admin"]}),
+            ),
+            Some(&gateway),
+            McpCaller::User {
+                user_id: "ualice".into(),
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let sids: Vec<&str> = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|session| session["sid"].as_str())
+            .collect();
+        assert!(sids.contains(&alice_sid.as_str()), "{body}");
+        assert!(!sids.contains(&bob_sid.as_str()), "{body}");
+        assert!(!sids.contains(&admin_sid.as_str()), "{body}");
+        assert_eq!(body["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn user_screenshot_rejects_foreign_project_before_protocol_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let dispatch = McpDispatch {
+            paths,
+            sink: None,
+            pending: None,
+            gateway: Some(gateway),
+        };
+        let response = dispatch
+            .dispatch_as(
+                call("screenshot", json!({"slug": "bob"})),
+                McpCaller::User {
+                    user_id: "ualice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "screenshot: project not found"
+        );
     }
 
     /// v0.9 T4 review fix — the internal-bus methods are refused on the admin
