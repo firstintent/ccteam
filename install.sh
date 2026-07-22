@@ -11,13 +11,17 @@
 #   * No sudo. Writes to $HOME/.local/bin by default.
 #   * Override target dir: CCTEAM_INSTALL_DIR=/usr/local/bin sh install.sh
 #   * Override tag (CI / pin): CCTEAM_VERSION=<tag> sh install.sh
-#   * Post-install daemon launch: interactive prompt (reads /dev/tty) to
-#     install a supervised service (systemd --user on Linux, launchd on
-#     macOS), start in the background, or skip. Non-interactive default =
-#     skip. Force a choice with
-#     CCTEAM_POST_INSTALL=systemd|launchd|start|none sh install.sh
-#   * Uninstall (stops + removes the service and the binary; keeps ~/.ccteam):
-#     curl -sSL .../install.sh | sh -s -- --uninstall
+#   * Post-install daemon launch (v0.9.7): ccteam self-manages the daemon
+#     via `ccteam daemon start` (Codex-style setsid pid-detach) — systemd /
+#     launchd are retired. On an UPGRADE from a pre-0.9.7 box that was
+#     systemd/launchd-managed, we invoke `ccteam daemon start`, whose
+#     built-in one-time takeover disables + removes the installer-written
+#     unit and restores the service under pid-detach. On a FRESH install we
+#     only print the next step (装包 ≠ 启服) unless asked to start.
+#     Force behaviour: CCTEAM_POST_INSTALL=start|none sh install.sh
+#     (none = detect + print only, never launch).
+#   * Uninstall (stops the daemon, removes any legacy unit + the binary;
+#     keeps ~/.ccteam):  curl -sSL .../install.sh | sh -s -- --uninstall
 #   * Windows is not supported — run ccteam under WSL2 and use the
 #     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
 #
@@ -157,27 +161,37 @@ resolve_tag() {
     info "Latest release (via API fallback): $TAG"
 }
 
-# ---- post-install: launch the daemon (systemd / launchd / nohup), then show
-#      the restart command + web console URL (for Telegram / Feishu setup) ----
+# ---- post-install (v0.9.7): ccteam self-manages the daemon via
+#      `ccteam daemon start` (setsid pid-detach). systemd / launchd are
+#      retired: no unit generation here. On an upgrade from a legacy-managed
+#      box we launch `ccteam daemon start`, whose one-time takeover migrates
+#      the old unit and restores the service; a fresh install only prints the
+#      next step unless explicitly asked to start. ----
 
 daemon_running() {
     command -v pgrep >/dev/null 2>&1 && pgrep -f "ccteam start" >/dev/null 2>&1
 }
 
-have_systemd_user() {
-    [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1
+# True if this box carries a pre-0.9.7 installer-written service unit
+# (systemd --user or launchd). Detection only — the actual disable+remove
+# lives in `ccteam daemon start`'s Rust takeover (single implementation).
+legacy_service_present() {
+    _unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ccteam.service"
+    _plist="$HOME/Library/LaunchAgents/com.firstintent.ccteam.plist"
+    [ -f "$_unit" ] || [ -f "$_plist" ]
 }
 
-have_launchd() {
-    [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1
-}
-
-# Poll the daemon for its web URL (up to ~20s), then print the restart
-# command and the link. $1 = ccteam binary path, $2 = restart command.
-show_result() {
+# Bring the daemon up via the self-managed launcher, then poll `ccteam
+# status` for the web URL (up to ~20s) and print it. $1 = binary path.
+start_daemon() {
     _bin="$1"
-    _restart="$2"
-    info "Waiting for the daemon to come up..."
+    info "Starting the ccteam daemon (self-managed; log: ~/.ccteam/daemon.log)..."
+    # `daemon start` runs the legacy-unit takeover, detaches (setsid), and
+    # blocks until the daemon is ready — so status below sees a live socket.
+    "$_bin" daemon start || {
+        warn "\`ccteam daemon start\` did not report success; check: ccteam daemon status"
+        return 0
+    }
     _i=0
     _url=""
     while [ "$_i" -lt 20 ]; do
@@ -187,9 +201,9 @@ show_result() {
         sleep 1
         _i=$((_i + 1))
     done
-
     printf '\n%s==>%s %sccteam is up.%s\n\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
-    printf '    Restart it with:\n      %s\n\n' "$_restart"
+    printf '    Restart it with:  ccteam daemon restart\n'
+    printf '    Stop it with:     ccteam daemon stop\n\n'
     if [ -n "$_url" ]; then
         printf '    Open the web console to configure Telegram / Feishu and add projects:\n\n'
         printf '      %s\n\n' "$_url"
@@ -198,199 +212,77 @@ show_result() {
     fi
 }
 
-start_nohup() {
-    _bin="$1"
-    mkdir -p "$HOME/.ccteam" 2>/dev/null || true
-    info "Starting the daemon in the background (nohup; log: ~/.ccteam/daemon.log)..."
-    nohup "$_bin" start >"$HOME/.ccteam/daemon.log" 2>&1 </dev/null &
-    show_result "$_bin" "ccteam stop && nohup ccteam start >~/.ccteam/daemon.log 2>&1 &"
-}
-
-start_systemd() {
-    _bin="$1"
-    _unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-    _unit="$_unit_dir/ccteam.service"
-    mkdir -p "$_unit_dir"
-    info "Installing systemd --user service: $_unit"
-    cat > "$_unit" <<EOF
-[Unit]
-Description=ccteam daemon (IM gateway + web console + MCP)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$_bin start
-Environment=PATH=$PATH
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-    # Survive logout / start on boot (best-effort; harmless if not permitted).
-    loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
-    if systemctl --user daemon-reload >/dev/null 2>&1 \
-        && systemctl --user enable --now ccteam.service >/dev/null 2>&1; then
-        show_result "$_bin" "systemctl --user restart ccteam"
-    else
-        warn "Could not start the systemd --user service (no active user session / D-Bus?)."
-        printf '    Retry in a login session:  systemctl --user enable --now ccteam\n'
-        printf '    Or use nohup instead:      nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n'
-    fi
-}
-
-start_launchd() {
-    _bin="$1"
-    _label="com.firstintent.ccteam"
-    _plist_dir="$HOME/Library/LaunchAgents"
-    _plist="$_plist_dir/$_label.plist"
-    _log="$HOME/.ccteam/daemon.log"
-    mkdir -p "$_plist_dir" "$HOME/.ccteam"
-    info "Installing launchd agent: $_plist"
-    cat > "$_plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>$_label</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$_bin</string>
-        <string>start</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>$PATH</string></dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ProcessType</key><string>Background</string>
-    <key>StandardOutPath</key><string>$_log</string>
-    <key>StandardErrorPath</key><string>$_log</string>
-</dict>
-</plist>
-EOF
-    # Idempotent + race-free load. `bootout` is asynchronous, so a bootstrap
-    # fired immediately after can hit a transient "already loaded" / I/O error;
-    # settle first, then enable (clear any disabled flag), bootstrap, and
-    # kickstart. Verify success by the agent's actual STATE (launchctl print),
-    # not by bootstrap's exit code — on a fresh GUI session bootstrap can report
-    # a benign error while the agent still comes up. Surface launchctl's real
-    # message on genuine failure instead of guessing at the cause.
-    _dom="gui/$(id -u)"
-    _svc="$_dom/$_label"
-    launchctl bootout "$_svc" >/dev/null 2>&1 || true
-    sleep 1
-    launchctl enable "$_svc" >/dev/null 2>&1 || true
-    _err="$(launchctl bootstrap "$_dom" "$_plist" 2>&1)" || true
-    launchctl kickstart "$_svc" >/dev/null 2>&1 || true
-    if launchctl print "$_svc" >/dev/null 2>&1; then
-        show_result "$_bin" "launchctl kickstart -k $_svc"
-    else
-        warn "Could not load the launchd agent. launchctl reported:"
-        if [ -n "$_err" ]; then printf '      %s\n' "$_err" >&2; fi
-        printf '    The binary is installed. Load it manually (from a GUI login session):\n' >&2
-        printf '      launchctl bootstrap %s %s\n' "$_dom" "$_plist" >&2
-        printf '    Or run it in the background:  nohup ccteam start >~/.ccteam/daemon.log 2>&1 &\n' >&2
-    fi
+# Print the fresh-install next step without launching (装包 ≠ 启服).
+print_start_hint() {
+    info "Installed. Start the daemon when ready:"
+    printf '      ccteam daemon start        # background (setsid); prints the web URL\n'
+    printf '      ccteam daemon status       # health, pid, version\n'
+    printf '      ccteam daemon logs -f      # follow ~/.ccteam/daemon.log\n'
 }
 
 post_install() {
     _bin="$1"
+    _action="${CCTEAM_POST_INSTALL:-}"
 
-    if daemon_running; then
-        info "A ccteam daemon is already running."
-        show_result "$_bin" "ccteam stop && ccteam start"
+    # `none` → detect + print only, never launch.
+    if [ "$_action" = "none" ] || [ "$_action" = "skip" ]; then
+        if legacy_service_present; then
+            warn "A legacy systemd/launchd ccteam unit is present. systemd/launchd management"
+            warn "is retired — migrate on your next start:  ccteam daemon start  (auto-takeover)."
+        fi
+        print_start_hint
         return 0
     fi
 
-    # Resolve launch method: env override, else interactive prompt, else skip.
-    _action="${CCTEAM_POST_INSTALL:-}"
-    if [ -z "$_action" ]; then
-        if [ -r /dev/tty ]; then
-            if have_systemd_user; then
-                printf '\n%s==>%s Start the ccteam daemon now?\n' "$BOLD" "$RESET"
-                printf '      [1] systemd --user service — auto-start on boot + auto-restart  (recommended)\n'
-                printf '      [2] nohup — background process for this session\n'
-                printf '      Choice [1]: '
-                read -r _reply </dev/tty || _reply=""
-                case "$_reply" in
-                    2) _action="nohup" ;;
-                    *) _action="systemd" ;;
-                esac
-            elif have_launchd; then
-                printf '\n%s==>%s Start the ccteam daemon now?\n' "$BOLD" "$RESET"
-                printf '      [1] launchd agent — auto-start at login + auto-restart  (recommended)\n'
-                printf '      [2] nohup — background process for this session\n'
-                printf '      Choice [1]: '
-                read -r _reply </dev/tty || _reply=""
-                case "$_reply" in
-                    2) _action="nohup" ;;
-                    *) _action="launchd" ;;
-                esac
-            else
-                printf '\n%s==>%s Start the ccteam daemon in the background now? [Y/n] ' "$BOLD" "$RESET"
-                read -r _reply </dev/tty || _reply=""
-                case "$_reply" in
-                    [Nn]*) _action="none" ;;
-                    *)     _action="nohup" ;;
-                esac
-            fi
-        else
-            _action="none"   # non-interactive (CI / piped, no tty): don't auto-start
+    # Upgrade path: a legacy unit or an already-running daemon means the
+    # service was live before this reinstall → `daemon start` takes over the
+    # unit and restores the service (restoring prior state ≠ 装包=启服).
+    if [ "$_action" = "start" ] || [ "$_action" = "nohup" ] || [ "$_action" = "background" ] \
+        || [ "$_action" = "bg" ] || legacy_service_present || daemon_running; then
+        if legacy_service_present; then
+            info "Detected a legacy systemd/launchd unit — migrating to self-managed daemon."
         fi
+        start_daemon "$_bin"
+        return 0
     fi
 
-    case "$_action" in
-        systemd)
-            if have_systemd_user; then
-                start_systemd "$_bin"
-            else
-                warn "systemd --user unavailable here; starting with nohup instead."
-                start_nohup "$_bin"
-            fi
-            ;;
-        launchd)
-            if have_launchd; then
-                start_launchd "$_bin"
-            else
-                warn "launchd unavailable here; starting with nohup instead."
-                start_nohup "$_bin"
-            fi
-            ;;
-        nohup|start|background|bg)
-            start_nohup "$_bin"
-            ;;
-        none|skip)
-            info "Skipped. Start it yourself when ready:"
-            printf '      ccteam start                                       # foreground\n'
-            printf '      nohup ccteam start >~/.ccteam/daemon.log 2>&1 &    # background\n'
-            ;;
-        *)
-            warn "unknown CCTEAM_POST_INSTALL='$_action'; skipping auto-start. Run: ccteam start"
-            ;;
-    esac
+    # Fresh install, no explicit request: offer to start (interactive) or
+    # just print the hint (non-interactive / CI).
+    if [ -r /dev/tty ]; then
+        printf '\n%s==>%s Start the ccteam daemon now? [Y/n] ' "$BOLD" "$RESET"
+        read -r _reply </dev/tty || _reply=""
+        case "$_reply" in
+            [Nn]*) print_start_hint ;;
+            *)     start_daemon "$_bin" ;;
+        esac
+    else
+        print_start_hint
+    fi
 }
 
-# ---- uninstall: stop + remove the service (systemd / launchd) and the
+# ---- uninstall: stop the daemon, remove any legacy service unit + the
 #      binary. State (~/.ccteam) is kept — remove it manually for a purge. ----
 do_uninstall() {
     _unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ccteam.service"
     _label="com.firstintent.ccteam"
     _plist="$HOME/Library/LaunchAgents/$_label.plist"
+    if [ -x "$INSTALL_DIR/ccteam" ]; then
+        # Graceful stop of a self-managed (pid-detach) daemon.
+        "$INSTALL_DIR/ccteam" daemon stop >/dev/null 2>&1 || true
+    fi
+    # Sweep any pre-0.9.7 service unit left behind (retired mechanism).
     if [ -f "$_unit" ]; then
         systemctl --user disable --now ccteam.service >/dev/null 2>&1 || true
         systemctl --user daemon-reload >/dev/null 2>&1 || true
         rm -f "$_unit"
-        info "Removed service: $_unit"
+        info "Removed legacy service unit: $_unit"
     fi
     if [ -f "$_plist" ]; then
         launchctl bootout "gui/$(id -u)/$_label" >/dev/null 2>&1 || true
         rm -f "$_plist"
-        info "Removed service: $_plist"
+        info "Removed legacy launchd agent: $_plist"
     fi
     if [ -x "$INSTALL_DIR/ccteam" ]; then
-        # Graceful stop for a nohup-started daemon (service paths already stopped).
-        "$INSTALL_DIR/ccteam" stop >/dev/null 2>&1 || true
         rm -f "$INSTALL_DIR/ccteam"
         info "Removed binary: $INSTALL_DIR/ccteam"
     else
@@ -481,12 +373,13 @@ main() {
     mkdir -p "$INSTALL_DIR"
 
     # Warn if the daemon is currently running — the new binary won't be
-    # picked up until `ccteam stop && ccteam start` cycles the supervisor.
+    # picked up until the supervisor is cycled onto it. `post_install` below
+    # does exactly that (`ccteam daemon start`/`restart`) when it detects a
+    # running or legacy-managed daemon; this is just an early heads-up.
     # `pgrep -f "ccteam start"` matches the argv (not just the comm name),
     # so it won't false-positive on the installer's own shell children.
     if command -v pgrep >/dev/null 2>&1 && pgrep -f "ccteam start" >/dev/null 2>&1; then
-        warn "ccteam daemon is running. Restart after install:"
-        printf '      ccteam stop && ccteam start\n\n'
+        warn "ccteam daemon is running; it will be restarted onto the new binary below."
     fi
 
     mv "$_extracted" "$INSTALL_DIR/ccteam"
