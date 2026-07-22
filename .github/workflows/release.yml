@@ -235,9 +235,17 @@ jobs:
           set -eu
           TAG="${GITHUB_REF_NAME}"
           cd dist
+          # A pre-release-shaped tag (contains a hyphen, e.g. v0.9.7-rc1) is
+          # published as a GitHub pre-release: it is EXCLUDED from
+          # /releases/latest, so install.sh and `ccteam update` (both read
+          # /latest) never serve it to users — it is installable only via an
+          # explicit CCTEAM_VERSION=<tag> pin, for hand-testing before the
+          # final tag. A plain vX.Y.Z tag stays the "latest" release.
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
           # Only ship the user-facing archives + the aggregated SHA256SUMS;
           # the per-asset .sha256 files are intermediate.
-          gh release create "${TAG}" \
+          gh release create "${TAG}" ${PRERELEASE} \
             --repo "${GITHUB_REPOSITORY}" \
             --title "ccteam ${TAG}" \
             --notes-file ../release-notes.md \
