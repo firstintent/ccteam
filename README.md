@@ -121,7 +121,7 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 - **Settings → IM** — paste a Telegram/Lark bot token (chat id captured automatically)
 - **Marketplace** — install personas and skills, checksum-verified
 
-> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN, or use `ccteam start --web-bind 127.0.0.1:7331`.
+> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. To bind a specific host/port (e.g. loopback only), pass `--web-bind` when you start it: `ccteam daemon start --web-bind 127.0.0.1:7331`.
 
 ## Chaining sessions
 
