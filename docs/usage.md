@@ -44,7 +44,7 @@ git clone https://github.com/firstintent/ccteam && cd ccteam
 make install
 ```
 
-**3 · One-click script** — prebuilt binary, no toolchain required (also offers systemd setup):
+**3 · One-click script** — prebuilt binary, no toolchain required:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
@@ -63,9 +63,22 @@ kimi --version     # optional; only needed for Kimi Code sessions (`kimi login` 
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
 
-### 2. The Service
+### 2. The Daemon
 
-`make install` already started the service: one resident process (web console + IM gateway + standard resource API + MCP socket) supervised by systemd `--user` on Linux or a launchd agent on macOS — it starts at boot/login, restarts on crash, and survives logout. Manage it with `make daemon-status` / `daemon-logs` / `daemon-restart` / `daemon-stop` on either platform (macOS logs go to `~/.ccteam/daemon.log`). Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both remove the service and binary but keep `~/.ccteam`. Without any supervisor, run `ccteam start` in the foreground.
+`make install` (and the one-click script, when it detects an upgrade) already started the daemon with **`ccteam daemon start`**: one resident process (web console + IM gateway + standard resource API + MCP socket), detached with `setsid` so it survives your shell closing and SSH disconnects. This is the single supervision mechanism on Linux, macOS, and WSL — **there is no systemd or launchd unit anymore** (retired in v0.9.7). Manage it the same way on every platform:
+
+```bash
+ccteam daemon status     # pid · ready · running-vs-binary version   (add --json for scripts)
+ccteam daemon logs -f    # follow ~/.ccteam/daemon.log
+ccteam daemon restart    # graceful SIGTERM stop + re-detach (also `make daemon-restart`)
+ccteam daemon stop       # graceful stop; sessions resume by id on the next start
+```
+
+Honest tradeoff: with no OS supervisor there is **no crash-restart and no auto-start at boot** — after a reboot, run `ccteam daemon start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam daemon start` cron line covers boot-start if you want it). Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both stop the daemon and remove the binary but keep `~/.ccteam`.
+
+**Upgrading from a pre-v0.9.7 install (systemd/launchd):** just re-run the installer or `ccteam daemon start` once — its one-time takeover disables and removes the old ccteam service unit and brings the daemon back up self-managed. A unit you wrote by hand is left untouched (ccteam reports that instance as "not managed" and won't stop it — use your own supervisor). See [Updating](#updating) for the ongoing path.
+
+Without detaching at all (dev / containers / your own supervisor's `ExecStart`), `ccteam start` still runs in the foreground.
 
 `make install`, and `ccteam status` at any time, print the web console URL, for example:
 
@@ -264,11 +277,17 @@ ccteam init --slug demo        # Override inferred slug.
 ccteam init --owner user:u123  # Multi-user: assign project ownership.
 ccteam config                  # One-time setup: MCP, IM bot, preferences.
 ccteam config mcp              # Register/refresh ccteam MCP for all five vendors; useful without TTY.
-ccteam start                   # Start resident service; add & for background.
+ccteam daemon start            # Start the daemon in the background (setsid; idempotent).
+ccteam daemon stop [--force]   # Graceful stop; --force escalates to SIGKILL (daemon only).
+ccteam daemon restart          # Graceful stop + re-detach under one lock.
+ccteam daemon status [--json]  # pid · ready · running-vs-binary version.
+ccteam daemon logs [-f] [-n N] # Tail/follow ~/.ccteam/daemon.log.
+ccteam start                   # Run in the FOREGROUND (dev / containers / your own supervisor).
 ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token.
 ccteam start --no-web | --no-imd         # Gateway only / web only.
-ccteam stop                    # Gracefully stop daemon.
-ccteam status                  # Daemon heartbeat, projects, sessions, web link.
+ccteam stop                    # Alias for `ccteam daemon stop`.
+ccteam update [--now] [--no-restart] [--json]   # Update in place, then restart onto the new binary.
+ccteam status                  # Daemon heartbeat, projects, sessions, web link, version/update hint.
 ccteam doctor                  # Install/dependency checks; --verify-mcp checks MCP surface.
 ```
 
@@ -320,8 +339,20 @@ ccteam doctor --check-cost-orphan  # Cost ledger reconciliation.
 Restart daemon only; sessions reconnect by id afterward:
 
 ```bash
-systemctl --user restart ccteam    # or: make daemon-restart (rebuilds first)
+ccteam daemon restart              # or: make daemon-restart (rebuilds release first)
 ```
+
+### Updating
+
+```bash
+ccteam update                      # Update in place, then restart the daemon onto the new binary.
+ccteam update --no-restart         # Swap the binary only; apply later with `ccteam daemon restart`.
+ccteam update --now                # Skip the drain wait and restart immediately.
+```
+
+`ccteam update` detects how ccteam was installed and re-runs that install path — for the one-click / prebuilt install it replays `install.sh` (same download + SHA-256 verify + atomic swap; no second downloader). A from-source checkout is never recompiled for you: it prints `git pull && make install`. After the binary is swapped, if a managed daemon is running, `update` waits for in-flight turns to go idle (up to 5 minutes; `--now` skips the wait), gracefully restarts the daemon onto the new binary, and verifies the running version matches.
+
+What a daemon restart does to live sessions is the existing resume-by-id contract, stated plainly: `terminal`/tmux sessions keep running (separate process tree); a default `stream-json`/ACP session's child process ends with the daemon, its in-flight turn reports `stream_closed_in_flight`, and the session resumes its context by id on the next message. `ccteam status` and `ccteam doctor` show the install channel, the running-vs-binary version, and whether a newer release is available (a lazy check, at most once every ~20h; toggle with `check_for_update` in `preferences.toml`). **Satellites update themselves** — run `ccteam update` on each; the console's Hosts view and `ccteam status` flag any host whose version lags the daemon.
 
 State file quick reference. `~/.ccteam` is grouped by responsibility: `secrets/` for credentials, `state/` for daemon-written state, `cache/` for disposable cache, and `run/` for sockets.
 

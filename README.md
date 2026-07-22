@@ -72,7 +72,7 @@ git clone https://github.com/firstintent/ccteam && cd ccteam && make install   #
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
-One static binary into `~/.local/bin`, no sudo; the daemon starts and prints your web console link (`http://<lan-ip>:7331/?token=…`). `ccteam config` registers the MCP tools into the vendor CLIs you have — Claude Code, Codex, Grok, OpenCode, Kimi — so even your everyday, hand-started sessions can hire the team.
+One static binary into `~/.local/bin`, no sudo; `ccteam daemon start` launches the daemon (self-managed with `setsid` — one mechanism on Linux, macOS, and WSL, no systemd or launchd to wire up) and prints your web console link (`http://<lan-ip>:7331/?token=…`). `ccteam config` registers the MCP tools into the vendor CLIs you have — Claude Code, Codex, Grok, OpenCode, Kimi — so even your everyday, hand-started sessions can hire the team. Later, `ccteam update` swaps the binary in place and restarts onto it.
 
 **Configure in the browser**
 
