@@ -538,6 +538,13 @@ where
     }
     inbound_consumer.abort();
     gateway_event_consumer.abort();
+    // Per-session event pumps are gateway-owned tasks. `Drop for Gateway`
+    // aborts them, but an `Arc` clone held elsewhere (restore/notifier tasks,
+    // web AppState, MCP server) can outlive this future, so the Drop may never
+    // run — leaving the pumps detached and still polling their adapters. Abort
+    // them explicitly here, for the same reason the listeners/consumers above
+    // are aborted.
+    gateway.lock().await.abort_event_pumps();
     result
 }
 

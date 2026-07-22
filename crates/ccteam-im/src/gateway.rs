@@ -7887,11 +7887,29 @@ pub fn tracked_chat_sessions(ccteam_root: &Path) -> Result<Vec<TrackedSessionRow
         .collect())
 }
 
-impl Drop for Gateway {
-    fn drop(&mut self) {
+impl Gateway {
+    /// Abort every per-session event pump.
+    ///
+    /// [`Drop`] calls this too, but relying on Drop alone is fragile: the
+    /// gateway lives behind an `Arc<Mutex<Gateway>>` whose clones (the restore
+    /// / notifier tasks, the web `AppState`, the MCP socket server) can outlive
+    /// the daemon future, so the Drop may never run at shutdown. The pumps are
+    /// then merely *detached* — a dropped `JoinHandle` does NOT cancel its task
+    /// — and keep polling their adapters forever. Harmless when the process
+    /// exits, but a real leak in-process: a second daemon started in the same
+    /// process races the stale pumps for the same session's events, and
+    /// whichever pops first wins. So the daemon shutdown path calls this
+    /// explicitly, alongside the listener/consumer aborts.
+    pub fn abort_event_pumps(&mut self) {
         for (_, handle) in std::mem::take(&mut self.event_pumps) {
             handle.abort();
         }
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        self.abort_event_pumps();
     }
 }
 
