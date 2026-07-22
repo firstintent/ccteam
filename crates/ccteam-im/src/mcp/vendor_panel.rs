@@ -62,6 +62,9 @@ pub(crate) fn resolve_status_project(
                 .or_else(|| caller_slug_arg.map(str::trim).filter(|s| !s.is_empty()));
             Ok(pick.map(str::to_string))
         }
+        McpCaller::User { .. } => {
+            Err("status: tenant project scope must be resolved by the dispatch ACL".to_string())
+        }
     }
 }
 

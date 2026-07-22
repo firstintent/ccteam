@@ -183,11 +183,7 @@ impl Identity {
     /// channel — see the gateway's `canonical_owner`): the admin uses the shared
     /// `user:web-api` pool; a per-user tenant owns `user:<id>`.
     pub fn owner_tag(&self) -> String {
-        if self.is_admin {
-            "user:web-api".to_string()
-        } else {
-            format!("user:{}", self.id)
-        }
+        ccteam_core::identity::owner_tag(&self.id, self.is_admin)
     }
 
     /// v0.8.20 — the bare chat_id of this identity's WEB FRONTEND (the delivery
@@ -196,11 +192,7 @@ impl Identity {
     /// then derives the OWNER as `user:<id>` via `canonical_owner` (web↔IM
     /// convergence — the tenant's own IM bot then sees it too).
     pub fn web_chat_id(&self) -> String {
-        if self.is_admin {
-            "web-api".to_string()
-        } else {
-            self.id.clone()
-        }
+        ccteam_core::identity::web_chat_id(&self.id, self.is_admin)
     }
 
     /// Whether this identity may see a resource owned by `owner` (a project's
@@ -212,23 +204,8 @@ impl Identity {
     /// tenant (档1 owner ruling: admin does not peek into tenants' projects). A
     /// tenant sees ONLY its own.
     pub fn can_see_owner(&self, owner: Option<&str>) -> bool {
-        let tag = self.owner_tag();
-        if owner == Some(tag.as_str()) {
-            return true; // own resources (admin pool or the tenant's own)
-        }
-        // The operator sees everything EXCEPT a tenant's private resources.
-        self.is_admin && !is_tenant_owned(owner)
+        ccteam_core::identity::can_see_owner(&self.id, self.is_admin, owner)
     }
-}
-
-/// Whether `owner` is a per-user TENANT's tag (`user:<id>`, excluding the shared
-/// admin pool `user:web-api`). Tenant-owned resources are private to that tenant
-/// — not even the admin sees them (档1 owner ruling). Unowned (`None`) and
-/// IM-owned (`telegram:*`) tags are NOT tenant-owned.
-fn is_tenant_owned(owner: Option<&str>) -> bool {
-    owner
-        .and_then(|o| o.strip_prefix("user:"))
-        .is_some_and(|id| id != "web-api")
 }
 
 /// `Some(403)` unless the caller is the admin/owner — the shared gate for every
@@ -805,11 +782,17 @@ mod tests {
 
     #[test]
     fn is_tenant_owned_only_for_per_user_tags() {
-        assert!(is_tenant_owned(Some("user:u1")));
-        assert!(is_tenant_owned(Some("user:abc123")));
-        assert!(!is_tenant_owned(Some("user:web-api")), "shared admin pool");
-        assert!(!is_tenant_owned(Some("telegram:1")), "IM-owned");
-        assert!(!is_tenant_owned(None), "unowned");
+        assert!(ccteam_core::identity::is_tenant_owned(Some("user:u1")));
+        assert!(ccteam_core::identity::is_tenant_owned(Some("user:abc123")));
+        assert!(
+            !ccteam_core::identity::is_tenant_owned(Some("user:web-api")),
+            "shared admin pool"
+        );
+        assert!(
+            !ccteam_core::identity::is_tenant_owned(Some("telegram:1")),
+            "IM-owned"
+        );
+        assert!(!ccteam_core::identity::is_tenant_owned(None), "unowned");
     }
 
     #[test]

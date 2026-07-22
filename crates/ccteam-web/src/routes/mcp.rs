@@ -9,10 +9,12 @@
 //! bearer before this handler ran — which silently downgraded every managed
 //! session's A2A call to an admin fallback and dropped the delegation parent
 //! (fixed v0.9.2). [`require_mcp_auth`] is the single gate; it accepts exactly
-//! two bearers:
+//! three principals from two bearer families:
 //!
 //! - admin web token `ccteam:<hex>` → [`McpAuth::Admin`] (owner front door;
 //!   `session_spawn` is a root spawn by design)
+//! - tenant web token `ccteam:<hex>` → [`McpAuth::User`] (project-scoped root
+//!   caller; never promoted to admin or treated as a managed session)
 //! - session principal `ccteam-sid:<sid>:<secret>` → Ambient with the FULL
 //!   caller identity injected (the delegation-parent edge)
 //!
@@ -30,7 +32,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::auth::validate_bearer;
+use crate::auth::{resolve_identity, TOKEN_PREFIX};
 use crate::state::AppState;
 use crate::token::generate_or_load_token;
 
@@ -88,14 +90,15 @@ async fn handle_post(
         }
     };
 
-    // Admin bearer → owner's front door (session tools skip the principal gate).
-    // Session bearer `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL
-    // caller identity injected (_caller_sid/_caller_secret/_caller_role/
+    // Web-family bearer → Admin or project-scoped User. Session bearer
+    // `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL caller identity.
+    // The managed-session fields are injected (_caller_sid/_caller_secret/_caller_role/
     // _caller_slug) so session_* principal auth matches the live session
     // (v0.9.0 W1 G4 — previously only role+secret were injected, so session_*
     // over HTTP failed closed with "no project scope").
     let (caller, req) = match auth {
         McpAuth::Admin => (ccteam_im::mcp::McpCaller::Admin, req),
+        McpAuth::User { user_id } => (ccteam_im::mcp::McpCaller::User { user_id }, req),
         McpAuth::Session {
             sid,
             role,
@@ -122,6 +125,9 @@ async fn handle_post(
 /// Who authenticated against `POST /mcp`.
 enum McpAuth {
     Admin,
+    User {
+        user_id: String,
+    },
     Session {
         sid: String,
         role: String,
@@ -132,7 +138,7 @@ enum McpAuth {
 
 /// Enforce bearer always (this route mounts outside `auth_layer`, so this is
 /// the ONLY gate). Accepts:
-/// - admin web token `ccteam:<hex>` (owner front door → [`McpAuth::Admin`])
+/// - admin/tenant web token `ccteam:<hex>` (resolved by the shared web family)
 /// - session-scoped `ccteam-sid:<sid>:<secret>` (curated per-session MCP → Ambient)
 async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth, Response> {
     let unauthorized = || {
@@ -159,9 +165,10 @@ async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth
         }
     }
 
-    // Admin web token — the LIVE AuthState token when the web gate is enabled
-    // (single source with the REST surface, including rotation); loaded from
-    // disk on the loopback / --no-auth path where AuthState holds none.
+    // Web token family — the LIVE admin token when the web gate is enabled
+    // (single source with REST, including rotation) plus the tenant registry;
+    // load the admin token from disk on loopback / --no-auth where AuthState
+    // holds none.
     let expected = match app.auth.current_token() {
         Some(hex) => hex,
         None => match generate_or_load_token(&app.paths.web_token_path()) {
@@ -176,9 +183,15 @@ async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth
             }
         },
     };
-    match raw {
-        Some(p) if validate_bearer(p, &expected) => Ok(McpAuth::Admin),
-        _ => Err(unauthorized()),
+    let Some(bare) = raw.and_then(|presented| presented.strip_prefix(TOKEN_PREFIX)) else {
+        return Err(unauthorized());
+    };
+    match resolve_identity(bare, &expected, &app.paths.users_dir()) {
+        Some(identity) if identity.is_admin => Ok(McpAuth::Admin),
+        Some(identity) => Ok(McpAuth::User {
+            user_id: identity.id,
+        }),
+        None => Err(unauthorized()),
     }
 }
 

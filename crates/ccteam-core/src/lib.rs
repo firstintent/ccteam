@@ -62,6 +62,7 @@ pub mod mcp_register;
 // v0.8.6 — generic pull-based hot-reload wrapper for on-disk config
 // (stat-on-read, mtime-cached; no file-watch).
 pub mod hot_config;
+pub mod identity;
 // V0.6.1 F139 — embedded `~/.ccteam/hooks/hook.sh` dispatcher + install
 // helper. Routes Claude Code hooks through the long-running daemon's
 // HTTP server for a ~20× latency reduction.
