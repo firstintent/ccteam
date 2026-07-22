@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.7` 已合 `main`**(2026-07-22 owner merge PR #165,squash `825ae7d`)。V097 全三波:W1 daemon 生命周期核(Codex pid-detach)+ W2 systemd/launchd 退场 + W3 `ccteam update`/InstallChannel/版本外显;随车 2 个 ccm 提交(Grok 托管不 spawn stdio mcp-serve + idle 后台任务 /status 外显)。**tag+部署 = pre-release rc 先行人肉测**(release.yml 加 `--prerelease`(tag 带 `-` 即 pre-release,不进 /latest);已推 `v0.9.7-rc1` 触发工作流,owner `CCTEAM_VERSION=v0.9.7-rc1` 装测 → 满意后打 `v0.9.7` 正式 tag = latest)。
-- **在做**:**dev+PR 攒版本第一轮(PR #166,等 owner 合并)** —— v0.9.7 发布后修复:update 两 fix(inode 交换 + 版本门)+ resume 阶梯补全(IM/web/MCP 对称)+ daemon 关停泵泄漏(修活 restart flaky)+ CI 去 rmux smoke + 基线口径修正(`make test-baseline`,`--lib --bins`)+ **EXT-MCP-1 外部 Agent MCP Phase 1(e25544d:tenant web token 调 `/mcp`,`McpCaller::User` + project ACL,基线 1604→1615)**;全量门禁绿(2026-07-23 规划复核)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
+- **在做**:**dev+PR 攒版本第一轮(PR #166,等 owner 合并)** —— v0.9.7 发布后修复:update 两 fix(inode 交换 + 版本门)+ resume 阶梯补全(IM/web/MCP 对称)+ daemon 关停泵泄漏(修活 restart flaky)+ CI 去 rmux smoke + 基线口径修正(`make test-baseline`,`--lib --bins`)+ **EXT-MCP-1 外部 Agent MCP Phase 1(e25544d:tenant web token 调 `/mcp`,`McpCaller::User` + project ACL,基线 1604→1615)** + **异步可见性三连(owner 实测反馈,s119 codex):WEB-SSE-1(e3dfe5c 重连回填+复活)/ IM-MIRROR-1(4f1a45a root 会话异步收尾镜像 owner IM)/ IM-STATUS-1(cc0c5cf `/status` 子会话外显 + `/sessions` activity + 按钮互补,基线 →1623)**;全量门禁绿(2026-07-23 规划复核)。A2A-W5 仍挂起;P1-1/2/3 + P2-1 待排(P1-4 D7 作废);V094 npm gated —— 队列 = `.loop/backlog.md`。
 - **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
