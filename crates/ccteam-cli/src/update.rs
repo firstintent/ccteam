@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 
 use ccteam_core::daemon as dcore;
 use ccteam_core::install_channel::{self, InstallChannel};
+use ccteam_core::version_check::{update_available, VersionCache};
 use ccteam_core::CcteamPaths;
 
 use crate::daemon_cli;
@@ -81,6 +82,50 @@ pub(crate) fn plan(channel: &InstallChannel, no_restart: bool, now: bool) -> Upd
             }
         }
         InstallChannel::Other => UpdateAction::UnknownChannel,
+    }
+}
+
+/// Whether there is actually something newer to download, decided BEFORE any
+/// network write / binary swap (pure → unit-testable without touching curl).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateGate {
+    /// `latest` is strictly newer than the running version → install it.
+    Proceed { latest: String },
+    /// Already on the newest published release → skip the download entirely.
+    UpToDate { latest: String },
+    /// The latest release couldn't be determined (offline / GitHub hiccup) →
+    /// fail OPEN and install anyway, rather than stranding the user behind a
+    /// flaky network.
+    Unknown,
+}
+
+/// Pure version gate: compare the fetched `latest` release tag against the
+/// running `current` version.
+///
+/// `ccteam update` is EXPLICIT user intent, so two deliberate differences from
+/// the passive `ccteam status` check: the caller fetches fresh (never the 20h
+/// [`ccteam_core::version_check::REFRESH_INTERVAL_HOURS`] cache), and the probe
+/// cache carries no `dismissed_version` — dismissal only silences the passive
+/// nag and must never block an explicit update. Version comparison itself is
+/// delegated to the shared normalized comparator so `v0.9.8` vs `0.9.7`
+/// resolves identically everywhere.
+pub(crate) fn gate(latest: Option<&str>, current: &str) -> UpdateGate {
+    let Some(latest) = latest else {
+        return UpdateGate::Unknown;
+    };
+    let probe = VersionCache {
+        latest_version: Some(latest.to_string()),
+        last_checked_at: None,
+        dismissed_version: None,
+    };
+    if update_available(&probe, current).is_some() {
+        UpdateGate::Proceed {
+            latest: latest.to_string(),
+        }
+    } else {
+        UpdateGate::UpToDate {
+            latest: latest.to_string(),
+        }
     }
 }
 
@@ -156,7 +201,7 @@ pub(crate) fn run_restart_contract(
 }
 
 /// `ccteam update` entry point.
-pub fn run_update(now: bool, no_restart: bool, json: bool) -> Result<()> {
+pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let channel = install_channel::detect(&paths);
     match plan(&channel, no_restart, now) {
@@ -206,8 +251,66 @@ pub fn run_update(now: bool, no_restart: bool, json: bool) -> Result<()> {
                 ),
             )
         }
-        UpdateAction::RunInstaller { restart } => run_standalone_update(&paths, restart, json),
+        UpdateAction::RunInstaller { restart } => {
+            // Only download when something newer actually exists. Explicit user
+            // intent → fetch FRESH (not the 20h lazy cache `ccteam status`
+            // uses); `--force` skips the check entirely so a corrupt install can
+            // still be repaired in place. A failed fetch reads as `Unknown` and
+            // falls through to the install (fail-open, today's behaviour).
+            let current = env!("CARGO_PKG_VERSION");
+            if !force {
+                if let UpdateGate::UpToDate { latest } =
+                    gate(fetch_latest_version().as_deref(), current)
+                {
+                    return emit_up_to_date(&paths, &channel, current, &latest, json);
+                }
+            }
+            run_standalone_update(&paths, restart, json)
+        }
     }
+}
+
+/// Report "nothing to download". If a daemon is still running a DIFFERENT
+/// version, say so and point at the restart: the install path we just skipped
+/// is what would otherwise have restarted it, so staying silent here would
+/// quietly leave the daemon on the old binary.
+fn emit_up_to_date(
+    paths: &CcteamPaths,
+    channel: &InstallChannel,
+    current: &str,
+    latest: &str,
+    json: bool,
+) -> Result<()> {
+    let probe = dcore::probe_daemon(paths);
+    let daemon_version = if probe.ready {
+        probe.version.clone()
+    } else {
+        None
+    };
+    let stale_daemon = daemon_version.as_deref().is_some_and(|v| v != current);
+    let mut human = format!(
+        "already on the latest release ({current}) — nothing to download.\n  \
+         reinstall anyway with `ccteam update --force`"
+    );
+    if let Some(running) = daemon_version.as_deref().filter(|_| stale_daemon) {
+        human.push_str(&format!(
+            "\n  note: the running daemon reports {running} — restart it to pick up \
+             {current}: `ccteam daemon restart`"
+        ));
+    }
+    emit(
+        json,
+        serde_json::json!({
+            "status": "upToDate",
+            "channel": channel.as_str(),
+            "version": current,
+            "latest": latest,
+            "daemonVersion": daemon_version,
+            "daemonRestartRequired": stale_daemon,
+        }),
+        &human,
+    );
+    Ok(())
 }
 
 /// Standalone path: replay install.sh, then the upgrade-restart contract.
@@ -568,6 +671,44 @@ fn fail(json: bool, code: &str, message: &str) -> ! {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// The version gate is what stops `ccteam update` from re-downloading the
+    /// installer when nothing newer has been published — the whole point of the
+    /// pre-check. Pure, so it runs without touching the network.
+    #[test]
+    fn gate_skips_the_download_when_already_on_the_latest() {
+        // Newer upstream → install it.
+        assert_eq!(
+            gate(Some("v0.9.8"), "0.9.7"),
+            UpdateGate::Proceed {
+                latest: "v0.9.8".into()
+            }
+        );
+        // Same version, with and without the `v` prefix → nothing to download.
+        assert_eq!(
+            gate(Some("v0.9.7"), "0.9.7"),
+            UpdateGate::UpToDate {
+                latest: "v0.9.7".into()
+            }
+        );
+        assert_eq!(
+            gate(Some("0.9.7"), "0.9.7"),
+            UpdateGate::UpToDate {
+                latest: "0.9.7".into()
+            }
+        );
+        // Running a build NEWER than the published release (local / rc build)
+        // must never "update" backwards.
+        assert_eq!(
+            gate(Some("v0.9.7"), "0.10.0"),
+            UpdateGate::UpToDate {
+                latest: "v0.9.7".into()
+            }
+        );
+        // Release info unreachable → fail OPEN, so a flaky network cannot
+        // strand the user (preserves the pre-check-era behaviour).
+        assert_eq!(gate(None, "0.9.7"), UpdateGate::Unknown);
+    }
 
     #[test]
     fn plan_maps_channel_to_action() {

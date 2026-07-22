@@ -191,6 +191,10 @@ enum Command {
     /// turns to go idle first; `--now` skips the wait, `--no-restart` swaps
     /// the binary only). A source build prints `git pull && make install`;
     /// the npm channels aren't published yet.
+    ///
+    /// The latest release is checked FIRST: when you are already on it,
+    /// nothing is downloaded and the command exits early (`--force` reinstalls
+    /// anyway). If the release can't be reached, the update proceeds.
     Update {
         /// Skip the in-flight drain and restart the daemon immediately.
         #[arg(long, default_value_t = false)]
@@ -203,6 +207,11 @@ enum Command {
         /// prose moves to stderr).
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Reinstall even when already on the latest release (repair a
+        /// corrupt/partial install). Without it, `update` checks the latest
+        /// release first and exits early when there is nothing newer.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Project lifecycle group: `ccteam project <ls|show|new|stop|rm>`.
     ///
@@ -828,7 +837,8 @@ fn main() -> Result<()> {
             now,
             no_restart,
             json,
-        } => update::run_update(now, no_restart, json),
+            force,
+        } => update::run_update(now, no_restart, json, force),
         // v0.8.6 W3/W4a — `ccteam project <ls|show|new|stop|rm>` group.
         Command::Project { cmd } => match cmd {
             ProjectCommand::Ls { format } => run_ls(format),
