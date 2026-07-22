@@ -79,6 +79,8 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let mcp_codex = check_mcp_codex(codex_present);
     let mcp_kimi = check_mcp_kimi();
     let daemon = check_daemon(paths);
+    let legacy_service = check_legacy_service();
+    let updates = check_updates(paths);
     let pricing = check_pricing();
     let home = check_home_layout(paths);
     let auth_claude = check_vendor_auth_claude();
@@ -98,6 +100,8 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
         mcp_codex,
         mcp_kimi,
         daemon,
+        legacy_service,
+        updates,
         pricing,
         home,
         auth_claude,
@@ -472,7 +476,7 @@ fn check_mcp_kimi() -> CheckLine {
 
 /// Read-only daemon liveness ping — NEVER starts/stops/restarts the
 /// daemon (CLAUDE.md red line). A down daemon WARNs (perfectly normal
-/// before the first `ccteam start`), it doesn't fail the checkup.
+/// before the first `ccteam daemon start`), it doesn't fail the checkup.
 fn check_daemon(paths: &CcteamPaths) -> CheckLine {
     let health = ccteam_core::check_daemon_health(paths);
     let status = if health.is_healthy() {
@@ -481,6 +485,124 @@ fn check_daemon(paths: &CcteamPaths) -> CheckLine {
         CheckStatus::Warn
     };
     CheckLine::new(status, "daemon", health.describe())
+}
+
+/// v0.9.7 — residual legacy systemd/launchd unit detection (read-only;
+/// the actual migration lives in `ccteam daemon start`'s takeover
+/// pre-step, never in doctor). Installer-written unit → WARN with the
+/// one-command migration; hand-written unit → WARN with guidance only
+/// (ccteam never deletes it).
+fn check_legacy_service() -> CheckLine {
+    let paths = crate::legacy_takeover::LegacyServicePaths::from_env();
+    match crate::legacy_takeover::detect_legacy_unit(&paths) {
+        None => CheckLine::new(
+            CheckStatus::Pass,
+            "legacy service",
+            "no legacy systemd/launchd ccteam unit (pid-detach self-management)",
+        ),
+        Some((path, true)) => CheckLine::new(
+            CheckStatus::Warn,
+            "legacy service",
+            format!(
+                "legacy installer-written ccteam unit at {} — systemd/launchd management is \
+                 retired; migrate with `ccteam daemon start` (auto-takeover: stops + removes \
+                 the unit, restarts detached)",
+                path.display()
+            ),
+        ),
+        Some((path, false)) => CheckLine::new(
+            CheckStatus::Warn,
+            "legacy service",
+            format!(
+                "service unit at {} was not written by the ccteam installer — ccteam will not \
+                 manage or delete it; its instance counts as \"not managed\" for \
+                 `ccteam daemon stop`. Remove it manually if you want ccteam self-management",
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// v0.9.7 (PRD F3.5/F3.6) — install channel + version skew + fleet skew.
+///
+/// Reports: install channel · `current_exe` · on-disk binary version ·
+/// running-daemon version (from the versioned probe) with a
+/// restart-needed note if it lags the binary · cached latest release (with
+/// `update available → …` or `up to date`) · one line per registered
+/// satellite whose version differs (F3.6). WARN iff a newer ccteam is
+/// available, the running daemon lags the binary, or a satellite is
+/// skewed; otherwise PASS. **Cache-only** for the latest-version display —
+/// the doctor never blocks on a network fetch (the ≥20h refresh is driven
+/// by `ccteam status`); a missing cache / down daemon is informational,
+/// never FAIL.
+fn check_updates(paths: &CcteamPaths) -> CheckLine {
+    let channel = ccteam_core::install_channel::detect(paths);
+    let binary_version = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let probe = ccteam_core::daemon::probe_daemon(paths);
+    let cache = ccteam_core::version_check::cached_latest(paths).unwrap_or_default();
+    let update_avail = ccteam_core::version_check::update_available(&cache, binary_version);
+
+    let mut warn = false;
+    let mut parts: Vec<String> = vec![
+        format!("channel {}", channel.as_str()),
+        format!("exe {exe}"),
+        format!("binary {binary_version}"),
+    ];
+
+    // Running daemon version vs the on-disk binary.
+    if probe.ready {
+        match &probe.version {
+            Some(v) if v == binary_version => parts.push(format!("daemon {v}")),
+            Some(v) => {
+                warn = true;
+                parts.push(format!(
+                    "daemon {v} (RESTART NEEDED: `ccteam daemon restart` to load the new binary)"
+                ));
+            }
+            None => parts.push("daemon running (version unknown)".to_string()),
+        }
+    } else {
+        parts.push("daemon not running".to_string());
+    }
+
+    // Latest release, from the cache only (no network here).
+    match &update_avail {
+        Some(latest) => {
+            warn = true;
+            let action =
+                if ccteam_core::install_channel::suggested_update_command(&channel).is_some() {
+                    "run `ccteam update`".to_string()
+                } else {
+                    format!("reinstall from {}", ccteam_core::install_channel::REPO_URL)
+                };
+            parts.push(format!(
+                "update available {binary_version} → {latest}: {action}"
+            ));
+        }
+        None if cache.latest_version.is_some() => parts.push("up to date".to_string()),
+        None => parts.push(
+            "latest unknown (no cached check yet — `ccteam status` refreshes it)".to_string(),
+        ),
+    }
+
+    // Fleet version skew (F3.6) — shared with `ccteam status`.
+    for line in crate::update::fleet_version_skew(paths, binary_version) {
+        warn = true;
+        parts.push(line);
+    }
+
+    CheckLine::new(
+        if warn {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        "updates",
+        parts.join("; "),
+    )
 }
 
 /// V0.5.0 F92's staleness threshold (>180 days) re-derived per vendor —

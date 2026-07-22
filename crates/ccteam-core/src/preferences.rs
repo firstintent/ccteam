@@ -40,13 +40,38 @@ pub const PREFERENCES_FILENAME: &str = "preferences.toml";
 /// Top-level user preferences schema.
 ///
 /// Every section is optional; `Preferences::default()` yields a
-/// fully-defaulted (all-off) shape. Adding a new section in V0.7+
-/// follows the same `#[serde(default)]` pattern so older files keep
-/// parsing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+/// fully-defaulted shape (all fallback knobs off, update-check on).
+/// Adding a new knob follows the same `#[serde(default = …)]` pattern so
+/// older files keep parsing.
+///
+/// **Field order matters**: scalar knobs (`check_for_update`) come BEFORE
+/// the `[fallback]` table so `toml::to_string_pretty` emits the scalar at
+/// the top level, not swallowed into the table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preferences {
+    /// v0.9.7 (PRD F3.4) — opt out of the lazy "a newer ccteam is
+    /// available" check surfaced by `ccteam status` / `doctor`. Defaults
+    /// to `true`; a missing field in an older `preferences.toml` reads as
+    /// `true` too (no network is ever done in a daemon loop — the check is
+    /// lazy + ≥20h-gated and only fires on those command paths).
+    #[serde(default = "default_check_for_update")]
+    pub check_for_update: bool,
     #[serde(default)]
     pub fallback: FallbackPrefs,
+}
+
+/// Default for [`Preferences::check_for_update`] (on).
+fn default_check_for_update() -> bool {
+    true
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            check_for_update: default_check_for_update(),
+            fallback: FallbackPrefs::default(),
+        }
+    }
 }
 
 /// Cross-vendor fallback knobs.
@@ -265,5 +290,32 @@ mod tests {
         std::fs::write(&path, b"= invalid").unwrap();
         let p = load_or_default(tmp.path());
         assert_eq!(p, Preferences::default());
+    }
+
+    #[test]
+    fn check_for_update_defaults_on_and_old_files_stay_valid() {
+        // Default is on.
+        assert!(Preferences::default().check_for_update);
+        // A pre-v0.9.7 file that only has the fallback section still parses,
+        // and the missing scalar reads back as `true`.
+        let tmp = TempDir::new().unwrap();
+        let path = preferences_path(tmp.path());
+        std::fs::write(&path, b"[fallback]\non_claude_quota = \"codex\"\n").unwrap();
+        let p = load(tmp.path()).unwrap();
+        assert!(p.check_for_update, "missing field must default to true");
+        assert_eq!(p.fallback.on_claude_quota, OnClaudeQuota::Codex);
+    }
+
+    #[test]
+    fn check_for_update_roundtrips_off() {
+        let tmp = TempDir::new().unwrap();
+        let p = Preferences {
+            check_for_update: false,
+            ..Preferences::default()
+        };
+        save(tmp.path(), &p).unwrap();
+        let back = load(tmp.path()).unwrap();
+        assert!(!back.check_for_update);
+        assert_eq!(back, p);
     }
 }

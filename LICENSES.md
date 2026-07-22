@@ -4,6 +4,44 @@ ccteam itself is MIT-licensed (see `Cargo.toml::workspace.package.license`).
 This file lists the third-party assets that ship inside the ccteam binary
 or repository, with their respective licenses.
 
+## Rust source code (adapted)
+
+### OpenAI Codex — daemon lifecycle
+
+- **Adapted into**: `crates/ccteam-core/src/daemon.rs` (pid-record ownership,
+  operation lock, SIGTERM stop ladder, readiness probe) and
+  `crates/ccteam-cli/src/{daemon_cli,legacy_takeover}.rs` (the `ccteam daemon`
+  lifecycle command surface), introduced in v0.9.7.
+- **Derived from**: `codex-rs/app-server-daemon` — chiefly
+  `src/backend/pid.rs` (`PidRecord`, setsid detach, `process_start_time`
+  PID-reuse guard, stop poll + grace ladder), `src/lib.rs` (lifecycle
+  command/status enums, `daemon.lock` operation lock) and `src/client.rs`
+  (control-socket `initialize` readiness probe). The code was rewritten for
+  ccteam's MCP Unix socket and paths, not copied verbatim.
+- **Upstream**: <https://github.com/openai/codex>
+- **License**: [Apache License, Version 2.0](https://github.com/openai/codex/blob/main/LICENSE)
+- **Copyright**: OpenAI Codex, Copyright 2025 OpenAI (see the upstream `NOTICE`).
+
+The Apache-2.0 license permits use, modification, and redistribution under
+the terms of the license, including in MIT-licensed projects, provided the
+attribution and license notice above are retained.
+
+### OpenAI Codex — install channel + self-update
+
+- **Adapted into**: `crates/ccteam-core/src/install_channel.rs` (install-method
+  enum + `detect()` priority ladder) and `crates/ccteam-cli/src/update.rs`
+  (`ccteam update` channel→action mapping), introduced in v0.9.7.
+- **Derived from**: `codex-rs/install-context/src/lib.rs` (`InstallMethod`
+  enum + `current()` env/path detection) and `codex-rs/tui/src/update_action.rs`
+  (`UpdateAction` enum + per-channel command mapping). The managed-package /
+  releases machinery was dropped, a marker-file layer was added, the command
+  table was replaced with ccteam's install.sh pipeline, and the upgrade-restart
+  contract (probe → drain → graceful restart → version verify) is
+  ccteam-specific — this is a rewrite, not a verbatim copy.
+- **Upstream**: <https://github.com/openai/codex>
+- **License**: [Apache License, Version 2.0](https://github.com/openai/codex/blob/main/LICENSE)
+- **Copyright**: OpenAI Codex, Copyright 2025 OpenAI (see the upstream `NOTICE`).
+
 ## Fonts
 
 ### JetBrains Mono Regular

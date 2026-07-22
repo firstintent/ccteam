@@ -1036,12 +1036,12 @@ pub fn build_gateway_for_daemon(
 /// `setMyCommands`, reading the configured bot token from
 /// `credentials.json` (or `credentials_path` when overridden).
 ///
-/// `ccteam start` calls this on **every** invocation, *before* the
-/// single-instance pidfile guard — so the menu refreshes even when a
-/// daemon is already running (the second `ccteam start` otherwise aborts
-/// at `write_pidfile` before the daemon-startup registration in
-/// [`run_daemon_with_shutdown`] could fire) and even when Telegram was
-/// configured *after* the daemon first started. `setMyCommands` is
+/// `ccteam start` calls this on **every** invocation — so the menu
+/// refreshes even when a daemon is already running (a second
+/// `ccteam start` aborts at the socket-probe instance guard before the
+/// daemon-startup registration in [`run_daemon_with_shutdown`] could
+/// fire) and even when Telegram was configured *after* the daemon first
+/// started. `setMyCommands` is
 /// idempotent (it replaces the whole menu), so refreshing every start is
 /// safe and runs no risk to live sessions/daemon — it is one HTTPS POST
 /// to the Bot API, touching nothing in the running process.

@@ -82,7 +82,7 @@ impl AcpTransport {
         args: &[String],
         cwd: &std::path::Path,
     ) -> Result<Self> {
-        Self::spawn_command_with_policy(program, args, cwd, InboundPolicy::DefaultDecline).await
+        Self::spawn_command_full(program, args, cwd, &[], InboundPolicy::DefaultDecline).await
     }
 
     /// Spawn with an explicit inbound request policy (OpenCode skip →
@@ -93,13 +93,30 @@ impl AcpTransport {
         cwd: &std::path::Path,
         inbound: InboundPolicy,
     ) -> Result<Self> {
-        let mut child = Command::new(program)
-            .args(args)
+        Self::spawn_command_full(program, args, cwd, &[], inbound).await
+    }
+
+    /// Full-parameter spawn: `envs` are set on the child only — the daemon's
+    /// own environment is never mutated (e.g. Grok's
+    /// `GROK_CLAUDE_MCPS_ENABLED=false` compat kill-switch).
+    pub async fn spawn_command_full(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        envs: &[(String, String)],
+        inbound: InboundPolicy,
+    ) -> Result<Self> {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(cwd)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {program} {:?}", args))?;
 

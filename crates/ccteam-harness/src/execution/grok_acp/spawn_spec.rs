@@ -19,6 +19,21 @@ pub fn grok_bin() -> String {
     std::env::var(crate::GROK_BIN_ENV).unwrap_or_else(|_| "grok".to_string())
 }
 
+/// Child-only env for managed grok spawns.
+///
+/// `GROK_CLAUDE_MCPS_ENABLED=false` disables Grok's Claude MCP compat scan
+/// (`[compat.claude] mcps`, vendor default on): ccteam keeps a global stdio
+/// `ccteam internal mcp-serve` entry in `~/.claude.json` for plain Claude
+/// main sessions, and Grok would import it on top of the ACP-injected HTTP
+/// server — one orphan `mcp-serve` child per session plus a same-name double
+/// registration whose winner (admin stdio vs session-principal HTTP) depends
+/// on the grok version. Managed sessions get their tool face via ACP
+/// `mcpServers`, so the scan is pure downside here; the global Claude
+/// registration itself stays (Claude main-session fallback).
+pub fn build_envs() -> Vec<(String, String)> {
+    vec![("GROK_CLAUDE_MCPS_ENABLED".into(), "false".into())]
+}
+
 /// Build argv: `grok agent [--always-approve] [-m MODEL] stdio`.
 pub fn build_argv(bin: &str, input: &GrokSpawnInput<'_>) -> Vec<String> {
     let mut argv = vec![bin.to_string(), "agent".into()];
@@ -62,6 +77,14 @@ mod tests {
         );
         assert_eq!(argv, vec!["grok", "agent", "-m", "grok-4.5", "stdio"]);
         assert!(!argv.iter().any(|a| a == "--always-approve"));
+    }
+
+    #[test]
+    fn envs_disable_claude_mcp_compat_scan() {
+        assert_eq!(
+            build_envs(),
+            vec![("GROK_CLAUDE_MCPS_ENABLED".to_string(), "false".to_string())]
+        );
     }
 
     #[test]

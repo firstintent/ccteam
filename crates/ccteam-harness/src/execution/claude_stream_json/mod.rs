@@ -279,12 +279,14 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
-                        // The turn ended — turn-scoped tasks (subagents, shells)
+                        // The turn ended — turn-scoped tasks (sync subagents)
                         // cannot still be running, so drop them as a safety net in
                         // case a terminal task event was missed. Background
-                        // workflows OUTLIVE the turn by design (the Workflow tool
-                        // returns immediately and the run keeps going), so they
-                        // stay until their own terminal task event arrives.
+                        // workflows AND background shells (Bash run_in_background
+                        // / Monitor) OUTLIVE the turn by design (the tool returns
+                        // immediately and the run keeps going), so they stay until
+                        // their own terminal task event arrives — this is what
+                        // lets an idle session still show its in-flight work.
                         if let Ok(mut t) = running_tasks.lock() {
                             t.retain(task_outlives_turn);
                         }
@@ -341,13 +343,13 @@ fn spawn_status_tap(
 }
 
 /// True for a task that legitimately OUTLIVES the turn that spawned it, so the
-/// turn-end safety net must not evict it. claude's background dynamic
-/// workflows (`task_type: "local_workflow"`) keep running after the spawning
-/// turn's result and report their own terminal `task_updated`/
-/// `task_notification` later; everything else (subagents, shells) is
-/// turn-scoped.
+/// turn-end safety net must not evict it. Thin alias for
+/// [`crate::RunningTask::outlives_turn`] (the vocabulary's single authority,
+/// shared with the IM `/status` working-signal check): background workflows
+/// AND background shells (Bash `run_in_background` / Monitor) survive; sync
+/// subagents are turn-scoped.
 fn task_outlives_turn(t: &crate::RunningTask) -> bool {
-    t.task_type == "local_workflow"
+    t.outlives_turn()
 }
 
 /// True for a task `status` that means the task is no longer running, so it
@@ -1831,6 +1833,33 @@ mod effort_tests {
         }
         // The workflow's own terminal notification still removes it.
         let mut note = task_sys("task_notification", "w1");
+        note.status = "completed".into();
+        reflect_task_event(&tasks, &note);
+        assert!(tasks.lock().unwrap().is_empty());
+    }
+
+    /// Background SHELLS (`local_bash` — Bash `run_in_background` + Monitor
+    /// watches; probed live 2026-07-22) outlive the spawning turn exactly like
+    /// workflows: the turn ends, the task keeps running, and its own terminal
+    /// event arrives later. Before this vocabulary fix the turn-end net
+    /// evicted them, so an idle session showed no trace of an in-flight
+    /// `make test` — the exact observability gap reported from the field.
+    #[test]
+    fn turn_end_safety_net_keeps_background_shells() {
+        let tasks = Mutex::new(Vec::new());
+        let mut sh = task_sys("task_started", "b1");
+        sh.description = "make test".into();
+        sh.task_type = "local_bash".into();
+        reflect_task_event(&tasks, &sh);
+        // What the TurnResult arm applies at turn end.
+        tasks.lock().unwrap().retain(task_outlives_turn);
+        {
+            let g = tasks.lock().unwrap();
+            assert_eq!(g.len(), 1, "background shell survives turn end");
+            assert_eq!(g[0].task_id, "b1");
+        }
+        // Its own terminal notification still removes it.
+        let mut note = task_sys("task_notification", "b1");
         note.status = "completed".into();
         reflect_task_event(&tasks, &note);
         assert!(tasks.lock().unwrap().is_empty());

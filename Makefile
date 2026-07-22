@@ -2,9 +2,8 @@
 #
 #   make gate            # full pre-push gate: fmt + clippy + tests + SPA
 #   make install         # THE install: build release + symlink to $(BIN_DIR)/ccteam
-#                        #   + supervised service (systemd --user on Linux, launchd
-#                        #   on macOS: starts at boot/login, restarts on crash) +
-#                        #   first-run next steps
+#                        #   + `ccteam daemon restart` (self-managed setsid daemon;
+#                        #   migrates any legacy systemd/launchd unit) + next steps
 #   make start           # run the daemon in the FOREGROUND (dev / one-off)
 #   make wipe            # reset runtime state (keeps secrets + config + routing)
 #
@@ -30,15 +29,10 @@ WEB_BIND     ?= 0.0.0.0:$(WEB_PORT)
 # hooks/ — so creds + prefs survive a reset.
 WIPE_DIRS    := state run cache
 
-# systemd --user supervision (see the "Daemon" section).
-SYSTEMD_DIR  := $(HOME)/.config/systemd/user
-UNIT_NAME    := ccteam.service
-UNIT_FILE    := $(SYSTEMD_DIR)/$(UNIT_NAME)
-
-# launchd supervision — macOS parity for the same section.
-PLIST_LABEL  := com.firstintent.ccteam
-PLIST_FILE   := $(HOME)/Library/LaunchAgents/$(PLIST_LABEL).plist
-MAC_LOG      := $(CCTEAM_HOME)/daemon.log
+# v0.9.7 — the daemon is self-managed via `ccteam daemon *` (Codex-style
+# setsid pid-detach); systemd/launchd are retired. The daemon log lives at
+# $(CCTEAM_HOME)/daemon.log on every platform.
+DAEMON_LOG   := $(CCTEAM_HOME)/daemon.log
 
 .DEFAULT_GOAL := help
 .PHONY: help build release clean fmt fmt-check clippy check test test-web \
@@ -65,8 +59,8 @@ help:
 	@printf '  \033[1mmake gate\033[0m          full pre-push gate (fmt+clippy+test+test-web+web-check)\n'
 	@printf '  make clean         cargo clean + rm SPA dist\n\n'
 	@printf '\033[1mInstall\033[0m\n'
-	@printf '  \033[1mmake install\033[0m       build release + symlink + service (systemd --user / launchd: boot + auto-restart)\n'
-	@printf '  make uninstall     stop + remove the service and the symlink (state untouched)\n'
+	@printf '  \033[1mmake install\033[0m       build release + symlink + `ccteam daemon restart` (self-managed daemon)\n'
+	@printf '  make uninstall     stop the daemon + remove the symlink (state untouched)\n'
 	@printf '  make reinstall     uninstall + install\n\n'
 	@printf '\033[1mRun foreground (daemon = IM gateway + web UI + MCP, one process)\033[0m\n'
 	@printf '  make config        ccteam config   (register MCP + IM creds + prefs)\n'
@@ -75,12 +69,12 @@ help:
 	@printf '  make status        ccteam status   (daemon health + sessions)\n'
 	@printf '  make doctor        ccteam doctor --verify-mcp\n'
 	@printf '  make stop          ccteam stop     (stop the daemon; sessions resume on next start)\n\n'
-	@printf '\033[1mDaemon ops (service from `make install`; Linux systemd --user, macOS launchd)\033[0m\n'
-	@printf '  make daemon-status     service status\n'
-	@printf '  make daemon-logs       follow logs (journalctl / %s)\n' '$(MAC_LOG)'
-	@printf '  make daemon-restart    rebuild release + restart the service\n'
-	@printf '  make daemon-stop       stop (Linux keeps boot-start; macOS unloads until daemon-start)\n'
-	@printf '  make daemon-start      start it again\n\n'
+	@printf '\033[1mDaemon ops (self-managed setsid daemon; Linux / macOS / WSL, one mechanism)\033[0m\n'
+	@printf '  make daemon-status     ccteam daemon status  (pid / ready / running-vs-binary version)\n'
+	@printf '  make daemon-logs       ccteam daemon logs -f  (%s)\n' '$(DAEMON_LOG)'
+	@printf '  make daemon-restart    rebuild release + ccteam daemon restart\n'
+	@printf '  make daemon-stop       ccteam daemon stop\n'
+	@printf '  make daemon-start      ccteam daemon start\n\n'
 	@printf '\033[1mState reset (destructive)\033[0m\n'
 	@printf '  make wipe          rm %s/{%s} (keeps secrets/, hooks/, config.yaml, routing.md)\n' '$(CCTEAM_HOME)' 'state,run,cache'
 	@printf '  make nuke          rm -rf %s   (requires CONFIRM=1)\n' '$(CCTEAM_HOME)'
@@ -166,11 +160,11 @@ gate: fmt-check clippy test test-web web-check
 
 # --- Install / uninstall -----------------------------------------------------
 #
-# `make install` is THE product install: release build → symlink → systemd
-# --user service (unit generated below) → first-run next steps. Symlink (not
-# copy): a fresh `cargo build --release` goes live on the next service
-# restart. Without systemd (macOS / no user D-Bus) it falls back to the
-# symlink + a foreground hint — never nohup.
+# `make install` is THE product install: release build → symlink → `ccteam
+# daemon restart` (self-managed setsid daemon). Symlink (not copy): a fresh
+# `cargo build --release` goes live on the next `daemon restart`. `daemon
+# restart` runs the one-time legacy-unit takeover, so a dev box that used to
+# run the old systemd/launchd service migrates cleanly on this install.
 
 install: release
 	@mkdir -p $(BIN_DIR)
@@ -180,42 +174,8 @@ install: release
 	    *:$(BIN_DIR):*) ;; \
 	    *) printf '\033[33mwarning:\033[0m %s is not on PATH; add it to your shell rc.\n' '$(BIN_DIR)' ;; \
 	esac
-	@if [ "$$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then \
-	    mkdir -p $(SYSTEMD_DIR); \
-	    printf '%s\n' "$$CCTEAM_UNIT" > $(UNIT_FILE); \
-	    printf 'service:   %s\n' '$(UNIT_FILE)'; \
-	    loginctl enable-linger $(USER) >/dev/null 2>&1 || true; \
-	    if systemctl --user daemon-reload >/dev/null 2>&1 \
-	        && systemctl --user enable $(UNIT_NAME) >/dev/null 2>&1 \
-	        && systemctl --user restart $(UNIT_NAME); then \
-	        $(MAKE) --no-print-directory next-steps; \
-	    else \
-	        printf '\033[33mwarning:\033[0m could not start the systemd --user service (no login session / D-Bus?).\n'; \
-	        printf '    Retry in a login session:  systemctl --user enable --now %s\n' '$(UNIT_NAME)'; \
-	        printf '    Or run in the foreground:   %s start\n' '$(BIN_NAME)'; \
-	    fi; \
-	elif [ "$$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then \
-	    mkdir -p $(HOME)/Library/LaunchAgents $(CCTEAM_HOME); \
-	    printf '%s\n' "$$CCTEAM_PLIST" > $(PLIST_FILE); \
-	    printf 'service:   %s\n' '$(PLIST_FILE)'; \
-	    _dom="gui/$$(id -u)"; _svc="$$_dom/$(PLIST_LABEL)"; \
-	    launchctl bootout "$$_svc" >/dev/null 2>&1 || true; \
-	    sleep 1; \
-	    launchctl enable "$$_svc" >/dev/null 2>&1 || true; \
-	    _err="$$(launchctl bootstrap "$$_dom" $(PLIST_FILE) 2>&1)" || true; \
-	    launchctl kickstart "$$_svc" >/dev/null 2>&1 || true; \
-	    if launchctl print "$$_svc" >/dev/null 2>&1; then \
-	        $(MAKE) --no-print-directory next-steps; \
-	    else \
-	        printf '\033[33mwarning:\033[0m could not load the launchd agent. launchctl reported:\n'; \
-	        if [ -n "$$_err" ]; then printf '      %s\n' "$$_err"; fi; \
-	        printf '    The binary is installed. Load it manually (from a GUI login session):\n'; \
-	        printf '      launchctl bootstrap %s %s\n' "$$_dom" '$(PLIST_FILE)'; \
-	        printf '    Or run it in the foreground:  %s start\n' '$(BIN_NAME)'; \
-	    fi; \
-	else \
-	    printf 'no systemd --user / launchd here — run the daemon in the foreground:  %s start\n' '$(BIN_NAME)'; \
-	fi
+	@$(BIN_LINK) daemon restart
+	@$(MAKE) --no-print-directory next-steps
 
 # Internal: poll the fresh daemon for its web URL (≤20s; the `web url:` line of
 # `ccteam status` is a ready-to-click login link), then print where to finish
@@ -228,7 +188,9 @@ next-steps:
 	    [ -n "$$_url" ] && break; \
 	    sleep 1; _i=$$((_i + 1)); \
 	done; \
-	printf '\n\033[32mccteam is up\033[0m — supervised service: starts at boot/login, restarts on crash.\n\n'; \
+	printf '\n\033[32mccteam is up\033[0m — self-managed daemon (setsid; survives logout).\n'; \
+	printf '  Not auto-started on boot: re-run `ccteam daemon start` after a reboot\n'; \
+	printf '  (or add it to your login shell / a @reboot cron).\n\n'; \
 	if [ -n "$$_url" ]; then \
 	    printf '  Web console:  %s\n' "$$_url"; \
 	else \
@@ -242,22 +204,16 @@ next-steps:
 	printf '  Ops: make daemon-logs | make daemon-restart | make daemon-stop\n'
 
 uninstall:
-	@if [ -f $(UNIT_FILE) ]; then \
-	    systemctl --user disable --now $(UNIT_NAME) >/dev/null 2>&1 || true; \
-	    rm -f $(UNIT_FILE); \
-	    systemctl --user daemon-reload >/dev/null 2>&1 || true; \
-	    printf 'removed service: %s\n' '$(UNIT_FILE)'; \
-	fi
-	@if [ -f $(PLIST_FILE) ]; then \
-	    launchctl bootout gui/$$(id -u)/$(PLIST_LABEL) >/dev/null 2>&1 || true; \
-	    rm -f $(PLIST_FILE); \
-	    printf 'removed service: %s\n' '$(PLIST_FILE)'; \
+	@if command -v $(BIN_NAME) >/dev/null 2>&1; then \
+	    $(BIN_NAME) daemon stop >/dev/null 2>&1 || true; \
+	    printf 'stopped the self-managed daemon (if running).\n'; \
 	fi
 	@if [ -L $(BIN_LINK) ] || [ -f $(BIN_LINK) ]; then \
 	    rm -f $(BIN_LINK) && printf 'removed: %s (state/config untouched)\n' '$(BIN_LINK)'; \
 	else \
 	    printf 'not installed: %s\n' '$(BIN_LINK)'; \
 	fi
+	@printf 'note: any pre-0.9.7 systemd/launchd unit is swept by `ccteam daemon start` (auto-takeover) or `install.sh --uninstall`.\n'
 
 reinstall: uninstall install
 
@@ -292,125 +248,36 @@ doctor: require-cli
 stop: require-cli
 	$(BIN_NAME) stop
 
-# --- Daemon supervision (Linux systemd --user · macOS launchd) ----------------
+# --- Daemon ops (self-managed setsid daemon; one mechanism, all platforms) ----
 #
-# Why: `ccteam start` is a FOREGROUND process tied to its terminal. Started by
-# hand (e.g. `... >/tmp/ccteam.log 2>&1 &`) it dies on SIGHUP when the shell /
-# SSH session closes — healthy one moment, gone the next, no crash trace. The
-# service `make install` sets up fixes that: it owns the process, restarts it
-# on crash/OOM, and keeps it running across logout (linger) and across reboot.
-# The daemon traps SIGTERM into its graceful shutdown, so a service stop is a
-# clean stop (sessions resume by sid on next start). Logs: `make daemon-logs`
-# (journal on Linux; $(MAC_LOG) on macOS — launchd has no journal).
+# Why: `ccteam start` is a FOREGROUND process tied to its terminal. `ccteam
+# daemon start` detaches it (setsid): stdout/stderr → $(DAEMON_LOG), a JSON pid
+# record proves ownership, and the daemon traps SIGTERM into a graceful
+# shutdown (sessions resume by sid on next start). This is the SAME mechanism
+# on Linux / macOS / WSL — systemd/launchd are retired (v0.9.7). The daemon
+# spawns claude/codex from PATH, so the detaching shell's PATH must include
+# $(BIN_DIR) and the vendor CLIs (setsid inherits the caller's env — a win over
+# the old unit's hand-maintained PATH).
 #
-# Both units are generated below (no checked-in template). ExecStart + PATH
-# honor $(BIN_DIR); the daemon spawns claude/codex from PATH, so $(BIN_DIR)
-# MUST be on it. Tune the (commented) memory caps to your host if you want the
-# daemon contained rather than relying on restart-after-OOM.
-
-define CCTEAM_UNIT
-[Unit]
-Description=ccteam daemon (IM gateway + web UI + MCP)
-Documentation=https://github.com/firstintent/ccteam
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-[Service]
-Type=exec
-ExecStart=$(BIN_LINK) start --web-bind $(WEB_BIND)
-WorkingDirectory=$(HOME)
-# Daemon discovers claude/codex via PATH — user-local bins must be visible.
-# User-local bins (claude/codex/grok) + OpenCode's default install prefix.
-Environment=PATH=$(BIN_DIR):$(HOME)/.opencode/bin:/usr/local/bin:/usr/bin:/bin
-# Graceful: SIGTERM -> the daemon's own clean shutdown path. Give it room
-# before systemd escalates to SIGKILL (CLI `stop` waits ~35s).
-KillSignal=SIGTERM
-TimeoutStopSec=40
-# Restart on crash/OOM/any non-`systemctl stop` exit, rate-limited above.
-Restart=always
-RestartSec=2
-# Optional memory containment — uncomment + tune to host RAM:
-# MemoryHigh=4G
-# MemoryMax=6G
-
-[Install]
-WantedBy=default.target
-endef
-export CCTEAM_UNIT
-
-# macOS LaunchAgent: RunAtLoad = start at login, KeepAlive = restart on any
-# exit (so stopping goes through `launchctl bootout`, i.e. `make daemon-stop`).
-define CCTEAM_PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key><string>$(PLIST_LABEL)</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>$(BIN_LINK)</string>
-		<string>start</string>
-		<string>--web-bind</string>
-		<string>$(WEB_BIND)</string>
-	</array>
-	<key>WorkingDirectory</key><string>$(HOME)</string>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>PATH</key><string>$(BIN_DIR):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-	</dict>
-	<key>RunAtLoad</key><true/>
-	<key>KeepAlive</key><true/>
-	<key>ProcessType</key><string>Background</string>
-	<key>StandardOutPath</key><string>$(MAC_LOG)</string>
-	<key>StandardErrorPath</key><string>$(MAC_LOG)</string>
-</dict>
-</plist>
-endef
-export CCTEAM_PLIST
+# Honest tradeoff: no supervisor means no crash-restart / boot-start. Re-run
+# `make daemon-start` (or `ccteam daemon start`) after a reboot; `ccteam
+# status` / `ccteam doctor` surface a down daemon at a glance.
 
 daemon-start:
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    if [ ! -f $(PLIST_FILE) ]; then \
-	        printf '\033[31merror:\033[0m no launchd agent at %s — run `make install` first.\n' '$(PLIST_FILE)' >&2; \
-	        exit 1; \
-	    fi; \
-	    _dom="gui/$$(id -u)"; _svc="$$_dom/$(PLIST_LABEL)"; \
-	    launchctl bootstrap "$$_dom" $(PLIST_FILE) 2>/dev/null || true; \
-	    launchctl kickstart "$$_svc"; \
-	else \
-	    systemctl --user start $(UNIT_NAME); \
-	fi
+	@$(BIN_NAME) daemon start
 
 daemon-stop:
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    launchctl bootout gui/$$(id -u)/$(PLIST_LABEL); \
-	else \
-	    systemctl --user stop $(UNIT_NAME); \
-	fi
+	@$(BIN_NAME) daemon stop
 
 # Rebuild release then restart — the symlinked binary makes the new build live.
 daemon-restart: release
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    launchctl kickstart -k gui/$$(id -u)/$(PLIST_LABEL); \
-	else \
-	    systemctl --user restart $(UNIT_NAME); \
-	fi
-	@printf 'restarted with fresh release build.\n'
+	@$(BIN_NAME) daemon restart
 
 daemon-status:
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    { launchctl print gui/$$(id -u)/$(PLIST_LABEL) 2>/dev/null \
-	        || printf 'not loaded: %s\n' '$(PLIST_LABEL)'; } | sed -n '1,14p'; \
-	else \
-	    systemctl --user status $(UNIT_NAME) --no-pager || true; \
-	fi
+	@$(BIN_NAME) daemon status
 
 daemon-logs:
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-	    tail -f $(MAC_LOG); \
-	else \
-	    journalctl --user -u $(UNIT_NAME) -f; \
-	fi
+	@$(BIN_NAME) daemon logs -f
 
 # --- State reset (destructive) -----------------------------------------------
 

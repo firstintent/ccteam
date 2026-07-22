@@ -5826,9 +5826,11 @@ impl Gateway {
         // 🔴 stuck — EXCEPT running subagents are an AUTHORITATIVE "still working"
         // signal (straight from claude) that overrides the silence heuristic, so
         // a main session quietly awaiting subagents never mis-reads idle/stuck.
-        // Background workflows do NOT override: they outlive the spawning turn,
-        // so a leftover run must not mask a genuinely stuck later turn.
-        let turn_scoped_running = running.iter().any(|t| t.task_type != "local_workflow");
+        // Turn-OUTLIVING tasks (background workflows / shells / monitors) do NOT
+        // override: they survive the spawning turn by design, so a leftover run
+        // must not mask a genuinely stuck later turn. Same vocabulary as the
+        // harness turn-end eviction (`RunningTask::outlives_turn`).
+        let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
         let mut stuck_after = gateway_turn_timeout_duration();
         if stuck_after.is_zero() {
             stuck_after = std::time::Duration::from_secs(300);
@@ -8175,11 +8177,13 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
 /// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
 /// `0s`.
-/// Render the `/status` running-task block — claude's own subagent/background
-/// workflow lifecycle mirrored verbatim (NOT a fold), oldest first
-/// (longest-running on top). Empty string when nothing runs. Workflows
-/// (`task_type: "local_workflow"`) are counted and labeled separately from
-/// subagents: they run in the background and outlive the spawning turn.
+/// Render the `/status` running-task block — claude's own task lifecycle
+/// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
+/// Empty string when nothing runs. Three buckets by `task_type`: subagents
+/// (`local_agent`, turn-scoped), workflows (`local_workflow`) and background
+/// shells (`local_bash` = Bash run_in_background + Monitor watches) — the
+/// latter two outlive the spawning turn, so an idle session still shows its
+/// in-flight `make test` here instead of a bare `🟢 idle`.
 fn format_running_tasks(running: &[RunningTask]) -> String {
     if running.is_empty() {
         return String::new();
@@ -8188,7 +8192,11 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
         .iter()
         .filter(|t| t.task_type == "local_workflow")
         .count();
-    let subagents = running.len() - workflows;
+    let bg_shells = running
+        .iter()
+        .filter(|t| t.task_type == "local_bash")
+        .count();
+    let subagents = running.len() - workflows - bg_shells;
     let mut kinds: Vec<String> = Vec::new();
     if subagents > 0 {
         kinds.push(format!("subagent ({subagents})"));
@@ -8196,12 +8204,16 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     if workflows > 0 {
         kinds.push(format!("workflow ({workflows})"));
     }
+    if bg_shells > 0 {
+        kinds.push(format!("后台任务 ({bg_shells})"));
+    }
     let mut out = format!("\n   🤖 在跑 {}:", kinds.join(" + "));
     let mut tasks: Vec<&RunningTask> = running.iter().collect();
     tasks.sort_by_key(|t| t.started);
     for t in tasks {
         let kind = match t.task_type.as_str() {
             "local_workflow" => "workflow",
+            "local_bash" => "后台",
             _ if t.kind.is_empty() => "subagent",
             _ => t.kind.as_str(),
         };
@@ -12656,6 +12668,38 @@ mod tests {
         let wf = [task("w1", "", "migrate call sites", "local_workflow")];
         let s = format_running_tasks(&wf);
         assert!(s.contains("在跑 workflow (1):"), "{s}");
+        // Background shells (`local_bash` — Bash run_in_background / Monitor)
+        // get their own bucket + row label; an idle session with an in-flight
+        // `make test` renders it instead of a bare `🟢 idle`.
+        let bg = [
+            task("b1", "", "make test full suite", "local_bash"),
+            task("b2", "", "watch /tmp/maketest.log", "local_bash"),
+            task("a1", "code-reviewer", "review auth", "local_agent"),
+        ];
+        let s = format_running_tasks(&bg);
+        assert!(s.contains("在跑 subagent (1) + 后台任务 (2):"), "{s}");
+        assert!(s.contains("后台「make test full suite」"), "{s}");
+        assert!(s.contains("后台「watch /tmp/maketest.log」"), "{s}");
+    }
+
+    /// The outlives-turn vocabulary the working-signal check shares with the
+    /// harness turn-end eviction: background workflows AND background shells
+    /// survive a turn boundary; sync subagents are turn-scoped.
+    #[test]
+    fn outlives_turn_vocabulary_covers_workflows_and_bg_shells() {
+        fn t(task_type: &str) -> RunningTask {
+            RunningTask {
+                task_id: "x".into(),
+                kind: String::new(),
+                description: String::new(),
+                task_type: task_type.into(),
+                started: std::time::Instant::now(),
+            }
+        }
+        assert!(t("local_workflow").outlives_turn());
+        assert!(t("local_bash").outlives_turn());
+        assert!(!t("local_agent").outlives_turn());
+        assert!(!t("").outlives_turn());
     }
 
     /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's

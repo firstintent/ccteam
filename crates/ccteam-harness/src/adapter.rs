@@ -658,6 +658,23 @@ pub struct RunningTask {
     pub started: std::time::Instant,
 }
 
+impl RunningTask {
+    /// True for a task that legitimately OUTLIVES the turn that spawned it:
+    /// background workflows (`local_workflow`) and background shells
+    /// (`local_bash` = Bash `run_in_background` + Monitor watches; vocabulary
+    /// probed live 2026-07-22) keep running after the spawning turn's result
+    /// and report their own terminal `task_updated`/`task_notification`
+    /// later. Sync subagents (`local_agent`) are turn-scoped. Single
+    /// authority for BOTH the stream-json turn-end eviction net and the IM
+    /// `/status` "authoritative working signal" — the two must never diverge:
+    /// an outliving task left over from an earlier turn must not mask a
+    /// genuinely stuck later turn, and conversely must survive turn end so an
+    /// idle session still shows it.
+    pub fn outlives_turn(&self) -> bool {
+        matches!(self.task_type.as_str(), "local_workflow" | "local_bash")
+    }
+}
+
 /// A long-running session goal (`/goal`). `condition` is the objective text;
 /// `met` flips true when the agent reports it achieved. For Claude stream-json
 /// this is sourced from the session transcript's `goal_status` attachment —
