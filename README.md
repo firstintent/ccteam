@@ -187,6 +187,7 @@ Per project, delete `.ccteam/` and ccteam's section of `.claude/settings.local.j
 ## Support
 
 - Questions, bugs, ideas → [issues](https://github.com/firstintent/ccteam/issues); PRs welcome.
+- Telegram: [@cryptorobsu](https://t.me/cryptorobsu)
 - If the team saved you an alt-tab, a star keeps the juggler juggling.
 
 ## License
