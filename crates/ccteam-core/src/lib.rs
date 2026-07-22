@@ -47,6 +47,10 @@ pub mod host_registry;
 // `ccteam-im::hub` so this primitives leaf stays free of an async HTTP + sha2
 // dependency.
 pub mod hub;
+// v0.9.7 (PRD F3.1/F3.4) — install-channel detection + lazy latest-version
+// check backing `ccteam update` / `ccteam status` / `doctor`.
+pub mod install_channel;
+pub mod version_check;
 // Delegated vendor-plugin install (marketplace pointer → settings.local.json).
 pub mod marketplace_plugin;
 pub mod model_catalog;
@@ -176,6 +180,13 @@ pub use defaults::{
     claude_jobs_dir_from_env, state_json_path as claude_state_json_path, CLAUDE_BIN_ENV,
     CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, DEFAULT_CLAUDE_SID, DEFAULT_TURN_TIMEOUT_SECS,
     GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+};
+pub use install_channel::{
+    detect as detect_install_channel, install_channel_marker_path, suggested_update_command,
+    InstallChannel, InstallMarker, STANDALONE_INSTALL_PIPELINE,
+};
+pub use version_check::{
+    cached_latest, maybe_refresh_latest, update_available, version_cache_path, VersionCache,
 };
 // HarnessAdapter and its cross-vendor types live in ccteam-harness.
 // `UnifiedTokenUsage` is still re-exported below via
