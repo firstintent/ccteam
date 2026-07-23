@@ -650,10 +650,12 @@ pub struct TurnForm {
 /// - `kind: "image" | "file"` → `path` names a file previously stored by
 ///   `POST /projects/{slug}/uploads` (validated to live under THAT session's
 ///   project `.ccteam/uploads/` — the API accepts no arbitrary paths).
-/// - `kind: "skill"` → `name` is an installed skill id
-///   (`.claude/skills/<name>/SKILL.md`); the turn gains a self-describing
-///   "read this skill file and follow it" line, which works identically for
-///   every vendor (a skill is prompt-layer markdown any agent can `Read`).
+/// - `kind: "skill"` → `name` is a skill id. Omitted / `scope: "project"`
+///   resolves the project-local skill; `scope: "global"` resolves a possibly
+///   nested id in the admin's user-level library. The turn gains a
+///   self-describing "read this skill file and follow it" line, which works
+///   identically for every vendor (a skill is prompt-layer markdown any agent
+///   can `Read`).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TurnAttachment {
     /// `"image"` / `"file"` / `"skill"`.
@@ -664,6 +666,10 @@ pub struct TurnAttachment {
     /// Display name; for `kind: "skill"` the skill id (required).
     #[serde(default)]
     pub name: Option<String>,
+    /// Skill source: omitted / `"project"` keeps the project-local behavior;
+    /// `"global"` resolves a nested id in the admin's user-level library.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Render the skill-attachment line for the session's vendor — the ONE seam
@@ -706,6 +712,7 @@ fn build_turn_text_with_attachments(
     text: &str,
     attachments: &[TurnAttachment],
     project_dir: &std::path::Path,
+    skills_dir: &std::path::Path,
     vendor: &str,
 ) -> Result<String, String> {
     use ccteam_im::transport::{attachment_line, AttachmentKind, ChannelAttachment};
@@ -713,8 +720,16 @@ fn build_turn_text_with_attachments(
     let canonical_uploads = uploads_root.canonicalize().ok();
     let mut lines: Vec<String> = Vec::new();
     for att in attachments {
+        let scope = match att.scope.as_deref() {
+            None | Some("project") => "project",
+            Some("global") => "global",
+            Some(other) => return Err(format!("invalid attachment scope: {other}")),
+        };
         match att.kind.as_str() {
             "image" | "file" => {
+                if scope == "global" {
+                    return Err("attachment scope `global` is only valid for skills".into());
+                }
                 let Some(path) = att.path.as_deref().filter(|p| !p.trim().is_empty()) else {
                     return Err(format!("attachment kind `{}` requires `path`", att.kind));
                 };
@@ -751,6 +766,16 @@ fn build_turn_text_with_attachments(
                 let Some(id) = att.name.as_deref().filter(|n| !n.trim().is_empty()) else {
                     return Err("attachment kind `skill` requires `name` (the skill id)".into());
                 };
+                if scope == "global" {
+                    ccteam_core::validate_skill_library_id(id)
+                        .map_err(|_| format!("invalid skill id: {id}"))?;
+                    let md = skills_dir.join(id).join("SKILL.md");
+                    if !md.is_file() {
+                        return Err(format!("skill not in library: {id}"));
+                    }
+                    lines.push(skill_attachment_line(vendor, id, &md));
+                    continue;
+                }
                 // Same charset rule as the skill write path — subsumes any
                 // path traversal (`/`, `\`, `..` all rejected).
                 if !id
@@ -809,6 +834,15 @@ pub(crate) async fn handle_session_turn(
     if let Some(deny) = gate_sid(&app, &identity, &sid).await {
         return deny;
     }
+    let has_global_attachment = form
+        .attachments
+        .iter()
+        .any(|att| att.scope.as_deref() == Some("global"));
+    if has_global_attachment {
+        if let Some(deny) = crate::auth::deny_non_admin(&identity) {
+            return deny;
+        }
+    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -858,11 +892,36 @@ pub(crate) async fn handle_session_turn(
             return unknown_session(&sid);
         };
         // Weave attachments into the turn text (the web peer of the IM
-        // inbound attachment grammar). Uploads live on the daemon host, so a
-        // remote-host session can't see them — readable error, no silent rot.
+        // inbound attachment grammar). Project uploads and the global library
+        // live on the daemon host, so a remote-host session can't see them —
+        // readable error, no silent rot.
         let text = if form.attachments.is_empty() {
             form.text
         } else {
+            let Some(resolved) = guard.session_resolve(&sid) else {
+                return unknown_session(&sid);
+            };
+            if has_global_attachment {
+                let catalog_host = super::uploads::project_host(&app, &resolved.project);
+                let execution_host = if catalog_host != "local" {
+                    Some(catalog_host.as_str())
+                } else if !view.host.is_empty() && view.host != "local" {
+                    Some(view.host.as_str())
+                } else {
+                    None
+                };
+                if let Some(host) = execution_host {
+                    return create_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "project `{}` runs on remote host `{host}` — maintain \
+                             ~/.ccteam/skills on the execution host before attaching global skills",
+                            resolved.project
+                        ),
+                        mode,
+                    );
+                }
+            }
             if !view.host.is_empty() && view.host != "local" {
                 return create_error(
                     StatusCode::BAD_REQUEST,
@@ -874,13 +933,11 @@ pub(crate) async fn handle_session_turn(
                     mode,
                 );
             }
-            let Some(resolved) = guard.session_resolve(&sid) else {
-                return unknown_session(&sid);
-            };
             match build_turn_text_with_attachments(
                 &form.text,
                 &form.attachments,
                 &resolved.project_dir,
+                &app.paths.skills_dir(),
                 &view.vendor,
             ) {
                 Ok(text) => text,
