@@ -2735,14 +2735,24 @@ impl Gateway {
         let mut options: Vec<MessageOption> = visible
             .into_iter()
             .map(|s| {
-                // The text rows already carry vendor / role / model / title.
-                // Buttons are action-only: sid, plus a marker for the current
-                // session. Their callback payload remains unchanged.
-                let label = if Some(&s.id) == current_sid.as_ref() {
+                // Label = sid (✓ marks the current session) + the session's
+                // title, moved here off the text rows: the terse tree keeps the
+                // machine-ish `sid:project:vendor:role` line, the button carries
+                // the human name. A long title is clipped to
+                // `SESSION_BUTTON_TITLE_MAX_COLS` display cols so one verbose
+                // title can't widen every button (the left-align padding below
+                // pads all labels to the widest). Callback `data` is unchanged.
+                let mut label = if Some(&s.id) == current_sid.as_ref() {
                     format!("✓ {}", s.id)
                 } else {
                     s.id.clone()
                 };
+                if let Some(title) = self.session_title(s) {
+                    label.push_str(&format!(
+                        " 「{}」",
+                        truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
+                    ));
+                }
                 MessageOption {
                     data: format!("nav:use:{}", s.id),
                     label,
@@ -5753,13 +5763,12 @@ impl Gateway {
                 .map(String::as_str)
                 .unwrap_or("idle");
             row = format!("{vendor_tag:<10} {} · {row}", activity_marker(activity));
-            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host…
+            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
+            // (The session title is deliberately NOT on the text row anymore —
+            // it lives on the switch button label instead; see
+            // `session_switch_options`.)
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
-            }
-            // v0.8.22 P1 — …and the session's title when it has one.
-            if let Some(title) = self.session_title(s) {
-                row.push_str(&format!(" 「{title}」"));
             }
             // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
             // an outstanding HITL approval. Prefixed last so it stays the
@@ -8842,6 +8851,34 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 /// button whose payload would exceed it; slugs/sids are short, so this only
 /// guards a pathological slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
+
+/// Max display columns a session title may occupy inside a `/sessions` switch
+/// button label. A longer title is clipped with `…` so one verbose title can't
+/// widen every button — the left-align padding aligns all labels to the widest.
+const SESSION_BUTTON_TITLE_MAX_COLS: usize = 24;
+
+/// Clip `s` to at most `max_cols` DISPLAY columns, appending `…` on overflow.
+/// Column-based (not char count) so a CJK double-width title clips at a stable
+/// visual width; the ellipsis reserves one column.
+fn truncate_cols(s: &str, max_cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let budget = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
 
 /// Right-pad every picker label to the set's widest row so Telegram's
 /// centre-aligned button text reads as a LEFT-aligned list (owner req,
@@ -12836,17 +12873,18 @@ mod tests {
         assert!(mock[0].contains("s2:alpha:Claude:reviewer"), "{}", mock[0]);
     }
 
-    /// `/sessions` text owns the session information; picker buttons are a
-    /// complementary action surface with only the sid and a current marker.
-    /// Tail-padding remains visual-only so Telegram left-aligns the labels.
+    /// Picker buttons carry the sid + the session's TITLE (moved here off the
+    /// text rows), a `✓` marking the current session — but NOT the vendor/role,
+    /// which stay on the information-rich text rows. Tail-padding stays
+    /// visual-only so Telegram left-aligns the variable-width labels.
     #[tokio::test]
-    async fn session_picker_labels_are_compact_actions() {
+    async fn session_picker_labels_carry_sid_and_title() {
         use unicode_width::UnicodeWidthStr;
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
-        // One roleless session + one named/title-bearing session. Neither
-        // button should repeat the facets/title carried by the text rows.
+        // One roleless untitled session + one titled session: the untitled
+        // button is a bare sid, the titled one appends its 「title」.
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -12863,20 +12901,17 @@ mod tests {
         let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
         let s1_text = s1.label.trim_end_matches('\u{2800}');
         let s2_text = s2.label.trim_end_matches('\u{2800}');
+        // Untitled → bare sid; titled + current → `✓ sid 「title」`.
         assert_eq!(s1_text, "s1");
-        assert_eq!(s2_text, "✓ s2");
+        assert_eq!(s2_text, "✓ s2 「A long review title」");
         for label in [s1_text, s2_text] {
             assert!(
                 !label.contains("claude"),
-                "no vendor duplication: {label:?}"
+                "no vendor on the button: {label:?}"
             );
             assert!(
                 !label.contains("reviewer"),
-                "no role duplication: {label:?}"
-            );
-            assert!(
-                !label.contains("review title"),
-                "no title duplication: {label:?}"
+                "no role on the button: {label:?}"
             );
         }
         // Both labels padded to the same display width, with braille blanks.
@@ -12889,6 +12924,41 @@ mod tests {
             s1.label.ends_with('\u{2800}'),
             "shorter row is tail-padded: {:?}",
             s1.label
+        );
+    }
+
+    /// A verbose title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS` display
+    /// columns (ellipsis included) so one long title can't widen every button.
+    #[tokio::test]
+    async fn session_picker_title_is_width_capped() {
+        use unicode_width::UnicodeWidthStr;
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let long = "A really really long session title that keeps going";
+        gateway.rename_session("s1", long).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let opts = gateway.session_switch_options(&chat, false);
+        let label = opts[0].label.trim_end_matches('\u{2800}');
+        let title = label
+            .split_once('「')
+            .and_then(|(_, rest)| rest.strip_suffix('」'))
+            .expect("titled button label");
+        assert!(
+            title.ends_with('…'),
+            "clipped title ends with an ellipsis: {title:?}"
+        );
+        assert!(
+            title.width() <= SESSION_BUTTON_TITLE_MAX_COLS,
+            "within cap: {title:?}"
+        );
+        assert!(
+            long.starts_with(title.trim_end_matches('…')),
+            "prefix of the real title"
         );
     }
 
@@ -15694,14 +15764,14 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        // v0.8.22 P1 — s2's first plain message ("where am i") auto-titles it
-        // (rule-based truncation, no LLM); s1 never sent a plain message
-        // (only the `/new` directive), so it stays untitled/bare.
-        // v0.9.0 neutralization — s2 is roleless, so its `/sessions` row has an
-        // empty role field (`s2:beta:Claude:` + title).
+        // s2's first plain message ("where am i") auto-titles it, but the title
+        // now rides the switch BUTTON, not the text row (see
+        // `session_switch_options`); s1 never sent a plain message, so it is
+        // untitled either way. s2 is roleless → empty role field
+        // (`s2:beta:Claude:`).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude: 「where am i」\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
     }
 
@@ -16051,16 +16121,15 @@ mod tests {
         assert_eq!(after, vec!["alpha-reviewer-s1 echo: still here?"]);
 
         // The session list shows the new role bound to the same sid (no s2).
-        // v0.8.22 P1 — s1's first plain message ("hi") auto-titled it; the
-        // title is sid-scoped (not role-scoped), so it survives the `/role`
-        // re-spawn untouched.
+        // (The auto-title from "hi" is sid-scoped and survives the `/role`
+        // re-spawn, but now rides the switch button, not this text row.)
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -16125,15 +16194,15 @@ mod tests {
             "a bad /role must not re-spawn (no teardown of the live pane)"
         );
 
-        // The session is still resolvable, still s1, still `cto`.
-        // v0.8.22 P1 — carries the title auto-set from its earlier "hi".
+        // The session is still resolvable, still s1, still `cto`. (The title
+        // auto-set from "hi" now rides the switch button, not this text row.)
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「hi」"]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
         );
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
@@ -16230,16 +16299,26 @@ mod tests {
             vec!["已重命名 s1 → my custom title\n↓ 本项目会话 → /sessions"]
         );
 
-        // /sessions shows the rename.
+        // The title moved off the /sessions text row onto the switch button.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
         assert_eq!(
             listing,
-            vec![
-                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
-            ]
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
+        );
+        // …and the rename SURFACES on the picker button.
+        let chat = ChatKey::new("mock", "chat-1", "alice");
+        let s1_button = |g: &Gateway| {
+            g.session_switch_options(&chat, false)
+                .into_iter()
+                .find(|o| o.id == "s1")
+                .map(|o| o.label.trim_end_matches('\u{2800}').to_string())
+        };
+        assert_eq!(
+            s1_button(&gateway).as_deref(),
+            Some("✓ s1 「my custom title」")
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -16253,9 +16332,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing2,
-            vec![
-                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
-            ],
+            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
+        );
+        assert_eq!(
+            s1_button(&gateway).as_deref(),
+            Some("✓ s1 「my custom title」"),
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
