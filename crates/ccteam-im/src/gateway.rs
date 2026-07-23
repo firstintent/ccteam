@@ -17,7 +17,7 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
+    format_tokens, list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
@@ -191,21 +191,35 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
-/// Snapshot used by the pure live-capacity eviction selector. `None`
-/// `last_event_at` is deliberately treated as newest: a just-spawned session
-/// has not emitted an event yet and must not look older than every timestamped
-/// session.
+/// Snapshot used by the pure live-capacity eviction selector.
+///
+/// `last_active` is the PERSISTED `meta.json.last_active` (RFC3339,
+/// lexically sortable), refreshed on every completed turn by
+/// `refresh_session_activity_meta` — deliberately NOT the in-process
+/// `GatewaySession::last_event_at` (`Instant`), which resets to `None` every
+/// time a session is (re)constructed in memory (daemon restart, cold `/use`
+/// resume). Under the old `Instant`-based ranking, `None` was treated as
+/// "newest" (a reasonable default for a session that TRULY just spawned), but
+/// a rebuilt/restored session also starts at `None` despite having a real,
+/// possibly ancient, history — making a long-dormant-but-still-live session
+/// permanently eviction-immune (it always looked "freshest") while genuinely
+/// recently-used sessions got evicted around it. `last_active` fixes this: it
+/// is accurate across restarts/rebuilds because it lives on disk, not in the
+/// process. Empty (unreadable/never-written meta) sorts FIRST — a fail-safe
+/// toward evictable, not toward immunity.
 #[derive(Debug, Clone)]
 struct LiveCapacityCandidate {
     sid: String,
     idle: bool,
-    last_event_at: Option<Instant>,
+    last_active: String,
     waiting_approval: bool,
 }
 
 /// Select the least-recently-active eligible live session. Idle sessions are
 /// always preferred; busy sessions are considered only when no idle candidate
-/// remains. Sids and HITL waiters are excluded before ordering.
+/// remains. Among ties, an older (lexically smaller) `last_active` wins; a sid
+/// compare is the final deterministic tiebreak. Sids and HITL waiters are
+/// excluded before ordering.
 fn select_live_capacity_eviction(
     candidates: &[LiveCapacityCandidate],
     excluded: &HashSet<String>,
@@ -216,12 +230,8 @@ fn select_live_capacity_eviction(
         .min_by(|a, b| {
             b.idle
                 .cmp(&a.idle)
-                .then_with(|| match (a.last_event_at, b.last_event_at) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.sid.cmp(&b.sid),
-                })
+                .then_with(|| a.last_active.cmp(&b.last_active))
+                .then_with(|| a.sid.cmp(&b.sid))
         })
         .map(|candidate| candidate.sid.clone())
 }
@@ -2510,7 +2520,7 @@ impl Gateway {
                     );
                     Ok(None)
                 } else {
-                    Ok(Some(self.render_projects()))
+                    Ok(Some(self.render_projects(chat)))
                 }
             }
             "/help" => Ok(Some(format!(
@@ -2532,7 +2542,12 @@ impl Gateway {
     /// clear the active session so the next message spawns one there.
     fn change_project(&mut self, chat: &ChatKey, project: &str) -> Result<String> {
         self.ensure_project_loaded(project);
-        if !self.projects.contains_key(project) {
+        // Existence AND ownership in one gate (same policy as the picker /
+        // `/projects` / web REST): a chat may `/cd` only into a project it can
+        // SEE, so a tenant can't switch into — and then spawn sessions in — the
+        // admin's project by typing its slug. A hidden or nonexistent slug reads
+        // identically ("unknown project"), disclosing nothing.
+        if !self.can_see_project(chat, project) {
             return Err(anyhow!("unknown project: {project}"));
         }
         self.current_project
@@ -2633,17 +2648,49 @@ impl Gateway {
         crate::transport::platform_of(channel) == "telegram"
     }
 
-    /// Project slugs for `/projects` + the picker — the SAME source web and
-    /// `ccteam status` use (`collect_projects`: config.yaml filtered to on-disk
-    /// `state.json`), falling back to the in-memory routing cache when
-    /// `project_paths` isn't wired (unit tests without `enable_project_creation`).
-    fn project_slugs(&self) -> Vec<String> {
+    /// Project slugs `chat` may SEE — backs `/projects`, the `/cd` picker, and
+    /// the `/status` project count. Same source web and `ccteam status` use
+    /// (`collect_projects`: config.yaml filtered to on-disk `state.json`),
+    /// filtered through the SAME ownership policy the web REST project list
+    /// applies (`build_projects` → `Identity::can_see_owner`): a tenant sees only
+    /// its own `user:<id>` projects, the operator/admin sees every non-tenant
+    /// project. This is the IM twin of `build_projects`, so IM and web never
+    /// diverge on who sees which project (the multi-user isolation contract).
+    ///
+    /// Falls back to the UNFILTERED in-memory routing cache only when
+    /// `project_paths` isn't wired (unit tests without `enable_project_creation`),
+    /// where no persisted owner is available; production always has the paths.
+    fn visible_project_slugs(&self, chat: &ChatKey) -> Vec<String> {
         if let Some(paths) = &self.project_paths {
             if let Ok(summaries) = ccteam_core::collect_projects(paths) {
-                return summaries.iter().map(|s| s.state.slug.clone()).collect();
+                return summaries
+                    .iter()
+                    .filter(|s| Self::chat_can_see_project_owner(chat, s.state.owner.as_deref()))
+                    .map(|s| s.state.slug.clone())
+                    .collect();
             }
         }
         self.projects.keys().cloned().collect()
+    }
+
+    /// Whether `chat` may see/address the project `slug` — existence AND
+    /// ownership, the gate behind `/cd <slug>`. Existence via the in-memory
+    /// registry (as before); ownership via the SAME core policy as the picker /
+    /// web REST, so a tenant can't `/cd` into the admin's project by typing its
+    /// slug (visibility alone isn't enough — addressing must be gated too).
+    fn can_see_project(&self, chat: &ChatKey, slug: &str) -> bool {
+        self.projects.contains_key(slug)
+            && Self::chat_can_see_project_owner(chat, self.project_owner(slug).as_deref())
+    }
+
+    /// The persisted `ProjectState.owner` of `slug` (`None` when unset or the
+    /// state can't be read — treated as unowned: operator-visible, tenant-hidden,
+    /// a fail-safe that matches the web ACL).
+    fn project_owner(&self, slug: &str) -> Option<String> {
+        self.project_paths
+            .as_ref()
+            .and_then(|paths| ccteam_core::ProjectState::load(&paths.project_state(slug)).ok())
+            .and_then(|state| state.owner)
     }
 
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
@@ -2652,7 +2699,7 @@ impl Gateway {
     fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat);
         let mut options: Vec<MessageOption> = self
-            .project_slugs()
+            .visible_project_slugs(chat)
             .into_iter()
             .map(|slug| {
                 // A consistent leading glyph (✓ current / ▸ others) lines the
@@ -2698,14 +2745,25 @@ impl Gateway {
         let mut options: Vec<MessageOption> = visible
             .into_iter()
             .map(|s| {
-                // The text rows already carry vendor / role / model / title.
-                // Buttons are action-only: sid, plus a marker for the current
-                // session. Their callback payload remains unchanged.
-                let label = if Some(&s.id) == current_sid.as_ref() {
-                    format!("✓ {}", s.id)
+                // Label = `sid vendor (title)` (✓ prefixes the current
+                // session), arranged sid → vendor → title — same `sid vendor`
+                // opening as the text rows. The button carries the human name;
+                // a long title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS`
+                // display cols so one verbose title can't widen every button
+                // (the left-align padding below pads all labels to the widest).
+                // Callback `data` is unchanged.
+                let marker = if Some(&s.id) == current_sid.as_ref() {
+                    "✓ "
                 } else {
-                    s.id.clone()
+                    ""
                 };
+                let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
+                if let Some(title) = self.session_title(s) {
+                    label.push_str(&format!(
+                        " ({})",
+                        truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
+                    ));
+                }
                 MessageOption {
                     data: format!("nav:use:{}", s.id),
                     label,
@@ -5457,6 +5515,39 @@ impl Gateway {
         owner_identity.starts_with("user:")
     }
 
+    /// Map an IM/web chat to the shared core ownership identity `(user_id,
+    /// is_admin)` that `ccteam_core::identity::can_see_owner` expects — the
+    /// IM-side twin of the web [`crate::auth::Identity`], so BOTH frontends
+    /// resolve PROJECT visibility through ONE policy (web/IM symmetry). A
+    /// per-tenant IM bot (`<platform>@<tenant>`) or a per-user web token is that
+    /// tenant (`user:<tenant>`, non-admin); every other chat — the owner's global
+    /// IM bot or the admin web console — is the operator/admin (`user:web-api`,
+    /// sees all non-tenant projects, never a tenant's private ones). HONEST
+    /// SCOPE: like the session ACL this is soft (UX) isolation under one OS uid;
+    /// treating every non-tenant-bot chat as the operator mirrors how the session
+    /// pool (`owner_identity_visible`) already grants the `user:` view.
+    fn project_acl_identity(chat: &ChatKey) -> (String, bool) {
+        if let Some(tid) = crate::transport::tenant_of_bot_channel(&chat.channel) {
+            return (tid.to_string(), false);
+        }
+        if chat.channel == "web" && chat.chat_id != ccteam_core::identity::ADMIN_WEB_ID {
+            return (chat.chat_id.clone(), false);
+        }
+        (ccteam_core::identity::ADMIN_WEB_ID.to_string(), true)
+    }
+
+    /// Whether `chat` may see/address a project whose persisted
+    /// `ProjectState.owner` is `owner`. Delegates to the SAME core policy the web
+    /// REST project ACL uses (`build_projects` / `can_see_project` →
+    /// `ccteam_core::identity::can_see_owner`), so a tenant's IM bot sees exactly
+    /// the projects its web console does: it never sees the admin's projects, and
+    /// the admin never peeks into a tenant's. Fixes the IM project-visibility
+    /// leak where `/projects` / the `/cd` picker showed every owner's projects.
+    fn chat_can_see_project_owner(chat: &ChatKey, owner: Option<&str>) -> bool {
+        let (user_id, is_admin) = Self::project_acl_identity(chat);
+        ccteam_core::identity::can_see_owner(&user_id, is_admin, owner)
+    }
+
     /// Point the chat's active session at an existing session owned by this
     /// chat in `project` (deterministic: smallest session index), returning its
     /// id. When none exists, clear the active session so the next message spawns
@@ -5565,10 +5656,12 @@ impl Gateway {
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
         // web reply MUST stay the bare `id:project:vendor:role` rows (no banner /
-        // scoping / footer / history section — those would break
-        // `parse_sessions_reply`). The IM text surface, which has no chrome,
-        // instead gets a current-project banner + project scoping + an
-        // `/sessions all` footer + a "最近结束" history section (v0.8.22 P0-4).
+        // scoping / footer — those would break `parse_sessions_reply`). The IM
+        // text surface, which has no chrome, instead gets a current-project
+        // banner + project scoping + an `/sessions all` footer, and compact
+        // `sid vendor[.model][.effort][.window(pct%)]` rows (leading
+        // `sid vendor` mirrors the switch buttons; no project slug per row —
+        // the banner names it).
         let is_web = chat.channel == "web";
         // Default scope = the chat's CURRENT project; `all` (and web) lists the
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
@@ -5616,80 +5709,72 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
-        // v0.8.22 P0-4 — up to 5 most-recently-ended sessions this chat can
-        // see (same visibility rule as the live list), scoped like the live
-        // list (current project unless `all`). Reuses the existing on-disk
-        // `meta.json` scan (`list_history_sessions`) — no new store. IM-only:
-        // every web return below happens before this is rendered, so
-        // `parse_sessions_reply` still only ever sees live
-        // `id:project:vendor:role` rows.
-        let history = if is_web {
-            Vec::new()
-        } else {
-            let slugs: Vec<String> = if all {
-                self.projects.keys().cloned().collect()
-            } else {
-                vec![cur.clone()]
-            };
-            self.recent_ended_sessions(chat, &slugs, 5)
-        };
         if visible.is_empty() {
             if is_web {
                 return "no sessions".to_string();
             }
-            let head = if elsewhere > 0 {
-                format!(
+            if elsewhere > 0 {
+                return format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
-                )
-            } else {
-                format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个")
-            };
-            return Self::append_history_section(head, &history);
+                );
+            }
+            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
         }
-        let activity_by_sid = if is_web {
-            std::collections::HashMap::new()
-        } else {
-            self.session_activity_snapshot(&visible)
-        };
         // Render each visible session's row (async `thread_status`) once,
         // keyed by sid for the IM tree; web keeps the flat bare-row feed.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
         let mut rendered: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(visible.len());
         for s in &visible {
-            // P3 — append model + ctx from the owning adapter's
-            // `thread_status`. Statusless adapters (bg / default) report
-            // `ThreadStatus::default()` → `status_suffix() == None` → the
-            // legacy `id:project:vendor:role` row is unchanged. Per-session
-            // failures degrade to the bare row (never break the listing).
-            let base = format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role);
-            let suffix = match s.adapter.thread_status(&s.thread).await {
-                Ok(status) => status.status_suffix(),
-                Err(_) => None,
-            };
-            let mut row = match suffix {
-                Some(sfx) => format!("{base} — {sfx}"),
-                None => base,
-            };
-            // Web rows stay untouched (`parse_sessions_reply` splits on exactly
-            // 4 colon fields and must not see extra content appended).
+            // P3 — model + ctx from the owning adapter's `thread_status`.
+            // Statusless adapters (bg / default) report `ThreadStatus::default()`
+            // (no model / no context). Per-session failures degrade to the bare
+            // row (never break the listing).
+            let status = (s.adapter.thread_status(&s.thread).await).ok();
+            // Web rows stay the machine-parsed `sid:project:vendor:role` feed +
+            // the full, shared `status_suffix()` (matches Codex /status;
+            // `parse_sessions_reply` splits on exactly 4 colon fields).
             if is_web {
-                web_rows.push(row);
+                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
+                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
+                    Some(sfx) => format!("{base} — {sfx}"),
+                    None => base,
+                });
                 continue;
             }
-            let vendor_tag = format!("[{}]", vendor_str(s.vendor));
-            let activity = activity_by_sid
-                .get(&s.id)
-                .map(String::as_str)
-                .unwrap_or("idle");
-            row = format!("{vendor_tag:<10} {} · {row}", activity_marker(activity));
-            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host…
+            // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
+            // with `sid vendor` (the SAME opening as the switch button —
+            // `session_switch_options`: `sid vendor (title)`), then — when the
+            // adapter reports them — `.model`, `.effort`, and `.window(pct%)`
+            // context: the TOTAL window (absolute, via the same
+            // `format_tokens` humanizer `ContextUsage::render` uses) + the
+            // used percentage, but NOT the absolute used count. NO project
+            // slug (the `📁 当前项目:` header already names it; `/sessions all`
+            // spans projects without a per-row slug), NO role, NO `ctx` label
+            // (all on /status); the title lives on the button; the vendor tag
+            // + activity dot are gone.
+            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
+            if let Some(st) = &status {
+                if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
+                    row.push_str(&format!(
+                        ".{}",
+                        strip_vendor_prefix(vendor_str(s.vendor), m)
+                    ));
+                }
+                if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
+                    row.push_str(&format!(".{e}"));
+                }
+                if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
+                    row.push_str(&format!(
+                        ".{}({:.0}%)",
+                        format_tokens(ctx.window_tokens),
+                        ctx.pct()
+                    ));
+                }
+            }
+            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
-            }
-            // v0.8.22 P1 — …and the session's title when it has one.
-            if let Some(title) = self.session_title(s) {
-                row.push_str(&format!(" 「{title}」"));
             }
             // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
             // an outstanding HITL approval. Prefixed last so it stays the
@@ -5769,7 +5854,7 @@ impl Gateway {
                 "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
             ));
         }
-        Self::append_history_section(out, &history)
+        out
     }
 
     /// Best-effort `last_active` (RFC3339) for a LIVE session, read from its
@@ -5851,64 +5936,6 @@ impl Gateway {
                 (session.id.clone(), activity.to_string())
             })
             .collect()
-    }
-
-    /// Up to `limit` most-recently-ended sessions across `slugs` that `chat`
-    /// may see (same rule as the live list: own sessions + the shared `user:`
-    /// pool for the admin/web querier). Draws from on-disk `meta.json` via
-    /// [`Gateway::list_history_sessions`] (already excludes anything still in
-    /// the live map) — no new store, no new persistence.
-    fn recent_ended_sessions(
-        &self,
-        chat: &ChatKey,
-        slugs: &[String],
-        limit: usize,
-    ) -> Vec<SessionMeta> {
-        let mut metas: Vec<SessionMeta> = slugs
-            .iter()
-            .flat_map(|slug| self.list_history_sessions(slug))
-            .filter(|m| Self::owner_identity_visible(chat, &m.owner))
-            .collect();
-        metas.sort_by(|a, b| {
-            b.last_active
-                .cmp(&a.last_active)
-                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
-        });
-        metas.truncate(limit);
-        metas
-    }
-
-    /// Append the "最近结束" section (when non-empty) to an IM `/sessions`
-    /// reply. Each row carries `sid:project:vendor:role`, a relative
-    /// `last_active` time, and a `/use <sid>` resume hint — the cold-resume
-    /// path already exists (see `/use` handling); this just gives it a
-    /// visible entry point.
-    fn append_history_section(head: String, history: &[SessionMeta]) -> String {
-        if history.is_empty() {
-            return head;
-        }
-        let rows: Vec<String> = history
-            .iter()
-            .map(|m| {
-                let role = if m.role.is_empty() { "—" } else { &m.role };
-                // v0.8.22 P1 — show the session's title when it has one
-                // (fallback: the existing bare role/sid row, unchanged).
-                let title_suffix = m
-                    .title
-                    .as_deref()
-                    .map(|t| format!(" 「{t}」"))
-                    .unwrap_or_default();
-                format!(
-                    "{}:{}:{:?}:{role}{title_suffix} — {} → /use {}",
-                    m.sid,
-                    m.slug,
-                    m.vendor,
-                    relative_time_zh(&m.last_active),
-                    m.sid
-                )
-            })
-            .collect();
-        format!("{head}\n\n📜 最近结束:\n{}", rows.join("\n"))
     }
 
     /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
@@ -6035,11 +6062,11 @@ impl Gateway {
         // the two surfaces read identically.
         let title = self.session_title(s);
         let mut out = format!(
-            "🧭 {}\n📍 当前会话 {} · {} · {:?} · {role} · {state} {detail}",
+            "🧭 {}\n📍 当前会话 {} · {} · {} · {role} · {state} {detail}",
             context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
             s.id,
             s.project,
-            s.vendor
+            vendor_str(s.vendor)
         );
 
         // Project working-tree PATH — disambiguates an auto-appended slug
@@ -6165,18 +6192,21 @@ impl Gateway {
         }
         // Owner req — the last line points at the full project list (with a live
         // count), replacing the old cross-project `/sessions all` fleet pointer.
-        let nproj = self.project_slugs().len();
+        // Count only the projects THIS chat may see (same ACL as `/projects`), so
+        // the pointer never advertises another owner's projects.
+        let nproj = self.visible_project_slugs(chat).len();
         out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
         out
     }
 
-    fn render_projects(&self) -> String {
-        // `project_slugs` reads the SAME source web / `ccteam status` use —
-        // `collect_projects` (config.yaml filtered to projects that have an
-        // on-disk `state.json`) — so IM `/projects` never diverges from the
-        // other surfaces: a half-registered project (in config, no state.json)
-        // shows in NEITHER, and a removed project disappears from BOTH at once.
-        self.project_slugs().join("\n")
+    fn render_projects(&self, chat: &ChatKey) -> String {
+        // `visible_project_slugs` reads the SAME source web / `ccteam status` use
+        // — `collect_projects` (config.yaml filtered to projects that have an
+        // on-disk `state.json`) — filtered by the SAME per-owner ACL web applies,
+        // so IM `/projects` never diverges from the other surfaces: a
+        // half-registered project (in config, no state.json) shows in NEITHER, a
+        // removed project disappears from BOTH, and each owner sees only its own.
+        self.visible_project_slugs(chat).join("\n")
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -6224,7 +6254,7 @@ impl Gateway {
         let mut lines: Vec<String> = self
             .sessions
             .values()
-            .map(|s| format!("{}:{}:{:?}:{}", s.id, s.project, s.vendor, s.role))
+            .map(|s| format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role))
             .collect();
         lines.sort();
         for orphan in &inventory.orphans {
@@ -6847,7 +6877,7 @@ impl Gateway {
                             .lock()
                             .map(|started| started.is_none())
                             .unwrap_or(false),
-                        last_event_at: session.last_event_at.lock().ok().and_then(|last| *last),
+                        last_active: self.session_last_active(session),
                         waiting_approval: pending.pending_for_sid(&session.id).is_some(),
                     })
                     .collect::<Vec<_>>()
@@ -7810,6 +7840,33 @@ fn vendor_str(v: AgentVendor) -> &'static str {
     }
 }
 
+/// Model ids commonly repeat the vendor name as their own prefix
+/// (`claude-opus-4-8`, `grok-4.5`) — since the compact `/sessions` row
+/// ALREADY leads with the vendor (`sid vendor.model…`), showing the model
+/// verbatim reads redundant: `claude.claude-opus-4-8[1m]`. This strips a
+/// leading `{vendor}` + separator (`-`/`_`/`.`/`/`) for DISPLAY ONLY —
+/// `claude.opus-4-8[1m]` — never touching the real model id used for
+/// `--model` respawns / cost accounting / persistence. A false-positive
+/// partial-word match (no separator boundary) or a match that would leave
+/// nothing after stripping returns `model` unchanged.
+fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
+    let lower = model.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix(vendor) else {
+        return model;
+    };
+    let sep_len = match rest.as_bytes().first() {
+        None => 0,
+        Some(b'-' | b'_' | b'.' | b'/') => 1,
+        Some(_) => return model,
+    };
+    let stripped = &model[vendor.len() + sep_len..];
+    if stripped.is_empty() {
+        model
+    } else {
+        stripped
+    }
+}
+
 fn activity_marker(activity: &str) -> &'static str {
     match activity {
         "working" => "🟡 working",
@@ -8663,45 +8720,6 @@ fn humanize_dur(d: std::time::Duration) -> String {
     }
 }
 
-/// v0.8.22 P0-4 — Chinese relative-time phrase for an RFC3339 timestamp,
-/// matching the surrounding hardcoded-Chinese IM copy ("3分钟前"/"昨天"/
-/// "3天前"). Unparseable/empty input renders as `"—"` rather than panicking a
-/// `/sessions` reply (a missing `meta.json` read is already handled upstream
-/// by [`Gateway::session_last_active`] / [`Gateway::recent_ended_sessions`]).
-fn relative_time_zh(rfc3339: &str) -> String {
-    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-        return "—".to_string();
-    };
-    let now = chrono::Utc::now();
-    let secs = now
-        .signed_duration_since(dt.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .max(0);
-    if secs < 60 {
-        return "刚刚".to_string();
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}分钟前");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}小时前");
-    }
-    let days = hours / 24;
-    if days == 1 {
-        return "昨天".to_string();
-    }
-    if days < 7 {
-        return format!("{days}天前");
-    }
-    let weeks = days / 7;
-    if weeks < 5 {
-        return format!("{weeks}周前");
-    }
-    dt.format("%Y-%m-%d").to_string()
-}
-
 /// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
 /// [`ThreadHandle`], or `None` for a tmux / Codex handle (which has no
 /// stream-json uuid). Read from `raw_extras["vendor_uuid"]` — the field both
@@ -8770,20 +8788,62 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 /// guards a pathological slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
 
-/// Right-pad every picker label to the set's widest row so Telegram's
+/// Max display columns a session title may occupy inside a `/sessions` switch
+/// button label. A longer title is clipped with `…` so one verbose title can't
+/// widen every button — the left-align padding aligns all labels to the widest.
+const SESSION_BUTTON_TITLE_MAX_COLS: usize = 32;
+
+/// Clip `s` to at most `max_cols` DISPLAY columns, appending `…` on overflow.
+/// Column-based (not char count) so a CJK double-width title clips at a stable
+/// visual width; the ellipsis reserves one column.
+fn truncate_cols(s: &str, max_cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let budget = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Floor for [`left_align_option_labels`]'s pad target: Telegram renders every
+/// option as its OWN full-width single-button row (one button per
+/// `inline_keyboard` row — see `TelegramChannel::send`), so its text is
+/// centered within the FULL row width, not a column sized to the option set.
+/// Padding rows to only the OBSERVED max-in-set (e.g. all bare sids like
+/// "s1"/"s2"/"s28") still centers a short block deep in a wide row — visually
+/// indistinguishable from plain centering. Padding every label out to at
+/// least this many columns pushes that block toward the row's left edge on a
+/// typical phone-width chat. Approximate by nature: the bot API exposes no
+/// client viewport, so this can undershoot (desktop) or overshoot slightly.
+const PICKER_LABEL_MIN_PAD_COLS: usize = 30;
+
+/// Right-pad every picker label to at least the widest row in the SET, or
+/// [`PICKER_LABEL_MIN_PAD_COLS`], whichever is larger — so Telegram's
 /// centre-aligned button text reads as a LEFT-aligned list (owner req,
-/// tg-6955). Telegram strips ordinary trailing whitespace from button
-/// labels, so the pad is U+2800 BRAILLE PATTERN BLANK — renders blank,
-/// survives the trim, ~1 cell wide.
+/// tg-6955) even when every option in the set is short. Telegram strips
+/// ordinary trailing whitespace from button labels, so the pad is U+2800
+/// BRAILLE PATTERN BLANK — renders blank, survives the trim, ~1 cell wide.
 fn left_align_option_labels(options: &mut [MessageOption]) {
     use unicode_width::UnicodeWidthStr;
-    let max = options
+    let observed_max = options
         .iter()
         .map(|o| o.label.as_str().width())
         .max()
         .unwrap_or(0);
+    let target = observed_max.max(PICKER_LABEL_MIN_PAD_COLS);
     for o in options.iter_mut() {
-        for _ in 0..max.saturating_sub(o.label.as_str().width()) {
+        for _ in 0..target.saturating_sub(o.label.as_str().width()) {
             o.label.push('\u{2800}');
         }
     }
@@ -8942,34 +9002,40 @@ mod tests {
         })
     }
 
-    fn capacity_candidate(
-        sid: &str,
-        idle: bool,
-        last_event_at: Option<Instant>,
-    ) -> LiveCapacityCandidate {
+    fn capacity_candidate(sid: &str, idle: bool, last_active: &str) -> LiveCapacityCandidate {
         LiveCapacityCandidate {
             sid: sid.to_string(),
             idle,
-            last_event_at,
+            last_active: last_active.to_string(),
             waiting_approval: false,
         }
     }
 
+    /// RFC3339 timestamp `secs_ago` seconds in the past — matches
+    /// `meta.json.last_active`'s format, which sorts correctly as a plain
+    /// string (the property `select_live_capacity_eviction` relies on).
+    fn capacity_ts(secs_ago: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339()
+    }
+
     #[test]
-    fn capacity_eviction_prefers_idle_oldest_and_none_is_newest() {
-        let now = Instant::now();
+    fn capacity_eviction_prefers_idle_over_busy_even_if_more_recently_active() {
         let candidates = vec![
-            capacity_candidate("idle-new", true, None),
-            capacity_candidate(
-                "idle-old",
-                true,
-                Some(now - std::time::Duration::from_secs(20)),
-            ),
-            capacity_candidate(
-                "busy-older",
-                false,
-                Some(now - std::time::Duration::from_secs(100)),
-            ),
+            capacity_candidate("idle-recent", true, &capacity_ts(1)),
+            capacity_candidate("busy-older", false, &capacity_ts(100)),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("idle-recent"),
+            "idle is preferred for eviction even over a busier-but-older session"
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_prefers_oldest_last_active_among_idle() {
+        let candidates = vec![
+            capacity_candidate("idle-new", true, &capacity_ts(5)),
+            capacity_candidate("idle-old", true, &capacity_ts(20)),
         ];
         assert_eq!(
             select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
@@ -8977,20 +9043,36 @@ mod tests {
         );
     }
 
+    /// THE BUG FIX — a candidate with no readable `last_active` (empty: no
+    /// meta, or a meta that never completed a turn) must be treated as the
+    /// OLDEST (most evictable), never the newest. The prior `Instant`-based
+    /// design treated its "no signal yet" case (`None`) as newest — correct
+    /// for a session that TRULY just spawned, but also hit by every
+    /// REBUILT/RESTORED session (daemon restart, cold `/use` resume), whose
+    /// in-process clock resets to `None` regardless of how stale its real
+    /// history was. That made a long-dormant-but-still-live session
+    /// PERMANENTLY eviction-immune while genuinely-recent sessions were
+    /// evicted around it. Reading `last_active` from disk (refreshed on every
+    /// completed turn, survives restarts) fixes the common case; this test
+    /// locks the remaining fallback to fail toward evictable, not immunity.
+    #[test]
+    fn capacity_eviction_treats_missing_last_active_as_oldest_not_newest() {
+        let candidates = vec![
+            capacity_candidate("has-recent-real-activity", true, &capacity_ts(10)),
+            capacity_candidate("no-meta-signal", true, ""),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("no-meta-signal"),
+            "a blank/unreadable last_active must be evicted BEFORE a session with real recent activity"
+        );
+    }
+
     #[test]
     fn capacity_eviction_falls_back_to_busy_oldest() {
-        let now = Instant::now();
         let candidates = vec![
-            capacity_candidate(
-                "busy-new",
-                false,
-                Some(now - std::time::Duration::from_secs(2)),
-            ),
-            capacity_candidate(
-                "busy-old",
-                false,
-                Some(now - std::time::Duration::from_secs(30)),
-            ),
+            capacity_candidate("busy-new", false, &capacity_ts(2)),
+            capacity_candidate("busy-old", false, &capacity_ts(30)),
         ];
         assert_eq!(
             select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
@@ -9000,25 +9082,12 @@ mod tests {
 
     #[test]
     fn capacity_eviction_respects_sid_and_hitl_exclusions() {
-        let now = Instant::now();
-        let mut waiting = capacity_candidate(
-            "waiting",
-            true,
-            Some(now - std::time::Duration::from_secs(60)),
-        );
+        let mut waiting = capacity_candidate("waiting", true, &capacity_ts(60));
         waiting.waiting_approval = true;
         let candidates = vec![
             waiting,
-            capacity_candidate(
-                "parent",
-                true,
-                Some(now - std::time::Duration::from_secs(40)),
-            ),
-            capacity_candidate(
-                "eligible",
-                true,
-                Some(now - std::time::Duration::from_secs(10)),
-            ),
+            capacity_candidate("parent", true, &capacity_ts(40)),
+            capacity_candidate("eligible", true, &capacity_ts(10)),
         ];
         let excluded = HashSet::from(["parent".to_string()]);
         assert_eq!(
@@ -9030,8 +9099,8 @@ mod tests {
     #[test]
     fn capacity_eviction_returns_none_when_all_candidates_are_excluded() {
         let candidates = vec![
-            capacity_candidate("s1", true, Some(Instant::now())),
-            capacity_candidate("s2", false, None),
+            capacity_candidate("s1", true, &capacity_ts(0)),
+            capacity_candidate("s2", false, ""),
         ];
         let excluded = HashSet::from(["s1".to_string(), "s2".to_string()]);
         assert_eq!(select_live_capacity_eviction(&candidates, &excluded), None);
@@ -9070,11 +9139,15 @@ mod tests {
             vec!["s3".to_string(), second.clone(), first.clone()]
         );
         gateway.sessions.get_mut(&second).unwrap().parent_sid = None;
-        let now = Instant::now();
-        *gateway.sessions[&first].last_event_at.lock().unwrap() =
-            Some(now - std::time::Duration::from_secs(30));
-        *gateway.sessions[&second].last_event_at.lock().unwrap() =
-            Some(now - std::time::Duration::from_secs(5));
+        // Eviction ranks on the PERSISTED `meta.json.last_active` (not an
+        // in-process clock — see `LiveCapacityCandidate`), so seed it on disk:
+        // `first` older, `second` more recent.
+        for (sid, secs_ago) in [(&first, 30i64), (&second, 5)] {
+            let mut meta = read_session_meta(tmp.path(), sid).unwrap();
+            meta.last_active =
+                (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+            write_session_meta(tmp.path(), &meta).unwrap();
+        }
 
         let mut events = gateway.subscribe_events();
         let third = gateway
@@ -12760,20 +12833,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2:alpha:Claude:reviewer"), "{}", mock[0]);
+        assert!(mock[0].contains("s2 claude"), "{}", mock[0]);
     }
 
-    /// `/sessions` text owns the session information; picker buttons are a
-    /// complementary action surface with only the sid and a current marker.
-    /// Tail-padding remains visual-only so Telegram left-aligns the labels.
+    /// Picker buttons are `sid vendor (title)` (sid → vendor → title), a `✓`
+    /// marking the current session. The ROLE is NOT on the button (it stays on
+    /// the information-rich text rows). Tail-padding stays visual-only so
+    /// Telegram left-aligns the variable-width labels.
     #[tokio::test]
-    async fn session_picker_labels_are_compact_actions() {
+    async fn session_picker_labels_carry_sid_vendor_and_title() {
         use unicode_width::UnicodeWidthStr;
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
-        // One roleless session + one named/title-bearing session. Neither
-        // button should repeat the facets/title carried by the text rows.
+        // One roleless untitled session + one titled session: the untitled
+        // button is `sid vendor`, the titled one appends its (title).
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -12790,20 +12864,14 @@ mod tests {
         let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
         let s1_text = s1.label.trim_end_matches('\u{2800}');
         let s2_text = s2.label.trim_end_matches('\u{2800}');
-        assert_eq!(s1_text, "s1");
-        assert_eq!(s2_text, "✓ s2");
+        // Untitled → `sid vendor`; titled + current → `✓ sid vendor (title)`.
+        // Vendor is lowercase (`vendor_str`).
+        assert_eq!(s1_text, "s1 claude");
+        assert_eq!(s2_text, "✓ s2 claude (A long review title)");
         for label in [s1_text, s2_text] {
             assert!(
-                !label.contains("claude"),
-                "no vendor duplication: {label:?}"
-            );
-            assert!(
                 !label.contains("reviewer"),
-                "no role duplication: {label:?}"
-            );
-            assert!(
-                !label.contains("review title"),
-                "no title duplication: {label:?}"
+                "no role on the button: {label:?}"
             );
         }
         // Both labels padded to the same display width, with braille blanks.
@@ -12819,8 +12887,47 @@ mod tests {
         );
     }
 
+    /// A verbose title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS` display
+    /// columns (ellipsis included) so one long title can't widen every button.
     #[tokio::test]
-    async fn gateway_sessions_rows_show_activity_marker() {
+    async fn session_picker_title_is_width_capped() {
+        use unicode_width::UnicodeWidthStr;
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let long = "A really really long session title that keeps going";
+        gateway.rename_session("s1", long).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let opts = gateway.session_switch_options(&chat, false);
+        let label = opts[0].label.trim_end_matches('\u{2800}');
+        let title = label
+            .split_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .expect("titled button label");
+        assert!(
+            title.ends_with('…'),
+            "clipped title ends with an ellipsis: {title:?}"
+        );
+        assert!(
+            title.width() <= SESSION_BUTTON_TITLE_MAX_COLS,
+            "within cap: {title:?}"
+        );
+        assert!(
+            long.starts_with(title.trim_end_matches('…')),
+            "prefix of the real title"
+        );
+    }
+
+    /// `/sessions` text rows START with the sid and carry NO activity dot
+    /// (🟢/🟡/🟠/🔴/⚪) or leading `[vendor]` tag — those lived on the text row
+    /// pre-cleanup; activity now lives only on `/status`, and the vendor is
+    /// still readable from the `:{vendor}:` colon field.
+    #[tokio::test]
+    async fn gateway_sessions_text_rows_start_with_sid_and_have_no_activity_dot() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -12833,10 +12940,17 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
+        let row = listing[0].split('\n').nth(1).expect("a session row");
         assert!(
-            listing[0].contains("[claude]   🟢 idle · s1:alpha:Claude:reviewer"),
-            "activity marker belongs in the information-rich text row: {listing:?}"
+            row.starts_with("s1 claude"),
+            "row starts with the sid: {row:?}"
         );
+        for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
+            assert!(
+                !listing[0].contains(marker),
+                "no activity dot / vendor tag on the text row: {listing:?}"
+            );
+        }
     }
 
     /// Picker-label padding equalizes display width across an option set.
@@ -12943,6 +13057,35 @@ mod tests {
         assert_eq!(replies, vec!["invalid selection"]);
     }
 
+    /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a
+    /// model id that repeats it (`claude-opus-4-8` → `opus-4-8`), so the
+    /// compact `/sessions` row (`sid vendor.model…`) doesn't read redundant
+    /// (`claude.claude-opus-4-8`). A model that does NOT start with the
+    /// vendor (codex's `gpt-5`), a partial-word false-positive (no separator
+    /// boundary), and a match that would leave nothing after stripping all
+    /// pass through unchanged — case-insensitive on the match, but the
+    /// RETURNED text preserves the model's original casing/content.
+    #[test]
+    fn strip_vendor_prefix_drops_only_a_real_separator_bounded_match() {
+        assert_eq!(
+            strip_vendor_prefix("claude", "claude-opus-4-8[1m]"),
+            "opus-4-8[1m]"
+        );
+        assert_eq!(strip_vendor_prefix("grok", "grok-4.5"), "4.5");
+        assert_eq!(strip_vendor_prefix("claude", "Claude-Opus"), "Opus");
+        // codex's models (gpt-*) never repeat "codex" — unchanged.
+        assert_eq!(
+            strip_vendor_prefix("codex", "gpt-5.5-codex"),
+            "gpt-5.5-codex"
+        );
+        // "claudexyz" is a partial-word match, not "claude" + a real
+        // separator — must NOT strip.
+        assert_eq!(strip_vendor_prefix("claude", "claudexyz"), "claudexyz");
+        // Stripping down to nothing falls back to the original.
+        assert_eq!(strip_vendor_prefix("claude", "claude"), "claude");
+        assert_eq!(strip_vendor_prefix("claude", "claude-"), "claude-");
+    }
+
     /// P3 — `/sessions` appends each session's model + ctx from
     /// `thread_status`. With a `[1m]` model the window is 1M; with no
     /// status reported the legacy `id:project:vendor:role` row is unchanged.
@@ -12965,20 +13108,18 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            bare,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude"]);
 
-        // Now report a model + usage → suffix appears, rendered the same
-        // way Codex /status renders (shared helper).
+        // Now report a model + effort + usage → suffix appears with the
+        // TOTAL window (absolute, via `format_tokens`) + percent — no project
+        // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage {
                 used_tokens: 188_000,
                 window_tokens: 1_000_000,
             }),
-            effort: None,
+            effort: Some("max".into()),
             goal: None,
         })
         .await;
@@ -12988,10 +13129,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
         );
 
-        // A non-[1m] model renders against the 200k baseline.
+        // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
             model: Some("claude-sonnet-4-5".into()),
             context: Some(ContextUsage {
@@ -13008,12 +13149,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
         );
     }
 
+    /// Every vendor's IM row carries its lowercase vendor right after the sid
+    /// (`sid vendor · …`, the same opening as the switch button).
     #[tokio::test]
-    async fn gateway_sessions_im_rows_prefix_all_vendor_tags() {
+    async fn gateway_sessions_im_rows_lead_with_sid_then_vendor() {
         let factory: Arc<
             dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
                 + Send
@@ -13035,7 +13178,7 @@ mod tests {
             .next()
             .unwrap();
         for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
-            assert!(listing.contains(&format!("[{vendor}] ")), "{listing}");
+            assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
 
@@ -13067,10 +13210,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s2:alpha:Claude:qa\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns2 claude\ns1 claude"]);
 
         // Tag s1 (the OLDER session) with an outstanding approval.
         let token = "pwaitpin001";
@@ -13089,7 +13229,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ [claude]   🟢 idle · s1:alpha:Claude:reviewer\n[claude]   🟢 idle · s2:alpha:Claude:qa"],
+            vec!["📁 当前项目: alpha\n⏳ s1 claude\ns2 claude"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -13132,7 +13272,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             web_view,
-            vec!["s2:alpha:Claude:qa\ns1:alpha:Claude:reviewer"]
+            vec!["s2:alpha:claude:qa\ns1:alpha:claude:reviewer"]
         );
     }
 
@@ -13173,7 +13313,7 @@ mod tests {
         // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
         // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
+            idle[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
             "current-session header: {idle:?}"
         );
         assert!(
@@ -13201,7 +13341,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🔵 working "),
+            working[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
             "working state: {working:?}"
         );
         assert!(
@@ -13227,7 +13367,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🔴 STUCK "),
+            stuck[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔴 STUCK "),
             "stuck state: {stuck:?}"
         );
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
@@ -13300,7 +13440,7 @@ mod tests {
         assert_eq!(
             out,
             vec![format!(
-                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
                 proj.path().display()
             )]
         );
@@ -13323,7 +13463,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · Claude · — · 🟢 idle"),
+            out[0].contains("📍 当前会话 s1 · alpha · claude · — · 🟢 idle"),
             "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
@@ -13487,7 +13627,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
+            owner[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
             "got: {owner:?}"
         );
     }
@@ -13521,7 +13661,7 @@ mod tests {
             "the real --resume uuid must show in the deep view: {out:?}"
         );
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · Claude · reviewer · 🟢 idle"),
+            out[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
             "got: {out:?}"
         );
     }
@@ -13562,30 +13702,6 @@ mod tests {
         assert_eq!(humanize_dur(Duration::from_secs(7200)), "2h");
         // Sub-second rounds down to 0s (never panics / never blank).
         assert_eq!(humanize_dur(Duration::from_millis(400)), "0s");
-    }
-
-    /// v0.8.22 P0-4 — `relative_time_zh` phrase boundaries: seconds → 刚刚,
-    /// minutes/hours/days-per-unit thresholds, the "yesterday" special case,
-    /// the ≥5-week fallback to an absolute date, and the unparsable/empty
-    /// input fallback (never panics a `/sessions` reply).
-    #[test]
-    fn relative_time_zh_covers_all_bands() {
-        let ts =
-            |secs_ago: i64| (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
-        assert_eq!(relative_time_zh(""), "—");
-        assert_eq!(relative_time_zh("not-a-timestamp"), "—");
-        assert_eq!(relative_time_zh(&ts(10)), "刚刚");
-        assert_eq!(relative_time_zh(&ts(5 * 60)), "5分钟前");
-        assert_eq!(relative_time_zh(&ts(3 * 3600)), "3小时前");
-        assert_eq!(relative_time_zh(&ts(24 * 3600)), "昨天");
-        assert_eq!(relative_time_zh(&ts(3 * 24 * 3600)), "3天前");
-        assert_eq!(relative_time_zh(&ts(14 * 24 * 3600)), "2周前");
-        // ≥5 weeks falls back to an absolute `YYYY-MM-DD` date.
-        let old = chrono::Utc::now() - chrono::Duration::days(40);
-        assert_eq!(
-            relative_time_zh(&old.to_rfc3339()),
-            old.format("%Y-%m-%d").to_string()
-        );
     }
 
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — own-only isolation: a
@@ -13688,6 +13804,178 @@ mod tests {
         );
         // The admin/global bot oversees the shared web pool.
         assert!(Gateway::owner_identity_visible(&admin_tg, &web_a));
+    }
+
+    /// IM PROJECT ACL — the multi-user isolation the leaky unfiltered project
+    /// list broke: a tenant must NOT see the admin's projects (the reported
+    /// bug), and the operator must never peek into a tenant's — SYMMETRIC with
+    /// the web REST list (`build_projects` → `Identity::can_see_owner`) and the
+    /// MCP list (`visible_user_projects`), since all three now authorize off the
+    /// same `ProjectState.owner` through the same core policy
+    /// (`ccteam_core::identity::can_see_owner`). Pure-predicate twin of
+    /// `chat_owner_visible_converges_tenant_web_and_im` (the session rule),
+    /// keyed on PROJECT owners instead of session owners.
+    #[test]
+    fn project_acl_isolates_tenants_from_admin_and_each_other() {
+        // Project owner tags, as `/newproject` + web `POST /projects` stamp
+        // them: a tenant's project is `user:<id>`, the admin's is the shared web
+        // pool `user:web-api` or its own IM `telegram:<chat_id>`, a legacy
+        // `ccteam init` project is unowned (`None`).
+        let admin_web = Some("user:web-api");
+        let admin_im = Some("telegram:339");
+        let tenant_a = Some("user:ualice");
+        let tenant_b = Some("user:ubob");
+        let unowned: Option<&str> = None;
+
+        // A per-tenant IM bot (`telegram@ualice`) — the "user" in the bug report
+        // — and its own web console (channel "web", tenant id as chat_id) are ONE
+        // identity, so BOTH frontends see exactly the same projects (web/IM
+        // symmetry): ONLY the tenant's own, never the admin's (web OR IM), never
+        // another tenant's, never a legacy unowned one.
+        for viewer in [
+            ChatKey::new("telegram@ualice", "111", "alice"),
+            ChatKey::new("web", "ualice", "ualice"),
+        ] {
+            assert!(
+                Gateway::chat_can_see_project_owner(&viewer, tenant_a),
+                "a tenant sees its own project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, admin_web),
+                "a tenant must NOT see the admin's web project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, admin_im),
+                "a tenant must NOT see the admin's IM project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, tenant_b),
+                "a tenant must NOT see another tenant's project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, unowned),
+                "a tenant must NOT see a legacy unowned project ({})",
+                viewer.channel
+            );
+        }
+
+        // The operator (owner's global IM bot ≡ admin web console) sees every
+        // NON-tenant project — its own web pool, its own IM projects, and legacy
+        // unowned — but NEVER a per-user tenant's private project (exactly what
+        // web admin sees via `can_see_owner`).
+        for op in [
+            ChatKey::new("telegram", "339", "rob"),
+            ChatKey::new("web", "web-api", "web-api"),
+        ] {
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, admin_web),
+                "operator sees its own web pool ({})",
+                op.channel
+            );
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, admin_im),
+                "operator sees its own IM project ({})",
+                op.channel
+            );
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, unowned),
+                "operator sees legacy unowned projects ({})",
+                op.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&op, tenant_a),
+                "operator must NOT peek into a tenant's project ({})",
+                op.channel
+            );
+        }
+    }
+
+    /// IM `/projects` + `/cd` end-to-end — proves the owner ACL is WIRED at the
+    /// command surface, not just correct as a predicate: a tenant's `/projects`
+    /// lists only its OWN project, and it cannot `/cd` into — then spawn sessions
+    /// in — the admin's project by typing the slug. Seeds real owned
+    /// `state.json`s read through `collect_projects` (the SAME source the web
+    /// list reads), so a future refactor that keeps `chat_can_see_project_owner`
+    /// but stops `visible_project_slugs` / `change_project` from calling it would
+    /// still fail here — the gap the pure-predicate test above can't catch.
+    #[tokio::test]
+    async fn im_project_list_and_cd_hide_other_owners_projects() {
+        fn seed(paths: &ccteam_core::CcteamPaths, slug: &str, owner: Option<&str>) {
+            let dir = paths.projects_root.join(slug);
+            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+            state.owner = owner.map(str::to_string);
+            state
+                .save(&ccteam_core::CcteamPaths::project_state_in(&dir))
+                .unwrap();
+            ccteam_core::config::upsert_project(
+                &paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: slug.to_string(),
+                    path: dir,
+                    host: ccteam_core::LOCAL_HOST.to_string(),
+                    remote_slug: None,
+                    remote_path: None,
+                    team: "dev".to_string(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        seed(&paths, "tenant-proj", Some("user:ualice"));
+        seed(&paths, "admin-proj", Some("user:web-api"));
+        seed(&paths, "cli-proj", None); // legacy, unowned
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "seed", tmp.path().join("seed"));
+        gateway.enable_project_creation(paths);
+
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        let admin = ChatKey::new("telegram", "339", "rob");
+
+        // THE BUG: the tenant's `/projects` lists ONLY its own project.
+        assert_eq!(
+            gateway.visible_project_slugs(&tenant),
+            vec!["tenant-proj".to_string()],
+            "a tenant's /projects must not include the admin's or legacy projects"
+        );
+        // The operator sees the admin + legacy projects, not the tenant's private.
+        let admin_visible = gateway.visible_project_slugs(&admin);
+        assert!(
+            admin_visible.contains(&"admin-proj".to_string())
+                && admin_visible.contains(&"cli-proj".to_string()),
+            "operator sees its own + legacy, got {admin_visible:?}"
+        );
+        assert!(
+            !admin_visible.contains(&"tenant-proj".to_string()),
+            "operator must not peek into a tenant's project, got {admin_visible:?}"
+        );
+
+        // Addressing is gated too: the tenant can't `/cd` into the admin's
+        // project by typing the slug — it reads identically to a nonexistent one
+        // ("unknown project"), leaking no existence — but CAN `/cd` into its own.
+        let err = gateway
+            .change_project(&tenant, "admin-proj")
+            .expect_err("tenant must not /cd into the admin's project");
+        assert!(
+            err.to_string().contains("unknown project"),
+            "expected an unknown-project error, got {err}"
+        );
+        assert!(
+            gateway.change_project(&tenant, "tenant-proj").is_ok(),
+            "a tenant must be able to /cd into its OWN project"
+        );
     }
 
     /// v0.8.21 cold-resume ACL (web path) — `resume_stopped_session` resolves a
@@ -14067,61 +14355,6 @@ mod tests {
         );
     }
 
-    /// v0.8.22 P0-4 — `/sessions` grows a "📜 最近结束" section listing
-    /// recently-ended sessions with a `/use <sid>` resume hint, giving the
-    /// existing cold-resume path (exercised above) a visible entry point.
-    /// Own-only ACL applies to the history section too: a chat that doesn't
-    /// own the stopped session must not see it listed as "最近结束".
-    #[tokio::test]
-    async fn im_sessions_lists_recently_ended_with_use_hint_own_only() {
-        let proj = tempfile::TempDir::new().unwrap();
-        let agents = proj.path().join(".claude").join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(
-            agents.join("reviewer.md"),
-            "---\nname: reviewer\n---\nbody\n",
-        )
-        .unwrap();
-
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
-
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
-            .await
-            .unwrap();
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/stop s1")
-            .await
-            .unwrap();
-
-        // The owner sees s1 under "最近结束" with a `/use s1` resume hint.
-        let owner_view = gateway
-            .handle_text("mock", "chat-1", "alice", "/sessions")
-            .await
-            .unwrap();
-        assert_eq!(owner_view.len(), 1);
-        assert!(
-            owner_view[0].contains("📜 最近结束:"),
-            "history section present: {owner_view:?}"
-        );
-        assert!(
-            owner_view[0].contains("s1:alpha:Claude:reviewer") && owner_view[0].contains("/use s1"),
-            "s1 row carries a /use resume hint: {owner_view:?}"
-        );
-
-        // A different chat's `/sessions` must NOT list it — own-only ACL
-        // covers the history section exactly like the live list.
-        let other_view = gateway
-            .handle_text("mock", "chat-2", "bob", "/sessions")
-            .await
-            .unwrap();
-        assert!(
-            !other_view[0].contains("最近结束") && !other_view[0].contains("s1"),
-            "a non-owner must not see the ended s1 in history: {other_view:?}"
-        );
-    }
-
     #[tokio::test]
     async fn gateway_sessions_are_own_only_across_chats() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -14162,10 +14395,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            owner_sees,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude"]);
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -14206,10 +14436,7 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(
-            seen,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -14382,10 +14609,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[codex]    🟢 idle · s1:beta:Codex:api"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 codex"]);
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -14457,9 +14681,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec![
-                "📁 当前项目: beta\n[claude]   🟢 idle · s4:beta:Claude:qa\n[codex]    🟢 idle · s3:beta:Codex:api\n[codex]    🟢 idle · s2:alpha:Codex:docs\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"
-            ]
+            vec!["📁 当前项目: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
         );
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
@@ -14879,10 +15101,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
 
         assert_eq!(
             restored
@@ -14953,10 +15172,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
 
         assert_eq!(
             restored
@@ -15419,10 +15635,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -15449,15 +15662,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        // v0.8.22 P1 — s2's first plain message ("where am i") auto-titles it
-        // (rule-based truncation, no LLM); s1 never sent a plain message
-        // (only the `/new` directive), so it stays untitled/bare.
-        // v0.9.0 neutralization — s2 is roleless, so its `/sessions` row has an
-        // empty role field (`s2:beta:Claude:` + title).
-        assert_eq!(
-            after,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude: 「where am i」\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        // s2's first plain message ("where am i") auto-titles it, but the title
+        // now rides the switch BUTTON, not the text row (see
+        // `session_switch_options`); s1 never sent a plain message, so it is
+        // untitled either way. s2 is roleless → empty role field
+        // (`s2 claude.beta`).
+        assert_eq!(after, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
     }
 
     #[tokio::test]
@@ -15579,7 +15789,7 @@ mod tests {
         let live = ccteam_harness::list_chat_sessions(&backend).await.unwrap();
         let rendered = gateway.render_all_sessions(&live);
         assert!(
-            rendered.contains("s1:alpha:Claude:lead"),
+            rendered.contains("s1:alpha:claude:lead"),
             "rendered: {rendered}"
         );
         // v0.8.8 F1 — the orphan render labels the trailing segment as the sid
@@ -15687,9 +15897,7 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees
-                .iter()
-                .any(|r| r.contains("s1:alpha:Claude:assistant")),
+            owner_sees.iter().any(|r| r.contains("s1 claude")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -15806,17 +16014,13 @@ mod tests {
         assert_eq!(after, vec!["alpha-reviewer-s1 echo: still here?"]);
 
         // The session list shows the new role bound to the same sid (no s2).
-        // v0.8.22 P1 — s1's first plain message ("hi") auto-titled it; the
-        // title is sid-scoped (not role-scoped), so it survives the `/role`
-        // re-spawn untouched.
+        // (The auto-title from "hi" is sid-scoped and survives the `/role`
+        // re-spawn, but now rides the switch button, not this text row.)
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer 「hi」"]
-        );
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -15880,16 +16084,13 @@ mod tests {
             "a bad /role must not re-spawn (no teardown of the live pane)"
         );
 
-        // The session is still resolvable, still s1, still `cto`.
-        // v0.8.22 P1 — carries the title auto-set from its earlier "hi".
+        // The session is still resolvable, still s1, still `cto`. (The title
+        // auto-set from "hi" now rides the switch button, not this text row.)
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「hi」"]
-        );
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -15985,16 +16186,23 @@ mod tests {
             vec!["已重命名 s1 → my custom title\n↓ 本项目会话 → /sessions"]
         );
 
-        // /sessions shows the rename.
+        // The title moved off the /sessions text row onto the switch button.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        // …and the rename SURFACES on the picker button.
+        let chat = ChatKey::new("mock", "chat-1", "alice");
+        let s1_button = |g: &Gateway| {
+            g.session_switch_options(&chat, false)
+                .into_iter()
+                .find(|o| o.id == "s1")
+                .map(|o| o.label.trim_end_matches('\u{2800}').to_string())
+        };
         assert_eq!(
-            listing,
-            vec![
-                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
-            ]
+            s1_button(&gateway).as_deref(),
+            Some("✓ s1 claude (my custom title)")
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -16006,11 +16214,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
+        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude"]);
         assert_eq!(
-            listing2,
-            vec![
-                "📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto 「my custom title」"
-            ],
+            s1_button(&gateway).as_deref(),
+            Some("✓ s1 claude (my custom title)"),
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -17122,9 +17329,9 @@ mod tests {
         let out = gw
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
-        // Parent row precedes the indented child row.
-        let pline = format!("[claude]   🟢 idle · {parent}:alpha:Claude:");
-        let cline = format!("└─ [claude]   🟢 idle · {child}:alpha:Claude:");
+        // Parent row precedes the indented child row (roleless → `sid claude`).
+        let pline = format!("{parent} claude");
+        let cline = format!("└─ {child} claude");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
