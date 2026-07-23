@@ -62,7 +62,7 @@ fn reject_unknown_project(app: &AppState, slug: &str) -> Option<Response> {
 
 /// The project's catalog host binding (`"local"` when unregistered — every
 /// test fixture and pre-v0.9.2 entry deserializes as local).
-fn project_host(app: &AppState, slug: &str) -> String {
+pub(crate) fn project_host(app: &AppState, slug: &str) -> String {
     ccteam_core::config::load(&app.paths.root)
         .ok()
         .and_then(|cfg| cfg.projects.into_iter().find(|p| p.slug == slug))

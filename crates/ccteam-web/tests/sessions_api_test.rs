@@ -1121,6 +1121,312 @@ async fn skill_list_and_attach_names_skill_file_in_turn() {
     );
 }
 
+/// The user-level library is injected through `AppState.paths`, lists nested
+/// ids, and attaches by absolute path without creating a project skill copy.
+#[tokio::test]
+async fn global_skill_list_and_nested_attach_use_library_path_only() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+    let id = "baoyu-skills/baoyu-comic";
+    let skill_md = ccteam_core::write_library_skill(
+        &paths.skills_dir(),
+        id,
+        "---\nname: baoyu-comic\ndescription: make a comic\n---\nbody\n",
+        false,
+    )
+    .unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    let listed: Value = client
+        .get(format!("{base}/skills"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let skills = listed["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["id"], id);
+    assert_eq!(skills[0]["description"], "make a comic");
+    assert_eq!(skills[0]["path"], skill_md.to_string_lossy().as_ref());
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let turned = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "draw this",
+            "attachments": [{"kind": "skill", "name": id, "scope": "global"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned.status(), 202);
+
+    let turns =
+        ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+    let user_text = turns
+        .iter()
+        .map(|turn| turn.user.as_str())
+        .find(|text| !text.is_empty())
+        .expect("global-skill user turn mirrored");
+    assert!(user_text.contains(id), "nested id is named: {user_text}");
+    assert!(
+        user_text.contains(skill_md.to_string_lossy().as_ref()),
+        "library path is named: {user_text}"
+    );
+    assert!(
+        !project_dir.join(".claude/skills").exists(),
+        "global attach must not create a project skill copy"
+    );
+}
+
+/// Global ids use the nested-library validator, never path joining as a
+/// substitute for validation; a valid but absent id is also a readable 400.
+#[tokio::test]
+async fn global_skill_attach_rejects_invalid_missing_and_unknown_scope() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr =
+        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
+            .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for id in ["../x", "a//b", "UPPER", "/absolute"] {
+        let response = client
+            .post(format!("{base}/sessions/{sid}/turn"))
+            .json(&serde_json::json!({
+                "text": "use it",
+                "attachments": [{"kind": "skill", "name": id, "scope": "global"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "invalid global id: {id}");
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid skill id"),
+            "readable invalid-id error for {id}: {body}"
+        );
+    }
+
+    let missing = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "use it",
+            "attachments": [{"kind": "skill", "name": "missing/tool", "scope": "global"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 400);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"], "skill not in library: missing/tool");
+
+    let unknown_scope = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "use it",
+            "attachments": [{"kind": "skill", "name": "tool", "scope": "workspace"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_scope.status(), 400);
+    let body: Value = unknown_scope.json().await.unwrap();
+    assert_eq!(body["error"], "invalid attachment scope: workspace");
+}
+
+/// The global library is owner-wide rather than tenant-owned: tenants cannot
+/// list it or attach from it, even in a session belonging to their own project.
+#[tokio::test]
+async fn global_skill_list_and_attach_are_admin_only() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    ccteam_core::write_library_skill(
+        &paths.skills_dir(),
+        "private/tool",
+        "---\ndescription: owner only\n---\nbody\n",
+        false,
+    )
+    .unwrap();
+
+    let mut registry = ccteam_core::tenants::TenantRegistry::default();
+    let tenant = registry.add("alice");
+    let tenant_token = tenant.web_token.clone();
+    registry.save(&paths.users_dir()).unwrap();
+    let state_path = paths.project_state("demo");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let mut project_state =
+        ccteam_core::ProjectState::initial_for_team("demo".into(), "dev".into());
+    project_state.owner = Some(format!("user:{}", tenant.id));
+    project_state.save(&state_path).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    const ADMIN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+    let state = AppState::with_auth(paths, ccteam_web::AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+    let addr = spawn_server(state).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+    let auth = format!("Bearer ccteam:{tenant_token}");
+
+    let listed = client
+        .get(format!("{base}/skills"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 403);
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attached = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({
+            "text": "use it",
+            "attachments": [{"kind": "skill", "name": "private/tool", "scope": "global"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attached.status(), 403);
+}
+
+/// A daemon-local library path is meaningless to a satellite session. The
+/// catalog host binding is authoritative and returns the F7 maintenance hint.
+#[tokio::test]
+async fn global_skill_attach_rejects_remote_host_project() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    seed_project_state(&project_dir, "demo");
+    ccteam_core::write_library_skill(
+        &paths.skills_dir(),
+        "shared/tool",
+        "---\ndescription: shared\n---\nbody\n",
+        false,
+    )
+    .unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(
+        AppState::new(paths.clone()).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    ccteam_core::config::upsert_project(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: "demo".into(),
+            path: project_dir,
+            host: "sat-east".into(),
+            remote_slug: Some("demo".into()),
+            remote_path: Some("/srv/demo".into()),
+            team: "dev".into(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let response = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({
+            "text": "use it",
+            "attachments": [{"kind": "skill", "name": "shared/tool", "scope": "global"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("sat-east"), "host is named: {error}");
+    assert!(
+        error.contains("~/.ccteam/skills") && error.contains("execution host"),
+        "remote maintenance hint is actionable: {error}"
+    );
+}
+
 /// The turn attachment face accepts no arbitrary paths: only files under the
 /// session project's `.ccteam/uploads/` (stored by the upload endpoint) and
 /// installed skill ids pass; everything else is a readable 400.
