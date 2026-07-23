@@ -11,6 +11,19 @@
 // the filter/format logic by marketplaceFormat.test.ts.
 
 import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
+
+vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = globalThis as any;
+  // useWebSettings reads window/localStorage at module scope (node env: stub).
+  if (typeof g.window === "undefined") {
+    g.window = { innerWidth: 1024, addEventListener() {}, removeEventListener() {} };
+  }
+  if (typeof g.localStorage === "undefined") {
+    g.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  }
+});
+
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import MarketplaceView, { InstallButton, PluginCard } from "./MarketplaceView";
@@ -115,5 +128,71 @@ describe("PluginCard / InstallButton (seeded)", () => {
     expect(html).toContain("MIT");
     expect(html).toContain("#review");
     expect(html).toContain("安装");
+  });
+});
+
+// v0.9.9 — type=skill entries install into the user-level GLOBAL LIBRARY:
+// the CTA copy names the library (zh + en); agent/plugin CTAs are unchanged.
+describe("skill CTA — install-to-library copy (three states, zh + en)", () => {
+  it("not_installed → 安装到库 / Install to library", () => {
+    const zh = renderToString(
+      <InstallButton status="not_installed" installing={false} canInstall onInstall={() => {}} skill lang="zh" />,
+    );
+    expect(zh).toContain("<button");
+    expect(zh).toContain("安装到库");
+    const en = renderToString(
+      <InstallButton status="not_installed" installing={false} canInstall onInstall={() => {}} skill lang="en" />,
+    );
+    expect(en).toContain("Install to library");
+  });
+
+  it("installed → 已在库 / In library pill (not a button)", () => {
+    const zh = renderToString(
+      <InstallButton status="installed" installing={false} canInstall onInstall={() => {}} skill lang="zh" />,
+    );
+    expect(zh).toContain("已在库");
+    expect(zh).not.toContain("<button");
+    const en = renderToString(
+      <InstallButton status="installed" installing={false} canInstall onInstall={() => {}} skill lang="en" />,
+    );
+    expect(en).toContain("In library");
+  });
+
+  it("update_available → 更新库内版本 / Update in library", () => {
+    const zh = renderToString(
+      <InstallButton status="update_available" installing={false} canInstall onInstall={() => {}} skill lang="zh" />,
+    );
+    expect(zh).toContain("更新库内版本");
+    const en = renderToString(
+      <InstallButton status="update_available" installing={false} canInstall onInstall={() => {}} skill lang="en" />,
+    );
+    expect(en).toContain("Update in library");
+  });
+
+  it("a type=skill card renders the library CTA (no install-to-project button)", () => {
+    const html = renderToString(
+      <PluginCard
+        plugin={plugin({ type: "skill", installed_status: "not_installed" })}
+        installing={false}
+        canInstall
+        onOpen={() => {}}
+        onInstall={() => {}}
+      />,
+    );
+    expect(html).toContain("安装到库");
+  });
+
+  it("an agent card keeps the project install CTA unchanged", () => {
+    const html = renderToString(
+      <PluginCard
+        plugin={plugin({ type: "agent", installed_status: "not_installed" })}
+        installing={false}
+        canInstall
+        onOpen={() => {}}
+        onInstall={() => {}}
+      />,
+    );
+    expect(html).toContain("安装");
+    expect(html).not.toContain("安装到库");
   });
 });

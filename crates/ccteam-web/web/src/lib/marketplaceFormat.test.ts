@@ -18,6 +18,7 @@ import {
   installable,
   installedStatusLabel,
   matchesQuery,
+  skillLibraryStatusLabel,
   vendorCostSplit,
 } from "./marketplaceFormat";
 
@@ -64,6 +65,23 @@ describe("installedStatusLabel + installable", () => {
     expect(installable("not_installed")).toBe(true);
     expect(installable("update_available")).toBe(true);
     expect(installable("installed")).toBe(false);
+  });
+});
+
+// v0.9.9 — skill entries install into the user-level global library, so their
+// CTA names the library (both UI languages); agent/plugin keep the zh
+// project copy above.
+describe("skillLibraryStatusLabel (install-to-library CTA)", () => {
+  it("labels the three installed_status states in zh", () => {
+    expect(skillLibraryStatusLabel("not_installed", "zh")).toBe("安装到库");
+    expect(skillLibraryStatusLabel("installed", "zh")).toBe("已在库");
+    expect(skillLibraryStatusLabel("update_available", "zh")).toBe("更新库内版本");
+  });
+
+  it("labels the three installed_status states in en", () => {
+    expect(skillLibraryStatusLabel("not_installed", "en")).toBe("Install to library");
+    expect(skillLibraryStatusLabel("installed", "en")).toBe("In library");
+    expect(skillLibraryStatusLabel("update_available", "en")).toBe("Update in library");
   });
 });
 
