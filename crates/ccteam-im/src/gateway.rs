@@ -317,6 +317,11 @@ pub struct Gateway {
     /// v0.8.24 Track D — optional satellite agent proxy for remote-host
     /// stdio spawn. `None` ⇒ production [`crate::remote_host::HttpRemoteHostProxy`].
     remote_host_proxy: Option<std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>>,
+    /// Optional programmatic snapshot for the local vendor-availability
+    /// preflight. Production leaves this `None` and runs the cached live probe;
+    /// deterministic lib tests inject the stub adapters' declared availability
+    /// without mutating process environment or depending on `PATH`.
+    local_vendor_availability_override: Option<Vec<ccteam_core::VendorAvailability>>,
     /// v0.9.0 W2 (F2/F7) — in-memory mirror of the durable delegation watches
     /// (`child_sid → mirror`). The SoT is each child's
     /// `<project>/.ccteam/chat/<child_sid>/delegation.json`; this mirror keeps
@@ -1328,6 +1333,7 @@ impl Gateway {
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             remote_host_proxy: None,
+            local_vendor_availability_override: None,
             delegations: std::collections::HashMap::new(),
             spawn_idem: crate::delegation::IdemCache::default(),
             dispatch_idem: crate::delegation::IdemCache::default(),
@@ -1838,6 +1844,24 @@ impl Gateway {
         self.project_host_binding(slug)
             .map(|(host, _wire)| host)
             .unwrap_or_else(|_| ccteam_core::LOCAL_HOST.to_string())
+    }
+
+    /// Return the injected local availability snapshot, when present. The
+    /// caller probes live when this is `None`.
+    pub(crate) fn local_vendor_availability_override(
+        &self,
+    ) -> Option<Vec<ccteam_core::VendorAvailability>> {
+        self.local_vendor_availability_override.clone()
+    }
+
+    /// Test-only local capability injection. Lib tests cannot mutate the
+    /// process environment safely because they share one test process.
+    #[cfg(test)]
+    pub(crate) fn set_local_vendor_availability_for_tests(
+        &mut self,
+        availability: Vec<ccteam_core::VendorAvailability>,
+    ) {
+        self.local_vendor_availability_override = Some(availability);
     }
 
     /// v0.10 T1 — a satellite host's last control-channel agent report for the

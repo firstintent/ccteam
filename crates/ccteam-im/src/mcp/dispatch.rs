@@ -1654,24 +1654,27 @@ async fn run_session_spawn(
     // the unknown-host/offline cases).
     let vendor_wire = session_vendor_wire(vendor);
     {
-        let (bound_host, sat_snapshot) = {
+        let (bound_host, local_snapshot, sat_snapshot) = {
             let gw = gateway.lock().await;
             let host = gw.project_bound_host(&project);
-            let snap = if host == ccteam_core::LOCAL_HOST {
-                None
+            let (local, satellite) = if host == ccteam_core::LOCAL_HOST {
+                (gw.local_vendor_availability_override(), None)
             } else {
-                gw.satellite_agent_snapshot(&host)
+                (None, gw.satellite_agent_snapshot(&host))
             };
-            (host, snap)
+            (host, local, satellite)
         };
         if bound_host == ccteam_core::LOCAL_HOST {
             // Probe OFF the gateway lock (cached; shells out only on a cold
             // cache), so we never hold the mutex across a `<bin> --version`.
-            let avail = tokio::task::spawn_blocking(|| {
-                ccteam_core::host_registry::probe_availability(false)
-            })
-            .await
-            .unwrap_or_default();
+            let avail = match local_snapshot {
+                Some(snapshot) => snapshot,
+                None => tokio::task::spawn_blocking(|| {
+                    ccteam_core::host_registry::probe_availability(false)
+                })
+                .await
+                .unwrap_or_default(),
+            };
             if let Some(row) = avail.iter().find(|a| a.vendor == vendor_wire) {
                 if !row.installed {
                     let installed: Vec<String> = avail
@@ -3149,6 +3152,22 @@ mod session_tool_tests {
         })
     }
 
+    fn stub_vendor_availability(installed: bool) -> Vec<ccteam_core::VendorAvailability> {
+        ccteam_core::AGENT_PROBE_SPECS
+            .iter()
+            .map(|spec| ccteam_core::VendorAvailability {
+                vendor: spec.vendor,
+                harness_id: spec.harness_id,
+                installed,
+                version: installed.then(|| format!("{} test stub", spec.vendor)),
+            })
+            .collect()
+    }
+
+    fn mark_stub_vendors_installed(gateway: &mut Gateway) {
+        gateway.set_local_vendor_availability_for_tests(stub_vendor_availability(true));
+    }
+
     #[test]
     fn effective_inline_wait_seconds_caps_at_transport_safe_ceiling() {
         for (requested, expected) in [(600, 240), (240, 240), (0, 0), (30, 30)] {
@@ -3467,6 +3486,7 @@ mod session_tool_tests {
         });
         let mut gw =
             crate::gateway::Gateway::new_with_factory(factory, "alpha", "/tmp/cc-gate-alpha");
+        mark_stub_vendors_installed(&mut gw);
         gw.register_project("beta", "/tmp/cc-gate-beta");
         let cto_sid = gw
             .create_session_api(
@@ -3554,6 +3574,7 @@ mod session_tool_tests {
                 as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
         });
         let mut gateway = Gateway::new_with_factory(factory, "alice", alice_dir);
+        mark_stub_vendors_installed(&mut gateway);
         gateway.register_project("bob", bob_dir);
         gateway.register_project("admin", admin_dir);
 
@@ -4336,6 +4357,7 @@ mod session_tool_tests {
             }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
         });
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        mark_stub_vendors_installed(&mut gw);
         let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
         gw.set_delegation_notifier_tx(dtx);
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -4373,6 +4395,31 @@ mod session_tool_tests {
             .unwrap_err();
         assert_eq!(err, crate::remote_host::HOST_SPAWN_PARAM_REMOVED);
         assert_eq!(gw.lock().await.session_views().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_spawn_reports_vendor_not_installed_from_empty_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        gateway
+            .lock()
+            .await
+            .set_local_vendor_availability_for_tests(stub_vendor_availability(false));
+
+        let error = run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("vendor `claude` is not installed on host `local`"),
+            "{error}"
+        );
+        assert!(error.contains("installed there: none"), "{error}");
+        assert!(error.contains("observed just now"), "{error}");
+        assert!(error.contains("ccteam never installs a CLI"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
