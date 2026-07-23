@@ -46,9 +46,10 @@ fn t01_help_user_facing_only() {
     // live under `project`; `attach` / `pause` / `resume` (and the chat
     // bot register / persona / add-tool ops) under `session`; `web` and
     // `probe-project` under the hidden `internal` group.
-    // v0.8.7 W3 added the top-level `role` group (catalog search/add/list).
+    // v0.8.7 W3 added `role`; v0.9.9 adds the global `skill` library group.
     for required in [
-        "init", "start", "stop", "status", "project", "session", "role", "host", "doctor", "config",
+        "init", "start", "stop", "status", "project", "session", "role", "skill", "host", "doctor",
+        "config",
     ] {
         assert!(
             stdout.contains(required),

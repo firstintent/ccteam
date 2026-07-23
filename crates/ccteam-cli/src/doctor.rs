@@ -83,6 +83,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
     let updates = check_updates(paths);
     let pricing = check_pricing();
     let home = check_home_layout(paths);
+    let project_skills = check_project_skill_faces(paths);
     let auth_claude = check_vendor_auth_claude();
     let auth_codex = check_vendor_auth_codex();
     let auth_grok = check_vendor_auth_grok();
@@ -104,6 +105,7 @@ pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
         updates,
         pricing,
         home,
+        project_skills,
         auth_claude,
         auth_codex,
         auth_grok,
@@ -695,6 +697,49 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
                 unexpected.len(),
                 paths.root.display(),
                 unexpected.join(", "),
+            ),
+        )
+    }
+}
+
+/// Advisory-only scan for registered projects that still use a real legacy
+/// `.claude/skills` directory. One aggregate line avoids flooding doctor on
+/// large catalogs; migration remains an explicit user command.
+fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
+    let config = match ccteam_core::load_ccteam_config(&paths.root) {
+        Ok(config) => config,
+        Err(err) => {
+            return CheckLine::new(
+                CheckStatus::Skip,
+                "project skills",
+                format!("could not read registered projects: {err}"),
+            );
+        }
+    };
+    let mut legacy = Vec::new();
+    for project in config.projects {
+        let face = project.path.join(".claude/skills");
+        if matches!(
+            std::fs::symlink_metadata(&face),
+            Ok(metadata) if metadata.file_type().is_dir()
+        ) {
+            legacy.push(project.slug);
+        }
+    }
+    if legacy.is_empty() {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "project skills",
+            "registered projects use the neutral skill face (or have no project skills)",
+        )
+    } else {
+        legacy.sort();
+        CheckLine::new(
+            CheckStatus::Warn,
+            "project skills",
+            format!(
+                "legacy real .claude/skills dir in project(s): {} — migrate each with `ccteam skill migrate-project --project <slug>`",
+                legacy.join(", ")
             ),
         )
     }

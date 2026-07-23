@@ -1,11 +1,12 @@
 //! Command handlers for `ccteam {init, new, ls, show, attach, peek,
-//! progress, doctor, config, role, ...}`. Pure where possible (`run_ls` /
+//! progress, doctor, config, role, skill, ...}`. Pure where possible (`run_ls` /
 //! `run_show` return the formatted string instead of printing) so unit
 //! tests don't need a real terminal or running daemon.
 
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
@@ -2291,8 +2292,8 @@ fn run_config_lark_menu() -> Result<String> {
 
 /// v0.8.7 W3 (DC.3) — resolve a `--project <slug>` (or, when `None`, the
 /// current working directory canonicalized) to an existing project dir.
-/// Used by `ccteam role add` / `ccteam role list`. A `slug` that isn't a
-/// registered project (or a cwd that doesn't exist) is a loud error.
+/// Used by role commands and project-local skill face commands. A `slug` that
+/// isn't a registered project (or a cwd that doesn't exist) is a loud error.
 fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::path::PathBuf> {
     let dir = match slug {
         Some(s) => {
@@ -2318,23 +2319,31 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
 /// `ccteam role add`. The async load is driven on a throwaway current-thread
 /// runtime ([`block_on_async`]) since `main()` is sync.
 pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -> Result<String> {
+    let hits = search_hub_catalog(paths, query, None)?;
+    render_hub_search(&hits, query, format, "plugin", "ccteam role add <id>")
+}
+
+fn search_hub_catalog(
+    paths: &CcteamPaths,
+    query: &str,
+    type_filter: Option<&str>,
+) -> Result<Vec<ccteam_im::hub::HubPlugin>> {
     let index = block_on_async(ccteam_im::hub::load_catalog(
         &ccteam_im::hub::hub_base(),
         paths,
         false,
     ))??;
     let q = query.trim().to_lowercase();
-    let mut hits: Vec<&ccteam_im::hub::HubPlugin> = index
+    let mut hits: Vec<ccteam_im::hub::HubPlugin> = index
         .plugins
-        .iter()
+        .into_iter()
         .filter(|p| {
-            if q.is_empty() {
-                return true;
-            }
-            p.id.to_lowercase().contains(&q)
-                || p.name.to_lowercase().contains(&q)
-                || p.description.to_lowercase().contains(&q)
-                || p.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            type_filter.is_none_or(|expected| p.type_ == expected)
+                && (q.is_empty()
+                    || p.id.to_lowercase().contains(&q)
+                    || p.name.to_lowercase().contains(&q)
+                    || p.description.to_lowercase().contains(&q)
+                    || p.tags.iter().any(|t| t.to_lowercase().contains(&q)))
         })
         .collect();
     // Feature official ccteam plugins (`source == "ccteam"`) first, then by id —
@@ -2344,14 +2353,24 @@ pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -
             .cmp(&(b.source != "ccteam"))
             .then_with(|| a.id.cmp(&b.id))
     });
+    Ok(hits)
+}
+
+fn render_hub_search(
+    hits: &[ccteam_im::hub::HubPlugin],
+    query: &str,
+    format: OutputFormat,
+    noun: &str,
+    install_hint: &str,
+) -> Result<String> {
     Ok(match format {
         OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
         OutputFormat::Text => {
             if hits.is_empty() {
-                format!("no plugins match `{query}` in the ccteam-hub marketplace.\n")
+                format!("no {noun}s match `{query}` in the ccteam-hub marketplace.\n")
             } else {
                 let mut out = format!(
-                    "{} plugin(s) in the ccteam-hub marketplace{}:\n\n",
+                    "{} {noun}(s) in the ccteam-hub marketplace{}:\n\n",
                     hits.len(),
                     if query.trim().is_empty() {
                         String::new()
@@ -2359,7 +2378,7 @@ pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -
                         format!(" matching `{query}`")
                     }
                 );
-                for p in &hits {
+                for p in hits {
                     out.push_str(&format!("  {}  [{}]\n", p.id, p.type_));
                     if !p.description.is_empty() {
                         // One-line, truncated description for the list view.
@@ -2367,20 +2386,15 @@ pub fn run_role_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -
                         out.push_str(&format!("      {desc}\n"));
                     }
                 }
-                out.push_str(
-                    "\nInstall one: ccteam role add <id> [--as <role>] [--project <slug>]\n",
-                );
+                out.push_str(&format!("\nInstall one: {install_hint}\n"));
                 out
             }
         }
     })
 }
 
-/// v0.8.9 Phase 2 — `ccteam role add <id> [--as <role>] [--project <slug>]
-/// [--force]`. Installs a curated ccteam-hub plugin into the project's
-/// `.claude/` (fetch over HTTPS + sha256 verify → verbatim write) and prints a
-/// `/role <role>` hint. The async load + fetch is driven on a throwaway
-/// current-thread runtime ([`block_on_async`]) since `main()` is sync.
+/// `ccteam role add` installs agent/vendor-plugin entries into a project and
+/// refuses skill entries with a pointer to `ccteam skill add`.
 pub fn run_role_add(
     paths: &CcteamPaths,
     id: &str,
@@ -2388,7 +2402,6 @@ pub fn run_role_add(
     project: Option<&str>,
     force: bool,
 ) -> Result<String> {
-    let project_dir = resolve_project_dir(paths, project)?;
     let base = ccteam_im::hub::hub_base();
     let index = block_on_async(ccteam_im::hub::load_catalog(&base, paths, false))??;
     let plugin = index.find(id).ok_or_else(|| {
@@ -2396,9 +2409,14 @@ pub fn run_role_add(
             "no plugin `{id}` in the ccteam-hub marketplace — try `ccteam role search <q>`"
         )
     })?;
+    if plugin.type_ == "skill" {
+        bail!("hub entry `{id}` is a skill; use: ccteam skill add {id}");
+    }
+    let project_dir = resolve_project_dir(paths, project)?;
+    let library_root = paths.skills_dir();
     let result = block_on_async(ccteam_im::hub::install_plugin(
         &project_dir,
-        &paths.skills_dir(),
+        &library_root,
         plugin,
         as_role,
         force,
@@ -2468,6 +2486,687 @@ pub fn run_role_list(
             }
         }
     })
+}
+
+/// Search only `type=skill` entries in the curated hub catalog.
+pub fn run_skill_search(paths: &CcteamPaths, query: &str, format: OutputFormat) -> Result<String> {
+    let hits = search_hub_catalog(paths, query, Some("skill"))?;
+    render_hub_search(
+        &hits,
+        query,
+        format,
+        "skill",
+        "ccteam skill add <id> [--as <stem>]",
+    )
+}
+
+/// Install one hub skill into the user-level global library.
+pub fn run_skill_add(
+    paths: &CcteamPaths,
+    id: &str,
+    as_stem: Option<&str>,
+    force: bool,
+) -> Result<String> {
+    let index = block_on_async(ccteam_im::hub::load_catalog(
+        &ccteam_im::hub::hub_base(),
+        paths,
+        false,
+    ))??;
+    let plugin = index.find(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no skill `{id}` in the ccteam-hub marketplace — try `ccteam skill search <q>`"
+        )
+    })?;
+    if plugin.type_ != "skill" {
+        bail!(
+            "hub entry `{id}` is type `{}`; use: ccteam role add {id}",
+            plugin.type_
+        );
+    }
+    let project_dir = std::env::current_dir().context("read cwd for hub install context")?;
+    let library_root = paths.skills_dir();
+    let result = block_on_async(ccteam_im::hub::install_plugin(
+        &project_dir,
+        &library_root,
+        plugin,
+        as_stem,
+        force,
+    ))?
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(format!(
+        "Installed skill `{}` into the user library{}:\n  {}\n",
+        result.id,
+        if result.overwrote {
+            " (overwrote existing)"
+        } else {
+            ""
+        },
+        result.path.display()
+    ))
+}
+
+/// List the user-level library recursively.
+pub fn run_skill_list(paths: &CcteamPaths, json: bool) -> Result<String> {
+    let skills = ccteam_core::list_library_skills(&paths.skills_dir());
+    if json {
+        return Ok(serde_json::to_string_pretty(&skills)?);
+    }
+    if skills.is_empty() {
+        return Ok(format!(
+            "no skills in the user library ({}).\nBrowse the catalog: ccteam skill search <q>\n",
+            paths.skills_dir().display()
+        ));
+    }
+    let mut out = format!(
+        "{} skill(s) in {}:\n\n",
+        skills.len(),
+        paths.skills_dir().display()
+    );
+    for skill in skills {
+        out.push_str(&format!("  {}", skill.id));
+        if !skill.description.is_empty() {
+            let description: String = skill.description.chars().take(96).collect();
+            out.push_str(&format!("  — {description}"));
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Remove one library skill, or an arbitrary skill subtree with explicit
+/// `force`. A source root containing only nested skills is deliberately not
+/// mistaken for one skill.
+pub fn run_skill_remove(paths: &CcteamPaths, id: &str, force: bool) -> Result<String> {
+    ccteam_core::validate_skill_library_id(id)?;
+    let target = paths.skills_dir().join(id);
+    if !target.exists() {
+        bail!(
+            "skill library entry `{id}` does not exist at {}",
+            target.display()
+        );
+    }
+    if !target.is_dir() {
+        bail!(
+            "skill library entry `{id}` is not a directory: {}",
+            target.display()
+        );
+    }
+    if !target.join("SKILL.md").is_file() && !force {
+        bail!(
+            "`{id}` is a skill tree, not a single skill (no root SKILL.md); use `ccteam skill source rm {id}` for a registered source, or retry with --force"
+        );
+    }
+    std::fs::remove_dir_all(&target)
+        .with_context(|| format!("remove skill library subtree {}", target.display()))?;
+    Ok(format!("Removed `{id}` from the user skill library.\n"))
+}
+
+/// Refresh one hub-pinned skill, or every installed hub skill whose catalog
+/// sha differs from the library copy.
+pub fn run_skill_update(paths: &CcteamPaths, id: Option<&str>, all: bool) -> Result<String> {
+    if id.is_some() == all {
+        bail!("choose exactly one of <hub-id> or --all");
+    }
+    let index = block_on_async(ccteam_im::hub::load_catalog(
+        &ccteam_im::hub::hub_base(),
+        paths,
+        false,
+    ))??;
+    let library_root = paths.skills_dir();
+    let project_dir = std::env::current_dir().context("read cwd for hub status context")?;
+
+    let candidates: Vec<&ccteam_im::hub::HubPlugin> = if let Some(id) = id {
+        let plugin = index
+            .find(id)
+            .ok_or_else(|| anyhow::anyhow!("no skill `{id}` in the ccteam-hub marketplace"))?;
+        if plugin.type_ != "skill" {
+            bail!(
+                "hub entry `{id}` is type `{}`; use: ccteam role add {id}",
+                plugin.type_
+            );
+        }
+        vec![plugin]
+    } else {
+        index
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.type_ == "skill")
+            .collect()
+    };
+
+    let mut updated = Vec::new();
+    let mut current = Vec::new();
+    for plugin in candidates {
+        match ccteam_im::hub::installed_status(&project_dir, &library_root, plugin) {
+            ccteam_im::hub::InstalledStatus::UpdateAvailable => {
+                block_on_async(ccteam_im::hub::install_plugin(
+                    &project_dir,
+                    &library_root,
+                    plugin,
+                    None,
+                    true,
+                ))?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                updated.push(plugin.id.clone());
+            }
+            ccteam_im::hub::InstalledStatus::Installed => current.push(plugin.id.clone()),
+            ccteam_im::hub::InstalledStatus::NotInstalled => {}
+        }
+    }
+
+    if let Some(id) = id {
+        if updated.iter().any(|updated| updated == id) {
+            return Ok(format!("Updated hub skill `{id}` in the user library.\n"));
+        }
+        if current.iter().any(|current| current == id) {
+            return Ok(format!("Hub skill `{id}` is already current.\n"));
+        }
+        return Ok(format!(
+            "Hub skill `{id}` is not installed; use `ccteam skill add {id}`.\n"
+        ));
+    }
+
+    Ok(format!(
+        "Hub skill update complete: {} updated, {} already current.\n",
+        updated.len(),
+        current.len()
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SkillSourceKind {
+    Git,
+    Path,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SkillSourceRecord {
+    kind: SkillSourceKind,
+    origin: String,
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    r#ref: Option<String>,
+}
+
+type SkillSources = std::collections::BTreeMap<String, SkillSourceRecord>;
+
+fn skill_sources_path(paths: &CcteamPaths) -> std::path::PathBuf {
+    paths.skills_dir().join(".sources.json")
+}
+
+fn load_skill_sources(paths: &CcteamPaths) -> Result<SkillSources> {
+    let path = skill_sources_path(paths);
+    if !path.exists() {
+        return Ok(SkillSources::new());
+    }
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("read skill sources {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("parse skill sources {}", path.display()))
+}
+
+fn save_skill_sources(paths: &CcteamPaths, sources: &SkillSources) -> Result<()> {
+    let path = skill_sources_path(paths);
+    std::fs::create_dir_all(paths.skills_dir())
+        .with_context(|| format!("create skill library {}", paths.skills_dir().display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let mut body = serde_json::to_string_pretty(sources)?;
+    body.push('\n');
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+}
+
+fn source_default_stem(origin: &str) -> Result<String> {
+    let path = std::path::Path::new(origin);
+    let raw = if path.exists() {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("source path has no UTF-8 directory name: {origin}"))?
+            .to_string()
+    } else {
+        origin
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".git")
+            .to_string()
+    };
+    ccteam_core::sanitize_skill_library_id(&raw)
+}
+
+fn run_checked_command(mut command: Command, description: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("run {description}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "{description} failed{}",
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )
+}
+
+fn clone_git_source(origin: &str, target: &std::path::Path, reference: Option<&str>) -> Result<()> {
+    let mut clone = Command::new("git");
+    clone.arg("clone").arg("--").arg(origin).arg(target);
+    run_checked_command(clone, "git clone skill source")?;
+    if let Some(reference) = reference {
+        let mut checkout = Command::new("git");
+        checkout
+            .arg("-C")
+            .arg(target)
+            .args(["checkout", "--force", reference]);
+        run_checked_command(checkout, "git checkout skill source ref")?;
+    }
+    Ok(())
+}
+
+fn copy_source_tree(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    std::fs::create_dir(target)
+        .with_context(|| format!("create source target {}", target.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("read source directory {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry under {}", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type for {}", entry.path().display()))?;
+        let destination = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_source_tree(&entry.path(), &destination)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &destination).with_context(|| {
+                format!(
+                    "copy source file {} -> {}",
+                    entry.path().display(),
+                    destination.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "source tree contains unsupported symlink or special file: {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Register a git repository or one-time local-directory copy under the skill
+/// library and persist its update metadata.
+pub fn run_skill_source_add(
+    paths: &CcteamPaths,
+    origin: &str,
+    name: Option<&str>,
+    reference: Option<&str>,
+) -> Result<String> {
+    let origin_path = std::path::Path::new(origin);
+    let local = origin_path.exists();
+    if local && !origin_path.is_dir() {
+        bail!(
+            "skill source must be a directory: {}",
+            origin_path.display()
+        );
+    }
+    let is_git = !local || origin_path.join(".git").exists();
+    if !is_git && reference.is_some() {
+        bail!("--ref is only valid for git skill sources");
+    }
+    let raw_stem = name
+        .map(str::to_string)
+        .unwrap_or(source_default_stem(origin)?);
+    let stem = ccteam_core::sanitize_skill_library_id(&raw_stem)?;
+    let target = paths.skills_dir().join(&stem);
+    if target.exists() {
+        bail!(
+            "skill source target `{stem}` already exists at {}; remove it first",
+            target.display()
+        );
+    }
+    let mut sources = load_skill_sources(paths)?;
+    if sources.contains_key(&stem) {
+        bail!("skill source `{stem}` is already registered");
+    }
+    let target_parent = target.parent().ok_or_else(|| {
+        anyhow::anyhow!("skill source target has no parent: {}", target.display())
+    })?;
+    std::fs::create_dir_all(target_parent)
+        .with_context(|| format!("create skill source parent {}", target_parent.display()))?;
+
+    let canonical_origin = if local {
+        std::fs::canonicalize(origin_path)
+            .with_context(|| format!("canonicalize skill source {}", origin_path.display()))?
+            .display()
+            .to_string()
+    } else {
+        origin.to_string()
+    };
+    let install = if is_git {
+        clone_git_source(&canonical_origin, &target, reference)
+    } else {
+        copy_source_tree(origin_path, &target)
+    };
+    if let Err(err) = install {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(err);
+    }
+
+    sources.insert(
+        stem.clone(),
+        SkillSourceRecord {
+            kind: if is_git {
+                SkillSourceKind::Git
+            } else {
+                SkillSourceKind::Path
+            },
+            origin: canonical_origin,
+            r#ref: reference.map(str::to_string),
+        },
+    );
+    if let Err(err) = save_skill_sources(paths, &sources) {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(err);
+    }
+    let count = ccteam_core::list_library_skills(&target).len();
+    Ok(format!(
+        "Added {} skill source `{stem}` at {} ({count} skill(s) discovered).\n",
+        if is_git { "git" } else { "path" },
+        target.display()
+    ))
+}
+
+fn update_git_source(target: &std::path::Path, reference: Option<&str>) -> Result<()> {
+    if let Some(reference) = reference {
+        let mut fetch = Command::new("git");
+        fetch
+            .arg("-C")
+            .arg(target)
+            .args(["fetch", "origin", reference]);
+        run_checked_command(fetch, "git fetch skill source ref")?;
+        let mut checkout = Command::new("git");
+        checkout
+            .arg("-C")
+            .arg(target)
+            .args(["checkout", "--force", "FETCH_HEAD"]);
+        run_checked_command(checkout, "git checkout fetched skill source ref")
+    } else {
+        let mut pull = Command::new("git");
+        pull.arg("-C").arg(target).args(["pull", "--ff-only"]);
+        run_checked_command(pull, "git pull skill source")
+    }
+}
+
+/// Update one or all registered skill sources.
+pub fn run_skill_source_update(
+    paths: &CcteamPaths,
+    stem: Option<&str>,
+    all: bool,
+) -> Result<String> {
+    if stem.is_some() == all {
+        bail!("choose exactly one of <stem> or --all");
+    }
+    let sources = load_skill_sources(paths)?;
+    let selected: Vec<(&String, &SkillSourceRecord)> = if let Some(stem) = stem {
+        ccteam_core::validate_skill_library_id(stem)?;
+        let record = sources
+            .get_key_value(stem)
+            .ok_or_else(|| anyhow::anyhow!("skill source `{stem}` is not registered"))?;
+        vec![record]
+    } else {
+        sources.iter().collect()
+    };
+    let mut out = String::new();
+    for (stem, record) in selected {
+        let target = paths.skills_dir().join(stem);
+        if !target.is_dir() {
+            bail!("skill source `{stem}` is missing at {}", target.display());
+        }
+        match record.kind {
+            SkillSourceKind::Git => {
+                update_git_source(&target, record.r#ref.as_deref())?;
+                out.push_str(&format!("Updated git skill source `{stem}`.\n"));
+            }
+            SkillSourceKind::Path => out.push_str(&format!(
+                "Path skill source `{stem}` is self-managed; update is a no-op (origin {}).\n",
+                record.origin
+            )),
+        }
+    }
+    if out.is_empty() {
+        out.push_str("No skill sources are registered.\n");
+    }
+    Ok(out)
+}
+
+/// List registered skill sources.
+pub fn run_skill_source_list(paths: &CcteamPaths, json: bool) -> Result<String> {
+    let sources = load_skill_sources(paths)?;
+    if json {
+        return Ok(serde_json::to_string_pretty(&sources)?);
+    }
+    if sources.is_empty() {
+        return Ok("no skill sources registered.\n".to_string());
+    }
+    let mut out = format!("{} skill source(s):\n\n", sources.len());
+    for (stem, source) in sources {
+        out.push_str(&format!(
+            "  {stem}  [{}]  {}{}\n",
+            match source.kind {
+                SkillSourceKind::Git => "git",
+                SkillSourceKind::Path => "path",
+            },
+            source.origin,
+            source
+                .r#ref
+                .as_deref()
+                .map(|reference| format!(" @ {reference}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(out)
+}
+
+/// Remove a registered source tree and its metadata. Projects are never
+/// inspected or modified.
+pub fn run_skill_source_remove(paths: &CcteamPaths, stem: &str) -> Result<String> {
+    ccteam_core::validate_skill_library_id(stem)?;
+    let mut sources = load_skill_sources(paths)?;
+    if sources.remove(stem).is_none() {
+        bail!("skill source `{stem}` is not registered");
+    }
+    let target = paths.skills_dir().join(stem);
+    if target.exists() {
+        std::fs::remove_dir_all(&target)
+            .with_context(|| format!("remove skill source tree {}", target.display()))?;
+    }
+    save_skill_sources(paths, &sources)?;
+    Ok(format!(
+        "Removed skill source `{stem}` and its library tree.\n"
+    ))
+}
+
+const PROJECT_SKILLS_LINK_TARGET: &str = "../.agents/skills";
+
+fn ensure_project_skill_entity(project_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let entity = project_dir.join(".agents/skills");
+    match std::fs::symlink_metadata(&entity) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(entity),
+        Ok(_) => bail!(
+            "project skill entity must be a real directory, not a symlink/file: {}",
+            entity.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&entity)
+                .with_context(|| format!("create project skill entity {}", entity.display()))?;
+            Ok(entity)
+        }
+        Err(err) => Err(err).with_context(|| format!("inspect {}", entity.display())),
+    }
+}
+
+fn project_skills_link_is_correct(link: &std::path::Path, entity: &std::path::Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        link.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(target)
+    };
+    matches!(
+        (std::fs::canonicalize(resolved), std::fs::canonicalize(entity)),
+        (Ok(actual), Ok(expected)) if actual == expected
+    )
+}
+
+#[cfg(unix)]
+fn create_project_skills_link(link: &std::path::Path) -> Result<()> {
+    std::os::unix::fs::symlink(PROJECT_SKILLS_LINK_TARGET, link)
+        .with_context(|| format!("create project skill link {}", link.display()))
+}
+
+#[cfg(not(unix))]
+fn create_project_skills_link(_link: &std::path::Path) -> Result<()> {
+    bail!("project skill symlink management requires Unix/WSL")
+}
+
+/// Ensure the neutral project skill entity and Claude discovery symlink.
+pub fn run_skill_ensure_project(paths: &CcteamPaths, project: Option<&str>) -> Result<String> {
+    let project_dir = resolve_project_dir(paths, project)?;
+    let entity = ensure_project_skill_entity(&project_dir)?;
+    let link = project_dir.join(".claude/skills");
+    std::fs::create_dir_all(project_dir.join(".claude"))
+        .with_context(|| format!("create {}/.claude", project_dir.display()))?;
+    match std::fs::symlink_metadata(&link) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            create_project_skills_link(&link)?;
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if !project_skills_link_is_correct(&link, &entity) {
+                bail!(
+                    "{} is a symlink to the wrong target; expected {}",
+                    link.display(),
+                    PROJECT_SKILLS_LINK_TARGET
+                );
+            }
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let empty = std::fs::read_dir(&link)
+                .with_context(|| format!("read legacy skill dir {}", link.display()))?
+                .next()
+                .is_none();
+            if !empty {
+                bail!(
+                    "legacy project skill directory {} is non-empty; use `ccteam skill migrate-project{}`",
+                    link.display(),
+                    project
+                        .map(|slug| format!(" --project {slug}"))
+                        .unwrap_or_default()
+                );
+            }
+            std::fs::remove_dir(&link)
+                .with_context(|| format!("remove empty legacy skill dir {}", link.display()))?;
+            create_project_skills_link(&link)?;
+        }
+        Ok(_) => bail!(
+            "{} exists but is neither a directory nor the expected symlink",
+            link.display()
+        ),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", link.display())),
+    }
+    Ok(format!(
+        "Project skill face ready:\n  entity: {}\n  claude: {} -> {}\n",
+        entity.display(),
+        link.display(),
+        PROJECT_SKILLS_LINK_TARGET
+    ))
+}
+
+/// Move legacy project-local skill directories to the neutral entity, then
+/// replace the legacy directory with the Claude discovery symlink.
+pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> Result<String> {
+    let project_dir = resolve_project_dir(paths, project)?;
+    let entity = ensure_project_skill_entity(&project_dir)?;
+    let legacy = project_dir.join(".claude/skills");
+    std::fs::create_dir_all(project_dir.join(".claude"))
+        .with_context(|| format!("create {}/.claude", project_dir.display()))?;
+
+    let metadata = match std::fs::symlink_metadata(&legacy) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", legacy.display())),
+    };
+    if let Some(metadata) = metadata.as_ref() {
+        if metadata.file_type().is_symlink() {
+            if project_skills_link_is_correct(&legacy, &entity) {
+                return Ok(format!(
+                    "Project skills already use the neutral entity at {}.\n",
+                    entity.display()
+                ));
+            }
+            bail!(
+                "{} is a symlink to the wrong target; refusing migration",
+                legacy.display()
+            );
+        }
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "legacy project skill face is not a directory: {}",
+                legacy.display()
+            );
+        }
+
+        let mut moves = Vec::new();
+        for entry in std::fs::read_dir(&legacy)
+            .with_context(|| format!("read legacy skill dir {}", legacy.display()))?
+        {
+            let entry = entry.with_context(|| format!("read entry under {}", legacy.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("read file type for {}", entry.path().display()))?;
+            if !file_type.is_dir() {
+                bail!(
+                    "legacy skill face contains a non-directory entry {}; move it manually before migration",
+                    entry.path().display()
+                );
+            }
+            let destination = entity.join(entry.file_name());
+            if destination.exists() {
+                bail!(
+                    "project skill migration collision at {}; resolve it before retrying",
+                    destination.display()
+                );
+            }
+            moves.push((entry.path(), destination));
+        }
+        for (source, destination) in &moves {
+            std::fs::rename(source, destination).with_context(|| {
+                format!(
+                    "move project skill {} -> {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        std::fs::remove_dir(&legacy)
+            .with_context(|| format!("remove legacy skill dir {}", legacy.display()))?;
+    }
+    create_project_skills_link(&legacy)?;
+    Ok(format!(
+        "Migrated project skills to {} and linked {} -> {}.\n",
+        entity.display(),
+        legacy.display(),
+        PROJECT_SKILLS_LINK_TARGET
+    ))
 }
 
 /// V0.4.6 F81 — `ccteam remove <slug>` implementation.
