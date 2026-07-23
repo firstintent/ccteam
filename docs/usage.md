@@ -111,13 +111,13 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
-- **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and can attach any skill installed in the project (`.claude/skills/`). Both ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
+- **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and — admins only — the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
 
 > Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
-The **Marketplace** page browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it into the current project. Installs verify sha256 and show installed status. After installing a role, switch to it from any surface with `/role <role>`.
+The **Marketplace** page browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
 
 ### Configure Telegram / Lark
 
@@ -337,7 +337,23 @@ ccteam role add data-scientist --project demo   # Install into a named project.
 ccteam role list                   # List roles installed in current project.
 ```
 
-ccteam reads ccteam-hub over HTTPS with a local cache at `~/.ccteam/cache/hub/`, fetches upstream files pinned to fixed commits, verifies sha256, and writes only when missing unless `--force` is used. Multi-file skills install under `.claude/skills/<id>/`. The web marketplace uses the same catalog.
+ccteam reads ccteam-hub over HTTPS with a local cache at `~/.ccteam/cache/hub/`, fetches upstream files pinned to fixed commits, verifies sha256, and writes only when missing unless `--force` is used. Skills install into the user-level global library — multi-file skills land whole under `~/.ccteam/skills/<id>/` after the entire batch verifies. The web marketplace uses the same catalog.
+
+Skills have their own command group (`ccteam role add` refuses skill ids and points here):
+
+```bash
+ccteam skill search research        # Search marketplace skills.
+ccteam skill add deep-research      # Install into the global library ~/.ccteam/skills.
+ccteam skill ls                     # List the library; ids may nest (baoyu-skills/baoyu-comic).
+ccteam skill rm <id>                # Remove one skill; --force removes a whole tree.
+ccteam skill update --all           # Re-sync hub-pinned skills that drifted.
+ccteam skill source add <git-url>   # Register a multi-skill repo into the library.
+ccteam skill source update --all    # Sync registered sources (ls / rm work too).
+ccteam skill ensure-project         # Project-own skills: .agents/skills + .claude/skills symlink.
+ccteam skill migrate-project        # Move legacy .claude/skills entities into .agents/skills.
+```
+
+The global library and project skills never mix: nothing links or copies from the library into a project — sessions reference library skills per message (composer attach), while project-own skills live in the project as normal git-visible files.
 
 ### Operations
 

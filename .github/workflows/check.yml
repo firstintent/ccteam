@@ -27,6 +27,18 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  test:
+    name: cargo test (deterministic baseline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The deterministic baseline scope: workspace minus ccteam-web (its WS/PTY
+      # tests need a real terminal), lib + bins targets only (tests/*.rs
+      # integration files carry the env-flake families). Same scope as
+      # `make test-baseline` — keep the two in sync.
+      - run: cargo test --workspace --exclude ccteam-web --lib --bins --locked
+
   # The rmux real-daemon smoke (ubuntu + macOS matrix) used to run here.
   # The `terminal` protocol (tmux/rmux/PTY) is in maintenance-only mode and
   # planned for retirement — no new vendor or feature extends it — so paying

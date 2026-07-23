@@ -119,7 +119,7 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 - **Settings → Hosts** — register the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team; and mint join tokens for new machines
 - **Settings → IM** — paste a Telegram/Lark bot token (chat id captured automatically)
-- **Marketplace** — install personas and skills, checksum-verified
+- **Marketplace** — install personas (into the project) and skills (into your user-level library `~/.ccteam/skills`), checksum-verified; attach library skills to any message from the composer
 
 > The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. To bind a specific host/port (e.g. loopback only), pass `--web-bind` when you start it: `ccteam daemon start --web-bind 127.0.0.1:7331`.
 
@@ -153,7 +153,7 @@ ccteam adds a team to your repo without taking it over:
 
 ## Extras
 
-- **Marketplace** — personas and skills install from [ccteam-hub](https://github.com/firstintent/ccteam-hub) into your project's `.claude/`: fetched from pinned upstreams, sha256-verified, copied verbatim, never executed. Vendor-native Claude Code plugins are delegated to Claude Code itself (ccteam only flips the two settings keys).
+- **Marketplace** — personas install from [ccteam-hub](https://github.com/firstintent/ccteam-hub) into your project's `.claude/agents/`; skills install into the user-level global library `~/.ccteam/skills` (nested ids, whole-repo sources via `ccteam skill source add`), then attach to sessions per message — the library never links or copies into a project, while project-own skills live in `.agents/skills/` as normal git-visible files (`ccteam skill ensure-project`). Everything is fetched from pinned upstreams, sha256-verified, copied verbatim, never executed. Vendor-native Claude Code plugins are delegated to Claude Code itself (ccteam only flips the two settings keys).
 - **HITL approvals** — spawn a session in approval mode and its permission requests reach your IM as `[approve] [deny]` buttons, through the vendor's native gate; deny blocks the tool call without killing the turn.
 
 ## Why
