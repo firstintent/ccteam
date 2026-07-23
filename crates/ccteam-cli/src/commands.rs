@@ -2398,6 +2398,7 @@ pub fn run_role_add(
     })?;
     let result = block_on_async(ccteam_im::hub::install_plugin(
         &project_dir,
+        &paths.skills_dir(),
         plugin,
         as_role,
         force,

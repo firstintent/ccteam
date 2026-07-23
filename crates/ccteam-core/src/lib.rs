@@ -133,8 +133,8 @@ pub use actions::{
 // by the hub installer.
 pub use admin_actions::{
     agent_md_path, change_persona, sanitize_skill_library_id, skill_dir_path, skill_md_path,
-    validate_skill_library_id, write_library_skill, write_library_skill_file, write_role,
-    write_skill, write_skill_file, AddToolResult,
+    validate_skill_library_file_relpath, validate_skill_library_id, write_library_skill,
+    write_library_skill_file, write_role, write_skill, write_skill_file, AddToolResult,
 };
 // Ledger-only re-exports (product vote/parallel APIs deleted in v0.8.24 C2).
 pub use advise::{

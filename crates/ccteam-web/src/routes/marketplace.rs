@@ -254,6 +254,7 @@ pub(crate) async fn handle_project_marketplace(
         }
     };
     let project_dir = app.paths.project_dir(&slug);
+    let library_root = app.paths.skills_dir();
     // Decorate each entry with its on-disk installed status. We serialize the
     // plugin to a JSON object and splice in `installed_status` so the wire
     // shape is `{...plugin, installed_status}` without needing a parallel DTO
@@ -262,7 +263,7 @@ pub(crate) async fn handle_project_marketplace(
         .plugins
         .iter()
         .map(|plugin| {
-            let status = hub::installed_status(&project_dir, plugin);
+            let status = hub::installed_status(&project_dir, &library_root, plugin);
             let mut obj = serde_json::to_value(plugin).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(map) = obj.as_object_mut() {
                 map.insert(
@@ -333,8 +334,9 @@ pub(crate) async fn handle_project_marketplace_install(
         );
     };
     let project_dir = app.paths.project_dir(&slug);
+    let library_root = app.paths.skills_dir();
     let force = form.force.unwrap_or(false);
-    match hub::install_plugin(&project_dir, plugin, None, force).await {
+    match hub::install_plugin(&project_dir, &library_root, plugin, None, force).await {
         Ok(result) => {
             let body = serde_json::json!({
                 "id": result.id,

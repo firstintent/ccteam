@@ -253,13 +253,16 @@ pub fn write_library_skill_file(
     force: bool,
 ) -> Result<PathBuf> {
     validate_skill_library_id(id)?;
-    let relpath = validate_library_skill_relpath(relpath)?;
+    let relpath = validate_skill_library_file_relpath(relpath)?;
     let path = library_skill_dir_path(root, id).join(relpath);
     atomic_write_library_file(&path, bytes, force)?;
     Ok(path)
 }
 
-fn validate_library_skill_relpath(relpath: &str) -> Result<PathBuf> {
+/// Validate a manifest file path for [`write_library_skill_file`]. The
+/// normalized relative path is returned so callers can preflight an entire
+/// manifest before performing any writes.
+pub fn validate_skill_library_file_relpath(relpath: &str) -> Result<PathBuf> {
     if relpath.is_empty() {
         bail!("skill file relpath must be non-empty");
     }
