@@ -5658,9 +5658,10 @@ impl Gateway {
         // web reply MUST stay the bare `id:project:vendor:role` rows (no banner /
         // scoping / footer — those would break `parse_sessions_reply`). The IM
         // text surface, which has no chrome, instead gets a current-project
-        // banner + project scoping + an `/sessions all` footer, and rows in the
-        // human-facing `sid vendor · project · role` shape (leading `sid vendor`
-        // mirrors the switch buttons).
+        // banner + project scoping + an `/sessions all` footer, and compact
+        // `sid vendor[.model][.effort][.window(pct%)]` rows (leading
+        // `sid vendor` mirrors the switch buttons; no project slug per row —
+        // the banner names it).
         let is_web = chat.channel == "web";
         // Default scope = the chat's CURRENT project; `all` (and web) lists the
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
@@ -5743,13 +5744,16 @@ impl Gateway {
             }
             // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
             // with `sid vendor` (the SAME opening as the switch button —
-            // `session_switch_options`: `sid vendor (title)`), then `.project`
-            // and — when the adapter reports them — `.model`, `.effort`, and
-            // `.used/window(pct%)` context (absolute counts via the same
-            // `format_tokens` humanizer `ContextUsage::render` uses). NO role,
-            // NO `ctx` label (all on /status); the title lives on the button;
-            // the vendor tag + activity dot are gone.
-            let mut row = format!("{} {}.{}", s.id, vendor_str(s.vendor), s.project);
+            // `session_switch_options`: `sid vendor (title)`), then — when the
+            // adapter reports them — `.model`, `.effort`, and `.window(pct%)`
+            // context: the TOTAL window (absolute, via the same
+            // `format_tokens` humanizer `ContextUsage::render` uses) + the
+            // used percentage, but NOT the absolute used count. NO project
+            // slug (the `📁 当前项目:` header already names it; `/sessions all`
+            // spans projects without a per-row slug), NO role, NO `ctx` label
+            // (all on /status); the title lives on the button; the vendor tag
+            // + activity dot are gone.
+            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
             if let Some(st) = &status {
                 if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
                     row.push_str(&format!(".{m}"));
@@ -5759,8 +5763,7 @@ impl Gateway {
                 }
                 if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
                     row.push_str(&format!(
-                        ".{}/{}({:.0}%)",
-                        format_tokens(ctx.used_tokens),
+                        ".{}({:.0}%)",
                         format_tokens(ctx.window_tokens),
                         ctx.pct()
                     ));
@@ -12800,7 +12803,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2 claude.alpha"), "{}", mock[0]);
+        assert!(mock[0].contains("s2 claude"), "{}", mock[0]);
     }
 
     /// Picker buttons are `sid vendor (title)` (sid → vendor → title), a `✓`
@@ -12909,7 +12912,7 @@ mod tests {
             .unwrap();
         let row = listing[0].split('\n').nth(1).expect("a session row");
         assert!(
-            row.starts_with("s1 claude.alpha"),
+            row.starts_with("s1 claude"),
             "row starts with the sid: {row:?}"
         );
         for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
@@ -13046,10 +13049,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude"]);
 
-        // Now report a model + effort + usage → suffix appears with absolute
-        // counts (`format_tokens`) alongside the percent.
+        // Now report a model + effort + usage → suffix appears with the
+        // TOTAL window (absolute, via `format_tokens`) + percent — no project
+        // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage {
@@ -13066,7 +13070,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-opus-4-8[1m].max.188k/1M(19%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.claude-opus-4-8[1m].max.1M(19%)"]
         );
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
@@ -13086,7 +13090,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-sonnet-4-5.188k/200k(94%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.claude-sonnet-4-5.200k(94%)"]
         );
     }
 
@@ -13115,7 +13119,7 @@ mod tests {
             .next()
             .unwrap();
         for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
-            assert!(listing.contains(&format!(" {vendor}.")), "{listing}");
+            assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
 
@@ -13147,10 +13151,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 当前项目: alpha\ns2 claude.alpha\ns1 claude.alpha"]
-        );
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns2 claude\ns1 claude"]);
 
         // Tag s1 (the OLDER session) with an outstanding approval.
         let token = "pwaitpin001";
@@ -13169,7 +13170,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ s1 claude.alpha\ns2 claude.alpha"],
+            vec!["📁 当前项目: alpha\n⏳ s1 claude\ns2 claude"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -14335,7 +14336,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude"]);
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -14376,7 +14377,7 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -14549,10 +14550,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 codex.beta"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 codex"]);
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -14624,9 +14622,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec![
-                "📁 当前项目: beta\ns4 claude.beta\ns3 codex.beta\ns2 codex.alpha\ns1 claude.alpha"
-            ]
+            vec!["📁 当前项目: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
         );
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
@@ -15046,10 +15042,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 claude.beta"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
 
         assert_eq!(
             restored
@@ -15120,7 +15113,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude.beta"]);
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
 
         assert_eq!(
             restored
@@ -15583,7 +15576,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -15615,10 +15608,7 @@ mod tests {
         // `session_switch_options`); s1 never sent a plain message, so it is
         // untitled either way. s2 is roleless → empty role field
         // (`s2 claude.beta`).
-        assert_eq!(
-            after,
-            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 claude.alpha"]
-        );
+        assert_eq!(after, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
     }
 
     #[tokio::test]
@@ -15848,7 +15838,7 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees.iter().any(|r| r.contains("s1 claude.alpha")),
+            owner_sees.iter().any(|r| r.contains("s1 claude")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -15971,7 +15961,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -16041,7 +16031,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -16142,7 +16132,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
         // …and the rename SURFACES on the picker button.
         let chat = ChatKey::new("mock", "chat-1", "alice");
         let s1_button = |g: &Gateway| {
@@ -16165,7 +16155,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
+        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude"]);
         assert_eq!(
             s1_button(&gateway).as_deref(),
             Some("✓ s1 claude (my custom title)"),
@@ -17280,9 +17270,9 @@ mod tests {
         let out = gw
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
-        // Parent row precedes the indented child row (roleless → `sid claude · alpha`).
-        let pline = format!("{parent} claude.alpha");
-        let cline = format!("└─ {child} claude.alpha");
+        // Parent row precedes the indented child row (roleless → `sid claude`).
+        let pline = format!("{parent} claude");
+        let cline = format!("└─ {child} claude");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
