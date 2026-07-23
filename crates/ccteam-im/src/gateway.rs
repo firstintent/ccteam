@@ -2745,13 +2745,13 @@ impl Gateway {
         let mut options: Vec<MessageOption> = visible
             .into_iter()
             .map(|s| {
-                // Label = `sid vendor 「title」` (✓ prefixes the current
-                // session), arranged sid → vendor → title. The terse text tree
-                // keeps the full `sid:project:vendor:role` line; the button
-                // carries the human name. A long title is clipped to
-                // `SESSION_BUTTON_TITLE_MAX_COLS` display cols so one verbose
-                // title can't widen every button (the left-align padding below
-                // pads all labels to the widest). Callback `data` is unchanged.
+                // Label = `sid vendor (title)` (✓ prefixes the current
+                // session), arranged sid → vendor → title — same `sid vendor`
+                // opening as the text rows. The button carries the human name;
+                // a long title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS`
+                // display cols so one verbose title can't widen every button
+                // (the left-align padding below pads all labels to the widest).
+                // Callback `data` is unchanged.
                 let marker = if Some(&s.id) == current_sid.as_ref() {
                     "✓ "
                 } else {
@@ -2760,7 +2760,7 @@ impl Gateway {
                 let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
                 if let Some(title) = self.session_title(s) {
                     label.push_str(&format!(
-                        " 「{}」",
+                        " ({})",
                         truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
                     ));
                 }
@@ -5727,35 +5727,35 @@ impl Gateway {
         for s in &visible {
             // P3 — model + ctx from the owning adapter's `thread_status`.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
-            // → `status_suffix() == None` → no ` — suffix`. Per-session failures
-            // degrade to the bare row (never break the listing).
-            let suffix = match s.adapter.thread_status(&s.thread).await {
-                Ok(status) => status.status_suffix(),
-                Err(_) => None,
-            };
-            // Web rows stay the machine-parsed `sid:project:vendor:role` feed
-            // (`parse_sessions_reply` splits on exactly 4 colon fields and must
-            // not see extra content appended).
+            // (no model / no context). Per-session failures degrade to the bare
+            // row (never break the listing).
+            let status = (s.adapter.thread_status(&s.thread).await).ok();
+            // Web rows stay the machine-parsed `sid:project:vendor:role` feed +
+            // the full, shared `status_suffix()` (matches Codex /status;
+            // `parse_sessions_reply` splits on exactly 4 colon fields).
             if is_web {
                 let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
-                web_rows.push(match &suffix {
+                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
                     Some(sfx) => format!("{base} — {sfx}"),
                     None => base,
                 });
                 continue;
             }
-            // IM row LEADS with `sid vendor` — the SAME opening as the switch
-            // button (`session_switch_options`: `sid vendor 「title」`) — so the
-            // text tree and the buttons line up. Then `· project`, `· role`
-            // (role omitted when empty), the optional model/ctx suffix, and a
-            // non-local host. No vendor tag or activity dot (activity → /status;
-            // title → the button).
-            let mut row = format!("{} {} · {}", s.id, vendor_str(s.vendor), s.project);
-            if !s.role.is_empty() {
-                row.push_str(&format!(" · {}", s.role));
-            }
-            if let Some(sfx) = &suffix {
-                row.push_str(&format!(" — {sfx}"));
+            // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
+            // with `sid vendor` (the SAME opening as the switch button —
+            // `session_switch_options`: `sid vendor (title)`), then `.project`
+            // and — when the adapter reports them — `.model` and `.<pct>%`
+            // context. Deliberately terse: NO role, NO `ctx` label, NO absolute
+            // token counts (all on /status); the title lives on the button; the
+            // vendor tag + activity dot are gone.
+            let mut row = format!("{} {}.{}", s.id, vendor_str(s.vendor), s.project);
+            if let Some(st) = &status {
+                if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
+                    row.push_str(&format!(".{m}"));
+                }
+                if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
+                    row.push_str(&format!(".{:.0}%", ctx.pct()));
+                }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
             if !s.host.is_empty() && s.host != "local" {
@@ -12791,14 +12791,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(
-            mock[0].contains("s2 claude · alpha · reviewer"),
-            "{}",
-            mock[0]
-        );
+        assert!(mock[0].contains("s2 claude.alpha"), "{}", mock[0]);
     }
 
-    /// Picker buttons are `sid vendor 「title」` (sid → vendor → title), a `✓`
+    /// Picker buttons are `sid vendor (title)` (sid → vendor → title), a `✓`
     /// marking the current session. The ROLE is NOT on the button (it stays on
     /// the information-rich text rows). Tail-padding stays visual-only so
     /// Telegram left-aligns the variable-width labels.
@@ -12809,7 +12805,7 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         // One roleless untitled session + one titled session: the untitled
-        // button is `sid vendor`, the titled one appends its 「title」.
+        // button is `sid vendor`, the titled one appends its (title).
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -12826,10 +12822,10 @@ mod tests {
         let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
         let s1_text = s1.label.trim_end_matches('\u{2800}');
         let s2_text = s2.label.trim_end_matches('\u{2800}');
-        // Untitled → `sid vendor`; titled + current → `✓ sid vendor 「title」`.
+        // Untitled → `sid vendor`; titled + current → `✓ sid vendor (title)`.
         // Vendor is lowercase (`vendor_str`).
         assert_eq!(s1_text, "s1 claude");
-        assert_eq!(s2_text, "✓ s2 claude 「A long review title」");
+        assert_eq!(s2_text, "✓ s2 claude (A long review title)");
         for label in [s1_text, s2_text] {
             assert!(
                 !label.contains("reviewer"),
@@ -12867,8 +12863,8 @@ mod tests {
         let opts = gateway.session_switch_options(&chat, false);
         let label = opts[0].label.trim_end_matches('\u{2800}');
         let title = label
-            .split_once('「')
-            .and_then(|(_, rest)| rest.strip_suffix('」'))
+            .split_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
             .expect("titled button label");
         assert!(
             title.ends_with('…'),
@@ -12904,7 +12900,7 @@ mod tests {
             .unwrap();
         let row = listing[0].split('\n').nth(1).expect("a session row");
         assert!(
-            row.starts_with("s1 claude · alpha · reviewer"),
+            row.starts_with("s1 claude.alpha"),
             "row starts with the sid: {row:?}"
         );
         for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
@@ -13041,10 +13037,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            bare,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
-        );
+        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
 
         // Now report a model + usage → suffix appears, rendered the same
         // way Codex /status renders (shared helper).
@@ -13064,7 +13057,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-opus-4-8[1m].19%"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -13084,7 +13077,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-sonnet-4-5.94%"]
         );
     }
 
@@ -13113,7 +13106,7 @@ mod tests {
             .next()
             .unwrap();
         for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
-            assert!(listing.contains(&format!(" {vendor} · ")), "{listing}");
+            assert!(listing.contains(&format!(" {vendor}.")), "{listing}");
         }
     }
 
@@ -13147,7 +13140,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\ns2 claude · alpha · qa\ns1 claude · alpha · reviewer"]
+            vec!["📁 当前项目: alpha\ns2 claude.alpha\ns1 claude.alpha"]
         );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -13167,7 +13160,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ s1 claude · alpha · reviewer\ns2 claude · alpha · qa"],
+            vec!["📁 当前项目: alpha\n⏳ s1 claude.alpha\ns2 claude.alpha"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -14333,10 +14326,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            owner_sees,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
-        );
+        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -14377,10 +14367,7 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(
-            seen,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
-        );
+        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -14555,7 +14542,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2 claude · beta · reviewer\ns1 codex · beta · api"]
+            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 codex.beta"]
         );
 
         let use_first = gateway
@@ -14629,7 +14616,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\ns4 claude · beta · qa\ns3 codex · beta · api\ns2 codex · alpha · docs\ns1 claude · alpha · reviewer"
+                "📁 当前项目: beta\ns4 claude.beta\ns3 codex.beta\ns2 codex.alpha\ns1 claude.alpha"
             ]
         );
         let projects = gateway
@@ -15052,7 +15039,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2 claude · beta · reviewer\ns1 claude · beta · reviewer"]
+            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 claude.beta"]
         );
 
         assert_eq!(
@@ -15124,10 +15111,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\ns1 claude · beta · reviewer"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude.beta"]);
 
         assert_eq!(
             restored
@@ -15590,10 +15574,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
-        );
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -15624,10 +15605,10 @@ mod tests {
         // now rides the switch BUTTON, not the text row (see
         // `session_switch_options`); s1 never sent a plain message, so it is
         // untitled either way. s2 is roleless → empty role field
-        // (`s2 claude · beta`).
+        // (`s2 claude.beta`).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns2 claude · beta\ns1 claude · alpha · reviewer"]
+            vec!["📁 当前项目: beta\ns2 claude.beta\ns1 claude.alpha"]
         );
     }
 
@@ -15858,9 +15839,7 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees
-                .iter()
-                .any(|r| r.contains("s1 claude · alpha · assistant")),
+            owner_sees.iter().any(|r| r.contains("s1 claude.alpha")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -15983,10 +15962,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
-        );
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -16056,7 +16032,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -16157,7 +16133,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
         // …and the rename SURFACES on the picker button.
         let chat = ChatKey::new("mock", "chat-1", "alice");
         let s1_button = |g: &Gateway| {
@@ -16168,7 +16144,7 @@ mod tests {
         };
         assert_eq!(
             s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude 「my custom title」")
+            Some("✓ s1 claude (my custom title)")
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -16180,13 +16156,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing2,
-            vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]
-        );
+        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
         assert_eq!(
             s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude 「my custom title」"),
+            Some("✓ s1 claude (my custom title)"),
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -17299,8 +17272,8 @@ mod tests {
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
         // Parent row precedes the indented child row (roleless → `sid claude · alpha`).
-        let pline = format!("{parent} claude · alpha");
-        let cline = format!("└─ {child} claude · alpha");
+        let pline = format!("{parent} claude.alpha");
+        let cline = format!("└─ {child} claude.alpha");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
