@@ -16,9 +16,9 @@
 ## 当前卡
 
 ### V099-SHIP 文档 + version bump + 治理回填(规划)
-- **状态**:进行中(规划 s134·2026-07-24) · **冲突域**:`docs/ + AGENTS.md + .loop/ + Cargo.toml` · **建议入口**:规划(控制)会话
+- **状态**:完成(6b8211f) · **冲突域**:`docs/ + AGENTS.md + .loop/ + Cargo.toml` · **建议入口**:规划(控制)会话
+- **验证**:usage/usage-cn/README/tech-design(含陈旧 cto 表述清理)+ AGENTS §〇/§一/§四 + workspace 0.9.9 + lock 刷新 + `.loop` 蒸馏回填全部入库;writeback 绿;**dev→main PR #169 已开**(CI 三 job 全绿),tag/部署 HELD 等 owner。
 - **规格**:usage(+cn)/tech-design/README 把 skill 库融入当前能力;AGENTS §一版本行 + §四 Skills 行;workspace 0.9.9;state/history/backlog 蒸馏;P2-1 CI job 顺带(SSH push)。
-- **DoD**:最低门 + writeback 绿;dev→main PR 开出。
 
 ### A2A-W5 A2A 线收尾:三场景真机 smoke + README/usage 重写
 - **状态**:待排 · **冲突域**:`README.md + docs/`(smoke 零代码)· **建议入口**:规划(控制)会话(涉治理面写权)
@@ -52,8 +52,8 @@
 - **DoD**:—(gated)
 
 ### P2-1 CI 增确定性测试 job
-- **状态**:进行中(规划 s134·2026-07-24) · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)
-- **补充**:job 已随 v0.9.9 落 `check.yml`(口径修正为 `--lib --bins --locked`,对齐 41c6569 后的 baseline 口径;卡面原文 `--lib` 系口径修正前拟定);判据 = 本 PR CI 三 job 绿,绿后此卡转完成。
+- **状态**:完成(6b8211f) · **冲突域**:`.github/workflows/` · **建议入口**:规划(控制)会话(治理面;改 workflow 须 SSH push,§六)
+- **验证**:PR #169 CI 三 job 全绿(fmt 18s / clippy 1m54s / test 2m51s,run 30038720051)。**门有牙实锤 = 首跑即红**:干净 runner 咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻致本地恒绿假象)→ hermetic 注入缝 `0ec136d`(per-Gateway 可用性快照;无 env 突变、不出 lib 口径、生产探测不变;红后绿双 PATH 证)→ 复跑全绿。口径 `--lib --bins --locked`(对齐 41c6569 修正;卡面原文 `--lib` 系修正前拟定)。
 - **背景**:V095 复核发现 `check.yml` 只跑 fmt + clippy,**测试完全不在 CI** —— 基线只增当前全靠会话自律 + 复核(P1-3 的测试陈化即因此漏网)。确定性口径(`--lib`)本就为免 env-flake 设计,适合上 CI。
 - **规格**:加 job `cargo test --workspace --exclude ccteam-web --lib --locked`;**不**上 web/e2e(env 依赖);过门后同步 `.loop/verify/README.md` 门禁地图。
 - **DoD**:CI 三 job 绿;writeback 绿。

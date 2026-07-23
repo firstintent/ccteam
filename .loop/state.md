@@ -8,12 +8,12 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.9` 已集成落 `dev`**(owner 2026-07-24 委托「review 需求→决策改良→开发→治理→PR」;决议 = `docs-local/versions/v0-9-9/decisions.md`,内容一行史 = `.loop/history.md` v0.9.9 行),**dev→main PR 已开待 owner 合并**(合并 = 版本落 main;tag/部署仍 HELD)。上一版 v0.9.8 已发布(`ad1c7c2` + tag,`/releases/latest`)。
-- **在做**:v0.9.9 等 owner merge;**PR CI 三 job 首跑 = P2-1 验收判据**(test job 新增,绿后 P2-1 卡转完成)。队列现势卡 = V099-SHIP(收尾中)/ A2A-W5 / FB-2 / P1-1/2 / P2-1 + 下一版候选 A2A-OBS-1..4(V094 gated)。
+- **在做**:v0.9.9 收官,**dev→main PR #169 等 owner merge**(CI 三 job 全绿:fmt/clippy/test;test job 首跑红 → hermetic `0ec136d` → 复跑绿,P2-1 完成)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1 完成待下轮蒸馏)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1650/0**(1623 + v0.9.9 批 +24 + FIX1 消红 +1 + P0 双修 +2;2026-07-24 规划于集成 worktree 实测,ship 点 `2a2b38a`)
+- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1651/0**(1623 + v0.9.9 批 +24 + FIX1 消红 +1 + P0 双修 +2 + hermetic 反向覆盖 +1;2026-07-24 规划于集成 worktree 实测,tip `0ec136d`。注:CI test job 首跑咬出 `session_tool_tests` 隐性 PATH 依赖 —— 开发机 vendor 常驻故本地恒绿,干净 runner 15 红;已上 per-Gateway 可用性快照注入缝,双 PATH 红后绿证)
 - `ccteam-web` 全量:lib 137 + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,**与 v0.9.8 实测同三只、main=dev 同红不变**,非回归)· vitest **417**(上轮记录 395;#166/#167 窗口 +11 未及回填,V099-W5 +11)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
@@ -36,7 +36,6 @@
 ## 未固化教训
 
 - **vendor 容量中断 = 委派链故障模式**(v0.9.9 FIX1 尾段 codex「model at capacity」,turn 断在门禁前):恢复路径 = `session_collect` 读账本中间记录 → 接手方按其结论收尾,不重做已完成的归因;工作品外部化(worktree/commit)= 会话可弃性。**产品侧主体已固化**(owner 复盘驱动,`2a2b38a`:TurnFailed/终态 Error 贯穿 DelegationSignal,通知冠 VENDOR ERROR = 修「假成功」;TurnStarted 刷 last_active = 消挤停误排);余量 = A2A-OBS-5/OBS-2 卡。恢复纪律候选固化 → verify/README 运行纪律。
-- **「main 烂测」第二例**(web_chat_newproject,#167 窗口带入,CI 不跑测试漏网):已由 FIX1 修(产品 bug)+ P2-1 CI test job 堵;**PR CI 首跑绿后本行移走**。
 - **规划自身教训**:backlog 批量卡片删除禁用 sed 范围盲切(v0.9.9 蒸馏时 sed 端点被此前 Edit 吃掉的卡头坑掉整段,靠 cp 备份 + Edit 精确重建恢复)—— 结构性 `.loop/` 编辑一律 Edit 工具 + 事后 `writeback.sh`。
 
 ## 流程速查
