@@ -726,6 +726,17 @@ fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
     serde_json::from_str(&body).ok()
 }
 
+/// Whether `m` is claude's OWN model-picker placeholder (`SystemMsg::
+/// from_initialize`'s `models[0].value`, typically the literal string
+/// `"default"` — labeled "Default"/"recommended" in the picker) rather than a
+/// concrete, resolvable model id. ccteam cannot know which real model that
+/// resolves to without a live turn, so this must never reach `--model` or be
+/// displayed as if it were a resolved name — see the status seed in
+/// [`ClaudeStreamJsonAdapter::start_thread`] and the filter below.
+fn is_model_placeholder(m: &str) -> bool {
+    m.trim().eq_ignore_ascii_case("default")
+}
+
 /// The last-known model for a session, from its persisted `status.json` (the
 /// status tap records every `/model` switch + the API model). The gateway uses
 /// this so a daemon-restart resume re-spawns at the model the user actually set
@@ -736,10 +747,13 @@ pub fn persisted_session_model(project_dir: &Path, sid: &str) -> Option<String> 
     read_status_file(project_dir, sid)
         .and_then(|s| s.model)
         // Real model ids never contain `<`/`>`; reject a placeholder like
-        // `<synthetic>` (legacy / never-resolved) so it can't reach `--model`.
+        // `<synthetic>` (legacy / never-resolved), and reject claude's own
+        // unresolved "default" picker label (defense-in-depth — the status
+        // seed already withholds it, but `--model default` would be a
+        // meaningless, ambiguous request if one ever slipped through).
         .filter(|m| {
             let m = m.trim();
-            !m.is_empty() && !m.contains('<') && !m.contains('>')
+            !m.is_empty() && !m.contains('<') && !m.contains('>') && !is_model_placeholder(m)
         })
 }
 
@@ -1161,9 +1175,18 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         };
         // Seed the live status with the `initialize` model (context unknown
         // until the first turn's `usage` lands). The status tap below keeps it
-        // current; thread_status reads it.
+        // current; thread_status reads it. `models[0].value` is often the
+        // literal string `"default"` — claude's OWN picker-menu placeholder
+        // (`SystemMsg::from_initialize`: "Default" / "recommended"), not a
+        // concrete resolved model id; ccteam genuinely does not know which
+        // model that resolves to until a real turn runs. Surfacing "default"
+        // verbatim in /sessions or /status would read as a real (wrong) model
+        // name, so withhold it here (`None` = "not yet known", the SAME
+        // convention every other not-yet-reported field already uses) —
+        // `spawn_status_tap`'s `preserve_1m_tag` below overwrites it with the
+        // REAL API-reported model as soon as the first assistant message lands.
         let status = Arc::new(StdMutex::new(ThreadStatus {
-            model: init.model.clone(),
+            model: init.model.clone().filter(|m| !is_model_placeholder(m)),
             context: None,
             // Effort is unknown until the first turn — the status tap reads the
             // vendor's runtime-resolved level via `get_settings`.
@@ -1742,11 +1765,63 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 mod effort_tests {
     use super::protocol::SystemMsg;
     use super::{
-        claude_model_options, normalize_effort, parse_latest_goal_status, preserve_1m_tag,
-        reflect_task_event, set_effort_level, split_model_effort, task_outlives_turn,
-        ClaudeModelOption, EFFORT_LEVELS,
+        claude_model_options, is_model_placeholder, normalize_effort, parse_latest_goal_status,
+        persisted_session_model, preserve_1m_tag, reflect_task_event, set_effort_level,
+        split_model_effort, task_outlives_turn, write_status_file, ClaudeModelOption,
+        EFFORT_LEVELS,
     };
+    use crate::ThreadStatus;
     use std::sync::Mutex;
+
+    /// `"default"` (claude's own picker-menu label, any case/whitespace) is a
+    /// placeholder, not a real model id; every other string — including a
+    /// concrete id that merely CONTAINS "default" as a substring — is not.
+    #[test]
+    fn is_model_placeholder_matches_only_the_bare_default_label() {
+        assert!(is_model_placeholder("default"));
+        assert!(is_model_placeholder("Default"));
+        assert!(is_model_placeholder("  default  "));
+        assert!(!is_model_placeholder("claude-opus-4-8[1m]"));
+        assert!(!is_model_placeholder("default-ish"));
+        assert!(!is_model_placeholder(""));
+    }
+
+    /// THE FIX — `persisted_session_model` must never resolve to claude's own
+    /// unresolved "default" placeholder (defense-in-depth for the spawn-time
+    /// seed filter): a `status.json` snapshot recording it reads back as
+    /// `None`, exactly like the existing `<synthetic>` placeholder guard, so
+    /// neither can reach a real `--model` respawn request.
+    #[test]
+    fn persisted_session_model_rejects_the_default_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        write_status_file(
+            dir.path(),
+            "s1",
+            &ThreadStatus {
+                model: Some("default".to_string()),
+                context: None,
+                effort: None,
+                goal: None,
+            },
+        );
+        assert_eq!(persisted_session_model(dir.path(), "s1"), None);
+
+        // A concrete id round-trips normally.
+        write_status_file(
+            dir.path(),
+            "s2",
+            &ThreadStatus {
+                model: Some("claude-opus-4-8[1m]".to_string()),
+                context: None,
+                effort: None,
+                goal: None,
+            },
+        );
+        assert_eq!(
+            persisted_session_model(dir.path(), "s2"),
+            Some("claude-opus-4-8[1m]".to_string())
+        );
+    }
 
     /// Build a `system:task_*` line with the given subtype + task id.
     fn task_sys(subtype: &str, task_id: &str) -> SystemMsg {
