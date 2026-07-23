@@ -5756,7 +5756,10 @@ impl Gateway {
             let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
             if let Some(st) = &status {
                 if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
-                    row.push_str(&format!(".{m}"));
+                    row.push_str(&format!(
+                        ".{}",
+                        strip_vendor_prefix(vendor_str(s.vendor), m)
+                    ));
                 }
                 if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
                     row.push_str(&format!(".{e}"));
@@ -7834,6 +7837,33 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
+    }
+}
+
+/// Model ids commonly repeat the vendor name as their own prefix
+/// (`claude-opus-4-8`, `grok-4.5`) — since the compact `/sessions` row
+/// ALREADY leads with the vendor (`sid vendor.model…`), showing the model
+/// verbatim reads redundant: `claude.claude-opus-4-8[1m]`. This strips a
+/// leading `{vendor}` + separator (`-`/`_`/`.`/`/`) for DISPLAY ONLY —
+/// `claude.opus-4-8[1m]` — never touching the real model id used for
+/// `--model` respawns / cost accounting / persistence. A false-positive
+/// partial-word match (no separator boundary) or a match that would leave
+/// nothing after stripping returns `model` unchanged.
+fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
+    let lower = model.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix(vendor) else {
+        return model;
+    };
+    let sep_len = match rest.as_bytes().first() {
+        None => 0,
+        Some(b'-' | b'_' | b'.' | b'/') => 1,
+        Some(_) => return model,
+    };
+    let stripped = &model[vendor.len() + sep_len..];
+    if stripped.is_empty() {
+        model
+    } else {
+        stripped
     }
 }
 
@@ -13027,6 +13057,35 @@ mod tests {
         assert_eq!(replies, vec!["invalid selection"]);
     }
 
+    /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a
+    /// model id that repeats it (`claude-opus-4-8` → `opus-4-8`), so the
+    /// compact `/sessions` row (`sid vendor.model…`) doesn't read redundant
+    /// (`claude.claude-opus-4-8`). A model that does NOT start with the
+    /// vendor (codex's `gpt-5`), a partial-word false-positive (no separator
+    /// boundary), and a match that would leave nothing after stripping all
+    /// pass through unchanged — case-insensitive on the match, but the
+    /// RETURNED text preserves the model's original casing/content.
+    #[test]
+    fn strip_vendor_prefix_drops_only_a_real_separator_bounded_match() {
+        assert_eq!(
+            strip_vendor_prefix("claude", "claude-opus-4-8[1m]"),
+            "opus-4-8[1m]"
+        );
+        assert_eq!(strip_vendor_prefix("grok", "grok-4.5"), "4.5");
+        assert_eq!(strip_vendor_prefix("claude", "Claude-Opus"), "Opus");
+        // codex's models (gpt-*) never repeat "codex" — unchanged.
+        assert_eq!(
+            strip_vendor_prefix("codex", "gpt-5.5-codex"),
+            "gpt-5.5-codex"
+        );
+        // "claudexyz" is a partial-word match, not "claude" + a real
+        // separator — must NOT strip.
+        assert_eq!(strip_vendor_prefix("claude", "claudexyz"), "claudexyz");
+        // Stripping down to nothing falls back to the original.
+        assert_eq!(strip_vendor_prefix("claude", "claude"), "claude");
+        assert_eq!(strip_vendor_prefix("claude", "claude-"), "claude-");
+    }
+
     /// P3 — `/sessions` appends each session's model + ctx from
     /// `thread_status`. With a `[1m]` model the window is 1M; with no
     /// status reported the legacy `id:project:vendor:role` row is unchanged.
@@ -13070,7 +13129,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1 claude.claude-opus-4-8[1m].max.1M(19%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
         );
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
@@ -13090,7 +13149,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1 claude.claude-sonnet-4-5.200k(94%)"]
+            vec!["📁 当前项目: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
         );
     }
 
