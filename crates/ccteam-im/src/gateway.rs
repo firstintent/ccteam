@@ -191,21 +191,35 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
-/// Snapshot used by the pure live-capacity eviction selector. `None`
-/// `last_event_at` is deliberately treated as newest: a just-spawned session
-/// has not emitted an event yet and must not look older than every timestamped
-/// session.
+/// Snapshot used by the pure live-capacity eviction selector.
+///
+/// `last_active` is the PERSISTED `meta.json.last_active` (RFC3339,
+/// lexically sortable), refreshed on every completed turn by
+/// `refresh_session_activity_meta` — deliberately NOT the in-process
+/// `GatewaySession::last_event_at` (`Instant`), which resets to `None` every
+/// time a session is (re)constructed in memory (daemon restart, cold `/use`
+/// resume). Under the old `Instant`-based ranking, `None` was treated as
+/// "newest" (a reasonable default for a session that TRULY just spawned), but
+/// a rebuilt/restored session also starts at `None` despite having a real,
+/// possibly ancient, history — making a long-dormant-but-still-live session
+/// permanently eviction-immune (it always looked "freshest") while genuinely
+/// recently-used sessions got evicted around it. `last_active` fixes this: it
+/// is accurate across restarts/rebuilds because it lives on disk, not in the
+/// process. Empty (unreadable/never-written meta) sorts FIRST — a fail-safe
+/// toward evictable, not toward immunity.
 #[derive(Debug, Clone)]
 struct LiveCapacityCandidate {
     sid: String,
     idle: bool,
-    last_event_at: Option<Instant>,
+    last_active: String,
     waiting_approval: bool,
 }
 
 /// Select the least-recently-active eligible live session. Idle sessions are
 /// always preferred; busy sessions are considered only when no idle candidate
-/// remains. Sids and HITL waiters are excluded before ordering.
+/// remains. Among ties, an older (lexically smaller) `last_active` wins; a sid
+/// compare is the final deterministic tiebreak. Sids and HITL waiters are
+/// excluded before ordering.
 fn select_live_capacity_eviction(
     candidates: &[LiveCapacityCandidate],
     excluded: &HashSet<String>,
@@ -216,12 +230,8 @@ fn select_live_capacity_eviction(
         .min_by(|a, b| {
             b.idle
                 .cmp(&a.idle)
-                .then_with(|| match (a.last_event_at, b.last_event_at) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.sid.cmp(&b.sid),
-                })
+                .then_with(|| a.last_active.cmp(&b.last_active))
+                .then_with(|| a.sid.cmp(&b.sid))
         })
         .map(|candidate| candidate.sid.clone())
 }
@@ -6921,7 +6931,7 @@ impl Gateway {
                             .lock()
                             .map(|started| started.is_none())
                             .unwrap_or(false),
-                        last_event_at: session.last_event_at.lock().ok().and_then(|last| *last),
+                        last_active: self.session_last_active(session),
                         waiting_approval: pending.pending_for_sid(&session.id).is_some(),
                     })
                     .collect::<Vec<_>>()
@@ -9058,34 +9068,40 @@ mod tests {
         })
     }
 
-    fn capacity_candidate(
-        sid: &str,
-        idle: bool,
-        last_event_at: Option<Instant>,
-    ) -> LiveCapacityCandidate {
+    fn capacity_candidate(sid: &str, idle: bool, last_active: &str) -> LiveCapacityCandidate {
         LiveCapacityCandidate {
             sid: sid.to_string(),
             idle,
-            last_event_at,
+            last_active: last_active.to_string(),
             waiting_approval: false,
         }
     }
 
+    /// RFC3339 timestamp `secs_ago` seconds in the past — matches
+    /// `meta.json.last_active`'s format, which sorts correctly as a plain
+    /// string (the property `select_live_capacity_eviction` relies on).
+    fn capacity_ts(secs_ago: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339()
+    }
+
     #[test]
-    fn capacity_eviction_prefers_idle_oldest_and_none_is_newest() {
-        let now = Instant::now();
+    fn capacity_eviction_prefers_idle_over_busy_even_if_more_recently_active() {
         let candidates = vec![
-            capacity_candidate("idle-new", true, None),
-            capacity_candidate(
-                "idle-old",
-                true,
-                Some(now - std::time::Duration::from_secs(20)),
-            ),
-            capacity_candidate(
-                "busy-older",
-                false,
-                Some(now - std::time::Duration::from_secs(100)),
-            ),
+            capacity_candidate("idle-recent", true, &capacity_ts(1)),
+            capacity_candidate("busy-older", false, &capacity_ts(100)),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("idle-recent"),
+            "idle is preferred for eviction even over a busier-but-older session"
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_prefers_oldest_last_active_among_idle() {
+        let candidates = vec![
+            capacity_candidate("idle-new", true, &capacity_ts(5)),
+            capacity_candidate("idle-old", true, &capacity_ts(20)),
         ];
         assert_eq!(
             select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
@@ -9093,20 +9109,36 @@ mod tests {
         );
     }
 
+    /// THE BUG FIX — a candidate with no readable `last_active` (empty: no
+    /// meta, or a meta that never completed a turn) must be treated as the
+    /// OLDEST (most evictable), never the newest. The prior `Instant`-based
+    /// design treated its "no signal yet" case (`None`) as newest — correct
+    /// for a session that TRULY just spawned, but also hit by every
+    /// REBUILT/RESTORED session (daemon restart, cold `/use` resume), whose
+    /// in-process clock resets to `None` regardless of how stale its real
+    /// history was. That made a long-dormant-but-still-live session
+    /// PERMANENTLY eviction-immune while genuinely-recent sessions were
+    /// evicted around it. Reading `last_active` from disk (refreshed on every
+    /// completed turn, survives restarts) fixes the common case; this test
+    /// locks the remaining fallback to fail toward evictable, not immunity.
+    #[test]
+    fn capacity_eviction_treats_missing_last_active_as_oldest_not_newest() {
+        let candidates = vec![
+            capacity_candidate("has-recent-real-activity", true, &capacity_ts(10)),
+            capacity_candidate("no-meta-signal", true, ""),
+        ];
+        assert_eq!(
+            select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
+            Some("no-meta-signal"),
+            "a blank/unreadable last_active must be evicted BEFORE a session with real recent activity"
+        );
+    }
+
     #[test]
     fn capacity_eviction_falls_back_to_busy_oldest() {
-        let now = Instant::now();
         let candidates = vec![
-            capacity_candidate(
-                "busy-new",
-                false,
-                Some(now - std::time::Duration::from_secs(2)),
-            ),
-            capacity_candidate(
-                "busy-old",
-                false,
-                Some(now - std::time::Duration::from_secs(30)),
-            ),
+            capacity_candidate("busy-new", false, &capacity_ts(2)),
+            capacity_candidate("busy-old", false, &capacity_ts(30)),
         ];
         assert_eq!(
             select_live_capacity_eviction(&candidates, &HashSet::new()).as_deref(),
@@ -9116,25 +9148,12 @@ mod tests {
 
     #[test]
     fn capacity_eviction_respects_sid_and_hitl_exclusions() {
-        let now = Instant::now();
-        let mut waiting = capacity_candidate(
-            "waiting",
-            true,
-            Some(now - std::time::Duration::from_secs(60)),
-        );
+        let mut waiting = capacity_candidate("waiting", true, &capacity_ts(60));
         waiting.waiting_approval = true;
         let candidates = vec![
             waiting,
-            capacity_candidate(
-                "parent",
-                true,
-                Some(now - std::time::Duration::from_secs(40)),
-            ),
-            capacity_candidate(
-                "eligible",
-                true,
-                Some(now - std::time::Duration::from_secs(10)),
-            ),
+            capacity_candidate("parent", true, &capacity_ts(40)),
+            capacity_candidate("eligible", true, &capacity_ts(10)),
         ];
         let excluded = HashSet::from(["parent".to_string()]);
         assert_eq!(
@@ -9146,8 +9165,8 @@ mod tests {
     #[test]
     fn capacity_eviction_returns_none_when_all_candidates_are_excluded() {
         let candidates = vec![
-            capacity_candidate("s1", true, Some(Instant::now())),
-            capacity_candidate("s2", false, None),
+            capacity_candidate("s1", true, &capacity_ts(0)),
+            capacity_candidate("s2", false, ""),
         ];
         let excluded = HashSet::from(["s1".to_string(), "s2".to_string()]);
         assert_eq!(select_live_capacity_eviction(&candidates, &excluded), None);
@@ -9186,11 +9205,15 @@ mod tests {
             vec!["s3".to_string(), second.clone(), first.clone()]
         );
         gateway.sessions.get_mut(&second).unwrap().parent_sid = None;
-        let now = Instant::now();
-        *gateway.sessions[&first].last_event_at.lock().unwrap() =
-            Some(now - std::time::Duration::from_secs(30));
-        *gateway.sessions[&second].last_event_at.lock().unwrap() =
-            Some(now - std::time::Duration::from_secs(5));
+        // Eviction ranks on the PERSISTED `meta.json.last_active` (not an
+        // in-process clock — see `LiveCapacityCandidate`), so seed it on disk:
+        // `first` older, `second` more recent.
+        for (sid, secs_ago) in [(&first, 30i64), (&second, 5)] {
+            let mut meta = read_session_meta(tmp.path(), sid).unwrap();
+            meta.last_active =
+                (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+            write_session_meta(tmp.path(), &meta).unwrap();
+        }
 
         let mut events = gateway.subscribe_events();
         let third = gateway
