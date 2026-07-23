@@ -17,7 +17,7 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
+    format_tokens, list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
@@ -5744,17 +5744,26 @@ impl Gateway {
             // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
             // with `sid vendor` (the SAME opening as the switch button —
             // `session_switch_options`: `sid vendor (title)`), then `.project`
-            // and — when the adapter reports them — `.model` and `.<pct>%`
-            // context. Deliberately terse: NO role, NO `ctx` label, NO absolute
-            // token counts (all on /status); the title lives on the button; the
-            // vendor tag + activity dot are gone.
+            // and — when the adapter reports them — `.model`, `.effort`, and
+            // `.used/window(pct%)` context (absolute counts via the same
+            // `format_tokens` humanizer `ContextUsage::render` uses). NO role,
+            // NO `ctx` label (all on /status); the title lives on the button;
+            // the vendor tag + activity dot are gone.
             let mut row = format!("{} {}.{}", s.id, vendor_str(s.vendor), s.project);
             if let Some(st) = &status {
                 if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
                     row.push_str(&format!(".{m}"));
                 }
+                if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
+                    row.push_str(&format!(".{e}"));
+                }
                 if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
-                    row.push_str(&format!(".{:.0}%", ctx.pct()));
+                    row.push_str(&format!(
+                        ".{}/{}({:.0}%)",
+                        format_tokens(ctx.used_tokens),
+                        format_tokens(ctx.window_tokens),
+                        ctx.pct()
+                    ));
                 }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
@@ -13039,15 +13048,15 @@ mod tests {
             .unwrap();
         assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude.alpha"]);
 
-        // Now report a model + usage → suffix appears, rendered the same
-        // way Codex /status renders (shared helper).
+        // Now report a model + effort + usage → suffix appears with absolute
+        // counts (`format_tokens`) alongside the percent.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage {
                 used_tokens: 188_000,
                 window_tokens: 1_000_000,
             }),
-            effort: None,
+            effort: Some("max".into()),
             goal: None,
         })
         .await;
@@ -13057,10 +13066,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-opus-4-8[1m].19%"]
+            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-opus-4-8[1m].max.188k/1M(19%)"]
         );
 
-        // A non-[1m] model renders against the 200k baseline.
+        // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
             model: Some("claude-sonnet-4-5".into()),
             context: Some(ContextUsage {
@@ -13077,7 +13086,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-sonnet-4-5.94%"]
+            vec!["📁 当前项目: alpha\ns1 claude.alpha.claude-sonnet-4-5.188k/200k(94%)"]
         );
     }
 
