@@ -150,6 +150,12 @@ impl CcteamPaths {
         self.cache_dir().join("hub")
     }
 
+    /// `~/.ccteam/skills/` — the user-level global skill library. Skills may
+    /// use nested ids and are discovered by their `<id>/SKILL.md` entrypoint.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
     /// Global user-authored routing notes. They are an advisory fallback for
     /// projects without their own `.ccteam/routing.md`.
     pub fn global_routing_notes(&self) -> PathBuf {
@@ -355,10 +361,11 @@ pub struct ProjectSessionContext {
 /// hook.sh dispatcher), `run/` (live sockets), `state/` (everything the daemon
 /// writes — `progress/`, `im/`, `harness/`, `pty/`, the pidfile), `secrets/`
 /// (0700 — `web-token`, `im-credentials.json`, `users/<id>.json`), and `cache/`
-/// (deletable — `hub/`). Subdirectories are created lazily by their writers
-/// (`create_dir_all`); this is the top-level manifest the doctor tolerates.
+/// (deletable — `hub/`), and `skills/` (the user-level global skill library).
+/// Subdirectories are created lazily by their writers (`create_dir_all`);
+/// this is the top-level manifest the doctor tolerates.
 pub fn canonical_home_dirs() -> &'static [&'static str] {
-    &["hooks", "run", "state", "secrets", "cache"]
+    &["hooks", "run", "state", "secrets", "cache", "skills"]
 }
 
 /// Idempotently materialize the global `~/.ccteam/` home so any
@@ -704,6 +711,17 @@ mod tests {
                 .join(".ccteam")
                 .join("routing.md")
         );
+    }
+
+    #[test]
+    fn skills_dir_is_in_canonical_manifest_and_home_ensure_creates_it() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths(&tmp);
+
+        assert_eq!(paths.skills_dir(), paths.root.join("skills"));
+        assert!(canonical_home_dirs().contains(&"skills"));
+        ensure_ccteam_home(&paths).unwrap();
+        assert!(paths.skills_dir().is_dir());
     }
 
     #[test]
