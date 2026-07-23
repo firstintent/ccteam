@@ -3903,6 +3903,24 @@ impl Gateway {
                                 );
                             }
                         }
+                        // A paneless adapter's structured turn start is the
+                        // first authoritative proof that work is underway.
+                        // Persist it immediately: capacity eviction ranks by
+                        // meta.last_active, so waiting until a long turn ends
+                        // can misclassify an actively working child as oldest.
+                        // Terminal sessions have hook-owned activity updates.
+                        if !session.protocol.is_terminal()
+                            && matches!(&evt, ThreadEvent::TurnStarted { .. })
+                        {
+                            if let Some(dir) = project_dir.as_ref() {
+                                refresh_session_activity_meta(
+                                    dir,
+                                    &session_id,
+                                    session.vendor,
+                                    progress_path.as_deref(),
+                                );
+                            }
+                        }
                         // v0.8.19 `/status` — a completed turn ends the in-flight
                         // window: clear `turn_started_at` (→ 🟢 idle) and the
                         // activity summary. Protocol-INDEPENDENT (both tmux and
@@ -4020,6 +4038,7 @@ impl Gateway {
                                     vendor: pump_vendor,
                                     host: pump_host.clone(),
                                     boundary: true,
+                                    vendor_error: false,
                                     interim_notes: notes.saturating_sub(1),
                                     covered_turns: covered,
                                 });
@@ -4166,6 +4185,7 @@ impl Gateway {
                                                     vendor: pump_vendor,
                                                     host: pump_host.clone(),
                                                     boundary: true,
+                                                    vendor_error: true,
                                                     interim_notes: notes,
                                                     covered_turns: covered,
                                                 });
@@ -4184,6 +4204,7 @@ impl Gateway {
                                                     vendor: pump_vendor,
                                                     host: pump_host.clone(),
                                                     boundary: false,
+                                                    vendor_error: false,
                                                     interim_notes: 0,
                                                     covered_turns: vec![record.turn_id.clone()],
                                                 });
@@ -7409,13 +7430,14 @@ impl Gateway {
         };
         if should_notify {
             let text = if signal.boundary {
-                crate::delegation::build_notification_text(
+                crate::delegation::build_notification_text_with_outcome(
                     &child,
                     signal.vendor,
                     mirror.title.as_deref(),
                     &signal.turn_id,
                     &signal.tail,
                     signal.interim_notes,
+                    signal.vendor_error,
                 )
             } else {
                 crate::delegation::build_interim_notification_text(
@@ -7558,6 +7580,7 @@ impl Gateway {
                         vendor,
                         host: host.clone(),
                         boundary: true,
+                        vendor_error: false,
                         interim_notes: missed.len().saturating_sub(1),
                         covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
                     });
@@ -7897,9 +7920,10 @@ fn context_echo_line(slug: &str, sid: &str, role: &str, title: Option<&str>) -> 
 }
 
 /// v0.8.22 P1 — one read-modify-write refreshing meta.json's activity trio
-/// after an assistant turn lands: `last_active` (as `touch_last_active` always
-/// did), `turn_count` (the turns.jsonl line count), and `cost_usd` (this sid's
-/// priced `chat_turn_completed` events in progress.jsonl — the same
+/// when paneless work starts or an assistant/error row lands: `last_active`
+/// (as `touch_last_active` always did), `turn_count` (the turns.jsonl line
+/// count), and `cost_usd` (this sid's priced `chat_turn_completed` events in
+/// progress.jsonl — the same
 /// deterministic per-turn accounting `GET /api/v1/status`'s
 /// `build_session_cost_rows` uses, scoped to one sid). Best-effort, like the
 /// `touch_last_active` it replaces: a missing/unreadable meta is silently
@@ -9569,6 +9593,13 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// Emit the structured paneless turn-start boundary before reply data.
+        /// Opt-in so timing-sensitive tests can pause between start/completion.
+        emit_turn_started: bool,
+        /// Emit a structured terminal vendor failure instead of a normal
+        /// assistant answer/boundary. Models Codex `error{willRetry:false}` and
+        /// ACP prompt-RPC errors after their harness translation.
+        turn_failure: Option<String>,
         /// v0.8.19 — thread identities passed to `interrupt_turn`, in call
         /// order, so the `/interrupt` test can assert the gateway invoked the
         /// adapter's interrupt (not destroy).
@@ -9608,6 +9639,8 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                emit_turn_started: false,
+                turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
@@ -9618,6 +9651,16 @@ mod tests {
         /// (v0.8.11 E4 — drives the stream-json pump's progress.jsonl mirror).
         fn with_turn_boundary(mut self) -> Self {
             self.emit_turn_boundary = true;
+            self
+        }
+
+        fn with_turn_started(mut self) -> Self {
+            self.emit_turn_started = true;
+            self
+        }
+
+        fn with_turn_failure(mut self, message: impl Into<String>) -> Self {
+            self.turn_failure = Some(message.into());
             self
         }
 
@@ -9698,44 +9741,66 @@ mod tests {
                 .lock()
                 .await
                 .push((h.identity.clone(), text.clone()));
-            self.events.lock().await.push_back((
-                h.identity.clone(),
-                ThreadEvent::ItemCompleted {
-                    item: ThreadItem {
-                        id: "msg-1".to_string(),
-                        details: ThreadItemDetails::AgentMessage(format!(
-                            "{} echo: {text}",
-                            h.identity
-                        )),
-                    },
-                },
-            ));
-            // A real adapter also emits a turn boundary (carrying usage); the
-            // stream-json pump mirrors it to progress.jsonl for paneless
-            // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
-            // sync-drain tests don't leave a stale TurnCompleted queued.
-            if self.emit_turn_boundary {
+            let turn_id = format!("turn-{}", h.identity);
+            if self.emit_turn_started {
                 self.events.lock().await.push_back((
                     h.identity.clone(),
-                    ThreadEvent::TurnCompleted {
-                        turn_id: format!("turn-{}", h.identity),
-                        // Non-zero usage so experience cost_usd prices > 0 for
-                        // known models (v0.9 T5 pump writer).
-                        usage: ccteam_harness::UnifiedTokenUsage {
-                            input_tokens: 1_000,
-                            output_tokens: 500,
-                            ..Default::default()
-                        },
-                        // A real claude turn carries its canonical model; seed
-                        // one so the pump's chat_turn_completed mirror exercises
-                        // the per-turn model path.
-                        model: Some("claude-sonnet-4-6".to_string()),
+                    ThreadEvent::TurnStarted {
+                        turn_id: turn_id.clone(),
                     },
                 ));
             }
+            if let Some(message) = self.turn_failure.as_ref() {
+                self.events.lock().await.push_back((
+                    h.identity.clone(),
+                    ThreadEvent::TurnFailed {
+                        turn_id: turn_id.clone(),
+                        err: ccteam_harness::ThreadErrorEvent {
+                            kind: "turn_failed".to_string(),
+                            message: message.clone(),
+                        },
+                    },
+                ));
+            } else {
+                self.events.lock().await.push_back((
+                    h.identity.clone(),
+                    ThreadEvent::ItemCompleted {
+                        item: ThreadItem {
+                            id: "msg-1".to_string(),
+                            details: ThreadItemDetails::AgentMessage(format!(
+                                "{} echo: {text}",
+                                h.identity
+                            )),
+                        },
+                    },
+                ));
+                // A real adapter also emits a turn boundary (carrying usage); the
+                // stream-json pump mirrors it to progress.jsonl for paneless
+                // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
+                // sync-drain tests don't leave a stale TurnCompleted queued.
+                if self.emit_turn_boundary {
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::TurnCompleted {
+                            turn_id: turn_id.clone(),
+                            // Non-zero usage so experience cost_usd prices > 0 for
+                            // known models (v0.9 T5 pump writer).
+                            usage: ccteam_harness::UnifiedTokenUsage {
+                                input_tokens: 1_000,
+                                output_tokens: 500,
+                                ..Default::default()
+                            },
+                            // A real claude turn carries its canonical model; seed
+                            // one so the pump's chat_turn_completed mirror exercises
+                            // the per-turn model path.
+                            model: Some("claude-sonnet-4-6".to_string()),
+                        },
+                    ));
+                }
+            }
             // Wake any pump task that is waiting in `events()` for new work.
             self.events_notify.notify_one();
-            Ok(TurnId::new(format!("turn-{}", h.identity)))
+            Ok(TurnId::new(turn_id))
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -9816,6 +9881,71 @@ mod tests {
         fn thread_is_live(&self, _h: &ThreadHandle) -> bool {
             self.live.load(Ordering::SeqCst)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paneless_turn_start_refreshes_last_active_before_delayed_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(
+            FakeAdapter::new_with_event_delay(
+                AgentVendor::Claude,
+                std::time::Duration::from_millis(250),
+            )
+            .with_turn_started()
+            .with_turn_boundary(),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let mut meta = read_session_meta(tmp.path(), &sid).unwrap();
+        let spawn_last_active = "2000-01-01T00:00:00Z".to_string();
+        meta.last_active.clone_from(&spawn_last_active);
+        write_session_meta(tmp.path(), &meta).unwrap();
+
+        gateway
+            .submit_to_sid(&sid, "long repository task".into())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let started_seen = gateway
+                .sessions
+                .get(&sid)
+                .is_some_and(|session| session.activity_events.load(Ordering::SeqCst) > 0);
+            if started_seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gateway
+                .sessions
+                .get(&sid)
+                .is_some_and(|session| session.activity_events.load(Ordering::SeqCst) > 0),
+            "fake vendor must emit TurnStarted before its delayed answer"
+        );
+        // Let the pump finish the TurnStarted branch, while the next fake event
+        // remains delayed well beyond this read.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let during_turn = read_session_meta(tmp.path(), &sid).unwrap();
+        assert_ne!(
+            during_turn.last_active, spawn_last_active,
+            "TurnStarted must refresh persisted last_active before completion"
+        );
+        assert!(
+            gateway.session_turn_in_flight(&sid),
+            "the delayed vendor turn must still be running at this checkpoint"
+        );
     }
 
     #[tokio::test]
@@ -16554,21 +16684,10 @@ mod tests {
     /// (drained) + delegation notifier tx + the notifier task. Mirrors the
     /// daemon startup order (delegation_tx BEFORE set_event_sink so pumps
     /// capture it). Returns the shared handle.
-    async fn delegation_gateway(project_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<Gateway>> {
-        // A FRESH fake per spawn so each session's pump has its OWN
-        // `events_notify` — a single shared fake's `notify_one` could wake the
-        // wrong pump when two sessions (parent + child) run concurrently.
-        let factory: Arc<
-            dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
-                + Send
-                + Sync,
-        > = Arc::new(|vendor, _protocol| {
-            // `with_turn_boundary` mirrors every REAL adapter (all five emit
-            // `TurnCompleted`) — required since v0.9.5: the delegation
-            // notification fires on the turn boundary, not per answer.
-            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
-                as Arc<dyn HarnessAdapter + Send + Sync>
-        });
+    async fn delegation_gateway_with_factory(
+        project_dir: &std::path::Path,
+        factory: crate::daemon::AdapterFactory,
+    ) -> Arc<tokio::sync::Mutex<Gateway>> {
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
         gw.register_project("alpha", project_dir);
         let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
@@ -16577,8 +16696,36 @@ mod tests {
         gw.set_event_sink(etx);
         tokio::spawn(async move { while erx.recv().await.is_some() {} });
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
-        tokio::spawn(Gateway::run_delegation_notifier(Arc::clone(&gateway), drx));
+        // Production runs reconciliation before draining live signals. Finish
+        // that empty-project startup phase before returning the fixture too,
+        // so a newly-created watch cannot race a historical replay.
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let notifier_gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            let mut drx = drx;
+            while let Some(signal) = drx.recv().await {
+                notifier_gateway
+                    .lock()
+                    .await
+                    .deliver_delegation_signal(signal)
+                    .await;
+            }
+        });
         gateway
+    }
+
+    async fn delegation_gateway(project_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<Gateway>> {
+        // A FRESH fake per spawn so each session's pump has its OWN
+        // `events_notify` — a single shared fake's `notify_one` could wake the
+        // wrong pump when two sessions (parent + child) run concurrently.
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            // `with_turn_boundary` mirrors every REAL adapter (all five emit
+            // `TurnCompleted`) — required since v0.9.5: the delegation
+            // notification fires on the turn boundary, not per answer.
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        delegation_gateway_with_factory(project_dir, factory).await
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
@@ -16685,6 +16832,91 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_vendor_fatal_turn_is_explicitly_marked_for_parent() {
+        const CAPACITY_ERROR: &str = "Selected model is at capacity. Please try a different model.";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            let fake = if vendor == AgentVendor::Codex {
+                FakeAdapter::new(vendor).with_turn_failure(CAPACITY_ERROR)
+            } else {
+                FakeAdapter::new(vendor).with_turn_boundary()
+            };
+            Arc::new(fake) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory).await;
+
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    Some("capacity probe".into()),
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("capacity probe".into()),
+                None,
+            );
+            gw.submit_to_sid(&child, "run the task".into())
+                .await
+                .unwrap();
+            (parent, child)
+        };
+
+        let mut notification = None;
+        for _ in 0..200 {
+            notification =
+                ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &parent_sid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|turn| turn.user.contains(CAPACITY_ERROR));
+            if notification.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let notification = notification.expect("parent receives vendor-fatal notification");
+        assert!(
+            notification
+                .user
+                .starts_with("[ccteam] [delegation completed with VENDOR ERROR]"),
+            "vendor-fatal notification must lead with an explicit marker: {}",
+            notification.user
+        );
+        assert!(notification.user.contains(CAPACITY_ERROR));
+        assert!(notification
+            .user
+            .contains(&format!("session_collect{{sid:{child_sid}, tail:true}}")));
+    }
+
     /// v0.9.5 feedback fix (P0) — a codex-shaped chatty child (several
     /// mirrored assistant messages inside ONE vendor turn) must produce
     /// exactly ONE notification for the default `final` watch: at the turn
@@ -16744,6 +16976,7 @@ mod tests {
             vendor: AgentVendor::Codex,
             host: "local".into(),
             boundary: false,
+            vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
         };
@@ -16767,6 +17000,7 @@ mod tests {
             vendor: AgentVendor::Codex,
             host: "local".into(),
             boundary: true,
+            vendor_error: false,
             interim_notes: 3,
             covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
         };
@@ -16856,6 +17090,7 @@ mod tests {
             vendor: AgentVendor::Codex,
             host: "local".into(),
             boundary,
+            vendor_error: false,
             interim_notes: if boundary { n as usize - 1 } else { 0 },
             covered_turns: vec![format!("{child_sid}-{n}")],
         };
@@ -16921,6 +17156,7 @@ mod tests {
                 vendor: AgentVendor::Codex,
                 host: "local".into(),
                 boundary: true,
+                vendor_error: false,
                 interim_notes: 0,
                 covered_turns: vec![format!("{child2}-1")],
             })
