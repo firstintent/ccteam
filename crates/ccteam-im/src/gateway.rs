@@ -2828,9 +2828,11 @@ impl Gateway {
         bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
             .with_context(|| format!("scaffold project {slug} at {}", abs.display()))?;
         // v0.8.18 柱2 — record the creating chat as owner (explicit field; NOT
-        // path-derived). Best-effort: a load/save miss just leaves owner unset.
+        // path-derived). Use the known project dir: the config upsert happens
+        // below, so `paths.project_state(slug)` would still resolve the fallback
+        // projects-root path and miss an arbitrary-path project's real state.
         if let Some(owner) = owner {
-            let state_path = paths.project_state(&slug);
+            let state_path = ccteam_core::CcteamPaths::project_state_in(&abs);
             match ccteam_core::ProjectState::load(&state_path) {
                 Ok(mut state) => {
                     state.owner = Some(owner.to_string());
