@@ -13851,6 +13851,90 @@ mod tests {
         }
     }
 
+    /// IM `/projects` + `/cd` end-to-end — proves the owner ACL is WIRED at the
+    /// command surface, not just correct as a predicate: a tenant's `/projects`
+    /// lists only its OWN project, and it cannot `/cd` into — then spawn sessions
+    /// in — the admin's project by typing the slug. Seeds real owned
+    /// `state.json`s read through `collect_projects` (the SAME source the web
+    /// list reads), so a future refactor that keeps `chat_can_see_project_owner`
+    /// but stops `visible_project_slugs` / `change_project` from calling it would
+    /// still fail here — the gap the pure-predicate test above can't catch.
+    #[tokio::test]
+    async fn im_project_list_and_cd_hide_other_owners_projects() {
+        fn seed(paths: &ccteam_core::CcteamPaths, slug: &str, owner: Option<&str>) {
+            let dir = paths.projects_root.join(slug);
+            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+            state.owner = owner.map(str::to_string);
+            state
+                .save(&ccteam_core::CcteamPaths::project_state_in(&dir))
+                .unwrap();
+            ccteam_core::config::upsert_project(
+                &paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: slug.to_string(),
+                    path: dir,
+                    host: ccteam_core::LOCAL_HOST.to_string(),
+                    remote_slug: None,
+                    remote_path: None,
+                    team: "dev".to_string(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        seed(&paths, "tenant-proj", Some("user:ualice"));
+        seed(&paths, "admin-proj", Some("user:web-api"));
+        seed(&paths, "cli-proj", None); // legacy, unowned
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "seed", tmp.path().join("seed"));
+        gateway.enable_project_creation(paths);
+
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        let admin = ChatKey::new("telegram", "339", "rob");
+
+        // THE BUG: the tenant's `/projects` lists ONLY its own project.
+        assert_eq!(
+            gateway.visible_project_slugs(&tenant),
+            vec!["tenant-proj".to_string()],
+            "a tenant's /projects must not include the admin's or legacy projects"
+        );
+        // The operator sees the admin + legacy projects, not the tenant's private.
+        let admin_visible = gateway.visible_project_slugs(&admin);
+        assert!(
+            admin_visible.contains(&"admin-proj".to_string())
+                && admin_visible.contains(&"cli-proj".to_string()),
+            "operator sees its own + legacy, got {admin_visible:?}"
+        );
+        assert!(
+            !admin_visible.contains(&"tenant-proj".to_string()),
+            "operator must not peek into a tenant's project, got {admin_visible:?}"
+        );
+
+        // Addressing is gated too: the tenant can't `/cd` into the admin's
+        // project by typing the slug — it reads identically to a nonexistent one
+        // ("unknown project"), leaking no existence — but CAN `/cd` into its own.
+        let err = gateway
+            .change_project(&tenant, "admin-proj")
+            .expect_err("tenant must not /cd into the admin's project");
+        assert!(
+            err.to_string().contains("unknown project"),
+            "expected an unknown-project error, got {err}"
+        );
+        assert!(
+            gateway.change_project(&tenant, "tenant-proj").is_ok(),
+            "a tenant must be able to /cd into its OWN project"
+        );
+    }
+
     /// v0.8.21 cold-resume ACL (web path) — `resume_stopped_session` resolves a
     /// sid across ALL registered projects (`find_meta_for_sid`), so the web
     /// caller's authorised slug MUST bind the resolved project. Without the
