@@ -5,8 +5,8 @@
 //! deleted in v0.8.6 W4a — `project rm` is the only path now):
 //!   t01–t02   dry-run + basic deregister (no fs change / config drop)
 //!   t03       --purge deletes ccteam footprint ONLY (W2 layout): .ccteam/
-//!             + seeded cto.md + ccteam hooks in settings.local.json; keeps
-//!             user work-roles, root workflow.yaml, CLAUDE.md, .env,
+//!             + ccteam hooks in settings.local.json; keeps all user roles
+//!             (including cto.md), root workflow.yaml, CLAUDE.md, .env,
 //!             settings.json, business code
 //!   t03b/c    surgical settings.local.json hook strip / empty-file delete
 //!   t04–t06   refusal gate (tmux / claude bg / open spawn) + --force
@@ -255,10 +255,9 @@ fn t02_remove_basic_drops_config_entry() {
 
 #[test]
 fn t03_purge_clears_ccteam_footprint_only() {
-    // v0.8.6 W3 — `--purge` deletes exactly ccteam's footprint
-    // (.ccteam/ + seeded cto.md + ccteam hooks in settings.local.json)
-    // and leaves user work-roles, root workflow.yaml, CLAUDE.md, .env,
-    // settings.json, and business code in place.
+    // `--purge` deletes exactly ccteam's footprint (.ccteam/ + ccteam hooks
+    // in settings.local.json) and leaves every user role, root workflow.yaml,
+    // CLAUDE.md, .env, settings.json, and business code in place.
     let fx = Fixture::new("dex-ui");
     fx.seed_closed_progress();
     // .ccteam/ already exists from the fixture; drop a state.json inside
@@ -281,9 +280,10 @@ fn t03_purge_clears_ccteam_footprint_only() {
         "{\"permissions\":{}}\n",
     )
     .unwrap();
-    // DELETE set: seeded cto.md. KEEP set: a user work-role beside it.
+    // KEEP set: v0.9.0 seeds no roles, so cto.md and reviewer.md are both
+    // user-owned files.
     let agents = fx.project_dir.join(".claude").join("agents");
-    std::fs::write(agents.join("cto.md"), "---\n---\nseeded cto").unwrap();
+    std::fs::write(agents.join("cto.md"), "---\n---\nuser cto").unwrap();
     std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
 
     let out = fx
@@ -303,19 +303,18 @@ fn t03_purge_clears_ccteam_footprint_only() {
         !fx.project_dir.join(".ccteam").exists(),
         ".ccteam/ should be purged",
     );
-    // seeded cto.md gone …
+    // Every role file survives, including a user-authored cto.md.
     assert!(
-        !agents.join("cto.md").exists(),
-        "seeded .claude/agents/cto.md should be purged",
+        agents.join("cto.md").exists(),
+        "user-owned .claude/agents/cto.md must survive --purge",
     );
-    // … but the agents dir + user work-role survive.
     assert!(
         agents.join("reviewer.md").exists(),
         "user work-role .claude/agents/reviewer.md must survive --purge",
     );
     assert!(
         agents.is_dir(),
-        ".claude/agents/ dir must survive (only cto.md is ours)",
+        ".claude/agents/ dir must survive (all role files are user-owned)",
     );
     // root workflow.yaml is NOT ccteam's footprint post-W2 — must survive.
     assert!(
@@ -748,9 +747,9 @@ fn t16_project_rm_nonpurge_keeps_project_files() {
 }
 
 /// t17 — `ccteam project rm --purge` deletes ccteam's footprint via the
-/// GROUP path (cto.md + .ccteam/ + settings.local.json hook section +
+/// GROUP path (.ccteam/ + settings.local.json hook section +
 /// config entry + ~/.ccteam/{progress,state/im/registry}/<slug>) and PROVABLY
-/// keeps a user role, CLAUDE.md, .env, and the user's settings.json.
+/// keeps all user roles, CLAUDE.md, .env, and the user's settings.json.
 #[test]
 fn t17_project_rm_purge_via_group() {
     let fx = Fixture::new("dex-grp-purge");
@@ -765,8 +764,8 @@ fn t17_project_rm_purge_via_group() {
     )
     .unwrap();
     let agents = fx.project_dir.join(".claude").join("agents");
-    std::fs::write(agents.join("cto.md"), "---\n---\nseeded cto").unwrap();
-    // KEEP set.
+    // KEEP set: v0.9.0 seeds no cto role; both files are user-owned.
+    std::fs::write(agents.join("cto.md"), "---\n---\nuser cto").unwrap();
     std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
     std::fs::write(fx.project_dir.join(".env"), "SECRET=hunter2\n").unwrap();
     std::fs::write(fx.project_dir.join("CLAUDE.md"), "# memory\n").unwrap();
@@ -811,10 +810,6 @@ fn t17_project_rm_purge_via_group() {
         ".ccteam/ must be purged",
     );
     assert!(
-        !agents.join("cto.md").exists(),
-        "seeded cto.md must be purged"
-    );
-    assert!(
         !settings_local.exists(),
         "settings.local.json (only ccteam hooks) must be deleted",
     );
@@ -833,6 +828,10 @@ fn t17_project_rm_purge_via_group() {
     );
 
     // KEEP set — provably untouched.
+    assert!(
+        agents.join("cto.md").exists(),
+        "user-owned .claude/agents/cto.md must survive --purge",
+    );
     assert!(
         agents.join("reviewer.md").exists(),
         "user role .claude/agents/reviewer.md must survive --purge",
