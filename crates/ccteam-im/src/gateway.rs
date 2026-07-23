@@ -2510,7 +2510,7 @@ impl Gateway {
                     );
                     Ok(None)
                 } else {
-                    Ok(Some(self.render_projects()))
+                    Ok(Some(self.render_projects(chat)))
                 }
             }
             "/help" => Ok(Some(format!(
@@ -2532,7 +2532,12 @@ impl Gateway {
     /// clear the active session so the next message spawns one there.
     fn change_project(&mut self, chat: &ChatKey, project: &str) -> Result<String> {
         self.ensure_project_loaded(project);
-        if !self.projects.contains_key(project) {
+        // Existence AND ownership in one gate (same policy as the picker /
+        // `/projects` / web REST): a chat may `/cd` only into a project it can
+        // SEE, so a tenant can't switch into — and then spawn sessions in — the
+        // admin's project by typing its slug. A hidden or nonexistent slug reads
+        // identically ("unknown project"), disclosing nothing.
+        if !self.can_see_project(chat, project) {
             return Err(anyhow!("unknown project: {project}"));
         }
         self.current_project
@@ -2633,17 +2638,49 @@ impl Gateway {
         crate::transport::platform_of(channel) == "telegram"
     }
 
-    /// Project slugs for `/projects` + the picker — the SAME source web and
-    /// `ccteam status` use (`collect_projects`: config.yaml filtered to on-disk
-    /// `state.json`), falling back to the in-memory routing cache when
-    /// `project_paths` isn't wired (unit tests without `enable_project_creation`).
-    fn project_slugs(&self) -> Vec<String> {
+    /// Project slugs `chat` may SEE — backs `/projects`, the `/cd` picker, and
+    /// the `/status` project count. Same source web and `ccteam status` use
+    /// (`collect_projects`: config.yaml filtered to on-disk `state.json`),
+    /// filtered through the SAME ownership policy the web REST project list
+    /// applies (`build_projects` → `Identity::can_see_owner`): a tenant sees only
+    /// its own `user:<id>` projects, the operator/admin sees every non-tenant
+    /// project. This is the IM twin of `build_projects`, so IM and web never
+    /// diverge on who sees which project (the multi-user isolation contract).
+    ///
+    /// Falls back to the UNFILTERED in-memory routing cache only when
+    /// `project_paths` isn't wired (unit tests without `enable_project_creation`),
+    /// where no persisted owner is available; production always has the paths.
+    fn visible_project_slugs(&self, chat: &ChatKey) -> Vec<String> {
         if let Some(paths) = &self.project_paths {
             if let Ok(summaries) = ccteam_core::collect_projects(paths) {
-                return summaries.iter().map(|s| s.state.slug.clone()).collect();
+                return summaries
+                    .iter()
+                    .filter(|s| Self::chat_can_see_project_owner(chat, s.state.owner.as_deref()))
+                    .map(|s| s.state.slug.clone())
+                    .collect();
             }
         }
         self.projects.keys().cloned().collect()
+    }
+
+    /// Whether `chat` may see/address the project `slug` — existence AND
+    /// ownership, the gate behind `/cd <slug>`. Existence via the in-memory
+    /// registry (as before); ownership via the SAME core policy as the picker /
+    /// web REST, so a tenant can't `/cd` into the admin's project by typing its
+    /// slug (visibility alone isn't enough — addressing must be gated too).
+    fn can_see_project(&self, chat: &ChatKey, slug: &str) -> bool {
+        self.projects.contains_key(slug)
+            && Self::chat_can_see_project_owner(chat, self.project_owner(slug).as_deref())
+    }
+
+    /// The persisted `ProjectState.owner` of `slug` (`None` when unset or the
+    /// state can't be read — treated as unowned: operator-visible, tenant-hidden,
+    /// a fail-safe that matches the web ACL).
+    fn project_owner(&self, slug: &str) -> Option<String> {
+        self.project_paths
+            .as_ref()
+            .and_then(|paths| ccteam_core::ProjectState::load(&paths.project_state(slug)).ok())
+            .and_then(|state| state.owner)
     }
 
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
@@ -2652,7 +2689,7 @@ impl Gateway {
     fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat);
         let mut options: Vec<MessageOption> = self
-            .project_slugs()
+            .visible_project_slugs(chat)
             .into_iter()
             .map(|slug| {
                 // A consistent leading glyph (✓ current / ▸ others) lines the
@@ -5457,6 +5494,39 @@ impl Gateway {
         owner_identity.starts_with("user:")
     }
 
+    /// Map an IM/web chat to the shared core ownership identity `(user_id,
+    /// is_admin)` that `ccteam_core::identity::can_see_owner` expects — the
+    /// IM-side twin of the web [`crate::auth::Identity`], so BOTH frontends
+    /// resolve PROJECT visibility through ONE policy (web/IM symmetry). A
+    /// per-tenant IM bot (`<platform>@<tenant>`) or a per-user web token is that
+    /// tenant (`user:<tenant>`, non-admin); every other chat — the owner's global
+    /// IM bot or the admin web console — is the operator/admin (`user:web-api`,
+    /// sees all non-tenant projects, never a tenant's private ones). HONEST
+    /// SCOPE: like the session ACL this is soft (UX) isolation under one OS uid;
+    /// treating every non-tenant-bot chat as the operator mirrors how the session
+    /// pool (`owner_identity_visible`) already grants the `user:` view.
+    fn project_acl_identity(chat: &ChatKey) -> (String, bool) {
+        if let Some(tid) = crate::transport::tenant_of_bot_channel(&chat.channel) {
+            return (tid.to_string(), false);
+        }
+        if chat.channel == "web" && chat.chat_id != ccteam_core::identity::ADMIN_WEB_ID {
+            return (chat.chat_id.clone(), false);
+        }
+        (ccteam_core::identity::ADMIN_WEB_ID.to_string(), true)
+    }
+
+    /// Whether `chat` may see/address a project whose persisted
+    /// `ProjectState.owner` is `owner`. Delegates to the SAME core policy the web
+    /// REST project ACL uses (`build_projects` / `can_see_project` →
+    /// `ccteam_core::identity::can_see_owner`), so a tenant's IM bot sees exactly
+    /// the projects its web console does: it never sees the admin's projects, and
+    /// the admin never peeks into a tenant's. Fixes the IM project-visibility
+    /// leak where `/projects` / the `/cd` picker showed every owner's projects.
+    fn chat_can_see_project_owner(chat: &ChatKey, owner: Option<&str>) -> bool {
+        let (user_id, is_admin) = Self::project_acl_identity(chat);
+        ccteam_core::identity::can_see_owner(&user_id, is_admin, owner)
+    }
+
     /// Point the chat's active session at an existing session owned by this
     /// chat in `project` (deterministic: smallest session index), returning its
     /// id. When none exists, clear the active session so the next message spawns
@@ -6165,18 +6235,21 @@ impl Gateway {
         }
         // Owner req — the last line points at the full project list (with a live
         // count), replacing the old cross-project `/sessions all` fleet pointer.
-        let nproj = self.project_slugs().len();
+        // Count only the projects THIS chat may see (same ACL as `/projects`), so
+        // the pointer never advertises another owner's projects.
+        let nproj = self.visible_project_slugs(chat).len();
         out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
         out
     }
 
-    fn render_projects(&self) -> String {
-        // `project_slugs` reads the SAME source web / `ccteam status` use —
-        // `collect_projects` (config.yaml filtered to projects that have an
-        // on-disk `state.json`) — so IM `/projects` never diverges from the
-        // other surfaces: a half-registered project (in config, no state.json)
-        // shows in NEITHER, and a removed project disappears from BOTH at once.
-        self.project_slugs().join("\n")
+    fn render_projects(&self, chat: &ChatKey) -> String {
+        // `visible_project_slugs` reads the SAME source web / `ccteam status` use
+        // — `collect_projects` (config.yaml filtered to projects that have an
+        // on-disk `state.json`) — filtered by the SAME per-owner ACL web applies,
+        // so IM `/projects` never diverges from the other surfaces: a
+        // half-registered project (in config, no state.json) shows in NEITHER, a
+        // removed project disappears from BOTH, and each owner sees only its own.
+        self.visible_project_slugs(chat).join("\n")
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -13688,6 +13761,94 @@ mod tests {
         );
         // The admin/global bot oversees the shared web pool.
         assert!(Gateway::owner_identity_visible(&admin_tg, &web_a));
+    }
+
+    /// IM PROJECT ACL — the multi-user isolation the leaky unfiltered project
+    /// list broke: a tenant must NOT see the admin's projects (the reported
+    /// bug), and the operator must never peek into a tenant's — SYMMETRIC with
+    /// the web REST list (`build_projects` → `Identity::can_see_owner`) and the
+    /// MCP list (`visible_user_projects`), since all three now authorize off the
+    /// same `ProjectState.owner` through the same core policy
+    /// (`ccteam_core::identity::can_see_owner`). Pure-predicate twin of
+    /// `chat_owner_visible_converges_tenant_web_and_im` (the session rule),
+    /// keyed on PROJECT owners instead of session owners.
+    #[test]
+    fn project_acl_isolates_tenants_from_admin_and_each_other() {
+        // Project owner tags, as `/newproject` + web `POST /projects` stamp
+        // them: a tenant's project is `user:<id>`, the admin's is the shared web
+        // pool `user:web-api` or its own IM `telegram:<chat_id>`, a legacy
+        // `ccteam init` project is unowned (`None`).
+        let admin_web = Some("user:web-api");
+        let admin_im = Some("telegram:339");
+        let tenant_a = Some("user:ualice");
+        let tenant_b = Some("user:ubob");
+        let unowned: Option<&str> = None;
+
+        // A per-tenant IM bot (`telegram@ualice`) — the "user" in the bug report
+        // — and its own web console (channel "web", tenant id as chat_id) are ONE
+        // identity, so BOTH frontends see exactly the same projects (web/IM
+        // symmetry): ONLY the tenant's own, never the admin's (web OR IM), never
+        // another tenant's, never a legacy unowned one.
+        for viewer in [
+            ChatKey::new("telegram@ualice", "111", "alice"),
+            ChatKey::new("web", "ualice", "ualice"),
+        ] {
+            assert!(
+                Gateway::chat_can_see_project_owner(&viewer, tenant_a),
+                "a tenant sees its own project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, admin_web),
+                "a tenant must NOT see the admin's web project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, admin_im),
+                "a tenant must NOT see the admin's IM project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, tenant_b),
+                "a tenant must NOT see another tenant's project ({})",
+                viewer.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&viewer, unowned),
+                "a tenant must NOT see a legacy unowned project ({})",
+                viewer.channel
+            );
+        }
+
+        // The operator (owner's global IM bot ≡ admin web console) sees every
+        // NON-tenant project — its own web pool, its own IM projects, and legacy
+        // unowned — but NEVER a per-user tenant's private project (exactly what
+        // web admin sees via `can_see_owner`).
+        for op in [
+            ChatKey::new("telegram", "339", "rob"),
+            ChatKey::new("web", "web-api", "web-api"),
+        ] {
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, admin_web),
+                "operator sees its own web pool ({})",
+                op.channel
+            );
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, admin_im),
+                "operator sees its own IM project ({})",
+                op.channel
+            );
+            assert!(
+                Gateway::chat_can_see_project_owner(&op, unowned),
+                "operator sees legacy unowned projects ({})",
+                op.channel
+            );
+            assert!(
+                !Gateway::chat_can_see_project_owner(&op, tenant_a),
+                "operator must NOT peek into a tenant's project ({})",
+                op.channel
+            );
+        }
     }
 
     /// v0.8.21 cold-resume ACL (web path) — `resume_stopped_session` resolves a
