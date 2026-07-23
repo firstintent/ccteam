@@ -5726,11 +5726,6 @@ impl Gateway {
             };
             return Self::append_history_section(head, &history);
         }
-        let activity_by_sid = if is_web {
-            std::collections::HashMap::new()
-        } else {
-            self.session_activity_snapshot(&visible)
-        };
         // Render each visible session's row (async `thread_status`) once,
         // keyed by sid for the IM tree; web keeps the flat bare-row feed.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
@@ -5757,16 +5752,12 @@ impl Gateway {
                 web_rows.push(row);
                 continue;
             }
-            let vendor_tag = format!("[{}]", vendor_str(s.vendor));
-            let activity = activity_by_sid
-                .get(&s.id)
-                .map(String::as_str)
-                .unwrap_or("idle");
-            row = format!("{vendor_tag:<10} {} · {row}", activity_marker(activity));
+            // The row already starts with `s.id` (the `base` built above) — no
+            // leading vendor tag or activity dot: the tree is a terse
+            // `sid:project:vendor:role` identifier line now, scannable by sid.
+            // (Activity/state lives on `/status`; the session TITLE lives on
+            // the switch button label — see `session_switch_options`.)
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
-            // (The session title is deliberately NOT on the text row anymore —
-            // it lives on the switch button label instead; see
-            // `session_switch_options`.)
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
             }
@@ -8855,7 +8846,7 @@ const TELEGRAM_CALLBACK_MAX: usize = 64;
 /// Max display columns a session title may occupy inside a `/sessions` switch
 /// button label. A longer title is clipped with `…` so one verbose title can't
 /// widen every button — the left-align padding aligns all labels to the widest.
-const SESSION_BUTTON_TITLE_MAX_COLS: usize = 24;
+const SESSION_BUTTON_TITLE_MAX_COLS: usize = 32;
 
 /// Clip `s` to at most `max_cols` DISPLAY columns, appending `…` on overflow.
 /// Column-based (not char count) so a CJK double-width title clips at a stable
@@ -8880,20 +8871,34 @@ fn truncate_cols(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Right-pad every picker label to the set's widest row so Telegram's
+/// Floor for [`left_align_option_labels`]'s pad target: Telegram renders every
+/// option as its OWN full-width single-button row (one button per
+/// `inline_keyboard` row — see `TelegramChannel::send`), so its text is
+/// centered within the FULL row width, not a column sized to the option set.
+/// Padding rows to only the OBSERVED max-in-set (e.g. all bare sids like
+/// "s1"/"s2"/"s28") still centers a short block deep in a wide row — visually
+/// indistinguishable from plain centering. Padding every label out to at
+/// least this many columns pushes that block toward the row's left edge on a
+/// typical phone-width chat. Approximate by nature: the bot API exposes no
+/// client viewport, so this can undershoot (desktop) or overshoot slightly.
+const PICKER_LABEL_MIN_PAD_COLS: usize = 30;
+
+/// Right-pad every picker label to at least the widest row in the SET, or
+/// [`PICKER_LABEL_MIN_PAD_COLS`], whichever is larger — so Telegram's
 /// centre-aligned button text reads as a LEFT-aligned list (owner req,
-/// tg-6955). Telegram strips ordinary trailing whitespace from button
-/// labels, so the pad is U+2800 BRAILLE PATTERN BLANK — renders blank,
-/// survives the trim, ~1 cell wide.
+/// tg-6955) even when every option in the set is short. Telegram strips
+/// ordinary trailing whitespace from button labels, so the pad is U+2800
+/// BRAILLE PATTERN BLANK — renders blank, survives the trim, ~1 cell wide.
 fn left_align_option_labels(options: &mut [MessageOption]) {
     use unicode_width::UnicodeWidthStr;
-    let max = options
+    let observed_max = options
         .iter()
         .map(|o| o.label.as_str().width())
         .max()
         .unwrap_or(0);
+    let target = observed_max.max(PICKER_LABEL_MIN_PAD_COLS);
     for o in options.iter_mut() {
-        for _ in 0..max.saturating_sub(o.label.as_str().width()) {
+        for _ in 0..target.saturating_sub(o.label.as_str().width()) {
             o.label.push('\u{2800}');
         }
     }
@@ -12962,8 +12967,12 @@ mod tests {
         );
     }
 
+    /// `/sessions` text rows START with the sid and carry NO activity dot
+    /// (🟢/🟡/🟠/🔴/⚪) or leading `[vendor]` tag — those lived on the text row
+    /// pre-cleanup; activity now lives only on `/status`, and the vendor is
+    /// still readable from the `:{vendor}:` colon field.
     #[tokio::test]
-    async fn gateway_sessions_rows_show_activity_marker() {
+    async fn gateway_sessions_text_rows_start_with_sid_and_have_no_activity_dot() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -12976,10 +12985,17 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
+        let row = listing[0].split('\n').nth(1).expect("a session row");
         assert!(
-            listing[0].contains("[claude]   🟢 idle · s1:alpha:Claude:reviewer"),
-            "activity marker belongs in the information-rich text row: {listing:?}"
+            row.starts_with("s1:alpha:Claude:reviewer"),
+            "row starts with the sid: {row:?}"
         );
+        for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
+            assert!(
+                !listing[0].contains(marker),
+                "no activity dot / vendor tag on the text row: {listing:?}"
+            );
+        }
     }
 
     /// Picker-label padding equalizes display width across an option set.
@@ -13108,10 +13124,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            bare,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
 
         // Now report a model + usage → suffix appears, rendered the same
         // way Codex /status renders (shared helper).
@@ -13131,7 +13144,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -13151,12 +13164,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
     }
 
+    /// Every vendor's row carries its vendor in the `:{vendor}:` colon field
+    /// (no separate `[vendor]` tag anymore — that prefix was dropped so the
+    /// row starts with the sid).
     #[tokio::test]
-    async fn gateway_sessions_im_rows_prefix_all_vendor_tags() {
+    async fn gateway_sessions_im_rows_carry_every_vendor_in_the_colon_field() {
         let factory: Arc<
             dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
                 + Send
@@ -13177,8 +13193,8 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
-            assert!(listing.contains(&format!("[{vendor}] ")), "{listing}");
+        for vendor in ["Claude", "Codex", "Grok", "Opencode", "Kimi"] {
+            assert!(listing.contains(&format!(":{vendor}:")), "{listing}");
         }
     }
 
@@ -13212,7 +13228,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s2:alpha:Claude:qa\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns2:alpha:Claude:qa\ns1:alpha:Claude:reviewer"]
         );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -13232,7 +13248,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ [claude]   🟢 idle · s1:alpha:Claude:reviewer\n[claude]   🟢 idle · s2:alpha:Claude:qa"],
+            vec!["📁 当前项目: alpha\n⏳ s1:alpha:Claude:reviewer\ns2:alpha:Claude:qa"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -14479,7 +14495,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner_sees,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
         );
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -14521,10 +14537,7 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(
-            seen,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -14699,7 +14712,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[codex]    🟢 idle · s1:beta:Codex:api"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Codex:api"]
         );
 
         let use_first = gateway
@@ -14773,7 +14786,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\n[claude]   🟢 idle · s4:beta:Claude:qa\n[codex]    🟢 idle · s3:beta:Codex:api\n[codex]    🟢 idle · s2:alpha:Codex:docs\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"
+                "📁 当前项目: beta\ns4:beta:Claude:qa\ns3:beta:Codex:api\ns2:alpha:Codex:docs\ns1:alpha:Claude:reviewer"
             ]
         );
         let projects = gateway
@@ -15196,7 +15209,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:reviewer\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:reviewer\ns1:beta:Claude:reviewer"]
         );
 
         assert_eq!(
@@ -15268,10 +15281,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s1:beta:Claude:reviewer"]
-        );
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1:beta:Claude:reviewer"]);
 
         assert_eq!(
             restored
@@ -15734,10 +15744,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
-        );
+        assert_eq!(before, vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -15771,7 +15778,7 @@ mod tests {
         // (`s2:beta:Claude:`).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\n[claude]   🟢 idle · s2:beta:Claude:\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2:beta:Claude:\ns1:alpha:Claude:reviewer"]
         );
     }
 
@@ -16129,7 +16136,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns1:alpha:Claude:reviewer"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -16200,10 +16207,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
-        );
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -16304,10 +16308,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
-        );
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto"]);
         // …and the rename SURFACES on the picker button.
         let chat = ChatKey::new("mock", "chat-1", "alice");
         let s1_button = |g: &Gateway| {
@@ -16330,10 +16331,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            listing2,
-            vec!["📁 当前项目: alpha\n[claude]   🟢 idle · s1:alpha:Claude:cto"]
-        );
+        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1:alpha:Claude:cto"]);
         assert_eq!(
             s1_button(&gateway).as_deref(),
             Some("✓ s1 「my custom title」"),
@@ -17449,8 +17447,8 @@ mod tests {
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
         // Parent row precedes the indented child row.
-        let pline = format!("[claude]   🟢 idle · {parent}:alpha:Claude:");
-        let cline = format!("└─ [claude]   🟢 idle · {child}:alpha:Claude:");
+        let pline = format!("{parent}:alpha:Claude:");
+        let cline = format!("└─ {child}:alpha:Claude:");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
