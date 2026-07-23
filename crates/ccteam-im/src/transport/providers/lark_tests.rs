@@ -949,3 +949,119 @@ fn image_ext_sniffs_magic_bytes() {
     assert_eq!(image_ext(b"\x00\x01\x02"), ".jpg");
     assert_eq!(image_ext(&[]), ".jpg");
 }
+
+// ── interactive card (options → buttons) round-trip ─────────────────────────
+
+#[test]
+fn build_option_card_renders_text_and_one_button_per_option() {
+    let opts = vec![
+        MessageOption {
+            data: "nav:cd:alpha".into(),
+            label: "✓ alpha".into(),
+            id: "alpha".into(),
+        },
+        MessageOption {
+            data: "nav:cd:beta".into(),
+            label: "▸ beta".into(),
+            id: "beta".into(),
+        },
+    ];
+    let card = build_option_card("Pick a project", &opts);
+    let elements = card["elements"].as_array().expect("elements array");
+    // One `div` for the text + one `action` per option.
+    assert_eq!(elements.len(), 3);
+    assert_eq!(elements[0]["tag"], "div");
+    assert_eq!(elements[0]["text"]["content"], "Pick a project");
+    // Each button carries the option's opaque `data` under `value.d`, and
+    // its human label — the same split telegram rides on callback_data/text.
+    assert_eq!(elements[1]["tag"], "action");
+    let btn1 = &elements[1]["actions"][0];
+    assert_eq!(btn1["tag"], "button");
+    assert_eq!(btn1["text"]["content"], "✓ alpha");
+    assert_eq!(btn1["value"]["d"], "nav:cd:alpha");
+    let btn2 = &elements[2]["actions"][0];
+    assert_eq!(btn2["value"]["d"], "nav:cd:beta");
+    assert_eq!(btn2["text"]["content"], "▸ beta");
+}
+
+#[test]
+fn build_option_card_omits_empty_text_div() {
+    let opts = vec![MessageOption {
+        data: "t:0".into(),
+        label: "Yes".into(),
+        id: "yes".into(),
+    }];
+    let card = build_option_card("", &opts);
+    let elements = card["elements"].as_array().expect("elements array");
+    // No leading text div when content is empty — just the one button.
+    assert_eq!(elements.len(), 1);
+    assert_eq!(elements[0]["tag"], "action");
+}
+
+#[test]
+fn decode_card_action_legacy_flat_shape() {
+    // Legacy card callback: fields flat at the top level, button value we set.
+    let payload = serde_json::json!({
+        "open_id": "ou_testuser123",
+        "open_chat_id": "oc_conv1",
+        "open_message_id": "om_msg1",
+        "token": "c-abc",
+        "action": { "tag": "button", "value": { "d": "nav:use:s7" } },
+    });
+    let action = decode_card_action(payload.to_string().as_bytes()).expect("decoded");
+    assert_eq!(action.open_id, "ou_testuser123");
+    assert_eq!(action.chat_id, "oc_conv1");
+    assert_eq!(action.message_id, "om_msg1");
+    assert_eq!(action.data, "nav:use:s7");
+}
+
+#[test]
+fn decode_card_action_card_2_0_event_shape() {
+    // card.action.trigger: fields nested under `event` with operator/context.
+    let payload = serde_json::json!({
+        "schema": "2.0",
+        "header": { "event_type": "card.action.trigger" },
+        "event": {
+            "operator": { "open_id": "ou_testuser123" },
+            "context": { "open_chat_id": "oc_conv2", "open_message_id": "om_msg2" },
+            "action": { "tag": "button", "value": { "d": "nav:cd:gamma" } },
+        },
+    });
+    assert!(payload_is_card_action(payload.to_string().as_bytes()));
+    let action = decode_card_action(payload.to_string().as_bytes()).expect("decoded");
+    assert_eq!(action.open_id, "ou_testuser123");
+    assert_eq!(action.chat_id, "oc_conv2");
+    assert_eq!(action.message_id, "om_msg2");
+    assert_eq!(action.data, "nav:cd:gamma");
+}
+
+#[test]
+fn decode_card_action_rejects_non_card_payload() {
+    // A plain message event carries no button value → None (falls through to
+    // the message decoder in the live loop).
+    let msg = serde_json::json!({
+        "schema": "2.0",
+        "header": { "event_type": "im.message.receive_v1" },
+        "event": {
+            "sender": { "sender_id": { "open_id": "ou_x" }, "sender_type": "user" },
+            "message": { "message_type": "text", "content": "{\"text\":\"hi\"}" },
+        },
+    });
+    assert!(!payload_is_card_action(msg.to_string().as_bytes()));
+    assert!(decode_card_action(msg.to_string().as_bytes()).is_none());
+}
+
+#[test]
+fn decode_card_action_requires_open_id_and_data() {
+    // Missing button value → None even with a valid operator.
+    let no_data = serde_json::json!({
+        "open_id": "ou_x",
+        "action": { "tag": "button", "value": {} },
+    });
+    assert!(decode_card_action(no_data.to_string().as_bytes()).is_none());
+    // Missing operator → None even with a value.
+    let no_op = serde_json::json!({
+        "action": { "tag": "button", "value": { "d": "t:0" } },
+    });
+    assert!(decode_card_action(no_op.to_string().as_bytes()).is_none());
+}

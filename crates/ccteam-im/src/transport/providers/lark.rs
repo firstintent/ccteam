@@ -44,7 +44,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, LarkOpenIdProbe, OutboundFile, OutboundFileKind, SendMessage,
+    ChannelMessage, ChoiceReply, LarkOpenIdProbe, MessageOption, OutboundFile, OutboundFileKind,
+    SendMessage,
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -311,6 +312,111 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
         text,
         timestamp,
         pending,
+    })
+}
+
+/// Build a Feishu interactive card (schema 1.0) rendering `text` plus one
+/// button per option. Each button's `value.d` carries the option's opaque
+/// callback `data` verbatim — the same payload telegram rides on
+/// `callback_data` — so a click round-trips back through
+/// [`decode_card_action`] into a [`ChoiceReply`]. One `action` element per
+/// button so they stack vertically (mirroring telegram's one-button-per-row
+/// keyboard). Pure — unit-tested without a live API.
+fn build_option_card(text: &str, options: &[MessageOption]) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    if !text.is_empty() {
+        elements.push(serde_json::json!({
+            "tag": "div",
+            "text": { "tag": "lark_md", "content": text },
+        }));
+    }
+    for opt in options {
+        elements.push(serde_json::json!({
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": opt.label },
+                "type": "default",
+                "value": { "d": opt.data },
+            }],
+        }));
+    }
+    serde_json::json!({
+        "config": { "wide_screen_mode": true },
+        "elements": elements,
+    })
+}
+
+/// True when a `type=="event"` payload is a card-2.0 `card.action.trigger`
+/// (its header event type), so the WS loop routes it to the card path
+/// instead of the message decoder. Legacy card callbacks arrive as a
+/// distinct `type=="card"` frame and don't need this probe.
+fn payload_is_card_action(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/header/event_type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "card.action.trigger")
+        })
+        .unwrap_or(false)
+}
+
+/// A decoded card-button click — the inbound half of the interactive-card
+/// round-trip, symmetric to a telegram `callback_query`.
+#[derive(Debug, PartialEq, Eq)]
+struct CardAction {
+    /// Clicking user's `open_id` (fed to the ACL, like a message sender).
+    open_id: String,
+    /// Conversation id (`oc_…`) → [`ChannelMessage::reply_target`].
+    chat_id: String,
+    /// The card's message id (`om_…`), used only to shape the event id.
+    message_id: String,
+    /// The clicked button's `value.d` — the opaque `data` the gateway resolves.
+    data: String,
+}
+
+/// Decode a Feishu card-action callback payload into a [`CardAction`].
+///
+/// Tolerates both wire shapes the long-connection can deliver: the legacy
+/// card callback (fields flat at the top level, frame header `type=="card"`)
+/// and the card-2.0 `card.action.trigger` event (fields nested under
+/// `event`, with `operator`/`context` sub-objects). Reads the button value
+/// from `action.value.d` — the key [`build_option_card`] writes. Returns
+/// `None` when there's no usable `open_id` or button `data` (any non-card
+/// event, e.g. a plain message, decodes to `None` here and falls through to
+/// the message path). Pure — no `&self`/network.
+fn decode_card_action(payload: &[u8]) -> Option<CardAction> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    // Card 2.0 nests the action under `event`; the legacy shape is flat.
+    let root = v.get("event").unwrap_or(&v);
+    let open_id = root
+        .pointer("/operator/open_id")
+        .or_else(|| root.get("open_id"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())?;
+    let data = root
+        .pointer("/action/value/d")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let chat_id = root
+        .pointer("/context/open_chat_id")
+        .or_else(|| root.get("open_chat_id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message_id = root
+        .pointer("/context/open_message_id")
+        .or_else(|| root.get("open_message_id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(CardAction {
+        open_id: open_id.to_string(),
+        chat_id,
+        message_id,
+        data,
     })
 }
 
@@ -648,6 +754,47 @@ impl LarkChannel {
                             full
                         } else { continue; }
                     };
+
+                    // Card-button click: a legacy card callback arrives as a
+                    // `type=="card"` frame; a card-2.0 click as an `event`
+                    // whose type is `card.action.trigger`. Either decodes to a
+                    // selection reply, symmetric to a telegram callback_query.
+                    // The generic 200-ok ACK above already dismissed the
+                    // button spinner (like telegram's `answerCallbackQuery`).
+                    if msg_type == "card" || (msg_type == "event" && payload_is_card_action(&payload)) {
+                        let Some(action) = decode_card_action(&payload) else { continue };
+                        if !self.is_user_allowed(&action.open_id) {
+                            tracing::warn!("Lark WS: ignoring card action from {} (not allowed)", action.open_id);
+                            continue;
+                        }
+                        // Dedup on the WS-frame message_id (Feishu reuses it on
+                        // retry) — this blocks re-delivery but still lets a user
+                        // click the same card twice (distinct frames).
+                        {
+                            let now = Instant::now();
+                            let mut seen = self.ws_seen_ids.write().await;
+                            seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30 * 60));
+                            let key = format!("card:{msg_id}");
+                            if seen.contains_key(&key) {
+                                tracing::debug!("Lark WS: dup card action {msg_id}");
+                                continue;
+                            }
+                            seen.insert(key, now);
+                        }
+                        let cm = ChannelMessage {
+                            id: format!("lark-card-{}", action.message_id),
+                            sender: action.open_id,
+                            reply_target: action.chat_id,
+                            content: String::new(),
+                            channel: self.name.clone(),
+                            timestamp: now_secs(),
+                            thread_ts: None,
+                            attachments: Vec::new(),
+                            selection: Some(ChoiceReply { data: action.data }),
+                        };
+                        if tx.send(cm).await.is_err() { break; }
+                        continue;
+                    }
 
                     if msg_type != "event" { continue; }
 
@@ -1149,6 +1296,16 @@ impl Channel for LarkChannel {
         // image/file message; the caption rides the first attachment.
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
+        }
+        // Picker options → an interactive card with one button per option
+        // (symmetric to telegram's inline keyboard). The numbered-text
+        // fallback already lives in `content`, so the card body carries it
+        // too — a client that can't render buttons still sees the list.
+        if !message.options.is_empty() {
+            let card = build_option_card(&message.content, &message.options);
+            return self
+                .send_raw(&message.recipient, "interactive", card.to_string())
+                .await;
         }
         // Feishu quirk: `content` is a STRING containing JSON, not a
         // nested object.
