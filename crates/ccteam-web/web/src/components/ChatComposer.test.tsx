@@ -2,7 +2,7 @@
 // IME guard (the owner-reported #1 bug: pressing Enter to confirm a Chinese
 // candidate must NOT send a half-typed message).
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 
 vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,9 +20,12 @@ import {
   attachmentsBlockSend,
   attachmentsPayload,
   ChatComposer,
+  fetchSkillLists,
   shouldSubmitOnEnter,
+  SkillMenuSections,
   type ComposerAttachment,
 } from "./ChatComposer";
+import type { LibrarySkillSummary, SkillSummary } from "../lib/attachmentsApi";
 import { defaultDraft } from "../lib/vendors";
 
 const base = { key: "Enter", shiftKey: false, isComposing: false, keyCode: 13 };
@@ -86,6 +89,30 @@ describe("attachmentsPayload", () => {
         fileChip({ id: "att-3", status: "error", path: undefined }),
       ]),
     ).toEqual([]);
+  });
+
+  // v0.9.9 — global skill library: a library pick carries scope:"global";
+  // a project pick stays byte-compatible with older clients.
+  it("maps a global-library skill chip to {kind, name, scope:'global'}", () => {
+    expect(
+      attachmentsPayload([
+        fileChip({
+          id: "att-g1",
+          kind: "skill",
+          name: "baoyu-skills/baoyu-comic",
+          path: undefined,
+          scope: "global",
+        }),
+      ]),
+    ).toEqual([{ kind: "skill", name: "baoyu-skills/baoyu-comic", scope: "global" }]);
+  });
+
+  it("keeps a project skill chip byte-compatible (no scope key on the wire)", () => {
+    const payload = attachmentsPayload([
+      fileChip({ id: "att-p1", kind: "skill", name: "deep-research", path: undefined }),
+    ]);
+    expect(payload).toEqual([{ kind: "skill", name: "deep-research" }]);
+    expect(Object.keys(payload[0]!)).not.toContain("scope");
   });
 });
 
@@ -171,5 +198,105 @@ describe("prefill", () => {
 
   it("nonce 0 means no prefill (draft untouched)", () => {
     expect(renderComposer({ text: "不该出现", nonce: 0 })).not.toContain("不该出现");
+  });
+});
+
+// ── v0.9.9 — global skill library: two-section attach menu (admin-gated) ─────
+
+const projectSkills: SkillSummary[] = [
+  { skill: "deep-research", description: "fan-out research harness" },
+];
+const librarySkills: LibrarySkillSummary[] = [
+  {
+    id: "grill-me",
+    description: "decision-tree griller",
+    path: "/home/u/.ccteam/skills/grill-me/SKILL.md",
+    source: "hub",
+  },
+  {
+    id: "baoyu-skills/baoyu-comic",
+    description: "comic renderer",
+    path: "/home/u/.ccteam/skills/baoyu-skills/baoyu-comic/SKILL.md",
+  },
+];
+
+describe("SkillMenuSections (two-section attach menu)", () => {
+  const renderSections = (over: Partial<Parameters<typeof SkillMenuSections>[0]> = {}) =>
+    renderToString(
+      <SkillMenuSections
+        lang="zh"
+        isAdmin
+        skills={projectSkills}
+        globalSkills={librarySkills}
+        attachments={[]}
+        onToggleSkill={() => {}}
+        {...over}
+      />,
+    );
+
+  it("admin sees BOTH the Project section and the Global library section", () => {
+    const html = renderSections();
+    expect(html).toContain('data-testid="skill-section-project"');
+    expect(html).toContain('data-testid="skill-section-global"');
+    expect(html).toContain("项目");
+    expect(html).toContain("全局库");
+    // project-local rows AND library rows (nested ids render verbatim)
+    expect(html).toContain("deep-research");
+    expect(html).toContain("grill-me");
+    expect(html).toContain("baoyu-skills/baoyu-comic");
+  });
+
+  it("renders the section headers in English when lang=en", () => {
+    const html = renderSections({ lang: "en" });
+    expect(html).toContain("Project");
+    expect(html).toContain("Global library");
+  });
+
+  it("non-admin sees NO Global section — even if library data were present", () => {
+    const html = renderSections({ isAdmin: false });
+    expect(html).toContain('data-testid="skill-section-project"');
+    expect(html).not.toContain('data-testid="skill-section-global"');
+    expect(html).toContain("deep-research");
+    expect(html).not.toContain("grill-me");
+    expect(html).not.toContain("baoyu-skills/baoyu-comic");
+  });
+
+  it("empty library gets the i18n empty hint (admin)", () => {
+    expect(renderSections({ globalSkills: [] })).toContain("全局库为空");
+    expect(renderSections({ globalSkills: [], lang: "en" })).toContain("Global library is empty");
+  });
+});
+
+describe("fetchSkillLists (the library fetch is admin-only)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("admin fetches the project list AND /api/v1/skills", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify([]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ skills: [] }), { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const lists = fetchSkillLists("demo", true);
+    expect(lists.global).not.toBeNull();
+    await lists.project;
+    await lists.global;
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls).toContain("/api/v1/projects/demo/skills");
+    expect(urls).toContain("/api/v1/skills");
+  });
+
+  it("non-admin NEVER fires a /api/v1/skills request", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const lists = fetchSkillLists("demo", false);
+    expect(lists.global).toBeNull();
+    await lists.project;
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls).toEqual(["/api/v1/projects/demo/skills"]);
   });
 });

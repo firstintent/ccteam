@@ -4,8 +4,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  listLibrarySkills,
   listProjectSkills,
   uploadAttachment,
+  type LibrarySkillSummary,
   type SkillSummary,
   type UploadedAttachment,
 } from "./attachmentsApi";
@@ -91,5 +93,43 @@ describe("listProjectSkills", () => {
   it("maps 401 to UNAUTHENTICATED", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, {}));
     await expect(listProjectSkills("demo")).rejects.toThrow("UNAUTHENTICATED");
+  });
+});
+
+// v0.9.9 — the user-level global skill library (admin-only endpoint).
+describe("listLibrarySkills", () => {
+  it("GETs /api/v1/skills and unwraps {skills} (nested ids; source optional)", async () => {
+    const skills: LibrarySkillSummary[] = [
+      {
+        id: "grill-me",
+        description: "decision-tree griller",
+        path: "/home/u/.ccteam/skills/grill-me/SKILL.md",
+        source: "hub",
+      },
+      {
+        id: "baoyu-skills/baoyu-comic",
+        description: "comic renderer",
+        path: "/home/u/.ccteam/skills/baoyu-skills/baoyu-comic/SKILL.md",
+      },
+    ];
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { skills }));
+    const got = await listLibrarySkills();
+    expect(got).toEqual(skills);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/v1/skills");
+    expect(init?.method ?? "GET").toBe("GET");
+  });
+
+  it("lifts the 403 admin-only error body", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(403, { error: "admin only" }),
+    );
+    await expect(listLibrarySkills()).rejects.toThrow("admin only");
+  });
+
+  it("maps 401 to UNAUTHENTICATED", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, {}));
+    await expect(listLibrarySkills()).rejects.toThrow("UNAUTHENTICATED");
   });
 });

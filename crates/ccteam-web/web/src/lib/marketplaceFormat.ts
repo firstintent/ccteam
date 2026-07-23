@@ -3,6 +3,7 @@
 // so the formatters can be unit-tested directly (mirrors `chatDefaults.ts`).
 
 import type { HubPlugin, InstalledStatus } from "./marketplaceApi";
+import { t, type Lang } from "./i18n";
 
 /** The marketplace category tabs, keyed by `HubPlugin.type`. The label is what
  *  the seg button shows; "Agents / Roles" covers the `agent` type (a role IS an
@@ -25,6 +26,22 @@ export function installedStatusLabel(status: InstalledStatus): string {
     case "not_installed":
     default:
       return "安装";
+  }
+}
+
+/** CTA label for a SKILL marketplace entry (v0.9.9): skills install into the
+ *  user-level global library (`~/.ccteam/skills`), never into a project — so
+ *  the copy names the library, in both UI languages. agent/plugin entries
+ *  keep `installedStatusLabel`. */
+export function skillLibraryStatusLabel(status: InstalledStatus, lang: Lang): string {
+  switch (status) {
+    case "installed":
+      return t(lang, "skillInLibrary");
+    case "update_available":
+      return t(lang, "skillUpdateLibrary");
+    case "not_installed":
+    default:
+      return t(lang, "skillInstallToLibrary");
   }
 }
 

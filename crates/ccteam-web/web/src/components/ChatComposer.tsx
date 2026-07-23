@@ -8,7 +8,10 @@
 //     (per-vendor; claude `terminal` admin-only)
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
-//   - attach menu (＋): upload files/photos + attach installed skills; picked
+//   - attach menu (＋): upload files/photos + attach skills in TWO sections —
+//     the project-local list and, admins only, the user-level global library
+//     (`GET /api/v1/skills`; a library pick rides the turn as
+//     `{kind:"skill", scope:"global"}`, never an install). Picked
 //     files upload immediately (chips show progress), paste/drag-drop attach
 //     too, and Send names the stored paths in the turn's `attachments[]` —
 //     the server weaves them into the turn text (vendor-generic IM grammar).
@@ -30,8 +33,10 @@ import {
 import { toastBus } from "../lib/toastBus";
 import { makeT, type Lang } from "../lib/i18n";
 import {
+  listLibrarySkills,
   listProjectSkills,
   uploadAttachment,
+  type LibrarySkillSummary,
   type SkillSummary,
   type TurnAttachment,
 } from "../lib/attachmentsApi";
@@ -64,25 +69,31 @@ export function shouldSubmitOnEnter(e: {
 
 /** One composer chip: a picked file mid-upload / stored, or an attached
  *  skill. `path` is set once the server stored the file (skills carry the
- *  id in `name` and never upload). */
+ *  id in `name` and never upload). `scope === "global"` marks a skill picked
+ *  from the user-level global library (project skills leave it undefined). */
 export interface ComposerAttachment {
   id: string;
   kind: "image" | "file" | "skill";
   name: string;
   path?: string;
   status: "uploading" | "ready" | "error";
+  scope?: "global";
 }
 
 /** Pure: the turn-POST `attachments[]` payload for the current chips.
  *  Only `ready` chips ride the turn; call [`attachmentsBlockSend`] first
- *  to keep the draft while uploads are still in flight. */
+ *  to keep the draft while uploads are still in flight. A global-library
+ *  skill carries `scope:"global"`; a project skill stays byte-compatible
+ *  (`{kind, name}`, no scope). */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
 export function attachmentsPayload(items: ComposerAttachment[]): TurnAttachment[] {
   return items
     .filter((a) => a.status === "ready")
     .map((a) =>
       a.kind === "skill"
-        ? { kind: "skill" as const, name: a.name }
+        ? a.scope === "global"
+          ? { kind: "skill" as const, name: a.name, scope: "global" as const }
+          : { kind: "skill" as const, name: a.name }
         : { kind: a.kind, path: a.path, name: a.name },
     );
 }
@@ -91,6 +102,106 @@ export function attachmentsPayload(items: ComposerAttachment[]): TurnAttachment[
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
 export function attachmentsBlockSend(items: ComposerAttachment[]): boolean {
   return items.some((a) => a.status === "uploading");
+}
+
+/** The attach-menu skill lists: the project list always, the user-level
+ *  global library ONLY for admins (the endpoint itself is admin-only — a
+ *  non-admin must not even fire the request). `global === null` = not asked. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
+export function fetchSkillLists(
+  slug: string,
+  isAdmin: boolean,
+): { project: Promise<SkillSummary[]>; global: Promise<LibrarySkillSummary[]> | null } {
+  return {
+    project: listProjectSkills(slug),
+    global: isAdmin ? listLibrarySkills() : null,
+  };
+}
+
+/** The attach menu's skill area — two sections: the project-local list
+ *  (existing behavior) and, admins only, the user-level Global library.
+ *  Picking a library skill attaches `{kind:"skill", scope:"global"}` — it
+ *  never installs anything. Extracted as a pure presentational component so
+ *  the admin/non-admin split is render-testable in the node vitest env. */
+export function SkillMenuSections({
+  lang,
+  isAdmin,
+  skills,
+  globalSkills,
+  attachments,
+  onToggleSkill,
+}: {
+  lang: Lang;
+  isAdmin: boolean;
+  /** `null` = still loading. */
+  skills: SkillSummary[] | null;
+  /** `null` = still loading (or never fetched — non-admin). */
+  globalSkills: LibrarySkillSummary[] | null;
+  attachments: ComposerAttachment[];
+  onToggleSkill: (name: string, scope: "project" | "global") => void;
+}) {
+  const t = makeT(lang);
+  return (
+    <>
+      <div className="sel-group" data-testid="skill-section-project">
+        {t("project")}
+      </div>
+      {skills === null ? (
+        <div className="sel-item muted skill-row">…</div>
+      ) : skills.length === 0 ? (
+        <div className="sel-item muted skill-row">{t("noSkills")}</div>
+      ) : (
+        skills.map((s) => {
+          const on = attachments.some(
+            (a) => a.kind === "skill" && a.name === s.skill && a.scope !== "global",
+          );
+          return (
+            <button
+              key={s.skill}
+              type="button"
+              className={`sel-item skill-row ${on ? "selected" : ""}`}
+              onClick={() => onToggleSkill(s.skill, "project")}
+              title={s.description || s.skill}
+            >
+              {s.skill}
+              <span className="check">✓</span>
+            </button>
+          );
+        })
+      )}
+      {isAdmin ? (
+        <>
+          <div className="sel-group" data-testid="skill-section-global">
+            {t("attachSkillGlobal")}
+          </div>
+          {globalSkills === null ? (
+            <div className="sel-item muted skill-row">…</div>
+          ) : globalSkills.length === 0 ? (
+            <div className="sel-item muted skill-row">{t("noGlobalSkills")}</div>
+          ) : (
+            globalSkills.map((g) => {
+              const on = attachments.some(
+                (a) => a.kind === "skill" && a.name === g.id && a.scope === "global",
+              );
+              return (
+                <button
+                  key={g.id}
+                  type="button"
+                  className={`sel-item skill-row ${on ? "selected" : ""}`}
+                  data-testid={`skill-global-${g.id}`}
+                  onClick={() => onToggleSkill(g.id, "global")}
+                  title={g.description || g.id}
+                >
+                  {g.id}
+                  <span className="check">✓</span>
+                </button>
+              );
+            })
+          )}
+        </>
+      ) : null}
+    </>
+  );
 }
 
 /** Per-surface draft key — an unsent message survives a reload / a session
@@ -169,6 +280,7 @@ export function ChatComposer({
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
+  const [globalSkills, setGlobalSkills] = useState<LibrarySkillSummary[] | null>(null);
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
@@ -193,6 +305,7 @@ export function ChatComposer({
   if (attachSlug !== uploadSlug) {
     setAttachSlug(uploadSlug);
     setSkills(null);
+    setGlobalSkills(null);
     if (attachments.length > 0) setAttachments([]);
   }
 
@@ -273,13 +386,24 @@ export function ChatComposer({
     [uploadSlug, t],
   );
 
-  const toggleSkill = useCallback((skill: string) => {
+  const toggleSkill = useCallback((skill: string, scope: "project" | "global" = "project") => {
     setAttachments((current) => {
-      const existing = current.find((a) => a.kind === "skill" && a.name === skill);
+      const existing = current.find(
+        (a) =>
+          a.kind === "skill" &&
+          a.name === skill &&
+          (scope === "global" ? a.scope === "global" : a.scope !== "global"),
+      );
       if (existing) return current.filter((a) => a.id !== existing.id);
       return [
         ...current,
-        { id: nextAttachmentId(), kind: "skill", name: skill, status: "ready" },
+        {
+          id: nextAttachmentId(),
+          kind: "skill",
+          name: skill,
+          status: "ready",
+          ...(scope === "global" ? { scope: "global" as const } : {}),
+        },
       ];
     });
   }, []);
@@ -297,19 +421,29 @@ export function ChatComposer({
     setAttachOpen((open) => !open);
   }, [uploadSlug, t]);
 
-  /** Expand/collapse the folded skills submenu; fetch the list lazily on
-   *  first expand (per project — the render-phase reset clears the cache). */
+  /** Expand/collapse the folded skills submenu; fetch the lists lazily on
+   *  first expand — the project list always, the global library only for
+   *  admins (the render-phase reset clears both caches on a project switch). */
   const toggleSkillsOpen = useCallback(() => {
     setSkillsOpen((open) => {
       const next = !open;
-      if (next && skills === null && uploadSlug) {
-        listProjectSkills(uploadSlug)
-          .then(setSkills)
-          .catch(() => setSkills([]));
+      if (next && uploadSlug && (skills === null || (isAdmin && globalSkills === null))) {
+        const lists = fetchSkillLists(uploadSlug, isAdmin);
+        // One list may already be cached (e.g. /me resolved admin AFTER the
+        // first expand) — refresh only the stale one, and settle the other so
+        // its promise can't go unhandled.
+        if (skills === null) {
+          lists.project.then(setSkills).catch(() => setSkills([]));
+        } else {
+          lists.project.catch(() => {});
+        }
+        if (lists.global && globalSkills === null) {
+          lists.global.then(setGlobalSkills).catch(() => setGlobalSkills([]));
+        }
       }
       return next;
     });
-  }, [skills, uploadSlug]);
+  }, [skills, globalSkills, uploadSlug, isAdmin]);
 
   // ---- send ------------------------------------------------------------------
 
@@ -536,29 +670,14 @@ export function ChatComposer({
               <ChevronRight className={`chev ${skillsOpen ? "open" : ""}`} />
             </button>
             {skillsOpen ? (
-              skills === null ? (
-                <div className="sel-item muted skill-row">…</div>
-              ) : skills.length === 0 ? (
-                <div className="sel-item muted skill-row">{t("noSkills")}</div>
-              ) : (
-                skills.map((s) => {
-                  const on = attachments.some(
-                    (a) => a.kind === "skill" && a.name === s.skill,
-                  );
-                  return (
-                    <button
-                      key={s.skill}
-                      type="button"
-                      className={`sel-item skill-row ${on ? "selected" : ""}`}
-                      onClick={() => toggleSkill(s.skill)}
-                      title={s.description || s.skill}
-                    >
-                      {s.skill}
-                      <span className="check">✓</span>
-                    </button>
-                  );
-                })
-              )
+              <SkillMenuSections
+                lang={lang}
+                isAdmin={isAdmin}
+                skills={skills}
+                globalSkills={globalSkills}
+                attachments={attachments}
+                onToggleSkill={toggleSkill}
+              />
             ) : null}
           </div>
         </div>
