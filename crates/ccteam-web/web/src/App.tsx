@@ -3,7 +3,7 @@
 //   /                → Home (landing; lazy-create on first message)
 //   /chat/s/:sid     → Conversation
 //   /flow/:tab?      → 工作流 (Skills/Roles/MCP/自进化)
-//   /settings/:tab?  → 设置 (运维总览/插件市场/IM/通用/账号)
+//   /settings/:tab?  → 设置 (运维总览/插件市场/通用/账号/管理员)
 // Legacy flat routes (marketplace/status/hosts/workflow) redirect into the
 // new IA so old deep links keep working.
 

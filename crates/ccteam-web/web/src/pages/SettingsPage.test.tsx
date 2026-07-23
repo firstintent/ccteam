@@ -1,5 +1,9 @@
 // v0.8.8 F4 — SettingsPage smoke tests.
 //
+// SettingsPage = the admin's GLOBAL IM credentials panel (Telegram + Lark);
+// SettingsView embeds it under 设置→账号 for admins. User management moved to
+// the 管理员 · Admin tab (UserManagementSection, exported here).
+//
 // No DOM env (no jsdom): use React's `renderToString` to assert the initial
 // HTML shape, mirroring SessionsListPage.test.tsx. The page's success state
 // needs the async getImConfig() to resolve (renderToString won't await), so
@@ -13,7 +17,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import SettingsPage, { LarkSection, TelegramSection } from "./SettingsPage";
+import SettingsPage, {
+  LarkSection,
+  TelegramSection,
+  UserManagementSection,
+} from "./SettingsPage";
 
 const realFetch = globalThis.fetch;
 
@@ -94,5 +102,13 @@ describe("Settings sections", () => {
     expect(html).toContain('data-testid="settings-lark"');
     // Default textarea is empty → fail-closed warning is visible.
     expect(html).toContain("fail-closed");
+  });
+
+  it("UserManagementSection (管理员 tab content) renders its testid + heading", () => {
+    // Effects don't run under renderToString → the table stays in its
+    // "loading…" row; we only assert the section shape here.
+    const html = renderToString(<UserManagementSection />);
+    expect(html).toContain('data-testid="settings-users"');
+    expect(html).toContain("用户管理 · Users");
   });
 });

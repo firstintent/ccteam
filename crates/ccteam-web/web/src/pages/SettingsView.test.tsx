@@ -1,5 +1,5 @@
-// v0.8.24 Track A — 设置 view (set-nav five sub-pages) + the tenant ACL gate
-// (红线 §1.6-3: fail-closed via useMe — a tenant NEVER sees 运维总览/IM).
+// v0.8.24 Track A — 设置 view (set-nav sub-pages) + the tenant ACL gate
+// (红线 §1.6-3: fail-closed via useMe — a tenant NEVER sees 运维总览/管理员).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -20,6 +20,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import SettingsView, {
   AccountPanel,
+  AdminPanel,
   GeneralPanel,
   OpsPanel,
   maskToken,
@@ -32,13 +33,13 @@ describe("visibleSettingsItems (fail-closed ACL)", () => {
     expect(visibleSettingsItems(false)).toEqual(["market", "general", "account"]);
   });
 
-  it("admin sees the five tabs, with Status + Hosts merged into ops", () => {
+  it("admin sees ops + the tenant tabs + 管理员 (no standalone IM tab)", () => {
     expect(visibleSettingsItems(true)).toEqual([
       "ops",
       "market",
-      "im",
       "general",
       "account",
+      "admin",
     ]);
   });
 });
@@ -46,13 +47,14 @@ describe("visibleSettingsItems (fail-closed ACL)", () => {
 describe("resolveSettingsTab", () => {
   it("honors a visible routed tab", () => {
     expect(resolveSettingsTab("market", false)).toBe("market");
-    expect(resolveSettingsTab("im", true)).toBe("im");
+    expect(resolveSettingsTab("admin", true)).toBe("admin");
+    expect(resolveSettingsTab("ops", true)).toBe("ops");
   });
 
   it("denies an admin-only tab to a tenant (falls back to market)", () => {
     expect(resolveSettingsTab("ops", false)).toBe("market");
     expect(resolveSettingsTab("hosts", false)).toBe("market");
-    expect(resolveSettingsTab("im", false)).toBe("market");
+    expect(resolveSettingsTab("admin", false)).toBe("market");
     expect(resolveSettingsTab("status", false)).toBe("market");
   });
 
@@ -88,7 +90,7 @@ describe("SettingsView SSR (identity unresolved = fail-closed tenant view)", () 
     expect(html).toContain('data-testid="set-item-account"');
     // Admin-only panels must never flash to a tenant.
     expect(html).not.toContain('data-testid="set-item-ops"');
-    expect(html).not.toContain('data-testid="set-item-im"');
+    expect(html).not.toContain('data-testid="set-item-admin"');
   });
 
   it("defaults an unresolved identity to the 插件市场 panel", () => {
@@ -123,6 +125,25 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     expect(css).toMatch(
       /@media \(max-width:\s*1280px\)\s*\{\s*\.ops-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
     );
+  });
+});
+
+describe("AdminPanel (管理员 · Admin — user management only)", () => {
+  it("renders the UserManagementSection as its only content", () => {
+    const html = renderToString(<AdminPanel lang="zh" />);
+    expect(html).toContain('data-testid="settings-admin"');
+    expect(html).toContain("管理员");
+    // The panel carries the 用户管理 · Users table (loading until the fetch
+    // resolves — effects don't run under renderToString).
+    expect(html).toContain('data-testid="settings-users"');
+    expect(html).toContain("用户管理 · Users");
+    expect(html).not.toContain('data-testid="settings-page"');
+    expect(html).not.toContain('data-testid="settings-my-im"');
+  });
+
+  it("renders the English heading in en", () => {
+    const html = renderToString(<AdminPanel lang="en" />);
+    expect(html).toContain("Admin");
   });
 });
 
@@ -195,7 +216,7 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
     expect(tenant).not.toContain('data-testid="account-reset-token"');
   });
 
-  it("tenant account panel embeds the self-serve 我的 IM bot section", () => {
+  it("tenant account panel embeds the self-serve 我的 IM bot section (no global creds)", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(
       <AccountPanel
@@ -209,6 +230,30 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
       />,
     );
     expect(html).toContain('data-testid="settings-my-im"');
+    // The admin-only global credentials panel is NOT rendered for a tenant.
+    expect(html).not.toContain('data-testid="settings-loading"');
+    expect(html).not.toContain('data-testid="settings-page"');
+  });
+
+  it("admin account panel embeds the global Telegram/Lark credentials (SettingsPage)", () => {
+    // Never-resolving fetch keeps the embedded SettingsPage in its loading
+    // state (its own useMe gate) — enough to prove it is mounted for admin.
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(
+      <AccountPanel
+        lang="zh"
+        isAdmin
+        handle="owner"
+        displayName=""
+        avatar="#f59e0b"
+        onName={() => {}}
+        onAvatar={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="settings-loading"');
+    // …and NOT the tenant self-serve bot, nor user management (管理员 tab).
+    expect(html).not.toContain('data-testid="settings-my-im"');
+    expect(html).not.toContain('data-testid="settings-users"');
   });
 });
 
