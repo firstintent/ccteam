@@ -5656,10 +5656,11 @@ impl Gateway {
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
         // web reply MUST stay the bare `id:project:vendor:role` rows (no banner /
-        // scoping / footer / history section — those would break
-        // `parse_sessions_reply`). The IM text surface, which has no chrome,
-        // instead gets a current-project banner + project scoping + an
-        // `/sessions all` footer + a "最近结束" history section (v0.8.22 P0-4).
+        // scoping / footer — those would break `parse_sessions_reply`). The IM
+        // text surface, which has no chrome, instead gets a current-project
+        // banner + project scoping + an `/sessions all` footer, and rows in the
+        // human-facing `sid vendor · project · role` shape (leading `sid vendor`
+        // mirrors the switch buttons).
         let is_web = chat.channel == "web";
         // Default scope = the chat's CURRENT project; `all` (and web) lists the
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
@@ -5707,35 +5708,16 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
-        // v0.8.22 P0-4 — up to 5 most-recently-ended sessions this chat can
-        // see (same visibility rule as the live list), scoped like the live
-        // list (current project unless `all`). Reuses the existing on-disk
-        // `meta.json` scan (`list_history_sessions`) — no new store. IM-only:
-        // every web return below happens before this is rendered, so
-        // `parse_sessions_reply` still only ever sees live
-        // `id:project:vendor:role` rows.
-        let history = if is_web {
-            Vec::new()
-        } else {
-            let slugs: Vec<String> = if all {
-                self.projects.keys().cloned().collect()
-            } else {
-                vec![cur.clone()]
-            };
-            self.recent_ended_sessions(chat, &slugs, 5)
-        };
         if visible.is_empty() {
             if is_web {
                 return "no sessions".to_string();
             }
-            let head = if elsewhere > 0 {
-                format!(
+            if elsewhere > 0 {
+                return format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
-                )
-            } else {
-                format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个")
-            };
-            return Self::append_history_section(head, &history);
+                );
+            }
+            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
         }
         // Render each visible session's row (async `thread_status`) once,
         // keyed by sid for the IM tree; web keeps the flat bare-row feed.
@@ -5743,31 +5725,38 @@ impl Gateway {
         let mut rendered: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(visible.len());
         for s in &visible {
-            // P3 — append model + ctx from the owning adapter's
-            // `thread_status`. Statusless adapters (bg / default) report
-            // `ThreadStatus::default()` → `status_suffix() == None` → the
-            // legacy `id:project:vendor:role` row is unchanged. Per-session
-            // failures degrade to the bare row (never break the listing).
-            let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
+            // P3 — model + ctx from the owning adapter's `thread_status`.
+            // Statusless adapters (bg / default) report `ThreadStatus::default()`
+            // → `status_suffix() == None` → no ` — suffix`. Per-session failures
+            // degrade to the bare row (never break the listing).
             let suffix = match s.adapter.thread_status(&s.thread).await {
                 Ok(status) => status.status_suffix(),
                 Err(_) => None,
             };
-            let mut row = match suffix {
-                Some(sfx) => format!("{base} — {sfx}"),
-                None => base,
-            };
-            // Web rows stay untouched (`parse_sessions_reply` splits on exactly
-            // 4 colon fields and must not see extra content appended).
+            // Web rows stay the machine-parsed `sid:project:vendor:role` feed
+            // (`parse_sessions_reply` splits on exactly 4 colon fields and must
+            // not see extra content appended).
             if is_web {
-                web_rows.push(row);
+                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
+                web_rows.push(match &suffix {
+                    Some(sfx) => format!("{base} — {sfx}"),
+                    None => base,
+                });
                 continue;
             }
-            // The row already starts with `s.id` (the `base` built above) — no
-            // leading vendor tag or activity dot: the tree is a terse
-            // `sid:project:vendor:role` identifier line now, scannable by sid.
-            // (Activity/state lives on `/status`; the session TITLE lives on
-            // the switch button label — see `session_switch_options`.)
+            // IM row LEADS with `sid vendor` — the SAME opening as the switch
+            // button (`session_switch_options`: `sid vendor 「title」`) — so the
+            // text tree and the buttons line up. Then `· project`, `· role`
+            // (role omitted when empty), the optional model/ctx suffix, and a
+            // non-local host. No vendor tag or activity dot (activity → /status;
+            // title → the button).
+            let mut row = format!("{} {} · {}", s.id, vendor_str(s.vendor), s.project);
+            if !s.role.is_empty() {
+                row.push_str(&format!(" · {}", s.role));
+            }
+            if let Some(sfx) = &suffix {
+                row.push_str(&format!(" — {sfx}"));
+            }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
             if !s.host.is_empty() && s.host != "local" {
                 row.push_str(&format!(" @{}", s.host));
@@ -5850,7 +5839,7 @@ impl Gateway {
                 "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
             ));
         }
-        Self::append_history_section(out, &history)
+        out
     }
 
     /// Best-effort `last_active` (RFC3339) for a LIVE session, read from its
@@ -5932,64 +5921,6 @@ impl Gateway {
                 (session.id.clone(), activity.to_string())
             })
             .collect()
-    }
-
-    /// Up to `limit` most-recently-ended sessions across `slugs` that `chat`
-    /// may see (same rule as the live list: own sessions + the shared `user:`
-    /// pool for the admin/web querier). Draws from on-disk `meta.json` via
-    /// [`Gateway::list_history_sessions`] (already excludes anything still in
-    /// the live map) — no new store, no new persistence.
-    fn recent_ended_sessions(
-        &self,
-        chat: &ChatKey,
-        slugs: &[String],
-        limit: usize,
-    ) -> Vec<SessionMeta> {
-        let mut metas: Vec<SessionMeta> = slugs
-            .iter()
-            .flat_map(|slug| self.list_history_sessions(slug))
-            .filter(|m| Self::owner_identity_visible(chat, &m.owner))
-            .collect();
-        metas.sort_by(|a, b| {
-            b.last_active
-                .cmp(&a.last_active)
-                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
-        });
-        metas.truncate(limit);
-        metas
-    }
-
-    /// Append the "最近结束" section (when non-empty) to an IM `/sessions`
-    /// reply. Each row carries `sid:project:vendor:role`, a relative
-    /// `last_active` time, and a `/use <sid>` resume hint — the cold-resume
-    /// path already exists (see `/use` handling); this just gives it a
-    /// visible entry point.
-    fn append_history_section(head: String, history: &[SessionMeta]) -> String {
-        if history.is_empty() {
-            return head;
-        }
-        let rows: Vec<String> = history
-            .iter()
-            .map(|m| {
-                let role = if m.role.is_empty() { "—" } else { &m.role };
-                // v0.8.22 P1 — show the session's title when it has one
-                // (fallback: the existing bare role/sid row, unchanged).
-                let title_suffix = m
-                    .title
-                    .as_deref()
-                    .map(|t| format!(" 「{t}」"))
-                    .unwrap_or_default();
-                format!(
-                    "{}:{}:{}:{role}{title_suffix} — {} → /use {}",
-                    m.sid,
-                    m.slug,
-                    vendor_str(m.vendor),
-                    relative_time_zh(&m.last_active),
-                    m.sid
-                )
-            })
-            .collect();
-        format!("{head}\n\n📜 最近结束:\n{}", rows.join("\n"))
     }
 
     /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
@@ -8745,45 +8676,6 @@ fn humanize_dur(d: std::time::Duration) -> String {
     } else {
         format!("{s}s")
     }
-}
-
-/// v0.8.22 P0-4 — Chinese relative-time phrase for an RFC3339 timestamp,
-/// matching the surrounding hardcoded-Chinese IM copy ("3分钟前"/"昨天"/
-/// "3天前"). Unparseable/empty input renders as `"—"` rather than panicking a
-/// `/sessions` reply (a missing `meta.json` read is already handled upstream
-/// by [`Gateway::session_last_active`] / [`Gateway::recent_ended_sessions`]).
-fn relative_time_zh(rfc3339: &str) -> String {
-    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-        return "—".to_string();
-    };
-    let now = chrono::Utc::now();
-    let secs = now
-        .signed_duration_since(dt.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .max(0);
-    if secs < 60 {
-        return "刚刚".to_string();
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}分钟前");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}小时前");
-    }
-    let days = hours / 24;
-    if days == 1 {
-        return "昨天".to_string();
-    }
-    if days < 7 {
-        return format!("{days}天前");
-    }
-    let weeks = days / 7;
-    if weeks < 5 {
-        return format!("{weeks}周前");
-    }
-    dt.format("%Y-%m-%d").to_string()
 }
 
 /// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
@@ -12899,7 +12791,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2:alpha:claude:reviewer"), "{}", mock[0]);
+        assert!(
+            mock[0].contains("s2 claude · alpha · reviewer"),
+            "{}",
+            mock[0]
+        );
     }
 
     /// Picker buttons are `sid vendor 「title」` (sid → vendor → title), a `✓`
@@ -13008,7 +12904,7 @@ mod tests {
             .unwrap();
         let row = listing[0].split('\n').nth(1).expect("a session row");
         assert!(
-            row.starts_with("s1:alpha:claude:reviewer"),
+            row.starts_with("s1 claude · alpha · reviewer"),
             "row starts with the sid: {row:?}"
         );
         for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
@@ -13145,7 +13041,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer"]);
+        assert_eq!(
+            bare,
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
+        );
 
         // Now report a model + usage → suffix appears, rendered the same
         // way Codex /status renders (shared helper).
@@ -13165,7 +13064,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer — claude-opus-4-8[1m] · ctx 188k / 1M (19%)"]
         );
 
         // A non-[1m] model renders against the 200k baseline.
@@ -13185,15 +13084,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer — claude-sonnet-4-5 · ctx 188k / 200k (94%)"]
         );
     }
 
-    /// Every vendor's row carries its vendor in the `:{vendor}:` colon field
-    /// (no separate `[vendor]` tag anymore — that prefix was dropped so the
-    /// row starts with the sid).
+    /// Every vendor's IM row carries its lowercase vendor right after the sid
+    /// (`sid vendor · …`, the same opening as the switch button).
     #[tokio::test]
-    async fn gateway_sessions_im_rows_carry_every_vendor_in_the_colon_field() {
+    async fn gateway_sessions_im_rows_lead_with_sid_then_vendor() {
         let factory: Arc<
             dyn Fn(AgentVendor, SessionProtocol) -> Arc<dyn HarnessAdapter + Send + Sync>
                 + Send
@@ -13215,7 +13113,7 @@ mod tests {
             .next()
             .unwrap();
         for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
-            assert!(listing.contains(&format!(":{vendor}:")), "{listing}");
+            assert!(listing.contains(&format!(" {vendor} · ")), "{listing}");
         }
     }
 
@@ -13249,7 +13147,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             before,
-            vec!["📁 当前项目: alpha\ns2:alpha:claude:qa\ns1:alpha:claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns2 claude · alpha · qa\ns1 claude · alpha · reviewer"]
         );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -13269,7 +13167,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ s1:alpha:claude:reviewer\ns2:alpha:claude:qa"],
+            vec!["📁 当前项目: alpha\n⏳ s1 claude · alpha · reviewer\ns2 claude · alpha · qa"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -13742,30 +13640,6 @@ mod tests {
         assert_eq!(humanize_dur(Duration::from_secs(7200)), "2h");
         // Sub-second rounds down to 0s (never panics / never blank).
         assert_eq!(humanize_dur(Duration::from_millis(400)), "0s");
-    }
-
-    /// v0.8.22 P0-4 — `relative_time_zh` phrase boundaries: seconds → 刚刚,
-    /// minutes/hours/days-per-unit thresholds, the "yesterday" special case,
-    /// the ≥5-week fallback to an absolute date, and the unparsable/empty
-    /// input fallback (never panics a `/sessions` reply).
-    #[test]
-    fn relative_time_zh_covers_all_bands() {
-        let ts =
-            |secs_ago: i64| (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
-        assert_eq!(relative_time_zh(""), "—");
-        assert_eq!(relative_time_zh("not-a-timestamp"), "—");
-        assert_eq!(relative_time_zh(&ts(10)), "刚刚");
-        assert_eq!(relative_time_zh(&ts(5 * 60)), "5分钟前");
-        assert_eq!(relative_time_zh(&ts(3 * 3600)), "3小时前");
-        assert_eq!(relative_time_zh(&ts(24 * 3600)), "昨天");
-        assert_eq!(relative_time_zh(&ts(3 * 24 * 3600)), "3天前");
-        assert_eq!(relative_time_zh(&ts(14 * 24 * 3600)), "2周前");
-        // ≥5 weeks falls back to an absolute `YYYY-MM-DD` date.
-        let old = chrono::Utc::now() - chrono::Duration::days(40);
-        assert_eq!(
-            relative_time_zh(&old.to_rfc3339()),
-            old.format("%Y-%m-%d").to_string()
-        );
     }
 
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — own-only isolation: a
@@ -14419,61 +14293,6 @@ mod tests {
         );
     }
 
-    /// v0.8.22 P0-4 — `/sessions` grows a "📜 最近结束" section listing
-    /// recently-ended sessions with a `/use <sid>` resume hint, giving the
-    /// existing cold-resume path (exercised above) a visible entry point.
-    /// Own-only ACL applies to the history section too: a chat that doesn't
-    /// own the stopped session must not see it listed as "最近结束".
-    #[tokio::test]
-    async fn im_sessions_lists_recently_ended_with_use_hint_own_only() {
-        let proj = tempfile::TempDir::new().unwrap();
-        let agents = proj.path().join(".claude").join("agents");
-        std::fs::create_dir_all(&agents).unwrap();
-        std::fs::write(
-            agents.join("reviewer.md"),
-            "---\nname: reviewer\n---\nbody\n",
-        )
-        .unwrap();
-
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
-
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
-            .await
-            .unwrap();
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/stop s1")
-            .await
-            .unwrap();
-
-        // The owner sees s1 under "最近结束" with a `/use s1` resume hint.
-        let owner_view = gateway
-            .handle_text("mock", "chat-1", "alice", "/sessions")
-            .await
-            .unwrap();
-        assert_eq!(owner_view.len(), 1);
-        assert!(
-            owner_view[0].contains("📜 最近结束:"),
-            "history section present: {owner_view:?}"
-        );
-        assert!(
-            owner_view[0].contains("s1:alpha:claude:reviewer") && owner_view[0].contains("/use s1"),
-            "s1 row carries a /use resume hint: {owner_view:?}"
-        );
-
-        // A different chat's `/sessions` must NOT list it — own-only ACL
-        // covers the history section exactly like the live list.
-        let other_view = gateway
-            .handle_text("mock", "chat-2", "bob", "/sessions")
-            .await
-            .unwrap();
-        assert!(
-            !other_view[0].contains("最近结束") && !other_view[0].contains("s1"),
-            "a non-owner must not see the ended s1 in history: {other_view:?}"
-        );
-    }
-
     #[tokio::test]
     async fn gateway_sessions_are_own_only_across_chats() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -14516,7 +14335,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner_sees,
-            vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
         );
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -14558,7 +14377,10 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer"]);
+        assert_eq!(
+            seen,
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
+        );
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -14733,7 +14555,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2:beta:claude:reviewer\ns1:beta:codex:api"]
+            vec!["📁 当前项目: beta\ns2 claude · beta · reviewer\ns1 codex · beta · api"]
         );
 
         let use_first = gateway
@@ -14807,7 +14629,7 @@ mod tests {
         assert_eq!(
             sessions,
             vec![
-                "📁 当前项目: beta\ns4:beta:claude:qa\ns3:beta:codex:api\ns2:alpha:codex:docs\ns1:alpha:claude:reviewer"
+                "📁 当前项目: beta\ns4 claude · beta · qa\ns3 codex · beta · api\ns2 codex · alpha · docs\ns1 claude · alpha · reviewer"
             ]
         );
         let projects = gateway
@@ -15230,7 +15052,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns2:beta:claude:reviewer\ns1:beta:claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2 claude · beta · reviewer\ns1 claude · beta · reviewer"]
         );
 
         assert_eq!(
@@ -15302,7 +15124,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1:beta:claude:reviewer"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 当前项目: beta\ns1 claude · beta · reviewer"]
+        );
 
         assert_eq!(
             restored
@@ -15765,7 +15590,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer"]);
+        assert_eq!(
+            before,
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
+        );
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -15796,10 +15624,10 @@ mod tests {
         // now rides the switch BUTTON, not the text row (see
         // `session_switch_options`); s1 never sent a plain message, so it is
         // untitled either way. s2 is roleless → empty role field
-        // (`s2:beta:claude:`).
+        // (`s2 claude · beta`).
         assert_eq!(
             after,
-            vec!["📁 当前项目: beta\ns2:beta:claude:\ns1:alpha:claude:reviewer"]
+            vec!["📁 当前项目: beta\ns2 claude · beta\ns1 claude · alpha · reviewer"]
         );
     }
 
@@ -16032,7 +15860,7 @@ mod tests {
         assert!(
             owner_sees
                 .iter()
-                .any(|r| r.contains("s1:alpha:claude:assistant")),
+                .any(|r| r.contains("s1 claude · alpha · assistant")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -16157,7 +15985,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listing,
-            vec!["📁 当前项目: alpha\ns1:alpha:claude:reviewer"]
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · reviewer"]
         );
 
         // `/use s1` still resolves the same (now-reviewer) session.
@@ -16228,7 +16056,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:claude:cto"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -16329,7 +16157,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1:alpha:claude:cto"]);
+        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]);
         // …and the rename SURFACES on the picker button.
         let chat = ChatKey::new("mock", "chat-1", "alice");
         let s1_button = |g: &Gateway| {
@@ -16352,7 +16180,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1:alpha:claude:cto"]);
+        assert_eq!(
+            listing2,
+            vec!["📁 当前项目: alpha\ns1 claude · alpha · cto"]
+        );
         assert_eq!(
             s1_button(&gateway).as_deref(),
             Some("✓ s1 claude 「my custom title」"),
@@ -17467,9 +17298,9 @@ mod tests {
         let out = gw
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await;
-        // Parent row precedes the indented child row.
-        let pline = format!("{parent}:alpha:claude:");
-        let cline = format!("└─ {child}:alpha:claude:");
+        // Parent row precedes the indented child row (roleless → `sid claude · alpha`).
+        let pline = format!("{parent} claude · alpha");
+        let cline = format!("└─ {child} claude · alpha");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
