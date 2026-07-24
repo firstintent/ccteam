@@ -7,8 +7,8 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.9` 已集成落 `dev`**(owner 2026-07-24 委托「review 需求→决策改良→开发→治理→PR」;决议 = `docs-local/versions/v0-9-9/decisions.md`,内容一行史 = `.loop/history.md` v0.9.9 行),**dev→main PR 已开待 owner 合并**(合并 = 版本落 main;tag/部署仍 HELD)。上一版 v0.9.8 已发布(`ad1c7c2` + tag,`/releases/latest`)。
-- **在做**:v0.9.9 收官,**dev→main PR #169 等 owner merge**(CI 三 job 全绿:fmt/clippy/test;test job 首跑红 → hermetic `0ec136d` → 复跑绿,P2-1 完成)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1 完成待下轮蒸馏)。
+- **版本线**:workspace **`0.9.9` 已合 `main`**(2026-07-24 owner squash-merge PR #169 → `7dfd271`;决议 = `docs-local/versions/v0-9-9/decisions.md`,一行史 = `.loop/history.md` v0.9.9 行)。**tag/部署 HELD** 等 owner 显式发话(push main ≠ 发布)。dev 已和解复用(merge main 回 dev `a3d22c9`,树差为零)。上一版 v0.9.8 已发布(`ad1c7c2` + tag)。
+- **在做**:v0.9.9 已收官(PR #169 CI 三 job 全绿后 owner 合并;test job 首跑红 → hermetic `0ec136d` → 复跑绿,P2-1 完成)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1 完成卡待下轮蒸馏;v0.9.9 委派子会话 s135–s138 idle 备查,下轮顺手停)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
