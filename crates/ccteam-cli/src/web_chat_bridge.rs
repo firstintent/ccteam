@@ -786,6 +786,13 @@ mod tests {
         recv_reply_contains(&mut socket, "已创建并切换到 demo").await;
 
         assert!(proj_dir.join(".ccteam").join("state.json").exists());
+        let state = ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&proj_dir))
+            .expect("chat-created project state");
+        assert_eq!(
+            state.owner.as_deref(),
+            Some("user:chat-1"),
+            "the creator owner must be stamped at the arbitrary project path before /cd applies its ACL"
+        );
         let config = std::fs::read_to_string(ccteam_home.join("config.yaml")).unwrap();
         assert!(config.contains("demo"), "config.yaml: {config}");
         assert!(config.contains(&proj_dir.display().to_string()));

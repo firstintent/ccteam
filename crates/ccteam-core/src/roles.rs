@@ -26,7 +26,7 @@
 //! pinned schema (Anthropic's frontmatter keys drift).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -106,10 +106,10 @@ pub fn list_roles(project_dir: &Path) -> Result<Vec<RoleSummary>> {
     Ok(out)
 }
 
-/// One entry in the project skill list (`GET .../skills`) — a directory
-/// `<project>/.claude/skills/<skill>/SKILL.md`. `description` is pulled
-/// from the SKILL.md frontmatter when present ("" otherwise) so the web
-/// composer's skill picker can show what each skill does.
+/// One entry in the project skill list (`GET .../skills`) — a leaf directory
+/// under the selected project-local skill face. `description` is pulled from
+/// the SKILL.md frontmatter when present ("" otherwise) so the web composer's
+/// skill picker can show what each skill does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
     /// Directory name (`deep-research` for `.claude/skills/deep-research/`).
@@ -118,17 +118,36 @@ pub struct SkillSummary {
     pub description: String,
 }
 
-/// List the project's installed skills — every
-/// `<project>/.claude/skills/<dir>/SKILL.md` — sorted by skill id. The
-/// read-side sibling of [`crate::write_skill`] (multi-file skills still
-/// list: only the SKILL.md entrypoint is read). Missing skills dir →
-/// empty vec; an unreadable SKILL.md is skipped, never fatal (mirrors
-/// [`list_roles`]).
+/// One entry in the global user-level skill library. Unlike project-local
+/// [`SkillSummary`], `id` may be a nested POSIX path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibrarySkillSummary {
+    /// Directory path relative to the library root, using `/` separators.
+    pub id: String,
+    /// Frontmatter `description`, or "" when absent.
+    pub description: String,
+    /// Absolute path to the skill's `SKILL.md` entrypoint.
+    pub path: PathBuf,
+}
+
+/// List the project's local skills, sorted by leaf id.
+///
+/// The neutral `<project>/.agents/skills` face wins whenever it exists and is
+/// followed when it is a directory symlink. Only when that face is absent do
+/// we inspect the legacy `<project>/.claude/skills`, and a symlink is never
+/// accepted as the legacy entity. Missing faces yield an empty vec; an
+/// unreadable SKILL.md is skipped, never fatal (mirrors [`list_roles`]).
 pub fn list_skills(project_dir: &Path) -> Result<Vec<SkillSummary>> {
-    let dir = project_dir.join(".claude").join("skills");
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+    let neutral = project_dir.join(".agents").join("skills");
+    let dir = if neutral.exists() {
+        neutral
+    } else {
+        let legacy = project_dir.join(".claude").join("skills");
+        match fs::symlink_metadata(&legacy) {
+            Ok(metadata) if metadata.file_type().is_dir() => legacy,
+            _ => return Ok(Vec::new()),
+        }
+    };
     let rd = fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
     let mut out: Vec<SkillSummary> = Vec::new();
     for entry in rd.flatten() {
@@ -152,6 +171,92 @@ pub fn list_skills(project_dir: &Path) -> Result<Vec<SkillSummary>> {
     }
     out.sort_by(|a, b| a.skill.cmp(&b.skill));
     Ok(out)
+}
+
+/// Recursively list every valid `<root>/<id>/SKILL.md` in a global skill
+/// library. Hidden or invalid path components are not traversed, unreadable
+/// entries are skipped, and results are sorted deterministically by id.
+pub fn list_library_skills(root: &Path) -> Vec<LibrarySkillSummary> {
+    let Ok(root) = fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    scan_library_dir(&root, &root, &mut out);
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Resolve `CCTEAM_HOME` and list its canonical [`crate::CcteamPaths::skills_dir`].
+pub fn list_default_library_skills() -> Result<Vec<LibrarySkillSummary>> {
+    let paths = crate::CcteamPaths::from_env()?;
+    Ok(list_library_skills(&paths.skills_dir()))
+}
+
+fn scan_library_dir(root: &Path, dir: &Path, out: &mut Vec<LibrarySkillSummary>) {
+    if dir != root {
+        let md = dir.join("SKILL.md");
+        if md.is_file() {
+            if let Some(id) = library_id(root, dir) {
+                match fs::read_to_string(&md) {
+                    Ok(text) => {
+                        let (frontmatter, _body) = split_frontmatter(&text);
+                        out.push(LibrarySkillSummary {
+                            id,
+                            description: scalar_field(&frontmatter, "description"),
+                            path: md,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, path = %md.display(), "library SKILL.md read failed; skipping");
+                    }
+                }
+            }
+        }
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %dir.display(), "skill library directory read failed; skipping");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(segment) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if segment.starts_with('.') || crate::validate_skill_library_id(&segment).is_err() {
+            continue;
+        }
+        scan_library_dir(root, &entry.path(), out);
+    }
+}
+
+fn library_id(root: &Path, dir: &Path) -> Option<String> {
+    let relative = dir.strip_prefix(root).ok()?;
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return None;
+        };
+        let segment = segment.to_str()?;
+        if segment.starts_with('.') {
+            return None;
+        }
+        segments.push(segment);
+    }
+    let id = segments.join("/");
+    crate::validate_skill_library_id(&id).ok()?;
+    Some(id)
 }
 
 /// Mirror of `admin_actions::validate_bot_name` (the write/PUT path
@@ -421,6 +526,108 @@ mod tests {
         assert_eq!(out[0].skill, "alpha");
         assert_eq!(out[0].description, "");
         assert_eq!(out[1].skill, "zeta");
+        assert_eq!(out[1].description, "z skill");
+    }
+
+    #[test]
+    fn list_skills_prefers_agents_face_over_legacy_entity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let neutral = tmp.path().join(".agents/skills/neutral");
+        let legacy = tmp.path().join(".claude/skills/legacy");
+        std::fs::create_dir_all(&neutral).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            neutral.join("SKILL.md"),
+            "---\ndescription: neutral face\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            legacy.join("SKILL.md"),
+            "---\ndescription: legacy face\n---\nbody\n",
+        )
+        .unwrap();
+
+        let out = list_skills(tmp.path()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].skill, "neutral");
+        assert_eq!(out[0].description, "neutral face");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skills_does_not_treat_symlinked_claude_face_as_legacy_entity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("legacy-target/linked");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("SKILL.md"), "---\ndescription: linked\n---\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("legacy-target"),
+            tmp.path().join(".claude/skills"),
+        )
+        .unwrap();
+
+        assert!(list_skills(tmp.path()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skills_follows_agents_face_directory_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("skill-entities/linked");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("SKILL.md"), "---\ndescription: linked\n---\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".agents")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("skill-entities"),
+            tmp.path().join(".agents/skills"),
+        )
+        .unwrap();
+
+        let out = list_skills(tmp.path()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].skill, "linked");
+    }
+
+    #[test]
+    fn list_library_skills_is_recursive_hidden_safe_and_sorted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        for dir in [
+            "zeta",
+            "baoyu-skills/baoyu-comic",
+            ".git/hidden",
+            "owner/.hidden",
+            "Upper/hidden",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(
+            root.join("zeta/SKILL.md"),
+            "---\ndescription: z skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("baoyu-skills/baoyu-comic/SKILL.md"),
+            "---\ndescription: nested skill\n---\nbody\n",
+        )
+        .unwrap();
+        for hidden in [
+            ".git/hidden/SKILL.md",
+            "owner/.hidden/SKILL.md",
+            "Upper/hidden/SKILL.md",
+        ] {
+            std::fs::write(root.join(hidden), "---\ndescription: hidden\n---\n").unwrap();
+        }
+        std::fs::write(root.join(".sources.json"), "{}\n").unwrap();
+
+        let out = list_library_skills(&root);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "baoyu-skills/baoyu-comic");
+        assert_eq!(out[0].description, "nested skill");
+        assert_eq!(out[0].path, root.join("baoyu-skills/baoyu-comic/SKILL.md"));
+        assert!(out[0].path.is_absolute());
+        assert_eq!(out[1].id, "zeta");
         assert_eq!(out[1].description, "z skill");
     }
 

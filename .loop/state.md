@@ -7,14 +7,14 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.8` 已合 `main` 并发布**(2026-07-23 owner merge PR #166 squash `ad1c7c2` → 同日 tag `v0.9.8` + release 全绿,`/releases/latest` → v0.9.8);上一版 v0.9.7 = PR #165 `825ae7d`,已发布 latest。dev 复用开下一轮(下一个 dev→main PR 由首个新提交自动攒起)。
-- **在做**:v0.9.8 已收官(合并记录见版本线;逐项明细 = `.loop/history.md` v0.9.8 行);队列现势卡 = A2A-W5 / FB-2 / P1-1/2/3 / P2-1(V094 gated)—— 唯一来源 `.loop/backlog.md`。
-- **下一版**:v0.9.4(npm 分发)gated 等 owner 重启(PRD DRAFT 留 `docs-local/versions/v0-9-4/prd.md`)。
+- **版本线**:workspace **`0.9.9` 已集成落 `dev`**(owner 2026-07-24 委托「review 需求→决策改良→开发→治理→PR」;决议 = `docs-local/versions/v0-9-9/decisions.md`,内容一行史 = `.loop/history.md` v0.9.9 行),**dev→main PR 已开待 owner 合并**(合并 = 版本落 main;tag/部署仍 HELD)。上一版 v0.9.8 已发布(`ad1c7c2` + tag,`/releases/latest`)。
+- **在做**:v0.9.9 收官,**dev→main PR #169 等 owner merge**(CI 三 job 全绿:fmt/clippy/test;test job 首跑红 → hermetic `0ec136d` → 复跑绿,P2-1 完成)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1 完成待下轮蒸馏)。
+- **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1623/0**(1604 + EXT-MCP-1 +11 + 异步可见性批 +8;2026-07-23 规划实测)
-- `ccteam-web` 全量:干净环境 **0 失败**;本机 live-daemon 宿主下 `pty_ws_test` 3 个 `ws_*` 红(2026-07-23 实测 **main=dev 同红**,环境层非回归,家族已登记 verify/README)· vitest **395**(392 + WEB-SSE-1 +3)· Playwright **7**(v0.9.6 未重跑,上轮口径)
+- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1651/0**(1623 + v0.9.9 批 +24 + FIX1 消红 +1 + P0 双修 +2 + hermetic 反向覆盖 +1;2026-07-24 规划于集成 worktree 实测,tip `0ec136d`。注:CI test job 首跑咬出 `session_tool_tests` 隐性 PATH 依赖 —— 开发机 vendor 常驻故本地恒绿,干净 runner 15 红;已上 per-Gateway 可用性快照注入缝,双 PATH 红后绿证)
+- `ccteam-web` 全量:lib 137 + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,**与 v0.9.8 实测同三只、main=dev 同红不变**,非回归)· vitest **417**(上轮记录 395;#166/#167 窗口 +11 未及回填,V099-W5 +11)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)
@@ -30,11 +30,13 @@
 | v0.9.4 动代码 | gated —— owner 暂缓(2026-07-17,v0.9.5 先行;v0.9.5 已于同日完成落 main,授权已消耗) |
 | 分支治理 = dev + PR 攒版本(常态规则,非一次性) | **已生效** —— owner 2026-07-22:「后续新功能开发一律在 dev 分支开发,提交 PR;多个提交累计组成一个版本,owner 合并 PR 后复用 dev 重复」;取代旧 direct-on-main,已固化 AGENTS.md §五「分支与推送」 |
 | 外部 Agent MCP 接入 Phase 1(研究稿 `docs-local/research/external-agent-mcp-symmetric-architecture.md` 待拍板 D1–D10) | **已签核消耗** —— owner 2026-07-23「实现这个需求」= 按稿内推荐默认拍板,授权范围仅 Phase 1(主 daemon WebUser MCP,tenant token 直用为 MVP);Phase 2(独立 MCP token)/3(卫星 relay)/4(多 Authority)未授权;8-tool wire schema 不变 |
+| v0.9.9 需求决策委托 + 开工(全局 skill 库 PRD FREEZE 解锁) | **已签核消耗** —— owner 2026-07-24「review v0-9-9 版本需求→不恰当处由规划决策改良→完成开发→治理沉淀清理→提 PR,owner 合并」;规划决议落 `docs-local/versions/v0-9-9/decisions.md`(O1–O5 钉死 + ADJ-1 全局面 admin-only + ADJ-2 rm 防误删 + ADJ-3 并入复盘 P0-1 wait 240,**wire schema 不变、additive 字段**;复盘其余排 A2A-OBS 卡)。merge 权仍在 owner |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训
 
-- (空 —— 已固化的住 `.loop/verify/README.md`「运行纪律」+ AGENTS.md §六;新教训先记这里或卡面「经验」行,蒸馏后移走)
+- **vendor 容量中断 = 委派链故障模式**(v0.9.9 FIX1 尾段 codex「model at capacity」,turn 断在门禁前):恢复路径 = `session_collect` 读账本中间记录 → 接手方按其结论收尾,不重做已完成的归因;工作品外部化(worktree/commit)= 会话可弃性。**产品侧主体已固化**(owner 复盘驱动,`2a2b38a`:TurnFailed/终态 Error 贯穿 DelegationSignal,通知冠 VENDOR ERROR = 修「假成功」;TurnStarted 刷 last_active = 消挤停误排);余量 = A2A-OBS-5/OBS-2 卡。恢复纪律候选固化 → verify/README 运行纪律。
+- **规划自身教训**:backlog 批量卡片删除禁用 sed 范围盲切(v0.9.9 蒸馏时 sed 端点被此前 Edit 吃掉的卡头坑掉整段,靠 cp 备份 + Edit 精确重建恢复)—— 结构性 `.loop/` 编辑一律 Edit 工具 + 事后 `writeback.sh`。
 
 ## 流程速查
 

@@ -26,6 +26,7 @@
   `web_chat_bridge` 的重启测试就这样在 main 上烂了很久没人发现(pump 泄漏 + 断言随架构漂移)。故口径固定为
   `--lib --bins`;**新增 binary-only crate 时必须确认它进了这个口径**。
 - **新校验 / 新门必须先证有牙**:先造缺陷态、定向测试红(留痕于卡面「验证」段),再修绿——恒绿的门 = 空洞,不算验收。
+- **基线口径内的测试必须密封**:不得依赖 PATH 上的真实 vendor CLI、全局 env、或宿主特有状态——CI test job(`check.yml`,同口径)是干净环境仲裁。实锤:v0.9.9 CI 首跑咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻 → 本地恒绿假象);修法 = 注入缝(per-Gateway 可用性快照),非 env 突变、非 CI 装桩。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
   `resume_*` · `ws_*` · `hook_*` · gateway 共享 `/tmp/alpha` 并行污染。

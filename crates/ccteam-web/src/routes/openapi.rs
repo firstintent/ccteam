@@ -126,6 +126,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
+        (name = "skills", description = "Admin-only user-level global skill library"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
         (name = "auth", description = "Web-token introspection"),
@@ -211,6 +212,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         // composer attachments — project uploads + installed-skill picker
         .routes(routes!(super::uploads::handle_project_upload))
         .routes(routes!(super::uploads::handle_list_skills))
+        .routes(routes!(super::skills::handle_list_library_skills))
         // sessions (gateway spine) — GET list + POST create share the path.
         .routes(routes!(
             super::sessions_api::handle_list_sessions,

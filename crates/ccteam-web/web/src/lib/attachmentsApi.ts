@@ -9,8 +9,11 @@
 //      session already knows to `Read` them.
 //
 // `listProjectSkills(slug)` backs the composer's attach-skill picker
-// (`GET /api/v1/projects/{slug}/skills` — the project's installed
-// `.claude/skills/<id>/SKILL.md` set).
+// (`GET /api/v1/projects/{slug}/skills` — the project's own skill set).
+// `listLibrarySkills()` backs the picker's Global-library section
+// (`GET /api/v1/skills` — the user-level `~/.ccteam/skills` library; ADMIN-only,
+// the SPA only calls it for admins). Attaching a library skill never installs
+// anything — the turn attachment just carries `scope:"global"` + the id.
 
 /** Server reply for one stored upload. */
 export interface UploadedAttachment {
@@ -22,17 +25,30 @@ export interface UploadedAttachment {
   size: number;
 }
 
-/** One installed project skill (`GET .../skills`). */
+/** One installed project skill (`GET .../projects/{slug}/skills`). */
 export interface SkillSummary {
   skill: string;
   description: string;
 }
 
-/** One attachment named in a turn POST (mirror of the server `TurnAttachment`). */
+/** One skill in the user-level global library (`GET /api/v1/skills`,
+ *  admin-only). `id` may be nested (`baoyu-skills/baoyu-comic`); `path` is the
+ *  absolute SKILL.md the server weaves into the turn. */
+export interface LibrarySkillSummary {
+  id: string;
+  description: string;
+  path: string;
+  source?: string;
+}
+
+/** One attachment named in a turn POST (mirror of the server `TurnAttachment`).
+ *  `scope` marks a skill as coming from the global library; project skills
+ *  omit it (byte-compatible with older clients). */
 export interface TurnAttachment {
   kind: "image" | "file" | "skill";
   path?: string;
   name?: string;
+  scope?: "project" | "global";
 }
 
 async function errorMessage(res: Response, fallback: string): Promise<string> {
@@ -95,4 +111,25 @@ export async function listProjectSkills(slug: string): Promise<SkillSummary[]> {
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (!res.ok) throw new Error(await errorMessage(res, `skills failed (${res.status})`));
   return (await res.json()) as SkillSummary[];
+}
+
+/** List the user-level global skill library (`GET /api/v1/skills`).
+ *  ADMIN-only server-side — the SPA calls this only for admins (a tenant
+ *  gets 403, lifted to its `{error}` message). */
+export async function listLibrarySkills(): Promise<LibrarySkillSummary[]> {
+  let res: Response;
+  try {
+    res = await fetch("/api/v1/skills", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    throw new Error(
+      `network: ${e instanceof Error ? e.message : "connection failed"}`,
+    );
+  }
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error(await errorMessage(res, `skills failed (${res.status})`));
+  const data = (await res.json()) as { skills?: LibrarySkillSummary[] };
+  return data.skills ?? [];
 }

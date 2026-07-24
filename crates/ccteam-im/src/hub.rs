@@ -6,9 +6,9 @@
 //! reads its `index.json` over HTTPS (github-raw) plus a local cache under
 //! `~/.ccteam/hub-cache/` (track-upstream: the index stores per-plugin
 //! `upstream` URLs, not vendored bodies), and installs a plugin's content into
-//! a user project (`.claude/agents/<id>.md` for an agent;
-//! `.claude/skills/<id>/…` for a skill — a single `SKILL.md`, or a whole dir
-//! for a multi-file skill via its `manifest`). `ccteam-web` + the CLI call
+//! its appropriate target: project-local `.claude/agents/<id>.md` for an
+//! agent, or the user-level ccteam skill library for a skill (a single
+//! `SKILL.md`, or a whole dir via its `manifest`). `ccteam-web` + the CLI call
 //! this module.
 //!
 //! ## Why here (not `ccteam-core`)
@@ -171,7 +171,7 @@ struct HubModelsCacheMeta {
 /// One file of a multi-file skill (PRD §二): a path relative to the skill
 /// dir + the sha256 of its body. The engine derives the file's fetch URL from
 /// the plugin's `upstream` dir + `relpath`, verifies the sha, and writes it
-/// under `.claude/skills/<id>/<relpath>`.
+/// under the user-level skill library's `<id>/<relpath>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Path relative to the skill dir (e.g. `SKILL.md`, `scripts/run.sh`).
@@ -263,17 +263,16 @@ pub struct InstallResult {
     pub id: String,
     /// The plugin `type` (`"agent"` / `"skill"`).
     pub type_: String,
-    /// Absolute path of the file written
-    /// (`.claude/agents/<stem>.md` or `.claude/skills/<stem>/SKILL.md`).
+    /// Absolute path of the file written (project agent definition, global
+    /// library `SKILL.md`, or delegated plugin settings).
     pub path: PathBuf,
     /// `true` when an existing file at the target was overwritten (only
     /// possible with `force`).
     pub overwrote: bool,
 }
 
-/// Whether a hub plugin is already present in a project, computed on-the-fly
-/// from the file on disk vs. the index's `content_sha` (no sidecar file — the
-/// `.ccteam` layout red-line forbids a new per-project state file).
+/// Whether a hub plugin is already present at its canonical target, computed
+/// on-the-fly from disk vs. the index's `content_sha` (no sidecar file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstalledStatus {
@@ -780,23 +779,26 @@ pub async fn fetch_plugin_body(plugin: &HubPlugin) -> Result<String, HubError> {
     fetch_text_verified(&plugin.upstream, &plugin.content_sha, &plugin.id).await
 }
 
-/// Install a hub plugin's content into `project_dir`.
+/// Install a hub plugin into its type-specific target. Both roots are explicit
+/// so callers and tests control all filesystem effects without ambient env
+/// reads.
 ///
-/// - **agent / single-file skill**: derive + sanitize the install stem
-///   (`target_stem` override, else `plugin.id`); refuse to clobber an existing
-///   target unless `force`; fetch the body from `plugin.upstream` + verify its
-///   sha; write `.claude/agents/<stem>.md` (agent) or
-///   `.claude/skills/<stem>/SKILL.md` (skill).
+/// - **agent**: sanitize the install stem, refuse to clobber without `force`,
+///   fetch + verify, then write `.claude/agents/<stem>.md` in `project_dir`.
+/// - **single-file skill**: sanitize with the nested library-id rules, refuse
+///   an existing `<library_root>/<stem>/` without `force`, fetch + verify, then
+///   write `<library_root>/<stem>/SKILL.md`.
 /// - **multi-file skill** (`manifest` present): the install target is the
-///   skill DIR (`.claude/skills/<stem>/`); refuse to clobber it unless `force`;
+///   library skill dir; refuse to clobber it unless `force`;
 ///   fetch + verify EVERY manifest file (URL = the `upstream` dir + each
 ///   `relpath`) BEFORE writing any — so a mid-list integrity failure leaves
-///   nothing partial — then write each under `.claude/skills/<stem>/<relpath>`.
+///   nothing partial — then write each under `<library_root>/<stem>/<relpath>`.
 /// - **workflow / unknown type**: [`HubError::UnsupportedType`] (deferred).
 ///
 /// `InstallResult.path` is the primary file (`SKILL.md` / the agent `.md`).
 pub async fn install_plugin(
     project_dir: &Path,
+    library_root: &Path,
     plugin: &HubPlugin,
     target_stem: Option<&str>,
     force: bool,
@@ -809,8 +811,12 @@ pub async fn install_plugin(
     }
 
     let raw_stem = target_stem.unwrap_or(&plugin.id);
-    let stem = ccteam_core::sanitize_role_stem(raw_stem)
-        .map_err(|e| HubError::BadStem(format!("{e:#}")))?;
+    let stem = if plugin.type_ == "skill" {
+        ccteam_core::sanitize_skill_library_id(raw_stem)
+    } else {
+        ccteam_core::sanitize_role_stem(raw_stem)
+    }
+    .map_err(|e| HubError::BadStem(format!("{e:#}")))?;
 
     // Multi-file skill (manifest present): a directory install.
     if let Some(manifest) = plugin.manifest.as_ref().filter(|m| !m.is_empty()) {
@@ -818,10 +824,21 @@ pub async fn install_plugin(
             // A manifest only makes sense for a skill directory.
             return Err(HubError::UnsupportedType(plugin.type_.clone()));
         }
-        let skill_dir = ccteam_core::skill_dir_path(project_dir, &stem);
+        let skill_dir = library_root.join(&stem);
         let exists = skill_dir.exists();
         if exists && !force {
             return Err(HubError::Exists(stem));
+        }
+        let mut relpaths = std::collections::HashSet::with_capacity(manifest.len());
+        for entry in manifest {
+            ccteam_core::validate_skill_library_file_relpath(&entry.relpath)
+                .map_err(|e| HubError::Write(format!("{e:#}")))?;
+            if !relpaths.insert(entry.relpath.as_str()) {
+                return Err(HubError::Write(format!(
+                    "skill manifest contains duplicate relpath `{}`",
+                    entry.relpath
+                )));
+            }
         }
         let base_url = upstream_dir(&plugin.upstream)?;
         // Pass 1: fetch + verify EVERY file (no writes → atomic on failure).
@@ -831,16 +848,22 @@ pub async fn install_plugin(
             let body = fetch_text_verified(&url, &entry.content_sha, &entry.relpath).await?;
             files.push((entry.relpath.clone(), body));
         }
-        // Pass 2: write each under .claude/skills/<stem>/<relpath>.
+        // Pass 2: write each under the global library skill dir.
         let mut primary: Option<PathBuf> = None;
         for (relpath, body) in &files {
-            let written = ccteam_core::write_skill_file(project_dir, &stem, relpath, body)
-                .map_err(|e| HubError::Write(format!("{e:#}")))?;
+            let written = ccteam_core::write_library_skill_file(
+                library_root,
+                &stem,
+                relpath,
+                body.as_bytes(),
+                force,
+            )
+            .map_err(|e| HubError::Write(format!("{e:#}")))?;
             if relpath == "SKILL.md" {
                 primary = Some(written);
             }
         }
-        let path = primary.unwrap_or_else(|| ccteam_core::skill_md_path(project_dir, &stem));
+        let path = primary.unwrap_or_else(|| skill_dir.join("SKILL.md"));
         return Ok(InstallResult {
             id: plugin.id.clone(),
             type_: plugin.type_.clone(),
@@ -854,18 +877,22 @@ pub async fn install_plugin(
     // type fails before any network I/O.
     let dest = match plugin.type_.as_str() {
         "agent" => ccteam_core::agent_md_path(project_dir, &stem),
-        "skill" => ccteam_core::skill_md_path(project_dir, &stem),
+        "skill" => library_root.join(&stem).join("SKILL.md"),
         "workflow" => return Err(HubError::UnsupportedType(plugin.type_.clone())),
         other => return Err(HubError::UnsupportedType(other.to_string())),
     };
-    let exists = dest.exists();
+    let exists = if plugin.type_ == "skill" {
+        library_root.join(&stem).exists()
+    } else {
+        dest.exists()
+    };
     if exists && !force {
         return Err(HubError::Exists(stem));
     }
     let body = fetch_plugin_body(plugin).await?;
     let path = match plugin.type_.as_str() {
         "agent" => ccteam_core::write_role(project_dir, &stem, &body),
-        "skill" => ccteam_core::write_skill(project_dir, &stem, &body),
+        "skill" => ccteam_core::write_library_skill(library_root, &stem, &body, force),
         // The match above already returned for every other type.
         _ => unreachable!("unsupported type handled before fetch"),
     }
@@ -915,21 +942,26 @@ fn install_marketplace_plugin(
     })
 }
 
-/// Compute the on-the-fly installed status of `plugin` in `project_dir` — no
-/// sidecar file. Keyed on `plugin.id` (the no-override install stem):
+/// Compute the on-the-fly installed status of `plugin` at its type-specific
+/// target — no sidecar file. Keyed on `plugin.id` (the no-override stem):
 ///
 /// - target absent → [`InstalledStatus::NotInstalled`],
 /// - present + sha matches → [`InstalledStatus::Installed`],
 /// - present + sha differs → [`InstalledStatus::UpdateAvailable`].
 ///
 /// For a **multi-file skill** (`manifest` present) the comparison is over the
-/// whole dir: every manifest file present + sha-matching → `Installed`; none
-/// present → `NotInstalled`; any file missing or stale → `UpdateAvailable`.
+/// whole dir: every manifest file present + sha-matching → `Installed`; any
+/// missing file → `NotInstalled`; a present but stale file →
+/// `UpdateAvailable`.
 ///
 /// An unreadable file (race / permissions) or an unsupported / unsanitizable
 /// type is treated as `NotInstalled` (best-effort decoration of the catalog;
 /// never errors). The web layer uses this to badge each catalog row.
-pub fn installed_status(project_dir: &Path, plugin: &HubPlugin) -> InstalledStatus {
+pub fn installed_status(
+    project_dir: &Path,
+    library_root: &Path,
+    plugin: &HubPlugin,
+) -> InstalledStatus {
     // Vendor-native plugin: "installed" == enabled in settings.local.json.
     // There is no `UpdateAvailable` (Claude tracks the marketplace's live ref,
     // not a hub-pinned sha) — the status is binary.
@@ -947,36 +979,46 @@ pub fn installed_status(project_dir: &Path, plugin: &HubPlugin) -> InstalledStat
     }
 
     // Default stem == sanitized plugin id (the no-override install path).
-    let Ok(stem) = ccteam_core::sanitize_role_stem(&plugin.id) else {
+    let stem = if plugin.type_ == "skill" {
+        ccteam_core::sanitize_skill_library_id(&plugin.id)
+    } else {
+        ccteam_core::sanitize_role_stem(&plugin.id)
+    };
+    let Ok(stem) = stem else {
         return InstalledStatus::NotInstalled;
     };
 
-    // Multi-file skill: compare every manifest file under the skill dir.
+    // Multi-file skill: every manifest entry must be present; sha mismatches
+    // are update-available only after that completeness gate passes.
     if let Some(manifest) = plugin.manifest.as_ref().filter(|m| !m.is_empty()) {
-        let dir = ccteam_core::skill_dir_path(project_dir, &stem);
-        let mut present = 0usize;
-        let mut matched = 0usize;
+        if plugin.type_ != "skill" {
+            return InstalledStatus::NotInstalled;
+        }
+        let dir = library_root.join(&stem);
+        let mut mismatch = false;
         for entry in manifest {
-            if let Ok(bytes) = std::fs::read(dir.join(&entry.relpath)) {
-                present += 1;
-                if sha_eq(&sha256_hex(&bytes), &entry.content_sha) {
-                    matched += 1;
-                }
+            let Ok(relpath) = ccteam_core::validate_skill_library_file_relpath(&entry.relpath)
+            else {
+                return InstalledStatus::NotInstalled;
+            };
+            let Ok(bytes) = std::fs::read(dir.join(relpath)) else {
+                return InstalledStatus::NotInstalled;
+            };
+            if !sha_eq(&sha256_hex(&bytes), &entry.content_sha) {
+                mismatch = true;
             }
         }
-        return if present == 0 {
-            InstalledStatus::NotInstalled
-        } else if matched == manifest.len() {
-            InstalledStatus::Installed
-        } else {
+        return if mismatch {
             InstalledStatus::UpdateAvailable
+        } else {
+            InstalledStatus::Installed
         };
     }
 
     // Single-file agent / SKILL.md-only skill.
     let path = match plugin.type_.as_str() {
         "agent" => ccteam_core::agent_md_path(project_dir, &stem),
-        "skill" => ccteam_core::skill_md_path(project_dir, &stem),
+        "skill" => library_root.join(&stem).join("SKILL.md"),
         // Not-yet-installable types can never be "installed".
         _ => return InstalledStatus::NotInstalled,
     };
@@ -1116,11 +1158,17 @@ mod tests {
     async fn plugin_install_writes_settings_and_status_flips() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        let library_root = dir.join("skills");
         let p = plugin_entry();
 
-        assert_eq!(installed_status(dir, &p), InstalledStatus::NotInstalled);
+        assert_eq!(
+            installed_status(dir, &library_root, &p),
+            InstalledStatus::NotInstalled
+        );
 
-        let res = install_plugin(dir, &p, None, false).await.unwrap();
+        let res = install_plugin(dir, &library_root, &p, None, false)
+            .await
+            .unwrap();
         assert_eq!(res.type_, "plugin");
         assert!(!res.overwrote);
         assert!(res.path.ends_with(".claude/settings.local.json"));
@@ -1139,7 +1187,10 @@ mod tests {
         );
 
         // Binary status — never UpdateAvailable for a plugin.
-        assert_eq!(installed_status(dir, &p), InstalledStatus::Installed);
+        assert_eq!(
+            installed_status(dir, &library_root, &p),
+            InstalledStatus::Installed
+        );
     }
 
     #[tokio::test]
@@ -1152,7 +1203,7 @@ mod tests {
         bad.marketplace = None;
         let tmp = tempfile::tempdir().unwrap();
         assert!(matches!(
-            install_plugin(tmp.path(), &bad, None, false).await,
+            install_plugin(tmp.path(), &tmp.path().join("skills"), &bad, None, false).await,
             Err(HubError::InvalidPlugin(_))
         ));
     }

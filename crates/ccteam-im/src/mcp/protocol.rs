@@ -198,7 +198,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, `opencode`, or `kimi`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default, and when the child's vendor turn completes and it goes idle you get ONE completion notification; `wait_seconds>0` blocks inline for the answer; `notify:\"off\"` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, `opencode`, or `kimi`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default, and when the child's vendor turn completes and it goes idle you get ONE completion notification; inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async; pending never cancels the child; `notify:\"off\"` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +223,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     },
                     "title": { "type": "string", "description": "Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt." },
                     "task": { "type": "string", "description": "Optional FIRST task — dispatched to the fresh child in the same call, exactly like session_dispatch{sid, task} (verbatim user turn, no injection). Omit to spawn only." },
-                    "wait_seconds": { "type": "integer", "description": "With `task`: block up to this many seconds (0–600, default 0 = async) for the child's answer, returning it inline (`status:completed`, `result_text`); on timeout returns `status:pending` and the child keeps running." },
+                    "wait_seconds": { "type": "integer", "description": "With `task`: request 0–600 seconds (default 0 = async); effective inline wait is capped at 240s. Use inline wait for health probes/short tasks; keep long/repo tasks async with completion notification. Pending/timeout never cancels the child." },
                     "notify": { "type": ["string", "boolean"], "description": "With `task`: `final` (default) wakes you ONCE, when the child's vendor turn completes and it goes idle (interim narration stays in the ledger); `all` wakes you on every assistant message (debug firehose); `off` = ledger-only (poll session_collect yourself). Booleans still parse: true→final, false→off." },
                     "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-project, within ~1h) replays the ORIGINAL spawn (same sid + same dispatch outcome, zero side effects) instead of creating a second session — safe against MCP-client timeouts. In-memory only: a daemon restart forgets keys." }
                 },
@@ -232,13 +232,13 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when its vendor turn COMPLETES (the child goes idle — mid-turn narration never notifies), ccteam delivers ONE completion notification back to you as a new turn; the notification explicitly marks the child as idle/waiting, so if the task isn't actually finished you know to dispatch a follow-up (set `notify:\"off\"` to opt out and poll session_collect yourself, `notify:\"all\"` for a per-message debug firehose). Pass `wait_seconds>0` to block inline for the answer: returns `{status:\"completed\", result_text, cost_usd?}` once the child's turn actually finishes, or `{status:\"pending\"}` on timeout (the child keeps running — never cancelled). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when its vendor turn COMPLETES (the child goes idle — mid-turn narration never notifies), ccteam delivers ONE completion notification back to you as a new turn; the notification explicitly marks the child as idle/waiting, so if the task isn't actually finished you know to dispatch a follow-up (set `notify:\"off\"` to opt out and poll session_collect yourself, `notify:\"all\"` for a per-message debug firehose). Inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async with completion notification. Completion returns `{status:\"completed\", result_text, cost_usd?}`; timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "sid": { "type": "string", "description": "Gateway session id (`s{n}`) from session_spawn / session_list." },
                     "task": { "type": "string", "description": "Task / instruction text, forwarded verbatim as a user turn." },
-                    "wait_seconds": { "type": "integer", "description": "Block up to this many seconds (0–600, default 0 = async) for the child's answer. On completion returns it inline (`status:completed`); on timeout returns `status:pending` and the child keeps running." },
+                    "wait_seconds": { "type": "integer", "description": "Request 0–600 seconds (default 0 = async); effective inline wait is capped at 240s. Use inline wait for health probes/short tasks; keep long/repo tasks async with completion notification. Pending/timeout never cancels the child." },
                     "notify": { "type": ["string", "boolean"], "description": "`final` (default) wakes you ONCE, when the child's vendor turn completes and it goes idle — the notification explicitly says the child is idle and waiting, so you always know when to dispatch the next step. `all` wakes you on every assistant message (debug firehose); `off` = ledger-only (poll session_collect yourself). Booleans still parse: true→final, false→off." },
                     "title": { "type": "string", "description": "Optional short label (≤80 chars) for the notification / ledger only — NEVER concatenated into the task or any prompt." },
                     "idempotency_key": { "type": "string", "description": "Optional client key. A retry with the same key (per-target-child, within ~1h) replays the ORIGINAL dispatch (same turn) instead of double-dispatching. In-memory only: a daemon restart forgets keys." }
@@ -533,6 +533,31 @@ mod tests {
                 .unwrap();
             assert!(description.contains("answer tersely with a structured summary"));
             assert!(description.contains("no code or diff dumps"));
+        }
+    }
+
+    #[test]
+    fn inline_wait_descriptions_explain_ceiling_without_changing_schema_shape() {
+        let defs = session_tool_definitions();
+        for name in ["session_spawn", "session_dispatch"] {
+            let definition = defs.iter().find(|tool| tool["name"] == name).unwrap();
+            let wait = &definition["inputSchema"]["properties"]["wait_seconds"];
+            assert_eq!(wait["type"], "integer");
+            assert!(wait.get("minimum").is_none(), "{name}: no schema minimum");
+            assert!(wait.get("maximum").is_none(), "{name}: no schema maximum");
+            let description = wait["description"].as_str().unwrap();
+            for expected in [
+                "0–600",
+                "240s",
+                "health probes/short tasks",
+                "long/repo tasks",
+                "never cancels",
+            ] {
+                assert!(
+                    description.contains(expected),
+                    "{name}: wait description must mention `{expected}`"
+                );
+            }
         }
     }
 

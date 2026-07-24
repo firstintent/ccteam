@@ -244,6 +244,22 @@ const SESSION_COLLECT_MIN_MAX_CHARS: usize = 500;
 const SESSION_COLLECT_MAX_MAX_CHARS: usize = 50_000;
 const INLINE_RESULT_MAX_CHARS: usize = 10_000;
 
+/// Keep inline waits below the shortest common MCP client deadline (~300s),
+/// leaving 60s for spawn/submit work around the wait itself. The wire still
+/// accepts the documented 0..=600 request range; only execution is capped.
+const EFFECTIVE_INLINE_WAIT_CEILING_SECONDS: u64 = 240;
+
+fn requested_inline_wait_seconds(args: &serde_json::Value) -> u64 {
+    args.get("wait_seconds")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .min(600)
+}
+
+fn effective_inline_wait_seconds(requested: u64) -> u64 {
+    requested.min(EFFECTIVE_INLINE_WAIT_CEILING_SECONDS)
+}
+
 /// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
 /// answer before forgetting the prompt + reporting a timeout (the hook then
 /// degrades to deny-with-reason). Matches the gateway pending TTL default.
@@ -1302,13 +1318,10 @@ async fn execute_session_tool_with_paths(
     // a READABLE error instead of hanging the caller's whole turn on a
     // never-resolving tool call. spawn/dispatch budget for process startup +
     // any explicit inline wait; the read-only tools are short.
-    let wait_secs = args
-        .get("wait_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(600);
+    let requested_wait_secs = requested_inline_wait_seconds(&args);
+    let effective_wait_secs = effective_inline_wait_seconds(requested_wait_secs);
     let budget = std::time::Duration::from_secs(match name.as_str() {
-        "session_spawn" | "session_dispatch" => 60 + wait_secs,
+        "session_spawn" | "session_dispatch" => 60 + effective_wait_secs,
         "session_stop" => 30,
         _ => 15,
     });
@@ -1567,11 +1580,8 @@ async fn run_session_spawn(
     // display only (task → label, never label → prompt; the injection red line
     // is untouched).
     let title = title.or_else(|| task.as_deref().map(derive_title_from_task));
-    let wait_seconds = args
-        .get("wait_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(600);
+    let requested_wait_seconds = requested_inline_wait_seconds(args);
+    let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
     let notify = parse_notify_mode("session_spawn", args)?;
     // Admin/managed-session spawns retain the shared ops pool. A tenant web
     // bearer uses the same bare web chat-id seed as REST session creation; the
@@ -1644,24 +1654,27 @@ async fn run_session_spawn(
     // the unknown-host/offline cases).
     let vendor_wire = session_vendor_wire(vendor);
     {
-        let (bound_host, sat_snapshot) = {
+        let (bound_host, local_snapshot, sat_snapshot) = {
             let gw = gateway.lock().await;
             let host = gw.project_bound_host(&project);
-            let snap = if host == ccteam_core::LOCAL_HOST {
-                None
+            let (local, satellite) = if host == ccteam_core::LOCAL_HOST {
+                (gw.local_vendor_availability_override(), None)
             } else {
-                gw.satellite_agent_snapshot(&host)
+                (None, gw.satellite_agent_snapshot(&host))
             };
-            (host, snap)
+            (host, local, satellite)
         };
         if bound_host == ccteam_core::LOCAL_HOST {
             // Probe OFF the gateway lock (cached; shells out only on a cold
             // cache), so we never hold the mutex across a `<bin> --version`.
-            let avail = tokio::task::spawn_blocking(|| {
-                ccteam_core::host_registry::probe_availability(false)
-            })
-            .await
-            .unwrap_or_default();
+            let avail = match local_snapshot {
+                Some(snapshot) => snapshot,
+                None => tokio::task::spawn_blocking(|| {
+                    ccteam_core::host_registry::probe_availability(false)
+                })
+                .await
+                .unwrap_or_default(),
+            };
             if let Some(row) = avail.iter().find(|a| a.vendor == vendor_wire) {
                 if !row.installed {
                     let installed: Vec<String> = avail
@@ -1801,7 +1814,8 @@ async fn run_session_spawn(
             dispatcher_sid,
             &sid,
             task,
-            wait_seconds,
+            requested_wait_seconds,
+            effective_wait_seconds,
             notify,
             title.clone(),
         )
@@ -1889,11 +1903,8 @@ async fn run_session_dispatch(
     // R-M3 — only operate sessions in the caller's own project.
     assert_caller_owns_session("session_dispatch", args, gateway, &sid, &caller).await?;
 
-    let wait_seconds = args
-        .get("wait_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(600);
+    let requested_wait_seconds = requested_inline_wait_seconds(args);
+    let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
     let notify = parse_notify_mode("session_dispatch", args)?;
     let title = args
         .get("title")
@@ -1999,7 +2010,8 @@ async fn run_session_dispatch(
         &caller_sid,
         &sid,
         task,
-        wait_seconds,
+        requested_wait_seconds,
+        effective_wait_seconds,
         notify,
         title,
     )
@@ -2060,7 +2072,8 @@ async fn dispatch_task(
     caller_sid: &str,
     sid: &str,
     task: String,
-    wait_seconds: u64,
+    requested_wait_seconds: u64,
+    effective_wait_seconds: u64,
     notify: ccteam_harness::NotifyMode,
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -2069,7 +2082,7 @@ async fn dispatch_task(
         let mut gw = gateway.lock().await;
         // Subscribe BEFORE submitting so a fast child can't answer before we
         // start listening (the wait races the child's own turn).
-        let rx = if wait_seconds > 0 {
+        let rx = if effective_wait_seconds > 0 {
             Some(gw.subscribe_events())
         } else {
             None
@@ -2105,10 +2118,16 @@ async fn dispatch_task(
 
     // ---- wait branch (OFF the gateway lock) ----
     if let Some(rx) = rx {
-        Ok(
-            dispatch_wait_for_completion(gateway, sid, &turn_id, wait_seconds, rx, is_delegation)
-                .await,
+        Ok(dispatch_wait_for_completion(
+            gateway,
+            sid,
+            &turn_id,
+            requested_wait_seconds,
+            effective_wait_seconds,
+            rx,
+            is_delegation,
         )
+        .await)
     } else {
         let mut m = serde_json::Map::new();
         m.insert("turn_id".to_string(), serde_json::json!(turn_id));
@@ -2123,13 +2142,53 @@ async fn dispatch_task(
     }
 }
 
+/// Build the existing normal pending fragment, adding cap metadata only when
+/// an over-ceiling request actually reaches its shorter effective deadline.
+fn pending_dispatch_response(
+    turn_id: &str,
+    requested_wait_seconds: u64,
+    effective_wait_seconds: u64,
+    hit_effective_deadline: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut response = serde_json::Map::new();
+    response.insert("turn_id".to_string(), serde_json::json!(turn_id));
+    response.insert("status".to_string(), serde_json::json!("pending"));
+    if hit_effective_deadline && requested_wait_seconds > effective_wait_seconds {
+        response.insert(
+            "requested_wait_seconds".to_string(),
+            serde_json::json!(requested_wait_seconds),
+        );
+        response.insert(
+            "effective_wait_seconds".to_string(),
+            serde_json::json!(effective_wait_seconds),
+        );
+        response.insert(
+            "hint".to_string(),
+            serde_json::json!(format!(
+                "inline wait capped at {effective_wait_seconds}s; task continues — poll session_collect{{sid, since:turn_id}} or await the completion notification if enabled."
+            )),
+        );
+    } else {
+        response.insert(
+            "hint".to_string(),
+            serde_json::json!(
+                "still running; you will be notified on completion, or poll session_collect{sid}."
+            ),
+        );
+    }
+    response
+}
+
 /// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits an
 /// `Answer` for `child_sid` on the gateway broadcast until the deadline. NEVER
 /// holds the gateway lock across the await (lock discipline). On completion it
 /// reads the child's freshly-appended turn (clean text) + cost from meta and,
 /// for a delegation, disarms the watch (the caller already has the result
 /// inline — suppress the redundant notification). On timeout it returns
-/// `pending` and leaves the watch armed (the child is not cancelled).
+/// `pending` and leaves the watch armed (the child is not cancelled). When a
+/// request above the effective inline ceiling reaches that ceiling, the
+/// pending response also reports the requested/effective waits and an honest
+/// collect-or-notification hint.
 ///
 /// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion: codex
 /// mirrors interim narration as separate answers inside one still-running
@@ -2142,14 +2201,17 @@ async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
     turn_id: &str,
-    wait_seconds: u64,
+    requested_wait_seconds: u64,
+    effective_wait_seconds: u64,
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(effective_wait_seconds);
     // Re-check cadence for "answer seen, is the turn still in flight?".
     const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
     let mut saw_answer = false;
+    let mut hit_effective_deadline = false;
     let completed = loop {
         if saw_answer {
             let in_flight = {
@@ -2162,6 +2224,7 @@ async fn dispatch_wait_for_completion(
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            hit_effective_deadline = true;
             break false;
         }
         // While mid-turn with an answer already seen, wake at least every
@@ -2190,16 +2253,12 @@ async fn dispatch_wait_for_completion(
     };
 
     if !completed {
-        let mut m = serde_json::Map::new();
-        m.insert("turn_id".to_string(), serde_json::json!(turn_id));
-        m.insert("status".to_string(), serde_json::json!("pending"));
-        m.insert(
-            "hint".to_string(),
-            serde_json::json!(
-                "still running; you will be notified on completion, or poll session_collect{sid}."
-            ),
+        return pending_dispatch_response(
+            turn_id,
+            requested_wait_seconds,
+            effective_wait_seconds,
+            hit_effective_deadline,
         );
-        return m;
     }
 
     // Resolve the child (sync) under a brief lock, then read its transcript
@@ -3093,6 +3152,81 @@ mod session_tool_tests {
         })
     }
 
+    fn stub_vendor_availability(installed: bool) -> Vec<ccteam_core::VendorAvailability> {
+        ccteam_core::AGENT_PROBE_SPECS
+            .iter()
+            .map(|spec| ccteam_core::VendorAvailability {
+                vendor: spec.vendor,
+                harness_id: spec.harness_id,
+                installed,
+                version: installed.then(|| format!("{} test stub", spec.vendor)),
+            })
+            .collect()
+    }
+
+    fn mark_stub_vendors_installed(gateway: &mut Gateway) {
+        gateway.set_local_vendor_availability_for_tests(stub_vendor_availability(true));
+    }
+
+    #[test]
+    fn effective_inline_wait_seconds_caps_at_transport_safe_ceiling() {
+        for (requested, expected) in [(600, 240), (240, 240), (0, 0), (30, 30)] {
+            assert_eq!(effective_inline_wait_seconds(requested), expected);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn capped_dispatch_wait_returns_honest_pending_and_keeps_child_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, principal) = dispatch_gateway(true, 10_000, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Inject a one-second effective wait into the shared production path;
+        // the real ceiling remains a non-overridable 240s constant.
+        let response = serde_json::Value::Object(
+            dispatch_task(
+                &gateway,
+                "session_dispatch",
+                &principal,
+                &child,
+                "slow task".to_string(),
+                600,
+                1,
+                ccteam_harness::NotifyMode::Final,
+                None,
+            )
+            .await
+            .expect("a capped inline timeout is a normal pending response"),
+        );
+        assert_eq!(response["status"], "pending");
+        assert!(response["turn_id"].as_str().is_some());
+        assert_eq!(response["requested_wait_seconds"], 600);
+        assert_eq!(response["effective_wait_seconds"], 1);
+        let hint = response["hint"].as_str().unwrap();
+        assert!(hint.contains("inline wait capped at 1s"), "{hint}");
+        assert!(hint.contains("task continues"), "{hint}");
+        assert!(
+            hint.contains("session_collect{sid, since:turn_id}"),
+            "{hint}"
+        );
+        assert!(hint.contains("completion notification"), "{hint}");
+        assert!(
+            gateway.lock().await.session_turn_in_flight(&child),
+            "a capped pending response must not cancel the child turn"
+        );
+    }
+
     /// A dispatcher with only `paths` wired (enough for the local-admin
     /// promotion, which never touches gateway/sink/pending).
     fn dispatch_with_root(root: &std::path::Path) -> McpDispatch {
@@ -3352,6 +3486,7 @@ mod session_tool_tests {
         });
         let mut gw =
             crate::gateway::Gateway::new_with_factory(factory, "alpha", "/tmp/cc-gate-alpha");
+        mark_stub_vendors_installed(&mut gw);
         gw.register_project("beta", "/tmp/cc-gate-beta");
         let cto_sid = gw
             .create_session_api(
@@ -3439,6 +3574,7 @@ mod session_tool_tests {
                 as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
         });
         let mut gateway = Gateway::new_with_factory(factory, "alice", alice_dir);
+        mark_stub_vendors_installed(&mut gateway);
         gateway.register_project("bob", bob_dir);
         gateway.register_project("admin", admin_dir);
 
@@ -4221,6 +4357,7 @@ mod session_tool_tests {
             }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
         });
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        mark_stub_vendors_installed(&mut gw);
         let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
         gw.set_delegation_notifier_tx(dtx);
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -4258,6 +4395,31 @@ mod session_tool_tests {
             .unwrap_err();
         assert_eq!(err, crate::remote_host::HOST_SPAWN_PARAM_REMOVED);
         assert_eq!(gw.lock().await.session_views().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_spawn_reports_vendor_not_installed_from_empty_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        gateway
+            .lock()
+            .await
+            .set_local_vendor_availability_for_tests(stub_vendor_availability(false));
+
+        let error = run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("vendor `claude` is not installed on host `local`"),
+            "{error}"
+        );
+        assert!(error.contains("installed there: none"), "{error}");
+        assert!(error.contains("observed just now"), "{error}");
+        assert!(error.contains("ccteam never installs a CLI"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4764,6 +4926,12 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(r2["status"], json!("pending"), "timeout: {r2}");
+        assert!(r2.get("requested_wait_seconds").is_none(), "{r2}");
+        assert!(r2.get("effective_wait_seconds").is_none(), "{r2}");
+        assert!(
+            gw2.lock().await.session_turn_in_flight(&child2),
+            "an inline timeout must not cancel the child turn"
+        );
     }
 
     /// v0.9.5 feedback fix — a `wait_seconds` dispatch to a NARRATING child

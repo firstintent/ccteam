@@ -237,14 +237,19 @@ enum Command {
     /// Role / plugin marketplace group: `ccteam role <search|add|list>`.
     ///
     /// Browse the curated ccteam-hub marketplace (`search`), one-shot install
-    /// a plugin into the project's `.claude/` (`add <id>`, fetches + sha256-
-    /// verifies the body over HTTPS), or list the roles already installed in a
-    /// project (`list`, wraps the resource-API reader). This is a different
+    /// an agent/vendor plugin into the project's `.claude/` (`add <id>`), or
+    /// list installed roles. Hub skills use the separate `ccteam skill` group.
+    /// This is a different
     /// noun from `session role` (which switches a *live* chat session's role
     /// inside the daemon).
     Role {
         #[command(subcommand)]
         cmd: RoleCommand,
+    },
+    /// Global skill library group: `ccteam skill <search|add|ls|rm|update|source|ensure-project|migrate-project>`.
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCommand,
     },
     /// Multi-host group: `ccteam host <join|mint-token|heartbeat|ls>`.
     ///
@@ -510,10 +515,8 @@ enum RoleCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install a ccteam-hub plugin into a project's `.claude/`. Fetches the
-    /// body from the hub, verifies its sha256 against the index, and writes it
-    /// verbatim (the file is already Claude-native — no conversion). On
-    /// success, prints a hint to `/role <role>` to switch to it in a chat.
+    /// Install a ccteam-hub agent/vendor plugin into a project. Skill entries
+    /// are refused with a pointer to `ccteam skill add`.
     Add {
         /// Plugin id (as shown by `ccteam role search`).
         id: String,
@@ -539,6 +542,84 @@ enum RoleCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Search skill entries in the curated ccteam-hub catalog.
+    Search {
+        #[arg(default_value = "")]
+        query: String,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Install one hub skill into the user-level ccteam skill library.
+    Add {
+        id: String,
+        #[arg(long = "as", value_name = "STEM")]
+        as_stem: Option<String>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// List the user-level skill library recursively.
+    Ls {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove one skill, or a whole skill tree with explicit --force.
+    Rm {
+        id: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Refresh a hub-pinned skill whose catalog sha differs from disk.
+    Update {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Register, update, list, or remove external skill sources.
+    Source {
+        #[command(subcommand)]
+        cmd: SkillSourceCommand,
+    },
+    /// Ensure `.agents/skills` plus the Claude discovery symlink.
+    EnsureProject {
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+    /// Move legacy project skills into `.agents/skills` and link Claude to it.
+    MigrateProject {
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillSourceCommand {
+    /// Clone a git source or copy a local directory into the library once.
+    Add {
+        origin: String,
+        #[arg(long, value_name = "STEM")]
+        name: Option<String>,
+        #[arg(long = "ref", value_name = "REV")]
+        r#ref: Option<String>,
+    },
+    /// Update one registered source or all sources.
+    Update {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        stem: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// List registered source metadata.
+    Ls {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Delete a registered source tree and deregister it.
+    Rm { stem: String },
 }
 
 /// v0.8.24 Track D — `ccteam host` multi-host ops.
@@ -877,6 +958,7 @@ fn main() -> Result<()> {
         Command::Session { cmd } => run_session(cmd),
         // v0.8.7 W3 — `ccteam role <search|add|list>` group.
         Command::Role { cmd } => run_role(cmd),
+        Command::Skill { cmd } => run_skill(cmd),
         Command::Host { cmd } => run_host(cmd),
         Command::Doctor { verify_mcp, json } => run_doctor(commands::DoctorOptions {
             verify_mcp,
@@ -1113,6 +1195,43 @@ fn run_role(cmd: RoleCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_skill(cmd: SkillCommand) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let out = match cmd {
+        SkillCommand::Search { query, format } => {
+            commands::run_skill_search(&paths, &query, format)?
+        }
+        SkillCommand::Add { id, as_stem, force } => {
+            commands::run_skill_add(&paths, &id, as_stem.as_deref(), force)?
+        }
+        SkillCommand::Ls { json } => commands::run_skill_list(&paths, json)?,
+        SkillCommand::Rm { id, force } => commands::run_skill_remove(&paths, &id, force)?,
+        SkillCommand::Update { id, all } => commands::run_skill_update(&paths, id.as_deref(), all)?,
+        SkillCommand::Source { cmd } => match cmd {
+            SkillSourceCommand::Add {
+                origin,
+                name,
+                r#ref,
+            } => {
+                commands::run_skill_source_add(&paths, &origin, name.as_deref(), r#ref.as_deref())?
+            }
+            SkillSourceCommand::Update { stem, all } => {
+                commands::run_skill_source_update(&paths, stem.as_deref(), all)?
+            }
+            SkillSourceCommand::Ls { json } => commands::run_skill_source_list(&paths, json)?,
+            SkillSourceCommand::Rm { stem } => commands::run_skill_source_remove(&paths, &stem)?,
+        },
+        SkillCommand::EnsureProject { project } => {
+            commands::run_skill_ensure_project(&paths, project.as_deref())?
+        }
+        SkillCommand::MigrateProject { project } => {
+            commands::run_skill_migrate_project(&paths, project.as_deref())?
+        }
+    };
+    print!("{out}");
+    Ok(())
 }
 
 /// Dispatch `ccteam internal <subcmd>` — the hidden low-level surface

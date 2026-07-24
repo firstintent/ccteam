@@ -103,7 +103,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 插件市场:装角色 / 技能 / 工作流
 
-**插件市场** 页浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览,**一键装进当前项目**(下载时校验 sha256,带「已装」标记)。装完在任意入口 `/role <角色>` 即可切换使用。
+**插件市场** 页浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库(管理员可见);全局库与项目之间不软链、不复制。
 
 ### 配置 Telegram / 飞书
 
@@ -315,7 +315,22 @@ ccteam role add data-scientist --project demo   # 装到指定项目
 ccteam role list                   # 列当前项目已装角色(= /role 可切的)
 ```
 
-读 ccteam-hub 的目录(HTTPS + 本地缓存 `~/.ccteam/cache/hub/`),从上游仓库 @固定提交拉取、校验 sha256 后写入,已存在不覆盖(`--force` 才覆盖)。多文件 skill 整目录落 `.claude/skills/<id>/`。Web 控制台插件市场页是同一来源的图形入口。
+读 ccteam-hub 的目录(HTTPS + 本地缓存 `~/.ccteam/cache/hub/`),从上游仓库 @固定提交拉取、校验 sha256 后写入,已存在不覆盖(`--force` 才覆盖)。技能装进全局库:多文件 skill 整批校验后整目录落 `~/.ccteam/skills/<id>/`。Web 控制台插件市场页是同一来源的图形入口。
+
+### `skill`(全局技能库;`role add` 遇技能会拒绝并指到这里)
+
+```bash
+ccteam skill search research        # 搜市场技能
+ccteam skill add deep-research      # 装进全局库 ~/.ccteam/skills
+ccteam skill ls                     # 列库(id 可嵌套,如 baoyu-skills/baoyu-comic)
+ccteam skill rm <id>                # 删单个技能;整树需 --force
+ccteam skill update --all           # 按 hub pin 重同步有更新的技能
+ccteam skill source add <git-url>   # 整仓登记进库(update/ls/rm 同组)
+ccteam skill ensure-project         # 项目自有技能面:.agents/skills + .claude/skills 软链
+ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/skills
+```
+
+全局库与项目**不相灌**:库里的技能只在会话里按条消息引用(web ＋ 菜单),要进 git 的项目技能自己放 `.agents/skills/`。
 
 ### 运维
 

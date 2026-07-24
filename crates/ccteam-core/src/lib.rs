@@ -132,8 +132,9 @@ pub use actions::{
 // adds the skill sibling `write_skill` (`.claude/skills/<id>/SKILL.md`) used
 // by the hub installer.
 pub use admin_actions::{
-    agent_md_path, change_persona, skill_dir_path, skill_md_path, write_role, write_skill,
-    write_skill_file, AddToolResult,
+    agent_md_path, change_persona, sanitize_skill_library_id, skill_dir_path, skill_md_path,
+    validate_skill_library_file_relpath, validate_skill_library_id, write_library_skill,
+    write_library_skill_file, write_role, write_skill, write_skill_file, AddToolResult,
 };
 // Ledger-only re-exports (product vote/parallel APIs deleted in v0.8.24 C2).
 pub use advise::{
@@ -273,7 +274,8 @@ pub use queries::{
     WorkflowSummary,
 };
 pub use roles::{
-    agents_dir, list_roles, list_skills, read_role, RoleDetail, RoleSummary, SkillSummary,
+    agents_dir, list_default_library_skills, list_library_skills, list_roles, list_skills,
+    read_role, LibrarySkillSummary, RoleDetail, RoleSummary, SkillSummary,
 };
 // v0.8.24 Track D — multi-host registry.
 pub use host::read_hostname;

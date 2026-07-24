@@ -2,12 +2,11 @@
 //! track-upstream model.
 //!
 //! The backend fetches `index.json` from the hub base and plugin bodies from
-//! each entry's `upstream` URL, then installs them into a project's
-//! `.claude/`. These tests stand a tiny in-process HTTP/1.1 responder in for
-//! `raw.githubusercontent.com` (loopback — on the fetch host-allowlist) so the
-//! round-trip is real HTTP but never touches the network. The project dir is a
-//! `TempDir`; `CCTEAM_HOME` is pointed at another `TempDir` so the hub cache
-//! writes under a throwaway root, not the real `~/.ccteam`.
+//! each entry's `upstream` URL, then installs agents into a project's
+//! `.claude/agents` and skills into an injected user-library root. These tests
+//! stand a tiny in-process HTTP/1.1 responder in for `raw.githubusercontent.com`
+//! (loopback — on the fetch host-allowlist) so the round-trip is real HTTP but
+//! never touches the network.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -194,9 +193,15 @@ async fn round_trip_fetch_parse_install_and_list() {
     assert_eq!(p.type_, "agent");
 
     // install_plugin writes the body verbatim under .claude/agents/.
-    let res = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect("install must succeed");
+    let res = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect("install must succeed");
     assert_eq!(res.id, id);
     assert_eq!(res.type_, "agent");
     assert!(!res.overwrote);
@@ -219,9 +224,15 @@ async fn install_sha_mismatch_is_refused() {
     let base = spawn_oneshot_http("HTTP/1.1 200 OK", AGENT_BODY);
     let p = plugin(&base, "helper", &sha256_hex(b"some other content"));
 
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("sha mismatch must be refused");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("sha mismatch must be refused");
     assert!(
         matches!(err, HubError::ShaMismatch { .. }),
         "expected ShaMismatch, got {err:?}"
@@ -238,9 +249,15 @@ async fn install_404_is_bad_status() {
     let base = spawn_oneshot_http("HTTP/1.1 404 Not Found", "nope");
     let p = plugin(&base, "helper", &sha256_hex(AGENT_BODY.as_bytes()));
 
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("a 404 body must be an honest error");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("a 404 body must be an honest error");
     match err {
         HubError::BadStatus { status, .. } => assert_eq!(status, 404),
         other => panic!("expected BadStatus 404, got {other:?}"),
@@ -256,9 +273,15 @@ async fn install_oversize_body_is_refused() {
     // sha is irrelevant — the size cap fires before the integrity check.
     let p = plugin(&base, "helper", &sha256_hex(&big));
 
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("an over-cap body must be refused");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("an over-cap body must be refused");
     match err {
         HubError::TooLarge { max, .. } => assert_eq!(max, MAX_HUB_BODY_BYTES),
         other => panic!("expected TooLarge, got {other:?}"),
@@ -277,9 +300,15 @@ async fn install_does_not_follow_redirects() {
     );
     let p = plugin(&base, "helper", &sha256_hex(AGENT_BODY.as_bytes()));
 
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("a redirect must NOT be followed");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("a redirect must NOT be followed");
     match err {
         HubError::BadStatus { status, .. } => assert!(
             (300..400).contains(&status),
@@ -299,9 +328,15 @@ async fn install_empty_body_is_refused() {
     let base = spawn_oneshot_http("HTTP/1.1 200 OK", blank);
     let p = plugin(&base, "helper", &sha256_hex(blank.as_bytes()));
 
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("an empty body must be refused");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("an empty body must be refused");
     assert!(
         matches!(err, HubError::EmptyBody(_)),
         "expected EmptyBody, got {err:?}"
@@ -318,9 +353,15 @@ async fn fetch_from_disallowed_host_is_refused() {
         "helper",
         &sha256_hex(AGENT_BODY.as_bytes()),
     );
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("a non-allowlisted host must be refused");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("a non-allowlisted host must be refused");
     assert!(
         matches!(err, HubError::HostNotAllowed { .. }),
         "expected HostNotAllowed, got {err:?}"
@@ -331,13 +372,14 @@ async fn fetch_from_disallowed_host_is_refused() {
 #[tokio::test]
 async fn install_refuses_existing_then_force_overwrites() {
     let proj = TempDir::new().unwrap();
+    let library_root = proj.path().join("unused-library");
     let id = "helper";
     let sha = sha256_hex(AGENT_BODY.as_bytes());
 
     // First install (one connection for the body).
     let base1 = spawn_oneshot_http("HTTP/1.1 200 OK", AGENT_BODY);
     let p1 = plugin(&base1, id, &sha);
-    let first = install_plugin(proj.path(), &p1, None, false)
+    let first = install_plugin(proj.path(), &library_root, &p1, None, false)
         .await
         .expect("first install succeeds");
     assert!(!first.overwrote);
@@ -345,7 +387,7 @@ async fn install_refuses_existing_then_force_overwrites() {
     // Second install without force → refused before any fetch (so the host is
     // never contacted; point upstream at a dead port to prove it).
     let p_dead = plugin("http://127.0.0.1:1", id, &sha);
-    let err = install_plugin(proj.path(), &p_dead, None, false)
+    let err = install_plugin(proj.path(), &library_root, &p_dead, None, false)
         .await
         .expect_err("re-install without force must be refused");
     assert!(
@@ -356,7 +398,7 @@ async fn install_refuses_existing_then_force_overwrites() {
     // With force it overwrites.
     let base2 = spawn_oneshot_http("HTTP/1.1 200 OK", AGENT_BODY);
     let p2 = plugin(&base2, id, &sha);
-    let forced = install_plugin(proj.path(), &p2, None, true)
+    let forced = install_plugin(proj.path(), &library_root, &p2, None, true)
         .await
         .expect("forced re-install succeeds");
     assert!(
@@ -375,9 +417,15 @@ async fn install_workflow_type_is_unsupported() {
     );
     p.type_ = "workflow".to_string();
     // UnsupportedType fires before any fetch → dead port is fine.
-    let err = install_plugin(proj.path(), &p, None, false)
-        .await
-        .expect_err("workflow type is not yet installable");
+    let err = install_plugin(
+        proj.path(),
+        &proj.path().join("unused-library"),
+        &p,
+        None,
+        false,
+    )
+    .await
+    .expect_err("workflow type is not yet installable");
     assert!(
         matches!(err, HubError::UnsupportedType(ref t) if t == "workflow"),
         "expected UnsupportedType(workflow), got {err:?}"
@@ -387,23 +435,61 @@ async fn install_workflow_type_is_unsupported() {
 #[tokio::test]
 async fn install_skill_writes_nested_skill_md() {
     let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
     let skill_body = "---\nname: do-thing\ndescription: does a thing\n---\nbody\n";
     let base = spawn_oneshot_http_dyn("HTTP/1.1 200 OK", "", skill_body.as_bytes().to_vec());
     let mut p = plugin(&base, "do-thing", &sha256_hex(skill_body.as_bytes()));
     p.type_ = "skill".to_string();
 
-    let res = install_plugin(proj.path(), &p, None, false)
+    let res = install_plugin(proj.path(), library.path(), &p, None, false)
         .await
         .expect("skill install succeeds");
     assert_eq!(res.type_, "skill");
-    let dest = proj.path().join(".claude/skills/do-thing/SKILL.md");
+    let dest = library.path().join("do-thing/SKILL.md");
     assert_eq!(res.path, dest);
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), skill_body);
+    assert!(
+        std::fs::read_dir(proj.path()).unwrap().next().is_none(),
+        "skill install must not touch the project tree"
+    );
+}
+
+#[tokio::test]
+async fn install_skill_nested_target_requires_force_for_existing_library_dir() {
+    let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
+    let stem = "suite/do-thing";
+    let skill_dir = library.path().join(stem);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("existing.txt"), "keep\n").unwrap();
+
+    let mut blocked = plugin("http://127.0.0.1:1", "do-thing", &sha256_hex(b"unused"));
+    blocked.type_ = "skill".to_string();
+    let err = install_plugin(proj.path(), library.path(), &blocked, Some(stem), false)
+        .await
+        .expect_err("an existing library dir must require force before fetch");
+    assert!(matches!(err, HubError::Exists(ref id) if id == stem));
+
+    let body = "---\ndescription: forced\n---\nbody\n";
+    let base = spawn_oneshot_http_dyn("HTTP/1.1 200 OK", "", body.as_bytes().to_vec());
+    let mut forced = plugin(&base, "do-thing", &sha256_hex(body.as_bytes()));
+    forced.type_ = "skill".to_string();
+    let result = install_plugin(proj.path(), library.path(), &forced, Some(stem), true)
+        .await
+        .expect("force should publish the library SKILL.md");
+    assert!(result.overwrote);
+    assert_eq!(result.path, skill_dir.join("SKILL.md"));
+    assert_eq!(std::fs::read_to_string(result.path).unwrap(), body);
+    assert!(
+        std::fs::read_dir(proj.path()).unwrap().next().is_none(),
+        "forced skill install must not touch the project tree"
+    );
 }
 
 #[tokio::test]
 async fn install_multi_file_skill_lands_every_file() {
     let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
     let skill_md = "---\nname: tdd\ndescription: test-driven\n---\nbody\n";
     let script = "#!/bin/sh\necho hi\n";
     let (listener, base) = bind_loopback();
@@ -443,11 +529,11 @@ async fn install_multi_file_skill_lands_every_file() {
         ],
     );
 
-    let res = install_plugin(proj.path(), &p, None, false)
+    let res = install_plugin(proj.path(), library.path(), &p, None, false)
         .await
         .expect("multi-file skill install succeeds");
     assert_eq!(res.type_, "skill");
-    let skill_dir = proj.path().join(".claude/skills/tdd");
+    let skill_dir = library.path().join("tdd");
     // InstallResult.path is the primary SKILL.md.
     assert_eq!(res.path, skill_dir.join("SKILL.md"));
     assert_eq!(
@@ -459,11 +545,16 @@ async fn install_multi_file_skill_lands_every_file() {
         std::fs::read_to_string(skill_dir.join("scripts/run.sh")).unwrap(),
         script
     );
+    assert!(
+        std::fs::read_dir(proj.path()).unwrap().next().is_none(),
+        "multi-file skill install must not touch the project tree"
+    );
 }
 
 #[tokio::test]
 async fn multi_file_skill_sha_mismatch_writes_nothing() {
     let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
     let skill_md = "---\nname: tdd\n---\nbody\n";
     let script = "echo hi\n";
     let (listener, base) = bind_loopback();
@@ -503,7 +594,7 @@ async fn multi_file_skill_sha_mismatch_writes_nothing() {
         ],
     );
 
-    let err = install_plugin(proj.path(), &p, None, false)
+    let err = install_plugin(proj.path(), library.path(), &p, None, false)
         .await
         .expect_err("a manifest sha mismatch must abort the whole install");
     assert!(
@@ -511,8 +602,12 @@ async fn multi_file_skill_sha_mismatch_writes_nothing() {
         "expected ShaMismatch, got {err:?}"
     );
     assert!(
-        !proj.path().join(".claude/skills/tdd").exists(),
+        !library.path().join("tdd").exists(),
         "no skill dir should be created when a manifest file fails its sha"
+    );
+    assert!(
+        std::fs::read_dir(proj.path()).unwrap().next().is_none(),
+        "failed skill install must not touch the project tree"
     );
 }
 
@@ -552,20 +647,21 @@ async fn load_catalog_caches_then_reads_offline() {
 #[test]
 fn installed_status_reflects_disk() {
     let proj = TempDir::new().unwrap();
+    let library_root = proj.path().join("unused-library");
     let sha = sha256_hex(AGENT_BODY.as_bytes());
     // upstream host is irrelevant for installed_status (no fetch).
     let p = plugin("http://127.0.0.1:1", "helper", &sha);
 
     // Absent → NotInstalled.
     assert_eq!(
-        installed_status(proj.path(), &p),
+        installed_status(proj.path(), &library_root, &p),
         InstalledStatus::NotInstalled
     );
 
     // Write the exact body → Installed (sha matches).
     write_agent(proj.path(), "helper", AGENT_BODY);
     assert_eq!(
-        installed_status(proj.path(), &p),
+        installed_status(proj.path(), &library_root, &p),
         InstalledStatus::Installed
     );
 
@@ -576,7 +672,48 @@ fn installed_status_reflects_disk() {
         &sha256_hex(b"newer hub content"),
     );
     assert_eq!(
-        installed_status(proj.path(), &stale),
+        installed_status(proj.path(), &library_root, &stale),
+        InstalledStatus::UpdateAvailable
+    );
+}
+
+#[test]
+fn installed_status_single_file_skill_uses_library_three_states() {
+    let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
+    let skill_body = "---\ndescription: library skill\n---\nbody\n";
+    let mut p = plugin(
+        "http://127.0.0.1:1",
+        "do-thing",
+        &sha256_hex(skill_body.as_bytes()),
+    );
+    p.type_ = "skill".to_string();
+
+    assert_eq!(
+        installed_status(proj.path(), library.path(), &p),
+        InstalledStatus::NotInstalled
+    );
+
+    let project_copy = proj.path().join(".claude/skills/do-thing/SKILL.md");
+    std::fs::create_dir_all(project_copy.parent().unwrap()).unwrap();
+    std::fs::write(&project_copy, skill_body).unwrap();
+    assert_eq!(
+        installed_status(proj.path(), library.path(), &p),
+        InstalledStatus::NotInstalled,
+        "project-local skill copies must not affect global library status"
+    );
+
+    let library_copy = library.path().join("do-thing/SKILL.md");
+    std::fs::create_dir_all(library_copy.parent().unwrap()).unwrap();
+    std::fs::write(&library_copy, skill_body).unwrap();
+    assert_eq!(
+        installed_status(proj.path(), library.path(), &p),
+        InstalledStatus::Installed
+    );
+
+    std::fs::write(&library_copy, "stale\n").unwrap();
+    assert_eq!(
+        installed_status(proj.path(), library.path(), &p),
         InstalledStatus::UpdateAvailable
     );
 }
@@ -584,6 +721,7 @@ fn installed_status_reflects_disk() {
 #[test]
 fn installed_status_multi_file_skill_compares_whole_dir() {
     let proj = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
     let skill_md = "---\nname: tdd\n---\nbody\n";
     let script = "echo hi\n";
     let p = HubPlugin {
@@ -609,33 +747,33 @@ fn installed_status_multi_file_skill_compares_whole_dir() {
             },
         ]),
     };
-    let dir = proj.path().join(".claude/skills/tdd");
+    let dir = library.path().join("tdd");
 
     // None present → NotInstalled.
     assert_eq!(
-        installed_status(proj.path(), &p),
+        installed_status(proj.path(), library.path(), &p),
         InstalledStatus::NotInstalled
     );
 
-    // Only SKILL.md present → partial → UpdateAvailable.
+    // Only SKILL.md present → incomplete → NotInstalled.
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     std::fs::write(dir.join("SKILL.md"), skill_md).unwrap();
     assert_eq!(
-        installed_status(proj.path(), &p),
-        InstalledStatus::UpdateAvailable
+        installed_status(proj.path(), library.path(), &p),
+        InstalledStatus::NotInstalled
     );
 
     // All files present + matching → Installed.
     std::fs::write(dir.join("scripts/run.sh"), script).unwrap();
     assert_eq!(
-        installed_status(proj.path(), &p),
+        installed_status(proj.path(), library.path(), &p),
         InstalledStatus::Installed
     );
 
     // Tamper a file → UpdateAvailable.
     std::fs::write(dir.join("scripts/run.sh"), "different\n").unwrap();
     assert_eq!(
-        installed_status(proj.path(), &p),
+        installed_status(proj.path(), library.path(), &p),
         InstalledStatus::UpdateAvailable
     );
 }

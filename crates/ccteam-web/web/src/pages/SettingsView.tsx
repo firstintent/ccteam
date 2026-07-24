@@ -1,25 +1,27 @@
 // v0.8.24 Track A — 设置 top-level view (prototype `#view-settings`):
-// set-nav second column with FIVE sub-pages — 运维总览 / 插件市场 /
-// IM 接入 / 通用 / 账号. 运维总览 combines Status + Hosts.
+// set-nav second column of sub-pages. Tabs: admin sees 运维总览 / 插件市场 /
+// 通用 / 账号 / 管理员; a tenant sees ONLY 插件市场 / 通用 / 账号. 运维总览
+// combines Status + Hosts; 管理员 carries user management.
 //
-// ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / IM 接入 are
-// admin-only nav items — a tenant sees ONLY 插件市场 / 通用 / 账号 (the
-// backend 403s regardless; this is the UI层 beta/visibility gate). The 账号
-// panel absorbs the old AvatarMenu entirely (头像 / 昵称 / 语言入口 / 登出 +
-// web token), and carries the tenant's self-serve 「我的 IM bot」.
+// ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / 管理员 are
+// admin-only nav items (the backend 403s regardless; this is the UI层
+// beta/visibility gate). The 账号 panel absorbs the old AvatarMenu entirely
+// (头像 / 昵称 / 语言入口 / 登出 + web token) plus IM: a tenant gets the
+// self-serve 「我的 IM bot」, an admin gets the global Telegram/Lark
+// credentials (no standalone IM tab).
 
 import { useMemo, useState } from "react";
 import {
   Activity,
-  MessageSquare,
   Package,
   SlidersHorizontal,
   User,
+  Users,
 } from "lucide-react";
 import HostsView from "./HostsView";
 import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
-import SettingsPage, { MyImSection } from "./SettingsPage";
+import SettingsPage, { MyImSection, UserManagementSection } from "./SettingsPage";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -29,14 +31,14 @@ import { resetToken } from "../lib/meApi";
 import { toastBus } from "../lib/toastBus";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
-export type SettingsTab = "ops" | "market" | "im" | "general" | "account";
+export type SettingsTab = "ops" | "market" | "general" | "account" | "admin";
 
 const ITEMS: { id: SettingsTab; labelKey: string; adminOnly: boolean; icon: React.ReactNode }[] = [
   { id: "ops", labelKey: "setOps", adminOnly: true, icon: <Activity /> },
   { id: "market", labelKey: "setMarket", adminOnly: false, icon: <Package /> },
-  { id: "im", labelKey: "setIm", adminOnly: true, icon: <MessageSquare /> },
   { id: "general", labelKey: "setGeneral", adminOnly: false, icon: <SlidersHorizontal /> },
   { id: "account", labelKey: "setAccount", adminOnly: false, icon: <User /> },
+  { id: "admin", labelKey: "setAdmin", adminOnly: true, icon: <Users /> },
 ];
 
 /** Visible nav items for the caller — fail-closed: admin-only panels are
@@ -46,7 +48,8 @@ export function visibleSettingsItems(isAdmin: boolean): SettingsTab[] {
   return ITEMS.filter((it) => isAdmin || !it.adminOnly).map((it) => it.id);
 }
 
-/** Resolve the routed tab against the caller's visible items. */
+/** Resolve the routed tab against the caller's visible items. Legacy routes:
+ *  hosts/status → ops. Retired tabs are not aliased (pre-v1 no-shim policy). */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
 export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): SettingsTab {
   const visible = visibleSettingsItems(isAdmin);
@@ -115,15 +118,7 @@ export default function SettingsView({
             </>
           ) : null}
 
-          {active === "im" && isAdmin ? (
-            <>
-              <header>
-                <h1>{t("setIm")}</h1>
-                <p>{t("imDesc")}</p>
-              </header>
-              <SettingsPage />
-            </>
-          ) : null}
+          {active === "admin" && isAdmin ? <AdminPanel lang={lang} /> : null}
 
           {active === "general" ? (
             <GeneralPanel
@@ -160,6 +155,20 @@ export function OpsPanel({ lang, rail }: { lang: Lang; rail: SessionSummary[] })
       <section className="ops-panel" aria-label="Hosts">
         <HostsView lang={lang} />
       </section>
+    </div>
+  );
+}
+
+/** 管理员 · Admin — user management ONLY (「用户管理 · Users」). Rendered just
+ *  for admins: the nav item is gated fail-closed, so a tenant never sees it. */
+export function AdminPanel({ lang }: { lang: Lang }) {
+  const t = makeT(lang);
+  return (
+    <div data-testid="settings-admin" className="flex flex-col gap-5">
+      <header>
+        <h1>{t("setAdmin")}</h1>
+      </header>
+      <UserManagementSection />
     </div>
   );
 }
@@ -403,9 +412,11 @@ export function AccountPanel({
         </div>
       </div>
 
-      {/* Tenant self-serve IM bot (v0.8.20 F2) lives under 账号 — the global
-          IM credentials stay admin-only under 设置→IM 接入. */}
-      {!isAdmin ? <MyImSection /> : null}
+      {/* IM under 账号: a tenant gets the self-serve 「我的 IM bot」
+          (v0.8.20 F2); an admin gets the GLOBAL Telegram/Lark credentials
+          (SettingsPage, admin-gated + fail-closed). User management is NOT
+          here — it lives on the admin-only 管理员 tab. */}
+      {isAdmin ? <SettingsPage /> : <MyImSection />}
     </div>
   );
 }

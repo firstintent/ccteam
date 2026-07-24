@@ -15,7 +15,8 @@
 //!   POST .../marketplace/install   → 201, `.claude/agents/<id>.md` on disk
 //!   GET /projects/{slug}/marketplace → installed_status = installed
 //!
-//! plus unknown-id (404) + unknown-project (404) + body-preview (200) edges.
+//! A parallel skill case pins the global-library target and its three status
+//! states. The suite also covers unknown-id/project and body-preview edges.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -30,6 +31,8 @@ const HUB_BASE_ENV: &str = "CCTEAM_HUB_BASE";
 
 const AGENT_BODY: &str =
     "---\nname: helper\ndescription: A curated helper\n---\nYou are a helpful agent.\n";
+const SKILL_BODY: &str =
+    "---\nname: helper-skill\ndescription: A curated skill\n---\nUse this skill.\n";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let d = Sha256::digest(bytes);
@@ -80,6 +83,31 @@ fn good_index_json(id: &str, base: &str) -> String {
     )
 }
 
+fn skill_index_json(id: &str, base: &str) -> String {
+    let sha = sha256_hex(SKILL_BODY.as_bytes());
+    format!(
+        r#"{{
+          "version": 1,
+          "name": "ccteam-hub",
+          "description": "curated",
+          "generated_at": "2026-01-01T00:00:00Z",
+          "plugins": [
+            {{
+              "id": "{id}",
+              "type": "skill",
+              "name": "Helper Skill",
+              "description": "A curated skill",
+              "upstream": "{base}/skills/{id}/SKILL.md",
+              "content_sha": "{sha}",
+              "source": "ccteam",
+              "license": "MIT",
+              "tags": ["util"]
+            }}
+          ]
+        }}"#
+    )
+}
+
 /// Bind + serve a looping fake hub for a single agent `id`. Returns the base
 /// URL; the index it serves points `upstream` back at this base so the engine's
 /// upstream-fetch (loopback — on the host allowlist) resolves `/agents/<id>.md`.
@@ -122,6 +150,47 @@ fn spawn_helper_hub(id: &str, serve_body: bool) -> String {
                  Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 b.len(),
                 b
+            ),
+            None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        };
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+    });
+    base
+}
+
+fn spawn_skill_hub(id: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let index_json = skill_index_json(id, &base);
+    let body_path = format!("/skills/{id}/SKILL.md");
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let body = if path == "/index.json" {
+            Some(index_json.as_str())
+        } else if path == body_path {
+            Some(SKILL_BODY)
+        } else {
+            None
+        };
+        let resp = match body {
+            Some(body) => format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
             ),
             None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 .to_string(),
@@ -296,6 +365,83 @@ async fn marketplace_round_trip_catalog_decorate_install() {
         "after install the entry must show installed; got {:#?}",
         v["plugins"]
     );
+
+    std::env::remove_var(HUB_BASE_ENV);
+}
+
+#[tokio::test]
+#[serial]
+async fn marketplace_skill_install_and_status_use_global_library_only() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "demo");
+    let project_dir = paths.project_dir("demo");
+    let library_root = paths.skills_dir();
+
+    let id = "helper-skill";
+    let hub_base = spawn_skill_hub(id);
+    std::env::set_var(HUB_BASE_ENV, &hub_base);
+
+    let addr = spawn_router(AppState::new(paths)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/v1/projects/demo/marketplace?refresh=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "decorated skill catalog");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["type"], "skill");
+    assert_eq!(v["plugins"][0]["installed_status"], "not_installed");
+
+    let resp = client
+        .post(format!(
+            "http://{addr}/api/v1/projects/demo/marketplace/install"
+        ))
+        .json(&serde_json::json!({ "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "skill install");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let dest = library_root.join("helper-skill/SKILL.md");
+    assert_eq!(v["type"], "skill");
+    assert_eq!(v["path"], dest.display().to_string());
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), SKILL_BODY);
+    assert!(
+        !project_dir.join(".agents/skills").exists()
+            && !project_dir.join(".claude/skills").exists(),
+        "skill install must not write either project skill face"
+    );
+
+    let resp = client
+        .get(format!("http://{addr}/api/v1/projects/demo/marketplace"))
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["installed_status"], "installed");
+
+    std::fs::write(&dest, "stale\n").unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/v1/projects/demo/marketplace"))
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["installed_status"], "update_available");
+
+    std::fs::remove_file(&dest).unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/v1/projects/demo/marketplace"))
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["plugins"][0]["installed_status"], "not_installed");
 
     std::env::remove_var(HUB_BASE_ENV);
 }

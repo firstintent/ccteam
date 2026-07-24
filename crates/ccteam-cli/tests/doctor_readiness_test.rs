@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use ccteam_core::{ProjectEntry, LOCAL_HOST};
+use chrono::Utc;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -102,6 +104,7 @@ fn bare_doctor_renders_every_check_line_and_a_summary() {
         "updates",
         "pricing tables",
         "home layout",
+        "project skills",
         "summary:",
     ] {
         assert!(
@@ -109,6 +112,46 @@ fn bare_doctor_renders_every_check_line_and_a_summary() {
             "bare doctor output missing {expected:?}. stdout:\n{stdout}",
         );
     }
+}
+
+#[test]
+fn doctor_warns_for_legacy_project_skill_entity_without_failing() {
+    let sb = sandbox();
+    std::fs::write(
+        &sb.claude_json,
+        json!({"mcpServers": {"ccteam": {"command": "/usr/bin/true", "args": [], "env": {}}}})
+            .to_string(),
+    )
+    .unwrap();
+    let project = sb._tmp.path().join("legacy-project");
+    std::fs::create_dir_all(project.join(".claude/skills/old-skill")).unwrap();
+    ccteam_core::config::upsert_project(
+        &sb.ccteam_home,
+        ProjectEntry {
+            slug: "legacy-project".to_string(),
+            path: project,
+            host: LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
+            team: "dev".to_string(),
+            installed_at: Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let (stdout, code) = run_bare_doctor(&sb);
+    assert!(
+        stdout.contains("[WARN] project skills")
+            && stdout.contains("legacy-project")
+            && stdout.contains("ccteam skill migrate-project"),
+        "doctor must emit one migration advisory line. stdout:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("project skills:").count(),
+        1,
+        "doctor must aggregate the advisory into one line. stdout:\n{stdout}"
+    );
+    assert_eq!(code, 0, "project-skill advisory must never fail doctor");
 }
 
 #[test]

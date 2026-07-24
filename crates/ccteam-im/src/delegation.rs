@@ -43,6 +43,9 @@ pub struct DelegationSignal {
     pub host: String,
     /// True = the vendor turn boundary (child idle); false = interim message.
     pub boundary: bool,
+    /// True when the boundary came from the vendor's structured fatal-turn
+    /// outcome (`TurnFailed` / terminal `Error`), rather than normal completion.
+    pub vendor_error: bool,
     /// Interim assistant messages that preceded this boundary within the same
     /// vendor turn (0 for interim signals and single-message turns).
     pub interim_notes: usize,
@@ -153,6 +156,30 @@ pub fn build_notification_text(
     assistant_text: &str,
     interim_notes: usize,
 ) -> String {
+    build_notification_text_with_outcome(
+        child_sid,
+        vendor,
+        title,
+        turn_id,
+        assistant_text,
+        interim_notes,
+        false,
+    )
+}
+
+/// Outcome-aware completion notification used by the gateway. Keeping the
+/// ordinary public builder as a success wrapper makes its existing output a
+/// byte-for-byte compatibility contract while structured vendor failures get
+/// an unmistakable leading marker.
+pub(crate) fn build_notification_text_with_outcome(
+    child_sid: &str,
+    vendor: AgentVendor,
+    title: Option<&str>,
+    turn_id: &str,
+    assistant_text: &str,
+    interim_notes: usize,
+    vendor_error: bool,
+) -> String {
     let label = title
         .filter(|t| !t.is_empty())
         .map(|t| format!(" \"{t}\""))
@@ -170,8 +197,13 @@ pub fn build_notification_text(
     } else {
         String::new()
     };
+    let outcome = if vendor_error {
+        "[delegation completed with VENDOR ERROR] "
+    } else {
+        ""
+    };
     format!(
-        "[ccteam] delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
+        "[ccteam] {outcome}delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
          --- final answer ---\n{}\n\
          (child is idle: if the task is not actually finished, follow up with session_dispatch{{sid:{child_sid}, task:…}}; run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
         vendor_key(vendor),
@@ -466,6 +498,13 @@ mod tests {
         assert!(t.contains("session_collect{sid:s7, tail:true}"));
         // Single-message turn → no interim-fold sentence.
         assert!(!t.contains("interim note(s)"));
+        assert_eq!(
+            t,
+            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE, waiting for the next dispatch.\n\
+             --- final answer ---\n\
+             hello\n\
+             (child is idle: if the task is not actually finished, follow up with session_dispatch{sid:s7, task:…}; run session_collect{sid:s7, tail:true} for the full answer)"
+        );
     }
 
     #[test]

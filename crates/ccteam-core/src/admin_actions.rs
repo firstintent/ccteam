@@ -149,6 +149,194 @@ pub fn skill_dir_path(project_dir: &Path, skill: &str) -> PathBuf {
     project_dir.join(".claude").join("skills").join(skill)
 }
 
+/// Validate a global skill-library id.
+///
+/// Library ids are relative POSIX paths with one or more `/`-separated
+/// segments. Every segment must match `[a-z0-9][a-z0-9_-]*`. This deliberately
+/// differs from [`validate_bot_name`]: nested ids such as
+/// `baoyu-skills/baoyu-comic` are first-class, while absolute paths, hidden
+/// segments, empty segments, backslashes, and traversal are rejected.
+pub fn validate_skill_library_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("skill library id must be non-empty");
+    }
+    if id.contains('\\') {
+        bail!("skill library id `{id}` must use POSIX `/` separators");
+    }
+    for segment in id.split('/') {
+        if segment.is_empty() {
+            bail!("skill library id `{id}` contains an empty segment");
+        }
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            bail!("skill library id `{id}` contains an empty segment");
+        };
+        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+            bail!(
+                "skill library id `{id}` has invalid segment `{segment}` (expected [a-z0-9][a-z0-9_-]*)"
+            );
+        }
+        if chars
+            .any(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-')
+        {
+            bail!(
+                "skill library id `{id}` has invalid segment `{segment}` (expected [a-z0-9][a-z0-9_-]*)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort normalization for an incoming `--as` stem.
+///
+/// A valid nested library id is passed through unchanged. Any other input is
+/// treated as one stem: it is lowercased, runs outside `[a-z0-9_-]` collapse
+/// to `-`, and invalid leading punctuation is stripped. Thus `owner/tool`
+/// remains nested, while `Owner/Tool` becomes the single stem `owner-tool`.
+pub fn sanitize_skill_library_id(raw: &str) -> Result<String> {
+    if validate_skill_library_id(raw).is_ok() {
+        return Ok(raw.to_string());
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.trim().chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
+            out.push(ch);
+            last_dash = ch == '-';
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let sanitized = out
+        .trim_start_matches(&['-', '_'][..])
+        .trim_end_matches('-')
+        .to_string();
+    validate_skill_library_id(&sanitized).with_context(|| {
+        format!("skill library id `{raw}` sanitizes to an invalid or empty stem")
+    })?;
+    Ok(sanitized)
+}
+
+fn library_skill_dir_path(root: &Path, id: &str) -> PathBuf {
+    root.join(id)
+}
+
+fn library_skill_md_path(root: &Path, id: &str) -> PathBuf {
+    library_skill_dir_path(root, id).join("SKILL.md")
+}
+
+/// Write `<root>/<id>/SKILL.md` in the global skill-library layout.
+///
+/// The body validation matches [`write_skill`]: whitespace-only content is
+/// rejected. Existing files are replaced only when `force` is true.
+pub fn write_library_skill(root: &Path, id: &str, content: &str, force: bool) -> Result<PathBuf> {
+    validate_skill_library_id(id)?;
+    if content.trim().is_empty() {
+        bail!("write_library_skill: content is empty");
+    }
+    let path = library_skill_md_path(root, id);
+    atomic_write_library_file(&path, content.as_bytes(), force)?;
+    Ok(path)
+}
+
+/// Write one file of a multi-file library skill to
+/// `<root>/<id>/<relpath>`. `relpath` is a relative POSIX path containing
+/// only normal, non-hidden segments; existing files require `force`.
+pub fn write_library_skill_file(
+    root: &Path,
+    id: &str,
+    relpath: &str,
+    bytes: &[u8],
+    force: bool,
+) -> Result<PathBuf> {
+    validate_skill_library_id(id)?;
+    let relpath = validate_skill_library_file_relpath(relpath)?;
+    let path = library_skill_dir_path(root, id).join(relpath);
+    atomic_write_library_file(&path, bytes, force)?;
+    Ok(path)
+}
+
+/// Validate a manifest file path for [`write_library_skill_file`]. The
+/// normalized relative path is returned so callers can preflight an entire
+/// manifest before performing any writes.
+pub fn validate_skill_library_file_relpath(relpath: &str) -> Result<PathBuf> {
+    if relpath.is_empty() {
+        bail!("skill file relpath must be non-empty");
+    }
+    if relpath.starts_with('/') || relpath.contains('\\') {
+        bail!("skill file relpath must be a relative POSIX path: `{relpath}`");
+    }
+
+    let mut normalized = PathBuf::new();
+    for segment in relpath.split('/') {
+        if segment.is_empty() {
+            bail!("skill file relpath `{relpath}` contains an empty segment");
+        }
+        if segment.starts_with('.') {
+            bail!("skill file relpath `{relpath}` contains a hidden or traversal segment");
+        }
+        normalized.push(segment);
+    }
+    if normalized
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("skill file relpath `{relpath}` must contain only normal segments");
+    }
+    Ok(normalized)
+}
+
+/// Write a complete temp file and then publish it atomically. The hard-link
+/// branch is an atomic create-if-absent, so a concurrent non-force writer can
+/// never clobber a file that appeared after validation.
+fn atomic_write_library_file(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("skill library file has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create_dir_all {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("skill library path has no file name: {}", path.display()))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+
+    let published = if force {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    } else {
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => std::fs::remove_file(&tmp)
+                .with_context(|| format!("remove temporary file {}", tmp.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&tmp);
+                bail!(
+                    "skill library file {} already exists (pass force to overwrite)",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(err).with_context(|| {
+                    format!(
+                        "publish temporary file {} -> {}",
+                        tmp.display(),
+                        path.display()
+                    )
+                })
+            }
+        }
+    };
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published
+}
+
 /// Validate a skill-relative file path: a plain relative path of only
 /// `Normal` components (rejects absolute paths, `..`, `.`, and Windows
 /// prefixes) so a hostile manifest `relpath` can never escape the skill dir.
@@ -413,6 +601,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_skill_library_id_accepts_nested_ids() {
+        for id in ["skill", "owner/skill", "owner_2/tool-kit", "0/a"] {
+            validate_skill_library_id(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_skill_library_id_rejects_unsafe_or_noncanonical_ids() {
+        for id in [
+            "",
+            "/skill",
+            "skill/",
+            "owner//skill",
+            ".hidden",
+            "owner/.hidden",
+            ".",
+            "..",
+            "owner/../skill",
+            "owner\\skill",
+            "Owner/skill",
+            "owner/Skill",
+            "_skill",
+            "-skill",
+        ] {
+            assert!(
+                validate_skill_library_id(id).is_err(),
+                "expected invalid library id {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_skill_library_id_preserves_valid_nested_ids_and_flattens_stems() {
+        assert_eq!(
+            sanitize_skill_library_id("owner/tool-kit").unwrap(),
+            "owner/tool-kit"
+        );
+        assert_eq!(
+            sanitize_skill_library_id("Owner/Tool Kit").unwrap(),
+            "owner-tool-kit"
+        );
+        assert_eq!(sanitize_skill_library_id("__Foo!!").unwrap(), "foo");
+        assert!(sanitize_skill_library_id("!!!").is_err());
+    }
+
+    #[test]
     fn change_persona_writes_full_body() {
         let tmp = TempDir::new().unwrap();
         seed_persona(tmp.path(), "alice", "---\nname: alice\n---\nbody\n");
@@ -495,6 +729,61 @@ mod tests {
         // Path-traversal / charset escapes are rejected by validate_bot_name.
         assert!(write_skill(tmp.path(), "../escape", "---\nx\n---\n").is_err());
         assert!(write_skill(tmp.path(), "Bad Name", "---\nx\n---\n").is_err());
+    }
+
+    #[test]
+    fn write_library_skill_supports_nested_ids_and_explicit_force() {
+        let tmp = TempDir::new().unwrap();
+        let old = "---\ndescription: old\n---\nbody\n";
+        let new = "---\ndescription: new\n---\nbody\n";
+        let written = write_library_skill(tmp.path(), "owner/tool", old, false).unwrap();
+        assert_eq!(written, tmp.path().join("owner/tool/SKILL.md"));
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), old);
+
+        assert!(write_library_skill(tmp.path(), "owner/tool", new, false).is_err());
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), old);
+        write_library_skill(tmp.path(), "owner/tool", new, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), new);
+        assert!(write_library_skill(tmp.path(), "owner/other", " \n", false).is_err());
+    }
+
+    #[test]
+    fn write_library_skill_file_supports_bytes_and_rejects_bad_relpaths() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = [0, 1, 2, 0xff];
+        let written =
+            write_library_skill_file(tmp.path(), "owner/tool", "assets/icon.bin", &bytes, false)
+                .unwrap();
+        assert_eq!(written, tmp.path().join("owner/tool/assets/icon.bin"));
+        assert_eq!(std::fs::read(&written).unwrap(), bytes);
+        assert!(write_library_skill_file(
+            tmp.path(),
+            "owner/tool",
+            "assets/icon.bin",
+            b"new",
+            false,
+        )
+        .is_err());
+        write_library_skill_file(tmp.path(), "owner/tool", "assets/icon.bin", b"new", true)
+            .unwrap();
+        assert_eq!(std::fs::read(&written).unwrap(), b"new");
+
+        for relpath in [
+            "",
+            "/absolute",
+            "../escape",
+            "assets/../escape",
+            ".hidden",
+            "assets/.hidden/file",
+            "assets//file",
+            "assets\\file",
+        ] {
+            assert!(
+                write_library_skill_file(tmp.path(), "owner/tool", relpath, b"body", false,)
+                    .is_err(),
+                "expected invalid library relpath {relpath:?}"
+            );
+        }
     }
 
     #[test]

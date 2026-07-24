@@ -1,5 +1,8 @@
-// v0.8.8 F4 — Settings page: configure IM credentials (Telegram + Lark) +
-// per-user (tenant) management from the web UI.
+// v0.8.8 F4 — Settings panels: the admin's GLOBAL IM credentials
+// (Telegram + Lark), the tenant's self-serve 「我的 IM bot」, and the
+// admin-only user management table. SettingsView places them: credentials
+// under 设置→账号 (admin), MyImSection under 账号 (tenant), and
+// UserManagementSection on the standalone 管理员 · Admin tab.
 // Backend SoT: `crates/ccteam-web/src/routes/im_config.rs` (+ `users.rs`);
 // clients: `lib/configApi.ts` + `lib/usersApi.ts`.
 //
@@ -21,8 +24,8 @@
 //   - Overwriting an already-configured secret is destructive → an inline
 //     two-step confirm (NOT window.confirm, which clashes with the dark/light
 //     SPA chrome).
-//   - Admin-gate: this page is admin-only (IM creds + user management are
-//     GLOBAL daemon config). A tenant gets a pointer to the avatar menu.
+//   - Admin-gate: this panel is admin-only (global IM creds are GLOBAL
+//     daemon config). A tenant gets their self-serve MyImSection instead.
 //   - Theme tokens only (surface-*/brand-*/text-*/status-*), no bare colors.
 //
 // NOTE — no "测试连接 / Test connection" button: configApi exposes no
@@ -80,8 +83,8 @@ import {
 const CHAT_ID_POLL_MS = 1500;
 
 export default function SettingsPage() {
-  // v0.8.18 档1 — this page is admin-only (IM credentials + user management are
-  // GLOBAL daemon config); a tenant gets a pointer to the avatar menu instead.
+  // v0.8.18 档1 — this panel is admin-only (global IM credentials are GLOBAL
+  // daemon config); a tenant gets their self-serve MyImSection instead.
   const { me } = useMe();
   const [config, setConfig] = useState<ImConfigStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -123,9 +126,10 @@ export default function SettingsPage() {
       </div>
     );
   }
-  // v0.8.24 A4 — 设置→IM 接入 is an admin-only panel (SettingsView gates the
-  // nav item); a tenant reaching this component directly still only gets its
-  // self-serve "我的 IM bot" (fail-closed — the global credentials 403 anyway).
+  // v0.8.24 A4 — the global IM credentials are an admin-only panel
+  // (SettingsView renders it under 账号 for admins); a tenant reaching this
+  // component directly still only gets its self-serve "我的 IM bot"
+  // (fail-closed — the global credentials 403 anyway).
   if (!me.is_admin) {
     return (
       <div data-testid="settings-tenant" className="flex flex-col gap-6">
@@ -174,8 +178,6 @@ export default function SettingsPage() {
         <TelegramSection status={config.telegram} onSaved={reload} />
         <LarkSection status={config.lark} onSaved={reload} />
       </section>
-
-      <UserManagementSection />
     </div>
   );
 }
@@ -714,7 +716,8 @@ export function LarkSection({
 // Backend SoT: `crates/ccteam-web/src/routes/users.rs`; client `lib/usersApi`.
 // Admin-gated: a non-admin caller 403s → we show the read-only note instead of
 // the management table. There is deliberately NO `ccteam user` CLI — runtime
-// user writes live here on the web.
+// user writes live here on the web. SettingsView renders this as the whole
+// content of the admin-only 管理员 · Admin tab (never for tenants).
 // --------------------------------------------------------------------------
 
 // --------------------------------------------------------------------------
@@ -1001,7 +1004,7 @@ export function MyImSection() {
   );
 }
 
-function UserManagementSection() {
+export function UserManagementSection() {
   const [users, setUsers] = useState<TenantView[] | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [error, setError] = useState<string | null>(null);

@@ -8,7 +8,7 @@
 //                               keyed by sid → atomic per-sid state reset).
 //   工作流 (`/flow/:tab?`)     — Skills / Roles / MCP / 自进化
 //                               (WorkflowView, set-nav layout).
-//   设置 (`/settings/:tab?`)   — 主机 / 插件市场 / Status / IM / 通用 / 账号
+//   设置 (`/settings/:tab?`)   — 运维总览 / 插件市场 / 通用 / 账号 / 管理员
 //                               (SettingsView, set-nav layout; admin-gated
 //                               panels stay fail-closed via useMe).
 //

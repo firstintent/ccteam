@@ -1,5 +1,6 @@
 //! LIVE smoke (network — `#[ignore]`, NOT in the deterministic baseline):
-//! installs a real multi-file skill from the live ccteam-hub into a TempDir,
+//! installs a real multi-file skill from the live ccteam-hub into a temporary
+//! user library,
 //! end-to-end through the real engine (load_catalog + install_plugin against
 //! `raw.githubusercontent.com`). Proves the track-upstream chain works against
 //! production: pointer index -> upstream fetch -> per-file sha gate -> dir
@@ -35,11 +36,13 @@ async fn live_install_multi_file_skill() {
         plugin.upstream
     );
 
-    // Install through the real engine into a throwaway project.
+    // Install through the real engine into the temporary user library. The
+    // throwaway project must remain untouched by a skill install.
     let proj = TempDir::new().unwrap();
-    let res = ccteam_im::hub::install_plugin(proj.path(), &plugin, None, false)
-        .await
-        .expect("live multi-file install");
+    let res =
+        ccteam_im::hub::install_plugin(proj.path(), &paths.skills_dir(), &plugin, None, false)
+            .await
+            .expect("live multi-file install");
     let skill_dir = res.path.parent().expect("SKILL.md has a parent dir");
 
     // Every manifest file must have landed.
@@ -55,7 +58,7 @@ async fn live_install_multi_file_skill() {
 
     // installed_status must now read back as Installed.
     assert_eq!(
-        ccteam_im::hub::installed_status(proj.path(), &plugin),
+        ccteam_im::hub::installed_status(proj.path(), &paths.skills_dir(), &plugin),
         ccteam_im::hub::InstalledStatus::Installed,
         "freshly installed multi-file skill must read back Installed"
     );

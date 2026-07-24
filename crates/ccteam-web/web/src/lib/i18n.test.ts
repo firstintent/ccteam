@@ -48,6 +48,8 @@ describe("I18N dictionary", () => {
     expect(tt("quickStart")).toBe("Quick start");
     expect(t("zh", "setOps")).toBe("运维总览");
     expect(tt("setOps")).toBe("Ops & Hosts");
+    expect(t("zh", "setAdmin")).toBe("管理员");
+    expect(tt("setAdmin")).toBe("Admin");
   });
 
   it("parameterized phrases interpolate per language", () => {

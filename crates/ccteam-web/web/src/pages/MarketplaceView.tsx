@@ -6,6 +6,13 @@
 //   底部点市场 → 选类目/来源/搜 → 点卡看正文 → 安装到当前项目 → 立刻能在新建
 //   session 里选用.
 //
+// v0.9.9 — a `type=skill` entry installs into the user-level GLOBAL LIBRARY
+// (`~/.ccteam/skills`), never the project: its CTA copy names the library
+// (安装到库 / 已在库 / 更新库内版本, zh+en via the zh/en switch) and no
+// "install to project" affordance exists for skills. agent/plugin CTAs and
+// the install POST route are unchanged — the library semantics live in the
+// backend; `installed_status` for skills is library-relative.
+//
 // Data: a PROJECT PICKER selects the install target; the decorated
 // `GET /api/v1/projects/{slug}/marketplace` gives per-project `installed_status`
 // so cards can flip to 已装/更新. With no project selected (none exist, or
@@ -49,7 +56,10 @@ import {
   filterPlugins,
   installable,
   installedStatusLabel,
+  skillLibraryStatusLabel,
 } from "../lib/marketplaceFormat";
+import { makeT, type Lang } from "../lib/i18n";
+import { useWebSettings } from "../hooks/useWebSettings";
 import { toastBus } from "../lib/toastBus";
 
 /** A catalog plugin enriched with an (optional) per-project install status —
@@ -64,6 +74,11 @@ type LoadState =
 const SRC_ALL = "__all";
 
 export default function MarketplaceView({ embedded = false }: { embedded?: boolean } = {}) {
+  // v0.9.9 — the zh/en switch drives the skill install-to-library CTA copy
+  // (the rest of this panel's long-tail strings are still zh-only).
+  const { settings } = useWebSettings();
+  const lang = settings.language;
+  const t = makeT(lang);
   // ---- install-target project picker -------------------------------------
   const [projects, setProjects] = useState<string[]>([]);
   const [project, setProject] = useState<string>("");
@@ -209,8 +224,12 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
       setInstalling(plugin.id);
       installPlugin(project, plugin.id, force)
         .then((res) => {
+          // A skill install lands in the user-level global library (never
+          // the project) — its toast names the library, not `→ project`.
           toastBus.handler?.info(
-            `已安装 ${res.id} → ${project}${res.overwrote ? "（已更新）" : ""}`,
+            plugin.type === "skill"
+              ? `${t("skillInstalledToast")}: ${res.id}${res.overwrote ? (lang === "en" ? " (updated)" : "（已更新）") : ""}`
+              : `已安装 ${res.id} → ${project}${res.overwrote ? "（已更新）" : ""}`,
           );
           // Re-fetch the decorated catalog so the card flips to 已装 — quietly
           // (no loading flash; only the resolved result updates the grid).
@@ -225,7 +244,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
         })
         .finally(() => setInstalling(null));
     },
-    [project, fetchCatalog],
+    [project, fetchCatalog, t, lang],
   );
 
   return (
@@ -383,6 +402,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
               <PluginCard
                 key={plugin.id}
                 plugin={plugin}
+                lang={lang}
                 installing={installing === plugin.id}
                 canInstall={project.length > 0}
                 onOpen={() => setDetailId(plugin.id)}
@@ -408,6 +428,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           key={detailPlugin.id}
           plugin={detailPlugin}
           project={project}
+          lang={lang}
           installing={installing === detailPlugin.id}
           onClose={() => setDetailId(null)}
           onInstall={() => doInstall(detailPlugin)}
@@ -440,28 +461,35 @@ function SourceBadge({ source }: { source: string }) {
 }
 
 /** The install button / state pill driven by `installed_status`. When no
- *  install target is selected the action is disabled with a hint. */
+ *  install target is selected the action is disabled with a hint. SKILL
+ *  entries (`skill`) install into the user-level global library — their copy
+ *  names the library (i18n); agent/plugin entries keep the project copy. */
 export function InstallButton({
   status,
   installing,
   canInstall,
   onInstall,
+  skill = false,
+  lang = "zh",
 }: {
   status: InstalledStatus | undefined;
   installing: boolean;
   canInstall: boolean;
   onInstall: () => void;
+  /** true for `type === "skill"` entries (install-to-library semantics). */
+  skill?: boolean;
+  lang?: Lang;
 }) {
   // No per-project decoration (global browse) → treat as not_installed.
   const st: InstalledStatus = status ?? "not_installed";
   if (st === "installed") {
     return (
       <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">
-        已装
+        {skill ? skillLibraryStatusLabel("installed", lang) : "已装"}
       </span>
     );
   }
-  const label = installedStatusLabel(st);
+  const label = skill ? skillLibraryStatusLabel(st, lang) : installedStatusLabel(st);
   return (
     <button
       type="button"
@@ -484,12 +512,14 @@ export function InstallButton({
 
 export function PluginCard({
   plugin,
+  lang = "zh",
   installing,
   canInstall,
   onOpen,
   onInstall,
 }: {
   plugin: CatalogPlugin;
+  lang?: Lang;
   installing: boolean;
   canInstall: boolean;
   onOpen: () => void;
@@ -528,6 +558,8 @@ export function PluginCard({
             installing={installing}
             canInstall={canInstall}
             onInstall={onInstall}
+            skill={plugin.type === "skill"}
+            lang={lang}
           />
         </span>
       </div>
@@ -566,12 +598,14 @@ function renderBody(markdown: string): string {
 export function PluginDrawer({
   plugin,
   project,
+  lang = "zh",
   installing,
   onClose,
   onInstall,
 }: {
   plugin: CatalogPlugin;
   project: string;
+  lang?: Lang;
   installing: boolean;
   onClose: () => void;
   onInstall: () => void;
@@ -581,6 +615,8 @@ export function PluginDrawer({
   // initializer is the reset — no synchronous setState in the effect body
   // (keeps react-hooks/set-state-in-effect clean).
   const [body, setBody] = useState<BodyState>({ kind: "loading" });
+  const t = makeT(lang);
+  const isSkill = plugin.type === "skill";
 
   useEffect(() => {
     let cancelled = false;
@@ -679,7 +715,9 @@ export function PluginDrawer({
 
         <div className="shrink-0 px-4 py-3 border-t border-surface-700/50 flex items-center gap-2">
           <span className="text-[11px] text-text-dim truncate">
-            {project ? (
+            {isSkill ? (
+              t("skillLibraryTarget")
+            ) : project ? (
               <>
                 安装到 <span className="font-mono text-text-secondary">{project}</span>
               </>
@@ -690,7 +728,7 @@ export function PluginDrawer({
           <span className="flex-1" />
           {plugin.installed_status === "installed" ? (
             <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">
-              已装
+              {isSkill ? skillLibraryStatusLabel("installed", lang) : "已装"}
             </span>
           ) : (
             <button
@@ -701,9 +739,11 @@ export function PluginDrawer({
             >
               {installing
                 ? "安装中…"
-                : plugin.installed_status === "update_available"
-                  ? `更新到 ${project || "项目"}`
-                  : `安装到 ${project || "项目"}`}
+                : isSkill
+                  ? skillLibraryStatusLabel(plugin.installed_status ?? "not_installed", lang)
+                  : plugin.installed_status === "update_available"
+                    ? `更新到 ${project || "项目"}`
+                    : `安装到 ${project || "项目"}`}
             </button>
           )}
         </div>
