@@ -148,7 +148,7 @@
 ### 版本开发流程(版本化迭代不变;`.loop/` 只是承载)
 
 - **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review;拍板后**规划把 PRD 拆成卡进 `.loop/backlog.md`**(冲突域/规格/DoD/建议入口),wave = 一组卡。owner `/goal` 直驱的小/中改 = 独立卡可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(**briefing 自包含**:规格/坐标/验收直接写进 brief)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ §五.7 ship gate 回填。
-- **分支与推送 = dev + PR 攒版本**(owner 决策 2026-07-22,取代旧「direct-on-main no-PR」):新功能/修复一律提交并推送 `dev`;开一个 dev→main PR,多个提交累计组成一个版本;**merge 仅由 owner 执行**(合并 = 版本落 main),合并后**复用 `dev`** 开启下一轮。**main 不直推**;`gh pr create` 可用(改 `.github/workflows/*` 仍需 SSH push,见 §六)。**tag + 部署 HELD,等 owner 显式「部署」**(merge 到 main 不等于发布)。
+- **分支与推送 = dev + PR 攒版本**(owner 决策 2026-07-22;合并方式 owner 决策 2026-07-24):新功能/修复一律提交并推送 `dev`;**周期开始(首个新提交)即开 dev→main draft PR**(`check.yml` 只跑 main push + PR —— draft PR 让每次推 dev 都过 CI 三 job),多个提交累计 = 一个版本,收口转 ready;**merge 仅由 owner 执行,方式 = merge commit(非 squash)**——main 含 dev 完整历史,合并后 dev 即 main 祖先,**免和解直接续用**(squash 时代每轮的平凡和解合并不再需要;每版一行时间轴的家 = `.loop/history.md`,main 历史不承担此职)。**main 不直推**;`gh pr create` 可用(改 `.github/workflows/*` 仍需 SSH push,见 §六)。**tag + 部署 HELD,等 owner 显式「部署」**(merge 到 main 不等于发布)。
 - **wave 范式**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 commit;subagent briefing 必含 wave acceptance gate + 上 wave handoff link。**红线:每 wave baseline ≥ 上 wave**(test pass count + clippy 0 warnings),否则不推。架构级大改可把 tier-1 文档**全量重写**放最后一 wave(docs 反映已落地代码)。
 
 ## 六、易踩的坑(实战累积)
