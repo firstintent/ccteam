@@ -41,10 +41,11 @@ const MAX_CONCURRENT_PROJECTS: usize = 3;
 /// - **Attachments**: a bare `claude` session does NOT auto-`Read` an
 ///   attachment path — it must be told to.
 pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam is the local agent bridge: any session can hire other agent sessions \
-(Claude Code / Codex / Grok / OpenCode, on this machine or a registered satellite host) and ccteam does the identity, \
+(Claude Code / Codex / Grok / OpenCode / Kimi, on this machine or a registered satellite host) and ccteam does the identity, \
 routing, delivery, guardrails, cost ledger, and team observability underneath.\n\n\
 ORCHESTRATION (important): when the user asks you to call / use / delegate to another agent (e.g. \"call codex\", \
-\"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick `vendor`, optionally \
+\"use grok to search\", \"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick \
+`vendor`: `claude` / `codex` / `grok` / `opencode` / `kimi`, optionally \
 `model` / `role`, and pass the first `task` in the same call); its execution host is inherited from the project \
 binding. `session_dispatch` sends follow-up tasks \
 (async with a completion notification, or `wait_seconds` to block inline), `session_collect` reads its output \
@@ -152,7 +153,7 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
-            "description": "daemon health + sessions + today's cost",
+            "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
             "inputSchema": object_schema(&[]),
         }),
         json!({
@@ -198,7 +199,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, `opencode`, or `kimi`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default, and when the child's vendor turn completes and it goes idle you get ONE completion notification; inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async; pending never cancels the child; `notify:\"off\"` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn an agent session — `vendor`: `claude` (default) | `codex` | `grok` | `opencode` | `kimi` — in YOUR OWN project; always mints a NEW `s{n}` sid. `grok` = fast live web/X search; `claude`/`codex` = coding agents for repo work; `status` shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch (async + ONE completion notification when the child's turn completes and it goes idle; see `wait_seconds`/`notify`); the response then adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -232,7 +233,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when its vendor turn COMPLETES (the child goes idle — mid-turn narration never notifies), ccteam delivers ONE completion notification back to you as a new turn; the notification explicitly marks the child as idle/waiting, so if the task isn't actually finished you know to dispatch a follow-up (set `notify:\"off\"` to opt out and poll session_collect yourself, `notify:\"all\"` for a per-message debug firehose). Inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async with completion notification. Completion returns `{status:\"completed\", result_text, cost_usd?}`; timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Async by default: ONE completion notification when the child's vendor turn completes and it goes idle — mid-turn narration never notifies; the notification says the child is idle, so you know when to dispatch the next step (`notify` changes this, `wait_seconds` blocks inline). Completion returns `{status:\"completed\", result_text, elapsed_seconds, cost_usd?, tokens_total?}` (child's session ledger); timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Dispatch to yourself or an ancestor is rejected (cycle). Explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -559,6 +560,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// MCP-DX-1 — external-agent feedback: callers searching for "grok" (or
+    /// any vendor keyword) must hit the spawn tool without reading a 500-char
+    /// paragraph. The five vendor names live in the FIRST sentence.
+    #[test]
+    fn session_spawn_description_front_loads_all_vendors() {
+        let defs = session_tool_definitions();
+        let spawn = defs.iter().find(|t| t["name"] == "session_spawn").unwrap();
+        let head: String = spawn["description"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .take(140)
+            .collect();
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+            assert!(
+                head.contains(vendor),
+                "vendor `{vendor}` must appear in the first 140 chars (discoverability): {head}"
+            );
+        }
+    }
+
+    /// MCP-DX-1 — `status` is the discovery surface (vendor availability per
+    /// host); its description and the server instructions must say so, and the
+    /// instructions must list ALL five harnesses (Kimi was missing).
+    #[test]
+    fn status_description_and_instructions_advertise_the_vendor_axis() {
+        assert!(CCTEAM_MCP_INSTRUCTIONS.contains("Kimi"));
+        for vendor in ["`claude`", "`codex`", "`grok`", "`opencode`", "`kimi`"] {
+            assert!(
+                CCTEAM_MCP_INSTRUCTIONS.contains(vendor),
+                "instructions must enumerate {vendor}"
+            );
+        }
+        let defs = tool_definitions();
+        let status = defs.iter().find(|t| t["name"] == "status").unwrap();
+        let description = status["description"].as_str().unwrap();
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+            assert!(
+                description.contains(vendor),
+                "status description must enumerate `{vendor}`"
+            );
+        }
+        assert!(description.contains("vendor panel"));
     }
 
     #[test]
