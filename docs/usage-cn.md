@@ -98,6 +98,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
 - **历史会话与恢复**:会话列表下点「更多历史 (N) ▸」展开已**停止但未销毁**的会话(灰显)。点任意一个即从磁盘 `meta.json` **冷恢复**(cold-resume) —— 停止的会话、甚至 daemon 重启前的会话都不丢,随时可恢复(手机上 `/use <sid>` 同样能恢复)。「+ 导入历史会话」对话框还能发现你在 ccteam 之外用原生 `claude` 跑过的会话(按工作目录内容匹配),一键**收编**成普通 ccteam 会话,对话原文保留。
+- **定时发送**:点输入框旁的**时钟**进入定时模式 → 选时间(日期时间框,或快捷 `+30m` / `+1h`)→ 写正文 → 发送。排队条出现在**输入框上方**,按发送时间排序,点 **×** 取消。时间按 **daemon 本机时区**解释(选择器旁会标注;相对时间如 `+30m` 无歧义)。到点后正文作为**普通用户消息**进入该会话(与现在手打同路)。定时模式**不能**带附件/技能。上限:每会话最多 20 条 pending,最远约 **7 天**。投递失败的条目会标红并在队列里保留 24 小时,可手动关掉。
 
 > 部分高级选项(terminal/rmux 协议、在 Web 里选角色、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
 
@@ -131,7 +132,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 控制台本身就建立在一套 **令牌鉴权的 HTTP API** 之上,你也可以直接用它做集成:
 
 - 交互式文档:浏览器开 `http://<host>:7331/api/docs`(Scalar,可直接试调);机读 spec 在 `/api/v1/openapi.json`。
-- 资源:`/api/v1/projects`、`…/projects/{slug}/sessions`、`/sessions/{sid}/{turn,events,stop}`、`/marketplace`、`/status`、`/hosts`、`/capabilities`。
+- 资源:`/api/v1/projects`、`…/projects/{slug}/sessions`、`/sessions/{sid}/{turn,events,stop,scheduled}`、`/marketplace`、`/status`、`/hosts`、`/capabilities`。
 - 鉴权与 Web 同一令牌;会话类端点需要 daemon 在线。
 
 ### 外部 Agent 直连 MCP(`POST /mcp`)
@@ -215,7 +216,24 @@ Authorization: Bearer ccteam:<hex>
 /sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目
 /status                    全队健康:每个会话 idle / working / stuck + model · ctx
 /help                      列出网关命令
+
+# 定时发送(一次性 user turn)
+/inbox                     列出你可见的全部定时消息(自己的 + web 池),按发送时间排序
+/inbox <时间> <正文>        约到**当前**会话(没有当前会话时先 /use 或 /sessions)
+/inbox cancel <dN>         按 list 里的短 id 取消(或关掉失败条目)
 ```
+
+`<时间>` 写法(按 **daemon 本机时区**;过去时刻直接拒绝,裸 `HH:MM` **不会**自动滚到明天):
+
+```text
+/inbox +30m 提醒我打开那个 PR
+/inbox +2h 跑一遍夜间检查清单
+/inbox 22:30 写今日日报
+/inbox 明天 09:00 晨会纪要
+/inbox 2026-07-26 09:00 发版 checklist
+```
+
+list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原因)。到点成功时 IM **不会**再刷「已发送」——正文直接以普通用户消息进会话;失败会通知你,并在 list 里留 24 小时。与 Web 相同上限(每会话 20 条、最远 7 天)。空正文拒绝;正文以 `/` 开头时到点仍当 agent 的普通输入(不再当网关指令解析)。
 
 ### 寻址
 

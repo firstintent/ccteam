@@ -112,6 +112,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
 - **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and — admins only — the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
+- **Schedule a message:** tap the **clock** on the composer to enter schedule mode. Pick a time (datetime control or quick chips such as `+30m` / `+1h`), type the text, and send — the message joins a **queue above the input**, sorted by send time. Cancel with **×**. Times use the **daemon's local timezone** (shown next to the picker; relative times like `+30m` are unambiguous). At fire time the text is a normal user turn into that session (same path as typing now). Schedule mode does not carry file/skill attachments. Caps: 20 pending per session, farthest **7 days** ahead. Failed deliveries stay in the queue (marked failed) for 24 hours so you can dismiss them.
 
 > Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
 
@@ -147,7 +148,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 The console is built on a token-authenticated HTTP API you can use directly:
 
 - Interactive docs: `http://<host>:7331/api/docs` (Scalar). Machine-readable spec: `/api/v1/openapi.json`.
-- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
+- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop,scheduled}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
 - Auth uses the same web token. Session endpoints require the daemon to be online.
 
 ### External agents over MCP (`POST /mcp`)
@@ -231,7 +232,24 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /sessions [all]            List sessions for current project; all = across projects.
 /status                    Team health: idle / working / stuck plus model and context.
 /help                      List gateway commands.
+
+# Delayed send (one-shot user turns)
+/inbox                     List scheduled messages you can see (own + web pool), by send time.
+/inbox <time> <text>       Schedule text into the **current** session (/use first if needed).
+/inbox cancel <dN>         Cancel (or dismiss a failed) item by short id from the list.
 ```
+
+Time forms for `/inbox <time> …` (daemon local timezone; past times are rejected, bare `HH:MM` does **not** roll to tomorrow):
+
+```text
+/inbox +30m remind me to open the PR
+/inbox +2h run the nightly checklist
+/inbox 22:30 write the daily summary
+/inbox 明天 09:00 morning standup notes
+/inbox 2026-07-26 09:00 release checklist
+```
+
+List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows carry a reason). Successful fires are silent in IM — the text just appears as a normal user message in that session. Failures notify you and stay listed for 24 hours. Same limits as the web queue (20 per session, 7-day horizon). Empty text is rejected; a body that starts with `/` is still sent as ordinary agent text at fire time (not re-parsed as a gateway command).
 
 ### Addressing
 

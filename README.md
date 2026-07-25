@@ -34,6 +34,7 @@ Paste a bot token once (Settings → IM) and the chat becomes a full console —
 /new codex                      # more sessions: /new [vendor] [role]
 @s2 run the test suite          # address any session directly
 /status  /sessions  /stop s3    # health · fleet · cost · stop
+/inbox +30m remind me …         # schedule a one-shot user turn; /inbox lists · cancel dN
 ```
 
 **2 · Remote control from the web console**
@@ -41,7 +42,7 @@ Paste a bot token once (Settings → IM) and the chat becomes a full console —
 The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-ip>:7331/?token=…`) — open it from any device on your LAN. It's a chat shell, not a dashboard:
 
 - quick-start templates aimed at each vendor's strength
-- a Chat tab per session (plus a byte-faithful terminal where applicable)
+- a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
 - the live delegation tree
 - a cost pill with daily budget caps
 - marketplace and settings
