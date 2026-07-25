@@ -3972,6 +3972,13 @@ impl Gateway {
             let mut watch_idle = std::time::Duration::ZERO;
             let mut watch_last_activity: u64 = 0;
             let mut watch_warned_turn: Option<String> = None;
+            // Item ids of in-flight tool/command work. A long silent tool
+            // (build, test suite, MCP call) legitimately emits no further
+            // events while it runs — that is NOT a stall. Cleared on item
+            // complete and at turn boundary so a lost complete cannot
+            // suppress the watchdog forever.
+            let mut open_work_items: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -4014,6 +4021,9 @@ impl Gateway {
                         // TRUE silence (no event for the whole idle window) is a
                         // stall. Counts every event, before any branch/filter.
                         session.activity_events.fetch_add(1, Ordering::SeqCst);
+                        // Track open tool/command work so a long silent tool
+                        // run does not look like a hung turn.
+                        track_open_work_items(&mut open_work_items, &evt);
                         // v0.8.19 `/status` — record the wall-clock of this event
                         // right beside the liveness counter. `/status` derives the
                         // 🔴 stuck state from it the SAME way the watchdog does (a
@@ -4574,9 +4584,13 @@ impl Gateway {
                                             session.activity_events.load(Ordering::SeqCst);
                                     } else {
                                         let cur = session.activity_events.load(Ordering::SeqCst);
-                                        if cur != watch_last_activity {
+                                        // Still working if either the event
+                                        // counter moved OR a tool/command is
+                                        // open (long silent tools are real work).
+                                        if cur != watch_last_activity || !open_work_items.is_empty()
+                                        {
                                             watch_last_activity = cur;
-                                            watch_idle = std::time::Duration::ZERO; // still working
+                                            watch_idle = std::time::Duration::ZERO;
                                         } else {
                                             watch_idle += watch_poll;
                                         }
@@ -9220,6 +9234,108 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::TurnCompleted { .. }
         | ThreadEvent::ItemStarted { .. } => None,
+    }
+}
+
+/// Whether this item is long-running work that can legitimately go silent
+/// between start and complete (tools, shell, search — not the final answer).
+fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
+    matches!(
+        details,
+        ThreadItemDetails::ToolCall { .. }
+            | ThreadItemDetails::CommandExecution { .. }
+            | ThreadItemDetails::WebSearch { .. }
+            | ThreadItemDetails::FileChange { .. }
+    )
+}
+
+/// Maintain the set of in-flight tool/command item ids for the silence
+/// watchdog. Start opens, complete closes, turn boundary clears all.
+fn track_open_work_items(open: &mut std::collections::HashSet<String>, evt: &ThreadEvent) {
+    match evt {
+        ThreadEvent::ItemStarted { item } if is_openable_work_item(&item.details) => {
+            open.insert(item.id.clone());
+        }
+        ThreadEvent::ItemCompleted { item } if is_openable_work_item(&item.details) => {
+            open.remove(&item.id);
+        }
+        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } => {
+            open.clear();
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod open_work_items_tests {
+    use super::*;
+    use ccteam_harness::{ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+
+    #[test]
+    fn open_work_tracks_tool_start_complete_and_clears_on_turn_end() {
+        let mut open = std::collections::HashSet::new();
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemStarted {
+                item: ThreadItem {
+                    id: "tc1".into(),
+                    details: ThreadItemDetails::ToolCall {
+                        name: "Bash".into(),
+                        args: serde_json::json!({}),
+                    },
+                },
+            },
+        );
+        assert!(open.contains("tc1"));
+        // Answer deltas are not open work.
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemUpdated {
+                item: ThreadItem {
+                    id: "msg".into(),
+                    details: ThreadItemDetails::AgentMessage("draft".into()),
+                },
+            },
+        );
+        assert_eq!(open.len(), 1);
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id: "tc1".into(),
+                    details: ThreadItemDetails::ToolCall {
+                        name: "Bash".into(),
+                        args: serde_json::json!({}),
+                    },
+                },
+            },
+        );
+        assert!(open.is_empty());
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemStarted {
+                item: ThreadItem {
+                    id: "tc2".into(),
+                    details: ThreadItemDetails::CommandExecution {
+                        cmd: "sleep 600".into(),
+                        status: "running".into(),
+                    },
+                },
+            },
+        );
+        assert!(open.contains("tc2"));
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: UnifiedTokenUsage::default(),
+                model: None,
+            },
+        );
+        assert!(
+            open.is_empty(),
+            "turn boundary must clear so a lost ItemCompleted cannot mute forever"
+        );
     }
 }
 

@@ -2,10 +2,14 @@
 //!
 //! Turn-end SoT = matching `session/prompt` JSON-RPC **response** (not
 //! `turn_completed` notifications). Buffer only `agent_message_chunk`;
-//! drop thoughts and `isReplay` frames.
+//! drop thoughts and `isReplay` frames from the **final answer**, but emit
+//! throttled mid-stream liveness events so the gateway silence watchdog
+//! sees that a long think / long draft is still alive (ACP vendors otherwise
+//! surface zero `ThreadEvent`s between tool calls and turn end).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -16,6 +20,11 @@ use super::protocol::{
 };
 use super::transport::Notification;
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails};
+
+/// Min gap between liveness `ThreadEvent`s for message/thought chunks.
+/// Chunks arrive many times per second; the watchdog only needs a periodic
+/// pulse. First chunk of a streak always emits (interval elapsed).
+const LIVENESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Per-turn buffer while a prompt is in flight.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +60,10 @@ pub struct SessionTranslateState {
     pub prev_session_cost_usd: Option<f64>,
     /// Methods we already warn-once skipped.
     pub warned_methods: HashSet<String>,
+    /// Last time we emitted a message/thought liveness event (throttled).
+    /// `pub` so vendor adapters can construct the state with struct update
+    /// syntax (`..Default::default()`); not part of the public API surface.
+    pub last_liveness_at: Option<Instant>,
 }
 
 impl SessionTranslateState {
@@ -60,6 +73,8 @@ impl SessionTranslateState {
             text: String::new(),
         });
         self.turn_done = Some(done);
+        // Fresh turn → first thought/message chunk should emit immediately.
+        self.last_liveness_at = None;
     }
 
     pub fn append_message(&mut self, chunk: &str) {
@@ -166,13 +181,24 @@ fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Ve
 
     match kind {
         "agent_message_chunk" => {
-            if let Some(text) = extract_chunk_text(&update) {
+            let text = extract_chunk_text(&update).unwrap_or_default();
+            if !text.is_empty() {
                 state.append_message(&text);
             }
-            Vec::new()
+            // Final answer still waits for the prompt response (buffer only).
+            // Emit a throttled ItemUpdated so the gateway activity counter
+            // moves during long drafts — without this, a multi-minute pure
+            // generation looks "silent" and the 300s watchdog false-alarms.
+            maybe_liveness_event(state, "msg", ThreadItemDetails::AgentMessage(text))
         }
-        "agent_thought_chunk" | "user_message_chunk" => {
-            // Thoughts never enter final; user echo ignored.
+        "agent_thought_chunk" => {
+            // Thoughts never enter final text; still pulse liveness (Grok can
+            // think for many minutes with zero tool calls).
+            let text = extract_chunk_text(&update).unwrap_or_default();
+            maybe_liveness_event(state, "thought", ThreadItemDetails::Reasoning(text))
+        }
+        "user_message_chunk" => {
+            // User echo ignored (and not a liveness signal for the agent turn).
             Vec::new()
         }
         "available_commands_update" => {
@@ -266,6 +292,35 @@ fn extract_chunk_text(update: &Value) -> Option<String> {
         .get("text")
         .and_then(|t| t.as_str())
         .map(str::to_string)
+}
+
+/// Throttled mid-stream pulse for the silence watchdog / progress fold.
+/// Does **not** affect the final answer (still buffer + prompt response).
+fn maybe_liveness_event(
+    state: &mut SessionTranslateState,
+    kind: &str,
+    details: ThreadItemDetails,
+) -> Vec<ThreadEvent> {
+    let now = Instant::now();
+    if state
+        .last_liveness_at
+        .is_some_and(|at| now.duration_since(at) < LIVENESS_MIN_INTERVAL)
+    {
+        return Vec::new();
+    }
+    state.last_liveness_at = Some(now);
+    let turn_id = state
+        .buffer
+        .as_ref()
+        .map(|b| b.turn_id.as_str())
+        .unwrap_or("pending");
+    vec![ThreadEvent::ItemUpdated {
+        item: ThreadItem {
+            // Stable per-kind id so ProgressFold updates one card, not a flood.
+            id: format!("{turn_id}-live-{kind}"),
+            details,
+        },
+    }]
 }
 
 /// Finalize a turn from the `session/prompt` response (authoritative).
@@ -433,6 +488,75 @@ mod tests {
             ThreadEvent::TurnCompleted { usage, .. } => *usage,
             _ => unreachable!(),
         };
+    }
+
+    #[test]
+    fn message_and_thought_chunks_emit_throttled_liveness_events() {
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        let thought = apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type":"text","text":"thinking hard"}
+                    }
+                }),
+            },
+        );
+        assert_eq!(thought.len(), 1, "first thought chunk must pulse liveness");
+        match &thought[0] {
+            ThreadEvent::ItemUpdated { item } => match &item.details {
+                ThreadItemDetails::Reasoning(t) => assert!(t.contains("thinking")),
+                other => panic!("expected Reasoning, got {other:?}"),
+            },
+            other => panic!("expected ItemUpdated, got {other:?}"),
+        }
+        // Immediate second thought is throttled (same Instant window).
+        let thought2 = apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type":"text","text":"more thought"}
+                    }
+                }),
+            },
+        );
+        assert!(
+            thought2.is_empty(),
+            "second thought within throttle window must not flood"
+        );
+
+        // Force throttle window open for the message-chunk arm.
+        st.last_liveness_at =
+            Some(Instant::now() - LIVENESS_MIN_INTERVAL - Duration::from_millis(1));
+        let msg = apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"Hello"}
+                    }
+                }),
+            },
+        );
+        assert_eq!(msg.len(), 1, "message chunk after throttle must pulse");
+        match &msg[0] {
+            ThreadEvent::ItemUpdated { item } => match &item.details {
+                ThreadItemDetails::AgentMessage(t) => assert_eq!(t, "Hello"),
+                other => panic!("expected AgentMessage, got {other:?}"),
+            },
+            other => panic!("expected ItemUpdated, got {other:?}"),
+        }
+        // Buffer still accumulates for the final answer.
+        assert_eq!(st.buffer.as_ref().unwrap().text, "Hello");
     }
 
     #[test]
