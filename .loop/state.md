@@ -8,12 +8,12 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.9` 已合 `main`**(2026-07-24 owner squash-merge PR #169 → `7dfd271`;决议 = `docs-local/versions/v0-9-9/decisions.md`,一行史 = `.loop/history.md` v0.9.9 行)。**tag/部署 HELD** 等 owner 显式发话(push main ≠ 发布)。dev 已和解复用(merge main 回 dev `a3d22c9`,树差为零);随后 owner 指令「main 与 dev 保持一样」→ main **ff 推平至 dev 同点**(一次性授权的和解直推,常态「main 不直推」不变)。上一版 v0.9.8 已发布(`ad1c7c2` + tag)。
-- **在做**:v0.9.9 已收官(PR #169 CI 三 job 全绿后 owner 合并;test job 首跑红 → hermetic `0ec136d` → 复跑绿,P2-1 完成)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1 完成卡待下轮蒸馏;v0.9.9 委派子会话 s135–s138 idle 备查,下轮顺手停)。
+- **在做**:**新周期已开(post-v0.9.9,dev 攒版本)**:MCP-DX-1 完成(`cf49539`,外部 agent 反馈驱动的 MCP 工具面 DX —— 描述净减法 -792 字符 + 可操作 project 错误 + wait 完成遥测;owner 直驱 2026-07-24,钢线「MCP 面向 agent,改进 ≠ 加法」),dev→main draft PR 随首推开启(周期规则)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 / **HERM-1(新,基线口径内 3 测试宿主态泄漏)** + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1/MCP-DX-1 完成卡待下轮蒸馏;v0.9.9 委派子会话 s135–s138 idle 备查,下轮顺手停)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1651/0**(1623 + v0.9.9 批 +24 + FIX1 消红 +1 + P0 双修 +2 + hermetic 反向覆盖 +1;2026-07-24 规划于集成 worktree 实测,tip `0ec136d`。注:CI test job 首跑咬出 `session_tool_tests` 隐性 PATH 依赖 —— 开发机 vendor 常驻故本地恒绿,干净 runner 15 红;已上 per-Gateway 可用性快照注入缝,双 PATH 红后绿证)
+- 确定性口径 `make test-baseline`(`--lib --bins`,41c6569 修正:补上 binary-only `ccteam-cli` 的覆盖盲区)= **1658/0 预期**(1651 + MCP-DX-1 +7,`cf49539`;干净环境仲裁 = 周期 draft PR CI。注:2026-07-25 live-daemon 宿主实测 1655 绿 + 3 红,`git stash` 对照 **origin/dev 同机同红** = 宿主态泄漏非回归,已立 HERM-1 卡;上一锚 1651/0 = 2026-07-24 集成 worktree tip `0ec136d`,CI 全绿)
 - `ccteam-web` 全量:lib 137 + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,**与 v0.9.8 实测同三只、main=dev 同红不变**,非回归)· vitest **417**(上轮记录 395;#166/#167 窗口 +11 未及回填,V099-W5 +11)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 

@@ -20,6 +20,13 @@
 - **验证**:usage/usage-cn/README/tech-design(含陈旧 cto 表述清理)+ AGENTS §〇/§一/§四 + workspace 0.9.9 + lock 刷新 + `.loop` 蒸馏回填全部入库;writeback 绿;**dev→main PR #169 已开**(CI 三 job 全绿),tag/部署 HELD 等 owner。
 - **规格**:usage(+cn)/tech-design/README 把 skill 库融入当前能力;AGENTS §一版本行 + §四 Skills 行;workspace 0.9.9;state/history/backlog 蒸馏;P2-1 CI job 顺带(SSH push)。
 
+### MCP-DX-1 外部 agent 反馈:MCP 工具面 DX(发现性 + 可操作错误 + 完成遥测;净减法)
+- **状态**:完成(cf49539) · **冲突域**:`crates/ccteam-im/src/mcp` · **建议入口**:规划(控制)会话(owner 直驱 2026-07-24)
+- **验证**:7 个新定向测试有牙实锤(三处缺陷态突变咬红 4 测试→复原后绿);`ccteam-im` mcp 模块 113 绿;`make check` clippy 0 warnings;`make test-baseline` 本分支 +7、无新增红(本机 3 只口径内红 = 宿主态泄漏,`git stash` 对照 origin/dev **同机同红**归因非本改动,见 HERM-1 卡;干净环境仲裁 = PR CI);writeback 绿。描述净减法量化:8 工具描述总量 6210→5418 字符(-792;spawn -607、dispatch -439,与 schema property 文档去重;status +254 = 39 字符占位升级为发现面)。全量 `make test` 在本机撞已登记 `hook_*` env-flake 挂死(README 在案),不计入判据。
+- **背景**:三份外部 agent 调用复盘(codex/workbuddy/qoder,owner 2026-07-24 转交):① "grok" 关键词搜不到 spawn(vendor 埋描述中段);② project 解析失败是死胡同(cwd≠catalog slug 只能瞎猜,`missing project`/`not found` 无恢复指引);③ 同步等待完成不带成本/耗时。owner 追加钢线:MCP 面向 agent,改进 ≠ 更多更长。
+- **规格**:A. 发现性(净减法)—— spawn 描述 vendor 五选一提至第一句 + 一句用途提示,与 property 文档去重;dispatch 同步瘦身;`status` 描述升级为发现面(vendor panel/catalog/routing,**替代**外部建议的新 capabilities 工具);instructions 补 Kimi。B. 可操作错误 —— admin missing/unknown project 附注册清单(cap 20)+ did-you-mean(Levenshtein/containment,离谱输入不瞎猜);tenant 错误附自己可见清单(纯 identity 派生,foreign/unknown 字节一致不泄露,原测试收紧为显式一致性断言)。C. 完成遥测 —— inline-wait completed 增 `elapsed_seconds`(submit→完成,0.1s 分辨率)+ `tokens_total`(会话累计账,同 list/collect 语义);additive 字段,8-tool wire schema 形状零改动。**明确不做**(记录在案):新工具 ask/vendors/project_list/per-vendor alias(违背 v0.9-T1 cull;发现性走描述+status);过程叙述与最终答案分离(ACP 整 turn 单 TurnBuffer 结构性,归 A2A-OBS-4 族);wait 心跳/进度通知(同族);response_format/json_schema(vendor-specific,prompt 层可达);qoder「vendor 非 schema enum」系过时(已是 enum);workbuddy「ACP spawn+task+wait Connection closed」判客户端超时(服务端预算 60s+wait 正确,idempotency_key 即正解),无 repro 不动。
+- **DoD**:达成(见验证段)。
+
 ### A2A-W5 A2A 线收尾:三场景真机 smoke + README/usage 重写
 - **状态**:待排 · **冲突域**:`README.md + docs/`(smoke 零代码)· **建议入口**:规划(控制)会话(涉治理面写权)
 - **背景**:v0.9.0–0.9.2 A2A 底座已落,W5 是 ship gate 前最后一步;hub 示例配方 = `team-brain` agent(grok 跨模型 review 已跑通;cct-codex/cct-grok wrapper skill 已于 2026-07-21 退役 —— MCP server instructions 原生覆盖,owner 拍板)。
@@ -38,6 +45,12 @@
 - **背景**:codex 叙述消息被当独立 turn 记账/展示(v0.9.2 遗留 P1)。**通知面已由 FB-1(e96bf56)按 turn 边界修复**;本卡余量 = turns.jsonl/展示侧的叙述折叠是否仍值得做,开工时先核现值再定。
 - **规格**:折叠 codex 叙述消息进所属 turn(记账/展示);不改 `CanonicalEvent` schema 语义(schema 权威 = `harness/progress_bridge`)。
 - **DoD**:新定向测试先造缺陷态红、后修绿(证有牙,留痕验证段);`make test` 基线只增;writeback 绿。
+
+### HERM-1 基线口径内 3 测试宿主态泄漏(live 机红 / 干净环境绿)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli(web_chat_bridge) + crates/ccteam-core(roles) + crates/ccteam-harness(transcript_tail)` · **建议入口**:dev 会话
+- **背景**:MCP-DX-1 收口实测(2026-07-25,live-daemon 宿主):`make test-baseline` 口径内 3 红,`git stash` 对照 origin/dev **同机同红**、CI 干净环境全绿(v0.9.9 tip)——违反「基线口径内测试必须密封」纪律(verify/README):① `web_chat_bridge::web_chat_ws_routes_through_gateway_and_survives_restart`(live daemon 端口/socket 争用嫌疑);② `roles::list_library_skills_is_recursive_hidden_safe_and_sorted`(疑读真实 `~/.ccteam/skills` —— v0.9.9 全局库新面,隔离助手须同时 pin HOME+CCTEAM_HOME,AGENTS §六);③ `execution::transcript_tail::discover_skips_subagent_jsonls_even_when_newest`(单测绿、全套并发红 = 套内相互作用/真实 `~/.claude/projects` 泄漏嫌疑)。
+- **规格**:逐只归因 + 注入缝密封(参照 0ec136d per-Gateway 快照先例;禁 env 突变);先红后绿留痕。
+- **DoD**:live-daemon 宿主上 `make test-baseline` 全绿;CI 同绿;writeback 绿。
 
 ### P1-2 session_collect 游标去重
 - **状态**:待排 · **冲突域**:`crates/ccteam-im(session_collect MCP)` · **建议入口**:dev 会话
