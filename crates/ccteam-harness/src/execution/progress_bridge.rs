@@ -45,6 +45,11 @@ pub const DELEGATION_NOTIFIED: &str = "delegation_notified";
 pub const DELEGATION_COLLECTED: &str = "delegation_collected";
 pub const DELEGATION_STOPPED: &str = "delegation_stopped";
 pub const DELEGATION_DENIED: &str = "delegation_denied";
+/// One-shot human-message scheduler lifecycle events.
+pub const SCHEDULED_ENQUEUED: &str = "scheduled_enqueued";
+pub const SCHEDULED_CANCELLED: &str = "scheduled_cancelled";
+pub const SCHEDULED_FIRED: &str = "scheduled_fired";
+pub const SCHEDULED_FAILED: &str = "scheduled_failed";
 
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
@@ -387,6 +392,39 @@ pub fn build_delegation_event(
     ev
 }
 
+/// Build one scheduled-message lifecycle row. The full message body never
+/// enters `progress.jsonl`; callers may supply only a hard-capped preview.
+pub fn build_scheduled_event(
+    event: &str,
+    id: &str,
+    sid: &str,
+    send_at: &str,
+    preview: Option<&str>,
+    reason: Option<&str>,
+) -> Value {
+    let mut ev = json!({
+        "event": event,
+        "id": id,
+        "sid": sid,
+        "send_at": send_at,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    let obj = ev.as_object_mut().expect("json object");
+    if let Some(preview) = preview.filter(|value| !value.is_empty()) {
+        obj.insert(
+            "preview".to_string(),
+            Value::String(preview.chars().take(80).collect()),
+        );
+    }
+    if let Some(reason) = reason.filter(|value| !value.is_empty()) {
+        obj.insert(
+            "reason".to_string(),
+            Value::String(reason.chars().take(256).collect()),
+        );
+    }
+    ev
+}
+
 pub fn build_codex_plan_updated_event(
     thread_id: &str,
     turn_id: &str,
@@ -488,5 +526,22 @@ mod tests {
         assert_eq!(event["sid"], "s9");
         assert_eq!(event["reason"], "capacity");
         assert!(event["ts"].is_string());
+    }
+
+    #[test]
+    fn scheduled_event_never_carries_more_than_an_80_char_preview() {
+        let event = build_scheduled_event(
+            SCHEDULED_ENQUEUED,
+            "d7",
+            "s2",
+            "2026-07-26T09:30:00Z",
+            Some(&"x".repeat(100)),
+            None,
+        );
+        assert_eq!(event["event"], SCHEDULED_ENQUEUED);
+        assert_eq!(event["id"], "d7");
+        assert_eq!(event["sid"], "s2");
+        assert_eq!(event["preview"].as_str().unwrap().chars().count(), 80);
+        assert!(event.get("text").is_none());
     }
 }

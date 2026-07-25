@@ -261,6 +261,8 @@ pub struct Gateway {
     /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
     /// reused" survives a wiped routing table / purged meta.json set.
     next_sid_path: Option<PathBuf>,
+    /// Daemon-wide monotonic scheduled-message counter (`d{n}`).
+    next_scheduled_path: Option<PathBuf>,
     /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
     /// `load_state` (sync) for the async `resume_restored_sessions` step to
     /// cold-start rebuild from their `meta.json`. Drained once on startup.
@@ -276,6 +278,11 @@ pub struct Gateway {
     sessions: BTreeMap<String, GatewaySession>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
+    next_scheduled: u64,
+    /// Durable scheduled rows indexed by globally unique short id.
+    scheduled_items: BTreeMap<String, ScheduledEntry>,
+    /// Wakes the lightweight next-fire timer after create/cancel/GC.
+    scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
     /// Broadcast tee of every [`GatewayEvent`] the gateway emits (V0.8.6 —
     /// fix #2). The IM delivery path stays on the mpsc `event_sink`; this
@@ -349,6 +356,12 @@ pub struct Gateway {
     /// v0.9.2 — optional programmatic capacity override. Production reads the
     /// hot config; deterministic gateway tests use this to exercise a tiny cap.
     sessions_config_override: Option<ccteam_core::SessionsConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledEntry {
+    project_dir: PathBuf,
+    item: crate::scheduled::ScheduledItem,
 }
 
 /// v0.9.0 W2 (F2/F7) — in-memory mirror of one child's durable delegation
@@ -502,6 +515,9 @@ pub enum GatewayEventKind {
         /// Machine-readable cause, currently `capacity`.
         reason: String,
     },
+    /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
+    /// the authoritative list instead of receiving queue contents over SSE.
+    ScheduledChanged,
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -1143,6 +1159,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/inbox",
+        arg_hint: Some("[<time> <text>|cancel <dN>]"),
+        help: "list, schedule, or cancel delayed user messages",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/projects",
         arg_hint: None,
         help: "list projects",
@@ -1315,6 +1337,7 @@ impl Gateway {
             default_project,
             routing_path: None,
             next_sid_path: None,
+            next_scheduled_path: None,
             restore_pending: Vec::new(),
             projects,
             current_project: BTreeMap::new(),
@@ -1322,6 +1345,9 @@ impl Gateway {
             sessions: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
+            next_scheduled: 0,
+            scheduled_items: BTreeMap::new(),
+            scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
             event_pumps: BTreeMap::new(),
@@ -1466,7 +1492,14 @@ impl Gateway {
         let root = ccteam_root.into();
         self.routing_path = Some(crate::routing_state_path_in(&root));
         self.next_sid_path = Some(crate::next_sid_path_in(&root));
-        self.load_state()
+        self.next_scheduled_path = Some(
+            root.join("state")
+                .join("scheduled")
+                .join("next-scheduled-id"),
+        );
+        self.load_state()?;
+        self.load_scheduled_state();
+        Ok(())
     }
 
     /// v0.8.21 Wave-2 — compute the (sync, no-`.await`) plan to rebuild a
@@ -2004,6 +2037,11 @@ impl Gateway {
             }
         }
         // Commands parse on the raw text; attachments don't apply to them.
+        if text.split_whitespace().next() == Some("/inbox") && !attachments.is_empty() {
+            return Err(anyhow!(
+                "/inbox scheduled messages do not support files or skills"
+            ));
+        }
         if let Some(mut reply) = self.handle_command(&chat, text).await? {
             // Owner req — teach the next step: append a recommended-command
             // footer as the reply's last line (see `command_next_hint`). IM only
@@ -2223,6 +2261,7 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
+            "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
@@ -2554,6 +2593,117 @@ impl Gateway {
             ))),
             _ => Ok(None),
         }
+    }
+
+    fn handle_inbox_command(&mut self, chat: &ChatKey, trimmed: &str) -> Result<String> {
+        self.gc_failed_scheduled(chrono::Utc::now());
+        let rest = trimmed.strip_prefix("/inbox").unwrap_or("").trim();
+        if rest.is_empty() {
+            let mut items = self
+                .scheduled_items
+                .values()
+                .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
+                .map(|entry| entry.item.clone())
+                .collect::<Vec<_>>();
+            items.sort_by(crate::scheduled::scheduled_order);
+            if items.is_empty() {
+                return Ok(format!(
+                    "📥 /inbox is empty (daemon timezone: {})",
+                    crate::scheduled::daemon_timezone_label()
+                ));
+            }
+            let mut lines = vec![format!(
+                "📥 scheduled messages (daemon timezone: {})",
+                crate::scheduled::daemon_timezone_label()
+            )];
+            for item in items {
+                let when = item
+                    .send_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M");
+                let state = match item.status {
+                    crate::scheduled::ScheduledStatus::Pending => String::new(),
+                    crate::scheduled::ScheduledStatus::Failed => format!(
+                        " [failed: {}]",
+                        item.fail_reason.as_deref().unwrap_or("unknown error")
+                    ),
+                };
+                lines.push(format!(
+                    "{} · {} · {} · {}{}",
+                    item.id,
+                    item.sid,
+                    when,
+                    crate::scheduled::preview(&item.text),
+                    state
+                ));
+            }
+            return Ok(lines.join("\n"));
+        }
+
+        if rest == "cancel" || rest.starts_with("cancel ") {
+            let mut parts = rest["cancel".len()..].split_whitespace();
+            let id = parts
+                .next()
+                .ok_or_else(|| anyhow!("usage: /inbox cancel <dN>"))?;
+            if parts.next().is_some() {
+                return Err(anyhow!("usage: /inbox cancel <dN>"));
+            }
+            let entry = self
+                .scheduled_items
+                .get(id)
+                .cloned()
+                .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
+                .ok_or_else(|| anyhow!("unknown scheduled message for this chat: {id}"))?;
+            self.cancel_scheduled_message(&entry.item.sid, id)?;
+            return Ok(format!("cancelled {id}"));
+        }
+
+        let (when, text) = parse_inbox_create_args(rest)?;
+        let send_at = crate::scheduled::parse_send_time(&when)?;
+        let sid = self
+            .current_session
+            .read()
+            .unwrap()
+            .get(chat)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
+            })?;
+        let visible_pending = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && self.chat_can_access_scheduled_entry(chat, entry)
+            })
+            .count();
+        let item = self.create_scheduled_message_inner(
+            &sid,
+            text,
+            send_at,
+            canonical_owner(chat).identity(),
+            Some(chat.channel.clone()),
+            Some(chat.chat_id.clone()),
+            visible_pending,
+        )?;
+        Ok(format!(
+            "scheduled {} → {} at {} ({})",
+            item.id,
+            item.sid,
+            item.send_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            crate::scheduled::daemon_timezone_label()
+        ))
+    }
+
+    fn chat_can_access_scheduled_entry(&self, chat: &ChatKey, entry: &ScheduledEntry) -> bool {
+        if let Some(session) = self.sessions.get(&entry.item.sid) {
+            return Self::chat_can_access(chat, session);
+        }
+        read_session_meta(&entry.project_dir, &entry.item.sid)
+            .map(|meta| Self::owner_identity_visible(chat, &meta.owner))
+            .unwrap_or(false)
     }
 
     /// Switch the chat's current project to `project` — the `/cd` core, shared
@@ -3711,6 +3861,7 @@ impl Gateway {
                 "",
                 turn.text,
                 TurnOrigin::Internal,
+                turn.literal,
             ))
             .await
             {
@@ -4597,6 +4748,454 @@ impl Gateway {
         atomic_write_durable(path, self.next_session.to_string().as_bytes())
     }
 
+    fn load_scheduled_state(&mut self) {
+        if let Some(path) = self.next_scheduled_path.as_ref() {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(next) = raw.trim().parse::<u64>() {
+                    self.next_scheduled = next;
+                }
+            }
+        }
+        self.scheduled_items.clear();
+        for (project_dir, item) in crate::scheduled::scan_scheduled(&self.projects) {
+            if let Some(number) = item
+                .id
+                .strip_prefix('d')
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                self.next_scheduled = self.next_scheduled.max(number);
+            }
+            self.scheduled_items
+                .insert(item.id.clone(), ScheduledEntry { project_dir, item });
+        }
+        // If a surviving queue proves the counter file was stale/missing, repair
+        // it before accepting another create. Fired ids still rely on the
+        // durable counter, which is written before their queue row is created.
+        if let Err(err) = self.persist_next_scheduled() {
+            tracing::warn!(error = %err, "failed to repair scheduled-message counter");
+        }
+        self.gc_failed_scheduled(chrono::Utc::now());
+    }
+
+    fn persist_next_scheduled(&self) -> Result<()> {
+        let Some(path) = self.next_scheduled_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_durable(path, self.next_scheduled.to_string().as_bytes())
+    }
+
+    fn scheduled_target(&self, sid: &str) -> Result<(String, PathBuf)> {
+        if let Some(session) = self.sessions.get(sid) {
+            let dir = self
+                .projects
+                .get(&session.project)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project for session {sid}"))?;
+            return Ok((session.project.clone(), dir));
+        }
+        self.find_meta_for_sid(sid)
+            .map(|(slug, dir, _)| (slug, dir))
+            .map_err(|_| anyhow!("unknown session: {sid}"))
+    }
+
+    fn persist_scheduled_sid(&self, project_dir: &Path, sid: &str) -> Result<()> {
+        let mut items = self
+            .scheduled_items
+            .values()
+            .filter(|entry| entry.item.sid == sid)
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        items.sort_by(crate::scheduled::scheduled_order);
+        crate::scheduled::write_scheduled(project_dir, sid, &items)
+    }
+
+    /// Pending rows visible in a set of projects. `None` means every project
+    /// (admin); tenants pass their project ACL set from the REST layer.
+    pub fn scheduled_pending_count_in_projects(
+        &self,
+        visible_projects: Option<&HashSet<String>>,
+    ) -> usize {
+        self.scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && visible_projects
+                        .map(|projects| projects.contains(&entry.item.project))
+                        .unwrap_or(true)
+            })
+            .count()
+    }
+
+    /// List pending and short-lived failed rows for one sid.
+    pub fn scheduled_items_for_sid(
+        &mut self,
+        sid: &str,
+    ) -> Result<Vec<crate::scheduled::ScheduledItem>> {
+        self.scheduled_target(sid)?;
+        self.gc_failed_scheduled(chrono::Utc::now());
+        let mut items = self
+            .scheduled_items
+            .values()
+            .filter(|entry| entry.item.sid == sid)
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        items.sort_by(crate::scheduled::scheduled_order);
+        Ok(items)
+    }
+
+    /// REST/web create. The route supplies its already-resolved visible project
+    /// set so the 100-pending human limit is checked atomically under the same
+    /// gateway lock as insertion.
+    pub fn create_scheduled_message(
+        &mut self,
+        sid: &str,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        visible_projects: Option<&HashSet<String>>,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let visible_count = self.scheduled_pending_count_in_projects(visible_projects);
+        self.create_scheduled_message_inner(
+            sid,
+            text,
+            send_at,
+            created_by,
+            None,
+            None,
+            visible_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_scheduled_message_inner(
+        &mut self,
+        sid: &str,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        reply_channel: Option<String>,
+        reply_chat_id: Option<String>,
+        visible_pending: usize,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        if text.trim().is_empty() {
+            return Err(anyhow!("scheduled message text cannot be empty"));
+        }
+        let now = chrono::Utc::now();
+        if send_at <= now {
+            return Err(anyhow!("scheduled time must be in the future"));
+        }
+        if send_at.signed_duration_since(now) > crate::scheduled::MAX_HORIZON {
+            return Err(anyhow!("scheduled time must be within 7 days"));
+        }
+        let (project, project_dir) = self.scheduled_target(sid)?;
+        let sid_pending = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.sid == sid
+                    && entry.item.status == crate::scheduled::ScheduledStatus::Pending
+            })
+            .count();
+        if sid_pending >= crate::scheduled::MAX_PENDING_PER_SID {
+            return Err(anyhow!(
+                "session {sid} already has {} pending scheduled messages (limit {})",
+                sid_pending,
+                crate::scheduled::MAX_PENDING_PER_SID
+            ));
+        }
+        if visible_pending >= crate::scheduled::MAX_PENDING_VISIBLE {
+            return Err(anyhow!(
+                "this chat already sees {} pending scheduled messages (limit {})",
+                visible_pending,
+                crate::scheduled::MAX_PENDING_VISIBLE
+            ));
+        }
+
+        self.next_scheduled += 1;
+        // Counter durability comes before queue insertion: a later write failure
+        // burns a harmless gap but can never reuse the id.
+        self.persist_next_scheduled()?;
+        let item = crate::scheduled::ScheduledItem {
+            id: format!("d{}", self.next_scheduled),
+            sid: sid.to_string(),
+            project,
+            text,
+            send_at,
+            created_at: now,
+            created_by,
+            status: crate::scheduled::ScheduledStatus::Pending,
+            fail_reason: None,
+            failed_at: None,
+            reply_channel,
+            reply_chat_id,
+        };
+        self.scheduled_items.insert(
+            item.id.clone(),
+            ScheduledEntry {
+                project_dir: project_dir.clone(),
+                item: item.clone(),
+            },
+        );
+        if let Err(err) = self.persist_scheduled_sid(&project_dir, sid) {
+            self.scheduled_items.remove(&item.id);
+            return Err(err);
+        }
+        self.emit_scheduled_progress(
+            &item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_ENQUEUED,
+            None,
+        );
+        self.emit_scheduled_changed(&item);
+        self.scheduled_notify.notify_one();
+        Ok(item)
+    }
+
+    /// Cancel/dismiss one pending or failed row. The sid is part of the REST
+    /// resource address and prevents a globally-valid id being cancelled under
+    /// another session path.
+    pub fn cancel_scheduled_message(
+        &mut self,
+        sid: &str,
+        id: &str,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let entry = self
+            .scheduled_items
+            .get(id)
+            .filter(|entry| entry.item.sid == sid)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown scheduled message: {id}"))?;
+        self.scheduled_items.remove(id);
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, sid) {
+            self.scheduled_items.insert(id.to_string(), entry.clone());
+            return Err(err);
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_CANCELLED,
+            None,
+        );
+        self.emit_scheduled_changed(&entry.item);
+        self.scheduled_notify.notify_one();
+        Ok(entry.item)
+    }
+
+    fn emit_scheduled_progress(
+        &self,
+        item: &crate::scheduled::ScheduledItem,
+        event: &str,
+        reason: Option<&str>,
+    ) {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let preview = crate::scheduled::preview(&item.text);
+        let row = ccteam_harness::execution::progress_bridge::build_scheduled_event(
+            event,
+            &item.id,
+            &item.sid,
+            &item.send_at.to_rfc3339(),
+            (!preview.is_empty()).then_some(preview.as_str()),
+            reason,
+        );
+        if let Err(err) =
+            ccteam_core::progress::append_event(&paths.progress_jsonl(&item.project), &row)
+        {
+            tracing::warn!(id = %item.id, sid = %item.sid, error = %err, "append scheduled progress failed");
+        }
+    }
+
+    fn emit_scheduled_changed(&self, item: &crate::scheduled::ScheduledItem) {
+        let _ = self.events_broadcast.send(GatewayEvent {
+            id: format!("scheduled-changed-{}-{}", item.sid, item.id),
+            channel: "web".to_string(),
+            chat_id: "web-api".to_string(),
+            thread_ts: None,
+            content: String::new(),
+            kind: GatewayEventKind::ScheduledChanged,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(item.sid.clone()),
+            slug: Some(item.project.clone()),
+        });
+    }
+
+    fn gc_failed_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let expired = self
+            .scheduled_items
+            .iter()
+            .filter(|(_, entry)| entry.item.failed_expired(now))
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        for (id, entry) in expired {
+            self.scheduled_items.remove(&id);
+            if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+                tracing::warn!(id = %id, error = %err, "persist scheduled failed-item GC failed");
+                self.scheduled_items.insert(id, entry);
+                continue;
+            }
+            self.emit_scheduled_changed(&entry.item);
+        }
+    }
+
+    fn next_scheduled_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.scheduled_items
+            .values()
+            .filter_map(|entry| match entry.item.status {
+                crate::scheduled::ScheduledStatus::Pending => Some(entry.item.send_at),
+                crate::scheduled::ScheduledStatus::Failed => entry
+                    .item
+                    .failed_at
+                    .map(|at| at + crate::scheduled::FAILED_RETENTION),
+            })
+            .min()
+    }
+
+    async fn fire_due_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let mut due = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && entry.item.send_at <= now
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        due.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
+        for entry in due {
+            if now.signed_duration_since(entry.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE {
+                self.fail_scheduled(
+                    &entry.item.id,
+                    "catch-up is older than 24 hours".to_string(),
+                );
+                continue;
+            }
+            let result = self.submit_scheduled_user_turn(&entry.item).await;
+            match result {
+                Ok(()) => self.complete_scheduled_fire(&entry),
+                Err(err) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+            }
+        }
+    }
+
+    async fn submit_scheduled_user_turn(
+        &mut self,
+        item: &crate::scheduled::ScheduledItem,
+    ) -> Result<()> {
+        let chat = match (&item.reply_channel, &item.reply_chat_id) {
+            (Some(channel), Some(chat_id)) => ChatKey::new(channel, chat_id, chat_id),
+            _ => web_api_chat(),
+        };
+        match self
+            .submit_resolved(
+                &chat,
+                &item.sid,
+                "",
+                item.text.clone(),
+                TurnOrigin::User,
+                true,
+            )
+            .await?
+        {
+            SubmitResult::Turn { .. } => Ok(()),
+            SubmitResult::Directive(_) => Err(anyhow!("scheduled body was parsed as a directive")),
+        }
+    }
+
+    fn complete_scheduled_fire(&mut self, entry: &ScheduledEntry) {
+        self.scheduled_items.remove(&entry.item.id);
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+            tracing::warn!(id = %entry.item.id, error = %err, "persist fired scheduled removal failed");
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_FIRED,
+            None,
+        );
+        self.emit_scheduled_changed(&entry.item);
+    }
+
+    fn fail_scheduled(&mut self, id: &str, reason: String) {
+        let Some(mut entry) = self.scheduled_items.get(id).cloned() else {
+            return;
+        };
+        entry.item.status = crate::scheduled::ScheduledStatus::Failed;
+        entry.item.fail_reason = Some(reason.clone());
+        entry.item.failed_at = Some(chrono::Utc::now());
+        self.scheduled_items.insert(id.to_string(), entry.clone());
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+            tracing::warn!(id = %id, error = %err, "persist scheduled failure failed");
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_FAILED,
+            Some(&reason),
+        );
+        self.emit_scheduled_changed(&entry.item);
+        if let (Some(channel), Some(chat_id)) =
+            (&entry.item.reply_channel, &entry.item.reply_chat_id)
+        {
+            self.emit_user_signal(GatewayEvent {
+                id: format!("scheduled-failed-{}", entry.item.id),
+                channel: channel.clone(),
+                chat_id: chat_id.clone(),
+                thread_ts: None,
+                content: format!(
+                    "⏰ {} failed to send to {}: {} (kept in /inbox for 24h)",
+                    entry.item.id, entry.item.sid, reason
+                ),
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                sid: Some(entry.item.sid.clone()),
+                slug: Some(entry.item.project.clone()),
+            });
+        }
+    }
+
+    /// Lightweight wakeable next-fire task. It sleeps until the earliest UTC
+    /// deadline and is notified on every queue mutation; there is no periodic
+    /// orchestrator tick.
+    pub async fn run_scheduled_scheduler(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let notify = { Arc::clone(&gateway.lock().await.scheduled_notify) };
+        loop {
+            let next = {
+                let mut guard = gateway.lock().await;
+                let now = chrono::Utc::now();
+                guard.gc_failed_scheduled(now);
+                if guard.next_scheduled_at().is_some_and(|at| at <= now) {
+                    guard.fire_due_scheduled(now).await;
+                }
+                guard.next_scheduled_at()
+            };
+            match next {
+                Some(at) => {
+                    let delay = at
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = notify.notified() => {}
+                    }
+                }
+                None => notify.notified().await,
+            }
+        }
+    }
+
+    /// Process restart catch-up before the general live-session restore. A due
+    /// target cold-resumes itself through `submit_resolved`; the subsequent
+    /// restore sees it in the live map and skips a duplicate spawn.
+    pub async fn catch_up_scheduled(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let mut guard = gateway.lock().await;
+        let now = chrono::Utc::now();
+        guard.gc_failed_scheduled(now);
+        guard.fire_due_scheduled(now).await;
+    }
+
     /// v0.8.8 bug-fix — persist the USER side of a turn to
     /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump only observes ANSWER
     /// events, so it writes assistant-only records; without this the user's
@@ -4686,7 +5285,14 @@ impl Gateway {
         // `message_id` (the inbound IM message) seeds the 👀 ack reaction when a
         // real turn is submitted (empty for the web leg → no reaction).
         match self
-            .submit_resolved(chat, &session_id, message_id, payload, TurnOrigin::User)
+            .submit_resolved(
+                chat,
+                &session_id,
+                message_id,
+                payload,
+                TurnOrigin::User,
+                false,
+            )
             .await?
         {
             SubmitResult::Directive(replies) => Ok(replies),
@@ -5058,16 +5664,19 @@ impl Gateway {
         message_id: &str,
         payload: String,
         origin: TurnOrigin,
+        literal_user_text: bool,
     ) -> Result<SubmitResult> {
-        if let Some(directive) = parse_session_directive(&payload) {
-            // Directive path: PROBE-and-resume a dead child before dispatching
-            // (a directive may have side effects → never blindly retried). The
-            // turn path below uses the race-free reactive shape instead.
-            self.ensure_session_live(session_id, chat).await?;
-            let replies = self
-                .dispatch_directive(chat, session_id, directive, origin)
-                .await?;
-            return Ok(SubmitResult::Directive(replies));
+        if !literal_user_text {
+            if let Some(directive) = parse_session_directive(&payload) {
+                // Directive path: PROBE-and-resume a dead child before dispatching
+                // (a directive may have side effects → never blindly retried). The
+                // turn path below uses the race-free reactive shape instead.
+                self.ensure_session_live(session_id, chat).await?;
+                let replies = self
+                    .dispatch_directive(chat, session_id, directive, origin)
+                    .await?;
+                return Ok(SubmitResult::Directive(replies));
+            }
         }
 
         // Resume-by-sid (deepest rung): a session ABSENT from the live map —
@@ -5109,6 +5718,7 @@ impl Gateway {
                 session_id,
                 payload.clone(),
                 Some(origin),
+                literal_user_text,
             )?;
             self.resume_dead_session(session_id).await?;
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
@@ -7650,7 +8260,7 @@ impl Gateway {
         // has no inbound IM message) + the `web` channel both suppress the 👀
         // ack reaction — web has its own UI.
         match self
-            .submit_resolved(&web_api_chat(), sid, "", text, origin)
+            .submit_resolved(&web_api_chat(), sid, "", text, origin, false)
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id
@@ -8939,6 +9549,34 @@ fn render_help() -> String {
     }
     s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
     s
+}
+
+fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
+    fn take_word(value: &str) -> Option<(&str, &str)> {
+        let value = value.trim_start();
+        let split = value.find(char::is_whitespace).unwrap_or(value.len());
+        let word = &value[..split];
+        (!word.is_empty()).then(|| (word, value[split..].trim_start()))
+    }
+
+    let (first, after_first) =
+        take_word(rest).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+    let needs_second = first == "今天"
+        || first == "明天"
+        || (first.len() == 10
+            && first.as_bytes().get(4) == Some(&b'-')
+            && first.as_bytes().get(7) == Some(&b'-'));
+    let (when, text) = if needs_second {
+        let (second, body) =
+            take_word(after_first).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+        (format!("{first} {second}"), body)
+    } else {
+        (first.to_string(), after_first)
+    };
+    if text.trim().is_empty() {
+        return Err(anyhow!("scheduled message text cannot be empty"));
+    }
+    Ok((when, text.to_string()))
 }
 
 /// Split an inbound callback payload `"{token}:{idx}"` (v0.8.5 D3).
@@ -10607,6 +11245,7 @@ mod tests {
             &sid,
             "queued-first",
             Some("web".into()),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -17746,5 +18385,239 @@ mod tests {
             }
             _ => unreachable!("filtered above"),
         }
+    }
+
+    #[tokio::test]
+    async fn inbox_create_list_and_cancel_use_current_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway
+            .enable_persistence(tmp.path().join("ccteam-home"))
+            .unwrap();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let created = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                "/inbox +30m review the release notes",
+            )
+            .await
+            .unwrap();
+        assert!(created[0].contains("scheduled d1 → s1"), "{created:?}");
+
+        let listed = gateway
+            .handle_text("mock", "chat-1", "alice", "/inbox")
+            .await
+            .unwrap();
+        assert!(listed[0].contains("d1 · s1"), "{listed:?}");
+        assert!(listed[0].contains("review the release notes"));
+
+        let cancelled = gateway
+            .handle_text("mock", "chat-1", "alice", "/inbox cancel d1")
+            .await
+            .unwrap();
+        assert_eq!(cancelled, vec!["cancelled d1"]);
+        assert!(gateway.scheduled_items_for_sid("s1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_list_reuses_own_plus_web_pool_acl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/inbox +30m own-message")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-2", "bob", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-2", "bob", "/inbox +30m foreign-message")
+            .await
+            .unwrap();
+        let web_sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .create_scheduled_message(
+                &web_sid,
+                "web-pool-message".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(30),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+
+        let listed = gateway
+            .handle_text("telegram", "chat-1", "alice", "/inbox")
+            .await
+            .unwrap();
+        assert!(listed[0].contains("own-message"), "{listed:?}");
+        assert!(listed[0].contains("web-pool-message"), "{listed:?}");
+        assert!(!listed[0].contains("foreign-message"), "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_slash_body_fires_as_literal_user_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "/model opus".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        // Exercise the cold-start pending_turns leg too: the literal flag must
+        // survive enqueue/drain rather than turning `/model` into a directive.
+        fake.live.store(false, Ordering::SeqCst);
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+
+        let submissions = fake.submissions.lock().await.clone();
+        assert!(submissions.iter().any(|(_, text)| text == "/model opus"));
+        assert!(fake.directives.lock().await.is_empty());
+        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_id_counter_survives_cancel_and_daemon_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        seed_role(&project_dir, "reviewer");
+        let root = tmp.path().join("home");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_persistence(&root).unwrap();
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let first = gateway
+            .create_scheduled_message(
+                &sid,
+                "first".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.id, "d1");
+        gateway.cancel_scheduled_message(&sid, "d1").unwrap();
+        drop(gateway);
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restored = Gateway::new(fake, "alpha", &project_dir);
+        restored.enable_persistence(&root).unwrap();
+        let second = restored
+            .create_scheduled_message(
+                &sid,
+                "second".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(10),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second.id, "d2", "cancelled ids are never reused");
+    }
+
+    #[tokio::test]
+    async fn scheduled_restart_catch_up_marks_over_24h_failed_then_gc_expires_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "too old".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::hours(25);
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+        let failed = gateway.scheduled_items_for_sid(&sid).unwrap();
+        assert_eq!(failed[0].status, crate::scheduled::ScheduledStatus::Failed);
+        assert!(failed[0]
+            .fail_reason
+            .as_deref()
+            .unwrap()
+            .contains("older than 24 hours"));
+        assert!(fake.submissions.lock().await.is_empty());
+
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .failed_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
+        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
     }
 }

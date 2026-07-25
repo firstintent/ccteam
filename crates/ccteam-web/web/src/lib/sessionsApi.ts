@@ -99,6 +99,19 @@ export interface SessionStatus {
   status_line: string | null;
 }
 
+/** One pending or short-lived failed delayed user message. */
+export interface ScheduledItem {
+  id: string;
+  sid: string;
+  project: string;
+  text: string;
+  send_at: string;
+  created_at: string;
+  created_by: string;
+  status: "pending" | "failed";
+  fail_reason?: string | null;
+}
+
 /** One role summary from `GET /api/v1/projects/{slug}/roles`
  *  (`crates/ccteam-core` `RoleSummary` → `crates/ccteam-web/src/routes/roles.rs`).
  *  `description`/`model` default to `""` server-side when absent. Drives the
@@ -259,6 +272,42 @@ export function submitTurn(
   const body =
     attachments && attachments.length > 0 ? { text, attachments } : { text };
   return postJson<{ accepted: boolean }>(`${sessionUrl(sid)}/turn`, body);
+}
+
+/** Queue rows for one session, already ordered by `send_at` server-side. */
+export function listScheduled(sid: string): Promise<ScheduledItem[]> {
+  return getJson<ScheduledItem[]>(`${sessionUrl(sid)}/scheduled`);
+}
+
+/** Schedule a one-shot normal user turn using the daemon-local strict parser. */
+export function createScheduled(
+  sid: string,
+  text: string,
+  when: string,
+): Promise<ScheduledItem> {
+  return postJson<ScheduledItem>(`${sessionUrl(sid)}/scheduled`, { text, when });
+}
+
+/** Cancel a pending row or dismiss a retained failure. */
+export async function cancelScheduled(
+  sid: string,
+  id: string,
+): Promise<{ cancelled: boolean; id: string }> {
+  const res = await fetch(`${sessionUrl(sid)}/scheduled/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("NOT_FOUND");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as { cancelled: boolean; id: string };
+}
+
+/** Daemon-local timezone used by both IM and REST wall-clock parsing. */
+export async function getDaemonTimezone(): Promise<string> {
+  const response = await getJson<{ daemon_timezone?: string }>("/api/v1/capabilities");
+  return response.daemon_timezone || "local";
 }
 
 /** `POST /api/v1/sessions/{sid}/stop` — deregister the session. */

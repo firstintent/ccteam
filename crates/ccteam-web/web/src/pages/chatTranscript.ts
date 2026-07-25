@@ -76,7 +76,7 @@ export function appendRow(rows: TranscriptRow[], row: TranscriptRow): Transcript
 export function eventToRow(ev: SessionEvent): TranscriptRow | null {
   // Capacity/lifecycle frames update shell state; they are not conversation
   // content and must never appear as an assistant bubble.
-  if (ev.kind === "session_lifecycle") return null;
+  if (ev.kind === "session_lifecycle" || ev.kind === "scheduled_changed") return null;
   if (ev.options && ev.options.length > 0) {
     return {
       id: ev.id ?? nextRowId("approval"),

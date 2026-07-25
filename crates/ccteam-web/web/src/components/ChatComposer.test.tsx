@@ -21,6 +21,7 @@ import {
   attachmentsPayload,
   ChatComposer,
   fetchSkillLists,
+  scheduleWireWhen,
   shouldSubmitOnEnter,
   SkillMenuSections,
   type ComposerAttachment,
@@ -53,6 +54,13 @@ describe("shouldSubmitOnEnter", () => {
 
   it("still sends Cmd/Ctrl+Enter (no shift, not composing)", () => {
     expect(shouldSubmitOnEnter({ ...base, key: "Enter" })).toBe(true);
+  });
+});
+
+describe("scheduleWireWhen", () => {
+  it("maps datetime-local values to the shared daemon parser and preserves quick chips", () => {
+    expect(scheduleWireWhen("2026-07-26T09:30")).toBe("2026-07-26 09:30");
+    expect(scheduleWireWhen("+30m")).toBe("+30m");
   });
 });
 

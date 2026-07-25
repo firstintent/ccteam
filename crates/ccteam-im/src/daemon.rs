@@ -420,8 +420,14 @@ where
         }
     }
     let restore_gateway = Arc::clone(&gateway);
-    tokio::spawn(async move {
-        Gateway::resume_restored_sessions_shared(restore_gateway).await;
+    let scheduled_scheduler = tokio::spawn(async move {
+        // Catch up due rows BEFORE the general live-set restore. A due target
+        // cold-resumes itself; the restore then observes it live and skips a
+        // duplicate spawn. This keeps restart delivery from waiting behind a
+        // long batch of unrelated vendor resumes.
+        Gateway::catch_up_scheduled(Arc::clone(&restore_gateway)).await;
+        Gateway::resume_restored_sessions_shared(Arc::clone(&restore_gateway)).await;
+        Gateway::run_scheduled_scheduler(restore_gateway).await;
     });
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every
@@ -538,6 +544,7 @@ where
     }
     inbound_consumer.abort();
     gateway_event_consumer.abort();
+    scheduled_scheduler.abort();
     // Per-session event pumps are gateway-owned tasks. `Drop for Gateway`
     // aborts them, but an `Arc` clone held elsewhere (restore/notifier tasks,
     // web AppState, MCP server) can outlive this future, so the Drop may never
@@ -1366,7 +1373,9 @@ fn spawn_gateway_event_consumer(
             // warning firing for every delegation transition).
             if matches!(
                 evt.kind,
-                GatewayEventKind::Delegation { .. } | GatewayEventKind::SessionLifecycle { .. }
+                GatewayEventKind::Delegation { .. }
+                    | GatewayEventKind::SessionLifecycle { .. }
+                    | GatewayEventKind::ScheduledChanged
             ) {
                 continue;
             }
@@ -1416,6 +1425,7 @@ fn spawn_gateway_event_consumer(
                 // correct if that early skip is ever removed.
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
+                GatewayEventKind::ScheduledChanged => {}
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,

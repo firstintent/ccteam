@@ -40,6 +40,8 @@ pub struct HarnessCapability {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CapabilitiesResponse {
     pub harnesses: Vec<HarnessCapability>,
+    /// Daemon-local timezone used by delayed-message wall-clock parsing.
+    pub daemon_timezone: String,
 }
 
 /// List the harness vendors ccteam can drive, each flagged `available`
@@ -71,5 +73,8 @@ pub(crate) async fn handle_capabilities() -> impl IntoResponse {
         tracing::warn!(?err, "capabilities probe worker failed");
         Vec::new()
     });
-    Json(CapabilitiesResponse { harnesses })
+    Json(CapabilitiesResponse {
+        harnesses,
+        daemon_timezone: ccteam_im::scheduled::daemon_timezone_label(),
+    })
 }

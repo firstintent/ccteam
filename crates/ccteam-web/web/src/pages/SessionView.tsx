@@ -17,7 +17,7 @@
 // byte-exact `ccteam-pty.v1` relay via TerminalView.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, Clock, X } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import CostPill from "../components/CostPill";
@@ -33,11 +33,16 @@ import {
 } from "../lib/vendors";
 import {
   getHistory,
+  getDaemonTimezone,
   getSessionStatus,
+  listScheduled,
+  createScheduled,
+  cancelScheduled,
   interruptSession as apiInterruptSession,
   resolveApproval as apiResolveApproval,
   submitTurn,
   type SessionView as SessionSummary,
+  type ScheduledItem,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
@@ -188,6 +193,55 @@ export default function SessionView({
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
   }, []);
+
+  // ---- delayed user-message queue ------------------------------------------
+  const [scheduled, setScheduled] = useState<ScheduledItem[]>([]);
+  const [daemonTimezone, setDaemonTimezone] = useState("local");
+  const scheduledRevision = events.reduce(
+    (count, event) => count + (event.kind === "scheduled_changed" ? 1 : 0),
+    0,
+  );
+  const reloadScheduled = useCallback(() => {
+    listScheduled(sid)
+      .then(setScheduled)
+      .catch(() => {
+        /* best-effort: retain the last authoritative queue */
+      });
+  }, [sid]);
+  useEffect(() => {
+    reloadScheduled();
+  }, [reloadScheduled, scheduledRevision]);
+  useEffect(() => {
+    getDaemonTimezone().then(setDaemonTimezone).catch(() => setDaemonTimezone("local"));
+  }, []);
+
+  const scheduleText = useCallback(
+    (content: string, when: string) => {
+      createScheduled(sid, content, when)
+        .then(() => reloadScheduled())
+        .catch((error) => {
+          pushRow({
+            kind: "system",
+            content: `${t("scheduleFailed")}: ${error instanceof Error ? error.message : "unknown"}`,
+          });
+        });
+    },
+    [sid, reloadScheduled, pushRow, t],
+  );
+
+  const removeScheduled = useCallback(
+    (id: string) => {
+      cancelScheduled(sid, id)
+        .then(() => reloadScheduled())
+        .catch((error) => {
+          pushRow({
+            kind: "system",
+            content: `${t("scheduleCancelFailed")}: ${error instanceof Error ? error.message : "unknown"}`,
+          });
+        });
+    },
+    [sid, reloadScheduled, pushRow, t],
+  );
 
   // ---- send a turn ----------------------------------------------------------
   const submitText = useCallback(
@@ -457,6 +511,42 @@ export default function SessionView({
 
           <div className="conv-composer-wrap">
             <div className="composer-group">
+              {scheduled.length > 0 ? (
+                <div className="scheduled-queue" data-testid="scheduled-queue">
+                  <div className="scheduled-head">
+                    <Clock />
+                    <span>{t("scheduleQueue")}</span>
+                  </div>
+                  {scheduled.map((item) => (
+                    <div key={item.id} className={`scheduled-row ${item.status}`}>
+                      <time dateTime={item.send_at}>
+                        {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
+                          month: "2-digit",
+                          day: "2-digit",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </time>
+                      <span className="scheduled-preview" title={item.text}>
+                        {item.text.replace(/\s+/g, " ").trim().slice(0, 80)}
+                      </span>
+                      {item.status === "failed" ? (
+                        <span className="scheduled-error" title={item.fail_reason ?? ""}>
+                          {t("scheduleFailed")}
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        aria-label={`${t("scheduleCancel")} ${item.id}`}
+                        title={`${t("scheduleCancel")} ${item.id}`}
+                        onClick={() => removeScheduled(item.id)}
+                      >
+                        <X />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               <ChatComposer
                 draftKey={sid}
                 lang={lang}
@@ -470,6 +560,8 @@ export default function SessionView({
                 isAdmin={isAdmin}
                 modelLabel={statusModel ?? ""}
                 uploadSlug={session?.project}
+                onSchedule={scheduleText}
+                scheduleTimezone={daemonTimezone}
               />
             </div>
           </div>

@@ -226,6 +226,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_turn))
+        .routes(routes!(
+            super::sessions_api::handle_list_scheduled,
+            super::sessions_api::handle_create_scheduled
+        ))
+        .routes(routes!(super::sessions_api::handle_cancel_scheduled))
         // v0.8.7 review-fix (R-H1) — token-resolve for the web HITL approve/deny
         // path (same pending machinery as an IM click, NOT a turn).
         .routes(routes!(super::sessions_api::handle_session_resolve))

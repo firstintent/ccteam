@@ -396,6 +396,24 @@ button { font-family: inherit; cursor: pointer; }
 }
 .composer textarea::placeholder { color: var(--text-faint); }
 
+.schedule-controls {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 7px 9px; border-radius: 9px; background: var(--bg-soft);
+  color: var(--text-muted); font-size: 12px;
+}
+.schedule-controls input {
+  min-width: 190px; padding: 5px 7px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--bg-card); color: var(--text);
+  font: 12px var(--font-mono);
+}
+.schedule-controls button {
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--bg-card); color: var(--text-muted); font-size: 12px;
+}
+.schedule-controls button.selected { background: var(--ink); color: var(--on-ink); }
+.schedule-controls span { margin-left: auto; }
+.icon-btn.schedule-on { background: var(--ink); color: var(--on-ink); }
+
 /* Composer attachment chips (files uploading/stored + attached skills). */
 .att-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .att-chip {
@@ -601,6 +619,29 @@ html.dark .dot.off { background: #4b4e57; }
 .conv-composer-wrap { padding: 0 28px 20px; }
 .conv-composer-wrap .composer-group { max-width: 820px; margin: 0 auto; }
 .conv-composer-wrap .composer { margin-top: 0; }
+.scheduled-queue {
+  margin-bottom: 8px; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 11px; background: var(--bg-card); box-shadow: var(--shadow-card);
+}
+.scheduled-head {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+  color: var(--text-muted); font-size: 12px; font-weight: 500;
+}
+.scheduled-head svg { width: 14px; height: 14px; }
+.scheduled-row {
+  display: flex; align-items: center; gap: 8px; min-height: 28px;
+  color: var(--text-muted); font-size: 12px;
+}
+.scheduled-row time { flex: none; font-family: var(--font-mono); color: var(--text-faint); }
+.scheduled-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scheduled-error { flex: none; color: var(--red); }
+.scheduled-row > button {
+  margin-left: auto; width: 24px; height: 24px; display: inline-flex;
+  align-items: center; justify-content: center; border: none; border-radius: 50%;
+  background: transparent; color: var(--text-faint);
+}
+.scheduled-row > button:hover { background: var(--bg-soft); color: var(--text); }
+.scheduled-row > button svg { width: 13px; height: 13px; }
 .jump-latest {
   position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: center; gap: 5px;

@@ -20,6 +20,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   ChevronRight,
+  Clock,
   FileText,
   Hand,
   Image as ImageIcon,
@@ -65,6 +66,13 @@ export function shouldSubmitOnEnter(e: {
   if (e.isComposing || e.keyCode === 229) return false;
   if (e.shiftKey) return false;
   return true;
+}
+
+/** Convert a `datetime-local` control value to the daemon parser's absolute
+ * form; relative quick chips pass through unchanged. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function scheduleWireWhen(value: string): string {
+  return value.includes("T") ? value.replace("T", " ") : value;
 }
 
 /** One composer chip: a picked file mid-upload / stored, or an attached
@@ -237,6 +245,8 @@ export function ChatComposer({
   sendTestId = "composer-send",
   uploadSlug,
   prefill,
+  onSchedule,
+  scheduleTimezone,
 }: {
   /** localStorage draft scope — `"home"` or the sid. */
   draftKey: string;
@@ -272,6 +282,10 @@ export function ChatComposer({
   /** Home 快速开始 templates: bump `nonce` to replace the draft text with
    *  `text` and focus the textarea (nonce 0 = no prefill). */
   prefill?: { text: string; nonce: number };
+  /** Conversation-only delayed send. Omit on Home to hide schedule mode. */
+  onSchedule?: (text: string, when: string) => boolean | void;
+  /** Label reported by the daemon (`PDT (UTC-07:00)`, etc.). */
+  scheduleTimezone?: string;
 }) {
   const t = makeT(lang);
   const [text, setText] = useState(() => loadDraft(draftKey));
@@ -281,6 +295,8 @@ export function ChatComposer({
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const [globalSkills, setGlobalSkills] = useState<LibrarySkillSummary[] | null>(null);
+  const [scheduleMode, setScheduleMode] = useState(false);
+  const [scheduleWhen, setScheduleWhen] = useState("");
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
@@ -350,6 +366,7 @@ export function ChatComposer({
 
   const attachFiles = useCallback(
     (files: FileList | File[] | null | undefined) => {
+      if (scheduleMode) return;
       const picked = Array.from(files ?? []);
       if (picked.length === 0) return;
       if (!uploadSlug) {
@@ -383,7 +400,7 @@ export function ChatComposer({
           });
       }
     },
-    [uploadSlug, t],
+    [uploadSlug, scheduleMode, t],
   );
 
   const toggleSkill = useCallback((skill: string, scope: "project" | "global" = "project") => {
@@ -449,6 +466,27 @@ export function ChatComposer({
 
   const send = useCallback(() => {
     const trimmed = text.trim();
+    if (scheduleMode) {
+      if (!trimmed) {
+        toastBus.handler?.info(t("emptyInput"));
+        return;
+      }
+      if (!scheduleWhen) {
+        toastBus.handler?.info(t("schedulePickTime"));
+        return;
+      }
+      const keep = onSchedule?.(trimmed, scheduleWireWhen(scheduleWhen)) === false;
+      if (keep) return;
+      setText("");
+      setScheduleWhen("");
+      setScheduleMode(false);
+      try {
+        localStorage.removeItem(draftStorageKey(draftKey));
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     if (!trimmed && attachments.length === 0) {
       toastBus.handler?.info(t("emptyInput"));
       return;
@@ -466,7 +504,7 @@ export function ChatComposer({
     } catch {
       /* ignore */
     }
-  }, [text, attachments, onSend, draftKey, t]);
+  }, [text, attachments, onSend, onSchedule, scheduleMode, scheduleWhen, draftKey, t]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -544,9 +582,9 @@ export function ChatComposer({
   // Vendor is ALWAYS spelled out next to the model — a bare "默认"/"opus"
   // plus a colored dot left the harness unreadable (owner feedback).
   const modelText = modelLabel ?? draft.model;
-  const showStop = !!busy && !text.trim() && !!onStop;
+  const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor, isAdmin);
-  const sendable = !!text.trim() || attachments.length > 0;
+  const sendable = scheduleMode ? !!text.trim() && !!scheduleWhen : !!text.trim() || attachments.length > 0;
 
   return (
     <div
@@ -561,6 +599,31 @@ export function ChatComposer({
       }}
     >
       {topSlot}
+      {scheduleMode ? (
+        <div className="schedule-controls" data-testid="schedule-controls">
+          <input
+            type="datetime-local"
+            value={scheduleWhen.includes("T") ? scheduleWhen : ""}
+            aria-label={t("scheduleDateTime")}
+            onChange={(event) => setScheduleWhen(event.currentTarget.value)}
+          />
+          <button
+            type="button"
+            className={scheduleWhen === "+30m" ? "selected" : ""}
+            onClick={() => setScheduleWhen("+30m")}
+          >
+            +30m
+          </button>
+          <button
+            type="button"
+            className={scheduleWhen === "+1h" ? "selected" : ""}
+            onClick={() => setScheduleWhen("+1h")}
+          >
+            +1h
+          </button>
+          <span>{t("scheduleTimezone")}: {scheduleTimezone || "local"}</span>
+        </div>
+      ) : null}
       {attachments.length > 0 ? (
         <div className="att-chips" data-testid="att-chips">
           {attachments.map((a) => (
@@ -625,7 +688,30 @@ export function ChatComposer({
         }}
       />
       <div className="composer-row">
-        <div className={`sel ${attachOpen ? "open" : ""}`} ref={attachRef}>
+        {onSchedule ? (
+          <button
+            type="button"
+            className={`icon-btn ${scheduleMode ? "schedule-on" : ""}`}
+            data-testid="schedule-toggle"
+            title={t("scheduleToggle")}
+            aria-label={t("scheduleToggle")}
+            onClick={() => {
+              setScheduleMode((current) => {
+                const next = !current;
+                if (next) {
+                  setAttachments([]);
+                  setAttachOpen(false);
+                } else {
+                  setScheduleWhen("");
+                }
+                return next;
+              });
+            }}
+          >
+            <Clock />
+          </button>
+        ) : null}
+        {!scheduleMode ? <div className={`sel ${attachOpen ? "open" : ""}`} ref={attachRef}>
           <button
             type="button"
             className="icon-btn"
@@ -680,7 +766,7 @@ export function ChatComposer({
               />
             ) : null}
           </div>
-        </div>
+        </div> : null}
         <button
           type="button"
           data-testid="hitl-toggle"
@@ -775,10 +861,10 @@ export function ChatComposer({
               data-testid={sendTestId}
               className="send-btn"
               onClick={send}
-              disabled={disabled}
-              title={t("sendTip")}
+              disabled={disabled || (scheduleMode && !scheduleWhen)}
+              title={scheduleMode ? t("scheduleSend") : t("sendTip")}
             >
-              <ArrowUp />
+              {scheduleMode ? <Clock /> : <ArrowUp />}
             </button>
           )}
         </div>
