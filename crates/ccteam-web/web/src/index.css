@@ -397,11 +397,32 @@ button { font-family: inherit; cursor: pointer; }
 .composer textarea::placeholder { color: var(--text-faint); }
 
 .schedule-controls {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  padding: 7px 9px; border-radius: 9px; background: var(--bg-soft);
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 9px 10px; border-radius: 9px; background: var(--bg-soft);
   color: var(--text-muted); font-size: 12px;
 }
-.schedule-controls input {
+.schedule-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.schedule-label {
+  flex: none; min-width: 2.5em; color: var(--text-faint); font-weight: 500;
+}
+.schedule-num {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 6px 2px 2px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg-card);
+}
+.schedule-num input[type="number"] {
+  width: 3.6em; min-width: 0; padding: 5px 4px; border: 0;
+  background: transparent; color: var(--text);
+  font: 12px var(--font-mono); text-align: right;
+}
+.schedule-num input[type="number"]::-webkit-outer-spin-button,
+.schedule-num input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.schedule-num input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+.schedule-controls input[type="datetime-local"] {
   min-width: 190px; padding: 5px 7px; border: 1px solid var(--border);
   border-radius: 7px; background: var(--bg-card); color: var(--text);
   font: 12px var(--font-mono);
@@ -411,7 +432,16 @@ button { font-family: inherit; cursor: pointer; }
   background: var(--bg-card); color: var(--text-muted); font-size: 12px;
 }
 .schedule-controls button.selected { background: var(--ink); color: var(--on-ink); }
-.schedule-controls span { margin-left: auto; }
+.schedule-hint {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px;
+  padding-top: 2px; border-top: 1px dashed var(--border);
+  color: var(--text-faint); font-size: 11.5px;
+}
+.schedule-hint code {
+  font: 11px var(--font-mono); color: var(--text-muted);
+  background: var(--bg-card); padding: 1px 5px; border-radius: 4px;
+}
+.schedule-tz-note { margin-left: auto; opacity: 0.85; }
 .icon-btn.schedule-on { background: var(--ink); color: var(--on-ink); }
 
 /* Composer attachment chips (files uploading/stored + attached skills). */

@@ -19,9 +19,11 @@ import { renderToString } from "react-dom/server";
 import {
   attachmentsBlockSend,
   attachmentsPayload,
+  buildScheduleWhen,
   ChatComposer,
+  datetimeLocalToMs,
   fetchSkillLists,
-  scheduleWireWhen,
+  scheduleWhenPreview,
   shouldSubmitOnEnter,
   SkillMenuSections,
   type ComposerAttachment,
@@ -57,10 +59,33 @@ describe("shouldSubmitOnEnter", () => {
   });
 });
 
-describe("scheduleWireWhen", () => {
-  it("maps datetime-local values to the shared daemon parser and preserves quick chips", () => {
-    expect(scheduleWireWhen("2026-07-26T09:30")).toBe("2026-07-26 09:30");
-    expect(scheduleWireWhen("+30m")).toBe("+30m");
+describe("buildScheduleWhen", () => {
+  const noon = new Date(2026, 6, 25, 12, 0, 0, 0).getTime(); // local noon
+
+  it("prefers chips, then free-form hours+minutes as a single +Nm delay", () => {
+    expect(buildScheduleWhen({ chip: "+30m", minutes: "5" }, noon)).toBe("+30m");
+    expect(buildScheduleWhen({ hours: "1", minutes: "15" }, noon)).toBe("+75m");
+    expect(buildScheduleWhen({ minutes: "45" }, noon)).toBe("+45m");
+    expect(buildScheduleWhen({ hours: "2" }, noon)).toBe("+120m");
+    expect(buildScheduleWhen({ minutes: "0", hours: "0" }, noon)).toBeNull();
+    expect(buildScheduleWhen({ minutes: "-3" }, noon)).toBeNull();
+  });
+
+  it("maps datetime-local (browser wall clock) to minutes-from-now, not daemon TZ", () => {
+    // 12:40 local → +40m from noon
+    expect(buildScheduleWhen({ absolute: "2026-07-25T12:40" }, noon)).toBe("+40m");
+    // Past absolute is rejected
+    expect(buildScheduleWhen({ absolute: "2026-07-25T11:00" }, noon)).toBeNull();
+    expect(datetimeLocalToMs("2026-07-25T12:40")).toBe(
+      new Date(2026, 6, 25, 12, 40, 0, 0).getTime(),
+    );
+  });
+
+  it("previews a relative when as a local clock label", () => {
+    const label = scheduleWhenPreview("+30m", noon, "en-US");
+    expect(label).toBeTruthy();
+    // Locale-dependent formatting (12:30 vs 12:30 PM) — only assert the minute.
+    expect(label).toMatch(/12:30/);
   });
 });
 

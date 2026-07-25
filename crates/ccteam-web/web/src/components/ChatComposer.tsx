@@ -68,11 +68,106 @@ export function shouldSubmitOnEnter(e: {
   return true;
 }
 
-/** Convert a `datetime-local` control value to the daemon parser's absolute
- * form; relative quick chips pass through unchanged. */
+/** Inputs that resolve to a daemon `when` string for delayed send. */
+export type ScheduleTimeDraft = {
+  /** Quick chip such as `+30m` / `+1h`; wins over free-form numbers when set. */
+  chip?: string;
+  /** Free-form minutes (integer ≥ 0). Combined with hours as total delay. */
+  minutes?: string;
+  /** Free-form hours (integer ≥ 0). */
+  hours?: string;
+  /** `datetime-local` value (`YYYY-MM-DDTHH:MM`) in the **browser** wall clock. */
+  absolute?: string;
+};
+
+function parseNonNegInt(raw: string | undefined): number | null {
+  if (raw == null) return null;
+  const t = raw.trim();
+  if (t === "" || !/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
+/** Parse a `datetime-local` string as the browser's local wall clock. */
+export function datetimeLocalToMs(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const [, ys, mos, ds, hs, mins] = m;
+  const ms = new Date(
+    Number(ys),
+    Number(mos) - 1,
+    Number(ds),
+    Number(hs),
+    Number(mins),
+    0,
+    0,
+  ).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Build the daemon-facing `when` string.
+ *
+ * Prefer **relative** `+Nm` so browser timezone and daemon timezone never
+ * disagree: absolute `datetime-local` is converted to minutes-from-now using
+ * the browser clock (same real-world instant on any NTP-synced host).
+ * Returns `null` when nothing valid / not in the future.
+ */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
-export function scheduleWireWhen(value: string): string {
-  return value.includes("T") ? value.replace("T", " ") : value;
+export function buildScheduleWhen(
+  draft: ScheduleTimeDraft,
+  nowMs: number = Date.now(),
+): string | null {
+  const chip = draft.chip?.trim() ?? "";
+  if (/^\+\d+[mh]$/.test(chip)) return chip;
+
+  const hours = parseNonNegInt(draft.hours);
+  const minutes = parseNonNegInt(draft.minutes);
+  if (hours !== null || minutes !== null) {
+    const total = (hours ?? 0) * 60 + (minutes ?? 0);
+    if (total <= 0) return null;
+    return `+${total}m`;
+  }
+
+  const absolute = draft.absolute?.trim() ?? "";
+  if (absolute.includes("T")) {
+    const target = datetimeLocalToMs(absolute);
+    if (target == null) return null;
+    const mins = Math.round((target - nowMs) / 60_000);
+    if (mins <= 0) return null;
+    return `+${mins}m`;
+  }
+  return null;
+}
+
+/** Human preview of a relative `when` as a local clock time (for the UI). */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function scheduleWhenPreview(
+  when: string,
+  nowMs: number = Date.now(),
+  locale = "en-US",
+): string | null {
+  const m = /^\+(\d+)([mh])$/.exec(when.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  const ms = m[2] === "h" ? n * 3_600_000 : n * 60_000;
+  const at = new Date(nowMs + ms);
+  return at.toLocaleString(locale, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** @deprecated use {@link buildScheduleWhen}; kept for older call sites/tests. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function scheduleWireWhen(value: string, nowMs: number = Date.now()): string {
+  if (value.includes("T")) {
+    return buildScheduleWhen({ absolute: value }, nowMs) ?? value.replace("T", " ");
+  }
+  return value;
 }
 
 /** One composer chip: a picked file mid-upload / stored, or an attached
@@ -296,7 +391,12 @@ export function ChatComposer({
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const [globalSkills, setGlobalSkills] = useState<LibrarySkillSummary[] | null>(null);
   const [scheduleMode, setScheduleMode] = useState(false);
-  const [scheduleWhen, setScheduleWhen] = useState("");
+  /** Quick chip (`+30m`) — exclusive with free-form numbers / absolute. */
+  const [scheduleChip, setScheduleChip] = useState("");
+  const [scheduleMinutes, setScheduleMinutes] = useState("");
+  const [scheduleHours, setScheduleHours] = useState("");
+  /** `datetime-local` value in the browser wall clock. */
+  const [scheduleAbsolute, setScheduleAbsolute] = useState("");
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
@@ -464,6 +564,22 @@ export function ChatComposer({
 
   // ---- send ------------------------------------------------------------------
 
+  const resolvedScheduleWhen = scheduleMode
+    ? buildScheduleWhen({
+        chip: scheduleChip,
+        minutes: scheduleMinutes,
+        hours: scheduleHours,
+        absolute: scheduleAbsolute,
+      })
+    : null;
+
+  const clearScheduleFields = useCallback(() => {
+    setScheduleChip("");
+    setScheduleMinutes("");
+    setScheduleHours("");
+    setScheduleAbsolute("");
+  }, []);
+
   const send = useCallback(() => {
     const trimmed = text.trim();
     if (scheduleMode) {
@@ -471,14 +587,20 @@ export function ChatComposer({
         toastBus.handler?.info(t("emptyInput"));
         return;
       }
-      if (!scheduleWhen) {
+      const when = buildScheduleWhen({
+        chip: scheduleChip,
+        minutes: scheduleMinutes,
+        hours: scheduleHours,
+        absolute: scheduleAbsolute,
+      });
+      if (!when) {
         toastBus.handler?.info(t("schedulePickTime"));
         return;
       }
-      const keep = onSchedule?.(trimmed, scheduleWireWhen(scheduleWhen)) === false;
+      const keep = onSchedule?.(trimmed, when) === false;
       if (keep) return;
       setText("");
-      setScheduleWhen("");
+      clearScheduleFields();
       setScheduleMode(false);
       try {
         localStorage.removeItem(draftStorageKey(draftKey));
@@ -504,7 +626,20 @@ export function ChatComposer({
     } catch {
       /* ignore */
     }
-  }, [text, attachments, onSend, onSchedule, scheduleMode, scheduleWhen, draftKey, t]);
+  }, [
+    text,
+    attachments,
+    onSend,
+    onSchedule,
+    scheduleMode,
+    scheduleChip,
+    scheduleMinutes,
+    scheduleHours,
+    scheduleAbsolute,
+    clearScheduleFields,
+    draftKey,
+    t,
+  ]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -584,7 +719,12 @@ export function ChatComposer({
   const modelText = modelLabel ?? draft.model;
   const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor, isAdmin);
-  const sendable = scheduleMode ? !!text.trim() && !!scheduleWhen : !!text.trim() || attachments.length > 0;
+  const sendable = scheduleMode
+    ? !!text.trim() && !!resolvedScheduleWhen
+    : !!text.trim() || attachments.length > 0;
+  const schedulePreview = resolvedScheduleWhen
+    ? scheduleWhenPreview(resolvedScheduleWhen, Date.now(), lang === "en" ? "en-US" : "zh-CN")
+    : null;
 
   return (
     <div
@@ -601,27 +741,90 @@ export function ChatComposer({
       {topSlot}
       {scheduleMode ? (
         <div className="schedule-controls" data-testid="schedule-controls">
-          <input
-            type="datetime-local"
-            value={scheduleWhen.includes("T") ? scheduleWhen : ""}
-            aria-label={t("scheduleDateTime")}
-            onChange={(event) => setScheduleWhen(event.currentTarget.value)}
-          />
-          <button
-            type="button"
-            className={scheduleWhen === "+30m" ? "selected" : ""}
-            onClick={() => setScheduleWhen("+30m")}
-          >
-            +30m
-          </button>
-          <button
-            type="button"
-            className={scheduleWhen === "+1h" ? "selected" : ""}
-            onClick={() => setScheduleWhen("+1h")}
-          >
-            +1h
-          </button>
-          <span>{t("scheduleTimezone")}: {scheduleTimezone || "local"}</span>
+          <div className="schedule-row">
+            <span className="schedule-label">{t("scheduleIn")}</span>
+            <label className="schedule-num">
+              <input
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                placeholder="0"
+                data-testid="schedule-minutes"
+                aria-label={t("scheduleMinutes")}
+                value={scheduleMinutes}
+                onChange={(e) => {
+                  setScheduleMinutes(e.currentTarget.value);
+                  setScheduleChip("");
+                  setScheduleAbsolute("");
+                }}
+              />
+              <span>{t("scheduleMinutes")}</span>
+            </label>
+            <label className="schedule-num">
+              <input
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                placeholder="0"
+                data-testid="schedule-hours"
+                aria-label={t("scheduleHours")}
+                value={scheduleHours}
+                onChange={(e) => {
+                  setScheduleHours(e.currentTarget.value);
+                  setScheduleChip("");
+                  setScheduleAbsolute("");
+                }}
+              />
+              <span>{t("scheduleHours")}</span>
+            </label>
+            {(["+15m", "+30m", "+1h", "+2h"] as const).map((chip) => (
+              <button
+                key={chip}
+                type="button"
+                className={scheduleChip === chip ? "selected" : ""}
+                data-testid={`schedule-chip-${chip}`}
+                onClick={() => {
+                  setScheduleChip(chip);
+                  setScheduleMinutes("");
+                  setScheduleHours("");
+                  setScheduleAbsolute("");
+                }}
+              >
+                {chip}
+              </button>
+            ))}
+          </div>
+          <div className="schedule-row">
+            <span className="schedule-label">{t("scheduleOrAt")}</span>
+            <input
+              type="datetime-local"
+              data-testid="schedule-absolute"
+              value={scheduleAbsolute}
+              aria-label={t("scheduleDateTime")}
+              onChange={(event) => {
+                setScheduleAbsolute(event.currentTarget.value);
+                setScheduleChip("");
+                setScheduleMinutes("");
+                setScheduleHours("");
+              }}
+            />
+          </div>
+          <div className="schedule-hint" data-testid="schedule-hint">
+            {schedulePreview && resolvedScheduleWhen ? (
+              <span>
+                {t("schedulePreview")}: {schedulePreview}{" "}
+                <code>{resolvedScheduleWhen}</code>
+              </span>
+            ) : (
+              <span>{t("schedulePickTime")}</span>
+            )}
+            <span className="schedule-tz-note" title={scheduleTimezone || undefined}>
+              {t("scheduleTzNote")}
+              {scheduleTimezone ? ` (${scheduleTimezone})` : ""}
+            </span>
+          </div>
         </div>
       ) : null}
       {attachments.length > 0 ? (
@@ -702,7 +905,7 @@ export function ChatComposer({
                   setAttachments([]);
                   setAttachOpen(false);
                 } else {
-                  setScheduleWhen("");
+                  clearScheduleFields();
                 }
                 return next;
               });
@@ -861,7 +1064,7 @@ export function ChatComposer({
               data-testid={sendTestId}
               className="send-btn"
               onClick={send}
-              disabled={disabled || (scheduleMode && !scheduleWhen)}
+              disabled={disabled || (scheduleMode && !resolvedScheduleWhen)}
               title={scheduleMode ? t("scheduleSend") : t("sendTip")}
             >
               {scheduleMode ? <Clock /> : <ArrowUp />}

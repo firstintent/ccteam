@@ -519,7 +519,10 @@ export default function SessionView({
                   </div>
                   {scheduled.map((item) => (
                     <div key={item.id} className={`scheduled-row ${item.status}`}>
-                      <time dateTime={item.send_at}>
+                      <time
+                        dateTime={item.send_at}
+                        title={`${t("scheduleLocalTime")}: ${item.send_at}`}
+                      >
                         {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
                           month: "2-digit",
                           day: "2-digit",
