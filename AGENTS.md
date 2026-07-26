@@ -25,8 +25,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.9`(已合 main;tag/部署 HELD 等 owner 显式发话) |
-| 本版 headline | 全局 skill 库:hub skill 一律落 `~/.ccteam/skills`(项目零写入)+ 会话显式 attach + 项目 skill 面(`.agents/skills` 实体 + `.claude/skills` 软链)+ `ccteam skill` CLI 组 + session 工具 inline wait 诚实上限 240s |
+| Workspace version | `0.9.10`(dev 攒齐待 owner 合 PR #170;tag/部署 HELD 等 owner 显式发话) |
+| 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker) |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
 > 开发一律落 `dev` 分支 + dev→main PR 攒版本,main 不直推(§五「分支与推送」);主分支 HEAD 以 `git rev-parse origin/main` 为准。

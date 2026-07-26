@@ -79,7 +79,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ## 一、Web 控制台(推荐)
 
-打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / MCP / 自进化(只读)。**设置**收编主机 / 插件市场 / Status / IM 凭据。主题**默认浅色**(可切深色)。
+打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / 插件市场 / MCP / 自进化(只读)。**设置**含 运维总览(daemon 健康 + 主机,admin)/ 接入(外部 Agent MCP 配置、卫星加入、IM 凭据、用户登录链接,admin)/ 通用 / 账号。主题**默认浅色**(可切深色)。
 
 > **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
 
@@ -104,7 +104,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 插件市场:装角色 / 技能 / 工作流
 
-**插件市场** 页浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库(管理员可见);全局库与项目之间不软链、不复制。
+**插件市场** 页(在**工作流**下;默认打开 Skills 分类,项目选择器只在装进项目的类型(agent/plugin)出现)浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库(管理员可见);全局库与项目之间不软链、不复制。
 
 ### 配置 Telegram / 飞书
 

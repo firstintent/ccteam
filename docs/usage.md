@@ -92,7 +92,7 @@ Open that link to enter the console.
 
 ## 1. Web Console (Recommended)
 
-Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / MCP / Evolution (read-only). **Settings** links Hosts, Marketplace, Status, and IM credentials (admin). Theme defaults to **light** (dark remains available).
+Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / Marketplace / MCP / Evolution (read-only). **Settings** has Ops overview (daemon health + hosts, admin), Access (external-agent MCP config, satellite join, IM credentials, user login links — admin), General, and Account. Theme defaults to **light** (dark remains available).
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
@@ -118,7 +118,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
-The **Marketplace** page browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
+The **Marketplace** page (under **Workflow**; the Skills tab opens first, and the project picker appears only for project-scoped types like agents) browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
 
 ### Configure Telegram / Lark
 

@@ -27,7 +27,7 @@ ccteam is the connective tissue they lack — identity, routing, delivery guaran
 
 **1 · Remote control from Telegram / Lark**
 
-Paste a bot token once (Settings → IM) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast:
+Paste a bot token once (Settings → Access) and the chat becomes a full console — completion notifications, HITL `[approve] [deny]` buttons, and shipped files all land in the same thread. Dispatch at midnight, close the laptop, find the result at breakfast:
 
 ```text
 /cd demo                        # pick a project; your next message talks to it
@@ -64,7 +64,7 @@ Spawn a claude reviewer on s2's diff — I'm not merging until it signs off.
 
 **4 · Many machines, one console**
 
-Register a satellite with a join token (Settings → Hosts) — it dials out to your daemon, so a laptop behind NAT works fine. Projects are bound to a host and run where they live: spawn into the GPU-box project and its tests run on the GPU box, while transcripts, cost, and the team view stay in one console. Switching machines is just switching projects.
+Register a satellite with a join token (Settings → Access) — it dials out to your daemon, so a laptop behind NAT works fine. Projects are bound to a host and run where they live: spawn into the GPU-box project and its tests run on the GPU box, while transcripts, cost, and the team view stay in one console. Switching machines is just switching projects.
 
 > Satellite execution currently runs Claude sessions; the other vendors run on the daemon's machine.
 
@@ -118,9 +118,9 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
-- **Settings → Hosts** — register the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team; and mint join tokens for new machines
-- **Settings → IM** — paste a Telegram/Lark bot token (chat id captured automatically)
-- **Marketplace** — install personas (into the project) and skills (into your user-level library `~/.ccteam/skills`), checksum-verified; attach library skills to any message from the composer
+- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents, satellite join tokens for new machines, Telegram/Lark bot credentials (chat id captured automatically), and per-user login links
+- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team
+- **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
 
 > The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. To bind a specific host/port (e.g. loopback only), pass `--web-bind` when you start it: `ccteam daemon start --web-bind 127.0.0.1:7331`.
 
