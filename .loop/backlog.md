@@ -79,6 +79,12 @@
 - **验证(B)**:实现 `9537720`。② roles caller graph 证实目标测试原本已直接调用 `list_library_skills(&root)`,scanner 只 canonicalize/递归该显式 root,不读 HOME/CCTEAM_HOME,故怀疑的真实-home fallback **诚实不可复现**;新增 `list_default_library_skills_in(ccteam_root)` 并让 env-derived wrapper 委托它,目标测试改走显式 ccteam root 且种 sibling decoy library 证明不越界。③ transcript 根因实锤:目标 lib test 自己 `set_var("HOME", temp)`，而 `discover_active_session` 每次经 `dirs::home_dir()` 定位 `~/.claude/projects`;全套并发时任一 HOME-mutating test 可把它重定向到别的树。新增 `discover_active_session_in(claude_projects_root,cwd)`,生产 wrapper 仅负责 home 派生,目标测试全程注入 root、零 env mutation,并种第二棵完整 decoy Claude tree。tests-first 两目标均因注入缝不存在编译红;③行为缺陷另由 caller graph 实锤,②不伪造旧码行为红。最终两目标各连续 **10/10** 绿;`make test-baseline` **1669/0**(锚 1669/0,两只均为原测试改写,净 ±0);fmt 绿;`make check` clippy 0;`writeback.sh` 绿。
 - **验证**:Part A/B 均完成;实现与门禁证据分别见上方 `验证(A)`、`验证(B)`。
 
+### TEST-MACOS-1 macOS 宿主两族测试环境红修复(ae24cb3 review 顺带实锤;非产品 bug)
+- **状态**:待排 · **冲突域**:`crates/ccteam-core(roles tests) + crates/ccteam-harness(codex_app_server_test 基建)` · **建议入口**:dev 会话
+- **背景**:两族均先于 ae24cb3、Linux CI 绿,详见 `.loop/verify/README.md` env 账「macOS 宿主两族」。① roles `list_library_skills_is_recursive_hidden_safe_and_sorted`:scanner `fs::canonicalize`(/var→/private/var)vs 测试字面 tempdir 断言,默认 shell TMPDIR 下确定性红且**在 baseline 口径内**;② codex_app_server_test 9 只 `SUN_LEN`:UDS socket 路径超长(macOS 104B 上限,长 TMPDIR 嵌套)。
+- **规格**:① 测试期望 path 改按 canonicalized root 构造(生产 canonicalize 行为不动);② 测试 UDS socket 落短路径(如 `/tmp/<短随机>`,测试自清理),不动生产 socket 布局。
+- **DoD**:两族在默认 shell TMPDIR(`/var/folders/…`)下全绿;`make test-baseline` 本机默认 shell 全绿;不动任何生产逻辑;writeback 绿。
+
 ### P1-2 session_collect 游标去重
 - **状态**:待排 · **冲突域**:`crates/ccteam-im(session_collect MCP)` · **建议入口**:dev 会话
 - **背景**:collect 会重复返回已读段(v0.9.2 遗留 P1)。坐标开工时核现值。

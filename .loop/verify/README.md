@@ -33,6 +33,12 @@
   判 flake 前先在干净环境或 CI 复测;**禁「测试瞬时红就顺手改测试消红」**——先证据后定性,留账不冒充全绿。
   另:`remove_test t03/t17` = **确定性红非 flake**(v0.9.0 废 cto 后测试语义未跟,已立卡 P1-3),判基线单列、不得再增同类;
   注意 **CI 目前不跑测试**(只 fmt+clippy,P2-1 待补)——「CI 绿」不能当测试证据。
+- **macOS 宿主两族**(2026-07-26 ae24cb3 review 实锤,均先于该 commit、Linux CI 不受影响;修卡 = TEST-MACOS-1):
+  ① `ccteam-core roles::list_library_skills_is_recursive_hidden_safe_and_sorted` —— **在 baseline 口径内**,TMPDIR 形状敏感:
+  scanner `fs::canonicalize` 把 `/var/*` tempdir 解析成 `/private/var/*`,测试却按字面 tempdir 断言 path;默认 shell
+  (`TMPDIR=/var/folders/…`)确定性红、TMPDIR 已 canonical 的会话绿(state.md「本机全绿」与新会话红并存的成因)。判基线单列。
+  ② `ccteam-harness codex_app_server_test` 9 只 `SUN_LEN` 红 —— macOS UDS socket 路径超长(长 TMPDIR + tempdir 嵌套),
+  测试基建问题;在 `tests/*.rs`,**不在 baseline 口径**。
 
 ## 运行纪律(教训固化区;新教训从卡面「经验」行蒸馏进来)
 
