@@ -12,7 +12,7 @@
 
 **R-code 速查**(简写 ↔ CLAUDE.md §三):
 
-- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid;§三已并入「session = 独立一等实体」行)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目 slug = `slugify(目录名)` + 撞名数字累加,`ccteam init` 可就地初始化 · `R11` root README.md 英文且不含版本进展
+- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid;§三已并入「session = 独立一等实体」行)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目 slug = `slugify(目录名)` + 撞名数字累加,`ccteam init` 可就地初始化 · `R11` root README.md 英文且不含版本进展(家已迁 = CLAUDE.md §五.7 ship gate,不再是 §三行)
 
 > 已退役概念的一行清单在 CLAUDE.md §〇 尾注(本文档不再重复);R-code 与 §三行名的全量对齐校对 = TD-SYNC-1 卡。
 

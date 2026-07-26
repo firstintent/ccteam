@@ -57,6 +57,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | 红线 | 怎么守 |
 |---|---|
 | **No prompt injection** | role 行为住 `.claude/agents/<role>.md`,vendor 原生 `--agent <role>` 让它自读,**不**向 pane / app-server 注入 system prompt;**roleless session(空 role)= spawn 省略 `--agent`**(裸 claude 自读项目 `CLAUDE.md`)= 同一红线的合法形态(不注入 ≠ 必须有 role);`/compact /new /clear` 完全透传 |
+| **引擎零 LLM** | ccteam 引擎自身不调用任何 LLM —— 无中介模型、无内置 judge、无智能摘要/智能路由;**LLM 推理只发生在 agent session 内部**,任何前端/网关不得引入新 LLM 层 |
+| **daemon 无自主内容决策循环** | 只响应消息、排程与连接;**引擎不产生任务、不选择工作**,编排智能永在 agent 会话/用户空间 |
 | **`progress.jsonl` 是 state SoT** | `harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export;chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(**按 sid**;gateway `spawn_event_pump` 是 live daemon 唯一 turns writer)|
 | **session = 独立一等实体;role 是属性** | session 有持久 `sid`(`s<N>`,单调、扛 daemon 重启、不复用);**同一 role 可并存多 session**;turns/marker 全按 sid(terminal 协议的 pane/env 定位同样按 sid,命名细节以代码为准);会话生命周期 = **spawn-on-demand + 按 sid resume(resume-by-session-id)+ 容量挤停**(见「永不主动 kill」例外),**非**常驻吊着;chat 复用 context 是 feature |
 | **session ACL = 多用户软分区(IM 面 own/web 池 + web 面项目归属)** | **IM 面**(`chat_can_access`):一个 chat 只见/只控**自己建的** session + **web 控制台建的**(web 是单一共享操作台);IM chat 之间互相隔离,web 也不看 IM session;「同-current-project 互看」曾上线又被**反转删除,勿再加回**。**web 面 = 项目归属模型**:project 是归属单元(`ProjectState.owner`,显式字段、非路径派生),session 继承其 project 的归属(session.owner 只作回信路由);REST 全按 project 鉴权,**单一 choke point = `auth::project_acl_layer` 中间件**兜底所有 `/api/v1/projects/{slug}/*`(新路由自动覆盖),`/sessions/{sid}/*` 按其 project 门,集合面按身份过滤;admin 见全部、tenant 只见自己 owner 的。**全局·运维面(IM 凭据 / hosts / status / users)仅 admin**(deny→403);SPA 按 `GET /api/v1/me` 显隐(fail-closed)。owner 轴 = 合成身份 `user:<tenant>`(**非投递 channel**)。**诚实范围**:同 OS uid 下是**软隔离(UX)、非安全边界**;真隔离 = per-user OS user/sandbox(deferred)。web↔IM 同一人复联(`linked_chat`)deferred,tenant 当前 web-only |
@@ -68,12 +70,12 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | **委派语义 = 路由,非新引擎;完成通知非注入** | `session_dispatch` 与 IM `@handle` **同路**(路由,不是第二引擎);完成通知 = gateway 生成的一条**普通 user-role turn** 投给 parent(live = vendor steer / dead = pending FIFO + resume),与人转告同构、**非 prompt 注入**;**通知单位 = 任务(vendor turn 边界)**,中途叙述只进账本;child turns 按 child sid 落 `turns.jsonl`,委派关系写 `progress.jsonl`(schema 权威见上),**不伪造进对方 transcript**。可靠性合同:幂等 spawn/dispatch(`idempotency_key`)· at-least-once 通知扛重启(`delegation.json` 落盘 + 启动 reconcile)· append→notify 顺序 · 崩溃一致原子写;诚实:单 daemon 无 HA,是**协议语义**可靠 |
 | **跨机 = host 是 project 属性,session 继承;网络方向 = 卫星拨入(反向连接)** | host 住 project catalog(`~/.ccteam/config.yaml`,条目含 `host` + `remote_slug` —— **slug 相同 ≠ 同一项目**);**spawn 面无 host 参数**(MCP/REST 传入即硬错 `HOST_SPAWN_PARAM_REMOVED`),执行位置 = project 绑定;daemon 记账(turns/progress/cost)一律 catalog slug。远程项目进入 = web 选主机新建,或 `POST /projects/import` 接入卫星已上报项目(**绝不自动接入**;撞名累加、幂等)。**卫星零监听面**:`ccteam start` 统一进程内嵌卫星客户端**出站**长连 daemon(反向拨入),远程 spawn 由卫星拨回执行通道;**卫星自己解析 binary + cwd(slug→自身注册表),主侧永不下发路径**;通道 op/心跳/退避等 wire 细节以代码为准。**terminal 永不上多机**;rebuild 一律 re-gate project 绑定(host 不符或卫星 offline → 可读错误,**绝不本地重生**);HITL 跨流回主侧;远程 verdict 钉 claude,codex/opencode/grok/kimi 远程 = 显式 NotImplemented |
 | **ccteam 不改写已有项目 `CLAUDE.md`/`AGENTS.md`(空项目 scaffold 除外)** | 项目知识层归 vendor 原生(Claude 读 `CLAUDE.md`、Codex 读 `AGENTS.md`)+ 项目自己;ccteam 唯一管的指令面 = `.claude/agents/<role>.md`。唯一放宽(owner 决策):对**真空项目**(两文件都不存在)scaffold 占位 `AGENTS.md` + `CLAUDE.md` = `@AGENTS.md`,**绝不覆盖**已有内容;并把 `.ccteam/` 幂等加进项目 `.gitignore` |
+| **vendor 配置足迹 = 只写自家 MCP 注册** | ccteam 对 vendor 全局配置(`~/.claude.json`、`~/.codex/config.toml`、grok/opencode/kimi 对称面)的唯一写入 = **幂等注册/修复自己的 MCP server 条目**;项目侧托管设置只写 `.claude/settings.local.json` **自己的段**;除此之外不碰用户任何配置 |
 | **`ccteam-core` 零 team 名字面量** | core = primitives leaf,team 名不入 core |
 | **ccteam repo 零提示词类型插件(零例外)** | role/agent/skill/workflow 的**内容**一律不进 ccteam repo,**零例外**;一切 persona/skill 住 **ccteam-hub** 或用户空间,ccteam 只读 index、按 sha 取内容、装进用户项目/全局库;编排智能 100% 用户空间。用户项目里既有的 `.claude/agents/*.md`(含历史 `cto.md`)是**用户文件**,ccteam 不删不改 |
 | **跨项目记忆走官方接口** | Claude `~/.claude/CLAUDE.md` + `~/.claude/rules/*.md`;Codex `~/.codex/AGENTS.md` —— ccteam 只**读**,不代项目生成 |
 | **init 布局(不种任何 role)** | 项目 `.ccteam/` 由 init 只种 `state.json` + `workflow.yaml`(`routing.md` 用户可选自建 —— init 不种,`status` 原文透传);**`ccteam init` / IM `/newproject` / API create 不种任何 role**,`.claude/agents/` 留空;ccteam 托管设置(hook + base)只写 `.claude/settings.local.json`(**绝不碰用户 `.claude/settings.json`**);`~/.ccteam` 规范布局 = `ccteam_core::canonical_home_dirs()`(doctor 查 home-drift)|
 | **新建项目 slug = 目录名 + 数字累加** | `slugify(目录名)`,撞名数字累加;`ccteam init` 可在任意现有目录**就地**初始化;`--slug` 显式覆盖 |
-| **root README.md 必须英文 + 不含版本进展/状态** | README 始终反映当前能力,不夹版本时间轴 / baseline / shipped 日期 |
 
 **vendor 红线**:
 - ccteam **不 vendor** Claude / Codex 二进制(`references/{claude-code,codex/codex-rs}/` git-ignore 不入库,仅协议参考;实际 spawn 走 `$PATH` 内 binary + `CCTEAM_{CLAUDE,CODEX}_BIN` env override)。
@@ -105,7 +107,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 6. **测试不过不算完成** — `cargo test --workspace` 退步 = block;clippy 不能新增 warning
 7. **版本发布同步文档(ship gate)** — 每次 `vX.Y.Z` ship 必须同步:
    - **内部 SoT**:本文 §一(只更 version 行 + 一行 headline)+ `.loop/state.md`(焦点/基线回填)+ `.loop/history.md`(一行蒸馏)+ backlog 完成卡蒸馏移出(**队列只持现势**)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
-   - **用户面**:root `README.md`(英文,不含版本进展)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞
+   - **用户面**:root `README.md`(**英文**,始终反映当前能力,不含版本进展/时间轴/baseline/shipped 日期)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞(README 规则的唯一家 = 本条,原 §三行已迁出)
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
 
