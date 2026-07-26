@@ -15,6 +15,14 @@
 
 ## 当前卡
 
+### DX-DOCTOR-1 doctor 体检面重排 + daemon 启动自动注册五 vendor MCP(owner 直驱 2026-07-25)
+- **状态**:完成(4b1fc4d) · **冲突域**:`crates/ccteam-cli + crates/ccteam-core(host_registry/mcp_register) + crates/ccteam-web(routes/hosts)` · **建议入口**:codex 委派(cct-codex)+ grok 对抗 review
+- **验证**:codex s113 三轮(实现 + F1-F3 + R1-R4)+ grok s114 侦察与对抗 review(verdict FIX,4 发现全采纳:probe 不查退出码 / override 判据过松会误建 vendor 配置 / hint 门 healthy 向无测试 / SPA fixture 只编码翻转前形态);fmt + clippy 0 warnings;doctor 契约测试重写 + autoreg 密封测试(HOME/CCTEAM_HOME/五 vendor env/PATH 全 pin,断言不逃逸沙箱)+ 纯渲染单测(daemon hint 双向 + 静默 pass 计数);真机目验 daemon up/down 两态输出。基线:本机 = HERM-1 三红 + `resume_*` 族瞬时红(gateway_resumes_dead_session_on_next_turn,3/3 复跑绿,本卡 diff 零碰 ccteam-im)之外全绿;vitest 422 / tsc 干净;干净环境仲裁待 dev→main PR CI(本机无 gh,开 PR 在 owner)。
+- **偏差**:① openapi 路由清单测试在 origin/dev 本来就红(schedule 三路由入库时无 PR/CI),随卡修复并在 commit 注明;② `make web-check` 被 ChatComposer.tsx 两个存量 eslint 错误挡住(文件不在本卡 diff)= origin/dev 既有,已另起 chore 修复(独立提交);③ auto-register 使「注册写入」的触发时机从"仅显式命令"扩到 daemon start —— vendor 足迹唯一写 = 自家 MCP 注册的红线语义不变,owner 本口头指令即授权。
+- **背景**:owner 拿远端 `ccteam doctor` 输出反馈:排版散(每 vendor binary/auth/MCP 三行)、tmux/legacy-service/exe 是与用户无关的噪音、daemon down 提示埋在中段;MCP 注册目前要用户在 web 主机页手点。另发现 `AGENT_PROBE_SPECS` grok/opencode `mcp_registrable:false` 是 v0.8.18 陈旧值(v0.9.3 已对称注册五 vendor),doctor 只查 claude/codex/kimi 三家 MCP。
+- **规格**:A. doctor 输出重排 = agents(五 vendor 每家一行,折叠 binary+auth+MCP)/ ccteam(daemon/version/pricing/home/host-skew)/ projects(skills 行仅 WARN 时现身)三段;删 tmux 检查;legacy-service 仅检出时现身;updates 行拆成 version 行(去 exe 噪音)+ 每个 skew 卫星一行;daemon down = 短行 + **汇总后末行显著提示** `ccteam daemon start`;TTY 上色(尊重 NO_COLOR);claude MCP 未注册由 FAIL 降 WARN(理由 = B 起动自愈)。B. `ccteam start`(run_start)启动时 best-effort 幂等注册五 vendor 全局 MCP(binary 可解析或 config 足迹已存在才写;失败 warn 不阻断;吞并 heal_codex_mcp_if_stale)。C. 陈旧 flag 修正:AGENT_PROBE_SPECS grok/opencode registrable=true + hosts.rs `mcp_registered()` 接 grok/opencode 真实检查 + register-mcp 端点文案随 spec 列表。红线不破:doctor 保持只读;vendor 足迹唯一写 = 自家 MCP 注册(仅触发时机扩至 daemon start)。
+- **DoD**:doctor 新版式定向测试更新(daemon-down 末行提示、tmux 不再出现、claude MCP 未注册 = WARN 且 exit 0);auto-register 沙箱测试(严禁写真实 HOME,pin HOME+CCTEAM_HOME);`make test-baseline` 只增(同机对照 origin/dev);clippy 0 warnings;fmt 干净;writeback 绿。
+
 ### V099-SHIP 文档 + version bump + 治理回填(规划)
 - **状态**:完成(6b8211f) · **冲突域**:`docs/ + AGENTS.md + .loop/ + Cargo.toml` · **建议入口**:规划(控制)会话
 - **验证**:usage/usage-cn/README/tech-design(含陈旧 cto 表述清理)+ AGENTS §〇/§一/§四 + workspace 0.9.9 + lock 刷新 + `.loop` 蒸馏回填全部入库;writeback 绿;**dev→main PR #169 已开**(CI 三 job 全绿),tag/部署 HELD 等 owner。

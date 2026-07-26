@@ -8,7 +8,7 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.9` 已合 `main`**(2026-07-24 owner squash-merge PR #169 → `7dfd271`;决议 = `docs-local/versions/v0-9-9/decisions.md`,一行史 = `.loop/history.md` v0.9.9 行)。**tag/部署 HELD** 等 owner 显式发话(push main ≠ 发布)。dev 已和解复用(merge main 回 dev `a3d22c9`,树差为零);随后 owner 指令「main 与 dev 保持一样」→ main **ff 推平至 dev 同点**(一次性授权的和解直推,常态「main 不直推」不变)。上一版 v0.9.8 已发布(`ad1c7c2` + tag)。
-- **在做**:**新周期已开(post-v0.9.9,dev 攒版本)**:MCP-DX-1 完成(`cf49539`,外部 agent 反馈驱动的 MCP 工具面 DX —— 描述净减法 -792 字符 + 可操作 project 错误 + wait 完成遥测;owner 直驱 2026-07-24,钢线「MCP 面向 agent,改进 ≠ 加法」),dev→main draft PR 随首推开启(周期规则)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 / **HERM-1(新,基线口径内 3 测试宿主态泄漏)** + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1/MCP-DX-1 完成卡待下轮蒸馏;v0.9.9 委派子会话 s135–s138 idle 备查,下轮顺手停)。
+- **在做**:**新周期已开(post-v0.9.9,dev 攒版本)**:MCP-DX-1 完成(`cf49539`,外部 agent 反馈驱动的 MCP 工具面 DX —— 描述净减法 -792 字符 + 可操作 project 错误 + wait 完成遥测;owner 直驱 2026-07-24,钢线「MCP 面向 agent,改进 ≠ 加法」);**DX-DOCTOR-1 完成(`4b1fc4d`,owner 直驱 2026-07-25:doctor 分组版式(五 vendor 每家一行折叠 binary·auth·MCP)+ 删 tmux 检查 + daemon down 末行显著提示 + `ccteam start` 起动自动注册五 vendor 全局 MCP(替代 web 手点/codex-only heal)+ grok/opencode `mcp_registrable` 陈旧 flag 修正;首个全程 codex 实现 + grok 对抗 review 的委派卡)**;dev→main draft PR 随首推开启(周期规则;**本机无 gh,开 PR 需 owner** —— schedule 三路由 openapi 存量红与 ChatComposer eslint 存量红皆因 dev 推送无 PR 未过 CI,已随卡修复)。队列现势卡 = A2A-W5 / FB-2 / P1-1/2 / **HERM-1(新,基线口径内 3 测试宿主态泄漏)** + 下一版候选 A2A-OBS-1..5(V094 gated;V099-SHIP/P2-1/MCP-DX-1/DX-DOCTOR-1 完成卡待下轮蒸馏;v0.9.9 委派子会话 s135–s138 idle 备查,下轮顺手停)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
