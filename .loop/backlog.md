@@ -23,7 +23,8 @@
 - **DoD**:`doctor --verify-mcp` = 7 工具 0 STUB;`make check` clippy 0;基线无新红(删除面净减测试在案);writeback 绿。
 
 ### MCP-BEACON-1 status 裸名发现别名 + spawn 配方(owner 拍板 2026-07-26「纯别名,方便后续随时改;opencode 排最后」)
-- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests/SPA) + docs` · **建议入口**:规划(控制)会话(契约变更签核 = owner 本条)
+- **状态**:完成(ffcf817) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests/SPA) + docs` · **建议入口**:规划(控制)会话(契约变更签核 = owner 本条)
+- **验证**:派生测试(AgentVendor::ALL 全员恰一次 + opencode 殿后 + `mcp__ccteam__` 前缀下 64 字符上限)+ 等价测试(alias 与 status tools/call 响应逐字节一致 + schema 一致)+ 配方单测(只列已装 vendor / 全未装 = 空串)全绿;三路同判(protocol call_tool / dispatch is_status_call / cli forward_status)入库;doctor --verify-mcp = 8 工具 0 STUB(admin 组 2);`make test-baseline` 1662 绿(+2)+ HERM-1 同三红;clippy 0;vitest 422;fmt 干净;writeback 绿。计数/文档八处同步在案(AGENTS/tech-design/README/usage±cn/orchestration±cn/SPA)。
 - **背景**:WorkBuddy P0-1 诊断(裸名宿主抹掉描述与 instructions,工具名是唯一发现面,9 个名字里没有 vendor 关键词 → 「用 grok 搜索」第一轮发现失败)。规划初判改名 status,owner 中途改令**纯别名**(alias 可随时改/删,status 零 churn);vendor 序 = 枚举序但 **opencode 殿后**(owner 钦点)。名字含 "agents" 的变体被放弃 —— 64 字符工具名上限扣除 `mcp__ccteam__` 前缀后要给第六个 vendor 留余量。
 - **规格**:新增 `claude_codex_grok_kimi_opencode_status`(7→8)= status 纯别名(protocol.rs 定义 + call_tool / dispatch is_status_call / cli forward_status 三路同判;admin 组);名字派生测试锁死(AgentVendor::ALL 全员恰一次 + opencode 殿后 + 64 上限);等价测试(响应逐字节一致);status 响应(vendor panel 路径)加 `recipes` 块 = 已装 vendor 各一行 session_spawn 一行式 + collect/dispatch 收尾行(纯静态拼接零 LLM,措辞不超 spawn 描述既有定性);全量计数/文档同步(AGENTS §〇×2/§四、tech-design census、README、usage±cn、orchestration±cn、SPA WorkflowView)。
 - **DoD**:定向测试绿(派生/等价/配方);doctor --verify-mcp = 8 工具 0 STUB;基线只增;clippy 0;web-check 绿;writeback 绿。
