@@ -16,10 +16,11 @@
 ## 当前卡
 
 ### IM-HINT-1 IM 命令回执「下一步」提示补全:/model + picker 按钮一致性(owner 直驱 2026-07-26)
-- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-im(gateway)` · **建议入口**:codex 委派(规划发卡 + review)
+- **状态**:完成(0dc6fab) · **冲突域**:`crates/ccteam-im(gateway)` · **建议入口**:codex 委派(规划发卡 + review)
 - **背景**:owner 三点(项目切换尾加 /sessions、会话切换尾加 /status、模型切换尾加 /status)。核对现状:typed `/cd`→`↓ 本项目会话 → /sessions` 与 `/use`→`↓ 查看状态 → /status` **repo 已实现**(`command_next_hint` + handle 路径 choke,owner live 二进制旧未见);真缺口 = ① `/model` 是 vendor 透传(五 adapter 生成同步回执「已切换 model → …」,不经 gateway 命令 choke,注释明示 never reach);② picker 按钮路径(`resolve_nav_selection` nav:cd/nav:use)返回裸串,与 typed 同动作不同待遇。
 - **规格**:A. `/model` IM 尾行:在 IM handle 路径对 vendor 透传返回的同步 Directive replies,若原文首 token == `/model` 且 channel != "web" 且 replies 非空 → 最后一条 reply 追加 `↓ 查看状态 → /status`(harness 五处回执生成点零碰,web SSE/receipt 语义不变;terminal 无同步回执自然豁免);B. picker 一致性:nav:cd → `↓ 本项目会话 → /sessions`、nav:use → `↓ 查看状态 → /status`(同 web 豁免;与 typed 共用 hint 常量,禁字面量复制)。**明确不做**:/effort 等其他透传(owner 未点名)、web 面(GUI 导航既有豁免)、`/compact /clear` 透传。
 - **DoD**:定向测试先红后绿(IM `/model` 回执带尾行 / web 无尾行 / nav:cd·nav:use tap 带尾行);`make check` clippy 0;`make test-baseline` 红不增(HERM-1 口径)、数目净变对账;fmt 干净;writeback 绿;两 commit(实现→写回,sha 精确)。
+- **验证**:实现提交 `0dc6fab`。有牙 red→green:仅翻测试后旧源上 IM `/model` 回执缺 `/status` 尾行红、nav:cd 完整回执缺 `/sessions` 尾行红;web `/model` 字节一致守卫在旧源即绿;实现后 IM/web `/model` + nav:cd/nav:use + 既有 typed `/cd`/`/use` 定向测试全绿。门禁:`cargo fmt --all -- --check` 绿;`make check` clippy 0 warnings;`make test-baseline` 1666 绿 + 1 个已登记 HERM-1 红(`web_chat_bridge…survives_restart`),对照上卡 1664 绿 + 同一红净 +2,恰为新增两只 `/model` 测试;nav 测试仅收紧断言,测试数净 0;无新增红。实现 diff 仅 `crates/ccteam-im/src/gateway.rs`,harness/web 零碰;两条 hint 生产字面量各自仅在共享常量单点定义;`writeback.sh` 绿。
 
 ### WEB-IA-1 web 信息架构改版:market 迁 flow + ops 会话大表删除 + 「接入」聚合(owner 直驱 2026-07-26)
 - **状态**:完成(f7f5d67) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:codex 委派(规划发卡 + review)
