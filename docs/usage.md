@@ -92,13 +92,13 @@ Open that link to enter the console.
 
 ## 1. Web Console (Recommended)
 
-Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / MCP / Evolution (read-only). **Settings** links Hosts, Marketplace, Status, and IM credentials (admin). Theme defaults to **light** (dark remains available).
+Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / Marketplace / MCP / Evolution (read-only). **Settings** has Ops overview (daemon health + hosts), Access (external-agent MCP config, developer REST API, satellite join, IM credentials — the admin manages the global bot, regular users configure their own; user login links stay admin-only), General, and Account (with self-serve token reset for every identity). Only the Users (admin) tab is admin-exclusive. Theme defaults to **light** (dark remains available).
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
-### Register MCP (One-Time)
+### Register MCP (Automatic)
 
-Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **all five vendors** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The Hosts page also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -106,18 +106,19 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` (admin picker); tenants create roleless sessions. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
-- **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and — admins only — the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
+- **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
+- **Schedule a message:** tap the **clock** on the composer to enter schedule mode. Enter **how many minutes and/or hours** from now (or tap chips `+15m` / `+30m` / `+1h` / `+2h`), or pick a **local-clock** datetime — the UI converts everything to a relative delay so browser timezone and daemon timezone never disagree. A preview shows the expected local send time. Type the text and send — the message joins a **queue above the input**, sorted by send time; cancel with **×**. At fire time the text is a normal user turn into that session. Schedule mode does not carry file/skill attachments. Caps: 20 pending per session, farthest **7 days** ahead. Failed deliveries stay in the queue (marked failed) for 24 hours so you can dismiss them.
 
-> Some advanced options (terminal/rmux protocol selection, role selection in web, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
+> Some advanced options (terminal/rmux protocol selection, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
-The **Marketplace** page browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
+The **Marketplace** page (under **Workflow**; the Skills tab opens first, and the project picker appears only for project-scoped types like agents) browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
 
 ### Configure Telegram / Lark
 
@@ -147,7 +148,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 The console is built on a token-authenticated HTTP API you can use directly:
 
 - Interactive docs: `http://<host>:7331/api/docs` (Scalar). Machine-readable spec: `/api/v1/openapi.json`.
-- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
+- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop,scheduled}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
 - Auth uses the same web token. Session endpoints require the daemon to be online.
 
 ### External agents over MCP (`POST /mcp`)
@@ -225,13 +226,29 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
 /stop <id>                 Destroy a session.
-/screen [id]               Screenshot the current screen. Omit id for current.
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.
 /status                    Team health: idle / working / stuck plus model and context.
 /help                      List gateway commands.
+
+# Delayed send (one-shot user turns)
+/inbox                     List scheduled messages you can see (own + web pool), by send time.
+/inbox <time> <text>       Schedule text into the **current** session (/use first if needed).
+/inbox cancel <dN>         Cancel (or dismiss a failed) item by short id from the list.
 ```
+
+Time forms for `/inbox <time> …` (daemon local timezone; past times are rejected, bare `HH:MM` does **not** roll to tomorrow):
+
+```text
+/inbox +30m remind me to open the PR
+/inbox +2h run the nightly checklist
+/inbox 22:30 write the daily summary
+/inbox 明天 09:00 morning standup notes
+/inbox 2026-07-26 09:00 release checklist
+```
+
+List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows carry a reason). Successful fires are silent in IM — the text just appears as a normal user message in that session. Failures notify you and stay listed for 24 hours. Same limits as the web queue (20 per session, 7-day horizon). Empty text is rejected; a body that starts with `/` is still sent as ordinary agent text at fire time (not re-parsed as a gateway command).
 
 ### Addressing
 
@@ -246,7 +263,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 - **Messages without a prefix** go to the current session.
 - **Non-gateway slash commands** (`/compact`, `/clear`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons.
-- **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files and screenshots back to chat.
+- **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files back to chat.
 - **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
 
 ### Human-in-the-Loop (HITL)
@@ -265,7 +282,7 @@ There is no skill to install — the ccteam MCP server ships its own instruction
 
 ### Model Routing
 
-A session deciding whom to spawn never has to guess. One `status` call (the MCP tool) answers with a **vendor panel** for the host your current project is bound to: which vendors are installed and their versions, an honest auth signal (`ready` / `not_ready` / `unknown` — sitting on PATH never masquerades as logged in), budget state, and whether the snapshot is fresh or stale. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
+A session deciding whom to spawn never has to guess. One `status` call (the MCP tool, also exposed through the byte-identical discovery alias `grok_claude_codex_kimi`) answers with a **vendor panel** for the host your current project is bound to: which vendors are installed and their versions, an honest auth signal (`ready` / `not_ready` / `unknown` — sitting on PATH never masquerades as logged in), budget state, and whether the snapshot is fresh or stale. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
 
 Your division of labor is plain markdown you own; ccteam carries it to any session that asks, on any host, and never parses, merges, or executes it:
 
@@ -361,7 +378,6 @@ The global library and project skills never mix: nothing links or copies from th
 ccteam status                      # Daemon + projects/sessions + web token/url lines.
 ccteam session ls                  # Gateway session status; degrades when daemon is offline.
 ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
-ccteam doctor --check-cost-orphan  # Cost ledger reconciliation.
 ```
 
 Restart daemon only; sessions reconnect by id afterward:

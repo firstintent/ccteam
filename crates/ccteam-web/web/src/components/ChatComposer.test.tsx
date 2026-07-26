@@ -19,8 +19,11 @@ import { renderToString } from "react-dom/server";
 import {
   attachmentsBlockSend,
   attachmentsPayload,
+  buildScheduleWhen,
   ChatComposer,
+  datetimeLocalToMs,
   fetchSkillLists,
+  scheduleWhenPreview,
   shouldSubmitOnEnter,
   SkillMenuSections,
   type ComposerAttachment,
@@ -53,6 +56,36 @@ describe("shouldSubmitOnEnter", () => {
 
   it("still sends Cmd/Ctrl+Enter (no shift, not composing)", () => {
     expect(shouldSubmitOnEnter({ ...base, key: "Enter" })).toBe(true);
+  });
+});
+
+describe("buildScheduleWhen", () => {
+  const noon = new Date(2026, 6, 25, 12, 0, 0, 0).getTime(); // local noon
+
+  it("prefers chips, then free-form hours+minutes as a single +Nm delay", () => {
+    expect(buildScheduleWhen({ chip: "+30m", minutes: "5" }, noon)).toBe("+30m");
+    expect(buildScheduleWhen({ hours: "1", minutes: "15" }, noon)).toBe("+75m");
+    expect(buildScheduleWhen({ minutes: "45" }, noon)).toBe("+45m");
+    expect(buildScheduleWhen({ hours: "2" }, noon)).toBe("+120m");
+    expect(buildScheduleWhen({ minutes: "0", hours: "0" }, noon)).toBeNull();
+    expect(buildScheduleWhen({ minutes: "-3" }, noon)).toBeNull();
+  });
+
+  it("maps datetime-local (browser wall clock) to minutes-from-now, not daemon TZ", () => {
+    // 12:40 local → +40m from noon
+    expect(buildScheduleWhen({ absolute: "2026-07-25T12:40" }, noon)).toBe("+40m");
+    // Past absolute is rejected
+    expect(buildScheduleWhen({ absolute: "2026-07-25T11:00" }, noon)).toBeNull();
+    expect(datetimeLocalToMs("2026-07-25T12:40")).toBe(
+      new Date(2026, 6, 25, 12, 40, 0, 0).getTime(),
+    );
+  });
+
+  it("previews a relative when as a local clock label", () => {
+    const label = scheduleWhenPreview("+30m", noon, "en-US");
+    expect(label).toBeTruthy();
+    // Locale-dependent formatting (12:30 vs 12:30 PM) — only assert the minute.
+    expect(label).toMatch(/12:30/);
   });
 });
 
@@ -225,7 +258,6 @@ describe("SkillMenuSections (two-section attach menu)", () => {
     renderToString(
       <SkillMenuSections
         lang="zh"
-        isAdmin
         skills={projectSkills}
         globalSkills={librarySkills}
         attachments={[]}
@@ -234,7 +266,7 @@ describe("SkillMenuSections (two-section attach menu)", () => {
       />,
     );
 
-  it("admin sees BOTH the Project section and the Global library section", () => {
+  it("every caller sees BOTH the Project section and the Global library section", () => {
     const html = renderSections();
     expect(html).toContain('data-testid="skill-section-project"');
     expect(html).toContain('data-testid="skill-section-global"');
@@ -252,13 +284,13 @@ describe("SkillMenuSections (two-section attach menu)", () => {
     expect(html).toContain("Global library");
   });
 
-  it("non-admin sees NO Global section — even if library data were present", () => {
-    const html = renderSections({ isAdmin: false });
+  it("global rows keep their distinct test ids and nested library names", () => {
+    const html = renderSections();
     expect(html).toContain('data-testid="skill-section-project"');
-    expect(html).not.toContain('data-testid="skill-section-global"');
+    expect(html).toContain('data-testid="skill-section-global"');
     expect(html).toContain("deep-research");
-    expect(html).not.toContain("grill-me");
-    expect(html).not.toContain("baoyu-skills/baoyu-comic");
+    expect(html).toContain('data-testid="skill-global-grill-me"');
+    expect(html).toContain('data-testid="skill-global-baoyu-skills/baoyu-comic"');
   });
 
   it("empty library gets the i18n empty hint (admin)", () => {
@@ -267,19 +299,19 @@ describe("SkillMenuSections (two-section attach menu)", () => {
   });
 });
 
-describe("fetchSkillLists (the library fetch is admin-only)", () => {
+describe("fetchSkillLists", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = realFetch;
   });
 
-  it("admin fetches the project list AND /api/v1/skills", async () => {
+  it("fetches the project list AND /api/v1/skills", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response(JSON.stringify([]), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ skills: [] }), { status: 200 }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    const lists = fetchSkillLists("demo", true);
+    const lists = fetchSkillLists("demo");
     expect(lists.global).not.toBeNull();
     await lists.project;
     await lists.global;
@@ -288,15 +320,17 @@ describe("fetchSkillLists (the library fetch is admin-only)", () => {
     expect(urls).toContain("/api/v1/skills");
   });
 
-  it("non-admin NEVER fires a /api/v1/skills request", async () => {
+  it("always returns a real global-library promise", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify([]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ skills: [] }), { status: 200 }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    const lists = fetchSkillLists("demo", false);
-    expect(lists.global).toBeNull();
+    const lists = fetchSkillLists("demo");
+    expect(lists.global).not.toBeNull();
     await lists.project;
+    await lists.global;
     const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(urls).toEqual(["/api/v1/projects/demo/skills"]);
+    expect(urls).toEqual(["/api/v1/projects/demo/skills", "/api/v1/skills"]);
   });
 });

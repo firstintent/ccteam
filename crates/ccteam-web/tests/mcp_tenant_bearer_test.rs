@@ -116,8 +116,8 @@ async fn tenant_bearer_is_accepted_while_bad_and_admin_tokens_keep_their_posture
     assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 8);
 
     // This distinguishes User from Admin at the real route boundary: an admin
-    // caller would reach the screenshot renderer, while the tenant is denied by
-    // project ownership before protocol fallback.
+    // caller naming `admin-project` would get the status vendor panel, while
+    // the tenant is denied by project ownership first.
     let scoped = post_mcp(
         addr,
         &format!("ccteam:{}", tenant.web_token),
@@ -125,7 +125,7 @@ async fn tenant_bearer_is_accepted_while_bad_and_admin_tokens_keep_their_posture
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "screenshot", "arguments": {"slug": "admin-project"}}
+            "params": {"name": "status", "arguments": {"project": "admin-project"}}
         }),
     )
     .await;
@@ -134,7 +134,7 @@ async fn tenant_bearer_is_accepted_while_bad_and_admin_tokens_keep_their_posture
     assert_eq!(scoped_body["result"]["isError"], true, "{scoped_body}");
     assert_eq!(
         scoped_body["result"]["content"][0]["text"],
-        "screenshot: project not found"
+        "status: project not found"
     );
 
     assert_eq!(

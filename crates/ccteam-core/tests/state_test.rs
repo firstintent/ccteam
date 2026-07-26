@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use chrono::{TimeZone, Utc};
 use tempfile::TempDir;
 
-use ccteam_core::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState, TeamKind};
+use ccteam_core::{Parallelism, PhaseHistoryEntry, ProjectState, TeamKind};
 
 fn sample_state() -> ProjectState {
     let t0 = Utc.with_ymd_and_hms(2026, 5, 4, 10, 23, 0).unwrap();
@@ -24,7 +24,6 @@ fn sample_state() -> ProjectState {
         tmux_session: "ccteam-bookmark-mgr-a3f9".into(),
         claude_session_id: Some("abc123-def-456".into()),
         claude_pid: Some(12345),
-        phase_state: PhaseState::Idle,
         parallelism: Parallelism::Solo,
         current_phase: "implement".into(),
         phase_history: vec![
@@ -219,6 +218,20 @@ fn legacy_state_without_f49_fields_loads_as_workflow_with_empty_sessions() {
     loaded.save(&main).unwrap();
     let saved = std::fs::read_to_string(&main).unwrap();
     assert!(!saved.contains("team_kind"));
+}
+
+#[test]
+fn legacy_state_with_retired_phase_state_key_still_loads() {
+    let dir = TempDir::new().unwrap();
+    let (main, _, _) = paths(&dir);
+    let mut json = serde_json::to_value(sample_state()).unwrap();
+    // Once the phase enum is retired this intentionally invalid historical
+    // value is an unknown key and must not block the rest of state recovery.
+    json["phase_state"] = serde_json::json!({"legacy": "unexpected shape"});
+    std::fs::write(&main, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let loaded = ProjectState::load(&main).expect("retired keys are ignored by serde");
+    assert_eq!(loaded.slug, "bookmark-mgr-a3f9");
 }
 
 #[test]

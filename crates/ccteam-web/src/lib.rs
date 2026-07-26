@@ -9,7 +9,8 @@
 //! - **M5.1** — `GET /` dashboard, `GET /project/<slug>` detail
 //!   page, `GET /assets/{file}` vendored static assets.
 //! - **M5.2** — on-demand pane snapshots (`GET /api/<slug>/pane-snapshot.ansi`
-//!   for xterm.js, `GET /screenshot/<slug>.png` as the PNG fallback). Also
+//!   for xterm.js; the PNG `/screenshot/<slug>.png` fallback was removed
+//!   2026-07-26 with the screenshot surface cull). Also
 //!   shipped `GET /sse/all` + `GET /sse/project/<slug>` progress-file SSE
 //!   streams (a `notify`-watcher broadcast) — **removed in v0.9.0 W4**
 //!   (zero SPA consumers; superseded by the gateway-broadcast-backed

@@ -181,6 +181,13 @@ describe("shouldAcceptEventSeq (review §3.1-3 reconnect dedup)", () => {
 });
 
 describe("parseSessionEvent (W2 payload shape)", () => {
+  it("preserves scheduled queue invalidations for a list re-fetch", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({ id: "scheduled-changed-s1-d1", sid: "s1", kind: "scheduled_changed", content: "" }),
+    );
+    expect(ev).toMatchObject({ sid: "s1", kind: "scheduled_changed", content: "" });
+  });
+
   it("preserves session lifecycle frames instead of degrading them to answers", () => {
     const ev = parseSessionEvent(
       JSON.stringify({ kind: "session_lifecycle", content: "session evicted: s4" }),

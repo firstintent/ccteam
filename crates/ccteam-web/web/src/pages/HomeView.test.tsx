@@ -55,7 +55,7 @@ describe("HomeView (landing page)", () => {
     const html = render();
     expect(html).toContain('data-testid="ctx-project"');
     expect(html).toContain('data-testid="ctx-role"');
-    // Project identity is available before the admin-only host probe resolves.
+    // Project identity is available before the shared host probe resolves.
     expect(html).toContain('data-testid="ctx-host"');
     // v0.8.24 Q7 — 分支 renders ONLY from real backend data (current_branch);
     // without it the dimension stays hidden (never mocked).
@@ -81,9 +81,9 @@ describe("HomeView (landing page)", () => {
     expect(seg.slice(0, 200)).not.toContain("<button");
   });
 
-  it("角色 picker is an admin-only beta surface (tenant launches roleless)", () => {
+  it("角色 picker is available to tenants", () => {
     const tenant = render(false);
-    expect(tenant).not.toContain('data-testid="ctx-role"');
+    expect(tenant).toContain('data-testid="ctx-role"');
     expect(tenant).toContain('data-testid="ctx-project"');
   });
 

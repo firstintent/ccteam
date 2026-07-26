@@ -10,9 +10,9 @@
 //   semantics from v0.9.0 W4, now with full-height room.
 //
 // A KPI strip (live / working / active dispatches / total cost) sits above
-// the tabs, computed client-side from the same graph+SSE data. Admin-only
-// beta gate lives in the SIDEBAR nav button; the real ACL is the backend's
-// per-tenant graph/SSE filter (fail-closed regardless of this UI gate).
+// the tabs, computed client-side from the same graph+SSE data. The view is
+// available to every identity; the real ACL is the backend's
+// per-tenant graph/SSE filter.
 //
 // Live state comes from the global SSE (`useAgentsEvents`) folded through
 // `lib/agentsReducer.ts`; roster order from `lib/agentsTree.ts` (pure).
@@ -231,7 +231,6 @@ export default function AgentsView({
   initialTab = "topology",
 }: {
   lang?: Lang;
-  isAdmin?: boolean;
   onOpenChat?: (sid: string) => void;
   /** Initial tab (tests / deep links); the user switches freely afterwards. */
   initialTab?: AgentsTab;

@@ -96,7 +96,7 @@ export function getMcpServers(slug: string): Promise<McpServersResponse> {
 }
 
 /** `POST .../mcp-servers` — idempotently merge one third-party server into
- *  the project `.mcp.json` (admin-only; config write, never executes). */
+ *  the project `.mcp.json` (project-owner ACL; config write, never executes). */
 export function registerMcpServer(
   slug: string,
   form: RegisterMcpServerForm,

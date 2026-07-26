@@ -11,8 +11,7 @@ use serde_json::{json, Map, Value};
 
 use ccteam_core::tmux::TmuxSession;
 use ccteam_core::{
-    cost_summary, current_ccteam_bin, session_name_for_project, CcteamPaths, PhaseState,
-    ProjectState,
+    cost_summary, current_ccteam_bin, session_name_for_project, CcteamPaths, ProjectState,
 };
 
 // V0.3 M5.1 — `ProjectSummary` / `collect_projects` /
@@ -375,7 +374,7 @@ fn install_project_at(
             "(installed via `ccteam init`)",
             team,
         )?;
-        scaffold_workflow_yaml(target, false)?;
+        ccteam_core::scaffold_workflow_yaml(target, false)?;
         state_action = "created";
         workflow_action = "scaffolded";
         // v0.9.0 W2 (F6.1) — engine neutralization: init seeds NO role. The
@@ -411,7 +410,7 @@ fn install_project_at(
         state_action = "refreshed";
 
         workflow_action = if opts.force {
-            scaffold_workflow_yaml(target, true)?;
+            ccteam_core::scaffold_workflow_yaml(target, true)?;
             "overwritten (--force)"
         } else {
             "preserved"
@@ -452,48 +451,6 @@ fn normalize_owner(raw: &str) -> Option<String> {
         Some(format!("user:{v}"))
     }
 }
-
-/// V0.4.2 F72: write a minimal `workflow.yaml` example into
-/// `target/.ccteam/`. V0.4.6 F83 moved this from the project root into
-/// `.ccteam/` so the orchestration state SoT stays out of the user's
-/// business tree. Returns silently if the file already exists and
-/// `force` is false.
-///
-fn scaffold_workflow_yaml(target: &std::path::Path, force: bool) -> Result<()> {
-    let ccteam_dir = target.join(".ccteam");
-    std::fs::create_dir_all(&ccteam_dir)
-        .with_context(|| format!("create {}", ccteam_dir.display()))?;
-    let path = ccteam_dir.join("workflow.yaml");
-    if path.exists() && !force {
-        return Ok(());
-    }
-    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-/// V0.4.2 F72: write minimal `.claude/agents/*.md` examples. Returns
-/// the count of files written. With `force=false`, existing files are
-/// preserved; with `force=true`, the shipped scaffolds always
-/// overwrite.
-const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
-# Edit this file to declare your project's agent topology. Each agent
-# is a role (filename of .claude/agents/<role>.md) with a trigger that
-# decides when ccteam spawns a session for it.
-#
-# Trigger grammar:
-#   manual                        # explicit `ccteam spawn <slug> <role>` only
-#   schedule                      # periodic; needs `schedule:` 5-field cron
-#   gate                          # waits for `trigger_gate` MCP / CLI call
-#   watch:.ccteam/issues/         # spawn one session per new file under the path
-name: default-workflow
-description: |
-  Minimal starter workflow. Edit me — declare your own agents below.
-  (v0.9.0: ccteam seeds no default role; sessions are roleless unless
-  you author `.claude/agents/<role>.md` or install one from the hub.)
-
-agents: {}
-"#;
 
 /// `ccteam ls`. Returns either a human table or the interfaces.md §10.3
 /// JSON shape (a single string, not printed — caller decides).
@@ -1526,11 +1483,8 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
         );
         return out;
     }
-    out.push_str(
-        "SLUG                                     PHASE          STATE       COST   AGE\n",
-    );
+    out.push_str("SLUG                                     COST(24H)   AGE\n");
     for p in projects {
-        let phase = display_phase(&p.state.current_phase);
         // V0.4.6 F91 — cost column sources cost_24h_usd from
         // progress.jsonl (best-effort; failure → $0.00 — fresh
         // projects with no progress events show $0.00, same shape
@@ -1539,10 +1493,8 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
             .map(|c| c.cost_24h_usd)
             .unwrap_or(0.0);
         out.push_str(&format!(
-            "{:<40} {:<14} {:<11} ${:<5.2} {}s\n",
+            "{:<40} ${:<10.2} {}s\n",
             truncate(&p.state.slug, 40),
-            truncate(phase, 14),
-            phase_state_str(&p.state.phase_state),
             cost_24h,
             p.age_seconds,
         ));
@@ -1550,9 +1502,8 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
     out
 }
 
-/// `current_phase` is empty between `ccteam project new` and the first
-/// dispatch; surface that as `pending` instead of a blank column so
-/// `ls` and `show` are readable on fresh projects.
+/// `current_phase` is empty between project creation and the first dispatch;
+/// surface that as `pending` in the detailed `show` view.
 fn display_phase(phase: &str) -> &str {
     if phase.is_empty() {
         "pending"
@@ -1566,8 +1517,6 @@ fn render_ls_json(
     projects: &[ProjectSummary],
     daemon_up: bool,
 ) -> Result<String> {
-    // V0.4.0 F60: the phase state machine was deleted; "active" can no
-    // longer be derived from `phase_state == InFlight`.
     let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
@@ -1587,14 +1536,11 @@ fn render_ls_json(
             let stall = stall_level(last_event.as_ref(), p.stall_silent_seconds);
             json!({
                 "slug": p.state.slug,
-                "current_phase": p.state.current_phase,
-                "phase_state": phase_state_str(&p.state.phase_state),
                 "cost_used_usd": cost_summary.cost_24h_usd,
                 "cost_24h_usd": cost_summary.cost_24h_usd,
                 "cost_active_usd": cost_summary.cost_active_usd,
                 "cost_total_usd": cost_summary.cost_total_usd,
                 "context_tokens_used": p.state.context_tokens_used,
-                "tmux_session": p.state.tmux_session,
                 "user_attached": p.state.user_attached,
                 "age_seconds": p.age_seconds,
                 "last_event_ts": p
@@ -1656,10 +1602,6 @@ fn render_show_text(
     out.push_str(&format!(
         "current phase  : {}\n",
         display_phase(&state.current_phase)
-    ));
-    out.push_str(&format!(
-        "phase state    : {}\n",
-        phase_state_str(&state.phase_state)
     ));
     // V0.4.6 F91 — cost(24h) sums every `agent_done.cost_usd` in the
     // last 24h; cost(active) live-reads each open session's
@@ -1756,13 +1698,6 @@ fn render_show_json(
         "recommendations": Value::Array(Vec::new()),
     });
     Ok(serde_json::to_string_pretty(&v)?)
-}
-
-fn phase_state_str(s: &PhaseState) -> &'static str {
-    match s {
-        PhaseState::Idle => "idle",
-        PhaseState::Done => "done",
-    }
 }
 
 pub(crate) fn stall_level(last_event: Option<&Value>, silent_s: u64) -> &'static str {
@@ -4813,7 +4748,10 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 8, "ships 8 tools (v0.9 T1 cull)");
+        assert_eq!(
+            report.total_tools, 8,
+            "ships 8 tools (v0.9 T1 cull; 2026-07-26 screenshot cull + status beacon alias)"
+        );
     }
 
     #[test]

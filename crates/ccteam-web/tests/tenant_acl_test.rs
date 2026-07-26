@@ -1,7 +1,6 @@
 //! v0.8.18 档1 — per-user web isolation, end to end. A tenant token is gated
-//! off every admin-only / global surface (IM credentials, user management,
-//! hosts, status) and sees none of the admin's projects; the admin reaches all
-//! of them. Proves the owner-reported leaks are closed.
+//! off user management + global IM credentials, while shared operational
+//! surfaces stay available and project resources remain ownership-scoped.
 
 use std::net::SocketAddr;
 
@@ -35,7 +34,7 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn tenant_token_is_gated_off_admin_surfaces() {
+async fn tenant_token_keeps_only_user_management_and_global_im_admin_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(&paths.root).unwrap();
@@ -58,15 +57,24 @@ async fn tenant_token_is_gated_off_admin_surfaces() {
     let addr = spawn(state).await;
     let c = client();
 
-    // Admin-only / global surfaces → 403 for the tenant.
-    for path in ["/api/v1/config/im", "/api/v1/hosts", "/api/v1/status"] {
+    // The admin's global IM credentials stay admin-only.
+    let r = c
+        .get(format!("http://{addr}/api/v1/config/im"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "tenant must be 403 on global IM config");
+
+    // Shared operational/library surfaces are available to every identity.
+    for path in ["/api/v1/hosts", "/api/v1/status", "/api/v1/skills"] {
         let r = c
             .get(format!("http://{addr}{path}"))
             .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status(), 403, "tenant must be 403 on {path}");
+        assert_eq!(r.status(), 200, "tenant reaches shared surface {path}");
     }
 
     // The admin reaches the global surface (200).

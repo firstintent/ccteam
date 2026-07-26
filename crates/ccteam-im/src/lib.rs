@@ -61,6 +61,7 @@ pub mod rate_limit;
 pub mod remote_host;
 pub mod router;
 pub mod sanitize;
+pub mod scheduled;
 pub mod three_layer_sec;
 pub mod transport;
 

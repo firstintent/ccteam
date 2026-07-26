@@ -1,7 +1,7 @@
 //! Transport-agnostic MCP protocol core (JSON-RPC value-in / value-out).
 //!
-//! Speaks `initialize` / `tools/list` / `tools/call` for the **local** tools
-//! (`status`, `screenshot`). Stateful tools (`chat_send_file`, `session_*`)
+//! Speaks `initialize` / `tools/list` / `tools/call` for the **local** tool
+//! (`status`). Stateful tools (`chat_send_file`, `session_*`)
 //! are listed in `tools/list` but only dispatched by [`super::dispatch::McpDispatch`]
 //! (daemon socket / future HTTP). The stdio process in `ccteam-cli` forwards
 //! those tools to the daemon over `mcp.sock` before falling through here.
@@ -9,10 +9,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use ccteam_core::{
-    check_daemon_health, collect_projects, cost_summary, render_screenshot, CcteamPaths,
-    DaemonHealth,
-};
+use ccteam_core::{check_daemon_health, collect_projects, cost_summary, CcteamPaths, DaemonHealth};
 
 use super::groups;
 
@@ -23,11 +20,6 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "ccteam";
 /// Workspace-synced version of this crate (same workspace version as the binary).
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Must match `ccteam_flow::MAX_CONCURRENT_PROJECTS` (orchestrator hard cap).
-/// Duplicated here so `ccteam-im` does not depend on `ccteam-flow` while the
-/// `status` tool body shape stays identical.
-const MAX_CONCURRENT_PROJECTS: usize = 3;
 
 /// Server `instructions` surfaced to the agent on `initialize`.
 ///
@@ -41,10 +33,11 @@ const MAX_CONCURRENT_PROJECTS: usize = 3;
 /// - **Attachments**: a bare `claude` session does NOT auto-`Read` an
 ///   attachment path — it must be told to.
 pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam is the local agent bridge: any session can hire other agent sessions \
-(Claude Code / Codex / Grok / OpenCode, on this machine or a registered satellite host) and ccteam does the identity, \
+(Claude Code / Codex / Grok / OpenCode / Kimi, on this machine or a registered satellite host) and ccteam does the identity, \
 routing, delivery, guardrails, cost ledger, and team observability underneath.\n\n\
 ORCHESTRATION (important): when the user asks you to call / use / delegate to another agent (e.g. \"call codex\", \
-\"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick `vendor`, optionally \
+\"use grok to search\", \"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick \
+`vendor`: `claude` / `codex` / `grok` / `opencode` / `kimi`, optionally \
 `model` / `role`, and pass the first `task` in the same call); its execution host is inherited from the project \
 binding. `session_dispatch` sends follow-up tasks \
 (async with a completion notification, or `wait_seconds` to block inline), `session_collect` reads its output \
@@ -52,8 +45,8 @@ binding. `session_dispatch` sends follow-up tasks \
 out to vendor CLIs (`codex exec`, `claude -p`, …) for this: a raw CLI run has no session id, no transcript, no cost \
 tracking, no completion notification, and is invisible to the team — it bypasses the bridge. The tools work both \
 from ccteam-spawned sessions (per-session principal) and from a plain local session running inside a registered \
-project (same-user admin fallback; `session_spawn` then targets the project of your working directory, or an \
-explicit `project`).\n\n\
+project (same-user admin fallback; `session_spawn` then targets the project of your working directory, an explicit \
+`project`, or — when exactly one project is registered — that project).\n\n\
 CHAT ROUTING: ccteam routes IM (Telegram / web) chats to you and back. \
 An inbound chat message may arrive wrapped in a `<channel source=\"…\" chat_id=\"…\" user=\"…\" message_id=\"…\">` tag.\n\n\
 ATTACHMENTS (important): if a `<channel …>` tag carries an `image_path=\"/abs/path\"` attribute, immediately `Read` that file — \
@@ -61,6 +54,18 @@ it is an image the user attached (often an error screenshot) and is essential co
 attribute, `Read` that file too. Further attachments may appear in the body as `[attachment image_path=\"…\"]` / \
 `[attachment file_path=\"…\"]` lines — `Read` each of those as well. Do this BEFORE you answer; the user expects you to have \
 looked at the file they sent.";
+
+/// Bare-name discovery beacon — a PURE ALIAS of `status` (same handler,
+/// same response). Some MCP hosts strip descriptions and server
+/// instructions from ambient context and surface tool NAMES only; in that
+/// world nothing in `status` / `chat_send_file` / `session_*` says "grok"
+/// or "codex", so "use grok to search" dies on first-turn discovery. This
+/// name front-loads every vendor keyword. Owner decisions (2026-07-26):
+/// alias — NOT a rename — so it stays cheap to change or drop; `opencode`
+/// sorts last. The name is derived from [`ccteam_harness::AgentVendor::ALL`]
+/// (test-enforced), so adding a vendor forces this name to grow in the
+/// same PR.
+pub const STATUS_BEACON_TOOL_NAME: &str = "grok_claude_codex_kimi";
 
 /// Full tool names in the session group, registration order.
 pub const SESSION_TOOL_NAMES: &[&str] = &[
@@ -79,7 +84,7 @@ pub fn is_session_tool(name: &str) -> bool {
 /// Dispatch a single JSON-RPC message. Returns `Some(response)` for
 /// requests (which carry an `id`) and `None` for notifications.
 ///
-/// `tools/call` only handles **local** tools (`status`, `screenshot`).
+/// `tools/call` only handles the **local** tool (`status`).
 /// Unknown tools (including stateful `chat_send_file` / `session_*` when
 /// reached without a prior intercept) return `isError: true`.
 pub async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
@@ -145,30 +150,20 @@ fn tools_list_response() -> Value {
     json!({ "tools": tools })
 }
 
-/// Single source of truth for the MCP tool surface (v0.9 T1):
-/// `status` (1) + `screenshot` (1) + `chat_send_file` (1) +
+/// Single source of truth for the MCP tool surface:
+/// `status` (1) + its bare-name beacon alias (1) + `chat_send_file` (1) +
 /// session (5) = **8 total**.
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
-            "description": "daemon health + sessions + today's cost",
+            "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + per-vendor session_spawn recipes + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
             "inputSchema": object_schema(&[]),
         }),
         json!({
-            "name": "screenshot",
-            "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "Project slug." },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Scrollback depth to capture (default 50)."
-                    }
-                },
-                "required": ["slug"],
-            }),
+            "name": STATUS_BEACON_TOOL_NAME,
+            "description": "Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode — with install/auth state and per-vendor session_spawn recipes, plus registered projects, daemon health, today's cost. Identical response to status.",
+            "inputSchema": object_schema(&[]),
         }),
     ];
     tools.extend(chat_tool_definitions());
@@ -180,7 +175,7 @@ pub fn tool_definitions() -> Vec<Value> {
 pub fn chat_tool_definitions() -> Vec<Value> {
     vec![json!({
         "name": "chat_send_file",
-        "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
+        "description": "Send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web) — a chat user cannot open a local path, so this is how a generated artifact (chart, report, photo) actually reaches them. Zero addressing params: the daemon resolves your home chat from your session identity. `path` must be on the daemon's filesystem. `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
         "inputSchema": json!({
             "type": "object",
             "properties": {
@@ -198,7 +193,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn a new session in YOUR OWN project and return its `s{n}` id. Any authenticated session may call this: the daemon authenticates your per-session `(sid, secret)` principal and you can only spawn into your own project. The execution host is inherited from the project binding; to run on another host, spawn into a project cataloged on that host. `vendor` selects the harness — `claude` (default), `codex`, `grok`, `opencode`, or `kimi`. `role` is optional: omit or pass \"\" for a roleless session (the bare vendor reads the project CLAUDE.md/AGENTS.md); a named role must exist as `.claude/agents/<role>.md`. Pass `task` to dispatch the FIRST task in the same call (the common flow — identical semantics to session_dispatch: async by default, and when the child's vendor turn completes and it goes idle you get ONE completion notification; inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async; pending never cancels the child; `notify:\"off\"` opts out); the response then also carries `turn_id` + `status` (and `result_text` when waited). Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Optional facets: `model`, `effort`, `protocol` (`stream-json` default, or `acp`), `permission_mode` (`skip` default, or `hitl`), `title` (a short label for the ledger/visualization only). Always mints a NEW sid. Returns `{sid, vendor_session_id, host, ...}`; `vendor_session_id` is the vendor-native resume key (may be empty for some vendors). Follow up with session_dispatch and read output with session_collect.",
+            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex = coding agents for repo work; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch (async + ONE completion notification when the child's turn completes and it goes idle; see `wait_seconds`/`notify`); the response then adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -206,16 +201,11 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "vendor": {
                         "type": "string",
                         "enum": ["claude", "codex", "grok", "opencode", "kimi"],
-                        "description": "Harness vendor (lowercase). Default `claude`."
+                        "description": "Harness vendor (lowercase). Default claude."
                     },
                     "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
                     "effort": { "type": "string", "description": "Optional reasoning-effort token (vendor-specific value set). Ignored for grok (undocumented value set)." },
-                    "protocol": {
-                        "type": "string",
-                        "enum": ["stream-json", "acp"],
-                        "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode/kimi (forced). `terminal` is not available to agents."
-                    },
-                    "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Local callers default to the project resolved from the working directory." },
+                    "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Omitted: your working directory's project, else the sole registered project; `status` lists every slug." },
                     "permission_mode": {
                         "type": "string",
                         "enum": ["skip", "hitl"],
@@ -232,7 +222,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task (a user turn) to a session addressed by `sid` (e.g. `s2` from session_spawn / session_list). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project dispatch is rejected). The `task` text is forwarded VERBATIM as a user turn to the target session (NO system-prompt injection). By default the target runs ASYNCHRONOUSLY and, when its vendor turn COMPLETES (the child goes idle — mid-turn narration never notifies), ccteam delivers ONE completion notification back to you as a new turn; the notification explicitly marks the child as idle/waiting, so if the task isn't actually finished you know to dispatch a follow-up (set `notify:\"off\"` to opt out and poll session_collect yourself, `notify:\"all\"` for a per-message debug firehose). Inline wait is for health probes/short tasks and has a 240s effective ceiling; long/repo tasks should stay async with completion notification. Completion returns `{status:\"completed\", result_text, cost_usd?}`; timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. A dispatch to yourself or an ancestor is rejected (cycle). This is an explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Async by default: ONE completion notification when the child's vendor turn completes and it goes idle — mid-turn narration never notifies; the notification says the child is idle, so you know when to dispatch the next step (`notify` changes this, `wait_seconds` blocks inline). Completion returns `{status:\"completed\", result_text, elapsed_seconds, cost_usd?, tokens_total?}` (child's session ledger); timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Dispatch to yourself or an ancestor is rejected (cycle). Explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -302,25 +292,23 @@ fn object_schema(props: &[(&str, &str, &str)]) -> Value {
     })
 }
 
-/// Local-only `tools/call` dispatch (`status` + `screenshot`).
+/// Local-only `tools/call` dispatch (`status` + its beacon alias).
 async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match name {
-        "status" => Ok(text_content(tool_ls(paths)?)),
-        "screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
-        other => Err(anyhow!("unknown tool: {other}")),
+    if name == "status" || name == STATUS_BEACON_TOOL_NAME {
+        return Ok(text_content(tool_ls(paths)?));
     }
+    Err(anyhow!("unknown tool: {name}"))
 }
 
 fn text_content(body: String) -> Vec<Value> {
     vec![json!({ "type": "text", "text": body })]
 }
 
-/// Base `status` JSON body (projects + orchestrator + daemon health). The
+/// Base `status` JSON body (slim projects + daemon health). The
 /// daemon-aware dispatch path reuses this verbatim, then appends the vendor
 /// panel + routing notes (see [`super::dispatch`]).
 pub(crate) fn tool_ls(paths: &CcteamPaths) -> Result<String> {
@@ -340,10 +328,6 @@ fn tool_ls_matching(
     mut visible: impl FnMut(&ccteam_core::ProjectState) -> bool,
 ) -> Result<String> {
     let projects = collect_projects(paths)?;
-    // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
-    // with the phase state machine deleted F66 will recompute this from
-    // `state.sessions` (live agent count).
-    let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
         .filter(|project| visible(&project.state))
@@ -352,71 +336,29 @@ fn tool_ls_matching(
                 .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
-                "team": p.state.team,
-                "current_phase": p.state.current_phase,
-                "phase_state": match p.state.phase_state {
-                    ccteam_core::PhaseState::Idle => "idle",
-                    ccteam_core::PhaseState::Done => "done",
-                },
-                "cost_used_usd": cost.cost_total_usd,
                 "cost_24h_usd": cost.cost_24h_usd,
-                "cost_active_usd": cost.cost_active_usd,
-                "tmux_session": p.state.tmux_session,
-                "age_seconds": p.age_seconds,
             })
         })
         .collect();
     let health = check_daemon_health(paths);
     let body = json!({
         "projects": arr,
-        "orchestrator": {
-            "active_count": active_count,
-            "max_concurrent": MAX_CONCURRENT_PROJECTS,
-            "daemon_health": daemon_health_json(&health),
-        },
+        "daemon": daemon_health_json(&health),
     });
     Ok(serde_json::to_string_pretty(&body)?)
 }
 
 fn daemon_health_json(health: &DaemonHealth) -> Value {
     match health {
-        DaemonHealth::Healthy { socket } => json!({
+        DaemonHealth::Healthy { .. } => json!({
             "status": "healthy",
-            "socket": socket.display().to_string(),
             "message": health.describe(),
         }),
-        DaemonHealth::Unreachable { socket, reason } => json!({
+        DaemonHealth::Unreachable { .. } => json!({
             "status": "unreachable",
-            "socket": socket.display().to_string(),
-            "reason": reason,
             "message": health.describe(),
         }),
     }
-}
-
-fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    match render_screenshot(paths, &slug, None, lines)? {
-        Some(path) => Ok(serde_json::to_string_pretty(&json!({
-            "ok": true,
-            "slug": slug,
-            "path": path.to_string_lossy(),
-        }))?),
-        None => Ok(serde_json::to_string_pretty(&json!({
-            "ok": false,
-            "slug": slug,
-            "reason": "screenshot rendering degraded; check daemon stderr for warn details \
-                      (tmux missing, session not found, font failed, or IO failure)",
-        }))?),
-    }
-}
-
-fn arg_string(args: &Value, name: &str) -> Result<String> {
-    args.get(name)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("missing required argument `{name}`"))
 }
 
 fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
@@ -434,10 +376,12 @@ fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
+    /// Exact set of MCP tool names (8 tools; `screenshot` culled 2026-07-26
+    /// as tmux-era legacy, the bare-name status beacon alias added the same
+    /// day — owner-ordered both).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
-        "screenshot",
+        "grok_claude_codex_kimi",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -480,23 +424,6 @@ mod tests {
             );
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
-    }
-
-    #[test]
-    fn screenshot_tool_definition_present_with_optional_lines() {
-        let tools = tool_definitions();
-        let s = tools
-            .iter()
-            .find(|t| t["name"] == "screenshot")
-            .expect("screenshot tool registered");
-        let req: Vec<&str> = s["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(req, vec!["slug"]);
-        assert_eq!(s["inputSchema"]["properties"]["lines"]["type"], "integer");
     }
 
     #[test]
@@ -561,6 +488,115 @@ mod tests {
         }
     }
 
+    /// MCP-DX-1 — external-agent feedback: callers searching for "grok" (or
+    /// any vendor keyword) must hit the spawn tool without reading a 500-char
+    /// paragraph. The five vendor names live in the FIRST sentence.
+    ///
+    /// MCP-DX-2 hardening: vendor keywords must be PLAIN TEXT. A host-side
+    /// keyword matcher tokenizes the description — backtick-wrapped `grok`
+    /// was measured to miss, so `session_spawn` was undiscoverable by the
+    /// very keyword it advertises (the plain-text `status` description
+    /// matched fine, which confirmed the diagnosis).
+    #[test]
+    fn session_spawn_description_front_loads_all_vendors() {
+        let defs = session_tool_definitions();
+        let spawn = defs.iter().find(|t| t["name"] == "session_spawn").unwrap();
+        let description = spawn["description"].as_str().unwrap();
+        let head: String = description.chars().take(140).collect();
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+            assert!(
+                head.contains(vendor),
+                "vendor `{vendor}` must appear in the first 140 chars (discoverability): {head}"
+            );
+            assert!(
+                !description.contains(&format!("`{vendor}`")),
+                "vendor keyword {vendor} must be plain text in the spawn description \
+                 (backticks defeat host keyword matchers)"
+            );
+        }
+    }
+
+    /// MCP-BEACON-1 — the bare-name beacon is a PURE alias: listed next to
+    /// `status`, same handler, byte-identical response. Its NAME is the
+    /// contract — derived from `AgentVendor::ALL` with `opencode` sorted
+    /// last (owner decisions 2026-07-26), and it must survive the
+    /// `mcp__ccteam__` client prefix under the 64-char tool-name cap, so a
+    /// sixth vendor forces a conscious rename in the same PR.
+    #[tokio::test]
+    async fn status_beacon_is_a_pure_alias_with_owner_pinned_literal_name() {
+        assert_eq!(STATUS_BEACON_TOOL_NAME, "grok_claude_codex_kimi");
+        assert!(
+            "mcp__ccteam__".len() + STATUS_BEACON_TOOL_NAME.len() <= 64,
+            "beacon name must fit the 64-char tool-name cap with the client prefix"
+        );
+
+        // Listed, admin-grouped, schema-identical to status.
+        let defs = tool_definitions();
+        let beacon = defs
+            .iter()
+            .find(|t| t["name"] == STATUS_BEACON_TOOL_NAME)
+            .expect("beacon listed");
+        let status = defs.iter().find(|t| t["name"] == "status").unwrap();
+        assert_eq!(beacon["inputSchema"], status["inputSchema"]);
+
+        // Pure alias: tools/call returns the same body as status.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let call = |name: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": {} }
+            })
+        };
+        let via_status = handle_request(&paths, &call("status")).await.unwrap();
+        let via_beacon = handle_request(&paths, &call(STATUS_BEACON_TOOL_NAME))
+            .await
+            .unwrap();
+        assert_eq!(via_status["result"], via_beacon["result"]);
+        assert_eq!(via_beacon["result"]["isError"], false);
+
+        let old = handle_request(
+            &paths,
+            &call(concat!("claude_codex_grok_kimi_", "opencode_status")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old["result"]["isError"], true);
+        assert!(old["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
+    }
+
+    /// MCP-DX-1 — `status` is the discovery surface (vendor availability per
+    /// host); its description and the server instructions must say so, and the
+    /// instructions must list ALL five harnesses (Kimi was missing).
+    #[test]
+    fn status_description_and_instructions_advertise_the_vendor_axis() {
+        assert!(CCTEAM_MCP_INSTRUCTIONS.contains("Kimi"));
+        for vendor in ["`claude`", "`codex`", "`grok`", "`opencode`", "`kimi`"] {
+            assert!(
+                CCTEAM_MCP_INSTRUCTIONS.contains(vendor),
+                "instructions must enumerate {vendor}"
+            );
+        }
+        let defs = tool_definitions();
+        let status = defs.iter().find(|t| t["name"] == "status").unwrap();
+        let description = status["description"].as_str().unwrap();
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+            assert!(
+                description.contains(vendor),
+                "status description must enumerate `{vendor}`"
+            );
+        }
+        assert!(description.contains("vendor panel"));
+    }
+
     #[test]
     fn cto_scheduling_tools_present_in_canonical_set() {
         for needed in [
@@ -614,25 +650,16 @@ mod tests {
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
 
         // v0.9.0 W1 (G1) — new facets are present.
-        for key in ["model", "effort", "protocol", "title"] {
+        for key in ["model", "effort", "title"] {
             assert!(
                 props[key].is_object(),
                 "session_spawn schema must carry `{key}`"
             );
         }
         assert!(props.get("host").is_none());
-
-        // protocol enum = stream-json | acp ONLY — terminal is NEVER exposed.
-        let protos: Vec<&str> = props["protocol"]["enum"]
-            .as_array()
-            .expect("protocol has an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(protos, vec!["stream-json", "acp"]);
         assert!(
-            !protos.contains(&"terminal"),
-            "terminal must not be exposed to agents"
+            props.get("protocol").is_none(),
+            "session_spawn schema must not carry removed `protocol`"
         );
 
         // role is now OPTIONAL (roleless is a first-class form) → required = [].
@@ -770,6 +797,8 @@ mod tests {
             "ccteam__chat_list_bots",
             "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
+            // 2026-07-26 cull: tmux-era pane screenshot (web route stays).
+            "screenshot",
             // Pre-rename prefixed wire names (client namespaces by server
             // key; the baked-in prefix rendered as mcp__ccteam__ccteam__*).
             "ccteam__status",
@@ -828,8 +857,86 @@ mod tests {
         assert_eq!(slugs, vec!["alice"]);
     }
 
+    #[test]
+    fn status_base_has_slim_exact_key_sets_for_admin_and_tenant() {
+        use std::collections::BTreeSet;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let slug = "slim";
+        let dir = paths.projects_root.join(slug);
+        std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+        let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+        state.owner = Some("user:ualice".to_string());
+        state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+        ccteam_core::config::upsert_project(
+            &paths.root,
+            ccteam_core::ProjectEntry {
+                slug: slug.to_string(),
+                path: dir,
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        for body in [
+            tool_ls(&paths).unwrap(),
+            tool_ls_for_user(&paths, "ualice").unwrap(),
+        ] {
+            let body: Value = serde_json::from_str(&body).unwrap();
+            let top: BTreeSet<_> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(top, BTreeSet::from(["daemon", "projects"]));
+            let project = body["projects"].as_array().unwrap().first().unwrap();
+            let project_keys: BTreeSet<_> = project
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(project_keys, BTreeSet::from(["cost_24h_usd", "slug"]));
+            let daemon_keys: BTreeSet<_> = body["daemon"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(daemon_keys, BTreeSet::from(["message", "status"]));
+            for dead in [
+                "team",
+                "current_phase",
+                "phase_state",
+                "cost_used_usd",
+                "cost_active_usd",
+                "tmux_session",
+                "age_seconds",
+                "orchestrator",
+                "socket",
+                "reason",
+            ] {
+                assert!(
+                    !body.to_string().contains(&format!("\"{dead}\"")),
+                    "{dead} reappeared: {body}"
+                );
+            }
+        }
+    }
+
+    /// 2026-07-26 cull — `screenshot` (tmux-era pane render) is no longer an
+    /// MCP tool; a call must fail as UNKNOWN, not degrade gracefully.
     #[tokio::test]
-    async fn handle_tools_call_screenshot_degrades_when_session_missing() {
+    async fn handle_tools_call_screenshot_is_unknown_after_cull() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -845,11 +952,11 @@ mod tests {
             }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("\"ok\": false"),
-            "expected ok=false on graceful degrade, got: {text}"
+            text.contains("unknown tool: screenshot"),
+            "expected unknown-tool error, got: {text}"
         );
     }
 
@@ -922,7 +1029,7 @@ mod tests {
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
-            parsed["orchestrator"]["daemon_health"]["status"], "unreachable",
+            parsed["daemon"]["status"], "unreachable",
             "status must annotate daemon health when daemon is down"
         );
     }

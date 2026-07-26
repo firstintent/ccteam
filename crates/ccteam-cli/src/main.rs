@@ -18,10 +18,10 @@ mod update;
 mod mcp_session_tools;
 mod mcp_tool_groups;
 mod web_chat_bridge;
-// Bare `ccteam doctor` full readiness checkup (five vendor binaries +
-// auth, tmux, MCP registration, daemon health, pricing, home-layout
-// drift). `main::run_doctor` runs it for every invocation except
-// `--verify-mcp`; the historical one-shot migration/repair flags were
+// Bare `ccteam doctor` readiness checkup: one consolidated row per vendor,
+// grouped ccteam/project advisories, a summary, and a final daemon-start hint
+// when down. Only a missing Claude binary FAILs. `main::run_doctor` runs it for
+// every invocation except `--verify-mcp`; historical one-shot repair flags were
 // removed (pre-v1.0 = no back-compat shims).
 mod doctor;
 
@@ -260,13 +260,12 @@ enum Command {
         #[command(subcommand)]
         cmd: HostCommand,
     },
-    /// Bare `ccteam doctor` (no flags) runs a full readiness checkup: the
-    /// five vendor binaries (claude / codex / grok / opencode / kimi) and
-    /// their auth, tmux, MCP registration, daemon health, pricing
-    /// staleness, and `~/.ccteam` home-layout drift — one
-    /// `[PASS]/[WARN]/[FAIL]/[SKIP]` line per check plus a summary line,
-    /// exit code 1 iff any check FAILs. `--verify-mcp` is a separate
-    /// CI-oriented invariant (the MCP tool-surface / STUB self-check).
+    /// Bare `ccteam doctor` groups one consolidated readiness row per vendor
+    /// under `agents`, ccteam/project advisories under their own sections, and
+    /// a summary plus a final daemon-start hint when the daemon is down. Only a
+    /// missing Claude Code binary is a FAIL; warnings remain READY.
+    /// `--verify-mcp` is a separate CI-oriented invariant (the MCP
+    /// tool-surface / STUB self-check).
     /// The historical hidden one-shot migration / repair flags from older
     /// ccteam versions were removed (pre-v1.0 = no back-compat shims).
     Doctor {
@@ -672,6 +671,13 @@ enum InternalCommand {
     /// "register the ccteam MCP server" menu item / `config mcp`) so
     /// daily-driver claude sessions see the ccteam tool surface.
     McpServe,
+    /// Best-effort registration of ccteam's MCP server for installed vendors.
+    #[command(hide = true)]
+    RegisterMcp {
+        /// Emit one machine-readable JSON line.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Attach to a session. Resolves a gateway chat-mode bot session
     /// (`ccteam-chat-<slug>-<sid>`) first: `<slug> <sid>` (or a full session
     /// name) is deterministic; with `<slug>` alone, attaches when the slug has
@@ -1241,6 +1247,7 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::McpServe => run_mcp_serve(),
+        InternalCommand::RegisterMcp { json } => run_internal_register_mcp(json),
         InternalCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
         InternalCommand::Peek { slug, sid } => run_internal_peek(&slug, sid.as_deref()),
         InternalCommand::Progress { slug, tail } => run_progress(&slug, tail),
@@ -1259,6 +1266,54 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
         }
         InternalCommand::Experience { cmd } => run_experience(cmd),
     }
+}
+
+fn run_internal_register_mcp(json_output: bool) -> Result<()> {
+    let mut rows = Vec::new();
+    let mut failures = 0usize;
+    for (vendor, result) in mcp_serve::auto_register_vendor_mcp() {
+        match result {
+            Ok(Some(path)) => rows.push(serde_json::json!({
+                "vendor": vendor,
+                "status": "registered",
+                "path": path,
+            })),
+            Ok(None) => rows.push(serde_json::json!({
+                "vendor": vendor,
+                "status": "skipped",
+            })),
+            Err(err) => {
+                failures += 1;
+                rows.push(serde_json::json!({
+                    "vendor": vendor,
+                    "status": "error",
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+    if json_output {
+        println!("{}", serde_json::json!({"results": rows}));
+    } else {
+        for row in &rows {
+            let vendor = row["vendor"].as_str().unwrap_or("unknown");
+            match row["status"].as_str().unwrap_or("error") {
+                "registered" => println!(
+                    "{vendor}: registered {}",
+                    row["path"].as_str().unwrap_or("<unknown>")
+                ),
+                "skipped" => println!("{vendor}: skipped"),
+                _ => println!(
+                    "{vendor}: error: {}",
+                    row["error"].as_str().unwrap_or("unknown error")
+                ),
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} vendor MCP registration(s) failed");
+    }
+    Ok(())
 }
 
 /// v0.9 T5 — `ccteam internal experience rebuild <slug>`.
@@ -1525,24 +1580,19 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
     }
 
-    // Self-heal a stale Codex MCP registration (a pre-HTTP stdio
-    // `[mcp_servers.ccteam]` entry) so `/new codex` sessions don't fail
-    // `thread/start` with "url is not supported for stdio" under Codex's deep
-    // config merge. Narrow + idempotent: only a legacy stdio entry ccteam wrote
-    // is rewritten to HTTP; a missing config / no ccteam entry / already-HTTP
-    // entry is untouched. Best-effort — never block startup.
-    match crate::mcp_serve::heal_codex_mcp_if_stale() {
-        Ok(Some(path)) => tracing::info!(
-            config = %path.display(),
-            "migrated stale Codex MCP entry (stdio → HTTP) so codex sessions can start"
-        ),
-        Ok(None) => {}
-        Err(err) => tracing::warn!(
-            error = %err,
-            "could not check/heal Codex MCP registration at daemon start; if `/new codex` \
-             fails with 'url is not supported for stdio', rerun `ccteam config`"
-        ),
+    let mut registered = Vec::new();
+    for (vendor, result) in crate::mcp_serve::auto_register_vendor_mcp() {
+        match result {
+            Ok(Some(path)) => registered.push(format!("{vendor}={}", path.display())),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                vendor,
+                error = %err,
+                "could not auto-register vendor MCP at daemon start"
+            ),
+        }
     }
+    tracing::info!(?registered, "vendor MCP auto-registration complete");
 
     // V0.4.0 F60: the shipped team seed writer was deleted with the
     // phase machinery (F63 will reintroduce a workflow seed). Daemon

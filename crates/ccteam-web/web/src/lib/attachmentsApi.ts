@@ -31,8 +31,8 @@ export interface SkillSummary {
   description: string;
 }
 
-/** One skill in the user-level global library (`GET /api/v1/skills`,
- *  admin-only). `id` may be nested (`baoyu-skills/baoyu-comic`); `path` is the
+/** One skill in the user-level global library (`GET /api/v1/skills`).
+ *  `id` may be nested (`baoyu-skills/baoyu-comic`); `path` is the
  *  absolute SKILL.md the server weaves into the turn. */
 export interface LibrarySkillSummary {
   id: string;

@@ -35,6 +35,7 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -52,7 +53,7 @@ use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome,
     ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    TurnId, TurnInput,
+    TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -101,6 +102,9 @@ struct LiveSession {
     /// per-turn `result` clears as a safety net). Read by
     /// [`HarnessAdapter::running_tasks`]. Interior-mutable, shared with the tap.
     running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
+    /// Adapter-local vendor-turn occupancy for truthful Started vs Injected
+    /// submission receipts. Set before writing input; cleared on TurnResult.
+    active_turn: Arc<AtomicBool>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -211,6 +215,7 @@ fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
     status: Arc<StdMutex<ThreadStatus>>,
     running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
+    active_turn: Arc<AtomicBool>,
     project_dir: PathBuf,
     sid: String,
 ) {
@@ -279,6 +284,7 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
+                        active_turn.store(false, Ordering::Release);
                         // The turn ended — turn-scoped tasks (sync subagents)
                         // cannot still be running, so drop them as a safety net in
                         // case a terminal task event was missed. Background
@@ -1198,6 +1204,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // current by the SAME status tap from claude's `system:task_*` events.
         let running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>> =
             Arc::new(StdMutex::new(Vec::new()));
+        let active_turn = Arc::new(AtomicBool::new(false));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -1207,6 +1214,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             Arc::clone(&transport),
             Arc::clone(&status),
             Arc::clone(&running_tasks),
+            Arc::clone(&active_turn),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
         );
@@ -1275,6 +1283,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             models: init.models.clone(),
             status,
             running_tasks,
+            active_turn,
         };
         self.live
             .lock()
@@ -1324,11 +1333,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .unwrap_or(false)
     }
 
-    async fn submit_turn(
+    async fn submit_turn_routed(
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        if routing == TurnRouting::Queue {
+            return Err(HarnessError::NotImplemented {
+                reason: "claude stream-json does not expose a distinct queued-turn channel".into(),
+            });
+        }
         let Some(live) = self.lookup(&h.identity) else {
             // Registry miss = the session was idle-released / closed: nothing was
             // sent, so this is a recoverable ThreadDied (caller resumes + retries
@@ -1354,13 +1369,20 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 format!("Tool result for {call_id}: {body}")
             }
         };
-        live.transport
+        let was_active = live.active_turn.swap(true, Ordering::AcqRel);
+        if let Err(error) = live
+            .transport
             .send_line(protocol::user_text_line(&text))
             .await
+        {
+            live.active_turn.store(was_active, Ordering::Release);
             // Writer closed = the child exited mid-handoff (the probe→send
             // race): the line was NOT delivered, so it's a recoverable
             // ThreadDied the gateway resumes + retries once.
-            .map_err(|e| HarnessError::ThreadDied(format!("stream-json send: {e:#}")))?;
+            return Err(HarnessError::ThreadDied(format!(
+                "stream-json send: {error:#}"
+            )));
+        }
 
         // Synthesize a turn id (the pump keys turns.jsonl off its own seq;
         // this id is only for adapter-side correlation / logs).
@@ -1368,7 +1390,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        Ok(TurnId::new(format!("turn-{nanos:x}")))
+        let turn_id = TurnId::new(format!("turn-{nanos:x}"));
+        if was_active {
+            Ok(TurnSubmission::injected(turn_id))
+        } else {
+            Ok(TurnSubmission::started(turn_id))
+        }
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

@@ -1,27 +1,25 @@
 // v0.8.24 Track A — 设置 top-level view (prototype `#view-settings`):
-// set-nav second column of sub-pages. Tabs: admin sees 运维总览 / 插件市场 /
-// 通用 / 账号 / 管理员; a tenant sees ONLY 插件市场 / 通用 / 账号. 运维总览
-// combines Status + Hosts; 管理员 carries user management.
+// set-nav second column of sub-pages. Every identity sees 运维总览 / 接入 /
+// 通用 / 账号; only an admin sees 管理员. 运维总览 combines Status + Hosts;
+// 管理员 carries user management.
 //
-// ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / 管理员 are
-// admin-only nav items (the backend 403s regardless; this is the UI层
-// beta/visibility gate). The 账号 panel absorbs the old AvatarMenu entirely
-// (头像 / 昵称 / 语言入口 / 登出 + web token) plus IM: a tenant gets the
-// self-serve 「我的 IM bot」, an admin gets the global Telegram/Lark
-// credentials (no standalone IM tab).
+// ACL (fail-closed via useMe): only 管理员 is an admin-only nav item. The 账号
+// panel absorbs the old AvatarMenu entirely (头像 / 昵称 / 语言入口 / 登出 +
+// web token); tenant self-serve IM and global admin credentials live as the
+// two identity-specific shapes of Access.
 
 import { useMemo, useState } from "react";
 import {
   Activity,
-  Package,
+  PlugZap,
   SlidersHorizontal,
   User,
   Users,
 } from "lucide-react";
 import HostsView from "./HostsView";
-import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
-import SettingsPage, { MyImSection, UserManagementSection } from "./SettingsPage";
+import { UserManagementSection } from "./SettingsPage";
+import AccessView from "./AccessView";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -29,13 +27,12 @@ import { useMe } from "../hooks/useMe";
 import { clearToken, getToken, saveToken } from "../lib/token";
 import { resetToken } from "../lib/meApi";
 import { toastBus } from "../lib/toastBus";
-import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
-export type SettingsTab = "ops" | "market" | "general" | "account" | "admin";
+export type SettingsTab = "ops" | "access" | "general" | "account" | "admin";
 
 const ITEMS: { id: SettingsTab; labelKey: string; adminOnly: boolean; icon: React.ReactNode }[] = [
-  { id: "ops", labelKey: "setOps", adminOnly: true, icon: <Activity /> },
-  { id: "market", labelKey: "setMarket", adminOnly: false, icon: <Package /> },
+  { id: "ops", labelKey: "setOps", adminOnly: false, icon: <Activity /> },
+  { id: "access", labelKey: "setAccess", adminOnly: false, icon: <PlugZap /> },
   { id: "general", labelKey: "setGeneral", adminOnly: false, icon: <SlidersHorizontal /> },
   { id: "account", labelKey: "setAccount", adminOnly: false, icon: <User /> },
   { id: "admin", labelKey: "setAdmin", adminOnly: true, icon: <Users /> },
@@ -55,7 +52,14 @@ export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): S
   const visible = visibleSettingsItems(isAdmin);
   const normalized = tab === "hosts" || tab === "status" ? "ops" : tab;
   if (normalized && (visible as string[]).includes(normalized)) return normalized as SettingsTab;
-  return isAdmin ? "ops" : "market";
+  return "ops";
+}
+
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
+export function settingsDetailWidthClass(active: SettingsTab): string {
+  if (active === "ops") return "ops-wide";
+  if (active === "access") return "access-wide";
+  return "";
 }
 
 const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
@@ -63,11 +67,9 @@ const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
 export default function SettingsView({
   tab: routeTab,
   onNav,
-  rail = [],
 }: {
   tab?: string;
   onNav?: (tab: SettingsTab) => void;
-  rail?: SessionSummary[];
 }) {
   const { settings, update } = useWebSettings();
   const lang = settings.language;
@@ -103,20 +105,11 @@ export default function SettingsView({
 
       <div className="set-detail">
         <div
-          className={`set-detail-inner fade-in ${active === "market" ? "wide" : ""} ${active === "ops" ? "ops-wide" : ""}`}
+          className={`set-detail-inner fade-in ${settingsDetailWidthClass(active)}`}
           key={active}
         >
-          {active === "ops" && isAdmin ? <OpsPanel lang={lang} rail={rail} /> : null}
-
-          {active === "market" ? (
-            <>
-              <header>
-                <h1>{t("setMarket")}</h1>
-                <p>{t("marketDesc")}</p>
-              </header>
-              <MarketplaceView embedded />
-            </>
-          ) : null}
+          {active === "ops" ? <OpsPanel lang={lang} /> : null}
+          {active === "access" ? <AccessView lang={lang} /> : null}
 
           {active === "admin" && isAdmin ? <AdminPanel lang={lang} /> : null}
 
@@ -146,14 +139,21 @@ export default function SettingsView({
   );
 }
 
-export function OpsPanel({ lang, rail }: { lang: Lang; rail: SessionSummary[] }) {
+/** Status · 运维总览: single vertical stack —
+ *  daemon health first, then per-host agent cards (full width). */
+export function OpsPanel({ lang }: { lang: Lang }) {
+  const t = makeT(lang);
   return (
-    <div className="ops-grid" data-testid="ops-view">
+    <div className="ops-stack" data-testid="ops-view">
+      <header>
+        <h1>{t("setOps")}</h1>
+        <p>{t("statusDesc")}</p>
+      </header>
       <section className="ops-panel" aria-label="Status">
-        <StatusView rail={rail} />
+        <StatusView embedded />
       </section>
       <section className="ops-panel" aria-label="Hosts">
-        <HostsView lang={lang} />
+        <HostsView embedded lang={lang} />
       </section>
     </div>
   );
@@ -265,7 +265,7 @@ export function AccountPanel({
 }) {
   const t = makeT(lang);
   const initial = ((displayName || "").trim() || handle || "C").slice(0, 1).toUpperCase();
-  // v0.8.24 — admin self-serve web-token reset: two-step inline confirm
+  // v0.8.24 — self-serve web-token reset: two-step inline confirm
   // (arm → confirm), then store the NEW token locally at once (the old one
   // is already dead server-side; the fetch interceptor picks the new Bearer
   // up on the next request — session uninterrupted, no re-login).
@@ -372,27 +372,25 @@ export function AccountPanel({
             <button type="button" className="btn ghost mini" onClick={copyToken}>
               {lang === "en" ? "Copy token" : "复制 token"}
             </button>
-            {isAdmin ? (
-              <button
-                type="button"
-                className={`btn mini ${resetArmed ? "primary" : "ghost"}`}
-                data-testid="account-reset-token"
-                disabled={resetBusy}
-                onClick={() => void doReset()}
-              >
-                {resetBusy
+            <button
+              type="button"
+              className={`btn mini ${resetArmed ? "primary" : "ghost"}`}
+              data-testid="account-reset-token"
+              disabled={resetBusy}
+              onClick={() => void doReset()}
+            >
+              {resetBusy
+                ? lang === "en"
+                  ? "Rotating…"
+                  : "重置中…"
+                : resetArmed
                   ? lang === "en"
-                    ? "Rotating…"
-                    : "重置中…"
-                  : resetArmed
-                    ? lang === "en"
-                      ? "Confirm reset? (old token dies at once)"
-                      : "确认重置?(旧 token 立即失效)"
-                    : lang === "en"
-                      ? "Reset token"
-                      : "重置 web token"}
-              </button>
-            ) : null}
+                    ? "Confirm reset? (old token dies at once)"
+                    : "确认重置?(旧 token 立即失效)"
+                  : lang === "en"
+                    ? "Reset token"
+                    : "重置 web token"}
+            </button>
             {resetArmed && !resetBusy ? (
               <button
                 type="button"
@@ -411,12 +409,6 @@ export function AccountPanel({
           </button>
         </div>
       </div>
-
-      {/* IM under 账号: a tenant gets the self-serve 「我的 IM bot」
-          (v0.8.20 F2); an admin gets the GLOBAL Telegram/Lark credentials
-          (SettingsPage, admin-gated + fail-closed). User management is NOT
-          here — it lives on the admin-only 管理员 tab. */}
-      {isAdmin ? <SettingsPage /> : <MyImSection />}
     </div>
   );
 }

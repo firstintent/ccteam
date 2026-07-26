@@ -17,13 +17,70 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const NOTIFICATION_BUFFER: usize = 512;
 const WRITER_BUFFER: usize = 64;
 
 type Pending = HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>;
+
+/// Removes an outstanding correlation entry when a caller future is cancelled
+/// (for example by the Gateway submit timeout) before the peer replies.
+struct PendingRegistration {
+    id: i64,
+    pending: Arc<StdMutex<Pending>>,
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// One-shot stateful barrier released after an ACP request enters the
+/// transport's FIFO writer queue. A watch value lets every current and future
+/// waiter observe either `sent` or `failed`, so concurrent interjections cannot
+/// consume a single permit and strand the rest.
+#[derive(Debug)]
+pub struct AcpWriteBarrier {
+    state: tokio::sync::watch::Sender<u8>,
+}
+
+impl Default for AcpWriteBarrier {
+    fn default() -> Self {
+        let (state, _) = tokio::sync::watch::channel(0);
+        Self { state }
+    }
+}
+
+impl AcpWriteBarrier {
+    const SENT: u8 = 1;
+    const FAILED: u8 = 2;
+
+    pub async fn wait(&self) -> Result<()> {
+        let mut state = self.state.subscribe();
+        loop {
+            match *state.borrow_and_update() {
+                Self::SENT => return Ok(()),
+                Self::FAILED => return Err(anyhow!("owning ACP request was not queued")),
+                _ => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| anyhow!("owning ACP request barrier closed"))?;
+        }
+    }
+
+    fn release(&self, sent: bool) {
+        self.state
+            .send_replace(if sent { Self::SENT } else { Self::FAILED });
+    }
+}
 
 /// How to answer agent→client JSON-RPC requests on this transport.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,7 +124,7 @@ pub struct Notification {
 pub struct AcpTransport {
     out: mpsc::Sender<Vec<u8>>,
     next_id: AtomicI64,
-    pending: Arc<Mutex<Pending>>,
+    pending: Arc<StdMutex<Pending>>,
     notifications: broadcast::Sender<Notification>,
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
@@ -162,7 +219,7 @@ impl AcpTransport {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<StdMutex<Pending>> = Arc::new(StdMutex::new(HashMap::new()));
         let (notif_tx, _) = broadcast::channel(NOTIFICATION_BUFFER);
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(WRITER_BUFFER);
         let closed = Arc::new(tokio::sync::Notify::new());
@@ -190,12 +247,37 @@ impl AcpTransport {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_inner(method, params, None).await
+    }
+
+    /// Send one request and release `write_barrier` after its frame has entered
+    /// the single FIFO writer queue. A later interjection can await this barrier
+    /// to guarantee the owning `session/prompt` is ordered first on the wire.
+    pub async fn call_with_write_barrier(
+        &self,
+        method: &str,
+        params: Value,
+        write_barrier: Arc<AcpWriteBarrier>,
+    ) -> Result<Value> {
+        self.call_inner(method, params, Some(write_barrier)).await
+    }
+
+    async fn call_inner(
+        &self,
+        method: &str,
+        params: Value,
+        write_barrier: Option<Arc<AcpWriteBarrier>>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
-            let mut guard = self.pending.lock().await;
+            let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(id, tx);
         }
+        let _registration = PendingRegistration {
+            id,
+            pending: Arc::clone(&self.pending),
+        };
 
         let mut frame = json!({
             "jsonrpc": "2.0",
@@ -205,13 +287,32 @@ impl AcpTransport {
         if !params.is_null() {
             frame["params"] = params;
         }
-        let mut line = serde_json::to_vec(&frame)?;
+        let mut line = match serde_json::to_vec(&frame) {
+            Ok(line) => line,
+            Err(err) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                if let Some(barrier) = write_barrier {
+                    barrier.release(false);
+                }
+                return Err(err.into());
+            }
+        };
         line.push(b'\n');
 
-        self.out
-            .send(line)
-            .await
-            .with_context(|| format!("send jsonrpc request {method}"))?;
+        let send = self.out.send(line).await;
+        if let Some(barrier) = write_barrier {
+            barrier.release(send.is_ok());
+        }
+        if let Err(err) = send {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return Err(err).with_context(|| format!("send jsonrpc request {method}"));
+        }
 
         match rx.await {
             Ok(Ok(v)) => Ok(v),
@@ -251,7 +352,7 @@ impl AcpTransport {
     pub async fn shutdown(&self) -> Result<()> {
         // Drop pending callers.
         {
-            let mut guard = self.pending.lock().await;
+            let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             for (_, tx) in guard.drain() {
                 let _ = tx.send(Err(JsonRpcError {
                     code: None,
@@ -302,7 +403,7 @@ async fn run_writer_loop<W: AsyncWrite + Unpin + Send>(
 
 async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
     reader: R,
-    pending: Arc<Mutex<Pending>>,
+    pending: Arc<StdMutex<Pending>>,
     notifications: broadcast::Sender<Notification>,
     out: mpsc::Sender<Vec<u8>>,
     closed: Arc<tokio::sync::Notify>,
@@ -339,9 +440,9 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
     }
 }
 
-async fn fail_pending(pending: &Arc<Mutex<Pending>>, message: &str) {
+async fn fail_pending(pending: &Arc<StdMutex<Pending>>, message: &str) {
     let drained = {
-        let mut guard = pending.lock().await;
+        let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
         guard.drain().map(|(_, tx)| tx).collect::<Vec<_>>()
     };
     for tx in drained {
@@ -355,7 +456,7 @@ async fn fail_pending(pending: &Arc<Mutex<Pending>>, message: &str) {
 
 async fn dispatch(
     v: Value,
-    pending: &Arc<Mutex<Pending>>,
+    pending: &Arc<StdMutex<Pending>>,
     notifications: &broadcast::Sender<Notification>,
     out: &mpsc::Sender<Vec<u8>>,
     inbound: InboundPolicy,
@@ -368,7 +469,12 @@ async fn dispatch(
     // Response to our request: numeric id + result/error, no method.
     if let Some(id) = numeric_id {
         if method.is_none() && (v.get("result").is_some() || v.get("error").is_some()) {
-            let tx = { pending.lock().await.remove(&id) };
+            let tx = {
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id)
+            };
             if let Some(tx) = tx {
                 let outcome = if let Some(err) = v.get("error") {
                     Err(JsonRpcError {
@@ -494,6 +600,71 @@ fn pick_allow_option_id(params: &Value) -> String {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn write_barrier_releases_all_current_and_future_waiters() {
+        let barrier = Arc::new(AcpWriteBarrier::default());
+        let first = {
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move { barrier.wait().await })
+        };
+        let second = {
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move { barrier.wait().await })
+        };
+        tokio::task::yield_now().await;
+        barrier.release(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("first waiter released")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second waiter released")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(10), barrier.wait())
+            .await
+            .expect("future waiter observes released state")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_call_removes_pending_correlation() {
+        let (client_rw, mut peer_rw) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_rw);
+        let client = Arc::new(AcpTransport::from_halves(client_r, client_w, None));
+        let call = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.call("session/prompt", json!({})).await }
+        });
+
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (peer_r, _peer_w) = tokio::io::split(&mut peer_rw);
+        let mut peer_r = BufReader::new(peer_r);
+        let mut line = String::new();
+        peer_r.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            client
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+
+        call.abort();
+        let _ = call.await;
+        assert!(
+            client
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "cancelled caller must not leak a pending request id"
+        );
+    }
 
     #[tokio::test]
     async fn call_includes_jsonrpc_2_0() {

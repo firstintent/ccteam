@@ -192,7 +192,14 @@ pub fn list_library_skills(root: &Path) -> Vec<LibrarySkillSummary> {
 /// Resolve `CCTEAM_HOME` and list its canonical [`crate::CcteamPaths::skills_dir`].
 pub fn list_default_library_skills() -> Result<Vec<LibrarySkillSummary>> {
     let paths = crate::CcteamPaths::from_env()?;
-    Ok(list_library_skills(&paths.skills_dir()))
+    Ok(list_default_library_skills_in(&paths.root))
+}
+
+/// List the canonical global skill library under an explicitly supplied
+/// ccteam home. This is the hermetic seam for callers/tests that already own
+/// a [`crate::CcteamPaths`] root and must not re-resolve process environment.
+pub fn list_default_library_skills_in(ccteam_root: &Path) -> Vec<LibrarySkillSummary> {
+    list_library_skills(&ccteam_root.join("skills"))
 }
 
 fn scan_library_dir(root: &Path, dir: &Path, out: &mut Vec<LibrarySkillSummary>) {
@@ -592,7 +599,8 @@ mod tests {
     #[test]
     fn list_library_skills_is_recursive_hidden_safe_and_sorted() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().join("skills");
+        let ccteam_root = tmp.path().join("home");
+        let root = ccteam_root.join("skills");
         for dir in [
             "zeta",
             "baoyu-skills/baoyu-comic",
@@ -620,8 +628,15 @@ mod tests {
             std::fs::write(root.join(hidden), "---\ndescription: hidden\n---\n").unwrap();
         }
         std::fs::write(root.join(".sources.json"), "{}\n").unwrap();
+        let decoy = tmp.path().join("decoy/skills/host-only");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(
+            decoy.join("SKILL.md"),
+            "---\ndescription: must stay outside injected root\n---\n",
+        )
+        .unwrap();
 
-        let out = list_library_skills(&root);
+        let out = list_default_library_skills_in(&ccteam_root);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].id, "baoyu-skills/baoyu-comic");
         assert_eq!(out[0].description, "nested skill");

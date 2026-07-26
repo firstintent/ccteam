@@ -542,10 +542,43 @@ pub(crate) fn render_section(
     let notes = read_routing_file(paths, slug);
     let runtime = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
     format!(
-        "{}\n\n{}\n\n{}",
+        "{}{}\n\n{}\n\n{}",
         render_panel(&header, &rows),
+        render_recipes(&rows),
         render_catalog(&runtime, hub),
         render_routing_notes(notes.as_ref()),
+    )
+}
+
+/// MCP-BEACON-1 — one `session_spawn` recipe line per INSTALLED vendor, so
+/// discovery → execution is a single hop (the external-agent complaint: the
+/// panel said grok exists but not how to call it). Static text assembled
+/// from the probe rows — no model, no routing opinion beyond what the spawn
+/// tool description already states. Empty when nothing is installed (the
+/// panel rows already say so).
+fn render_recipes(rows: &[PanelRow]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for row in rows.iter().filter(|r| r.installed) {
+        let recipe = match row.vendor.as_str() {
+            "grok" => {
+                "session_spawn{vendor:\"grok\", task:\"…\", wait_seconds:120} — fast live web/X search, inline answer"
+            }
+            "claude" => "session_spawn{vendor:\"claude\", task:\"…\"} — coding agent for repo work",
+            "codex" => {
+                "session_spawn{vendor:\"codex\", task:\"…\"} — coding agent (long grinds; async + ONE completion notification)"
+            }
+            "kimi" => "session_spawn{vendor:\"kimi\", task:\"…\"}",
+            "opencode" => "session_spawn{vendor:\"opencode\", task:\"…\"}",
+            _ => continue,
+        };
+        lines.push(format!("  {recipe}"));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nrecipes (installed vendors):\n{}\n  then: session_collect{{sid, tail:true}} reads the final answer · session_dispatch{{sid, task}} sends follow-ups",
+        lines.join("\n")
     )
 }
 
@@ -721,6 +754,39 @@ mod tests {
             BudgetState::Disabled { approx_hours: 1 },
             "spend == cap trips disabled (window just cleared)"
         );
+    }
+
+    /// MCP-BEACON-1 — recipes list INSTALLED vendors only (one spawn
+    /// one-liner each + the collect/dispatch footer); nothing installed →
+    /// empty string (no dangling header).
+    #[test]
+    fn recipes_render_installed_vendors_only() {
+        let row = |vendor: &str, installed: bool| PanelRow {
+            vendor: vendor.to_string(),
+            installed,
+            version: None,
+            last_session_ok: None,
+            budget: BudgetState::NotConfigured,
+        };
+        let out = render_recipes(&[
+            row("claude", true),
+            row("codex", false),
+            row("grok", true),
+            row("kimi", false),
+            row("opencode", false),
+        ]);
+        assert!(out.contains("recipes (installed vendors):"), "{out}");
+        assert!(
+            out.contains("session_spawn{vendor:\"grok\", task:\"…\", wait_seconds:120}"),
+            "{out}"
+        );
+        assert!(out.contains("session_spawn{vendor:\"claude\""), "{out}");
+        assert!(!out.contains("vendor:\"codex\""), "{out}");
+        assert!(!out.contains("vendor:\"kimi\""), "{out}");
+        assert!(out.contains("session_collect{sid, tail:true}"), "{out}");
+
+        assert_eq!(render_recipes(&[row("claude", false)]), "");
+        assert_eq!(render_recipes(&[]), "");
     }
 
     #[test]

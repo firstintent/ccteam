@@ -25,4 +25,5 @@ pub use groups::{
 pub use protocol::{
     chat_tool_definitions, handle_request, is_session_tool, session_tool_definitions,
     tool_definitions, CCTEAM_MCP_INSTRUCTIONS, MCP_PROTOCOL_VERSION, SESSION_TOOL_NAMES,
+    STATUS_BEACON_TOOL_NAME,
 };

@@ -15,7 +15,6 @@ pub use artifact_watcher::{
 };
 pub use orchestrator::{
     CancelReason, Orchestrator, OrchestratorConfig, TeamEvent, DEFAULT_CLAUDE_MODEL,
-    MAX_CONCURRENT_PROJECTS,
 };
 pub use workflow::{
     AgentSpec, AgentTeamSpec, BudgetSpec, CleanupOnStop, Executor, OnTimeout,

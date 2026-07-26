@@ -150,9 +150,12 @@ fn mcp_registered(vendor: &str) -> bool {
         "codex" => ccteam_core::mcp_register::resolve_codex_config_path()
             .map(|p| ccteam_core::mcp_register::codex_mcp_registered(&p))
             .unwrap_or(false),
-        // Grok MCP registration not wired in MVP (L18: best-effort, non-blocking).
-        "grok" => false,
-        "opencode" => false,
+        "grok" => ccteam_core::mcp_register::resolve_grok_config_path()
+            .map(|p| ccteam_core::mcp_register::grok_mcp_registered(&p))
+            .unwrap_or(false),
+        "opencode" => ccteam_core::mcp_register::resolve_opencode_config_path()
+            .map(|p| ccteam_core::mcp_register::opencode_mcp_registered(&p))
+            .unwrap_or(false),
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
@@ -234,14 +237,7 @@ async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
     tag = "hosts",
     responses((status = 200, description = "Hosts ccteam drives (today one: `local`)", body = HostsResponse)),
 )]
-pub(crate) async fn handle_hosts(
-    State(app): State<crate::state::AppState>,
-    Extension(identity): Extension<Identity>,
-) -> Response {
-    // v0.8.18 档1 — the host-keyed agent report is an operator/admin surface.
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
+pub(crate) async fn handle_hosts(State(app): State<crate::state::AppState>) -> Response {
     let agents = probe_all_agents(false).await;
     let agents_ready = agents.iter().filter(|a| a.status == "ready").count();
     let mut hosts = vec![HostSummary {
@@ -296,13 +292,9 @@ pub struct HostDetailQuery {
 )]
 pub(crate) async fn handle_host_detail(
     State(app): State<crate::state::AppState>,
-    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<HostDetailQuery>,
 ) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     if host == LOCAL_HOST {
         let agents = probe_all_agents(q.refresh).await;
         let projects = ccteam_core::config::load(&app.paths.root)
@@ -397,11 +389,11 @@ pub(crate) async fn handle_host_detail(
     }
 }
 
-/// Query for `POST .../register-mcp` — optional `?vendor=claude|codex`
-/// (omitted ⇒ register every vendor).
+/// Query for `POST .../register-mcp` — optional vendor selector (one of the
+/// vendors advertised by `AGENT_PROBE_SPECS`; omitted ⇒ register all).
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 pub struct RegisterMcpQuery {
-    /// Restrict to one vendor (`claude` / `codex`); omit to register all.
+    /// Restrict to one registrable vendor; omit to register all.
     #[serde(default)]
     pub vendor: Option<String>,
 }
@@ -429,13 +421,9 @@ pub struct RegisterMcpQuery {
 )]
 pub(crate) async fn handle_register_mcp(
     State(app): State<AppState>,
-    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<RegisterMcpQuery>,
 ) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     if host != LOCAL_HOST {
         return (
             StatusCode::NOT_FOUND,
@@ -465,10 +453,15 @@ pub(crate) async fn handle_register_mcp(
         }
         Some(v) if AGENT_PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
         Some(other) => {
+            let expected = AGENT_PROBE_SPECS
+                .iter()
+                .map(|spec| spec.vendor)
+                .collect::<Vec<_>>()
+                .join("|");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("unknown vendor: {other} (expected claude|codex)")
+                    "error": format!("unknown vendor: {other} (expected {expected})")
                 })),
             )
                 .into_response();
@@ -552,7 +545,7 @@ fn register_mcp_blocking(
 
 // ── v0.8.24 Track D — join-token / join / heartbeat ───────────────────────────
 
-/// Body for `POST /api/v1/hosts/join-token` (admin mint).
+/// Body for `POST /api/v1/hosts/join-token`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct MintJoinTokenForm {
     #[serde(default)]
@@ -562,7 +555,7 @@ pub struct MintJoinTokenForm {
     pub max_uses: Option<u32>,
 }
 
-/// `POST /api/v1/hosts/join-token` — admin mints a join token for satellites.
+/// `POST /api/v1/hosts/join-token` — mint a join token for satellites.
 #[utoipa::path(
     post,
     path = "/api/v1/hosts/join-token",
@@ -570,17 +563,12 @@ pub struct MintJoinTokenForm {
     request_body = MintJoinTokenForm,
     responses(
         (status = 201, description = "Minted; `{token, label?, max_uses?, command}`", body = serde_json::Value),
-        (status = 403, description = "Non-admin"),
     ),
 )]
 pub(crate) async fn handle_mint_join_token(
     State(app): State<crate::state::AppState>,
-    Extension(identity): Extension<Identity>,
     Json(form): Json<MintJoinTokenForm>,
 ) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     let path = app.paths.host_join_tokens_path();
     let mut store = match ccteam_core::JoinTokenStore::load(&path) {
         Ok(s) => s,
@@ -613,27 +601,19 @@ pub(crate) async fn handle_mint_join_token(
         .into_response()
 }
 
-/// `GET /api/v1/hosts/join-token` — admin reads the newest still-valid join
+/// `GET /api/v1/hosts/join-token` — read the newest still-valid join
 /// token (unrevoked, not exhausted). `token: null` when none exists — the UI
 /// then offers the mint action (`POST` on this path). **Read-only**: never
-/// mints. Admin-only (`deny_non_admin`): a join token lets a machine register
-/// itself, so tenants must never see one.
+/// mints.
 #[utoipa::path(
     get,
     path = "/api/v1/hosts/join-token",
     tag = "hosts",
     responses(
         (status = 200, description = "Newest valid token or `{token: null}`; `{token, label?, minted_at?, max_uses?, uses, command}`", body = serde_json::Value),
-        (status = 403, description = "Non-admin"),
     ),
 )]
-pub(crate) async fn handle_get_join_token(
-    State(app): State<crate::state::AppState>,
-    Extension(identity): Extension<Identity>,
-) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
+pub(crate) async fn handle_get_join_token(State(app): State<crate::state::AppState>) -> Response {
     let path = app.paths.host_join_tokens_path();
     let store = match ccteam_core::JoinTokenStore::load(&path) {
         Ok(s) => s,
@@ -1072,25 +1052,16 @@ mod tests {
 
     #[test]
     fn classify_status_non_registrable_vendor_is_ready_when_installed() {
-        // grok/ACP has no config-file MCP seam: an installed binary is all
-        // there is to configure, so it reads `ready` (never `needs_config`)
-        // and offers no register CTA.
+        // No current vendor is non-registrable; retain branch coverage for a
+        // future ACP-only vendor with no global config seam.
         assert_eq!(classify_status(true, false, false), "ready");
         assert_eq!(classify_status(false, false, false), "not_installed");
     }
 
     #[test]
-    fn grok_spec_is_not_mcp_registrable() {
-        let grok = AGENT_PROBE_SPECS
-            .iter()
-            .find(|s| s.vendor == "grok")
-            .unwrap();
-        assert!(!grok.mcp_registrable);
-        let claude = AGENT_PROBE_SPECS
-            .iter()
-            .find(|s| s.vendor == "claude")
-            .unwrap();
-        assert!(claude.mcp_registrable);
+    fn all_five_specs_are_mcp_registrable() {
+        assert_eq!(AGENT_PROBE_SPECS.len(), 5);
+        assert!(AGENT_PROBE_SPECS.iter().all(|spec| spec.mcp_registrable));
     }
 
     #[test]

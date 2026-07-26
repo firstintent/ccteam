@@ -33,7 +33,7 @@ fn run_doctor_verify_mcp(extra_args: &[&str]) -> (String, String, i32) {
 
 #[test]
 fn active_count_is_8_and_stub_count_is_0_on_clean_tree() {
-    // status 1 + screenshot 1 + chat 1 + session 5 = 8. STUB_TOOLS empty.
+    // status 1 + beacon alias 1 + chat 1 + session 5 = 8. STUB_TOOLS empty.
     let (stdout, stderr, code) = run_doctor_verify_mcp(&["--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
@@ -64,7 +64,7 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     // Every shipped group with ≥1 tool is represented with `active` +
     // `stub` keys. Culled `advise` and retired `workflow` groups do not
     // appear (per_group is built from live tools only).
-    for group in ["admin", "screenshot", "chat", "session"] {
+    for group in ["admin", "chat", "session"] {
         let g = v["per_group"].get(group).unwrap_or_else(|| {
             panic!("per_group missing `{group}` in {v}");
         });
@@ -89,7 +89,8 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     assert_eq!(names, sorted, "tool_list must be sorted for stable output");
     // Spot-check a known tool from each surviving group is present.
     assert!(names.contains(&"status"));
-    assert!(names.contains(&"screenshot"));
+    assert!(names.contains(&"grok_claude_codex_kimi"));
+    assert!(!names.contains(&concat!("claude_codex_grok_kimi_", "opencode_status")));
     assert!(names.contains(&"chat_send_file"));
     assert!(names.contains(&"session_spawn"));
     // Culled / retired tools are gone from the live surface.
@@ -97,6 +98,8 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     assert!(!names.contains(&"ccteam__advise_vote"));
     assert!(!names.contains(&"ccteam__chat_register_bot"));
     assert!(!names.contains(&"ccteam__workflow_show"));
+    // 2026-07-26 cull: tmux-era pane screenshot tool is gone.
+    assert!(!names.contains(&"screenshot"));
 }
 
 #[test]
@@ -171,12 +174,7 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
     // appears with the right active count and `0 stub` suffix.
     let (stdout, _stderr, code) = run_doctor_verify_mcp(&[]);
     assert_eq!(code, 0);
-    for (group, active) in [
-        ("admin:", 1),
-        ("screenshot:", 1),
-        ("chat:", 1),
-        ("session:", 5),
-    ] {
+    for (group, active) in [("admin:", 2), ("chat:", 1), ("session:", 5)] {
         let needle = format!("{group}    {active} active / 0 stub");
         // Allow extra padding on either side — exact spacing depends
         // on the longest group name. Use a relaxed contains check.

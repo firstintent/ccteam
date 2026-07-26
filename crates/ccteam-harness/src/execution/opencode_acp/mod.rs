@@ -20,16 +20,16 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::execution::acp::{
-    acp_model_picker_options, apply_notification, known_efforts, next_acp_turn_id,
-    pluck_model_info, pluck_session_id, split_trailing_effort, AcpModelOption, AcpTransport,
-    AcpTurnRunner, AcpTurnTuning, InboundPolicy, ModelInfo, SessionTranslateState,
+    acp_model_picker_options, apply_notification, known_efforts, pluck_model_info,
+    pluck_session_id, route_acp_turn, split_trailing_effort, AcpModelOption, AcpTransport,
+    AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, InboundPolicy, ModelInfo, SessionTranslateState,
 };
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
     ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use spawn_spec::{build_argv, opencode_bin, OpencodeSpawnInput};
@@ -296,6 +296,73 @@ impl OpencodeAcpAdapter {
             goal: None,
         }
     }
+
+    async fn submit_with_routing(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        let live = self.get_live(&h.identity).ok_or_else(|| {
+            HarnessError::ThreadDied(format!("opencode session {} not live", h.identity))
+        })?;
+        let text = match input {
+            TurnInput::UserText(t) => t,
+            other => {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "opencode_acp: unsupported turn input {other:?}"
+                )));
+            }
+        };
+
+        // OpenCode's public ACP PromptRequest has no delivery discriminator or
+        // separate steer RPC. Overlapping session/prompt requests would share
+        // an uncorrelatable notification stream, so Inject degrades to the same
+        // lossless FIFO rather than pretending a second prompt was injected.
+        let route = {
+            let mut state = live
+                .state
+                .lock()
+                .map_err(|_| HarnessError::Io("opencode state lock poisoned".into()))?;
+            route_acp_turn(&mut state, &text, routing, false)
+        };
+        match route {
+            AcpTurnRoute::Start {
+                turn_id,
+                turn_done,
+                prompt_sent,
+            } => {
+                AcpTurnRunner {
+                    transport: Arc::clone(&live.transport),
+                    state: Arc::clone(&live.state),
+                    event_tx: live.event_tx.clone(),
+                    session_id: live.session_id.clone(),
+                    tuning: AcpTurnTuning {
+                        finalize_barrier: FINALIZE_BARRIER,
+                        post_finalize_sleep: Some(std::time::Duration::from_millis(50)),
+                        label: "opencode",
+                    },
+                }
+                .spawn(turn_id.clone(), turn_done, prompt_sent, text);
+                Ok(TurnSubmission::started(TurnId(turn_id)))
+            }
+            AcpTurnRoute::Queue {
+                turn_id,
+                degraded_from_inject,
+            } => {
+                if degraded_from_inject {
+                    tracing::debug!(
+                        turn_id = %turn_id,
+                        "opencode ACP has no correlatable native interject method; queued active-turn message"
+                    );
+                }
+                Ok(TurnSubmission::queued(TurnId(turn_id)))
+            }
+            AcpTurnRoute::Inject { .. } => Err(HarnessError::Io(
+                "opencode ACP routing selected unsupported native inject".into(),
+            )),
+        }
+    }
 }
 
 fn spawn_notif_dispatcher(
@@ -488,64 +555,13 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         Ok(handle)
     }
 
-    async fn submit_turn(
+    async fn submit_turn_routed(
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
-        let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("opencode session {} not live", h.identity))
-        })?;
-
-        let text = match input {
-            TurnInput::UserText(t) => t,
-            other => {
-                return Err(HarnessError::SubmitFailed(format!(
-                    "opencode_acp: unsupported turn input {other:?}"
-                )));
-            }
-        };
-
-        // Unique per-process id (timestamp + seq) so two turns steered in the
-        // same millisecond never collide in the pending queue / experience log.
-        let turn_id = next_acp_turn_id();
-        let turn_done = Arc::new(tokio::sync::Notify::new());
-        // Reserve the buffer if idle (→ spawn the runner) or queue behind the
-        // in-flight turn (the runner drains FIFO). The gateway steers by firing
-        // a fresh submit_turn mid-turn, exactly like Claude/Codex; ACP prompts
-        // serialize natively, so we queue rather than reject.
-        let spawn_runner = {
-            let mut st = live
-                .state
-                .lock()
-                .map_err(|_| HarnessError::Io("opencode state lock poisoned".into()))?;
-            if st.buffer.is_some() {
-                st.pending.push_back((turn_id.clone(), text.clone()));
-                false
-            } else {
-                st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
-                true
-            }
-        };
-
-        if spawn_runner {
-            AcpTurnRunner {
-                transport: Arc::clone(&live.transport),
-                state: Arc::clone(&live.state),
-                event_tx: live.event_tx.clone(),
-                session_id: live.session_id.clone(),
-                tuning: AcpTurnTuning {
-                    finalize_barrier: FINALIZE_BARRIER,
-                    // Let a usage_update that races the response land before
-                    // finalize (opencode reports cost slightly after the reply).
-                    post_finalize_sleep: Some(std::time::Duration::from_millis(50)),
-                    label: "opencode",
-                },
-            }
-            .spawn(turn_id.clone(), turn_done, text);
-        }
-
-        Ok(TurnId(turn_id))
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_with_routing(h, input, routing).await
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

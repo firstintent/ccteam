@@ -236,7 +236,19 @@ pub fn active_session_id_path(project_dir: &Path, sid: &str) -> PathBuf {
 /// subagent sessions). Main-session jsonls carry `"type":"last-prompt"`
 /// or `"type":"summary"` and pass through.
 pub fn discover_active_session(cwd: &Path) -> Option<(String, PathBuf)> {
-    let dir = anthropic_project_dir(cwd)?;
+    let home = dirs::home_dir()?;
+    discover_active_session_in(&home.join(".claude/projects"), cwd)
+}
+
+/// Discover the active main-session transcript under an explicitly supplied
+/// Claude projects root. Production resolves the root from the user home;
+/// baseline-scope tests and injected callers use this seam so concurrent
+/// process-environment changes cannot redirect discovery.
+pub fn discover_active_session_in(
+    claude_projects_root: &Path,
+    cwd: &Path,
+) -> Option<(String, PathBuf)> {
+    let dir = resolve_project_dir_in(claude_projects_root, cwd);
     let entries = std::fs::read_dir(&dir).ok()?;
     let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
     for ent in entries.flatten() {
@@ -907,10 +919,21 @@ mod tests {
     #[test]
     fn discover_skips_subagent_jsonls_even_when_newest() {
         let tmp_home = TempDir::new().unwrap();
-        std::env::set_var("HOME", tmp_home.path());
         let cwd = Path::new("/home/test/proj");
-        let dir = anthropic_project_dir(cwd).unwrap();
+        let projects_root = tmp_home.path().join(".claude/projects");
+        let dir = resolve_project_dir_in(&projects_root, cwd);
         std::fs::create_dir_all(&dir).unwrap();
+
+        // A second complete Claude tree is deliberate pollution. Discovery
+        // must stay pinned to `projects_root`, regardless of host/test state.
+        let decoy_root = tmp_home.path().join("decoy/.claude/projects");
+        let decoy_dir = resolve_project_dir_in(&decoy_root, cwd);
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(
+            decoy_dir.join("decoy-main.jsonl"),
+            r#"{"type":"last-prompt","sessionId":"decoy-main"}"#,
+        )
+        .unwrap();
 
         // Write the main session FIRST (so its mtime is older).
         let main_path = dir.join("main-sid.jsonl");
@@ -929,8 +952,8 @@ mod tests {
         )
         .unwrap();
 
-        let (picked_sid, picked_path) =
-            discover_active_session(cwd).expect("should pick the main session, not the subagent");
+        let (picked_sid, picked_path) = discover_active_session_in(&projects_root, cwd)
+            .expect("should pick the main session, not the subagent or decoy root");
         assert_eq!(picked_sid, "main-sid");
         assert_eq!(picked_path, main_path);
     }

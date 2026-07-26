@@ -2,9 +2,10 @@
 //!
 //! This is the **one** thing ccteam writes into a vendor's footprint
 //! (red line: "ccteam executes/writes nothing else"; registering its own
-//! MCP server is the single allowed write). Both the CLI (`ccteam config`)
-//! and `ccteam-web`'s `POST /api/v1/hosts/{host}/register-mcp` call these
-//! seams, so the merge logic lives in exactly one place.
+//! MCP server is the single allowed write). `ccteam config`, ccteam-web's
+//! `POST /api/v1/hosts/{host}/register-mcp`, and daemon-start
+//! auto-registration all call these seams, so the merge logic lives in exactly
+//! one place.
 //!
 //! All writers are **merge, never clobber + idempotent**: an existing
 //! config keeps every other key / MCP server; only `ccteam` is set. The
@@ -523,34 +524,6 @@ pub fn codex_mcp_registered(config_toml: &Path) -> bool {
         && !entry.contains_key("command")
 }
 
-/// Whether Codex's `config.toml` carries a `[mcp_servers.ccteam]` entry that is
-/// NOT the current HTTP form — i.e. a legacy stdio `command` entry left by a
-/// pre-HTTP ccteam. Such an entry poisons the per-thread HTTP override the
-/// daemon injects on `thread/start`: Codex deep-merges the same-named global and
-/// per-thread tables, and a surviving `command` classifies the merged table as
-/// stdio, so the override's `url` is rejected (`url is not supported for stdio`)
-/// and `thread/start` fails. The daemon migrates such an entry to HTTP on
-/// startup ([`install_codex_mcp_into`]).
-///
-/// Returns `false` when the file is missing / unreadable / unparseable, when
-/// there is no `ccteam` entry at all (a per-thread override then stands alone as
-/// valid `streamable_http`), or when the entry is already the HTTP form — so a
-/// healthy or absent config is left untouched.
-pub fn codex_mcp_entry_stale(config_toml: &Path) -> bool {
-    let Ok(body) = std::fs::read_to_string(config_toml) else {
-        return false;
-    };
-    let Ok(root) = toml::from_str::<toml::Table>(&body) else {
-        return false;
-    };
-    let has_ccteam_entry = root
-        .get("mcp_servers")
-        .and_then(toml::Value::as_table)
-        .map(|t| t.contains_key(crate::CCTEAM_MCP_SERVER_KEY))
-        .unwrap_or(false);
-    has_ccteam_entry && !codex_mcp_registered(config_toml)
-}
-
 /// Resolve `$CODEX_HOME/config.toml` (CODEX_HOME → `~/.codex` fallback),
 /// mirroring `ccteam_harness::execution::codex_app_server`'s resolution.
 pub fn resolve_codex_config_path() -> Result<PathBuf> {
@@ -713,32 +686,6 @@ mod tests {
         assert!(!entry.contains_key("command"));
         assert!(!entry.contains_key("args"));
         assert!(!entry.contains_key("env"));
-    }
-
-    #[test]
-    fn codex_mcp_entry_stale_only_flags_legacy_stdio_entry() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Missing file → not stale (nothing to heal).
-        let missing = tmp.path().join("absent.toml");
-        assert!(!codex_mcp_entry_stale(&missing));
-
-        // No ccteam entry → not stale (a per-thread override stands alone).
-        let none = tmp.path().join("none.toml");
-        std::fs::write(&none, "[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
-        assert!(!codex_mcp_entry_stale(&none));
-
-        // Legacy stdio ccteam entry → STALE (needs migration to HTTP).
-        let legacy = tmp.path().join("legacy.toml");
-        std::fs::write(
-            &legacy,
-            "[mcp_servers.ccteam]\ncommand = \"ccteam\"\nargs = [\"internal\", \"mcp-serve\"]\n",
-        )
-        .unwrap();
-        assert!(codex_mcp_entry_stale(&legacy));
-
-        // Current HTTP form → not stale.
-        install_codex_mcp_into(&legacy, "http://localhost:7331/mcp", "tok").unwrap();
-        assert!(!codex_mcp_entry_stale(&legacy));
     }
 
     #[test]

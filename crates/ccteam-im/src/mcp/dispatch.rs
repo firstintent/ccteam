@@ -29,7 +29,7 @@ pub type GatewayHandle = Arc<Mutex<Gateway>>;
 ///
 /// Fields are `Option` so a socket connection still works when IM / web
 /// pieces are not wired (structured errors for stateful tools; protocol
-/// core still serves `status` / `screenshot` / `tools/list`).
+/// core still serves `status` / `tools/list`).
 pub struct McpDispatch {
     /// ccteam path layout (home + projects root).
     pub paths: CcteamPaths,
@@ -179,8 +179,6 @@ impl McpDispatch {
             )
         } else if is_status_call(&req) {
             Some(execute_status(&req, self.gateway.as_ref(), caller.clone(), &self.paths).await)
-        } else if is_screenshot_call(&req) && caller.user_id().is_some() {
-            Some(execute_user_screenshot(&req, &caller, &self.paths).await)
         } else if is_reload_call(&req) {
             if caller.user_id().is_some() {
                 return Some(internal_bus_not_exposed(&req));
@@ -233,6 +231,114 @@ fn visible_user_projects(paths: &CcteamPaths, user_id: &str) -> Vec<String> {
         })
         .map(|project| project.state.slug)
         .collect()
+}
+
+/// MCP-DX-1 — cap on how many project slugs an error message enumerates.
+const ERROR_PROJECT_LIST_MAX: usize = 20;
+
+/// Registered project slugs from the config catalog (the same SoT `status`
+/// lists, local + satellite-bound). Read-only; used to make project-resolution
+/// errors actionable instead of a dead end.
+fn registered_project_slugs(paths: &CcteamPaths) -> Vec<String> {
+    ccteam_core::collect_projects(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|project| project.state.slug)
+        .collect()
+}
+
+/// Bounded, comma-separated slug list for error messages.
+fn format_slug_list(slugs: &[String]) -> String {
+    let shown: Vec<&str> = slugs
+        .iter()
+        .take(ERROR_PROJECT_LIST_MAX)
+        .map(String::as_str)
+        .collect();
+    let mut out = shown.join(", ");
+    if slugs.len() > shown.len() {
+        out.push_str(&format!(", … ({} total)", slugs.len()));
+    }
+    out
+}
+
+/// Admin-facing catalog hint appended to project-resolution errors. `None`
+/// paths (test-only construction) → empty.
+fn admin_project_catalog_hint(paths: Option<&CcteamPaths>) -> String {
+    let Some(paths) = paths else {
+        return String::new();
+    };
+    let slugs = registered_project_slugs(paths);
+    if slugs.is_empty() {
+        " — no projects are registered yet (run `ccteam init` in a project directory, or IM `/newproject`)".to_string()
+    } else {
+        format!(" — registered projects: {}", format_slug_list(&slugs))
+    }
+}
+
+/// MCP-DX-2 — the sole registered project, when the catalog holds exactly
+/// one. Used as the unambiguous default for an admin `session_spawn` that
+/// names no project (two or more candidates keep the explicit-or-error
+/// contract; zero keeps the "no projects registered" hint).
+fn sole_registered_project(paths: Option<&CcteamPaths>) -> Option<String> {
+    let slugs = registered_project_slugs(paths?);
+    match slugs.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Tenant-facing hint listing ONLY the caller's own visible projects. The text
+/// is a pure function of the caller identity — never of the probed input — so
+/// a foreign and a nonexistent project keep byte-identical errors (no
+/// existence disclosure; see `user_spawn_requires_own_explicit_project`).
+fn user_project_list_hint(visible: &[String]) -> String {
+    if visible.is_empty() {
+        " — you have no projects yet (create one from the web console)".to_string()
+    } else {
+        format!(" — your projects: {}", format_slug_list(visible))
+    }
+}
+
+/// Character-level Levenshtein distance (slugs are short; the O(n·m) DP is
+/// plenty). Used only for admin-facing "did you mean" hints.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut row = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            row.push((prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b.len()]
+}
+
+/// Closest registered slug for a "did you mean" hint: containment (≥3 chars)
+/// or an edit distance within half the longer name. `None` when nothing is
+/// reasonably close (a wild guess is worse than no hint).
+fn nearest_slug<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
+    let input_lower = input.to_lowercase();
+    candidates
+        .iter()
+        .map(|candidate| {
+            let cand_lower = candidate.to_lowercase();
+            let contained = input_lower.len() >= 3
+                && (cand_lower.contains(&input_lower) || input_lower.contains(&cand_lower));
+            let distance = if contained {
+                0
+            } else {
+                levenshtein(&input_lower, &cand_lower)
+            };
+            (distance, candidate)
+        })
+        .filter(|(distance, candidate)| {
+            *distance <= 2.max(input.chars().count().max(candidate.chars().count()) / 2)
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate.as_str())
 }
 
 /// v0.8.7 W1 — cap on how many child turns `session_collect` returns when the
@@ -1043,45 +1149,16 @@ fn is_session_tool_call(req: &serde_json::Value) -> bool {
             .is_some_and(|n| n.starts_with("session_"))
 }
 
-/// True for a `tools/call` whose tool name is `status`.
+/// True for a `tools/call` whose tool name is `status` or its bare-name
+/// beacon alias (a pure alias: same handler, same response).
 fn is_status_call(req: &serde_json::Value) -> bool {
-    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
-        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("status")
-}
-
-fn is_screenshot_call(req: &serde_json::Value) -> bool {
-    req.get("method").and_then(|method| method.as_str()) == Some("tools/call")
-        && req.pointer("/params/name").and_then(|name| name.as_str()) == Some("screenshot")
-}
-
-async fn execute_user_screenshot(
-    req: &serde_json::Value,
-    caller: &McpCaller,
-    paths: &CcteamPaths,
-) -> serde_json::Value {
-    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let Some(slug) = req
-        .pointer("/params/arguments/slug")
-        .and_then(|slug| slug.as_str())
-        .filter(|slug| !slug.is_empty())
-    else {
-        return session_tool_response(id, "screenshot: missing `slug`".to_string(), true);
-    };
-    let Some(user_id) = caller.user_id() else {
-        return session_tool_response(id, "screenshot: project not found".to_string(), true);
-    };
-    if !user_can_see_project(paths, user_id, slug) {
-        return session_tool_response(id, "screenshot: project not found".to_string(), true);
+    if req.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
     }
-    protocol::handle_request(paths, req)
-        .await
-        .unwrap_or_else(|| {
-            session_tool_response(
-                id,
-                "screenshot: request produced no response".to_string(),
-                true,
-            )
-        })
+    matches!(
+        req.pointer("/params/name").and_then(|n| n.as_str()),
+        Some("status") | Some(protocol::STATUS_BEACON_TOOL_NAME)
+    )
 }
 
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
@@ -1108,7 +1185,7 @@ async fn execute_status(
         return execute_user_status(id, &args, paths, user_id).await;
     }
 
-    // Base body (projects + orchestrator + daemon health), reused verbatim
+    // Base body (slim projects + daemon health), reused verbatim
     // from the protocol core so the daemon-aware path never drifts from the
     // local fallback.
     let base = super::protocol::tool_ls(paths).unwrap_or_else(|_| "{}".to_string());
@@ -1368,17 +1445,40 @@ async fn authorize_user_session_tool(
 ) -> std::result::Result<(), String> {
     match name {
         "session_spawn" => {
-            let project = args
+            // The hint enumerates the caller's OWN projects only (a pure
+            // function of identity, not of the probed input): actionable
+            // recovery without existence disclosure.
+            let hint = || user_project_list_hint(&visible_user_projects(paths, user_id));
+            let explicit = args
                 .get("project")
                 .and_then(|project| project.as_str())
                 .map(str::trim)
                 .filter(|project| !project.is_empty())
-                .ok_or_else(|| {
-                    "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
-                        .to_string()
-                })?;
-            if !user_can_see_project(paths, user_id, project) {
-                return Err("session_spawn: project not found".to_string());
+                .map(str::to_string);
+            let project = match explicit {
+                Some(project) => {
+                    args["_caller_project_source"] = serde_json::json!("explicit");
+                    project
+                }
+                // MCP-DX-2 — exactly one visible project is an unambiguous
+                // default (identity-derived, same disclosure surface as the
+                // hint); two or more keep the explicit-or-error contract.
+                None => match visible_user_projects(paths, user_id).as_slice() {
+                    [only] => {
+                        args["project"] = serde_json::json!(only);
+                        args["_caller_project_source"] = serde_json::json!("sole");
+                        only.clone()
+                    }
+                    _ => {
+                        return Err(format!(
+                            "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly{}",
+                            hint()
+                        ));
+                    }
+                },
+            };
+            if !user_can_see_project(paths, user_id, &project) {
+                return Err(format!("session_spawn: project not found{}", hint()));
             }
         }
         "session_dispatch" | "session_collect" | "session_stop" => {
@@ -1409,7 +1509,10 @@ async fn authorize_user_session_tool(
                 .filter(|project| !project.is_empty())
             {
                 if !visible.iter().any(|candidate| candidate == project) {
-                    return Err("session_list: project not found".to_string());
+                    return Err(format!(
+                        "session_list: project not found{}",
+                        user_project_list_hint(&visible)
+                    ));
                 }
             }
             if let Some(obj) = args.as_object_mut() {
@@ -1434,7 +1537,7 @@ async fn run_session_tool(
     paths: &CcteamPaths,
 ) -> std::result::Result<String, String> {
     match name {
-        "session_spawn" => run_session_spawn(args, gateway, caller).await,
+        "session_spawn" => run_session_spawn_at(args, gateway, caller, Some(paths)).await,
         "session_dispatch" => run_session_dispatch(args, gateway, caller).await,
         "session_collect" => run_session_collect(args, gateway, caller).await,
         "session_list" => run_session_list_at(args, gateway, Some(paths)).await,
@@ -1450,17 +1553,21 @@ async fn run_session_tool(
 /// Ambient caller can only spawn into that project. Admin (HTTP front door)
 /// names the target with an explicit `project` (fleet-wide).
 ///
-/// Facets mirror the REST `CreateSessionForm`: `{role?, vendor?, model?,
-/// effort?, protocol?, permission_mode?, title?}`. `role` empty/absent =
-/// roleless (bare vendor reads the project CLAUDE.md/AGENTS.md). `title` is
-/// metadata/ledger only — NEVER concatenated into any prompt.
-async fn run_session_spawn(
+/// MCP facets are `{role?, vendor?, model?, effort?, permission_mode?, title?}`.
+/// `role` empty/absent = roleless (bare vendor reads the project
+/// CLAUDE.md/AGENTS.md). `title` is metadata/ledger only — NEVER concatenated
+/// into any prompt.
+async fn run_session_spawn_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
+    paths: Option<&CcteamPaths>,
 ) -> std::result::Result<String, String> {
     if args.get("host").is_some() {
         return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
+    }
+    if args.get("protocol").is_some() {
+        return Err(PROTOCOL_SPAWN_PARAM_REMOVED.to_string());
     }
     // Roleless is a first-class form; absent or "" both mean roleless.
     let role = args
@@ -1469,58 +1576,13 @@ async fn run_session_spawn(
         .unwrap_or("")
         .trim()
         .to_string();
-    // Project scope: Ambient = the caller's server-resolved slug (overwritten
-    // in `execute_session_tool` from CallerCtx — never caller-supplied); Admin
-    // = explicit `project` (fleet-wide).
-    let project = match &caller {
-        McpCaller::Ambient => args
-            .get("_caller_slug")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
-        McpCaller::Admin => args
-            .get("project")
-            .or_else(|| args.get("_caller_slug"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .ok_or_else(|| {
-                "session_spawn: missing `project` — pass the target project slug explicitly, \
-                 or run from inside a registered project directory (cwd is resolved for local \
-                 main-session callers)"
-                    .to_string()
-            })?,
-        McpCaller::User { .. } => args
-            .get("project")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .ok_or_else(|| {
-                "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
-                    .to_string()
-            })?,
-    };
     let vendor = parse_session_vendor(args)?;
     // Optional `permission_mode` (`skip` default / `hitl`).
     let permission_mode = ccteam_harness::PermissionMode::parse_opt(
         args.get("permission_mode").and_then(|v| v.as_str()),
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
-    // Protocol: agents get `stream-json | acp` only — `terminal` is frozen and
-    // never exposed to agents. Grok/opencode/kimi are always ACP (honest meta).
-    let protocol = parse_session_protocol(args)?;
-    let protocol = if matches!(
-        vendor,
-        ccteam_harness::AgentVendor::Grok
-            | ccteam_harness::AgentVendor::Opencode
-            | ccteam_harness::AgentVendor::Kimi
-    ) {
-        ccteam_harness::SessionProtocol::Acp
-    } else {
-        protocol
-    };
+    let protocol = derive_session_protocol(vendor);
     // Optional model/effort (composer facets). Grok effort is dropped (its
     // value set is undocumented — an invalid value would fail the spawn),
     // mirroring the REST `spawn_tuning_from_form` contract.
@@ -1561,6 +1623,10 @@ async fn run_session_spawn(
             ));
         }
     }
+    // Resolve only after validating the request facets: falling through to
+    // scratch is a side effect and malformed spawns must not create projects.
+    let project_resolution = resolve_spawn_project(args, gateway, &caller, paths).await?;
+    let project = project_resolution.slug.clone();
     // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
     // call (the dominant flow; saves the second round-trip and closes the
     // crash window between a spawn and its first dispatch). Identical
@@ -1735,7 +1801,7 @@ async fn run_session_spawn(
                         title.clone(),
                     )
                     .await
-                    .map_err(|e| format!("session_spawn: {e}"))?;
+                    .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
                 let sid = created.sid.clone();
                 let resolved = gw.session_resolve(&sid);
                 (sid, resolved, None)
@@ -1754,7 +1820,7 @@ async fn run_session_spawn(
                     title.clone(),
                 )
                 .await
-                .map_err(|e| format!("session_spawn: {e}"))?;
+                .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
             let sid = created.sid.clone();
             let resolved = gw.session_resolve(&sid);
             (sid, resolved, None)
@@ -1787,6 +1853,7 @@ async fn run_session_spawn(
         "ok": true,
         "sid": sid,
         "project": project,
+        "project_source": project_resolution.source,
         "role": role,
         "vendor": session_vendor_wire(vendor),
         "protocol": protocol.as_str(),
@@ -1800,6 +1867,9 @@ async fn run_session_spawn(
     });
     if let Some(t) = &title {
         body["title"] = serde_json::json!(t);
+    }
+    if project_resolution.scratch {
+        body["note"] = serde_json::json!(SCRATCH_PROJECT_NOTE);
     }
     // v0.9.1 — dispatch the optional first task through the SAME submit path
     // session_dispatch uses; its outcome (turn_id / status / inline result /
@@ -1834,6 +1904,200 @@ async fn run_session_spawn(
     Ok(out)
 }
 
+/// Test-only 3-arg shim (the historical signature) — production goes through
+/// [`run_session_spawn_at`] with real paths for catalog-aware errors.
+#[cfg(test)]
+async fn run_session_spawn(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    caller: McpCaller,
+) -> std::result::Result<String, String> {
+    run_session_spawn_at(args, gateway, caller, None).await
+}
+
+struct SpawnProjectResolution {
+    slug: String,
+    source: &'static str,
+    scratch: bool,
+}
+
+const SCRATCH_PROJECT_NOTE: &str = "spawned into the shared default project — pass `project` to target a specific workspace; `status` lists slugs";
+
+/// Resolve the MCP spawn project. Admin callers use the owner-pinned ladder:
+/// explicit project, caller cwd, sole catalog project, configured default,
+/// then lazily provisioned scratch. Ambient principals and tenants retain
+/// their existing identity-scoped behavior.
+async fn resolve_spawn_project(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    caller: &McpCaller,
+    paths: Option<&CcteamPaths>,
+) -> std::result::Result<SpawnProjectResolution, String> {
+    let arg = |name: &str| {
+        args.get(name)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    match caller {
+        McpCaller::Ambient => Ok(SpawnProjectResolution {
+            slug: arg("_caller_slug")
+                .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
+            source: "principal",
+            scratch: false,
+        }),
+        McpCaller::User { .. } => Ok(SpawnProjectResolution {
+            slug: arg("project").ok_or_else(|| {
+                "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
+                    .to_string()
+            })?,
+            source: match args
+                .get("_caller_project_source")
+                .and_then(|value| value.as_str())
+            {
+                Some("sole") => "sole",
+                _ => "explicit",
+            },
+            scratch: false,
+        }),
+        McpCaller::Admin => {
+            if let Some(slug) = arg("project") {
+                return Ok(SpawnProjectResolution {
+                    slug,
+                    source: "explicit",
+                    scratch: false,
+                });
+            }
+            if let Some(slug) = arg("_caller_slug") {
+                return Ok(SpawnProjectResolution {
+                    slug,
+                    source: "cwd",
+                    scratch: false,
+                });
+            }
+            if let Some(slug) = sole_registered_project(paths) {
+                return Ok(SpawnProjectResolution {
+                    slug,
+                    source: "sole",
+                    scratch: false,
+                });
+            }
+            let Some(paths) = paths else {
+                return Err(format!(
+                    "session_spawn: missing `project`{}",
+                    admin_project_catalog_hint(paths)
+                ));
+            };
+            let config = ccteam_core::load_ccteam_config(&paths.root)
+                .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
+            if let Some(slug) = config.default_project.as_deref().and_then(|configured| {
+                config
+                    .projects
+                    .iter()
+                    .any(|entry| entry.slug == configured)
+                    .then(|| configured.to_string())
+            }) {
+                return Ok(SpawnProjectResolution {
+                    slug,
+                    source: "configured",
+                    scratch: false,
+                });
+            }
+            provision_scratch_project(gateway, paths).await
+        }
+    }
+}
+
+fn paths_refer_to_same_project(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+async fn provision_scratch_project(
+    gateway: &GatewayHandle,
+    paths: &CcteamPaths,
+) -> std::result::Result<SpawnProjectResolution, String> {
+    let scratch = paths.root.join("default_project");
+    // Serialize lookup + create + registration through the gateway lock so
+    // concurrent first spawns cannot mint two catalog entries for one path.
+    let mut gateway = gateway.lock().await;
+    let config = ccteam_core::load_ccteam_config(&paths.root)
+        .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
+    if let Some(existing) = config
+        .projects
+        .iter()
+        .find(|entry| paths_refer_to_same_project(&entry.path, &scratch))
+    {
+        gateway.register_project(existing.slug.clone(), existing.path.clone());
+        return Ok(SpawnProjectResolution {
+            slug: existing.slug.clone(),
+            source: "scratch",
+            scratch: true,
+        });
+    }
+
+    let slug = ccteam_core::pick_unused_project_slug(&paths.root, "default")
+        .map_err(|err| format!("session_spawn: choose scratch project slug: {err}"))?;
+    ccteam_core::bootstrap_project_at_dir(
+        paths,
+        &scratch,
+        &slug,
+        "(created by MCP session_spawn default)",
+        "dev",
+    )
+    .map_err(|err| format!("session_spawn: create scratch project: {err}"))?;
+    ccteam_core::scaffold_workflow_yaml(&scratch, false)
+        .map_err(|err| format!("session_spawn: create scratch workflow: {err}"))?;
+    ccteam_core::upsert_project_in_config(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: slug.clone(),
+            path: scratch.clone(),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
+            team: "dev".to_string(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .map_err(|err| format!("session_spawn: register scratch project: {err}"))?;
+    gateway.register_project(slug.clone(), scratch);
+    Ok(SpawnProjectResolution {
+        slug,
+        source: "scratch",
+        scratch: true,
+    })
+}
+
+/// MCP-DX-1 — enrich a spawn-create failure. An ADMIN caller naming an
+/// unknown project gets a "did you mean" + the registered catalog (the config
+/// SoT the gateway also syncs from). Tenant visibility is enforced before the
+/// create and ambient callers never name a project, so neither reaches this
+/// enrichment — no cross-tenant existence disclosure.
+fn spawn_create_error(
+    err: anyhow::Error,
+    project: &str,
+    caller: &McpCaller,
+    paths: Option<&CcteamPaths>,
+) -> String {
+    let base = format!("session_spawn: {err}");
+    if !err.to_string().starts_with("unknown project") || !matches!(caller, McpCaller::Admin) {
+        return base;
+    }
+    let Some(paths) = paths else { return base };
+    let slugs = registered_project_slugs(paths);
+    let suggestion = nearest_slug(project, &slugs)
+        .map(|slug| format!(" — did you mean `{slug}`?"))
+        .unwrap_or_default();
+    format!(
+        "{base}{suggestion}{}",
+        admin_project_catalog_hint(Some(paths))
+    )
+}
+
 /// v0.9.0 W2 (F7) — mark a recorded idempotency body as a replay: parse it,
 /// insert `"idempotent_replay": true`, re-serialize. On a parse miss (should
 /// never happen — we only store our own bodies) return the stored body as-is.
@@ -1849,24 +2113,22 @@ fn mark_idempotent_replay(body: &str) -> String {
     }
 }
 
-/// Parse the optional `protocol` arg for `session_spawn`. Agents may select
-/// `stream-json` (default) or `acp` only — `terminal` (tmux/PTY) is frozen and
-/// NEVER exposed to agents (an explicit reject keeps the red line legible even
-/// if a caller bypasses the schema enum).
-fn parse_session_protocol(
-    args: &serde_json::Value,
-) -> std::result::Result<ccteam_harness::SessionProtocol, String> {
-    let raw = args.get("protocol").and_then(|v| v.as_str());
-    if let Some(r) = raw {
-        let low = r.trim().to_ascii_lowercase();
-        if low == "terminal" || low == "tmux" {
-            return Err(
-                "session_spawn: protocol `terminal` is not available to agents (use `stream-json` or `acp`)"
-                    .to_string(),
-            );
+/// Stable error for the removed MCP `session_spawn.protocol` input.
+pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "session_spawn: `protocol` was removed; the channel is derived from `vendor` (claude/codex = stream-json, grok/opencode/kimi = acp) — omit `protocol`";
+
+/// Derive the sole wire channel for an MCP-spawned vendor session:
+/// claude/codex = stream-json; grok/opencode/kimi = acp. The `protocol`
+/// parameter was removed on 2026-07-26, mirroring the earlier `host` removal:
+/// callers must omit a facet that carries no choice.
+fn derive_session_protocol(vendor: ccteam_harness::AgentVendor) -> ccteam_harness::SessionProtocol {
+    match vendor {
+        ccteam_harness::AgentVendor::Grok
+        | ccteam_harness::AgentVendor::Opencode
+        | ccteam_harness::AgentVendor::Kimi => ccteam_harness::SessionProtocol::Acp,
+        ccteam_harness::AgentVendor::Claude | ccteam_harness::AgentVendor::Codex => {
+            ccteam_harness::SessionProtocol::StreamJson
         }
     }
-    ccteam_harness::SessionProtocol::parse_opt(raw).map_err(|e| format!("session_spawn: {e}"))
 }
 
 /// Lowercase wire string for a spawned session's vendor (response field).
@@ -2206,8 +2468,11 @@ async fn dispatch_wait_for_completion(
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(effective_wait_seconds);
+    // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
+    // submit→completion is an honest task-duration approximation for a wait
+    // that covers the whole task.
+    let wait_started = tokio::time::Instant::now();
+    let deadline = wait_started + std::time::Duration::from_secs(effective_wait_seconds);
     // Re-check cadence for "answer seen, is the turn still in flight?".
     const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
     let mut saw_answer = false;
@@ -2267,23 +2532,27 @@ async fn dispatch_wait_for_completion(
         let gw = gateway.lock().await;
         gw.session_resolve(child_sid)
     };
-    let (result_text, result_turn, cost_usd) = resolved
+    let (result_text, result_turn, cost_usd, tokens_total) = resolved
         .as_ref()
         .map(|r| {
             let last =
                 ccteam_harness::execution::turns_mirror::read_all_turns(&r.project_dir, &r.sid)
                     .ok()
                     .and_then(|all| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
-            let cost =
+            // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
+            // tokens, same semantics as session_list/collect (tokens present
+            // even for vendors with no USD price table).
+            let (cost, tokens) =
                 ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &r.sid)
                     .ok()
-                    .and_then(|m| m.cost_usd);
+                    .map(|m| (m.cost_usd, m.tokens_total))
+                    .unwrap_or((None, None));
             match last {
-                Some(t) => (t.assistant, Some(t.turn_id), cost),
-                None => (String::new(), None, cost),
+                Some(t) => (t.assistant, Some(t.turn_id), cost, tokens),
+                None => (String::new(), None, cost, tokens),
             }
         })
-        .unwrap_or((String::new(), None, None));
+        .unwrap_or((String::new(), None, None, None));
     let result_text = crate::delegation::truncate_head_tail_with_marker(
         &result_text,
         INLINE_RESULT_MAX_CHARS,
@@ -2302,8 +2571,16 @@ async fn dispatch_wait_for_completion(
     m.insert("status".to_string(), serde_json::json!("completed"));
     m.insert("result_text".to_string(), serde_json::json!(result_text));
     m.insert("result_turn".to_string(), serde_json::json!(result_turn));
+    // Additive telemetry (MCP-DX-1): submit→completion duration (0.1s
+    // resolution) + the child's session ledger, so a waiting caller can log
+    // per-vendor speed/cost without a second collect round-trip.
+    let elapsed = (wait_started.elapsed().as_millis() as f64 / 100.0).round() / 10.0;
+    m.insert("elapsed_seconds".to_string(), serde_json::json!(elapsed));
     if let Some(c) = cost_usd {
         m.insert("cost_usd".to_string(), serde_json::json!(c));
+    }
+    if let Some(t) = tokens_total {
+        m.insert("tokens_total".to_string(), serde_json::json!(t));
     }
     m
 }
@@ -3399,6 +3676,17 @@ mod session_tool_tests {
             }
             Ok(ccteam_harness::TurnId::new(format!("turn-{}", h.identity)))
         }
+        async fn submit_turn_routed(
+            &self,
+            h: &ccteam_harness::ThreadHandle,
+            input: ccteam_harness::TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> std::result::Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError>
+        {
+            self.submit_turn(h, input)
+                .await
+                .map(ccteam_harness::TurnSubmission::started)
+        }
         fn events(
             &self,
             h: &ccteam_harness::ThreadHandle,
@@ -3867,6 +4155,7 @@ mod session_tool_tests {
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(body["project"], "alice");
+        assert_eq!(body["project_source"], "explicit");
         assert!(
             body["parent_sid"].is_null(),
             "tenant spawn is a root: {body}"
@@ -3889,6 +4178,10 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
+        // MCP-DX-2 — a SECOND visible project keeps `project` genuinely
+        // ambiguous (with exactly one, spawn now auto-defaults; see
+        // `user_spawn_missing_project_defaults_to_sole_visible`).
+        seed_owned_project(&paths, "alice2", "user:ualice");
         let caller = McpCaller::User {
             user_id: "ualice".into(),
         };
@@ -3901,11 +4194,19 @@ mod session_tool_tests {
         )
         .await;
         assert_eq!(missing["result"]["isError"], true);
-        assert!(missing["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("missing `project`"));
+        let missing_text = missing["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(missing_text.contains("missing `project`"), "{missing_text}");
+        // MCP-DX-1 — actionable recovery: the error enumerates the caller's
+        // OWN projects (identity-derived, never input-derived).
+        assert!(missing_text.contains("your projects:"), "{missing_text}");
+        assert!(missing_text.contains("alice"), "{missing_text}");
+        assert!(missing_text.contains("alice2"), "{missing_text}");
+        assert!(!missing_text.contains("bob"), "{missing_text}");
 
+        // A foreign and a nonexistent project must stay BYTE-IDENTICAL (no
+        // existence disclosure) — the appended own-project hint is a constant
+        // for the caller, so the property is preserved.
+        let mut denied_texts = Vec::new();
         for project in ["bob", "admin", "unknown"] {
             let denied = execute_session_tool_with_paths(
                 &call("session_spawn", json!({"project": project})),
@@ -3915,11 +4216,335 @@ mod session_tool_tests {
             )
             .await;
             assert_eq!(denied["result"]["isError"], true, "{project}: {denied}");
-            assert_eq!(
-                denied["result"]["content"][0]["text"],
-                "session_spawn: project not found"
+            let text = denied["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                text.starts_with("session_spawn: project not found"),
+                "{text}"
             );
+            assert!(text.contains("your projects: alice"), "{text}");
+            denied_texts.push(text);
         }
+        assert!(
+            denied_texts.windows(2).all(|pair| pair[0] == pair[1]),
+            "foreign vs unknown project errors must be byte-identical: {denied_texts:?}"
+        );
+    }
+
+    /// MCP-DX-2 — a tenant with exactly ONE visible project no longer needs
+    /// to name it: spawn auto-defaults into it (identity-derived, the same
+    /// disclosure surface as the own-projects hint).
+    #[tokio::test]
+    async fn user_spawn_missing_project_defaults_to_sole_visible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = execute_session_tool_with_paths(
+            &call("session_spawn", json!({"vendor": "claude"})),
+            Some(&gateway),
+            McpCaller::User {
+                user_id: "ualice".into(),
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            body["project"], "alice",
+            "the sole visible project must be the default target: {body}"
+        );
+        assert_eq!(body["caller"], "user:ualice");
+        assert_eq!(body["project_source"], "sole");
+    }
+
+    /// MCP-DX-1 — "did you mean" suggests close/contained names only; a wild
+    /// guess is suppressed (worse than no hint).
+    #[test]
+    fn nearest_slug_suggests_close_and_contained_names_only() {
+        let candidates = vec!["robchat".to_string(), "demo".to_string()];
+        assert_eq!(nearest_slug("mychat", &candidates), Some("robchat"));
+        assert_eq!(nearest_slug("chat", &candidates), Some("robchat"));
+        assert_eq!(nearest_slug("demo2", &candidates), Some("demo"));
+        assert_eq!(nearest_slug("Robchat", &candidates), Some("robchat"));
+        assert_eq!(nearest_slug("zzz", &candidates), None);
+        assert_eq!(nearest_slug("mychat", &[]), None);
+    }
+
+    #[test]
+    fn format_slug_list_caps_and_reports_total() {
+        let many: Vec<String> = (0..25).map(|i| format!("p{i}")).collect();
+        let rendered = format_slug_list(&many);
+        assert!(rendered.starts_with("p0, p1"), "{rendered}");
+        assert!(rendered.ends_with("… (25 total)"), "{rendered}");
+        assert!(!rendered.contains("p24"), "{rendered}");
+        assert_eq!(format_slug_list(&many[..2]), "p0, p1");
+    }
+
+    /// MCP-DX-1 — an admin caller naming a nonexistent project gets a
+    /// "did you mean" + the registered catalog instead of a dead end (the
+    /// external-agent feedback: cwd-derived guesses like `mychat` vs the
+    /// registered `robchat`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_unknown_project_suggests_nearest_and_lists_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        seed_owned_project(&paths, "robchat", "user:web-api");
+        seed_owned_project(&paths, "demo", "user:web-api");
+        let err = run_session_spawn_at(
+            &json!({"project": "mychat", "vendor": "claude"}),
+            &gw,
+            McpCaller::Admin,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.starts_with("session_spawn: unknown project: mychat"),
+            "{err}"
+        );
+        assert!(err.contains("did you mean `robchat`?"), "{err}");
+        assert!(err.contains("registered projects: "), "{err}");
+        assert!(err.contains("demo"), "{err}");
+    }
+
+    /// MCP-DX-3 — invalid configured defaults skip to scratch; first use
+    /// provisions a real project and later uses reuse it by catalog path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_invalid_config_falls_back_to_scratch_and_reuses_path() {
+        ccteam_core::tool_surface::disable_tool_surface_bootstrap_for_tests();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
+        let default = seed_owned_project(&paths, "default", "user:web-api");
+        let config_path = ccteam_core::ccteam_config_path(&paths.root);
+        let mut yaml = std::fs::read_to_string(&config_path).unwrap();
+        yaml.push_str("default_project: missing\n");
+        std::fs::write(&config_path, yaml).unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, &alpha).await;
+        gw.lock().await.register_project("default", default);
+
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            bodies.push(parse(
+                &run_session_spawn_at(
+                    &json!({"vendor": "claude"}),
+                    &gw,
+                    McpCaller::Admin,
+                    Some(&paths),
+                )
+                .await
+                .unwrap(),
+            ));
+        }
+        assert_eq!(bodies[0]["project_source"], "scratch", "{:?}", bodies[0]);
+        assert_eq!(bodies[1]["project_source"], "scratch", "{:?}", bodies[1]);
+        assert_eq!(bodies[0]["project"], bodies[1]["project"]);
+        assert!(bodies.iter().all(|body| body.get("note").is_some()));
+        let scratch = paths.root.join("default_project");
+        assert!(CcteamPaths::project_state_in(&scratch).is_file());
+        assert!(scratch.join(".ccteam/workflow.yaml").is_file());
+        let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
+        let at_path: Vec<_> = cfg.projects.iter().filter(|p| p.path == scratch).collect();
+        assert_eq!(at_path.len(), 1, "scratch path registered once: {cfg:?}");
+        assert_eq!(at_path[0].slug, bodies[0]["project"].as_str().unwrap());
+        assert_eq!(at_path[0].slug, "default2");
+    }
+
+    /// MCP-DX-2 — with exactly ONE registered project, an admin spawn that
+    /// names no project defaults to it instead of dead-ending (external MCP
+    /// hosts run with a cwd outside any registered project, so `missing
+    /// project` used to be unrecoverable without a docs lookup). The fixture
+    /// The sole catalog project is selected and reported as such.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_missing_project_defaults_to_sole_registered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let robchat = seed_owned_project(&paths, "robchat", "user:web-api");
+        let (gw, _principal) = dispatch_gateway(false, 0, &robchat).await;
+        gw.lock().await.register_project("robchat", robchat.clone());
+        let body = parse(
+            &run_session_spawn_at(
+                &json!({"vendor": "claude"}),
+                &gw,
+                McpCaller::Admin,
+                Some(&paths),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["project"], "robchat", "{body}");
+        assert_eq!(body["project_source"], "sole", "{body}");
+        assert!(body.get("note").is_none(), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_project_source_covers_explicit_cwd_principal_and_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
+        let beta = seed_owned_project(&paths, "beta", "user:web-api");
+        let config_path = ccteam_core::ccteam_config_path(&paths.root);
+        let mut yaml = std::fs::read_to_string(&config_path).unwrap();
+        yaml.push_str("default_project: beta\n");
+        std::fs::write(&config_path, yaml).unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, &alpha).await;
+        gw.lock().await.register_project("beta", beta);
+
+        for (args, caller, source, project) in [
+            (
+                json!({"vendor":"claude","project":"alpha"}),
+                McpCaller::Admin,
+                "explicit",
+                "alpha",
+            ),
+            (
+                json!({"vendor":"claude","_caller_slug":"alpha"}),
+                McpCaller::Admin,
+                "cwd",
+                "alpha",
+            ),
+            (
+                ambient(&principal, "alpha", json!({"vendor":"claude"})),
+                McpCaller::Ambient,
+                "principal",
+                "alpha",
+            ),
+            (
+                json!({"vendor":"claude"}),
+                McpCaller::Admin,
+                "configured",
+                "beta",
+            ),
+        ] {
+            let body = parse(
+                &run_session_spawn_at(&args, &gw, caller, Some(&paths))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(body["project_source"], source, "{body}");
+            assert_eq!(body["project"], project, "{body}");
+            assert!(body.get("note").is_none(), "{body}");
+        }
+    }
+
+    /// MCP-CULL-3 — the wire protocol is derived from the vendor, and the
+    /// removed input parameter is rejected for every value (including a
+    /// formerly accepted matching value).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_protocol_is_derived_and_removed_param_is_rejected() {
+        use ccteam_harness::{AgentVendor, SessionProtocol};
+        for (vendor, derived) in [
+            (AgentVendor::Claude, SessionProtocol::StreamJson),
+            (AgentVendor::Codex, SessionProtocol::StreamJson),
+            (AgentVendor::Grok, SessionProtocol::Acp),
+            (AgentVendor::Opencode, SessionProtocol::Acp),
+            (AgentVendor::Kimi, SessionProtocol::Acp),
+        ] {
+            assert_eq!(derive_session_protocol(vendor), derived);
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        for args in [
+            json!({"vendor": "grok", "protocol": "acp"}),
+            json!({"vendor": "grok", "protocol": "stream-json"}),
+            json!({"vendor": "claude", "protocol": "terminal"}),
+            json!({"vendor": "claude", "protocol": "bogus"}),
+            json!({"vendor": "claude", "protocol": null}),
+        ] {
+            let err = run_session_spawn_at(&args, &gw, McpCaller::Admin, None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, PROTOCOL_SPAWN_PARAM_REMOVED);
+        }
+    }
+
+    /// MCP-DX-2 — pure resolution rule: exactly one catalog entry → that
+    /// slug; zero or several → no default.
+    #[test]
+    fn sole_registered_project_requires_exactly_one_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        assert_eq!(sole_registered_project(None), None);
+        assert_eq!(sole_registered_project(Some(&paths)), None);
+        seed_owned_project(&paths, "robchat", "user:web-api");
+        assert_eq!(
+            sole_registered_project(Some(&paths)).as_deref(),
+            Some("robchat")
+        );
+        seed_owned_project(&paths, "demo", "user:web-api");
+        assert_eq!(sole_registered_project(Some(&paths)), None);
+    }
+
+    /// MCP-DX-1 — an inline-wait completion carries submit→completion timing
+    /// and the child's session ledger (cost + raw tokens), so a waiting caller
+    /// can log per-vendor speed/cost without a second collect round-trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn dispatch_wait_completion_reports_ledger_and_elapsed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Seed the child's ledger the way the event pump would have.
+        let mut meta =
+            ccteam_harness::execution::session_meta::read_session_meta(tmp.path(), &child).unwrap();
+        meta.cost_usd = Some(0.12);
+        meta.tokens_total = Some(12_345);
+        ccteam_harness::execution::session_meta::write_session_meta(tmp.path(), &meta).unwrap();
+
+        let frag = dispatch_task(
+            &gw,
+            "session_dispatch",
+            &principal,
+            &child,
+            "quick question".to_string(),
+            6,
+            6,
+            ccteam_harness::NotifyMode::Final,
+            None,
+        )
+        .await
+        .unwrap();
+        let response = serde_json::Value::Object(frag);
+        assert_eq!(response["status"], "completed", "{response}");
+        assert_eq!(response["tokens_total"], 12_345, "{response}");
+        assert_eq!(response["cost_usd"], 0.12, "{response}");
+        let elapsed = response["elapsed_seconds"].as_f64().unwrap();
+        assert!(
+            (0.0..=6.0).contains(&elapsed),
+            "elapsed within the wait window: {response}"
+        );
     }
 
     #[tokio::test]
@@ -3995,8 +4620,11 @@ mod session_tool_tests {
         assert_eq!(body["total"], 1);
     }
 
+    /// 2026-07-26 cull — `screenshot` fell out of the MCP surface entirely;
+    /// any caller (tenant included) now gets the protocol core's unknown-tool
+    /// error, never a renderer path.
     #[tokio::test]
-    async fn user_screenshot_rejects_foreign_project_before_protocol_fallback() {
+    async fn screenshot_is_unknown_tool_after_cull() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
@@ -4016,10 +4644,8 @@ mod session_tool_tests {
             .await
             .unwrap();
         assert_eq!(response["result"]["isError"], true, "{response}");
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            "screenshot: project not found"
-        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unknown tool: screenshot"), "{text}");
     }
 
     /// v0.9 T4 review fix — the internal-bus methods are refused on the admin

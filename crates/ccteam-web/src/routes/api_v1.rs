@@ -255,8 +255,8 @@ fn build_projects(
 }
 
 /// `GET /api/v1/me` response — the authenticated caller's identity, so the SPA
-/// shows admin-only surfaces (user management, IM credentials, hosts, status)
-/// only to the owner.
+/// keeps user management and global IM credentials admin-only while rendering
+/// all shared/project-scoped surfaces for tenants.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeResponse {
     /// `"admin"` for the owner (bootstrap token), else the tenant id.
@@ -292,14 +292,13 @@ pub(crate) async fn handle_me(
     })
 }
 
-/// `POST /api/v1/me/reset-token` — v0.8.24: the ADMIN self-serve rotation of
-/// the bootstrap web token (`~/.ccteam/secrets/web-token`). Atomic write
-/// (tmp + rename, 0600) THEN a live in-memory rotate
-/// ([`crate::auth::AuthState::rotate`] — shared cell, no restart), so the
-/// response's new token is immediately valid and the old one immediately
-/// dead. Admin-only: a tenant's token lives in the user registry and is
-/// re-issued by the admin (`GET /users/{id}/link`), not here. 400 when auth
-/// is disabled (loopback — there is no token in use).
+/// `POST /api/v1/me/reset-token` — rotate the caller's own web token. The
+/// admin token is atomically rewritten then swapped into live [`AuthState`];
+/// a tenant token is atomically persisted through
+/// [`ccteam_core::tenants::TenantRegistry`] and is
+/// picked up by auth's per-request registry read. In both cases the response
+/// is the only reveal of the new token and the old token dies immediately.
+/// 400 when auth is disabled (loopback — there is no token in use).
 #[utoipa::path(
     post,
     path = "/api/v1/me/reset-token",
@@ -307,16 +306,12 @@ pub(crate) async fn handle_me(
     responses(
         (status = 200, description = "Rotated; `{wire_token: \"ccteam:<hex>\"}` — the ONLY reveal of the new token", body = AuthToken),
         (status = 400, description = "Auth disabled (no token in use)"),
-        (status = 403, description = "Non-admin"),
     ),
 )]
 pub(crate) async fn handle_reset_token(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
 ) -> Response {
-    if let Some(deny) = crate::auth::deny_non_admin(&identity) {
-        return deny;
-    }
     if !app.auth.enabled {
         return (
             StatusCode::BAD_REQUEST,
@@ -325,6 +320,40 @@ pub(crate) async fn handle_reset_token(
             })),
         )
             .into_response();
+    }
+    if !identity.is_admin {
+        let users_dir = app.paths.users_dir();
+        let tenant_id = identity.id.clone();
+        let write = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let mut registry = ccteam_core::tenants::TenantRegistry::load(&users_dir);
+            let Some(new_hex) = registry.rotate_token(&tenant_id) else {
+                return Ok(None);
+            };
+            registry.save(&users_dir)?;
+            Ok(Some(new_hex))
+        })
+        .await;
+        return match write {
+            Ok(Ok(Some(new_hex))) => Json(AuthToken {
+                wire_token: Some(format!("{}{new_hex}", crate::auth::TOKEN_PREFIX)),
+            })
+            .into_response(),
+            Ok(Ok(None)) => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "tenant identity no longer exists"})),
+            )
+                .into_response(),
+            Ok(Err(err)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("persist tenant token: {err}")})),
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("worker: {err}")})),
+            )
+                .into_response(),
+        };
     }
     // Mint a fresh 32-byte token + atomic overwrite of the token file
     // (`token::rotate_token` — same generator/mode as the bootstrap file).

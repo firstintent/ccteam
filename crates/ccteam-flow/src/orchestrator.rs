@@ -47,9 +47,6 @@ use crate::workflow::{
     AgentSpec, AgentTeamSpec, Executor, Trigger, WorkflowError, WorkflowMode, WorkflowSpec,
 };
 
-/// Hard cap on concurrent project sessions (excluding the meta-agent).
-pub const MAX_CONCURRENT_PROJECTS: usize = 3;
-
 /// V0.6.0 F107 — placeholder cost-from-usage estimator. Cost-crater
 /// teammate will replace this with `ccteam_cost::estimate_cost(&usage,
 /// vendor, model) -> f64`. Wave 1 returns 0 because the active

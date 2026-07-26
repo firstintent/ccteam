@@ -2,10 +2,11 @@
 //!
 //! Each test spawns `ccteam mcp-serve` with a different
 //! `CCTEAM_DISABLE_TOOLS` value and confirms `tools/list` shrinks /
-//! grows as expected. Group enum: `admin` / `workflow` / `screenshot`
-//! / `chat` / `session`. The `workflow` token stays a valid enum value,
+//! grows as expected. Group enum: `admin` / `workflow` / `chat` /
+//! `session`. The `workflow` token stays a valid enum value,
 //! but gates an empty set. The `advise` group was dropped in v0.9 T1
-//! (token now silently ignored like any unknown).
+//! and `screenshot` was culled 2026-07-26 (both tokens now silently
+//! ignored like any unknown).
 //!
 //! Unknown tokens are silently dropped. The filter is best-effort UX,
 //! not a security boundary.
@@ -112,9 +113,7 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
     for n in names {
         // Wire names are bare (client namespaces by server key).
         let bare = n.as_str();
-        if bare == "screenshot" {
-            out.insert("screenshot");
-        } else if bare == "status" || bare.starts_with("admin_") {
+        if bare == "status" || bare == "grok_claude_codex_kimi" || bare.starts_with("admin_") {
             out.insert("admin");
         } else if bare.starts_with("workflow_") {
             out.insert("workflow");
@@ -129,11 +128,11 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
 
 #[test]
 fn disable_unset_returns_all_visible_groups() {
-    // workflow gates an empty set (never appears). advise was culled.
-    // Visible surface: admin + screenshot + chat + session.
+    // workflow gates an empty set (never appears). advise + screenshot
+    // were culled. Visible surface: admin + chat + session.
     let names = names_with_disable(None);
     let groups = group_set(&names);
-    for g in ["admin", "screenshot", "chat", "session"] {
+    for g in ["admin", "chat", "session"] {
         assert!(
             groups.contains(g),
             "default tools/list should contain group `{g}`; got groups {:?}",
@@ -150,6 +149,10 @@ fn disable_unset_returns_all_visible_groups() {
         "advise group was culled in v0.9 T1; got groups {:?}",
         groups
     );
+    assert!(
+        !names.contains(&"screenshot".to_string()),
+        "screenshot was culled 2026-07-26; got {names:?}"
+    );
     assert_eq!(names.len(), 8);
 }
 
@@ -158,7 +161,7 @@ fn disable_chat_hides_chat_keeps_others() {
     let names = names_with_disable(Some("chat"));
     let groups = group_set(&names);
     assert!(!groups.contains("chat"), "chat group should be hidden");
-    for g in ["admin", "screenshot", "session"] {
+    for g in ["admin", "session"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
     assert!(!names.iter().any(|n| n.starts_with("chat_")));
@@ -166,12 +169,12 @@ fn disable_chat_hides_chat_keeps_others() {
 }
 
 #[test]
-fn disable_chat_and_screenshot_combines() {
+fn disable_chat_with_stale_screenshot_token_still_works() {
+    // A stale `screenshot` token (group culled 2026-07-26) parses as
+    // unknown and is ignored; the rest of the list still applies.
     let names = names_with_disable(Some("chat,screenshot"));
     let groups = group_set(&names);
     assert!(!groups.contains("chat"));
-    assert!(!groups.contains("screenshot"));
-    assert!(!names.contains(&"screenshot".to_string()));
     assert!(groups.contains("admin"));
     assert!(groups.contains("session"));
 }
@@ -180,7 +183,7 @@ fn disable_chat_and_screenshot_combines() {
 fn disable_each_group_individually() {
     // One spawn per group; confirms the enum parser covers every
     // documented value. (Cheap — each spawn is ~200ms.)
-    for g in ["admin", "workflow", "screenshot", "chat", "session"] {
+    for g in ["admin", "workflow", "chat", "session"] {
         let names = names_with_disable(Some(g));
         let groups = group_set(&names);
         assert!(
@@ -205,7 +208,7 @@ fn disable_unknown_token_is_silently_ignored() {
 
 #[test]
 fn disable_all_groups_returns_empty_list() {
-    let names = names_with_disable(Some("admin,workflow,screenshot,chat,session"));
+    let names = names_with_disable(Some("admin,workflow,chat,session"));
     assert!(
         names.is_empty(),
         "disabling every group should hide the entire surface; got {:?}",
@@ -214,15 +217,14 @@ fn disable_all_groups_returns_empty_list() {
 }
 
 #[test]
-fn disable_workflow_preserves_screenshot_group() {
-    // Sanity: screenshot is its OWN group, not workflow's subset.
-    // Disabling workflow must not collaterally hide screenshot.
+fn disable_workflow_preserves_other_groups() {
+    // Sanity: workflow gates only its own (empty) set — disabling it
+    // must not collaterally hide any live group.
     let names = names_with_disable(Some("workflow"));
-    assert!(
-        names.contains(&"screenshot".to_string()),
-        "screenshot must survive when only `workflow` is disabled",
-    );
     let groups = group_set(&names);
     assert!(!groups.contains("workflow"));
-    assert!(groups.contains("screenshot"));
+    for g in ["admin", "chat", "session"] {
+        assert!(groups.contains(g), "group `{g}` should still be present");
+    }
+    assert_eq!(names.len(), 8);
 }

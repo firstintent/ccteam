@@ -55,7 +55,7 @@ pub type AdapterFactory = Arc<
 /// - `Claude` + `StreamJson` (the default) → [`ClaudeStreamJsonAdapter`] —
 ///   the lightweight NDJSON chat path (no PTY / pane / hook chain).
 /// - `Claude` + `Terminal` → [`ClaudeTuiAdapter`] — the advanced tmux-PTY
-///   path (byte-faithful terminal mirror / attach / screenshot).
+///   path (byte-faithful terminal mirror / attach).
 /// - `Codex` → [`CodexAppServerAdapter`] regardless of protocol (codex
 ///   always drives via its app-server JSON-RPC control plane).
 ///
@@ -420,8 +420,16 @@ where
         }
     }
     let restore_gateway = Arc::clone(&gateway);
-    tokio::spawn(async move {
-        Gateway::resume_restored_sessions_shared(restore_gateway).await;
+    let (restore_complete_tx, restore_complete_rx) = tokio::sync::watch::channel(false);
+    let scheduled_scheduler = tokio::spawn(async move {
+        // Catch up due rows BEFORE the general live-set restore. A due target
+        // cold-resumes itself; the restore then observes it live and skips a
+        // duplicate spawn. This keeps restart delivery from waiting behind a
+        // long batch of unrelated vendor resumes.
+        Gateway::catch_up_scheduled(Arc::clone(&restore_gateway)).await;
+        Gateway::resume_restored_sessions_shared(Arc::clone(&restore_gateway)).await;
+        let _ = restore_complete_tx.send(true);
+        Gateway::run_scheduled_scheduler(restore_gateway).await;
     });
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every
@@ -480,6 +488,7 @@ where
         shared_channels.clone(),
         sec.clone(),
         gateway.clone(),
+        restore_complete_rx,
     );
     let gateway_event_consumer =
         spawn_gateway_event_consumer(gateway_event_rx, shared_channels.clone());
@@ -538,6 +547,7 @@ where
     }
     inbound_consumer.abort();
     gateway_event_consumer.abort();
+    scheduled_scheduler.abort();
     // Per-session event pumps are gateway-owned tasks. `Drop for Gateway`
     // aborts them, but an `Arc` clone held elsewhere (restore/notifier tasks,
     // web AppState, MCP server) can outlive this future, so the Drop may never
@@ -1149,6 +1159,7 @@ fn spawn_inbound_consumer(
     channels: Arc<RwLock<ChannelMap>>,
     sec: Arc<Mutex<ThreeLayerSec>>,
     gateway: Arc<Mutex<Gateway>>,
+    restore_complete: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -1205,6 +1216,44 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
+
+            let restore_incomplete = !*restore_complete.borrow();
+            if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
+                // Startup restore deliberately runs outside the gateway lock
+                // so the daemon and web face remain available while vendor
+                // children resume. A listing must not expose a partial prefix
+                // of that batch (s1 applied while s2 is still spawning), so
+                // park ONLY this request on the explicit completion signal.
+                // Its own task keeps the inbound consumer free to serve every
+                // unrelated message during restore.
+                let gateway = Arc::clone(&gateway);
+                let channel = Arc::clone(&channel);
+                let msg = msg.clone();
+                let cid = cid.clone();
+                let mut restore_complete = restore_complete.clone();
+                tokio::spawn(async move {
+                    if restore_complete.changed().await.is_err() {
+                        tracing::warn!(
+                            "ccteam-im: restore task ended before session-list readiness was signalled"
+                        );
+                    }
+                    let replies = gateway
+                        .lock()
+                        .await
+                        .handle_message(
+                            &msg.channel,
+                            &msg.reply_target,
+                            &msg.sender,
+                            &msg.id,
+                            &clean_payload,
+                            &msg.attachments,
+                            msg.selection.as_ref(),
+                        )
+                        .await;
+                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+                });
+                continue;
+            }
 
             // v0.8.x (concurrency review §4.1 P1) — LOCKING PROTOCOL. Before
             // this fix, `gateway.lock().await.handle_message(...).await` held
@@ -1366,7 +1415,9 @@ fn spawn_gateway_event_consumer(
             // warning firing for every delegation transition).
             if matches!(
                 evt.kind,
-                GatewayEventKind::Delegation { .. } | GatewayEventKind::SessionLifecycle { .. }
+                GatewayEventKind::Delegation { .. }
+                    | GatewayEventKind::SessionLifecycle { .. }
+                    | GatewayEventKind::ScheduledChanged
             ) {
                 continue;
             }
@@ -1416,6 +1467,7 @@ fn spawn_gateway_event_consumer(
                 // correct if that early skip is ever removed.
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
+                GatewayEventKind::ScheduledChanged => {}
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,

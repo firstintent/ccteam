@@ -123,10 +123,10 @@ async fn mcp_initialize_defaults_protocol_version_when_omitted() {
     assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
 }
 
-// ── ② tools/list returns exactly 8 tools ────────────────────────────
+// ── ② tools/list returns the full tool surface ─────────────────────
 
 #[tokio::test]
-async fn mcp_tools_list_returns_exactly_eight() {
+async fn mcp_tools_list_returns_the_full_surface() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     seed_web_token(&paths, TOKEN_HEX);

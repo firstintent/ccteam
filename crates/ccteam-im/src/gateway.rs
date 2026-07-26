@@ -21,7 +21,8 @@ use ccteam_harness::{
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnInput,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnDisposition,
+    TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -261,6 +262,8 @@ pub struct Gateway {
     /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
     /// reused" survives a wiped routing table / purged meta.json set.
     next_sid_path: Option<PathBuf>,
+    /// Daemon-wide monotonic scheduled-message counter (`d{n}`).
+    next_scheduled_path: Option<PathBuf>,
     /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
     /// `load_state` (sync) for the async `resume_restored_sessions` step to
     /// cold-start rebuild from their `meta.json`. Drained once on startup.
@@ -276,6 +279,11 @@ pub struct Gateway {
     sessions: BTreeMap<String, GatewaySession>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
+    next_scheduled: u64,
+    /// Durable scheduled rows indexed by globally unique short id.
+    scheduled_items: BTreeMap<String, ScheduledEntry>,
+    /// Wakes the lightweight next-fire timer after create/cancel/GC.
+    scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
     /// Broadcast tee of every [`GatewayEvent`] the gateway emits (V0.8.6 —
     /// fix #2). The IM delivery path stays on the mpsc `event_sink`; this
@@ -349,6 +357,12 @@ pub struct Gateway {
     /// v0.9.2 — optional programmatic capacity override. Production reads the
     /// hot config; deterministic gateway tests use this to exercise a tiny cap.
     sessions_config_override: Option<ccteam_core::SessionsConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledEntry {
+    project_dir: PathBuf,
+    item: crate::scheduled::ScheduledItem,
 }
 
 /// v0.9.0 W2 (F2/F7) — in-memory mirror of one child's durable delegation
@@ -502,6 +516,9 @@ pub enum GatewayEventKind {
         /// Machine-readable cause, currently `capacity`.
         reason: String,
     },
+    /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
+    /// the authoritative list instead of receiving queue contents over SSE.
+    ScheduledChanged,
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -1143,6 +1160,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/inbox",
+        arg_hint: Some("[<time> <text>|cancel <dN>]"),
+        help: "list, schedule, or cancel delayed user messages",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
         name: "/projects",
         arg_hint: None,
         help: "list projects",
@@ -1192,15 +1215,6 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         arg_hint: Some("[id]"),
         help: "interrupt the running turn (keeps the session; bare = current)",
         in_menu: true,
-    },
-    GatewayCommandSpec {
-        name: "/screen",
-        arg_hint: Some("[id]"),
-        // v0.9.x (owner req) — dropped from the menu: the terminal protocol is
-        // frozen/deprecated and default stream-json sessions have no pane, so
-        // /screen is niche. Still works if typed for a terminal session.
-        help: "screenshot a session's pane (bare = current)",
-        in_menu: false,
     },
     GatewayCommandSpec {
         name: "/rename",
@@ -1268,12 +1282,22 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 /// vendor passthroughs (`/model`, `/compact`, …) are not gateway commands and
 /// never reach this. Web is unaffected — its control face (`submit_web_sid`)
 /// does not call this, and web navigates by GUI.
+const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
+const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
+
 fn command_next_hint(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => "↓ 查看状态 → /status",
-        "/stop" | "/rename" | "/cd" | "/newproject" => "↓ 本项目会话 → /sessions",
+        "/new" | "/use" | "/role" | "/interrupt" => NEXT_HINT_STATUS,
+        "/stop" | "/rename" | "/cd" | "/newproject" => NEXT_HINT_SESSIONS,
         _ => return None,
     })
+}
+
+fn append_next_hint(reply: &mut String, hint: &str) {
+    if !reply.is_empty() {
+        reply.push('\n');
+    }
+    reply.push_str(hint);
 }
 
 impl Gateway {
@@ -1315,6 +1339,7 @@ impl Gateway {
             default_project,
             routing_path: None,
             next_sid_path: None,
+            next_scheduled_path: None,
             restore_pending: Vec::new(),
             projects,
             current_project: BTreeMap::new(),
@@ -1322,6 +1347,9 @@ impl Gateway {
             sessions: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
+            next_scheduled: 0,
+            scheduled_items: BTreeMap::new(),
+            scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
             event_pumps: BTreeMap::new(),
@@ -1466,7 +1494,14 @@ impl Gateway {
         let root = ccteam_root.into();
         self.routing_path = Some(crate::routing_state_path_in(&root));
         self.next_sid_path = Some(crate::next_sid_path_in(&root));
-        self.load_state()
+        self.next_scheduled_path = Some(
+            root.join("state")
+                .join("scheduled")
+                .join("next-scheduled-id"),
+        );
+        self.load_state()?;
+        self.load_scheduled_state();
+        Ok(())
     }
 
     /// v0.8.21 Wave-2 — compute the (sync, no-`.await`) plan to rebuild a
@@ -2004,6 +2039,11 @@ impl Gateway {
             }
         }
         // Commands parse on the raw text; attachments don't apply to them.
+        if text.split_whitespace().next() == Some("/inbox") && !attachments.is_empty() {
+            return Err(anyhow!(
+                "/inbox scheduled messages do not support files or skills"
+            ));
+        }
         if let Some(mut reply) = self.handle_command(&chat, text).await? {
             // Owner req — teach the next step: append a recommended-command
             // footer as the reply's last line (see `command_next_hint`). IM only
@@ -2012,19 +2052,16 @@ impl Gateway {
             if chat.channel != "web" {
                 if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
                 {
-                    if !reply.is_empty() {
-                        reply.push('\n');
-                    }
-                    reply.push_str(hint);
+                    append_next_hint(&mut reply, hint);
                 }
             }
             return Ok(vec![reply]);
         }
         // A gateway command may handle itself ENTIRELY via the event sink and
-        // return no inline reply — a screenshot (`/screen`), or a project /
-        // session picker delivered as text + inline buttons (`/projects`,
-        // `/sessions`). It must NOT fall through to `submit_to_current` below,
-        // where its `/command` text would be shipped to the agent verbatim.
+        // return no inline reply — a project / session picker delivered as
+        // text + inline buttons (`/projects`, `/sessions`). It must NOT fall
+        // through to `submit_to_current` below, where its `/command` text
+        // would be shipped to the agent verbatim.
         if Self::is_gateway_command(text) {
             return Ok(Vec::new());
         }
@@ -2083,7 +2120,13 @@ impl Gateway {
             }
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
-        self.submit_to_current(&chat, message_id, turn).await
+        let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
+        if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
+            if let Some(last) = replies.last_mut() {
+                append_next_hint(last, NEXT_HINT_STATUS);
+            }
+        }
+        Ok(replies)
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
@@ -2223,6 +2266,7 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
+            "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
             "/new" => {
                 let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
                 // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
@@ -2399,79 +2443,6 @@ impl Gateway {
                     "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
                 )))
             }
-            "/screen" => {
-                // v0.8.10 — capture a session's pane to a PNG and send it as an
-                // image, so the IM user can SEE the live claude/codex TUI state
-                // (e.g. a /model "Switch model?" confirmation or picker that has
-                // no hook and so can't be forwarded otherwise). This is the
-                // read-only screenshot path (ccteam-core render_screenshot: tmux
-                // capture → vt100 → imageproc PNG) — it shows the user a picture,
-                // it does NOT parse the pane for control flow (the no-scrape red
-                // line). `/screen <sid>` targets a session; bare `/screen` shoots
-                // the current one.
-                let sid = match parts.next() {
-                    Some(id) => id.to_string(),
-                    None => self
-                        .current_session
-                        .read()
-                        .unwrap()
-                        .get(chat)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("/screen 需要一个活动会话(或 /screen <sid>)"))?,
-                };
-                let slug = self
-                    .sessions
-                    .get(&sid)
-                    .filter(|s| Self::chat_can_access(chat, s))
-                    .map(|s| s.project.clone())
-                    .ok_or_else(|| anyhow!("unknown session for this chat: {sid}"))?;
-                // v0.8.11 E2 — a stream-json session has no pane to capture;
-                // refuse with a human message instead of a generic degrade.
-                if self
-                    .sessions
-                    .get(&sid)
-                    .map(|s| s.protocol.is_stream_json())
-                    .unwrap_or(false)
-                {
-                    return Ok(Some(format!(
-                        "会话 {sid} 是 stream-json 通道(无终端 pane),没法截图 —— 它的回复直接走聊天。要终端镜像/截图,用 `/new … terminal` 起一个终端通道会话。"
-                    )));
-                }
-                let paths = self
-                    .project_paths
-                    .clone()
-                    .ok_or_else(|| anyhow!("screenshot 暂不可用(daemon 缺少 paths 上下文)"))?;
-                match ccteam_core::render_screenshot(&paths, &slug, Some(sid.as_str()), 50) {
-                    Ok(Some(png)) => {
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
-                        self.emit_user_signal(GatewayEvent {
-                            id: format!("gateway-screenshot-{sid}-{nanos}"),
-                            channel: chat.channel.clone(),
-                            chat_id: chat.chat_id.clone(),
-                            thread_ts: None,
-                            content: String::new(),
-                            kind: GatewayEventKind::Answer,
-                            attachments: vec![crate::transport::OutboundFile {
-                                path: png.to_string_lossy().to_string(),
-                                caption: Some(format!("📸 {sid} ({slug})")),
-                                kind: crate::transport::OutboundFileKind::Photo,
-                            }],
-                            options: Vec::new(),
-                            sid: Some(sid.clone()),
-                            slug: Some(slug.clone()),
-                        });
-                        Ok(None)
-                    }
-                    Ok(None) => Ok(Some(
-                        "截图降级失败(tmux 缺失 / session 未找到 / 字体失败 / IO)—— 看 daemon stderr。"
-                            .to_string(),
-                    )),
-                    Err(err) => Ok(Some(format!("截图出错: {err}"))),
-                }
-            }
             "/cd" => {
                 let project = parts
                     .next()
@@ -2554,6 +2525,117 @@ impl Gateway {
             ))),
             _ => Ok(None),
         }
+    }
+
+    fn handle_inbox_command(&mut self, chat: &ChatKey, trimmed: &str) -> Result<String> {
+        self.gc_failed_scheduled(chrono::Utc::now());
+        let rest = trimmed.strip_prefix("/inbox").unwrap_or("").trim();
+        if rest.is_empty() {
+            let mut items = self
+                .scheduled_items
+                .values()
+                .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
+                .map(|entry| entry.item.clone())
+                .collect::<Vec<_>>();
+            items.sort_by(crate::scheduled::scheduled_order);
+            if items.is_empty() {
+                return Ok(format!(
+                    "📥 /inbox is empty (daemon timezone: {})",
+                    crate::scheduled::daemon_timezone_label()
+                ));
+            }
+            let mut lines = vec![format!(
+                "📥 scheduled messages (daemon timezone: {})",
+                crate::scheduled::daemon_timezone_label()
+            )];
+            for item in items {
+                let when = item
+                    .send_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M");
+                let state = match item.status {
+                    crate::scheduled::ScheduledStatus::Pending => String::new(),
+                    crate::scheduled::ScheduledStatus::Failed => format!(
+                        " [failed: {}]",
+                        item.fail_reason.as_deref().unwrap_or("unknown error")
+                    ),
+                };
+                lines.push(format!(
+                    "{} · {} · {} · {}{}",
+                    item.id,
+                    item.sid,
+                    when,
+                    crate::scheduled::preview(&item.text),
+                    state
+                ));
+            }
+            return Ok(lines.join("\n"));
+        }
+
+        if rest == "cancel" || rest.starts_with("cancel ") {
+            let mut parts = rest["cancel".len()..].split_whitespace();
+            let id = parts
+                .next()
+                .ok_or_else(|| anyhow!("usage: /inbox cancel <dN>"))?;
+            if parts.next().is_some() {
+                return Err(anyhow!("usage: /inbox cancel <dN>"));
+            }
+            let entry = self
+                .scheduled_items
+                .get(id)
+                .cloned()
+                .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
+                .ok_or_else(|| anyhow!("unknown scheduled message for this chat: {id}"))?;
+            self.cancel_scheduled_message(&entry.item.sid, id)?;
+            return Ok(format!("cancelled {id}"));
+        }
+
+        let (when, text) = parse_inbox_create_args(rest)?;
+        let send_at = crate::scheduled::parse_send_time(&when)?;
+        let sid = self
+            .current_session
+            .read()
+            .unwrap()
+            .get(chat)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
+            })?;
+        let visible_pending = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && self.chat_can_access_scheduled_entry(chat, entry)
+            })
+            .count();
+        let item = self.create_scheduled_message_inner(
+            &sid,
+            text,
+            send_at,
+            canonical_owner(chat).identity(),
+            Some(chat.channel.clone()),
+            Some(chat.chat_id.clone()),
+            visible_pending,
+        )?;
+        Ok(format!(
+            "scheduled {} → {} at {} ({})",
+            item.id,
+            item.sid,
+            item.send_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            crate::scheduled::daemon_timezone_label()
+        ))
+    }
+
+    fn chat_can_access_scheduled_entry(&self, chat: &ChatKey, entry: &ScheduledEntry) -> bool {
+        if let Some(session) = self.sessions.get(&entry.item.sid) {
+            return Self::chat_can_access(chat, session);
+        }
+        read_session_meta(&entry.project_dir, &entry.item.sid)
+            .map(|meta| Self::owner_identity_visible(chat, &meta.owner))
+            .unwrap_or(false)
     }
 
     /// Switch the chat's current project to `project` — the `/cd` core, shared
@@ -2654,10 +2736,18 @@ impl Gateway {
     /// or reads as an unknown target.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
         if let Some(slug) = nav.strip_prefix("cd:") {
-            return Ok(vec![self.change_project(chat, slug)?]);
+            let mut reply = self.change_project(chat, slug)?;
+            if chat.channel != "web" {
+                append_next_hint(&mut reply, NEXT_HINT_SESSIONS);
+            }
+            return Ok(vec![reply]);
         }
         if let Some(sid) = nav.strip_prefix("use:") {
-            return Ok(vec![self.use_session(chat, sid).await?]);
+            let mut reply = self.use_session(chat, sid).await?;
+            if chat.channel != "web" {
+                append_next_hint(&mut reply, NEXT_HINT_STATUS);
+            }
+            return Ok(vec![reply]);
         }
         Ok(vec!["invalid selection".to_string()])
     }
@@ -2801,8 +2891,8 @@ impl Gateway {
     }
 
     /// Emit a picker message (a project/session list) carrying inline `options`
-    /// to a button-capable channel, via the user-signal sink — the same egress
-    /// `/screen` uses. Delivers text + buttons as ONE message
+    /// to a button-capable channel, via the user-signal sink.
+    /// Delivers text + buttons as ONE message
     /// (`spawn_gateway_event_consumer` calls `.with_options`), so the caller
     /// returns no separate inline reply.
     fn emit_list_options(&self, chat: &ChatKey, content: String, options: Vec<MessageOption>) {
@@ -3711,6 +3801,7 @@ impl Gateway {
                 "",
                 turn.text,
                 TurnOrigin::Internal,
+                turn.literal,
             ))
             .await
             {
@@ -3821,6 +3912,13 @@ impl Gateway {
             let mut watch_idle = std::time::Duration::ZERO;
             let mut watch_last_activity: u64 = 0;
             let mut watch_warned_turn: Option<String> = None;
+            // Item ids of in-flight tool/command work. A long silent tool
+            // (build, test suite, MCP call) legitimately emits no further
+            // events while it runs — that is NOT a stall. Cleared on item
+            // complete and at turn boundary so a lost complete cannot
+            // suppress the watchdog forever.
+            let mut open_work_items: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -3863,6 +3961,9 @@ impl Gateway {
                         // TRUE silence (no event for the whole idle window) is a
                         // stall. Counts every event, before any branch/filter.
                         session.activity_events.fetch_add(1, Ordering::SeqCst);
+                        // Track open tool/command work so a long silent tool
+                        // run does not look like a hung turn.
+                        track_open_work_items(&mut open_work_items, &evt);
                         // v0.8.19 `/status` — record the wall-clock of this event
                         // right beside the liveness counter. `/status` derives the
                         // 🔴 stuck state from it the SAME way the watchdog does (a
@@ -3870,6 +3971,20 @@ impl Gateway {
                         // window = silent = STUCK).
                         if let Ok(mut last) = session.last_event_at.lock() {
                             *last = Some(Instant::now());
+                        }
+                        // A queued adapter submission starts only after its
+                        // predecessor completes. The submit call cannot stamp
+                        // that future boundary, so canonical TurnStarted is the
+                        // authority that opens a fresh working window when the
+                        // previous TurnCompleted already cleared it. Native
+                        // same-turn Inject emits no second TurnStarted and thus
+                        // preserves the original elapsed time.
+                        if matches!(&evt, ThreadEvent::TurnStarted { .. }) {
+                            if let Ok(mut started) = session.turn_started_at.lock() {
+                                if started.is_none() {
+                                    *started = Some(Instant::now());
+                                }
+                            }
                         }
                         // 👀 ack clear: the FIRST event of a turn is the moment
                         // the silent gap ends (💭 thinking / first progress), so
@@ -4423,9 +4538,13 @@ impl Gateway {
                                             session.activity_events.load(Ordering::SeqCst);
                                     } else {
                                         let cur = session.activity_events.load(Ordering::SeqCst);
-                                        if cur != watch_last_activity {
+                                        // Still working if either the event
+                                        // counter moved OR a tool/command is
+                                        // open (long silent tools are real work).
+                                        if cur != watch_last_activity || !open_work_items.is_empty()
+                                        {
                                             watch_last_activity = cur;
-                                            watch_idle = std::time::Duration::ZERO; // still working
+                                            watch_idle = std::time::Duration::ZERO;
                                         } else {
                                             watch_idle += watch_poll;
                                         }
@@ -4597,31 +4716,468 @@ impl Gateway {
         atomic_write_durable(path, self.next_session.to_string().as_bytes())
     }
 
+    fn load_scheduled_state(&mut self) {
+        if let Some(path) = self.next_scheduled_path.as_ref() {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(next) = raw.trim().parse::<u64>() {
+                    self.next_scheduled = next;
+                }
+            }
+        }
+        self.scheduled_items.clear();
+        for (project_dir, item) in crate::scheduled::scan_scheduled(&self.projects) {
+            if let Some(number) = item
+                .id
+                .strip_prefix('d')
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                self.next_scheduled = self.next_scheduled.max(number);
+            }
+            self.scheduled_items
+                .insert(item.id.clone(), ScheduledEntry { project_dir, item });
+        }
+        // If a surviving queue proves the counter file was stale/missing, repair
+        // it before accepting another create. Fired ids still rely on the
+        // durable counter, which is written before their queue row is created.
+        if let Err(err) = self.persist_next_scheduled() {
+            tracing::warn!(error = %err, "failed to repair scheduled-message counter");
+        }
+        self.gc_failed_scheduled(chrono::Utc::now());
+    }
+
+    fn persist_next_scheduled(&self) -> Result<()> {
+        let Some(path) = self.next_scheduled_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_durable(path, self.next_scheduled.to_string().as_bytes())
+    }
+
+    fn scheduled_target(&self, sid: &str) -> Result<(String, PathBuf)> {
+        if let Some(session) = self.sessions.get(sid) {
+            let dir = self
+                .projects
+                .get(&session.project)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project for session {sid}"))?;
+            return Ok((session.project.clone(), dir));
+        }
+        self.find_meta_for_sid(sid)
+            .map(|(slug, dir, _)| (slug, dir))
+            .map_err(|_| anyhow!("unknown session: {sid}"))
+    }
+
+    fn persist_scheduled_sid(&self, project_dir: &Path, sid: &str) -> Result<()> {
+        let mut items = self
+            .scheduled_items
+            .values()
+            .filter(|entry| entry.item.sid == sid)
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        items.sort_by(crate::scheduled::scheduled_order);
+        crate::scheduled::write_scheduled(project_dir, sid, &items)
+    }
+
+    /// Pending rows visible in a set of projects. `None` means every project
+    /// (admin); tenants pass their project ACL set from the REST layer.
+    pub fn scheduled_pending_count_in_projects(
+        &self,
+        visible_projects: Option<&HashSet<String>>,
+    ) -> usize {
+        self.scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && visible_projects
+                        .map(|projects| projects.contains(&entry.item.project))
+                        .unwrap_or(true)
+            })
+            .count()
+    }
+
+    /// List pending and short-lived failed rows for one sid.
+    pub fn scheduled_items_for_sid(
+        &mut self,
+        sid: &str,
+    ) -> Result<Vec<crate::scheduled::ScheduledItem>> {
+        self.scheduled_target(sid)?;
+        self.gc_failed_scheduled(chrono::Utc::now());
+        let mut items = self
+            .scheduled_items
+            .values()
+            .filter(|entry| entry.item.sid == sid)
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        items.sort_by(crate::scheduled::scheduled_order);
+        Ok(items)
+    }
+
+    /// REST/web create. The route supplies its already-resolved visible project
+    /// set so the 100-pending human limit is checked atomically under the same
+    /// gateway lock as insertion.
+    pub fn create_scheduled_message(
+        &mut self,
+        sid: &str,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        visible_projects: Option<&HashSet<String>>,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let visible_count = self.scheduled_pending_count_in_projects(visible_projects);
+        self.create_scheduled_message_inner(
+            sid,
+            text,
+            send_at,
+            created_by,
+            None,
+            None,
+            visible_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_scheduled_message_inner(
+        &mut self,
+        sid: &str,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        reply_channel: Option<String>,
+        reply_chat_id: Option<String>,
+        visible_pending: usize,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        if text.trim().is_empty() {
+            return Err(anyhow!("scheduled message text cannot be empty"));
+        }
+        let now = chrono::Utc::now();
+        if send_at <= now {
+            return Err(anyhow!("scheduled time must be in the future"));
+        }
+        if send_at.signed_duration_since(now) > crate::scheduled::MAX_HORIZON {
+            return Err(anyhow!("scheduled time must be within 7 days"));
+        }
+        let (project, project_dir) = self.scheduled_target(sid)?;
+        let sid_pending = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.sid == sid
+                    && entry.item.status == crate::scheduled::ScheduledStatus::Pending
+            })
+            .count();
+        if sid_pending >= crate::scheduled::MAX_PENDING_PER_SID {
+            return Err(anyhow!(
+                "session {sid} already has {} pending scheduled messages (limit {})",
+                sid_pending,
+                crate::scheduled::MAX_PENDING_PER_SID
+            ));
+        }
+        if visible_pending >= crate::scheduled::MAX_PENDING_VISIBLE {
+            return Err(anyhow!(
+                "this chat already sees {} pending scheduled messages (limit {})",
+                visible_pending,
+                crate::scheduled::MAX_PENDING_VISIBLE
+            ));
+        }
+
+        self.next_scheduled += 1;
+        // Counter durability comes before queue insertion: a later write failure
+        // burns a harmless gap but can never reuse the id.
+        self.persist_next_scheduled()?;
+        let item = crate::scheduled::ScheduledItem {
+            id: format!("d{}", self.next_scheduled),
+            sid: sid.to_string(),
+            project,
+            text,
+            send_at,
+            created_at: now,
+            created_by,
+            status: crate::scheduled::ScheduledStatus::Pending,
+            fail_reason: None,
+            failed_at: None,
+            reply_channel,
+            reply_chat_id,
+        };
+        self.scheduled_items.insert(
+            item.id.clone(),
+            ScheduledEntry {
+                project_dir: project_dir.clone(),
+                item: item.clone(),
+            },
+        );
+        if let Err(err) = self.persist_scheduled_sid(&project_dir, sid) {
+            self.scheduled_items.remove(&item.id);
+            return Err(err);
+        }
+        self.emit_scheduled_progress(
+            &item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_ENQUEUED,
+            None,
+        );
+        self.emit_scheduled_changed(&item);
+        self.scheduled_notify.notify_one();
+        Ok(item)
+    }
+
+    /// Cancel/dismiss one pending or failed row. The sid is part of the REST
+    /// resource address and prevents a globally-valid id being cancelled under
+    /// another session path.
+    pub fn cancel_scheduled_message(
+        &mut self,
+        sid: &str,
+        id: &str,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let entry = self
+            .scheduled_items
+            .get(id)
+            .filter(|entry| entry.item.sid == sid)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown scheduled message: {id}"))?;
+        self.scheduled_items.remove(id);
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, sid) {
+            self.scheduled_items.insert(id.to_string(), entry.clone());
+            return Err(err);
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_CANCELLED,
+            None,
+        );
+        self.emit_scheduled_changed(&entry.item);
+        self.scheduled_notify.notify_one();
+        Ok(entry.item)
+    }
+
+    fn emit_scheduled_progress(
+        &self,
+        item: &crate::scheduled::ScheduledItem,
+        event: &str,
+        reason: Option<&str>,
+    ) {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let preview = crate::scheduled::preview(&item.text);
+        let row = ccteam_harness::execution::progress_bridge::build_scheduled_event(
+            event,
+            &item.id,
+            &item.sid,
+            &item.send_at.to_rfc3339(),
+            (!preview.is_empty()).then_some(preview.as_str()),
+            reason,
+        );
+        if let Err(err) =
+            ccteam_core::progress::append_event(&paths.progress_jsonl(&item.project), &row)
+        {
+            tracing::warn!(id = %item.id, sid = %item.sid, error = %err, "append scheduled progress failed");
+        }
+    }
+
+    fn emit_scheduled_changed(&self, item: &crate::scheduled::ScheduledItem) {
+        let _ = self.events_broadcast.send(GatewayEvent {
+            id: format!("scheduled-changed-{}-{}", item.sid, item.id),
+            channel: "web".to_string(),
+            chat_id: "web-api".to_string(),
+            thread_ts: None,
+            content: String::new(),
+            kind: GatewayEventKind::ScheduledChanged,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(item.sid.clone()),
+            slug: Some(item.project.clone()),
+        });
+    }
+
+    fn gc_failed_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let expired = self
+            .scheduled_items
+            .iter()
+            .filter(|(_, entry)| entry.item.failed_expired(now))
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        for (id, entry) in expired {
+            self.scheduled_items.remove(&id);
+            if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+                tracing::warn!(id = %id, error = %err, "persist scheduled failed-item GC failed");
+                self.scheduled_items.insert(id, entry);
+                continue;
+            }
+            self.emit_scheduled_changed(&entry.item);
+        }
+    }
+
+    fn next_scheduled_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.scheduled_items
+            .values()
+            .filter_map(|entry| match entry.item.status {
+                crate::scheduled::ScheduledStatus::Pending => Some(entry.item.send_at),
+                crate::scheduled::ScheduledStatus::Failed => entry
+                    .item
+                    .failed_at
+                    .map(|at| at + crate::scheduled::FAILED_RETENTION),
+            })
+            .min()
+    }
+
+    async fn fire_due_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let mut due = self
+            .scheduled_items
+            .values()
+            .filter(|entry| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                    && entry.item.send_at <= now
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        due.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
+        for entry in due {
+            if now.signed_duration_since(entry.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE {
+                self.fail_scheduled(
+                    &entry.item.id,
+                    "catch-up is older than 24 hours".to_string(),
+                );
+                continue;
+            }
+            let result = self.submit_scheduled_user_turn(&entry.item).await;
+            match result {
+                Ok(()) => self.complete_scheduled_fire(&entry),
+                Err(err) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+            }
+        }
+    }
+
+    async fn submit_scheduled_user_turn(
+        &mut self,
+        item: &crate::scheduled::ScheduledItem,
+    ) -> Result<()> {
+        let chat = match (&item.reply_channel, &item.reply_chat_id) {
+            (Some(channel), Some(chat_id)) => ChatKey::new(channel, chat_id, chat_id),
+            _ => web_api_chat(),
+        };
+        match self
+            .submit_resolved(
+                &chat,
+                &item.sid,
+                "",
+                item.text.clone(),
+                TurnOrigin::User,
+                true,
+            )
+            .await?
+        {
+            SubmitResult::Turn { .. } => Ok(()),
+            SubmitResult::Directive(_) => Err(anyhow!("scheduled body was parsed as a directive")),
+        }
+    }
+
+    fn complete_scheduled_fire(&mut self, entry: &ScheduledEntry) {
+        self.scheduled_items.remove(&entry.item.id);
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+            tracing::warn!(id = %entry.item.id, error = %err, "persist fired scheduled removal failed");
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_FIRED,
+            None,
+        );
+        self.emit_scheduled_changed(&entry.item);
+    }
+
+    fn fail_scheduled(&mut self, id: &str, reason: String) {
+        let Some(mut entry) = self.scheduled_items.get(id).cloned() else {
+            return;
+        };
+        entry.item.status = crate::scheduled::ScheduledStatus::Failed;
+        entry.item.fail_reason = Some(reason.clone());
+        entry.item.failed_at = Some(chrono::Utc::now());
+        self.scheduled_items.insert(id.to_string(), entry.clone());
+        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
+            tracing::warn!(id = %id, error = %err, "persist scheduled failure failed");
+        }
+        self.emit_scheduled_progress(
+            &entry.item,
+            ccteam_harness::execution::progress_bridge::SCHEDULED_FAILED,
+            Some(&reason),
+        );
+        self.emit_scheduled_changed(&entry.item);
+        if let (Some(channel), Some(chat_id)) =
+            (&entry.item.reply_channel, &entry.item.reply_chat_id)
+        {
+            self.emit_user_signal(GatewayEvent {
+                id: format!("scheduled-failed-{}", entry.item.id),
+                channel: channel.clone(),
+                chat_id: chat_id.clone(),
+                thread_ts: None,
+                content: format!(
+                    "⏰ {} failed to send to {}: {} (kept in /inbox for 24h)",
+                    entry.item.id, entry.item.sid, reason
+                ),
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                sid: Some(entry.item.sid.clone()),
+                slug: Some(entry.item.project.clone()),
+            });
+        }
+    }
+
+    /// Lightweight wakeable next-fire task. It sleeps until the earliest UTC
+    /// deadline and is notified on every queue mutation; there is no periodic
+    /// orchestrator tick.
+    pub async fn run_scheduled_scheduler(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let notify = { Arc::clone(&gateway.lock().await.scheduled_notify) };
+        loop {
+            let next = {
+                let mut guard = gateway.lock().await;
+                let now = chrono::Utc::now();
+                guard.gc_failed_scheduled(now);
+                if guard.next_scheduled_at().is_some_and(|at| at <= now) {
+                    guard.fire_due_scheduled(now).await;
+                }
+                guard.next_scheduled_at()
+            };
+            match next {
+                Some(at) => {
+                    let delay = at
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = notify.notified() => {}
+                    }
+                }
+                None => notify.notified().await,
+            }
+        }
+    }
+
+    /// Process restart catch-up before the general live-session restore. A due
+    /// target cold-resumes itself through `submit_resolved`; the subsequent
+    /// restore sees it in the live map and skips a duplicate spawn.
+    pub async fn catch_up_scheduled(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let mut guard = gateway.lock().await;
+        let now = chrono::Utc::now();
+        guard.gc_failed_scheduled(now);
+        guard.fire_due_scheduled(now).await;
+    }
+
     /// v0.8.8 bug-fix — persist the USER side of a turn to
     /// `.ccteam/chat/<sid>/turns.jsonl`. The event pump only observes ANSWER
     /// events, so it writes assistant-only records; without this the user's
     /// prompts never land in the mirror and a session reopened from history
     /// (`GET /sessions/{sid}`) shows only the agent's replies (the user's
     /// messages "disappear" on session switch). Appended at submit time as a
-    /// user-only record; the pump later appends the assistant-only record for
-    /// the same turn, and `historyToRows` renders them as a user row then an
-    /// assistant row in append order. Best-effort: warns on failure, never
-    /// blocks the turn; holds no gateway lock (O_APPEND atomic write).
+    /// user-only record keyed by the submission's unique input id; the pump
+    /// later appends the assistant-only vendor-turn record. `historyToRows`
+    /// renders both in append order without duplicate row keys when several
+    /// inputs join one vendor turn. Best-effort: warns on failure, never blocks
+    /// the turn; holds no gateway lock (O_APPEND atomic write).
     fn mirror_user_turn(&self, session: &GatewaySession, user_text: &str, turn_id: &str) {
         if user_text.is_empty() {
             return;
-        }
-        // v0.9 T5 — mid-turn steer: a user message mirrored while a prior turn
-        // is still in flight (agent has already produced events). The opening
-        // prompt of a turn is mirrored after submit, usually before the pump
-        // drains → activity still 0 → not steered.
-        let in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
-        if in_flight && session.activity_events.load(Ordering::SeqCst) > 0 {
-            session.steered_this_turn.store(true, Ordering::SeqCst);
         }
         let Some(project_dir) = self.projects.get(&session.project).cloned() else {
             return;
@@ -4686,7 +5242,14 @@ impl Gateway {
         // `message_id` (the inbound IM message) seeds the 👀 ack reaction when a
         // real turn is submitted (empty for the web leg → no reaction).
         match self
-            .submit_resolved(chat, &session_id, message_id, payload, TurnOrigin::User)
+            .submit_resolved(
+                chat,
+                &session_id,
+                message_id,
+                payload,
+                TurnOrigin::User,
+                false,
+            )
             .await?
         {
             SubmitResult::Directive(replies) => Ok(replies),
@@ -5058,16 +5621,19 @@ impl Gateway {
         message_id: &str,
         payload: String,
         origin: TurnOrigin,
+        literal_user_text: bool,
     ) -> Result<SubmitResult> {
-        if let Some(directive) = parse_session_directive(&payload) {
-            // Directive path: PROBE-and-resume a dead child before dispatching
-            // (a directive may have side effects → never blindly retried). The
-            // turn path below uses the race-free reactive shape instead.
-            self.ensure_session_live(session_id, chat).await?;
-            let replies = self
-                .dispatch_directive(chat, session_id, directive, origin)
-                .await?;
-            return Ok(SubmitResult::Directive(replies));
+        if !literal_user_text {
+            if let Some(directive) = parse_session_directive(&payload) {
+                // Directive path: PROBE-and-resume a dead child before dispatching
+                // (a directive may have side effects → never blindly retried). The
+                // turn path below uses the race-free reactive shape instead.
+                self.ensure_session_live(session_id, chat).await?;
+                let replies = self
+                    .dispatch_directive(chat, session_id, directive, origin)
+                    .await?;
+                return Ok(SubmitResult::Directive(replies));
+            }
         }
 
         // Resume-by-sid (deepest rung): a session ABSENT from the live map —
@@ -5109,6 +5675,7 @@ impl Gateway {
                 session_id,
                 payload.clone(),
                 Some(origin),
+                literal_user_text,
             )?;
             self.resume_dead_session(session_id).await?;
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
@@ -5132,10 +5699,10 @@ impl Gateway {
             *target = chat.clone();
         }
         // v0.8.19 `/status` — a real Turn is now in flight: stamp its start (the
-        // pump clears it on `TurnCompleted`). Done for EVERY turn (web included,
-        // unlike the IM-only 👀 ack below) so `/status` shows 🔵 working with the
-        // elapsed time. Directives never reach here (they early-returned above),
-        // so a `/model` switch is correctly NOT counted as a working turn.
+        // pump clears it on `TurnCompleted`). A same-turn Inject preserves the
+        // original timestamp; resetting it here made any long-running turn look
+        // newly started whenever another message arrived. Directives never
+        // reach here, so a `/model` switch is not counted as a working turn.
         // v0.9 T5 — if a prior turn was still in flight this is a mid-turn
         // steer; otherwise clear the steered flag for a fresh turn.
         let was_in_flight = session
@@ -5143,13 +5710,20 @@ impl Gateway {
             .lock()
             .map(|g| g.is_some())
             .unwrap_or(false);
-        if was_in_flight {
-            session.steered_this_turn.store(true, Ordering::SeqCst);
-        } else {
+        let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
+        let requested_routing = TurnRouting::Inject;
+        let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
+        if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
-        }
-        if let Ok(mut started) = session.turn_started_at.lock() {
-            *started = Some(Instant::now());
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = Some(Instant::now());
+            }
+        } else if provisional_inject {
+            // Mark before awaiting the vendor acknowledgement: the active turn
+            // may complete immediately after accepting an interjection. An
+            // adapter that reports an actual Queue below rolls this provisional
+            // bit back while the original turn is still active.
+            session.steered_this_turn.store(true, Ordering::SeqCst);
         }
         // 👀 ack: add the transient "received, processing" reaction on the
         // inbound IM message the moment this turn is dispatched, filling the
@@ -5192,7 +5766,7 @@ impl Gateway {
         // session so the retry sees the resumed thread/adapter.
         let submit_wait = gateway_submit_timeout_duration();
         let mut attempt: u8 = 0;
-        let turn_id = loop {
+        let submitted = loop {
             attempt += 1;
             let outcome = {
                 let session = self
@@ -5201,24 +5775,48 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
                 tokio::time::timeout(
                     submit_wait,
-                    session
-                        .adapter
-                        .submit_turn(&session.thread, TurnInput::UserText(payload.clone())),
+                    session.adapter.submit_turn_routed(
+                        &session.thread,
+                        TurnInput::UserText(payload.clone()),
+                        requested_routing,
+                    ),
                 )
                 .await
             };
             match outcome {
                 Err(_) => {
-                    return Err(anyhow!(
+                    break Err(anyhow!(
                         "submit timed out after {submit_wait:?} for {session_id}"
-                    ))
+                    ));
                 }
-                Ok(Ok(id)) => break id,
+                Ok(Ok(submitted)) => break Ok(submitted),
                 Ok(Err(HarnessError::ThreadDied(_))) if attempt == 1 => {
-                    self.resume_dead_session(session_id).await?;
+                    if let Err(error) = self.resume_dead_session(session_id).await {
+                        break Err(error);
+                    }
                     continue;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(error)) => break Err(error.into()),
+            }
+        };
+        let mut submitted = match submitted {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                if provisional_inject {
+                    if let Some(session) = self.sessions.get(session_id) {
+                        let still_active = session
+                            .turn_started_at
+                            .lock()
+                            .map(|started| started.is_some())
+                            .unwrap_or(false);
+                        if still_active {
+                            session
+                                .steered_this_turn
+                                .store(prior_steered, Ordering::SeqCst);
+                        }
+                    }
+                }
+                return Err(error);
             }
         };
         // Re-fetch the session (a retry may have swapped its thread/adapter) for
@@ -5227,10 +5825,36 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        if submitted.disposition == TurnDisposition::Started {
+            // Adapter truth wins over the pre-submit Gateway marker. A dead
+            // mid-turn session can retain a stale Some until reactive resume;
+            // once the retried adapter starts a NEW vendor turn, reset both its
+            // elapsed clock and turn-scoped steer state unconditionally.
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = Some(Instant::now());
+            }
+            session.steered_this_turn.store(false, Ordering::SeqCst);
+        } else if provisional_inject && submitted.disposition == TurnDisposition::Queued {
+            let still_active = session
+                .turn_started_at
+                .lock()
+                .map(|started| started.is_some())
+                .unwrap_or(false);
+            if still_active {
+                session
+                    .steered_this_turn
+                    .store(prior_steered, Ordering::SeqCst);
+            }
+        }
+        let turn_id = submitted.turn_id.clone();
         if let Ok(mut origins) = session.turn_origins.lock() {
             origins.insert(turn_id.0.clone(), origin);
         }
-        self.mirror_user_turn(session, &user_text, &turn_id.0);
+        self.mirror_user_turn(session, &user_text, &submitted.input_id);
+        // Grok's native interjection path may hold its TurnCompleted boundary
+        // until the accepted input is registered above. Release only after
+        // origin and transcript bookkeeping are visible.
+        submitted.release_completion();
         let drained = self
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await?;
@@ -5488,7 +6112,7 @@ impl Gateway {
     }
 
     /// Session access scope — visibility (`/sessions`) AND addressing
-    /// (`/use` / `/stop` / `/screen`).
+    /// (`/use` / `/stop`).
     ///
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared user pool**: a
     /// chat reaches the sessions it OWNS, PLUS every session created by the web
@@ -7650,7 +8274,7 @@ impl Gateway {
         // has no inbound IM message) + the `web` channel both suppress the 👀
         // ack reaction — web has its own UI.
         match self
-            .submit_resolved(&web_api_chat(), sid, "", text, origin)
+            .submit_resolved(&web_api_chat(), sid, "", text, origin, false)
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id
@@ -8613,6 +9237,108 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     }
 }
 
+/// Whether this item is long-running work that can legitimately go silent
+/// between start and complete (tools, shell, search — not the final answer).
+fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
+    matches!(
+        details,
+        ThreadItemDetails::ToolCall { .. }
+            | ThreadItemDetails::CommandExecution { .. }
+            | ThreadItemDetails::WebSearch { .. }
+            | ThreadItemDetails::FileChange { .. }
+    )
+}
+
+/// Maintain the set of in-flight tool/command item ids for the silence
+/// watchdog. Start opens, complete closes, turn boundary clears all.
+fn track_open_work_items(open: &mut std::collections::HashSet<String>, evt: &ThreadEvent) {
+    match evt {
+        ThreadEvent::ItemStarted { item } if is_openable_work_item(&item.details) => {
+            open.insert(item.id.clone());
+        }
+        ThreadEvent::ItemCompleted { item } if is_openable_work_item(&item.details) => {
+            open.remove(&item.id);
+        }
+        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } => {
+            open.clear();
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod open_work_items_tests {
+    use super::*;
+    use ccteam_harness::{ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+
+    #[test]
+    fn open_work_tracks_tool_start_complete_and_clears_on_turn_end() {
+        let mut open = std::collections::HashSet::new();
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemStarted {
+                item: ThreadItem {
+                    id: "tc1".into(),
+                    details: ThreadItemDetails::ToolCall {
+                        name: "Bash".into(),
+                        args: serde_json::json!({}),
+                    },
+                },
+            },
+        );
+        assert!(open.contains("tc1"));
+        // Answer deltas are not open work.
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemUpdated {
+                item: ThreadItem {
+                    id: "msg".into(),
+                    details: ThreadItemDetails::AgentMessage("draft".into()),
+                },
+            },
+        );
+        assert_eq!(open.len(), 1);
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id: "tc1".into(),
+                    details: ThreadItemDetails::ToolCall {
+                        name: "Bash".into(),
+                        args: serde_json::json!({}),
+                    },
+                },
+            },
+        );
+        assert!(open.is_empty());
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::ItemStarted {
+                item: ThreadItem {
+                    id: "tc2".into(),
+                    details: ThreadItemDetails::CommandExecution {
+                        cmd: "sleep 600".into(),
+                        status: "running".into(),
+                    },
+                },
+            },
+        );
+        assert!(open.contains("tc2"));
+        track_open_work_items(
+            &mut open,
+            &ThreadEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: UnifiedTokenUsage::default(),
+                model: None,
+            },
+        );
+        assert!(
+            open.is_empty(),
+            "turn boundary must clear so a lost ItemCompleted cannot mute forever"
+        );
+    }
+}
+
 fn gateway_reply_wait_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS")
@@ -8939,6 +9665,34 @@ fn render_help() -> String {
     }
     s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
     s
+}
+
+fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
+    fn take_word(value: &str) -> Option<(&str, &str)> {
+        let value = value.trim_start();
+        let split = value.find(char::is_whitespace).unwrap_or(value.len());
+        let word = &value[..split];
+        (!word.is_empty()).then(|| (word, value[split..].trim_start()))
+    }
+
+    let (first, after_first) =
+        take_word(rest).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+    let needs_second = first == "今天"
+        || first == "明天"
+        || (first.len() == 10
+            && first.as_bytes().get(4) == Some(&b'-')
+            && first.as_bytes().get(7) == Some(&b'-'));
+    let (when, text) = if needs_second {
+        let (second, body) =
+            take_word(after_first).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+        (format!("{first} {second}"), body)
+    } else {
+        (first.to_string(), after_first)
+    };
+    if text.trim().is_empty() {
+        return Err(anyhow!("scheduled message text cannot be empty"));
+    }
+    Ok((when, text.to_string()))
 }
 
 /// Split an inbound callback payload `"{token}:{idx}"` (v0.8.5 D3).
@@ -9581,6 +10335,8 @@ mod tests {
         vendor: AgentVendor,
         starts: AtomicUsize,
         submissions: Arc<Mutex<Vec<(String, String)>>>,
+        routings: Arc<Mutex<Vec<TurnRouting>>>,
+        degrade_inject_to_queue: bool,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
         /// Notified whenever an event is pushed so `events()` can wait rather
         /// than terminate when the queue is momentarily empty (fixes the
@@ -9650,6 +10406,8 @@ mod tests {
                 vendor,
                 starts: AtomicUsize::new(0),
                 submissions: Arc::new(Mutex::new(Vec::new())),
+                routings: Arc::new(Mutex::new(Vec::new())),
+                degrade_inject_to_queue: false,
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 events_notify: Arc::new(tokio::sync::Notify::new()),
                 event_delay: std::time::Duration::ZERO,
@@ -9680,6 +10438,11 @@ mod tests {
 
         fn with_turn_started(mut self) -> Self {
             self.emit_turn_started = true;
+            self
+        }
+
+        fn with_inject_degraded_to_queue(mut self) -> Self {
+            self.degrade_inject_to_queue = true;
             self
         }
 
@@ -9825,6 +10588,30 @@ mod tests {
             // Wake any pump task that is waiting in `events()` for new work.
             self.events_notify.notify_one();
             Ok(TurnId::new(turn_id))
+        }
+
+        async fn submit_turn_routed(
+            &self,
+            h: &ThreadHandle,
+            input: TurnInput,
+            routing: TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+            self.routings.lock().await.push(routing);
+            let had_active = !self.submissions.lock().await.is_empty();
+            let disposition =
+                if self.degrade_inject_to_queue && had_active && routing == TurnRouting::Inject {
+                    TurnDisposition::Queued
+                } else if had_active && routing == TurnRouting::Inject {
+                    TurnDisposition::Injected
+                } else {
+                    TurnDisposition::Started
+                };
+            let turn_id = self.submit_turn(h, input).await?;
+            Ok(match disposition {
+                TurnDisposition::Started => ccteam_harness::TurnSubmission::started(turn_id),
+                TurnDisposition::Injected => ccteam_harness::TurnSubmission::injected(turn_id),
+                TurnDisposition::Queued => ccteam_harness::TurnSubmission::queued(turn_id),
+            })
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -9993,6 +10780,154 @@ mod tests {
             fake.submissions.lock().await.as_slice(),
             &[("alpha-reviewer-s1".to_string(), "hi".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn mid_turn_inject_preserves_original_working_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        // This sink-less fake emits an answer but no TurnCompleted boundary,
+        // leaving the first vendor turn marked in flight for the steer below.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        let first_started = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("first turn start");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        gateway.submit_to_sid(&sid, "steer".into()).await.unwrap();
+        let after_steer = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("turn remains active");
+        assert_eq!(after_steer, first_started, "Inject must not reset elapsed");
+        assert!(
+            gateway.sessions[&sid]
+                .steered_this_turn
+                .load(Ordering::SeqCst),
+            "same-turn submit is recorded as steered"
+        );
+        assert_eq!(
+            fake.routings.lock().await.as_slice(),
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "the application route is explicitly Inject for every message"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_submission_refreshes_stale_working_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        let stale = Instant::now() - std::time::Duration::from_secs(90);
+        *gateway.sessions[&sid].turn_started_at.lock().unwrap() = Some(stale);
+
+        // The fake has no active adapter submission, so despite the stale
+        // Gateway marker it honestly reports this accepted message as Started.
+        gateway
+            .submit_to_sid(&sid, "after resume".into())
+            .await
+            .unwrap();
+        let refreshed = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("new turn remains in flight");
+        assert!(
+            refreshed > stale + std::time::Duration::from_secs(60),
+            "Started disposition must replace stale turn_started_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_inject_is_reported_as_queue_not_steer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default().with_inject_degraded_to_queue());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        gateway.submit_to_sid(&sid, "queued".into()).await.unwrap();
+        assert!(
+            !gateway.sessions[&sid]
+                .steered_this_turn
+                .load(Ordering::SeqCst),
+            "adapter-reported Queue must roll back provisional steer state"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_started_reopens_working_window_for_queued_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let identity = gateway.sessions[&sid].thread.identity.clone();
+        *gateway.sessions[&sid].turn_started_at.lock().unwrap() = None;
+        fake.events.lock().await.push_back((
+            identity,
+            ThreadEvent::TurnStarted {
+                turn_id: "queued-2".into(),
+            },
+        ));
+        fake.events_notify.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if gateway.session_turn_in_flight(&sid) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event pump stamps queued TurnStarted");
     }
 
     /// V0.8.6 W5b — the resource-API spine: create a session via
@@ -10607,6 +11542,7 @@ mod tests {
             &sid,
             "queued-first",
             Some("web".into()),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -13164,11 +14100,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies.len(), 1);
-        assert!(
-            replies[0].starts_with("project set to beta"),
-            "{}",
-            replies[0]
+        assert_eq!(
+            replies,
+            vec![
+                "project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"
+            ]
         );
         assert_eq!(gateway.current_project_for(&chat), "beta");
 
@@ -13188,7 +14124,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["using session s1"]);
+        assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
         assert_eq!(gateway.current_project_for(&chat), "alpha");
         assert_eq!(
             gateway.current_session.read().unwrap().get(&chat).cloned(),
@@ -14986,6 +15922,53 @@ mod tests {
                 .unwrap();
             assert_eq!(reply, vec![expected.to_string()]);
         }
+    }
+
+    #[tokio::test]
+    async fn im_model_receipt_appends_status_hint() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::Done {
+                receipt: "已切换 model → opus（live）".into(),
+            });
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-im");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let replies = gateway
+            .handle_text("mock", "chat-1", "alice", "/model opus")
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["已切换 model → opus（live）\n↓ 查看状态 → /status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_model_receipt_stays_byte_identical() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::Done {
+                receipt: "已切换 model → opus（live）".into(),
+            });
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-web");
+        gateway
+            .handle_text("web", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let replies = gateway
+            .handle_text("web", "chat-1", "alice", "/model opus")
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["已切换 model → opus（live）"]);
     }
 
     /// Concept lock (arch-refactor §8-4 + §8-5): a `NeedsChoice` registers a
@@ -17746,5 +18729,239 @@ mod tests {
             }
             _ => unreachable!("filtered above"),
         }
+    }
+
+    #[tokio::test]
+    async fn inbox_create_list_and_cancel_use_current_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway
+            .enable_persistence(tmp.path().join("ccteam-home"))
+            .unwrap();
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let created = gateway
+            .handle_text(
+                "mock",
+                "chat-1",
+                "alice",
+                "/inbox +30m review the release notes",
+            )
+            .await
+            .unwrap();
+        assert!(created[0].contains("scheduled d1 → s1"), "{created:?}");
+
+        let listed = gateway
+            .handle_text("mock", "chat-1", "alice", "/inbox")
+            .await
+            .unwrap();
+        assert!(listed[0].contains("d1 · s1"), "{listed:?}");
+        assert!(listed[0].contains("review the release notes"));
+
+        let cancelled = gateway
+            .handle_text("mock", "chat-1", "alice", "/inbox cancel d1")
+            .await
+            .unwrap();
+        assert_eq!(cancelled, vec!["cancelled d1"]);
+        assert!(gateway.scheduled_items_for_sid("s1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_list_reuses_own_plus_web_pool_acl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/inbox +30m own-message")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-2", "bob", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-2", "bob", "/inbox +30m foreign-message")
+            .await
+            .unwrap();
+        let web_sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .create_scheduled_message(
+                &web_sid,
+                "web-pool-message".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(30),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+
+        let listed = gateway
+            .handle_text("telegram", "chat-1", "alice", "/inbox")
+            .await
+            .unwrap();
+        assert!(listed[0].contains("own-message"), "{listed:?}");
+        assert!(listed[0].contains("web-pool-message"), "{listed:?}");
+        assert!(!listed[0].contains("foreign-message"), "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_slash_body_fires_as_literal_user_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "/model opus".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        // Exercise the cold-start pending_turns leg too: the literal flag must
+        // survive enqueue/drain rather than turning `/model` into a directive.
+        fake.live.store(false, Ordering::SeqCst);
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+
+        let submissions = fake.submissions.lock().await.clone();
+        assert!(submissions.iter().any(|(_, text)| text == "/model opus"));
+        assert!(fake.directives.lock().await.is_empty());
+        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_id_counter_survives_cancel_and_daemon_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        seed_role(&project_dir, "reviewer");
+        let root = tmp.path().join("home");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_persistence(&root).unwrap();
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let first = gateway
+            .create_scheduled_message(
+                &sid,
+                "first".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.id, "d1");
+        gateway.cancel_scheduled_message(&sid, "d1").unwrap();
+        drop(gateway);
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restored = Gateway::new(fake, "alpha", &project_dir);
+        restored.enable_persistence(&root).unwrap();
+        let second = restored
+            .create_scheduled_message(
+                &sid,
+                "second".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(10),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second.id, "d2", "cancelled ids are never reused");
+    }
+
+    #[tokio::test]
+    async fn scheduled_restart_catch_up_marks_over_24h_failed_then_gc_expires_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "too old".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::hours(25);
+
+        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+        let failed = gateway.scheduled_items_for_sid(&sid).unwrap();
+        assert_eq!(failed[0].status, crate::scheduled::ScheduledStatus::Failed);
+        assert!(failed[0]
+            .fail_reason
+            .as_deref()
+            .unwrap()
+            .contains("older than 24 hours"));
+        assert!(fake.submissions.lock().await.is_empty());
+
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .failed_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
+        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
     }
 }

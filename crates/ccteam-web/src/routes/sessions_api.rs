@@ -667,7 +667,7 @@ pub struct TurnAttachment {
     #[serde(default)]
     pub name: Option<String>,
     /// Skill source: omitted / `"project"` keeps the project-local behavior;
-    /// `"global"` resolves a nested id in the admin's user-level library.
+    /// `"global"` resolves a nested id in the user-level global library.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -838,11 +838,6 @@ pub(crate) async fn handle_session_turn(
         .attachments
         .iter()
         .any(|att| att.scope.as_deref() == Some("global"));
-    if has_global_attachment {
-        if let Some(deny) = crate::auth::deny_non_admin(&identity) {
-            return deny;
-        }
-    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
@@ -954,6 +949,186 @@ pub(crate) async fn handle_session_turn(
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
             create_error(StatusCode::BAD_GATEWAY, format_submit_error(&err), mode)
+        }
+    }
+}
+
+/// JSON body for a one-shot delayed user turn. `send_at` and `when` are
+/// aliases for the same strict daemon-local parser; exactly one is required.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateScheduledRequest {
+    pub text: String,
+    #[serde(default)]
+    pub send_at: Option<String>,
+    #[serde(default)]
+    pub when: Option<String>,
+}
+
+/// `GET /api/v1/sessions/{sid}/scheduled`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{sid}/scheduled",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    responses(
+        (status = 200, description = "Pending and retained failed scheduled messages", body = serde_json::Value),
+        (status = 404, description = "Unknown or invisible session"),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_list_scheduled(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let result = gw.lock().await.scheduled_items_for_sid(&sid);
+    match result {
+        Ok(items) => Json(items).into_response(),
+        Err(_) => unknown_session(&sid),
+    }
+}
+
+/// `POST /api/v1/sessions/{sid}/scheduled` — create a one-shot delayed normal
+/// user turn. Time parsing is identical to IM `/inbox` and uses daemon local
+/// time while persistence/wire values are UTC RFC3339.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{sid}/scheduled",
+    tag = "sessions",
+    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    request_body = CreateScheduledRequest,
+    responses(
+        (status = 201, description = "Scheduled item", body = serde_json::Value),
+        (status = 400, description = "Empty body or invalid/past/out-of-range time"),
+        (status = 404, description = "Unknown or invisible session"),
+        (status = 409, description = "Pending-message limit reached"),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_create_scheduled(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path(sid): Path<String>,
+    Json(request): Json<CreateScheduledRequest>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    if request.text.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "scheduled message text cannot be empty"})),
+        )
+            .into_response();
+    }
+    let when = match (request.send_at.as_deref(), request.when.as_deref()) {
+        (Some(value), None) | (None, Some(value)) => value,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "provide exactly one of `send_at` or `when`"})),
+            )
+                .into_response()
+        }
+    };
+    let send_at = match ccteam_im::scheduled::parse_send_time(when) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let visible_projects = if identity.is_admin {
+        None
+    } else {
+        Some(
+            ccteam_core::collect_projects(&app.paths)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|project| identity.can_see_owner(project.state.owner.as_deref()))
+                .map(|project| project.state.slug)
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    };
+    let result = gw.lock().await.create_scheduled_message(
+        &sid,
+        request.text,
+        send_at,
+        identity.owner_tag(),
+        visible_projects.as_ref(),
+    );
+    match result {
+        Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
+        Err(err) => {
+            let message = err.to_string();
+            let status = if message.contains("limit") || message.contains("already has") {
+                StatusCode::CONFLICT
+            } else if message.contains("unknown session") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("cannot be empty")
+                || message.contains("future")
+                || message.contains("within 7 days")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                tracing::warn!(%sid, error = %err, "create scheduled message failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({"error": message}))).into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/sessions/{sid}/scheduled/{id}` — cancel a pending row or
+/// dismiss a retained failure.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sessions/{sid}/scheduled/{id}",
+    tag = "sessions",
+    params(
+        ("sid" = String, Path, description = "Gateway session id (`s{n}`)"),
+        ("id" = String, Path, description = "Scheduled id (`d{n}`)"),
+    ),
+    responses(
+        (status = 200, description = "Cancelled/dismissed", body = serde_json::Value),
+        (status = 404, description = "Unknown item, session, or invisible session"),
+        (status = 503, description = "No live gateway"),
+    ),
+)]
+pub(crate) async fn handle_cancel_scheduled(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path((sid, id)): Path<(String, String)>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    match gw.lock().await.cancel_scheduled_message(&sid, &id) {
+        Ok(_) => Json(json!({"cancelled": true, "id": id})).into_response(),
+        Err(err) if err.to_string().contains("unknown scheduled") => unknown_session(&id),
+        Err(err) => {
+            tracing::warn!(%sid, %id, error = %err, "cancel scheduled message failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
         }
     }
 }
@@ -1661,6 +1836,7 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         // exhaustiveness).
         GatewayEventKind::Delegation { .. } => ("delegation", false),
         GatewayEventKind::SessionLifecycle { .. } => ("session_lifecycle", false),
+        GatewayEventKind::ScheduledChanged => ("scheduled_changed", false),
     };
     let mut payload = json!({
         "id": ev.id,
@@ -2008,6 +2184,18 @@ mod tests {
         assert_eq!(payload["kind"], "session_lifecycle");
         assert_eq!(payload["state"], "evicted");
         assert_eq!(payload["reason"], "capacity");
+    }
+
+    #[test]
+    fn session_event_serializes_lightweight_scheduled_invalidation() {
+        let mut ev = gw_event(Some("s4"));
+        ev.content.clear();
+        ev.kind = ccteam_im::gateway::GatewayEventKind::ScheduledChanged;
+        let payload = session_event_payload(&ev);
+        assert_eq!(payload["kind"], "scheduled_changed");
+        assert_eq!(payload["sid"], "s4");
+        assert_eq!(payload["content"], "");
+        assert!(payload.get("items").is_none());
     }
 
     /// v0.8.19 — a structured `Activity` event serializes `kind:"activity"`
@@ -2427,15 +2615,29 @@ mod tests {
         async fn start_thread(
             &self,
             _spec: &ccteam_harness::AgentSpecBrief,
-            _ctx: &ccteam_harness::SpawnCtx,
+            ctx: &ccteam_harness::SpawnCtx,
         ) -> Result<ccteam_harness::ThreadHandle, ccteam_harness::HarnessError> {
-            unimplemented!("not exercised by these tests")
+            Ok(ccteam_harness::ThreadHandle {
+                vendor: AgentVendor::Claude,
+                mode: ccteam_harness::ExecutionMode::Chat,
+                identity: format!("test-{}", ctx.sid),
+                started_at: chrono::Utc::now(),
+                raw_extras: serde_json::json!({}),
+            })
         }
         async fn submit_turn(
             &self,
             _h: &ccteam_harness::ThreadHandle,
             _input: ccteam_harness::TurnInput,
         ) -> Result<ccteam_harness::TurnId, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn submit_turn_routed(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+            _input: ccteam_harness::TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError> {
             unimplemented!("not exercised by these tests")
         }
         fn events(
@@ -2487,6 +2689,90 @@ mod tests {
             paths.projects_root.join("demo"),
         );
         AppState::new(paths).with_gateway(std::sync::Arc::new(tokio::sync::Mutex::new(gateway)))
+    }
+
+    #[tokio::test]
+    async fn scheduled_rest_create_list_and_cancel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        let sid = app
+            .gateway
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .create_session_api(
+                "demo".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let identity = crate::auth::Identity::admin();
+
+        let created = handle_create_scheduled(
+            State(app.clone()),
+            Extension(identity.clone()),
+            Path(sid.clone()),
+            Json(CreateScheduledRequest {
+                text: "run the checks".into(),
+                send_at: None,
+                when: Some("+30m".into()),
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let listed = handle_list_scheduled(
+            State(app.clone()),
+            Extension(identity.clone()),
+            Path(sid.clone()),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            app.gateway
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .scheduled_items_for_sid(&sid)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let cancelled = handle_cancel_scheduled(
+            State(app.clone()),
+            Extension(identity),
+            Path((sid.clone(), "d1".into())),
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert!(app
+            .gateway
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .scheduled_items_for_sid(&sid)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn scheduled_request_rejects_attachment_fields() {
+        let parsed = serde_json::from_value::<CreateScheduledRequest>(serde_json::json!({
+            "text": "later",
+            "when": "+30m",
+            "attachments": [{"kind": "file", "path": "/tmp/nope"}]
+        }));
+        assert!(
+            parsed.is_err(),
+            "scheduled v1 must not silently accept attachments"
+        );
     }
 
     /// Register + sid-tag a pending approval directly against the app's

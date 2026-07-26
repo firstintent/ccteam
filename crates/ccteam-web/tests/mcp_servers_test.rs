@@ -214,7 +214,7 @@ async fn mcp_servers_acl_fails_closed_for_tenants() {
         .unwrap();
     assert_eq!(r.status(), 404);
 
-    // Own project: read OK, but the config WRITE is admin-only → 403.
+    // Own project: both read and config write are governed by project ACL.
     let r = c
         .get(format!(
             "http://{addr}/api/v1/projects/aliceproj/mcp-servers"
@@ -233,5 +233,5 @@ async fn mcp_servers_acl_fails_closed_for_tenants() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "config write is admin-only");
+    assert_eq!(r.status(), 201, "tenant writes its own project config");
 }

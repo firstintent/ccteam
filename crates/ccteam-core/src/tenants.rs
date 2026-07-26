@@ -210,6 +210,16 @@ impl TenantRegistry {
         self.tenants.iter().find(|t| t.id == id)
     }
 
+    /// Replace one tenant's web token and return the newly minted secret.
+    /// Returns `None` when `id` is not present; callers persist the registry
+    /// after a successful rotation.
+    pub fn rotate_token(&mut self, id: &str) -> Option<String> {
+        let tenant = self.tenants.iter_mut().find(|t| t.id == id)?;
+        let token = session_secret::mint();
+        tenant.web_token = token.clone();
+        Some(token)
+    }
+
     /// Remove a tenant by id. Returns whether one was removed.
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.tenants.len();
@@ -305,6 +315,19 @@ mod tests {
         assert_eq!(reg.by_id(&a.id).map(|t| &t.handle), Some(&a.handle));
         assert!(reg.by_token("nope").is_none());
         assert!(reg.by_id("uffffffff").is_none());
+    }
+
+    #[test]
+    fn rotate_token_replaces_only_the_requested_tenant() {
+        let mut reg = TenantRegistry::default();
+        let alice = reg.add("alice");
+        let bob = reg.add("bob");
+
+        let next = reg.rotate_token(&alice.id).expect("alice exists");
+        assert_ne!(next, alice.web_token);
+        assert_eq!(reg.by_id(&alice.id).unwrap().web_token, next);
+        assert_eq!(reg.by_id(&bob.id).unwrap().web_token, bob.web_token);
+        assert!(reg.rotate_token("ughost").is_none());
     }
 
     #[test]

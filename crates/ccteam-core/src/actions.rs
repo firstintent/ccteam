@@ -36,7 +36,7 @@ use crate::inbox::{
     inbox_filename, InboxFrontMatter, InboxMessage, SessionMailbox, LATEST_SCHEMA_VERSION,
 };
 use crate::paths::CcteamPaths;
-use crate::state::{PhaseState, ProjectState};
+use crate::state::ProjectState;
 
 /// Source label every action helper stamps onto inbox front matter.
 ///
@@ -211,9 +211,8 @@ pub fn pause(paths: &CcteamPaths, slug: &str) -> Result<()> {
 
 /// Resume a paused project.
 ///
-/// Clears `user_pause_pending`, lifts `user_attached`, re-arms
-/// `phase_state=Idle` so the F66 workflow loop's next tick can
-/// re-evaluate. Archives any sibling `escalation.md` to
+/// Clears `user_pause_pending` and lifts `user_attached`. Archives any sibling
+/// `escalation.md` to
 /// `escalation.<context_reset_count>.md` so future ESCALATE writes
 /// don't collide.
 ///
@@ -226,7 +225,6 @@ pub fn resume(paths: &CcteamPaths, slug: &str) -> Result<()> {
         ProjectState::load(&state_path).with_context(|| format!("load state for {slug}"))?;
     state.user_pause_pending = false;
     state.user_attached = false;
-    state.phase_state = PhaseState::Idle;
     state.last_user_interaction_at = Utc::now();
     state.save(&state_path)?;
 
@@ -401,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_clears_pause_and_resets_phase_state_to_idle() {
+    fn resume_clears_pause_and_user_attachment() {
         let (_tmp, paths) = isolated_paths();
         bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
         let state_path = paths.project_state("demo");
@@ -419,7 +417,6 @@ mod tests {
         let after = ProjectState::load(&state_path).unwrap();
         assert!(!after.user_pause_pending);
         assert!(!after.user_attached);
-        assert_eq!(after.phase_state, PhaseState::Idle);
     }
 
     #[test]

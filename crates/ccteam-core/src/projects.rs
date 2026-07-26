@@ -295,6 +295,40 @@ Until this file is filled in, keep replies short, ask clarifying questions, and
 do **not** guess at the task or start open-ended exploration.
 ";
 
+const DEFAULT_WORKFLOW_YAML: &str = r#"# ccteam workflow.yaml.
+# Edit this file to declare your project's agent topology. Each agent
+# is a role (filename of .claude/agents/<role>.md) with a trigger that
+# decides when ccteam spawns a session for it.
+#
+# Trigger grammar:
+#   manual                        # explicit `ccteam spawn <slug> <role>` only
+#   schedule                      # periodic; needs `schedule:` 5-field cron
+#   gate                          # waits for `trigger_gate` MCP / CLI call
+#   watch:.ccteam/issues/         # spawn one session per new file under the path
+name: default-workflow
+description: |
+  Minimal starter workflow. Edit me — declare your own agents below.
+  (v0.9.0: ccteam seeds no default role; sessions are roleless unless
+  you author `.claude/agents/<role>.md` or install one from the hub.)
+
+agents: {}
+"#;
+
+/// Write the standard `.ccteam/workflow.yaml` project scaffold. Existing
+/// content is preserved unless `force` is true.
+pub fn scaffold_workflow_yaml(target: &Path, force: bool) -> Result<()> {
+    let ccteam_dir = target.join(".ccteam");
+    std::fs::create_dir_all(&ccteam_dir)
+        .with_context(|| format!("create {}", ccteam_dir.display()))?;
+    let path = ccteam_dir.join("workflow.yaml");
+    if path.exists() && !force {
+        return Ok(());
+    }
+    std::fs::write(&path, DEFAULT_WORKFLOW_YAML)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 pub fn bootstrap_project_at_dir(
     // `paths` is the global `~/.ccteam/` root. It feeds the
     // home-ensure below (`ensure_ccteam_home`) so the `hook.sh`

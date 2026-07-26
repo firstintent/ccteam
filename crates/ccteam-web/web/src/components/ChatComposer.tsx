@@ -9,7 +9,7 @@
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
 //   - attach menu (＋): upload files/photos + attach skills in TWO sections —
-//     the project-local list and, admins only, the user-level global library
+//     the project-local list and the user-level global library
 //     (`GET /api/v1/skills`; a library pick rides the turn as
 //     `{kind:"skill", scope:"global"}`, never an install). Picked
 //     files upload immediately (chips show progress), paste/drag-drop attach
@@ -20,6 +20,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   ChevronRight,
+  Clock,
   FileText,
   Hand,
   Image as ImageIcon,
@@ -67,6 +68,109 @@ export function shouldSubmitOnEnter(e: {
   return true;
 }
 
+/** Inputs that resolve to a daemon `when` string for delayed send. */
+export type ScheduleTimeDraft = {
+  /** Quick chip such as `+30m` / `+1h`; wins over free-form numbers when set. */
+  chip?: string;
+  /** Free-form minutes (integer ≥ 0). Combined with hours as total delay. */
+  minutes?: string;
+  /** Free-form hours (integer ≥ 0). */
+  hours?: string;
+  /** `datetime-local` value (`YYYY-MM-DDTHH:MM`) in the **browser** wall clock. */
+  absolute?: string;
+};
+
+function parseNonNegInt(raw: string | undefined): number | null {
+  if (raw == null) return null;
+  const t = raw.trim();
+  if (t === "" || !/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
+/** Parse a `datetime-local` string as the browser's local wall clock. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure parser stays co-located with the scheduling helpers it serves and is exported for vitest.
+export function datetimeLocalToMs(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const [, ys, mos, ds, hs, mins] = m;
+  const ms = new Date(
+    Number(ys),
+    Number(mos) - 1,
+    Number(ds),
+    Number(hs),
+    Number(mins),
+    0,
+    0,
+  ).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Build the daemon-facing `when` string.
+ *
+ * Prefer **relative** `+Nm` so browser timezone and daemon timezone never
+ * disagree: absolute `datetime-local` is converted to minutes-from-now using
+ * the browser clock (same real-world instant on any NTP-synced host).
+ * Returns `null` when nothing valid / not in the future.
+ */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function buildScheduleWhen(
+  draft: ScheduleTimeDraft,
+  nowMs: number = Date.now(),
+): string | null {
+  const chip = draft.chip?.trim() ?? "";
+  if (/^\+\d+[mh]$/.test(chip)) return chip;
+
+  const hours = parseNonNegInt(draft.hours);
+  const minutes = parseNonNegInt(draft.minutes);
+  if (hours !== null || minutes !== null) {
+    const total = (hours ?? 0) * 60 + (minutes ?? 0);
+    if (total <= 0) return null;
+    return `+${total}m`;
+  }
+
+  const absolute = draft.absolute?.trim() ?? "";
+  if (absolute.includes("T")) {
+    const target = datetimeLocalToMs(absolute);
+    if (target == null) return null;
+    const mins = Math.round((target - nowMs) / 60_000);
+    if (mins <= 0) return null;
+    return `+${mins}m`;
+  }
+  return null;
+}
+
+/** Human preview of a relative `when` as a local clock time (for the UI). */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function scheduleWhenPreview(
+  when: string,
+  nowMs: number = Date.now(),
+  locale = "en-US",
+): string | null {
+  const m = /^\+(\d+)([mh])$/.exec(when.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  const ms = m[2] === "h" ? n * 3_600_000 : n * 60_000;
+  const at = new Date(nowMs + ms);
+  return at.toLocaleString(locale, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** @deprecated use {@link buildScheduleWhen}; kept for older call sites/tests. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper for vitest.
+export function scheduleWireWhen(value: string, nowMs: number = Date.now()): string {
+  if (value.includes("T")) {
+    return buildScheduleWhen({ absolute: value }, nowMs) ?? value.replace("T", " ");
+  }
+  return value;
+}
+
 /** One composer chip: a picked file mid-upload / stored, or an attached
  *  skill. `path` is set once the server stored the file (skills carry the
  *  id in `name` and never upload). `scope === "global"` marks a skill picked
@@ -104,38 +208,34 @@ export function attachmentsBlockSend(items: ComposerAttachment[]): boolean {
   return items.some((a) => a.status === "uploading");
 }
 
-/** The attach-menu skill lists: the project list always, the user-level
- *  global library ONLY for admins (the endpoint itself is admin-only — a
- *  non-admin must not even fire the request). `global === null` = not asked. */
+/** The attach-menu skill lists: project-local and user-level global library. */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
-export function fetchSkillLists(
-  slug: string,
-  isAdmin: boolean,
-): { project: Promise<SkillSummary[]>; global: Promise<LibrarySkillSummary[]> | null } {
+export function fetchSkillLists(slug: string): {
+  project: Promise<SkillSummary[]>;
+  global: Promise<LibrarySkillSummary[]>;
+} {
   return {
     project: listProjectSkills(slug),
-    global: isAdmin ? listLibrarySkills() : null,
+    global: listLibrarySkills(),
   };
 }
 
 /** The attach menu's skill area — two sections: the project-local list
- *  (existing behavior) and, admins only, the user-level Global library.
+ *  (existing behavior) and the user-level Global library.
  *  Picking a library skill attaches `{kind:"skill", scope:"global"}` — it
  *  never installs anything. Extracted as a pure presentational component so
  *  the admin/non-admin split is render-testable in the node vitest env. */
 export function SkillMenuSections({
   lang,
-  isAdmin,
   skills,
   globalSkills,
   attachments,
   onToggleSkill,
 }: {
   lang: Lang;
-  isAdmin: boolean;
   /** `null` = still loading. */
   skills: SkillSummary[] | null;
-  /** `null` = still loading (or never fetched — non-admin). */
+  /** `null` = still loading. */
   globalSkills: LibrarySkillSummary[] | null;
   attachments: ComposerAttachment[];
   onToggleSkill: (name: string, scope: "project" | "global") => void;
@@ -169,37 +269,33 @@ export function SkillMenuSections({
           );
         })
       )}
-      {isAdmin ? (
-        <>
-          <div className="sel-group" data-testid="skill-section-global">
-            {t("attachSkillGlobal")}
-          </div>
-          {globalSkills === null ? (
-            <div className="sel-item muted skill-row">…</div>
-          ) : globalSkills.length === 0 ? (
-            <div className="sel-item muted skill-row">{t("noGlobalSkills")}</div>
-          ) : (
-            globalSkills.map((g) => {
-              const on = attachments.some(
-                (a) => a.kind === "skill" && a.name === g.id && a.scope === "global",
-              );
-              return (
-                <button
-                  key={g.id}
-                  type="button"
-                  className={`sel-item skill-row ${on ? "selected" : ""}`}
-                  data-testid={`skill-global-${g.id}`}
-                  onClick={() => onToggleSkill(g.id, "global")}
-                  title={g.description || g.id}
-                >
-                  {g.id}
-                  <span className="check">✓</span>
-                </button>
-              );
-            })
-          )}
-        </>
-      ) : null}
+      <div className="sel-group" data-testid="skill-section-global">
+        {t("attachSkillGlobal")}
+      </div>
+      {globalSkills === null ? (
+        <div className="sel-item muted skill-row">…</div>
+      ) : globalSkills.length === 0 ? (
+        <div className="sel-item muted skill-row">{t("noGlobalSkills")}</div>
+      ) : (
+        globalSkills.map((g) => {
+          const on = attachments.some(
+            (a) => a.kind === "skill" && a.name === g.id && a.scope === "global",
+          );
+          return (
+            <button
+              key={g.id}
+              type="button"
+              className={`sel-item skill-row ${on ? "selected" : ""}`}
+              data-testid={`skill-global-${g.id}`}
+              onClick={() => onToggleSkill(g.id, "global")}
+              title={g.description || g.id}
+            >
+              {g.id}
+              <span className="check">✓</span>
+            </button>
+          );
+        })
+      )}
     </>
   );
 }
@@ -237,6 +333,8 @@ export function ChatComposer({
   sendTestId = "composer-send",
   uploadSlug,
   prefill,
+  onSchedule,
+  scheduleTimezone,
 }: {
   /** localStorage draft scope — `"home"` or the sid. */
   draftKey: string;
@@ -272,6 +370,10 @@ export function ChatComposer({
   /** Home 快速开始 templates: bump `nonce` to replace the draft text with
    *  `text` and focus the textarea (nonce 0 = no prefill). */
   prefill?: { text: string; nonce: number };
+  /** Conversation-only delayed send. Omit on Home to hide schedule mode. */
+  onSchedule?: (text: string, when: string) => boolean | void;
+  /** Label reported by the daemon (`PDT (UTC-07:00)`, etc.). */
+  scheduleTimezone?: string;
 }) {
   const t = makeT(lang);
   const [text, setText] = useState(() => loadDraft(draftKey));
@@ -281,6 +383,13 @@ export function ChatComposer({
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const [globalSkills, setGlobalSkills] = useState<LibrarySkillSummary[] | null>(null);
+  const [scheduleMode, setScheduleMode] = useState(false);
+  /** Quick chip (`+30m`) — exclusive with free-form numbers / absolute. */
+  const [scheduleChip, setScheduleChip] = useState("");
+  const [scheduleMinutes, setScheduleMinutes] = useState("");
+  const [scheduleHours, setScheduleHours] = useState("");
+  /** `datetime-local` value in the browser wall clock. */
+  const [scheduleAbsolute, setScheduleAbsolute] = useState("");
   const composingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const selRef = useRef<HTMLDivElement | null>(null);
@@ -350,6 +459,7 @@ export function ChatComposer({
 
   const attachFiles = useCallback(
     (files: FileList | File[] | null | undefined) => {
+      if (scheduleMode) return;
       const picked = Array.from(files ?? []);
       if (picked.length === 0) return;
       if (!uploadSlug) {
@@ -383,7 +493,7 @@ export function ChatComposer({
           });
       }
     },
-    [uploadSlug, t],
+    [uploadSlug, scheduleMode, t],
   );
 
   const toggleSkill = useCallback((skill: string, scope: "project" | "global" = "project") => {
@@ -422,33 +532,76 @@ export function ChatComposer({
   }, [uploadSlug, t]);
 
   /** Expand/collapse the folded skills submenu; fetch the lists lazily on
-   *  first expand — the project list always, the global library only for
-   *  admins (the render-phase reset clears both caches on a project switch). */
+   *  first expand (the render-phase reset clears both caches on a project switch). */
   const toggleSkillsOpen = useCallback(() => {
     setSkillsOpen((open) => {
       const next = !open;
-      if (next && uploadSlug && (skills === null || (isAdmin && globalSkills === null))) {
-        const lists = fetchSkillLists(uploadSlug, isAdmin);
-        // One list may already be cached (e.g. /me resolved admin AFTER the
-        // first expand) — refresh only the stale one, and settle the other so
-        // its promise can't go unhandled.
+      if (next && uploadSlug && (skills === null || globalSkills === null)) {
+        const lists = fetchSkillLists(uploadSlug);
+        // One list may already be cached — refresh only the stale one, and
+        // settle the other so its promise can't go unhandled.
         if (skills === null) {
           lists.project.then(setSkills).catch(() => setSkills([]));
         } else {
           lists.project.catch(() => {});
         }
-        if (lists.global && globalSkills === null) {
+        if (globalSkills === null) {
           lists.global.then(setGlobalSkills).catch(() => setGlobalSkills([]));
+        } else {
+          lists.global.catch(() => {});
         }
       }
       return next;
     });
-  }, [skills, globalSkills, uploadSlug, isAdmin]);
+  }, [skills, globalSkills, uploadSlug]);
 
   // ---- send ------------------------------------------------------------------
 
+  const resolvedScheduleWhen = scheduleMode
+    ? buildScheduleWhen({
+        chip: scheduleChip,
+        minutes: scheduleMinutes,
+        hours: scheduleHours,
+        absolute: scheduleAbsolute,
+      })
+    : null;
+
+  const clearScheduleFields = useCallback(() => {
+    setScheduleChip("");
+    setScheduleMinutes("");
+    setScheduleHours("");
+    setScheduleAbsolute("");
+  }, []);
+
   const send = useCallback(() => {
     const trimmed = text.trim();
+    if (scheduleMode) {
+      if (!trimmed) {
+        toastBus.handler?.info(t("emptyInput"));
+        return;
+      }
+      const when = buildScheduleWhen({
+        chip: scheduleChip,
+        minutes: scheduleMinutes,
+        hours: scheduleHours,
+        absolute: scheduleAbsolute,
+      });
+      if (!when) {
+        toastBus.handler?.info(t("schedulePickTime"));
+        return;
+      }
+      const keep = onSchedule?.(trimmed, when) === false;
+      if (keep) return;
+      setText("");
+      clearScheduleFields();
+      setScheduleMode(false);
+      try {
+        localStorage.removeItem(draftStorageKey(draftKey));
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     if (!trimmed && attachments.length === 0) {
       toastBus.handler?.info(t("emptyInput"));
       return;
@@ -466,7 +619,20 @@ export function ChatComposer({
     } catch {
       /* ignore */
     }
-  }, [text, attachments, onSend, draftKey, t]);
+  }, [
+    text,
+    attachments,
+    onSend,
+    onSchedule,
+    scheduleMode,
+    scheduleChip,
+    scheduleMinutes,
+    scheduleHours,
+    scheduleAbsolute,
+    clearScheduleFields,
+    draftKey,
+    t,
+  ]);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -544,9 +710,16 @@ export function ChatComposer({
   // Vendor is ALWAYS spelled out next to the model — a bare "默认"/"opus"
   // plus a colored dot left the harness unreadable (owner feedback).
   const modelText = modelLabel ?? draft.model;
-  const showStop = !!busy && !text.trim() && !!onStop;
+  const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor, isAdmin);
-  const sendable = !!text.trim() || attachments.length > 0;
+  const sendable = scheduleMode
+    ? !!text.trim() && !!resolvedScheduleWhen
+    : !!text.trim() || attachments.length > 0;
+  /* eslint-disable react-hooks/purity -- the preview intentionally tracks the wall clock on each render and does not mutate component state. */
+  const schedulePreview = resolvedScheduleWhen
+    ? scheduleWhenPreview(resolvedScheduleWhen, Date.now(), lang === "en" ? "en-US" : "zh-CN")
+    : null;
+  /* eslint-enable react-hooks/purity */
 
   return (
     <div
@@ -561,6 +734,94 @@ export function ChatComposer({
       }}
     >
       {topSlot}
+      {scheduleMode ? (
+        <div className="schedule-controls" data-testid="schedule-controls">
+          <div className="schedule-row">
+            <span className="schedule-label">{t("scheduleIn")}</span>
+            <label className="schedule-num">
+              <input
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                placeholder="0"
+                data-testid="schedule-minutes"
+                aria-label={t("scheduleMinutes")}
+                value={scheduleMinutes}
+                onChange={(e) => {
+                  setScheduleMinutes(e.currentTarget.value);
+                  setScheduleChip("");
+                  setScheduleAbsolute("");
+                }}
+              />
+              <span>{t("scheduleMinutes")}</span>
+            </label>
+            <label className="schedule-num">
+              <input
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                placeholder="0"
+                data-testid="schedule-hours"
+                aria-label={t("scheduleHours")}
+                value={scheduleHours}
+                onChange={(e) => {
+                  setScheduleHours(e.currentTarget.value);
+                  setScheduleChip("");
+                  setScheduleAbsolute("");
+                }}
+              />
+              <span>{t("scheduleHours")}</span>
+            </label>
+            {(["+15m", "+30m", "+1h", "+2h"] as const).map((chip) => (
+              <button
+                key={chip}
+                type="button"
+                className={scheduleChip === chip ? "selected" : ""}
+                data-testid={`schedule-chip-${chip}`}
+                onClick={() => {
+                  setScheduleChip(chip);
+                  setScheduleMinutes("");
+                  setScheduleHours("");
+                  setScheduleAbsolute("");
+                }}
+              >
+                {chip}
+              </button>
+            ))}
+          </div>
+          <div className="schedule-row">
+            <span className="schedule-label">{t("scheduleOrAt")}</span>
+            <input
+              type="datetime-local"
+              data-testid="schedule-absolute"
+              value={scheduleAbsolute}
+              aria-label={t("scheduleDateTime")}
+              onChange={(event) => {
+                setScheduleAbsolute(event.currentTarget.value);
+                setScheduleChip("");
+                setScheduleMinutes("");
+                setScheduleHours("");
+              }}
+            />
+          </div>
+          <div className="schedule-hint" data-testid="schedule-hint">
+            {schedulePreview && resolvedScheduleWhen ? (
+              <span>
+                {t("schedulePreview")}: {schedulePreview}{" "}
+                <code>{resolvedScheduleWhen}</code>
+              </span>
+            ) : (
+              <span>{t("schedulePickTime")}</span>
+            )}
+            <span className="schedule-tz-note" title={scheduleTimezone || undefined}>
+              {t("scheduleTzNote")}
+              {scheduleTimezone ? ` (${scheduleTimezone})` : ""}
+            </span>
+          </div>
+        </div>
+      ) : null}
       {attachments.length > 0 ? (
         <div className="att-chips" data-testid="att-chips">
           {attachments.map((a) => (
@@ -625,7 +886,30 @@ export function ChatComposer({
         }}
       />
       <div className="composer-row">
-        <div className={`sel ${attachOpen ? "open" : ""}`} ref={attachRef}>
+        {onSchedule ? (
+          <button
+            type="button"
+            className={`icon-btn ${scheduleMode ? "schedule-on" : ""}`}
+            data-testid="schedule-toggle"
+            title={t("scheduleToggle")}
+            aria-label={t("scheduleToggle")}
+            onClick={() => {
+              setScheduleMode((current) => {
+                const next = !current;
+                if (next) {
+                  setAttachments([]);
+                  setAttachOpen(false);
+                } else {
+                  clearScheduleFields();
+                }
+                return next;
+              });
+            }}
+          >
+            <Clock />
+          </button>
+        ) : null}
+        {!scheduleMode ? <div className={`sel ${attachOpen ? "open" : ""}`} ref={attachRef}>
           <button
             type="button"
             className="icon-btn"
@@ -672,7 +956,6 @@ export function ChatComposer({
             {skillsOpen ? (
               <SkillMenuSections
                 lang={lang}
-                isAdmin={isAdmin}
                 skills={skills}
                 globalSkills={globalSkills}
                 attachments={attachments}
@@ -680,7 +963,7 @@ export function ChatComposer({
               />
             ) : null}
           </div>
-        </div>
+        </div> : null}
         <button
           type="button"
           data-testid="hitl-toggle"
@@ -775,10 +1058,10 @@ export function ChatComposer({
               data-testid={sendTestId}
               className="send-btn"
               onClick={send}
-              disabled={disabled}
-              title={t("sendTip")}
+              disabled={disabled || (scheduleMode && !resolvedScheduleWhen)}
+              title={scheduleMode ? t("scheduleSend") : t("sendTip")}
             >
-              <ArrowUp />
+              {scheduleMode ? <Clock /> : <ArrowUp />}
             </button>
           )}
         </div>

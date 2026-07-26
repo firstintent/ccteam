@@ -94,7 +94,6 @@ export function Sidebar({
   flowActive,
   settingsActive,
   teamActive = false,
-  showTeam = false,
   userName,
   userInitial,
   avatarColor,
@@ -121,9 +120,6 @@ export function Sidebar({
   settingsActive: boolean;
   /** v0.9.0 W4 — whether the 团队/Team route is the active view. */
   teamActive?: boolean;
-  /** v0.9.0 W4 — beta-gate: only an admin sees the nav entry (UI-only gate;
-   *  the backend graph/SSE ACL is unaffected — see AgentsView's module doc). */
-  showTeam?: boolean;
   userName: string;
   userInitial: string;
   avatarColor?: string;
@@ -202,18 +198,16 @@ export function Sidebar({
           <ChevronRight className="chev" />
         </button>
 
-        {showTeam ? (
-          <button
-            type="button"
-            className={`sflow ${teamActive ? "active" : ""}`}
-            onClick={onOpenTeam}
-            data-testid="side-team"
-          >
-            <Users />
-            <span>{t("team")}</span>
-            <ChevronRight className="chev" />
-          </button>
-        ) : null}
+        <button
+          type="button"
+          className={`sflow ${teamActive ? "active" : ""}`}
+          onClick={onOpenTeam}
+          data-testid="side-team"
+        >
+          <Users />
+          <span>{t("team")}</span>
+          <ChevronRight className="chev" />
+        </button>
 
         <div className="side-sec">
           <span>{t("workspaces")}</span>
@@ -399,18 +393,16 @@ export function Sidebar({
         >
           <Workflow />
         </button>
-        {showTeam ? (
-          <button
-            type="button"
-            className="rail-btn"
-            onClick={onOpenTeam}
-            title={t("team")}
-            aria-label={t("team")}
-            data-testid="side-team-rail"
-          >
-            <Users />
-          </button>
-        ) : null}
+        <button
+          type="button"
+          className="rail-btn"
+          onClick={onOpenTeam}
+          title={t("team")}
+          aria-label={t("team")}
+          data-testid="side-team-rail"
+        >
+          <Users />
+        </button>
         {/* 会话区空白:点击展开 */}
         <div
           className="mini-blank"

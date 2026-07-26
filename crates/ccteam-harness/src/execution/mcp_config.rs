@@ -1,7 +1,7 @@
 //! Curated per-session MCP config for Claude stream-json (v0.8.24 C1 / v0.9-W2).
 //!
 //! Spawn writes `<project>/.ccteam/chat/<sid>/mcp.json` with **only** the
-//! ccteam MCP server (8 tools), then `build_argv` passes
+//! ccteam MCP server (7 tools), then `build_argv` passes
 //! `--mcp-config <path>` alongside `--strict-mcp-config` so ambient user
 //! MCP servers are not inherited (avoids the historical self-referential
 //! init deadlock).

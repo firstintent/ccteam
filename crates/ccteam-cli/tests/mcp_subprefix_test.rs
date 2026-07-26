@@ -5,7 +5,7 @@
 //!
 //! - server name still `ccteam` (V0.5 muscle memory preserved)
 //! - every tool carries a group sub-prefix (`chat_` / `session_`) OR
-//!   is one of the single-member exceptions (`screenshot`, `status`)
+//!   is a prefix-less admin tool (`status` + its bare-name beacon alias)
 //! - V0.5 unprefixed names (`ccteam__ls`, …) and culled v0.9 tools are
 //!   GONE from `tools/list` — no compat alias preserved
 
@@ -122,8 +122,8 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
     let names = list_tool_names();
     assert!(!names.is_empty(), "tools/list returned empty");
     for n in &names {
-        // Wire names are BARE `<group>_<rest>` (or a single-member
-        // exception: `screenshot`, `status`). The MCP client namespaces
+        // Wire names are BARE `<group>_<rest>` (or the prefix-less admin
+        // tools: `status` + its bare-name beacon alias). The MCP client namespaces
         // by server key, so Claude Code shows `mcp__ccteam__session_spawn`
         // — a baked-in `ccteam__` prefix would render as the double
         // `mcp__ccteam__ccteam__session_spawn`.
@@ -131,15 +131,15 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
             !n.starts_with("ccteam__"),
             "tool name {n:?} must not embed the server prefix (client namespaces by server key)"
         );
-        let ok = n == "screenshot"
-            || n == "status"
+        let ok = n == "status"
+            || n == "grok_claude_codex_kimi"
             || n.starts_with("admin_")
             || n.starts_with("workflow_")
             || n.starts_with("chat_")
             || n.starts_with("session_");
         assert!(
             ok,
-            "tool {n:?} is missing a group sub-prefix (chat_/session_/screenshot/status)",
+            "tool {n:?} is missing a group sub-prefix (chat_/session_/status)",
         );
     }
 }
@@ -175,6 +175,8 @@ fn legacy_v05_unprefixed_names_are_gone() {
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
         "ccteam__chat_list_bots",
+        // 2026-07-26 cull: tmux-era pane screenshot (web route stays).
+        "screenshot",
         // v0.9.1 rename: prefixed wire names dropped (client namespaces
         // by server key; the old form double-prefixed for the model).
         "ccteam__status",
@@ -229,22 +231,21 @@ fn status_and_session_tools_dispatch_through_server() {
 }
 
 #[test]
-fn screenshot_keeps_v05_name_in_listing() {
-    // `screenshot` is the one single-member group whose tool name does
-    // NOT get a sub-prefix, to preserve V0.5 muscle memory.
+fn status_keeps_singleton_name_in_listing() {
+    // `status` (v0.9 T1 rename of `admin_ls`) and its bare-name beacon
+    // alias are the prefix-less admin tools.
     let names = list_tool_names();
     assert!(
-        names.contains(&"screenshot".to_string()),
-        "screenshot must survive without sub-prefix"
+        names.contains(&"status".to_string()),
+        "status must survive without sub-prefix"
     );
-    // Sanity: no `screenshot_*` accidentally added.
-    for n in &names {
-        if n == "screenshot" {
-            continue;
-        }
-        assert!(
-            !n.starts_with("screenshot_"),
-            "no other tool may live under the screenshot group: {n}"
-        );
-    }
+    assert!(
+        names.contains(&"grok_claude_codex_kimi".to_string()),
+        "the bare-name beacon alias must be listed"
+    );
+    // Sanity: the culled screenshot singleton stays gone.
+    assert!(
+        !names.contains(&"screenshot".to_string()),
+        "screenshot was culled 2026-07-26 and must not resurface"
+    );
 }

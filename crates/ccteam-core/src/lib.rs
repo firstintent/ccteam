@@ -93,7 +93,6 @@ pub mod queries;
 // v0.8.6 W5b ResDisk — read-side reader for project-scoped agent roles
 // (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
 pub mod roles;
-pub mod screenshot;
 // v0.8.7 review-fix (R-M1) — per-session cto-gate secret (mint + ct_eq).
 pub mod session_secret;
 pub mod silence_classifier;
@@ -263,7 +262,7 @@ pub use progress::{
 pub use projects::{
     bootstrap_project, bootstrap_project_at_dir, ensure_project_data_home, pick_unused_slug,
     pick_unused_slug_verbatim, pre_trust_project, read_current_branch, refuses_active_session,
-    slugify, slugify_brief, validate_slug_format, ActiveSessionRefusal,
+    scaffold_workflow_yaml, slugify, slugify_brief, validate_slug_format, ActiveSessionRefusal,
 };
 // v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{
@@ -274,8 +273,8 @@ pub use queries::{
     WorkflowSummary,
 };
 pub use roles::{
-    agents_dir, list_default_library_skills, list_library_skills, list_roles, list_skills,
-    read_role, LibrarySkillSummary, RoleDetail, RoleSummary, SkillSummary,
+    agents_dir, list_default_library_skills, list_default_library_skills_in, list_library_skills,
+    list_roles, list_skills, read_role, LibrarySkillSummary, RoleDetail, RoleSummary, SkillSummary,
 };
 // v0.8.24 Track D — multi-host registry.
 pub use host::read_hostname;
@@ -286,10 +285,6 @@ pub use host_registry::{
     HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport, JoinToken,
     JoinTokenStore, SatelliteSelf, VendorAvailability, AGENT_PROBE_SPECS,
     DEFAULT_HEARTBEAT_TTL_SECS, LOCAL_HOST, LOCAL_HOST as REGISTRY_LOCAL_HOST,
-};
-pub use screenshot::{
-    probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
-    FONT_ENV as SCREENSHOT_FONT_ENV,
 };
 pub use silence_classifier::{
     classify as classify_silence, load_retry_count as load_limbo_retry_count,
@@ -303,7 +298,7 @@ pub use stall::{
     ProgressStallStatus, StallLevel, StallThresholds, STALL_ESCALATE_SECONDS,
     STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
-pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+pub use state::{Parallelism, PhaseHistoryEntry, ProjectState};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DomainRule, EscalateGrammarExtension,
     EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule, RetroFieldKind,

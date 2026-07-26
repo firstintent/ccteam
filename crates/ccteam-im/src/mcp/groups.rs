@@ -1,21 +1,21 @@
 //! MCP tool group enum + `CCTEAM_DISABLE_TOOLS` env filter.
 //!
 //! Each MCP tool exposed by `ccteam MCP server` belongs to exactly one
-//! group: `admin`, `workflow`, `screenshot`, `chat`, `session`. The
+//! group: `admin`, `workflow`, `chat`, `session`. The
 //! server name remains `ccteam` (V0.5 user muscle memory preserved).
 //! Group prefixes make the tool surface scannable in `/mcp` listings
 //! and give a clean env-driven way to disable categories (e.g.
-//! `CCTEAM_DISABLE_TOOLS=chat,screenshot`).
+//! `CCTEAM_DISABLE_TOOLS=chat,session`).
 //!
-//! Group model (v0.9 T1 — culled surface):
+//! Group model (v0.9 T1 culled surface; `screenshot` group removed
+//! 2026-07-26 with the tmux-era pane-capture tool):
 //! - 1 admin tool (`status`, renamed from `admin_ls`)
 //! - 0 workflow tools (variant kept so the `workflow_` prefix routing
 //!   + env toggle stay stable)
-//! - 1 screenshot tool
 //! - 1 chat tool (`send_file`)
 //! - 5 session tools (spawn / dispatch / collect / list / stop)
 //!
-//! Total: 8 tools registered. Disabling a group hides every tool in
+//! Total: 7 tools registered. Disabling a group hides every tool in
 //! that group from `tools/list`; `tools/call` against a disabled tool
 //! falls through to the standard "unknown tool" error.
 
@@ -42,9 +42,6 @@ pub enum ToolGroup {
     Admin,
     /// Per-workflow operations (retired; variant kept for env toggle).
     Workflow,
-    /// Pure-read tmux pane → PNG capture; its own group so heavy /
-    /// privacy-sensitive deployments can disable it independently.
-    Screenshot,
     /// Chat-mode bot workflow (`send_file` only after v0.9 T1).
     Chat,
     /// cto scheduling over the gateway session map (5 tools):
@@ -60,7 +57,6 @@ impl ToolGroup {
         match self {
             ToolGroup::Admin => "admin",
             ToolGroup::Workflow => "workflow",
-            ToolGroup::Screenshot => "screenshot",
             ToolGroup::Chat => "chat",
             ToolGroup::Session => "session",
         }
@@ -69,11 +65,12 @@ impl ToolGroup {
     /// Parse a single group token. Returns `None` for unknown names so
     /// typos in `CCTEAM_DISABLE_TOOLS` are silently ignored rather
     /// than crashing the MCP server at startup. Case-insensitive.
+    /// A leftover `screenshot` token (group culled 2026-07-26) is
+    /// covered by the same unknown-token path.
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_lowercase().as_str() {
             "admin" => Some(Self::Admin),
             "workflow" => Some(Self::Workflow),
-            "screenshot" => Some(Self::Screenshot),
             "chat" => Some(Self::Chat),
             "session" => Some(Self::Session),
             _ => None,
@@ -121,13 +118,10 @@ pub fn disabled_groups_from_env() -> HashSet<ToolGroup> {
 /// so a baked-in prefix would double up.
 pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
     let bare = name;
-    // Single-member groups that do not carry a sub-prefix:
-    // - `screenshot` (V0.5 muscle memory)
-    // - `status` (v0.9 T1 rename of `admin_ls` — admin group, no prefix)
-    if bare == "screenshot" {
-        return Some(ToolGroup::Screenshot);
-    }
-    if bare == "status" {
+    // Prefix-less admin tools:
+    // - `status` (v0.9 T1 rename of `admin_ls`)
+    // - its bare-name discovery beacon alias (2026-07-26)
+    if bare == "status" || bare == super::protocol::STATUS_BEACON_TOOL_NAME {
         return Some(ToolGroup::Admin);
     }
     if bare.strip_prefix("admin_").is_some() {
@@ -148,7 +142,7 @@ pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
 /// Filter a vector of tool definitions (each `serde_json::Value` with
 /// a `name` string) by removing any whose group is in `disabled`.
 /// Tools whose name doesn't map to any known group are kept (safe
-/// default — `screenshot` etc. handled by [`group_for_tool`]).
+/// default — see [`group_for_tool`]).
 pub fn filter_by_disabled(
     tools: Vec<serde_json::Value>,
     disabled: &HashSet<ToolGroup>,
@@ -184,9 +178,9 @@ mod tests {
 
     #[test]
     fn parse_disable_env_handles_comma_list_with_whitespace() {
-        let s = parse_disable_env(Some("chat, screenshot ,session"));
+        let s = parse_disable_env(Some("chat, admin ,session"));
         assert!(s.contains(&ToolGroup::Chat));
-        assert!(s.contains(&ToolGroup::Screenshot));
+        assert!(s.contains(&ToolGroup::Admin));
         assert!(s.contains(&ToolGroup::Session));
         assert_eq!(s.len(), 3);
     }
@@ -200,23 +194,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_disable_env_drops_retired_advise_token() {
-        // v0.9 T1 dropped the advise group; the token is now unknown.
-        let s = parse_disable_env(Some("advise"));
-        assert!(s.is_empty());
+    fn parse_disable_env_drops_retired_tokens() {
+        // v0.9 T1 dropped the advise group; 2026-07-26 dropped screenshot.
+        // Both tokens are now unknown — a stale env keeps working.
+        assert!(parse_disable_env(Some("advise")).is_empty());
+        assert!(parse_disable_env(Some("screenshot")).is_empty());
+        let s = parse_disable_env(Some("chat,screenshot"));
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&ToolGroup::Chat));
     }
 
     #[test]
     fn group_for_tool_maps_each_prefix() {
         assert_eq!(group_for_tool("status"), Some(ToolGroup::Admin));
         assert_eq!(group_for_tool("workflow_show"), Some(ToolGroup::Workflow));
-        assert_eq!(group_for_tool("screenshot"), Some(ToolGroup::Screenshot));
         assert_eq!(group_for_tool("chat_send_file"), Some(ToolGroup::Chat));
         assert_eq!(group_for_tool("session_spawn"), Some(ToolGroup::Session));
         assert_eq!(group_for_tool("bogus"), None);
         assert_eq!(group_for_tool("not-a-ccteam-tool"), None);
-        // Culled tools no longer map (advise group dropped).
+        // Culled tools no longer map (advise group dropped; screenshot
+        // culled 2026-07-26).
         assert_eq!(group_for_tool("advise_vote"), None);
+        assert_eq!(group_for_tool("screenshot"), None);
         // Legacy prefixed wire names (pre-rename) no longer map either —
         // the client's server namespace made the baked-in prefix redundant.
         assert_eq!(group_for_tool("ccteam__session_spawn"), None);
@@ -226,13 +225,11 @@ mod tests {
     fn filter_by_disabled_hides_matching_groups_only() {
         let tools = vec![
             json!({ "name": "status" }),
-            json!({ "name": "screenshot" }),
             json!({ "name": "chat_send_file" }),
             json!({ "name": "session_list" }),
         ];
         let mut disabled = HashSet::new();
         disabled.insert(ToolGroup::Chat);
-        disabled.insert(ToolGroup::Screenshot);
         let kept = filter_by_disabled(tools, &disabled);
         let names: Vec<&str> = kept.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["status", "session_list"]);
@@ -253,7 +250,6 @@ mod tests {
         for g in [
             ToolGroup::Admin,
             ToolGroup::Workflow,
-            ToolGroup::Screenshot,
             ToolGroup::Chat,
             ToolGroup::Session,
         ] {

@@ -16,29 +16,36 @@ import WorkflowView from "./WorkflowView";
 import { evolutionUrl, mcpServersUrl } from "../lib/workflowApi";
 
 describe("WorkflowView", () => {
-  it("renders the four workflow tabs", () => {
+  it("renders five workflow tabs with marketplace between roles and MCP", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(<WorkflowView />);
     expect(html).toContain("workflow-view");
     expect(html).toContain("workflow-tab-skills");
     expect(html).toContain("workflow-tab-roles");
+    expect(html).toContain("workflow-tab-market");
     expect(html).toContain("workflow-tab-mcp");
     expect(html).toContain("workflow-tab-evolution");
+    expect(html.indexOf("workflow-tab-roles")).toBeLessThan(html.indexOf("workflow-tab-market"));
+    expect(html.indexOf("workflow-tab-market")).toBeLessThan(html.indexOf("workflow-tab-mcp"));
   });
 
-  it("MCP tab: admin sees the register form + prefill templates; tenant does not", () => {
+  it("renders MarketplaceView in the market tab", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const admin = renderToString(<WorkflowView tab="mcp" isAdmin />);
-    expect(admin).toContain('data-testid="mcp-register-form"');
-    expect(admin).toContain('data-testid="mcp-tpl-context7"');
-    expect(admin).toContain('data-testid="mcp-tpl-playwright"');
-    expect(admin).toContain('data-testid="mcp-rows"');
-    // Templates prefill only — nothing auto-executes (copy says so).
-    expect(admin).toContain("不执行");
+    const html = renderToString(<WorkflowView tab="market" />);
+    expect(html).toContain('data-testid="marketplace-view"');
+  });
 
-    const tenant = renderToString(<WorkflowView tab="mcp" />);
-    expect(tenant).not.toContain('data-testid="mcp-register-form"');
-    expect(tenant).toContain("仅 admin");
+  it("MCP tab shows the register form + prefill templates to every caller", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(<WorkflowView tab="mcp" />);
+    expect(html).toContain('data-testid="mcp-register-form"');
+    expect(html).toContain('data-testid="mcp-tpl-context7"');
+    expect(html).toContain('data-testid="mcp-tpl-playwright"');
+    expect(html).toContain('data-testid="mcp-rows"');
+    // Templates prefill only — nothing auto-executes (copy says so).
+    expect(html).toContain("不执行");
+    expect(html).toContain("grok_claude_codex_kimi");
+    expect(html).not.toContain("仅 admin");
   });
 
 });

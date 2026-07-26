@@ -2,7 +2,8 @@
 //!
 //! ## What this file owns
 //!
-//! - The **new** [`HarnessAdapter`] trait (5 async methods + `name` + `vendor`)
+//! - The **new** [`HarnessAdapter`] trait (5 lifecycle async methods +
+//!   routed turn submission + `name` + `vendor`)
 //!   aligned with Codex `ThreadManager::{submit, next_event}` protocol.
 //! - Cross-vendor types: [`AgentVendor`], [`ExecutionMode`], [`ThreadHandle`],
 //!   [`TurnInput`], [`TurnId`], [`ThreadEvent`], [`ThreadItem`],
@@ -42,6 +43,7 @@
 //! within a wave are not.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -226,7 +228,7 @@ impl PermissionMode {
 ///   ([`crate::ClaudeStreamJsonAdapter`]). No PTY / pane / hook chain.
 /// - `Terminal` — the advanced path: a tmux PTY + `claude` TUI
 ///   ([`crate::execution::claude_tui::ClaudeTuiAdapter`]); needed only when
-///   the user wants the byte-faithful terminal mirror / attach / screenshot.
+///   the user wants the byte-faithful terminal mirror / attach.
 ///
 /// Named `protocol` (NOT `backend`) per PRD §七 ②: `backend` is reserved for
 /// the v0.9 **host** axis. Codex sessions carry a protocol value too but it
@@ -237,7 +239,7 @@ pub enum SessionProtocol {
     /// `stream-json` — the薄/default chat channel.
     #[default]
     StreamJson,
-    /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / screenshot).
+    /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / attach).
     Terminal,
     /// `acp` — Agent Client Protocol stdio (Grok Build). Honest meta value;
     /// Claude has no ACP arm.
@@ -342,6 +344,132 @@ pub enum TurnInput {
         call_id: String,
         content: serde_json::Value,
     },
+}
+
+/// How a user message submitted while a vendor turn is active should be
+/// delivered.
+///
+/// This is **user-turn routing**, not system-prompt injection: ccteam forwards
+/// the user's text unchanged through a vendor-native channel. Adapters report
+/// unsupported paths explicitly; where both are supported, an idle session
+/// starts a normal turn for either variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRouting {
+    /// Merge the message into the active vendor turn at its next safe point.
+    /// Adapters without a native steer/interject channel may explicitly
+    /// degrade to [`TurnRouting::Queue`] rather than cancel the active turn.
+    Inject,
+    /// Preserve the message as a distinct FIFO follow-up turn.
+    Queue,
+}
+
+/// What the adapter actually did with one accepted message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnDisposition {
+    /// No vendor turn was active, so this message started one.
+    Started,
+    /// The message joined the already-active vendor turn.
+    Injected,
+    /// The message became a distinct FIFO follow-up turn.
+    Queued,
+}
+
+/// Result of a routed user-message submission.
+///
+/// `disposition` is the path the adapter actually used. It can differ from the
+/// requested routing when a vendor has no native injection channel and safely
+/// degrades to a distinct FIFO turn. `input_id` is unique per accepted user
+/// message even when several injections share one `turn_id`. `turn_id` remains
+/// adapter-defined correlation (vendor-native where available, synthetic for
+/// transports that do not return one).
+pub struct TurnSubmission {
+    pub turn_id: TurnId,
+    pub input_id: String,
+    pub disposition: TurnDisposition,
+    completion_guard: Option<Box<dyn Send + 'static>>,
+}
+
+impl TurnSubmission {
+    pub fn started(turn_id: TurnId) -> Self {
+        Self::with_disposition(turn_id, TurnDisposition::Started)
+    }
+
+    pub fn started_with_input_id(turn_id: TurnId, input_id: impl Into<String>) -> Self {
+        Self::with_input_id(turn_id, input_id, TurnDisposition::Started)
+    }
+
+    pub fn injected(turn_id: TurnId) -> Self {
+        Self::with_disposition(turn_id, TurnDisposition::Injected)
+    }
+
+    pub fn injected_with_input_id(turn_id: TurnId, input_id: impl Into<String>) -> Self {
+        Self::with_input_id(turn_id, input_id, TurnDisposition::Injected)
+    }
+
+    pub fn queued(turn_id: TurnId) -> Self {
+        Self::with_disposition(turn_id, TurnDisposition::Queued)
+    }
+
+    fn with_disposition(turn_id: TurnId, disposition: TurnDisposition) -> Self {
+        Self::with_input_id(turn_id, next_turn_input_id(), disposition)
+    }
+
+    fn with_input_id(
+        turn_id: TurnId,
+        input_id: impl Into<String>,
+        disposition: TurnDisposition,
+    ) -> Self {
+        Self {
+            input_id: input_id.into(),
+            turn_id,
+            disposition,
+            completion_guard: None,
+        }
+    }
+
+    /// Hold a vendor turn boundary until the caller records this accepted
+    /// input. Used by adapters whose prompt can complete concurrently with the
+    /// submission acknowledgement.
+    pub fn hold_completion(mut self, guard: impl Send + 'static) -> Self {
+        self.completion_guard = Some(Box::new(guard));
+        self
+    }
+
+    /// Release any adapter completion fence after origin/transcript metadata is
+    /// registered. Safe and idempotent for unfenced submissions.
+    pub fn release_completion(&mut self) {
+        self.completion_guard.take();
+    }
+
+    /// Mint an opaque, process-unique receipt id before a vendor request is
+    /// sent (for protocols such as Codex `clientUserMessageId`).
+    pub fn mint_input_id() -> String {
+        next_turn_input_id()
+    }
+}
+
+impl std::fmt::Debug for TurnSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnSubmission")
+            .field("turn_id", &self.turn_id)
+            .field("input_id", &self.input_id)
+            .field("disposition", &self.disposition)
+            .field("completion_fenced", &self.completion_guard.is_some())
+            .finish()
+    }
+}
+
+static TURN_INPUT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_turn_input_id() -> String {
+    let seq = TURN_INPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("input-{nanos:x}-{seq:x}")
 }
 
 /// Vendor-agnostic event flowing out of [`HarnessAdapter::events`].
@@ -871,8 +999,35 @@ pub trait HarnessAdapter: Send + Sync {
 
     /// Submit one user-input turn to an existing thread. Bg adapters
     /// (single-turn) return a synthetic turn id from the spawn line.
-    async fn submit_turn(&self, h: &ThreadHandle, input: TurnInput)
-        -> Result<TurnId, HarnessError>;
+    /// Shorthand for the application's current default: native active-turn
+    /// injection. The routed method below is the adapter contract; this helper
+    /// exists for adapter-local directives and focused tests.
+    async fn submit_turn(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        let mut submitted = self
+            .submit_turn_routed(h, input, TurnRouting::Inject)
+            .await?;
+        submitted.release_completion();
+        Ok(submitted.turn_id)
+    }
+
+    /// Submit with an explicit active-turn routing intent. The application
+    /// currently selects [`TurnRouting::Inject`] for every vendor; retaining
+    /// the parameter here lets a future composer expose queue-vs-inject without
+    /// teaching the application vendor protocols.
+    ///
+    /// Every adapter implements this method explicitly so a new vendor cannot
+    /// accidentally inherit ambiguous queue-vs-inject behavior. Unsupported
+    /// paths fail honestly instead of silently changing semantics.
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError>;
 
     /// Stream of thread events. Adapters that don't yet feed structured
     /// events return an empty stream (the orchestrator's legacy
@@ -1598,6 +1753,45 @@ mod tests {
             let back: AgentVendor = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
         }
+    }
+
+    #[test]
+    fn turn_routing_round_trips_without_an_implicit_policy_default() {
+        for routing in [TurnRouting::Inject, TurnRouting::Queue] {
+            let json = serde_json::to_string(&routing).unwrap();
+            let decoded: TurnRouting = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, routing);
+        }
+    }
+
+    #[test]
+    fn turn_submission_separates_vendor_turn_from_unique_input_receipt() {
+        let turn = TurnId::new("vendor-turn-1");
+        let started = TurnSubmission::started(turn.clone());
+        let injected = TurnSubmission::injected(turn.clone());
+        assert_eq!(started.turn_id, turn);
+        assert_eq!(injected.turn_id, turn);
+        assert_ne!(started.input_id, injected.input_id);
+        assert_eq!(started.disposition, TurnDisposition::Started);
+        assert_eq!(injected.disposition, TurnDisposition::Injected);
+    }
+
+    #[test]
+    fn turn_submission_completion_guard_releases_only_after_registration() {
+        struct FlagOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for FlagOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut submission = TurnSubmission::injected(TurnId::new("vendor-turn-1"))
+            .hold_completion(FlagOnDrop(std::sync::Arc::clone(&dropped)));
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        submission.release_completion();
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        submission.release_completion();
     }
 
     #[test]

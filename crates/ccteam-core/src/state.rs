@@ -1,10 +1,7 @@
 //! `state.json` — project-level orchestrator state. Schema reference in
 //! `docs/interfaces.md` §2.1.
 //!
-//! V0.4.0 F60: the pre-F60 phase state machine (PhaseState variants
-//! InFlight / DonePending / AutoLocked) is gone — F66 reintroduces an
-//! `agent_sessions` shape against `workflow.yaml`. Until then we keep
-//! the identity / cost / lifecycle fields. `current_phase`,
+//! V0.4.0 F60: the pre-F60 phase state machine is gone. `current_phase`,
 //! `phase_history`, and
 //! `last_event_type` survive as **serde-only compat fields** with
 //! `skip_serializing_if` so fresh writes drop them but old state.json
@@ -16,7 +13,7 @@
 //!   POSIX `rename(2)` makes the new contents observable atomically.
 //! - **One-deep backup**: before each save, the prior `<path>` is rotated to
 //!   `<path>.bak` via rename. Load falls back automatically on parse failure.
-//! - **Strict deserialize**: enums (`phase_state`, `parallelism`) reject
+//! - **Strict deserialize**: enums (`parallelism`) reject
 //!   unknown values.
 
 use std::collections::BTreeMap;
@@ -28,31 +25,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::team::TeamKind;
-
-/// V0.4.0 F60 — only `Idle` and `Done` survive the phase-machine purge.
-/// `Idle` keeps existing tests / hook code that reads `state.phase_state`
-/// loadable; `Done` is reserved for F66 workflow completion.
-///
-/// `alias = "in_flight" / "done_pending" / "auto_locked" / "fix_locked"`
-/// lets pre-F60 state.json files still load (every legacy variant is
-/// coerced to `Idle` on read — the F66 loop will re-evaluate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PhaseState {
-    /// Project is alive but not currently driving any phase. The F66
-    /// workflow loop will subsume the dispatch logic; the variant
-    /// remains so old `state.json` files load without migration.
-    #[serde(
-        alias = "in_flight",
-        alias = "done_pending",
-        alias = "auto_locked",
-        alias = "fix_locked"
-    )]
-    Idle,
-    /// Project terminated successfully. The F66 workflow loop will
-    /// transition to this when every gated artifact resolves.
-    Done,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,11 +77,6 @@ pub struct ProjectState {
     pub tmux_session: String,
     pub claude_session_id: Option<String>,
     pub claude_pid: Option<i32>,
-    /// Coarse-grained lifecycle state. F60 collapsed this to
-    /// `Idle` / `Done`; F66 will either extend the enum or replace
-    /// it with workflow-aware tracking.
-    #[serde(default = "default_phase_state")]
-    pub phase_state: PhaseState,
     /// V0.4.0 F60 retained for serde-compat: old state.json files
     /// recorded a `parallelism` field. Default `Solo` keeps loading
     /// without migration; nothing currently reads it.
@@ -185,10 +152,6 @@ fn default_team() -> String {
     "dev".into()
 }
 
-fn default_phase_state() -> PhaseState {
-    PhaseState::Idle
-}
-
 fn default_parallelism() -> Parallelism {
     Parallelism::Solo
 }
@@ -232,7 +195,6 @@ impl ProjectState {
             created_at: now,
             claude_session_id: None,
             claude_pid: None,
-            phase_state: PhaseState::Idle,
             parallelism: Parallelism::Solo,
             current_phase: String::new(),
             phase_history: Vec::new(),

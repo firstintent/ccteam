@@ -156,16 +156,14 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("无会话");
   });
 
-  // v0.9.0 W4 — 团队/Team nav entry is admin-only (beta-gate); absent by
-  // default (a tenant / not-yet-resolved `useMe` never sees it).
-  it("hides the 团队/Team nav entry by default (showTeam unset)", () => {
+  it("always shows the 团队/Team nav entry in the expanded sidebar", () => {
     const html = renderSidebar([]);
-    expect(html).not.toContain('data-testid="side-team"');
-    expect(html).not.toContain('data-testid="side-team-rail"');
+    expect(html).toContain('data-testid="side-team"');
+    expect(html).toContain("团队");
   });
 
-  it("shows the 团队/Team nav entry (expanded + rail) when showTeam is set", () => {
-    const html = renderSidebar([], { showTeam: true, teamActive: true });
+  it("always shows the rail entry and reflects the active team route", () => {
+    const html = renderSidebar([], { teamActive: true });
     expect(html).toContain('data-testid="side-team"');
     expect(html).toContain('data-testid="side-team-rail"');
     expect(html).toContain("团队");

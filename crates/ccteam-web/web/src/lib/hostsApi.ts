@@ -68,7 +68,7 @@ export interface RegisterMcpResult {
   paths: Record<string, string>;
 }
 
-/** `GET`/`POST /api/v1/hosts/join-token` response (admin-only). `token` is
+/** `GET`/`POST /api/v1/hosts/join-token` response. `token` is
  *  null when none has been minted / all are spent (GET only). */
 export interface JoinTokenInfo {
   token: string | null;
@@ -80,12 +80,12 @@ export interface JoinTokenInfo {
 }
 
 /** `GET /api/v1/hosts/join-token` — newest still-valid join token (or
- *  `{token: null}`). Admin-only; a tenant gets HTTP 403. */
+ *  `{token: null}`). */
 export function getJoinToken(): Promise<JoinTokenInfo> {
   return getJson<JoinTokenInfo>("/api/v1/hosts/join-token");
 }
 
-/** `POST /api/v1/hosts/join-token` — mint a fresh join token (admin-only). */
+/** `POST /api/v1/hosts/join-token` — mint a fresh join token. */
 export function mintJoinToken(label?: string): Promise<JoinTokenInfo> {
   return postJson<JoinTokenInfo>("/api/v1/hosts/join-token", { label: label ?? null });
 }

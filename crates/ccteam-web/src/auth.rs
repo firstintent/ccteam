@@ -4,7 +4,7 @@
 //!
 //! When [`AuthState::enabled`] is true, **every** route on the
 //! stateful router (`/`, `/project/<slug>`, `/sse/...`,
-//! `/screenshot/<slug>.png`, `/api/<slug>/...`) requires either:
+//! `/api/<slug>/...`) requires either:
 //!
 //! - `Authorization: Bearer ccteam:<token>` on the request, or
 //! - the `ccteam_token` cookie set by the URL shim.
@@ -209,7 +209,7 @@ impl Identity {
 }
 
 /// `Some(403)` unless the caller is the admin/owner — the shared gate for every
-/// admin-only route (user management, IM credentials, hosts, global config).
+/// admin-only route (user management and global IM credentials).
 pub fn deny_non_admin(identity: &Identity) -> Option<Response> {
     if identity.is_admin {
         None
@@ -741,7 +741,6 @@ mod tests {
         assert!(!is_public_shell_path("/api/v1/auth/token"));
         assert!(!is_public_shell_path("/api/v1/projects/demo/sessions"));
         assert!(!is_public_shell_path("/health"));
-        assert!(!is_public_shell_path("/screenshot/demo.png"));
         // No prefix-confusion: a path that merely starts with "/app" but is not
         // under the shell must not slip through.
         assert!(!is_public_shell_path("/apple"));

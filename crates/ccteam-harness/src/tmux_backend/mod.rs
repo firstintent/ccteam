@@ -281,7 +281,7 @@ impl PaneBackend for TmuxBackend {
 
 // ─── helpers for non-async callers ────────────────────────────────────────
 //
-// Production callers that are already sync (screenshot, projects::
+// Production callers that are already sync (projects::
 // refuse_active_session, run_peek, run_attach) continue to consume the
 // sync free-fn surface in `crate::tmux_ops` directly. The trait is
 // async because rmux is; sync callers don't pay for an executor here.

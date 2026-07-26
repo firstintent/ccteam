@@ -337,6 +337,17 @@ mod tests {
             )))
         }
 
+        async fn submit_turn_routed(
+            &self,
+            h: &ThreadHandle,
+            input: TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+            self.submit_turn(h, input)
+                .await
+                .map(ccteam_harness::TurnSubmission::started)
+        }
+
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let identity = h.identity.clone();
             let queues = Arc::clone(&self.state.event_queues);
@@ -719,7 +730,13 @@ mod tests {
         recv_reply_contains(&mut socket, "stored while web was offline").await;
         send_text(&mut socket, "sessions-after-restart", "/sessions").await;
         let sessions = recv_sessions(&mut socket).await;
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 2, "restored sessions: {sessions:?}");
+        let mut restored_sids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|item| item.session.as_deref())
+            .collect();
+        restored_sids.sort_unstable();
+        assert_eq!(restored_sids, vec!["s1", "s2"]);
         send_text(&mut socket, "after-restart", "@api after restart").await;
         recv_replies_containing_all(&mut socket, &["Codex echo: after restart"]).await;
         drop(socket);

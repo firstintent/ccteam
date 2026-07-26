@@ -24,10 +24,12 @@ use tokio::sync::broadcast;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
     ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    TurnId, TurnInput,
+    TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
-use crate::execution::acp::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
+use crate::execution::acp::{
+    route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, JsonRpcError,
+};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use protocol::{
@@ -48,6 +50,11 @@ pub const GROK_ACP_ADAPTER_NAME: &str = "grok-acp";
 
 const EVENT_BUFFER: usize = 256;
 
+/// Grok's ACP extension for a no-cancel, same-turn user-message interjection.
+/// The leading underscore is the wire-level ACP extension prefix; Grok's
+/// internal method name is `x.ai/interject`.
+const GROK_INTERJECT_METHOD: &str = "_x.ai/interject";
+
 struct LiveSession {
     transport: Arc<AcpTransport>,
     session_id: String,
@@ -58,6 +65,9 @@ struct LiveSession {
     /// Vendor catalog from `session/new|load` `availableModels` — drives `/model`.
     available_models: Vec<AcpModelOption>,
     state: Arc<StdMutex<SessionTranslateState>>,
+    /// Tokio's mutex is FIFO: concurrent messages enter the native
+    /// interjection channel in adapter arrival order.
+    interjection_order: tokio::sync::Mutex<()>,
     event_tx: broadcast::Sender<ThreadEvent>,
     _dispatcher: tokio::task::JoinHandle<()>,
 }
@@ -220,6 +230,7 @@ impl GrokAcpAdapter {
             model: info.model,
             window_tokens: info.window,
             effort: info.effort,
+            capture_vendor_started_turns: true,
             ..Default::default()
         }));
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
@@ -234,6 +245,7 @@ impl GrokAcpAdapter {
             cwd,
             available_models: info.available,
             state,
+            interjection_order: tokio::sync::Mutex::new(()),
             event_tx,
             _dispatcher: dispatcher,
         });
@@ -291,6 +303,151 @@ impl GrokAcpAdapter {
             goal: None,
         }
     }
+
+    async fn submit_with_routing(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        let live = self.get_live(&h.identity).ok_or_else(|| {
+            HarnessError::ThreadDied(format!("grok session {} not live", h.identity))
+        })?;
+
+        let text = match input {
+            TurnInput::UserText(t) => t,
+            other => {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "grok_acp: unsupported turn input {other:?}"
+                )));
+            }
+        };
+
+        let route = {
+            let mut state = live
+                .state
+                .lock()
+                .map_err(|_| HarnessError::Io("grok state lock poisoned".into()))?;
+            route_acp_turn(&mut state, &text, routing, true)
+        };
+
+        match route {
+            AcpTurnRoute::Start {
+                turn_id,
+                turn_done,
+                prompt_sent,
+            } => {
+                AcpTurnRunner {
+                    transport: Arc::clone(&live.transport),
+                    state: Arc::clone(&live.state),
+                    event_tx: live.event_tx.clone(),
+                    session_id: live.session_id.clone(),
+                    tuning: AcpTurnTuning {
+                        finalize_barrier: FINALIZE_BARRIER,
+                        post_finalize_sleep: None,
+                        label: "grok",
+                    },
+                }
+                .spawn(turn_id.clone(), turn_done, prompt_sent, text);
+                Ok(TurnSubmission::started(TurnId(turn_id)))
+            }
+            AcpTurnRoute::Queue { turn_id, .. } => Ok(TurnSubmission::queued(TurnId(turn_id))),
+            AcpTurnRoute::Inject {
+                active_turn_id,
+                prompt_sent,
+                reservation,
+            } => {
+                let _ordered = live.interjection_order.lock().await;
+                // The first submit returns before its runner necessarily gets a
+                // CPU slice. Waiting here guarantees `session/prompt` entered
+                // the transport FIFO before `_x.ai/interject`, so a back-to-
+                // back message cannot race into Grok's "no active turn" arm.
+                if let Some(sent) = prompt_sent {
+                    sent.wait().await.map_err(|e| {
+                        HarnessError::SubmitFailed(format!(
+                            "grok {GROK_INTERJECT_METHOD} prompt barrier: {e:#}"
+                        ))
+                    })?;
+                }
+                let response = live
+                    .transport
+                    .call(
+                        GROK_INTERJECT_METHOD,
+                        json!({
+                            "sessionId": live.session_id,
+                            "text": text,
+                        }),
+                    )
+                    .await;
+                let response =
+                    match response {
+                        Ok(response) => response,
+                        Err(error) if grok_interject_missed_active_turn(&error) => {
+                            // Defensive compatibility for a Grok build that
+                            // explicitly rejects an idle interject. Current Grok
+                            // instead admits it and self-starts a turn; the shared
+                            // ACP translator captures that normal path.
+                            let queued_id = {
+                                let mut state = live.state.lock().map_err(|_| {
+                                    HarnessError::Io("grok state lock poisoned".into())
+                                })?;
+                                match route_acp_turn(&mut state, &text, TurnRouting::Queue, true) {
+                                    AcpTurnRoute::Queue { turn_id, .. } => turn_id,
+                                    _ => {
+                                        return Err(HarnessError::Io(
+                                            "grok late interject did not queue".into(),
+                                        ))
+                                    }
+                                }
+                            };
+                            tracing::debug!(
+                                turn_id = %queued_id,
+                                error = %error,
+                                "grok ACP late interjection queued as follow-up"
+                            );
+                            return Ok(TurnSubmission::queued(TurnId(queued_id))
+                                .hold_completion(reservation));
+                        }
+                        Err(error) => {
+                            return Err(HarnessError::SubmitFailed(format!(
+                                "grok {GROK_INTERJECT_METHOD}: {error}"
+                            )))
+                        }
+                    };
+                if !grok_interject_was_admitted(&response) {
+                    return Err(HarnessError::SubmitFailed(format!(
+                        "grok {GROK_INTERJECT_METHOD}: unexpected response {response}"
+                    )));
+                }
+                tracing::debug!(
+                    turn_id = %active_turn_id,
+                    response = %response,
+                    "grok ACP message injected into active turn"
+                );
+                Ok(TurnSubmission::injected(TurnId(active_turn_id)).hold_completion(reservation))
+            }
+        }
+    }
+}
+
+fn grok_interject_missed_active_turn(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<JsonRpcError>().is_some_and(|rpc| {
+        if rpc.code != Some(-32000) {
+            return false;
+        }
+        let message = rpc.message.to_ascii_lowercase();
+        message.contains("no active turn")
+            || message.contains("turn is not active")
+            || message.contains("no turn in progress")
+    })
+}
+
+fn grok_interject_was_admitted(response: &Value) -> bool {
+    response
+        .pointer("/result/status")
+        .or_else(|| response.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("queued"))
 }
 
 fn spawn_notif_dispatcher(
@@ -460,64 +617,13 @@ impl HarnessAdapter for GrokAcpAdapter {
         Ok(handle)
     }
 
-    async fn submit_turn(
+    async fn submit_turn_routed(
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
-        let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("grok session {} not live", h.identity))
-        })?;
-
-        let text = match input {
-            TurnInput::UserText(t) => t,
-            other => {
-                return Err(HarnessError::SubmitFailed(format!(
-                    "grok_acp: unsupported turn input {other:?}"
-                )));
-            }
-        };
-
-        // Unique per-process id (timestamp + seq) so two turns steered in the
-        // same millisecond never collide in the pending queue / experience log.
-        let turn_id = next_acp_turn_id();
-        // Barrier the dispatcher fires on the turn boundary so finalize sees
-        // every buffered chunk (see FINALIZE_BARRIER / SessionTranslateState).
-        let turn_done = Arc::new(tokio::sync::Notify::new());
-        // Reserve the buffer if idle (→ spawn the runner) or queue behind the
-        // in-flight turn (the runner drains FIFO). The gateway steers by firing
-        // a fresh submit_turn mid-turn, exactly like Claude/Codex; ACP prompts
-        // serialize natively, so we queue rather than reject.
-        let spawn_runner = {
-            let mut st = live
-                .state
-                .lock()
-                .map_err(|_| HarnessError::Io("grok state lock poisoned".into()))?;
-            if st.buffer.is_some() {
-                st.pending.push_back((turn_id.clone(), text.clone()));
-                false
-            } else {
-                st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
-                true
-            }
-        };
-
-        if spawn_runner {
-            AcpTurnRunner {
-                transport: Arc::clone(&live.transport),
-                state: Arc::clone(&live.state),
-                event_tx: live.event_tx.clone(),
-                session_id: live.session_id.clone(),
-                tuning: AcpTurnTuning {
-                    finalize_barrier: FINALIZE_BARRIER,
-                    post_finalize_sleep: None,
-                    label: "grok",
-                },
-            }
-            .spawn(turn_id.clone(), turn_done, text);
-        }
-
-        Ok(TurnId(turn_id))
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_with_routing(h, input, routing).await
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

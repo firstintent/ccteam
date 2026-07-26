@@ -1800,6 +1800,23 @@ async fn d2_active_turn_steers_plain_text() {
     assert_eq!(steer["params"]["threadId"], "tid-d2");
     assert_eq!(steer["params"]["expectedTurnId"], "turn-live");
     assert_eq!(steer["params"]["input"][0]["type"], "text");
+    let first_input_id = steer["params"]["clientUserMessageId"]
+        .as_str()
+        .expect("steer carries unique input receipt")
+        .to_string();
+
+    adapter
+        .submit_turn(&h, TurnInput::UserText("one more".into()))
+        .await
+        .unwrap();
+    let frames = seen.lock().unwrap().clone();
+    let input_ids = frames
+        .iter()
+        .filter(|frame| frame["method"] == "turn/steer")
+        .filter_map(|frame| frame["params"]["clientUserMessageId"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(input_ids.len(), 2);
+    assert_ne!(input_ids[1], first_input_id);
 
     drop(peer);
     let _ = std::fs::remove_file(&sock);

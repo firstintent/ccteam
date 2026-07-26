@@ -167,13 +167,12 @@ async fn handshake_prompt_final_only_on_fake() {
     clear_fake();
 }
 
-/// Mid-turn steer: a second `submit_turn` fired before the first turn finalizes
-/// must be QUEUED (not hard-rejected with "a turn is already in progress"), then
-/// run as its own turn once the first completes. Regression for the daemon
-/// steering an ACP session like Claude/Codex.
+/// The application requests Inject by default, but OpenCode ACP exposes no
+/// correlatable interject request. The adapter must degrade without loss to two
+/// FIFO turns rather than overlap prompt streams, cancel, or reject.
 #[tokio::test]
 #[serial]
-async fn mid_turn_submit_queues_second_turn() {
+async fn mid_turn_inject_degrades_to_fifo_without_native_extension() {
     install_fake();
     let tmp = TempDir::new().unwrap();
     let adapter = OpencodeAcpAdapter::new();
@@ -221,7 +220,7 @@ async fn mid_turn_submit_queues_second_turn() {
     let second = adapter
         .submit_turn(&handle, TurnInput::UserText("two".into()))
         .await
-        .expect("second submit must queue, not reject");
+        .expect("unsupported inject must degrade to queue, not reject");
     assert_ne!(first.0, second.0, "queued turn gets its own id");
 
     let finals = tokio::time::timeout(Duration::from_secs(10), collector)

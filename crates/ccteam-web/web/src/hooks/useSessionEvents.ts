@@ -54,7 +54,7 @@ export interface SessionActivity {
 export interface SessionEvent {
   id?: string;
   sid?: string;
-  kind: "answer" | "progress" | "activity" | "session_lifecycle";
+  kind: "answer" | "progress" | "activity" | "session_lifecycle" | "scheduled_changed";
   content: string;
   done?: boolean;
   options?: SessionEventOption[];
@@ -147,6 +147,8 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
         ? "activity"
         : obj.kind === "session_lifecycle"
           ? "session_lifecycle"
+          : obj.kind === "scheduled_changed"
+            ? "scheduled_changed"
           : "answer";
   const event: SessionEvent = {
     kind,

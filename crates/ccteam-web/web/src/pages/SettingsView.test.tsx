@@ -1,5 +1,5 @@
 // v0.8.24 Track A — 设置 view (set-nav sub-pages) + the tenant ACL gate
-// (红线 §1.6-3: fail-closed via useMe — a tenant NEVER sees 运维总览/管理员).
+// (fail-closed via useMe — a tenant never sees 用户管理 / Admin).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -25,18 +25,19 @@ import SettingsView, {
   OpsPanel,
   maskToken,
   resolveSettingsTab,
+  settingsDetailWidthClass,
   visibleSettingsItems,
 } from "./SettingsView";
 
 describe("visibleSettingsItems (fail-closed ACL)", () => {
-  it("tenant sees ONLY 插件市场 / 通用 / 账号", () => {
-    expect(visibleSettingsItems(false)).toEqual(["market", "general", "account"]);
+  it("tenant sees every settings surface except 用户管理", () => {
+    expect(visibleSettingsItems(false)).toEqual(["ops", "access", "general", "account"]);
   });
 
   it("admin sees ops + the tenant tabs + 管理员 (no standalone IM tab)", () => {
     expect(visibleSettingsItems(true)).toEqual([
       "ops",
-      "market",
+      "access",
       "general",
       "account",
       "admin",
@@ -46,16 +47,18 @@ describe("visibleSettingsItems (fail-closed ACL)", () => {
 
 describe("resolveSettingsTab", () => {
   it("honors a visible routed tab", () => {
-    expect(resolveSettingsTab("market", false)).toBe("market");
+    expect(resolveSettingsTab("general", false)).toBe("general");
+    expect(resolveSettingsTab("access", true)).toBe("access");
     expect(resolveSettingsTab("admin", true)).toBe("admin");
     expect(resolveSettingsTab("ops", true)).toBe("ops");
   });
 
-  it("denies an admin-only tab to a tenant (falls back to market)", () => {
-    expect(resolveSettingsTab("ops", false)).toBe("market");
-    expect(resolveSettingsTab("hosts", false)).toBe("market");
-    expect(resolveSettingsTab("admin", false)).toBe("market");
-    expect(resolveSettingsTab("status", false)).toBe("market");
+  it("keeps only the admin tab fail-closed and falls back to ops", () => {
+    expect(resolveSettingsTab("ops", false)).toBe("ops");
+    expect(resolveSettingsTab("access", false)).toBe("access");
+    expect(resolveSettingsTab("hosts", false)).toBe("ops");
+    expect(resolveSettingsTab("admin", false)).toBe("ops");
+    expect(resolveSettingsTab("status", false)).toBe("ops");
   });
 
   it("maps both legacy tabs to ops for admins", () => {
@@ -63,9 +66,22 @@ describe("resolveSettingsTab", () => {
     expect(resolveSettingsTab("status", true)).toBe("ops");
   });
 
-  it("defaults: admin → ops, tenant → market", () => {
+  it("defaults every identity to ops", () => {
     expect(resolveSettingsTab(undefined, true)).toBe("ops");
-    expect(resolveSettingsTab(undefined, false)).toBe("market");
+    expect(resolveSettingsTab(undefined, false)).toBe("ops");
+  });
+});
+
+describe("settings detail width", () => {
+  it("widens Access independently from the wider Ops surface", () => {
+    expect(settingsDetailWidthClass("access")).toBe("access-wide");
+    expect(settingsDetailWidthClass("ops")).toBe("ops-wide");
+    expect(settingsDetailWidthClass("account")).toBe("");
+
+    const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
+    expect(css).toMatch(
+      /\.set-detail-inner\.access-wide\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1200px/s,
+    );
   });
 });
 
@@ -78,28 +94,44 @@ describe("SettingsView SSR (identity unresolved = fail-closed tenant view)", () 
     vi.restoreAllMocks();
   });
 
-  it("renders the set-nav with ONLY the tenant items before /me resolves", () => {
+  it("renders shared items but not Admin before /me resolves", () => {
     const html = renderToString(
       <MemoryRouter>
         <SettingsView />
       </MemoryRouter>,
     );
     expect(html).toContain('data-testid="settings-view"');
-    expect(html).toContain('data-testid="set-item-market"');
+    expect(html).toContain('data-testid="set-item-ops"');
+    expect(html).toContain('data-testid="set-item-access"');
     expect(html).toContain('data-testid="set-item-general"');
     expect(html).toContain('data-testid="set-item-account"');
-    // Admin-only panels must never flash to a tenant.
-    expect(html).not.toContain('data-testid="set-item-ops"');
+    // User management must never flash to a tenant.
     expect(html).not.toContain('data-testid="set-item-admin"');
   });
 
-  it("defaults an unresolved identity to the 插件市场 panel", () => {
+  it("defaults an unresolved identity to the shared Ops panel", () => {
     const html = renderToString(
       <MemoryRouter>
         <SettingsView />
       </MemoryRouter>,
     );
-    expect(html).toContain('data-testid="marketplace-view"');
+    expect(html).toContain('data-testid="ops-view"');
+  });
+
+  it("renders both shared ops and tenant-shaped access routes", () => {
+    const ops = renderToString(
+      <MemoryRouter>
+        <SettingsView tab="ops" />
+      </MemoryRouter>,
+    );
+    const access = renderToString(
+      <MemoryRouter>
+        <SettingsView tab="access" />
+      </MemoryRouter>,
+    );
+    expect(ops).toContain('data-testid="ops-view"');
+    expect(access).toContain('data-testid="settings-access"');
+    expect(access).toContain('data-testid="access-my-im"');
   });
 });
 
@@ -111,20 +143,24 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders both existing panels in one grid without changing their test ids", () => {
-    const html = renderToString(<OpsPanel lang="zh" rail={[]} />);
+  it("stacks daemon status above hosts (single column) without changing test ids", () => {
+    const html = renderToString(<OpsPanel lang="zh" />);
     expect(html).toContain('data-testid="ops-view"');
-    expect(html).toContain('class="ops-grid"');
+    expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');
     expect(html).toContain('data-testid="hosts-view"');
+    // Daemon strip is the first status surface; hosts follow below.
+    expect(html.indexOf('data-testid="status-view"')).toBeLessThan(
+      html.indexOf('data-testid="hosts-view"'),
+    );
   });
 
-  it("uses two columns on wide screens and one column at the narrow breakpoint", () => {
+  it("uses a vertical ops stack (no side-by-side status/hosts columns)", () => {
     const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
-    expect(css).toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
-    expect(css).toMatch(
-      /@media \(max-width:\s*1280px\)\s*\{\s*\.ops-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
-    );
+    expect(css).toMatch(/\.ops-stack\s*\{[^}]*flex-direction:\s*column/s);
+    expect(css).toMatch(/\.daemon-strip\s*\{/);
+    // Retired two-column layout must not sneak back.
+    expect(css).not.toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
   });
 });
 
@@ -186,7 +222,7 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
     expect(html).toContain('type="password"');
   });
 
-  it("admin sees the web-token 重置 button; tenant does not (own token = admin-managed)", () => {
+  it("every caller sees the two-step web-token reset button", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const admin = renderToString(
       <AccountPanel
@@ -213,10 +249,10 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
         onAvatar={() => {}}
       />,
     );
-    expect(tenant).not.toContain('data-testid="account-reset-token"');
+    expect(tenant).toContain('data-testid="account-reset-token"');
   });
 
-  it("tenant account panel embeds the self-serve 我的 IM bot section (no global creds)", () => {
+  it("tenant account no longer embeds 我的 IM bot (it moved to Access)", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(
       <AccountPanel
@@ -229,15 +265,13 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
         onAvatar={() => {}}
       />,
     );
-    expect(html).toContain('data-testid="settings-my-im"');
+    expect(html).not.toContain('data-testid="settings-my-im"');
     // The admin-only global credentials panel is NOT rendered for a tenant.
     expect(html).not.toContain('data-testid="settings-loading"');
     expect(html).not.toContain('data-testid="settings-page"');
   });
 
-  it("admin account panel embeds the global Telegram/Lark credentials (SettingsPage)", () => {
-    // Never-resolving fetch keeps the embedded SettingsPage in its loading
-    // state (its own useMe gate) — enough to prove it is mounted for admin.
+  it("admin account panel no longer embeds global Telegram/Lark credentials", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(
       <AccountPanel
@@ -250,7 +284,7 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
         onAvatar={() => {}}
       />,
     );
-    expect(html).toContain('data-testid="settings-loading"');
+    expect(html).not.toContain('data-testid="settings-loading"');
     // …and NOT the tenant self-serve bot, nor user management (管理员 tab).
     expect(html).not.toContain('data-testid="settings-my-im"');
     expect(html).not.toContain('data-testid="settings-users"');
