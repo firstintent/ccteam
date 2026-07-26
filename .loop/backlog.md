@@ -40,11 +40,11 @@
 - **规格**:折叠 codex 叙述消息进所属 turn(记账/展示);不改 `CanonicalEvent` schema 语义(schema 权威 = `harness/progress_bridge`)。
 - **DoD**:新定向测试先造缺陷态红、后修绿(证有牙,留痕验证段);`make test` 基线只增;writeback 绿。
 
-### HERM-1 基线口径内测试宿主态泄漏(live 机红 / 干净环境绿)
-- **状态**:待排 · **冲突域**:`crates/ccteam-cli(web_chat_bridge) + crates/ccteam-core(roles) + crates/ccteam-harness(transcript_tail)` · **建议入口**:dev 会话
-- **背景**:MCP-DX-1 收口实测(2026-07-25,live-daemon 宿主):`make test-baseline` 口径内 3 红,`git stash` 对照 origin/dev **同机同红**、CI 干净环境全绿(v0.9.9 tip)——违反「基线口径内测试必须密封」纪律(verify/README):① `web_chat_bridge::web_chat_ws_routes_through_gateway_and_survives_restart`(live daemon 端口/socket 争用嫌疑);② `roles::list_library_skills_is_recursive_hidden_safe_and_sorted`(疑读真实 `~/.ccteam/skills` —— v0.9.9 全局库新面,隔离助手须同时 pin HOME+CCTEAM_HOME,AGENTS §六);③ `execution::transcript_tail::discover_skips_subagent_jsonls_even_when_newest`(单测绿、全套并发红 = 套内相互作用/真实 `~/.claude/projects` 泄漏嫌疑)。2026-07-26(v0.9.10 各卡收口)同机实测族内 ②③ 转绿、仅 ① 稳红 —— 漂移属宿主态泄漏本性,三只归因与密封目标不变。
-- **规格**:逐只归因 + 注入缝密封(参照 0ec136d per-Gateway 快照先例;禁 env 突变);先红后绿留痕。
-- **DoD**:live-daemon 宿主上 `make test-baseline` 全绿;CI 同绿;writeback 绿。
+### HERM-1 web_chat_bridge restart-restore 竞态(**PR #170 CI 红 = merge blocker**)+ 宿主态泄漏两只密封
+- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-cli(web_chat_bridge) + crates/ccteam-im(gateway restore) + crates/ccteam-core(roles) + crates/ccteam-harness(transcript_tail)` · **建议入口**:codex 委派(规划发卡 + review)
+- **背景(2026-07-26 规划复诊,原「宿主态泄漏×3」归因对 ① 作废)**:① `web_chat_bridge::web_chat_ws_routes_through_gateway_and_survives_restart` **:722 `assert_eq!(sessions.len(), 2)` left=1** —— daemon 重启后 `/sessions` 只见 1/2 会话(restore 自 v0.8.21 = 逐会话 resume-aware `start_thread` 重生)。本机 5/5 稳红(0.16s;**父提交 2963424b 同红** = 与 e9c13043 看门狗提交无关);CI 自 2026-07-25 15:30 边界起**多红偶绿**(run 30206871136 同断言;eea47f2b 含同代码一次绿 = 概率性)。同断言两环境复现 = **restart-restore 竞态真回归/真产品行为**(引入点 ≤2963424b 未定),旧「live 机红/CI 绿=环境态」判据失效;**PR #170 merge 等本卡 A 绿**。② `roles::list_library_skills_is_recursive_hidden_safe_and_sorted` + ③ `transcript_tail::discover_skips_subagent_jsonls_even_when_newest` = 宿主态泄漏族(本周期本机转绿,漂移本性),密封目标不变(② 疑读真实 `~/.ccteam/skills`,隔离须同时 pin HOME+CCTEAM_HOME;③ 套内并发相互作用/真实 `~/.claude/projects` 嫌疑)。
+- **规格**:A(优先,blocker). 根因归因 restart→restore→`/sessions` 竞态并修**确定性**:先查第二会话丢在哪层(restore 未跑完?重生失败被吞?列表渲染过滤?)——若 restore 异步与首个 `/sessions` 竞速,倾向产品侧诚实序(restore 完成信号/屏障,或 bridge 既有 ready 信号接线;daemon 不因此阻塞服务);**禁 sleep 修补**(测试侧带 deadline 的轮询可接受,产品侧优先);不弱化断言。修后本机(现稳红 = 天然 red→green 有牙)与 CI 双绿。B. ②③ 注入缝密封(参照 0ec136d per-Gateway 快照;禁 env 突变)。
+- **DoD**:A:该测试本机连跑 ≥20 次全绿 + `make test-baseline` 全绿(1667/0)+ push 后 PR #170 CI 三 job 绿;B:先红后绿留痕(可复现缺陷态)或如实报告不可复现;clippy 0;fmt 干净;writeback 绿;两 commit 收口(实现→写回)。
 
 ### P1-2 session_collect 游标去重
 - **状态**:待排 · **冲突域**:`crates/ccteam-im(session_collect MCP)` · **建议入口**:dev 会话
