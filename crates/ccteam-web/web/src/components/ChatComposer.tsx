@@ -90,6 +90,7 @@ function parseNonNegInt(raw: string | undefined): number | null {
 }
 
 /** Parse a `datetime-local` string as the browser's local wall clock. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure parser stays co-located with the scheduling helpers it serves and is exported for vitest.
 export function datetimeLocalToMs(value: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value.trim());
   if (!m) return null;
@@ -722,9 +723,11 @@ export function ChatComposer({
   const sendable = scheduleMode
     ? !!text.trim() && !!resolvedScheduleWhen
     : !!text.trim() || attachments.length > 0;
+  /* eslint-disable react-hooks/purity -- the preview intentionally tracks the wall clock on each render and does not mutate component state. */
   const schedulePreview = resolvedScheduleWhen
     ? scheduleWhenPreview(resolvedScheduleWhen, Date.now(), lang === "en" ? "en-US" : "zh-CN")
     : null;
+  /* eslint-enable react-hooks/purity */
 
   return (
     <div
