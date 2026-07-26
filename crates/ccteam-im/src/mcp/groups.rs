@@ -118,9 +118,10 @@ pub fn disabled_groups_from_env() -> HashSet<ToolGroup> {
 /// so a baked-in prefix would double up.
 pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
     let bare = name;
-    // Single-member group that does not carry a sub-prefix:
-    // - `status` (v0.9 T1 rename of `admin_ls` — admin group, no prefix)
-    if bare == "status" {
+    // Prefix-less admin tools:
+    // - `status` (v0.9 T1 rename of `admin_ls`)
+    // - its bare-name discovery beacon alias (2026-07-26)
+    if bare == "status" || bare == super::protocol::STATUS_BEACON_TOOL_NAME {
         return Some(ToolGroup::Admin);
     }
     if bare.strip_prefix("admin_").is_some() {

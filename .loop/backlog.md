@@ -22,6 +22,12 @@
 - **规格**:protocol.rs 定义+本地执行+import、dispatch.rs `is_screenshot_call`/`execute_user_screenshot`、groups.rs `Screenshot` 组(未知 token 既有忽略语义兜底旧 `CCTEAM_DISABLE_TOOLS=screenshot`)、cli mcp_serve 期望集/内嵌测试、doctor_verify_mcp/mcp_e2e/mcp_subprefix/mcp_disable_groups、web mcp_tenant_bearer_test(screenshot 拒绝测例改 cull 回归守卫);文档数字与清单同步(§五.7 家规)。
 - **DoD**:`doctor --verify-mcp` = 7 工具 0 STUB;`make check` clippy 0;基线无新红(删除面净减测试在案);writeback 绿。
 
+### MCP-BEACON-1 status 裸名发现别名 + spawn 配方(owner 拍板 2026-07-26「纯别名,方便后续随时改;opencode 排最后」)
+- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests/SPA) + docs` · **建议入口**:规划(控制)会话(契约变更签核 = owner 本条)
+- **背景**:WorkBuddy P0-1 诊断(裸名宿主抹掉描述与 instructions,工具名是唯一发现面,9 个名字里没有 vendor 关键词 → 「用 grok 搜索」第一轮发现失败)。规划初判改名 status,owner 中途改令**纯别名**(alias 可随时改/删,status 零 churn);vendor 序 = 枚举序但 **opencode 殿后**(owner 钦点)。名字含 "agents" 的变体被放弃 —— 64 字符工具名上限扣除 `mcp__ccteam__` 前缀后要给第六个 vendor 留余量。
+- **规格**:新增 `claude_codex_grok_kimi_opencode_status`(7→8)= status 纯别名(protocol.rs 定义 + call_tool / dispatch is_status_call / cli forward_status 三路同判;admin 组);名字派生测试锁死(AgentVendor::ALL 全员恰一次 + opencode 殿后 + 64 上限);等价测试(响应逐字节一致);status 响应(vendor panel 路径)加 `recipes` 块 = 已装 vendor 各一行 session_spawn 一行式 + collect/dispatch 收尾行(纯静态拼接零 LLM,措辞不超 spawn 描述既有定性);全量计数/文档同步(AGENTS §〇×2/§四、tech-design census、README、usage±cn、orchestration±cn、SPA WorkflowView)。
+- **DoD**:定向测试绿(派生/等价/配方);doctor --verify-mcp = 8 工具 0 STUB;基线只增;clippy 0;web-check 绿;writeback 绿。
+
 ### MCP-CULL-2 screenshot 关联面全删(owner 扩令 2026-07-26「screenshot 关联的一并删」)
 - **状态**:完成(614ed9b) · **冲突域**:`crates/ccteam-core(screenshot/paths/deps) + crates/ccteam-web(routes/tests/SPA 文案) + crates/ccteam-im(gateway /screen) + crates/ccteam-harness(注释) + docs` · **建议入口**:规划(控制)会话(契约扩令)
 - **验证**:-1376 行 / 4 文件删除;core 四依赖(vt100/image/imageproc/ab_glyph)出 Cargo.toml(harness 自有 vt100 保留,web 终端/快照用);漏网两处数字断言随卡补(`mcp_http_test` 8→7 —— 纯 count 断言首轮字符串 grep 抓不到,经验:契约数字变更须按数字扫非仅按名;SPA WorkflowView「8 tools…screenshot」文案)。门禁:clippy 0;fmt 干净;`make test-baseline` 1660 绿 + HERM-1 同三红,-12 恰为删除的 screenshot 模块内嵌测试(8+4 逐只对账,owner 令下的功能退役非回归);`make test-web` 除已登记 pty_ws env-flake 族 1 只外全绿;vitest 422 / tsc 干净;残留 grep 全为防复活反断言;writeback 绿。

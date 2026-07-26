@@ -1149,10 +1149,16 @@ fn is_session_tool_call(req: &serde_json::Value) -> bool {
             .is_some_and(|n| n.starts_with("session_"))
 }
 
-/// True for a `tools/call` whose tool name is `status`.
+/// True for a `tools/call` whose tool name is `status` or its bare-name
+/// beacon alias (a pure alias: same handler, same response).
 fn is_status_call(req: &serde_json::Value) -> bool {
-    req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
-        && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("status")
+    if req.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    matches!(
+        req.pointer("/params/name").and_then(|n| n.as_str()),
+        Some("status") | Some(protocol::STATUS_BEACON_TOOL_NAME)
+    )
 }
 
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the

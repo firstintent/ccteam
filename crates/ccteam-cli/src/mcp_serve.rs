@@ -217,7 +217,8 @@ pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<V
         // the caller gets the vendor panel + routing notes (scoped to its
         // project). On ANY miss (no daemon reachable / no identity) fall
         // THROUGH to the local base status below — status always succeeds.
-        if name == "status" {
+        // The bare-name beacon alias rides the exact same path (pure alias).
+        if name == "status" || name == ccteam_im::mcp::STATUS_BEACON_TOOL_NAME {
             let args = req
                 .pointer("/params/arguments")
                 .cloned()
@@ -502,9 +503,11 @@ mod tests {
     use super::*;
     use ccteam_im::mcp::MCP_PROTOCOL_VERSION;
 
-    /// Exact set of MCP tool names (7 tools; `screenshot` culled 2026-07-26).
+    /// Exact set of MCP tool names (8 tools; `screenshot` culled and the
+    /// bare-name status beacon alias added 2026-07-26).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
+        "claude_codex_grok_kimi_opencode_status",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -515,7 +518,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        assert_eq!(tool_definitions().len(), 7);
+        assert_eq!(tool_definitions().len(), 8);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
@@ -535,7 +538,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 7, "tool names must be unique");
+        assert_eq!(names.len(), 8, "tool names must be unique");
         for tool in &tools {
             // Wire names are BARE — the client namespaces by server key
             // (`mcp__ccteam__session_spawn`); a baked-in prefix doubles up.
@@ -777,7 +780,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();

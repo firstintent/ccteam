@@ -153,7 +153,7 @@ The console is built on a token-authenticated HTTP API you can use directly:
 
 ### External agents over MCP (`POST /mcp`)
 
-Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same seven tools a managed session has:
+Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same eight tools a managed session has:
 
 ```
 POST http://<host>:7331/mcp
@@ -377,7 +377,7 @@ The global library and project skills never mix: nothing links or copies from th
 ```bash
 ccteam status                      # Daemon + projects/sessions + web token/url lines.
 ccteam session ls                  # Gateway session status; degrades when daemon is offline.
-ccteam doctor --verify-mcp         # MCP surface check: 7 tools / 0 stubs; drift exits 1.
+ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
 ```
 
 Restart daemon only; sessions reconnect by id afterward:

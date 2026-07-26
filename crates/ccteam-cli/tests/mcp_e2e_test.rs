@@ -3,8 +3,8 @@
 //!
 //! Confirms the wire contract:
 //! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 7 bare-named tools — the client adds
-//!   the `mcp__ccteam__` namespace (status 1 + chat 1 +
+//! - `tools/list` enumerates exactly 8 bare-named tools — the client adds
+//!   the `mcp__ccteam__` namespace (status 1 + beacon alias 1 + chat 1 +
 //!   session 5);
 //! - `tools/call status` returns a JSON-encoded projects list as
 //!   the first content[].text.
@@ -113,7 +113,7 @@ fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
 
 #[test]
 fn mcp_serve_tools_list_returns_full_tool_set() {
-    // status 1 + chat 1 + session 5 = 7.
+    // status 1 + beacon alias 1 + chat 1 + session 5 = 8.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let projects = tmp.path().join("projects");
@@ -129,11 +129,16 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     }));
     let resp = srv.recv();
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7, "status 1 + chat 1 + session 5 = 7");
+    assert_eq!(
+        tools.len(),
+        8,
+        "status 1 + beacon alias 1 + chat 1 + session 5 = 8"
+    );
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     names.sort();
     let mut expected = vec![
         "chat_send_file",
+        "claude_codex_grok_kimi_opencode_status",
         "session_collect",
         "session_dispatch",
         "session_list",

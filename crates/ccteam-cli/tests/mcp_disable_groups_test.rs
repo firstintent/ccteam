@@ -113,7 +113,10 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
     for n in names {
         // Wire names are bare (client namespaces by server key).
         let bare = n.as_str();
-        if bare == "status" || bare.starts_with("admin_") {
+        if bare == "status"
+            || bare == "claude_codex_grok_kimi_opencode_status"
+            || bare.starts_with("admin_")
+        {
             out.insert("admin");
         } else if bare.starts_with("workflow_") {
             out.insert("workflow");
@@ -153,7 +156,7 @@ fn disable_unset_returns_all_visible_groups() {
         !names.contains(&"screenshot".to_string()),
         "screenshot was culled 2026-07-26; got {names:?}"
     );
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
 }
 
 #[test]
@@ -226,5 +229,5 @@ fn disable_workflow_preserves_other_groups() {
     for g in ["admin", "chat", "session"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
 }

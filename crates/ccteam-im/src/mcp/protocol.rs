@@ -60,6 +60,18 @@ attribute, `Read` that file too. Further attachments may appear in the body as `
 `[attachment file_path=\"…\"]` lines — `Read` each of those as well. Do this BEFORE you answer; the user expects you to have \
 looked at the file they sent.";
 
+/// Bare-name discovery beacon — a PURE ALIAS of `status` (same handler,
+/// same response). Some MCP hosts strip descriptions and server
+/// instructions from ambient context and surface tool NAMES only; in that
+/// world nothing in `status` / `chat_send_file` / `session_*` says "grok"
+/// or "codex", so "use grok to search" dies on first-turn discovery. This
+/// name front-loads every vendor keyword. Owner decisions (2026-07-26):
+/// alias — NOT a rename — so it stays cheap to change or drop; `opencode`
+/// sorts last. The name is derived from [`ccteam_harness::AgentVendor::ALL`]
+/// (test-enforced), so adding a vendor forces this name to grow in the
+/// same PR.
+pub const STATUS_BEACON_TOOL_NAME: &str = "claude_codex_grok_kimi_opencode_status";
+
 /// Full tool names in the session group, registration order.
 pub const SESSION_TOOL_NAMES: &[&str] = &[
     "session_spawn",
@@ -144,13 +156,21 @@ fn tools_list_response() -> Value {
 }
 
 /// Single source of truth for the MCP tool surface:
-/// `status` (1) + `chat_send_file` (1) + session (5) = **7 total**.
+/// `status` (1) + its bare-name beacon alias (1) + `chat_send_file` (1) +
+/// session (5) = **8 total**.
 pub fn tool_definitions() -> Vec<Value> {
-    let mut tools: Vec<Value> = vec![json!({
-        "name": "status",
-        "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
-        "inputSchema": object_schema(&[]),
-    })];
+    let mut tools: Vec<Value> = vec![
+        json!({
+            "name": "status",
+            "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + per-vendor session_spawn recipes + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
+            "inputSchema": object_schema(&[]),
+        }),
+        json!({
+            "name": STATUS_BEACON_TOOL_NAME,
+            "description": "Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode — with install/auth state and per-vendor session_spawn recipes, plus registered projects, daemon health, today's cost. Identical response to status.",
+            "inputSchema": object_schema(&[]),
+        }),
+    ];
     tools.extend(chat_tool_definitions());
     tools.extend(session_tool_definitions());
     tools
@@ -282,16 +302,16 @@ fn object_schema(props: &[(&str, &str, &str)]) -> Value {
     })
 }
 
-/// Local-only `tools/call` dispatch (`status`).
+/// Local-only `tools/call` dispatch (`status` + its beacon alias).
 async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
-    match name {
-        "status" => Ok(text_content(tool_ls(paths)?)),
-        other => Err(anyhow!("unknown tool: {other}")),
+    if name == "status" || name == STATUS_BEACON_TOOL_NAME {
+        return Ok(text_content(tool_ls(paths)?));
     }
+    Err(anyhow!("unknown tool: {name}"))
 }
 
 fn text_content(body: String) -> Vec<Value> {
@@ -387,10 +407,12 @@ fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// Exact set of MCP tool names (7 tools; `screenshot` culled 2026-07-26
-    /// as tmux-era legacy — the web `/screenshot/<slug>.png` route stays).
+    /// Exact set of MCP tool names (8 tools; `screenshot` culled 2026-07-26
+    /// as tmux-era legacy, the bare-name status beacon alias added the same
+    /// day — owner-ordered both).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
+        "claude_codex_grok_kimi_opencode_status",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -401,7 +423,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        assert_eq!(tool_definitions().len(), 7);
+        assert_eq!(tool_definitions().len(), 8);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
@@ -421,7 +443,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 7, "tool names must be unique");
+        assert_eq!(names.len(), 8, "tool names must be unique");
         for tool in &tools {
             // Wire names are BARE: the MCP client namespaces by server key
             // (`mcp__ccteam__session_spawn`), so a baked-in `ccteam__`
@@ -523,6 +545,65 @@ mod tests {
                  (backticks defeat host keyword matchers)"
             );
         }
+    }
+
+    /// MCP-BEACON-1 — the bare-name beacon is a PURE alias: listed next to
+    /// `status`, same handler, byte-identical response. Its NAME is the
+    /// contract — derived from `AgentVendor::ALL` with `opencode` sorted
+    /// last (owner decisions 2026-07-26), and it must survive the
+    /// `mcp__ccteam__` client prefix under the 64-char tool-name cap, so a
+    /// sixth vendor forces a conscious rename in the same PR.
+    #[tokio::test]
+    async fn status_beacon_is_a_pure_alias_with_vendor_derived_name() {
+        // Name derivation: every vendor wire token, opencode last.
+        let mut order: Vec<String> = ccteam_harness::AgentVendor::ALL
+            .iter()
+            .map(|v| {
+                serde_json::to_value(v)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .filter(|v| v != "opencode")
+            .collect();
+        order.push("opencode".to_string());
+        let expected = format!("{}_status", order.join("_"));
+        assert_eq!(STATUS_BEACON_TOOL_NAME, expected);
+        assert!(
+            "mcp__ccteam__".len() + STATUS_BEACON_TOOL_NAME.len() <= 64,
+            "beacon name must fit the 64-char tool-name cap with the client prefix"
+        );
+
+        // Listed, admin-grouped, schema-identical to status.
+        let defs = tool_definitions();
+        let beacon = defs
+            .iter()
+            .find(|t| t["name"] == STATUS_BEACON_TOOL_NAME)
+            .expect("beacon listed");
+        let status = defs.iter().find(|t| t["name"] == "status").unwrap();
+        assert_eq!(beacon["inputSchema"], status["inputSchema"]);
+
+        // Pure alias: tools/call returns the same body as status.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let call = |name: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": {} }
+            })
+        };
+        let via_status = handle_request(&paths, &call("status")).await.unwrap();
+        let via_beacon = handle_request(&paths, &call(STATUS_BEACON_TOOL_NAME))
+            .await
+            .unwrap();
+        assert_eq!(via_status["result"], via_beacon["result"]);
+        assert_eq!(via_beacon["result"]["isError"], false);
     }
 
     /// MCP-DX-1 — `status` is the discovery surface (vendor availability per
@@ -741,7 +822,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();

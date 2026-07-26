@@ -123,10 +123,10 @@ async fn mcp_initialize_defaults_protocol_version_when_omitted() {
     assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
 }
 
-// ── ② tools/list returns exactly 7 tools ────────────────────────────
+// ── ② tools/list returns the full tool surface ─────────────────────
 
 #[tokio::test]
-async fn mcp_tools_list_returns_exactly_seven() {
+async fn mcp_tools_list_returns_the_full_surface() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     seed_web_token(&paths, TOKEN_HEX);
@@ -147,7 +147,7 @@ async fn mcp_tools_list_returns_exactly_seven() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 7, "tools={tools:?}");
+    assert_eq!(tools.len(), 8, "tools={tools:?}");
 }
 
 // ── ③ tools/call status succeeds ────────────────────────────────────

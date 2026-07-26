@@ -113,7 +113,7 @@ async fn tenant_bearer_is_accepted_while_bad_and_admin_tokens_keep_their_posture
         "a registered tenant web bearer must authenticate at /mcp"
     );
     let body: serde_json::Value = tenant_response.json().await.unwrap();
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 8);
 
     // This distinguishes User from Admin at the real route boundary: an admin
     // caller naming `admin-project` would get the status vendor panel, while

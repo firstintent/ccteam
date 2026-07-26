@@ -9,12 +9,12 @@
 
 ## 〇、架构总览(定向图;红线唯一清单 = §三,勿与本节混)
 
-ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway + web + MCP)把 IM/web chat 路由到按需 spawn/resume 的 agent session;任意 session 经 7 个 MCP 工具委派任意其他 session(A2A)。**铁律:只做单 harness 做不到的(跨 vendor 身份/路由/账本/观测 + 跨机执行),永不做厂商能力。**
+ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway + web + MCP)把 IM/web chat 路由到按需 spawn/resume 的 agent session;任意 session 经 8 个 MCP 工具委派任意其他 session(A2A)。**铁律:只做单 harness 做不到的(跨 vendor 身份/路由/账本/观测 + 跨机执行),永不做厂商能力。**
 
 - **核心模型 `chat ⇄ project ⇄ session`**:session 是独立一等实体(持久 sid `s<N>`,单调、扛 daemon 重启、不复用);role / harness(claude|codex|grok|opencode|kimi,`AgentVendor` 可扩展)/ provider(model)/ protocol 都是 session 属性,同一 role 可并存多 session;host 是 project 属性,session 继承。roleless(空 role,裸 vendor 自读项目 `CLAUDE.md`)合法且是默认。
 - **协议轴**:Claude 默认 `stream-json`(长驻子进程 + 双向 NDJSON,无 PTY/pane/hook);grok/opencode/kimi 走 ACP;`terminal`(tmux/rmux)维护期、规划淘汰(见 §三)。所有 adapter 归一 **`CanonicalEvent`**,gateway `spawn_event_pump` 单点消费。
 - **数据面**:业务事件 = `progress.jsonl`(schema 唯一权威 `harness/progress_bridge`,`core` 只 re-export);对话原文 = `<project>/.ccteam/chat/<sid>/turns.jsonl`(按 sid;live daemon 唯一 turns writer = gateway);成本/委派树全入账本。
-- **接口面**:7 个 MCP 工具 `mcp__ccteam__{status,chat_send_file,session_*}` + `POST /mcp` streamable HTTP + REST `/api/v1`(OpenAPI = `/api/docs`)+ IM 斜杠命令面 + 统一 chat-shell web(per-session Chat|终端)。清单/参数/语义以代码与工具自描述为准(指针表 = tech-design 末尾)。
+- **接口面**:8 个 MCP 工具 `mcp__ccteam__{status(+裸名发现别名),chat_send_file,session_*}` + `POST /mcp` streamable HTTP + REST `/api/v1`(OpenAPI = `/api/docs`)+ IM 斜杠命令面 + 统一 chat-shell web(per-session Chat|终端)。清单/参数/语义以代码与工具自描述为准(指针表 = tech-design 末尾)。
 - **内容面**:引擎零内置 persona/skill/提示词;role = 项目 `.claude/agents/<role>.md`(vendor 原生 `--agent` 自读,init 不种);skill = 用户级全局库 `~/.ccteam/skills`(会话显式 attach)+ 项目 `.agents/skills`(`.claude/skills` 软链);一切内容从 ccteam-hub 装(sha256 校验、never-execute)或用户自建。
 - **执行面**:daemon 不 tick、无 orchestrator 循环,只响应消息/排程;会话 = resume-by-sid + 容量挤停;编排智能 100% 用户空间(`ccteam-flow`/workflow.yaml 占位 deferred,倾向 prompt 层 skill over Rust 特性)。
 - **安装面**:`curl install.sh | sh`(prebuilt binary)→ `ccteam config` 注册五 vendor 全局 MCP;**ccteam 是纯 CLI、不是 vendor 插件**。
@@ -90,7 +90,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | **role 库**(`.claude/agents/<role>.md`)| ccteam 唯一管的**项目级**指令面;init 不种、默认 roleless;用户自建或从 hub 装(`ccteam role search/add/list` / web 市场),`/role <role>` 原地换 |
 | **插件市场(ccteam-hub)**(`firstintent/ccteam-hub`)| repo 之外的唯一**内容**源,四型 agent/skill/workflow/plugin:track-upstream `index.json`(pinned-sha,零 vendored body)→ 安装 = host 白名单 + sha256 校验 + **never-execute**;agent 落项目、skill 落全局库、plugin 只写项目 `.claude/settings.local.json` 两键委托 vendor 自装;入口 = CLI(`role`/`skill` 组)+ web 市场 + REST `marketplace`/`skills` |
 | **CLAUDE.md / AGENTS.md** | 项目 / 用户级持久指令,**vendor 原生**(ccteam 只读,不生成)|
-| **MCP** | **7 工具 0 STUB**(`ccteam doctor --verify-mcp` 防 drift):`status`(发现面:vendor 面板/advisory 目录/routing notes,目录**永不当 spawn 白名单**)· `chat_send_file` · `session_*` 5 个 A2A 委派面(调度门与护栏 = §三红线);工具用法住工具自描述(**MCP-DX 钢线:面向 agent,改进 ≠ 加法**);ccteam-managed 会话统一走 `POST /mcp` HTTP(session bearer),普通主会话走全局 admin 注册,stdio `mcp-serve` 仅 Claude terminal/既有全局/显式 fallback |
+| **MCP** | **8 工具 0 STUB**(`ccteam doctor --verify-mcp` 防 drift):`status`(发现面:vendor 面板 + 已装 vendor 的 spawn 配方/advisory 目录/routing notes,目录**永不当 spawn 白名单**)+ 裸名发现别名 `claude_codex_grok_kimi_opencode_status`(纯 alias 同响应,治「宿主只显工具名」的发现失败;名字自 vendor 枚举派生、opencode 殿后,owner 2026-07-26)· `chat_send_file` · `session_*` 5 个 A2A 委派面(调度门与护栏 = §三红线);工具用法住工具自描述(**MCP-DX 钢线:面向 agent,改进 ≠ 加法**);ccteam-managed 会话统一走 `POST /mcp` HTTP(session bearer),普通主会话走全局 admin 注册,stdio `mcp-serve` 仅 Claude terminal/既有全局/显式 fallback |
 | **Skills** | repo 零自带;全局库 `~/.ccteam/skills` = hub/整仓 source 安装唯一落点(**只能会话显式 attach**,禁 link/copy 进项目);项目自有 skill = `.agents/skills/` 实体 + `.claude/skills` 软链(`skill ensure-project`/`migrate-project`)|
 | **Subagents / Hooks** | subagent = agent 内 `Task(subagent_type=…)` ad-hoc 节流;ccteam hook 只写 `.claude/settings.local.json` 自己的段 |
 | **MCP 注册(五 vendor)** | `ccteam config` / daemon-start 幂等写各 vendor 全局配置(Claude `~/.claude.json`、Codex `~/.codex/config.toml`、Grok/OpenCode/Kimi 对称),任何主会话可编排;per-project `.mcp.json` 仅由 web 按需写第三方 server;repo **不**带任何 vendor 插件清单(`.claude-plugin`/`marketplace.json`/根 `.mcp.json`)|

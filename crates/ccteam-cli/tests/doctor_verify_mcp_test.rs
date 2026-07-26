@@ -32,14 +32,14 @@ fn run_doctor_verify_mcp(extra_args: &[&str]) -> (String, String, i32) {
 }
 
 #[test]
-fn active_count_is_7_and_stub_count_is_0_on_clean_tree() {
-    // status 1 + chat 1 + session 5 = 7. STUB_TOOLS empty.
+fn active_count_is_8_and_stub_count_is_0_on_clean_tree() {
+    // status 1 + beacon alias 1 + chat 1 + session 5 = 8. STUB_TOOLS empty.
     let (stdout, stderr, code) = run_doctor_verify_mcp(&["--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(v["ok"], Value::Bool(true), "{v}");
-    assert_eq!(v["total_tools"], Value::Number(7.into()), "{v}");
-    assert_eq!(v["active_count"], Value::Number(7.into()), "{v}");
+    assert_eq!(v["total_tools"], Value::Number(8.into()), "{v}");
+    assert_eq!(v["active_count"], Value::Number(8.into()), "{v}");
     assert_eq!(v["stub_count"], Value::Number(0.into()), "{v}");
     assert!(v["unexpected_stubs"].as_array().unwrap().is_empty(), "{v}");
 }
@@ -89,6 +89,7 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     assert_eq!(names, sorted, "tool_list must be sorted for stable output");
     // Spot-check a known tool from each surviving group is present.
     assert!(names.contains(&"status"));
+    assert!(names.contains(&"claude_codex_grok_kimi_opencode_status"));
     assert!(names.contains(&"chat_send_file"));
     assert!(names.contains(&"session_spawn"));
     // Culled / retired tools are gone from the live surface.
@@ -112,8 +113,8 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
         stdout.contains("V0.6.6 F171"),
         "header must carry F171 marker for traceability: {stdout}",
     );
-    assert!(stdout.contains("total tools:    7"), "got: {stdout}");
-    assert!(stdout.contains("active:         7"), "got: {stdout}");
+    assert!(stdout.contains("total tools:    8"), "got: {stdout}");
+    assert!(stdout.contains("active:         8"), "got: {stdout}");
     assert!(stdout.contains("stubs:          0"), "got: {stdout}");
     assert!(stdout.contains("per-group breakdown:"), "got: {stdout}");
     // Verdict line on clean tree.
@@ -172,7 +173,7 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
     // appears with the right active count and `0 stub` suffix.
     let (stdout, _stderr, code) = run_doctor_verify_mcp(&[]);
     assert_eq!(code, 0);
-    for (group, active) in [("admin:", 1), ("chat:", 1), ("session:", 5)] {
+    for (group, active) in [("admin:", 2), ("chat:", 1), ("session:", 5)] {
         let needle = format!("{group}    {active} active / 0 stub");
         // Allow extra padding on either side — exact spacing depends
         // on the longest group name. Use a relaxed contains check.

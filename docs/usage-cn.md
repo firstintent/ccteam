@@ -137,7 +137,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 外部 Agent 直连 MCP(`POST /mcp`)
 
-任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 7 个工具:
+任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
 
 ```
 POST http://<host>:7331/mcp
@@ -354,7 +354,7 @@ ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/sk
 ```bash
 ccteam status                  # daemon + 项目/会话 + 末尾两行 web token/url
 ccteam session ls              # 网关会话状态(daemon 离线降级标注)
-ccteam doctor --verify-mcp     # MCP 表面验收(7 工具 / 0 stub,漂移退出码 1)
+ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
 ```
 
 重启(只停 daemon,重启后按会话 id 自动接回):

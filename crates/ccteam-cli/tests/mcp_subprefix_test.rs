@@ -5,7 +5,7 @@
 //!
 //! - server name still `ccteam` (V0.5 muscle memory preserved)
 //! - every tool carries a group sub-prefix (`chat_` / `session_`) OR
-//!   is the single-member exception (`status`)
+//!   is a prefix-less admin tool (`status` + its bare-name beacon alias)
 //! - V0.5 unprefixed names (`ccteam__ls`, …) and culled v0.9 tools are
 //!   GONE from `tools/list` — no compat alias preserved
 
@@ -122,8 +122,8 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
     let names = list_tool_names();
     assert!(!names.is_empty(), "tools/list returned empty");
     for n in &names {
-        // Wire names are BARE `<group>_<rest>` (or the single-member
-        // exception: `status`). The MCP client namespaces
+        // Wire names are BARE `<group>_<rest>` (or the prefix-less admin
+        // tools: `status` + its bare-name beacon alias). The MCP client namespaces
         // by server key, so Claude Code shows `mcp__ccteam__session_spawn`
         // — a baked-in `ccteam__` prefix would render as the double
         // `mcp__ccteam__ccteam__session_spawn`.
@@ -132,6 +132,7 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
             "tool name {n:?} must not embed the server prefix (client namespaces by server key)"
         );
         let ok = n == "status"
+            || n == "claude_codex_grok_kimi_opencode_status"
             || n.starts_with("admin_")
             || n.starts_with("workflow_")
             || n.starts_with("chat_")
@@ -231,12 +232,16 @@ fn status_and_session_tools_dispatch_through_server() {
 
 #[test]
 fn status_keeps_singleton_name_in_listing() {
-    // `status` is the one single-member group whose tool name does
-    // NOT get a sub-prefix (v0.9 T1 rename of `admin_ls`).
+    // `status` (v0.9 T1 rename of `admin_ls`) and its bare-name beacon
+    // alias are the prefix-less admin tools.
     let names = list_tool_names();
     assert!(
         names.contains(&"status".to_string()),
         "status must survive without sub-prefix"
+    );
+    assert!(
+        names.contains(&"claude_codex_grok_kimi_opencode_status".to_string()),
+        "the bare-name beacon alias must be listed"
     );
     // Sanity: the culled screenshot singleton stays gone.
     assert!(
