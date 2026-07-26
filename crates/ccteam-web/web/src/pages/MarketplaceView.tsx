@@ -13,17 +13,19 @@
 // the install POST route are unchanged — the library semantics live in the
 // backend; `installed_status` for skills is library-relative.
 //
-// Data: a PROJECT PICKER selects the install target; the decorated
-// `GET /api/v1/projects/{slug}/marketplace` gives per-project `installed_status`
-// so cards can flip to 已装/更新. With no project selected (none exist, or
-// none picked) we show the UNDECORATED global catalog (browse-only) and the
-// install button is disabled with a "pick a project" hint.
+// Install target: project is picked AT INSTALL TIME (detail drawer), not in
+// the filter bar — switching Skills ↔ Roles must not reflow the chrome.
+// Internally we still keep a default/last project so the decorated
+// `GET /api/v1/projects/{slug}/marketplace` can show 已装/更新 on cards, and
+// so skill installs (library-write, project-scoped REST path) have a slug.
+// With no projects registered we fall back to the UNDECORATED global catalog
+// (browse-only); install stays disabled until a project exists.
 //
 // Four states per the v0.8.8 web UI quality baseline: loading / error /
 // empty (no plugins in this category) / success. Install → POST → toast →
 // re-fetch the decorated catalog → card flips. The detail drawer fetches the
 // body lazily (marked-rendered markdown = review-before-install) + upstream +
-// license + an install button.
+// license + an install button (+ project picker for agent/plugin).
 //
 // Theme discipline: surface-*/brand-*/text-*/status-* + the vendor-* tokens
 // only — NO bare Tailwind color literals (mirrors SettingsPage).
@@ -146,9 +148,9 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
     [project],
   );
 
-  // Event-handler reload (refresh button / project switch / post-install): we
-  // CAN reset to a loading/refreshing state synchronously here because this
-  // runs from a user gesture, not an effect body.
+  // Event-handler reload (refresh button / post-install): we CAN reset to a
+  // loading/refreshing state synchronously here because this runs from a user
+  // gesture, not an effect body.
   const reload = useCallback(
     (refresh: boolean) => {
       if (!projectsLoaded) return;
@@ -161,9 +163,10 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
 
   // Initial / dependency-driven load. We fetch directly (no synchronous
   // setState in the effect body); the initial `state` is already `loading`, so
-  // there's nothing to reset on the first run. On a later `project` switch this
-  // effect re-fires (fetchCatalog deps on `project`) to fetch the new catalog;
-  // the select's onChange shows the loading state synchronously for feedback.
+  // there's nothing to reset on the first run. On a later `project` switch
+  // (drawer install-target change → setProject) this re-fires to re-decorate
+  // installed_status quietly — no loading flash, drawer stays open (it only
+  // unmounts when `state.kind !== "ready"`, which we avoid on project switch).
   useEffect(() => {
     if (!projectsLoaded) return;
     void fetchCatalog(false);
@@ -274,33 +277,9 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
         </button>
       </div>
 
-      {/* filter bar: project target · category seg · source · search */}
+      {/* filter bar: category seg · source · search (stable layout — install
+          target lives in the drawer so tab switches never reflow this row). */}
       <div className="mt-4 flex flex-wrap items-center gap-2.5">
-        {needsProjectTarget(category) ? (
-          <label
-            data-testid="market-project-picker"
-            className="flex items-center gap-1.5 text-xs text-text-dim"
-          >
-            安装到
-            <Combobox
-              value={project}
-              onChange={(v) => {
-                // Switching the install target re-fetches (the load effect keys
-                // on `project`); show the loading state immediately for feedback.
-                setProject(v);
-                setState({ kind: "loading" });
-              }}
-              options={projectOptions}
-              searchable={projects.length > 8}
-              placeholder="（无项目 · 仅浏览）"
-              searchPlaceholder="搜索项目…"
-              ariaLabel="安装目标项目"
-              className="min-w-[160px]"
-              buttonClassName="h-8 text-xs"
-            />
-          </label>
-        ) : null}
-
         <div className="flex items-center gap-0.5 rounded-md bg-surface-800 p-0.5" role="tablist">
           {CATEGORIES.map((c) => (
             <button
@@ -412,13 +391,14 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
                 installing={installing === plugin.id}
                 canInstall={project.length > 0}
                 onOpen={() => setDetailId(plugin.id)}
-                // review-before-install (装前 review): a NEVER-installed persona
-                // must be previewable before it lands (it executes as an agent
-                // once installed), so first-install routes through the drawer
-                // (where the body preview + the real Install button live). An
-                // `update_available` plugin was already reviewed once → install
-                // directly from the card. (see cardInstallNeedsPreview)
+                // Card CTA routes into the drawer when:
+                //   - agent/plugin → always (install-time project picker lives
+                //     there; never install-to-wrong-project from the card)
+                //   - skill first-install → review-before-install (body preview)
+                // Skill `update_available` was already reviewed → one-click
+                // install-to-library from the card (no project to pick).
                 onInstall={() =>
+                  needsProjectTarget(plugin.type) ||
                   cardInstallNeedsPreview(plugin.installed_status)
                     ? setDetailId(plugin.id)
                     : doInstall(plugin)
@@ -434,9 +414,12 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           key={detailPlugin.id}
           plugin={detailPlugin}
           project={project}
+          projects={projects}
+          projectOptions={projectOptions}
           lang={lang}
           installing={installing === detailPlugin.id}
           onClose={() => setDetailId(null)}
+          onProjectChange={setProject}
           onInstall={() => doInstall(detailPlugin)}
         />
       ) : null}
@@ -604,16 +587,24 @@ function renderBody(markdown: string): string {
 export function PluginDrawer({
   plugin,
   project,
+  projects = [],
+  projectOptions = [],
   lang = "zh",
   installing,
   onClose,
+  onProjectChange,
   onInstall,
 }: {
   plugin: CatalogPlugin;
   project: string;
+  /** Registered project slugs — drives the install-time target picker. */
+  projects?: string[];
+  projectOptions?: ComboboxOption[];
   lang?: Lang;
   installing: boolean;
   onClose: () => void;
+  /** Called when the operator picks a different install target (agent/plugin). */
+  onProjectChange?: (slug: string) => void;
   onInstall: () => void;
 }) {
   // Initial state is `loading`; the drawer is keyed on `plugin.id` at its
@@ -623,6 +614,8 @@ export function PluginDrawer({
   const [body, setBody] = useState<BodyState>({ kind: "loading" });
   const t = makeT(lang);
   const isSkill = plugin.type === "skill";
+  // agent / plugin install into a project; skill → global library (no picker).
+  const showProjectPicker = needsProjectTarget(plugin.type);
 
   useEffect(() => {
     let cancelled = false;
@@ -687,12 +680,12 @@ export function PluginDrawer({
           </div>
           {plugin.tags.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
-              {plugin.tags.map((t) => (
+              {plugin.tags.map((tag) => (
                 <span
-                  key={t}
+                  key={tag}
                   className="text-[10px] font-mono text-text-dim bg-surface-800 px-1.5 py-0.5 rounded"
                 >
-                  {`#${t}`}
+                  {`#${tag}`}
                 </span>
               ))}
             </div>
@@ -719,18 +712,40 @@ export function PluginDrawer({
           </div>
         </div>
 
-        <div className="shrink-0 px-4 py-3 border-t border-surface-700/50 flex items-center gap-2">
-          <span className="text-[11px] text-text-dim truncate">
-            {isSkill ? (
-              t("skillLibraryTarget")
-            ) : project ? (
-              <>
-                安装到 <span className="font-mono text-text-secondary">{project}</span>
-              </>
-            ) : (
-              "先选一个安装目标项目"
-            )}
-          </span>
+        <div className="shrink-0 px-4 py-3 border-t border-surface-700/50 flex flex-wrap items-center gap-2">
+          {isSkill ? (
+            <span className="text-[11px] text-text-dim truncate">
+              {t("skillLibraryTarget")}
+            </span>
+          ) : showProjectPicker ? (
+            <label
+              data-testid="market-project-picker"
+              className="flex items-center gap-1.5 text-xs text-text-dim min-w-0"
+            >
+              安装到
+              <Combobox
+                value={project}
+                onChange={(v) => onProjectChange?.(v)}
+                options={projectOptions}
+                searchable={projects.length > 8}
+                placeholder="（无项目 · 仅浏览）"
+                searchPlaceholder="搜索项目…"
+                ariaLabel="安装目标项目"
+                className="min-w-[140px]"
+                buttonClassName="h-8 text-xs"
+              />
+            </label>
+          ) : (
+            <span className="text-[11px] text-text-dim truncate">
+              {project ? (
+                <>
+                  安装到 <span className="font-mono text-text-secondary">{project}</span>
+                </>
+              ) : (
+                "无可用项目"
+              )}
+            </span>
+          )}
           <span className="flex-1" />
           {plugin.installed_status === "installed" ? (
             <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">

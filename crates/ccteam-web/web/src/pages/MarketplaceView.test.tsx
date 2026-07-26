@@ -26,7 +26,7 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import MarketplaceView, { InstallButton, PluginCard } from "./MarketplaceView";
+import MarketplaceView, { InstallButton, PluginCard, PluginDrawer } from "./MarketplaceView";
 import type { HubPlugin, InstalledStatus } from "../lib/marketplaceApi";
 import { CATEGORIES, needsProjectTarget } from "../lib/marketplaceFormat";
 
@@ -67,6 +67,8 @@ describe("MarketplaceView initial render", () => {
     expect(html).toContain('data-testid="marketplace-view"');
     expect(html).toContain('data-testid="marketplace-loading"');
     // The category seg tabs + search box render immediately (static chrome).
+    // Project picker is NOT in the filter bar (lives in the install drawer) so
+    // switching Skills ↔ Roles never reflows the chrome.
     expect(html).toContain("Skills");
     expect(html.indexOf("Skills")).toBeLessThan(html.indexOf("Agents / Roles"));
     expect(html).not.toContain('data-testid="market-project-picker"');
@@ -79,11 +81,57 @@ describe("marketplace category install target semantics", () => {
     expect(CATEGORIES.map((c) => c.type)).toEqual(["skill", "agent", "workflow", "plugin"]);
   });
 
-  it("shows the project target only for agent/plugin categories", () => {
+  it("project target is required only for agent/plugin (install-time picker)", () => {
     expect(needsProjectTarget("agent")).toBe(true);
     expect(needsProjectTarget("plugin")).toBe(true);
     expect(needsProjectTarget("skill")).toBe(false);
     expect(needsProjectTarget("workflow")).toBe(false);
+  });
+});
+
+// Install-time project picker lives in the detail drawer (not the filter bar).
+describe("PluginDrawer install-target picker", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("shows the project picker for an agent (install-to-project)", () => {
+    const html = renderToString(
+      <PluginDrawer
+        plugin={plugin({ type: "agent", installed_status: "not_installed" })}
+        project="cct"
+        projects={["cct", "demo"]}
+        projectOptions={[
+          { value: "cct", label: "cct" },
+          { value: "demo", label: "demo" },
+        ]}
+        installing={false}
+        onClose={() => {}}
+        onInstall={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="market-project-picker"');
+    expect(html).toContain("安装到");
+  });
+
+  it("hides the project picker for a skill (install-to-library)", () => {
+    const html = renderToString(
+      <PluginDrawer
+        plugin={plugin({ type: "skill", installed_status: "not_installed" })}
+        project="cct"
+        projects={["cct"]}
+        projectOptions={[{ value: "cct", label: "cct" }]}
+        installing={false}
+        onClose={() => {}}
+        onInstall={() => {}}
+      />,
+    );
+    expect(html).not.toContain('data-testid="market-project-picker"');
+    expect(html).toContain("装进全局库");
   });
 });
 

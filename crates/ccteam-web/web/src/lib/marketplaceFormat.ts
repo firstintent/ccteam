@@ -15,6 +15,9 @@ export const CATEGORIES: { type: HubPlugin["type"]; label: string }[] = [
   { type: "plugin", label: "Plugins" },
 ];
 
+/** Whether installing this type writes into a project (vs. the global skill
+ *  library). Drives the install-time project picker in the detail drawer —
+ *  the filter bar stays stable across category tabs. */
 export function needsProjectTarget(type: HubPlugin["type"]): boolean {
   return type === "agent" || type === "plugin";
 }
