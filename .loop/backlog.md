@@ -23,7 +23,8 @@
 - **DoD**:`doctor --verify-mcp` = 7 工具 0 STUB;`make check` clippy 0;基线无新红(删除面净减测试在案);writeback 绿。
 
 ### MCP-CULL-2 screenshot 关联面全删(owner 扩令 2026-07-26「screenshot 关联的一并删」)
-- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-core(screenshot/paths/deps) + crates/ccteam-web(routes/tests/SPA 文案) + crates/ccteam-im(gateway /screen) + crates/ccteam-harness(注释) + docs` · **建议入口**:规划(控制)会话(契约扩令)
+- **状态**:完成(614ed9b) · **冲突域**:`crates/ccteam-core(screenshot/paths/deps) + crates/ccteam-web(routes/tests/SPA 文案) + crates/ccteam-im(gateway /screen) + crates/ccteam-harness(注释) + docs` · **建议入口**:规划(控制)会话(契约扩令)
+- **验证**:-1376 行 / 4 文件删除;core 四依赖(vt100/image/imageproc/ab_glyph)出 Cargo.toml(harness 自有 vt100 保留,web 终端/快照用);漏网两处数字断言随卡补(`mcp_http_test` 8→7 —— 纯 count 断言首轮字符串 grep 抓不到,经验:契约数字变更须按数字扫非仅按名;SPA WorkflowView「8 tools…screenshot」文案)。门禁:clippy 0;fmt 干净;`make test-baseline` 1660 绿 + HERM-1 同三红,-12 恰为删除的 screenshot 模块内嵌测试(8+4 逐只对账,owner 令下的功能退役非回归);`make test-web` 除已登记 pty_ws env-flake 族 1 只外全绿;vitest 422 / tsc 干净;残留 grep 全为防复活反断言;writeback 绿。
 - **背景**:MCP-CULL-1 收口报告列明保留面(web `/screenshot` 路由 / core `render_screenshot` / IM `/screen`),owner 明示一并删。SPA WorkflowView 「8 tools …/screenshot/…」文案系首轮漏网,随卡清。
 - **规格**:删 core `screenshot` 模块 + `paths` 两 helper + vt100/image/imageproc/ab_glyph 四依赖(harness 自有 vt100 为 web 终端/快照用途,不动);删 web `/screenshot` 路由 + `screenshot_test.rs` + auth/state/pane_snapshot 注释残留;删 IM `/screen` 命令(spec + handler);harness 注释去 screenshot 提法(capture 函数被 web 终端/快照使用,保留);docs(AGENTS 红线行措辞 / tech-design / usage±cn `/screen` 行)同步。基线数字随删测试净减 —— 逐只列账,非回归。
 - **DoD**:workspace 零 screenshot 符号残留(注释与「用户报错截图」语义除外);`make check` clippy 0;`make test-baseline` 红不增、减少数与删除测试清单吻合;`make web-check` 绿(SPA 文案);writeback 绿。
