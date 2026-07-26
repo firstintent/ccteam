@@ -15,8 +15,14 @@
 
 ## 当前卡
 
+### WEB-IA-1 web 信息架构改版:market 迁 flow + ops 会话大表删除 + 「接入」聚合(owner 直驱 2026-07-26)
+- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:codex 委派(规划发卡 + review)
+- **背景**:owner 三项 UI 直驱:① 插件市场从设置迁到工作流下,市场内 skills 优先(全局 skill 库落地后按项目筛选不友好);② 设置·运维总览的会话 fleet 大表(`status-sessions`,「N live · M idle」)占版面且拓扑已有 团队 视图,删;③ token/授权四散面(用户登录链接 / 外部 MCP 配置 / 卫星加入 / IM 凭据)聚合一处 —— 规划钉设计 = 新设置 tab「接入 Access」(admin-only)四卡分区;外部 MCP 配置 JSON 此前无任何页面渲染(只在文档),本卡首次给它安家。纯 UI 层,REST/后端零碰;ACL 语义不变(后端 403 兜底,UI fail-closed)。
+- **规格**:A. market 迁移:SettingsView ITEMS/SettingsTab 去 market(非 admin 默认 tab market→general),WorkflowView TABS 增 market(序 skills/roles/market/mcp/evolution),App.tsx `/settings/market`+`/marketplace` → `/flow/market`,ChatConsole onOpenMarket 改指;B. 市场内:默认 category agent→skill 且 skill 排首,project 选择器仅 agent/plugin 类显示(skill 装全局库,无项目语义);C. StatusView 删 `status-sessions` fleet 大表区块(stat-grid 会话小瓷片保留;rail prop 失依随删);D. 新「接入 Access」tab(admin-only fail-closed,位 ops 后):①外部 Agent MCP 卡 = mcpServers JSON 模板(origin+`/mcp`+Bearer=当前登录 token,client-side 渲染零新端点)+ 复制;②卫星节点卡 = HostsView JoinCard 整体迁入(hosts 面留列表 + 指路链接);③IM 凭据卡 = admin 全局 Telegram/Lark 区块自 admin tab 迁入(tenant「我的 IM bot」留账号 tab);④用户登录链接卡 = tenant handle + 复制链接(复用 `GET /users/{id}/link`;用户生命周期管理留 管理员 tab);i18n zh/en 双语新键。
+- **DoD**:`make web-check` 绿(tsc/eslint/vitest,计数净变逐只对账);既有五处测试更新 + Access 定向测试(admin 门 fail-closed + 四卡渲染);rust 零碰;writeback 绿。
+
 ### MCP-CULL-3 session_spawn `protocol` 参数删除(owner 直驱 2026-07-26;wire 契约变更)
-- **状态**:完成(9638ce9) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
+- **状态**:完成(9c2a89e) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
 - **背景**:外部 agent 反馈「grok 必须 acp 只藏在描述括号里,第一次即踩坑」。MCP-DX-2(1ab85da)已把静默覆盖修成派生+冲突可操作错误但为守 wire 形状保留了字段;owner 本日追加拍板:**字段整个删掉** —— 每个 vendor 只有一种最佳协议(claude/codex=stream-json,grok/opencode/kimi=acp),调用方零选择;terminal/tmux 面后续另案退役。先例 = host 参数删除(`HOST_SPAWN_PARAM_REMOVED`,v0.9.2:schema 不列 + 传入即硬错)。
 - **规格**:A. schema 删 `protocol` property(protocol.rs session_spawn inputSchema);B. dispatch 镜像 host 门:`args.get("protocol").is_some()` → 稳定可操作错误(错误文案含 vendor→channel 派生表 + omit 指引;terminal 不再特判,任意值同一错误);`resolve_session_protocol` 简化为纯派生 `derive_session_protocol(vendor)`;spawn 响应/list 的 `protocol` 输出字段保留(观测面);C. 测试翻转:protocol.rs facet 测试 + cli mcp_session_tools schema 测试(protocol 出 presence 列表 + 加 absence 断言,镜像 host)+ dispatch 派生/removal 测试重写(五 vendor 派生 + 任意显式值(含此前被接受的一致值)同错);D. docs:orchestration.md(+cn)facet 列表去 `protocol?`、措辞改「无 protocol 参数,通道由 vendor 派生,传入即硬错(同 host)」——cn 版仍是 DX-2 前旧文(「强制 protocol:"acp"」括号即反馈踩坑点)一并修。**边界零碰**:REST CreateSessionForm/web SPA 协议选择(admin beta,terminal/rmux 退役另案)、内部 SessionProtocol/adapter/session_meta、IM/CLI 命令面。
 - **DoD**:翻转测试对旧代码红、新代码绿(留痕);`make check` clippy 0;`make test-baseline` 红不增(本机 HERM-1 三红口径)、数目净变逐只对账;fmt 干净;writeback 绿。
