@@ -15,6 +15,18 @@
 
 ## 当前卡
 
+### GOV-CE-2 §三红线表述治理(owner 签核 2026-07-26)
+- **状态**:完成(f0c834c) · **冲突域**:`AGENTS.md + docs/dev/tech-design.md + .loop/` · **建议入口**:规划(控制)会话(人工门:红线)
+- **验证**:变更行恰为已批 12 行,**「不动」7 行零字节未入 diff**(filtered diff 复核);`会话 = resume-by-session-id` 行并入 `session = 独立一等实体`(术语保留可 grep);§三 12,524→9,137 字符(-27%),AGENTS.md 147→146 行 / 30.4K→27.0K(自 GOV-CE-1 前累计 -41%);最低门绿(fmt-check + writeback)。
+- **规格**:语义零增删 —— 删三类(实现考古/版本叙事/与 §四·工具自描述重复),每格留不变式 + choke point 名 + 诚实范围 + 反转护栏;行标题去 v 标签 3 处 + ACL 副题「档0/档1」→「IM 面/web 面」。底稿 = owner 已批 chat 提案(2026-07-26,job 暂存 redlines-proposal.md)。
+- **偏差**:提案原文「tech-design §0 修为按行名引用」执行收窄为最小同步(R10 陈旧路径修正 + R4 并行注记 + 重复「已退役」段改指针)—— body 十余处 R-code 引用,全量转行名会造成孤儿引用,归 TD-SYNC-1 一次做完。
+
+### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
+- **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
+- **背景**:GOV-CE-2 排查实锤 §0 R-code 速查漂移(R1「文件系统是状态面」/R9「crate 拓扑」不在现行 §三;R10 旧 `<team>-<slug>` 路径已随卡修正)+ 正文残留 v0.9.0 前状态(§6.x 仍写「`ccteam init` 种默认 `cto.md`」)。
+- **规格**:全文一轮校对 —— R-code legend 与 body 引用对齐现行 §三(或整体改行名引用)、清 pre-v0.9.0 叙述(cto 种子/team 路径/退役命令)、协议细节改代码指针;语义争议处停手报规划。
+- **DoD**:grep「种默认 cto」「<team>-<slug>」= 0 命中;R-code 引用无孤儿;最低门绿;writeback 绿。
+
 ### GOV-CE-1 AGENTS.md 上下文工程瘦身(owner 直驱 2026-07-26)
 - **状态**:完成(ab275be) · **冲突域**:`AGENTS.md + .loop/` · **建议入口**:规划(控制)会话(治理面)
 - **验证**:最低门绿(fmt-check + writeback);AGENTS.md **178→147 行 / 45.7KB→30.4KB(字符 -33%)**;§三红线表 + vendor 红线 + §五纪律 + §六坑**逐字未动**(diff 逐行复核;§三唯一笔误 `(project,role)` 已还原);CLAUDE.md 软链完好;仓内无 §七 悬空引用(代码注释 `PRD §七` 指 v0.8.11 PRD,无关)。
