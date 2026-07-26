@@ -16,10 +16,11 @@
 ## 当前卡
 
 ### WEB-IA-1 web 信息架构改版:market 迁 flow + ops 会话大表删除 + 「接入」聚合(owner 直驱 2026-07-26)
-- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:codex 委派(规划发卡 + review)
+- **状态**:完成(f7f5d67) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:codex 委派(规划发卡 + review)
 - **背景**:owner 三项 UI 直驱:① 插件市场从设置迁到工作流下,市场内 skills 优先(全局 skill 库落地后按项目筛选不友好);② 设置·运维总览的会话 fleet 大表(`status-sessions`,「N live · M idle」)占版面且拓扑已有 团队 视图,删;③ token/授权四散面(用户登录链接 / 外部 MCP 配置 / 卫星加入 / IM 凭据)聚合一处 —— 规划钉设计 = 新设置 tab「接入 Access」(admin-only)四卡分区;外部 MCP 配置 JSON 此前无任何页面渲染(只在文档),本卡首次给它安家。纯 UI 层,REST/后端零碰;ACL 语义不变(后端 403 兜底,UI fail-closed)。
 - **规格**:A. market 迁移:SettingsView ITEMS/SettingsTab 去 market(非 admin 默认 tab market→general),WorkflowView TABS 增 market(序 skills/roles/market/mcp/evolution),App.tsx `/settings/market`+`/marketplace` → `/flow/market`,ChatConsole onOpenMarket 改指;B. 市场内:默认 category agent→skill 且 skill 排首,project 选择器仅 agent/plugin 类显示(skill 装全局库,无项目语义);C. StatusView 删 `status-sessions` fleet 大表区块(stat-grid 会话小瓷片保留;rail prop 失依随删);D. 新「接入 Access」tab(admin-only fail-closed,位 ops 后):①外部 Agent MCP 卡 = mcpServers JSON 模板(origin+`/mcp`+Bearer=当前登录 token,client-side 渲染零新端点)+ 复制;②卫星节点卡 = HostsView JoinCard 整体迁入(hosts 面留列表 + 指路链接);③IM 凭据卡 = admin 全局 Telegram/Lark 区块自 admin tab 迁入(tenant「我的 IM bot」留账号 tab);④用户登录链接卡 = tenant handle + 复制链接(复用 `GET /users/{id}/link`;用户生命周期管理留 管理员 tab);i18n zh/en 双语新键。
 - **DoD**:`make web-check` 绿(tsc/eslint/vitest,计数净变逐只对账);既有五处测试更新 + Access 定向测试(admin 门 fail-closed + 四卡渲染);rust 零碰;writeback 绿。
+- **验证**:`make web-check` 绿(eslint + vitest **422/422**);`npm run build` 绿(tsc + vite)。vitest 对发卡锚 422 净 0:删除 Status fleet 专属 7 测试,新增 Access 4 + Marketplace 2 + Workflow market 1;其余均为既有断言随 IA 更新。`git diff --check` 绿;实现提交 18 文件全部位于 `crates/ccteam-web/web/`,`.rs` 零命中;`writeback.sh` 绿。
 
 ### MCP-CULL-3 session_spawn `protocol` 参数删除(owner 直驱 2026-07-26;wire 契约变更)
 - **状态**:完成(9c2a89e) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
