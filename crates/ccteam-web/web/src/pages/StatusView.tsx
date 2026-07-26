@@ -15,7 +15,8 @@ type LoadState =
 
 const STATUS_POLL_MS = 15000;
 
-export default function StatusView() {
+/** `embedded` — hide the page header (Ops panel already owns the title). */
+export default function StatusView({ embedded = false }: { embedded?: boolean } = {}) {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
 
   useEffect(() => {
@@ -44,11 +45,13 @@ export default function StatusView() {
   }, []);
 
   return (
-    <div data-testid="status-view" className="flex flex-col gap-5">
-      <header>
-        <h1>Status · 运维总览</h1>
-        <p>daemon 健康 · 会话 · 今日成本 / 预算。</p>
-      </header>
+    <div data-testid="status-view" className="flex flex-col gap-3">
+      {embedded ? null : (
+        <header>
+          <h1>Status · 运维总览</h1>
+          <p>daemon 健康 · 会话 · 今日成本 / 预算。</p>
+        </header>
+      )}
       <div className="space-y-3">
         {state.kind === "loading" ? (
           <div data-testid="status-loading"><SkeletonRows rows={3} /></div>
@@ -69,14 +72,20 @@ export function StatusCards({ status }: { status: StatusSnapshot }) {
   const vendorSplit = vendorCostSplit(status.cost_24h_by_vendor);
   return (
     <>
+      {/* Daemon health leads — full-width strip so operators see it first. */}
+      <div
+        className={`daemon-strip ${status.daemon_healthy ? "ok" : "down"}`}
+        data-testid="status-daemon"
+      >
+        <span className={`dot ${status.daemon_healthy ? "on" : "off"}`} />
+        <span className="daemon-strip-title">
+          {status.daemon_healthy ? "daemon healthy" : "daemon down"}
+        </span>
+        <span className="daemon-strip-sub">
+          {status.daemon_healthy ? "MCP sock OK" : "MCP sock unreachable"}
+        </span>
+      </div>
       <div className="stat-grid">
-        <div className="stat" data-testid="status-daemon">
-          <span className="k">daemon</span>
-          <span className="v" style={{ color: status.daemon_healthy ? "var(--green-text)" : "var(--red-text)" }}>
-            {status.daemon_healthy ? "daemon healthy" : "daemon down"}
-          </span>
-          <span className="k">{status.daemon_healthy ? "MCP sock OK" : "MCP sock unreachable"}</span>
-        </div>
         <div className="stat" data-testid="status-session-stat">
           <span className="k">会话</span>
           <span className="v">

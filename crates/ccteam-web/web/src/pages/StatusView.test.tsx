@@ -30,13 +30,18 @@ describe("StatusView initial render", () => {
 });
 
 describe("StatusCards", () => {
-  it("keeps daemon, session, and cost stat tiles but removes the fleet table", () => {
+  it("leads with the daemon strip, then session/cost tiles (no fleet table)", () => {
     const html = renderToString(<StatusCards status={SNAP} />);
     expect(html).toContain('data-testid="status-daemon"');
+    expect(html).toContain("daemon-strip");
     expect(html).toContain('data-testid="status-session-stat"');
     expect(html).toContain('data-testid="status-cost"');
     expect(html).not.toContain('data-testid="status-sessions"');
     expect(html).not.toContain('data-testid="fleet-table"');
+    // Daemon health is the first element.
+    expect(html.indexOf('data-testid="status-daemon"')).toBeLessThan(
+      html.indexOf('data-testid="status-session-stat"'),
+    );
   });
 
   it("shows aggregate live/idle counts and vendor cost split", () => {

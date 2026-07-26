@@ -113,20 +113,24 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders both existing panels in one grid without changing their test ids", () => {
+  it("stacks daemon status above hosts (single column) without changing test ids", () => {
     const html = renderToString(<OpsPanel lang="zh" />);
     expect(html).toContain('data-testid="ops-view"');
-    expect(html).toContain('class="ops-grid"');
+    expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');
     expect(html).toContain('data-testid="hosts-view"');
+    // Daemon strip is the first status surface; hosts follow below.
+    expect(html.indexOf('data-testid="status-view"')).toBeLessThan(
+      html.indexOf('data-testid="hosts-view"'),
+    );
   });
 
-  it("uses two columns on wide screens and one column at the narrow breakpoint", () => {
+  it("uses a vertical ops stack (no side-by-side status/hosts columns)", () => {
     const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
-    expect(css).toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
-    expect(css).toMatch(
-      /@media \(max-width:\s*1280px\)\s*\{\s*\.ops-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
-    );
+    expect(css).toMatch(/\.ops-stack\s*\{[^}]*flex-direction:\s*column/s);
+    expect(css).toMatch(/\.daemon-strip\s*\{/);
+    // Retired two-column layout must not sneak back.
+    expect(css).not.toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
   });
 });
 

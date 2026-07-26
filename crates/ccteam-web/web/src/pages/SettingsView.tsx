@@ -133,14 +133,21 @@ export default function SettingsView({
   );
 }
 
+/** Status · 运维总览: single vertical stack —
+ *  daemon health first, then per-host agent cards (full width). */
 export function OpsPanel({ lang }: { lang: Lang }) {
+  const t = makeT(lang);
   return (
-    <div className="ops-grid" data-testid="ops-view">
+    <div className="ops-stack" data-testid="ops-view">
+      <header>
+        <h1>{t("setOps")}</h1>
+        <p>{t("statusDesc")}</p>
+      </header>
       <section className="ops-panel" aria-label="Status">
-        <StatusView />
+        <StatusView embedded />
       </section>
       <section className="ops-panel" aria-label="Hosts">
-        <HostsView lang={lang} />
+        <HostsView embedded lang={lang} />
       </section>
     </div>
   );

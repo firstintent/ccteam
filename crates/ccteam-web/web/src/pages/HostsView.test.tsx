@@ -6,8 +6,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
-import HostsView, { HostDetailCards, JoinCard } from "./HostsView";
-import type { HostDetail } from "../lib/hostsApi";
+import HostsView, { AgentVersionCell, HostDetailCards, JoinCard } from "./HostsView";
+import type { AgentHealth, HostDetail } from "../lib/hostsApi";
 
 const realFetch = globalThis.fetch;
 
@@ -105,19 +105,23 @@ describe("HostsView initial render", () => {
 });
 
 describe("HostDetailCards (seeded)", () => {
-  it("renders the hostname bar + per-agent cards + their statuses", () => {
+  it("renders the hostname bar + installed agent rows + folded absent row", () => {
     const html = renderToString(<HostDetailCards host={HOST} busy={null} onRegister={() => {}} onImport={() => {}} />);
     expect(html).toContain('data-testid="host-bar"');
     expect(html).toContain("devbox");
     expect(visibleText(html)).toContain("linux/x86_64");
+    // Installed vendors keep full rows.
     expect(html).toContain('data-testid="agent-card-claude"');
-    expect(html).toContain('data-testid="agent-card-codex"');
     expect(html).toContain('data-testid="agent-card-grok"');
     expect(html).toContain('data-testid="agent-card-opencode"');
     expect(html).toContain('data-testid="agent-card-kimi"');
+    // Uninstalled vendors collapse into one group row (still tagged for tests).
+    expect(html).toContain('data-testid="agents-absent-row"');
+    expect(html).toContain('data-testid="agent-card-codex"');
     expect(html).toContain("需配置"); // claude needs_config
-    expect(html).toContain("未安装"); // codex not_installed
-    expect(html).toContain("claude 1.2.3"); // captured version string
+    expect(html).toContain("未安装"); // absent group label
+    // Current version is the extracted numeric (latest arrives async after mount).
+    expect(html).toContain("1.2.3");
   });
 
   it("shows the register-MCP button only for an installed-but-unregistered registrable agent", () => {
@@ -176,7 +180,7 @@ describe("HostDetailCards (seeded)", () => {
     expect(html).not.toContain('data-testid="register-mcp-claude"');
   });
 
-  it("shows catalog state/alias and an import CTA for uncataloged satellite projects", () => {
+  it("keeps host projects collapsed by default (toggle only)", () => {
     const remote: HostDetail = {
       ...HOST,
       host: "sat-1",
@@ -190,10 +194,38 @@ describe("HostDetailCards (seeded)", () => {
     const html = renderToString(
       <HostDetailCards host={remote} busy={null} onRegister={() => {}} onImport={() => {}} />,
     );
-    expect(html).toContain("已接入");
-    expect(html).toContain("already-local");
-    expect(html).toContain('data-testid="import-project-fresh"');
-    expect(html).not.toContain('data-testid="import-project-already"');
+    expect(html).toContain('data-testid="host-projects-toggle-sat-1"');
+    expect(html).toContain('aria-expanded="false"');
+    // Rows are not rendered until expanded.
+    expect(html).not.toContain('data-testid="host-project-fresh"');
+    expect(html).not.toContain('data-testid="import-project-fresh"');
+  });
+});
+
+describe("AgentVersionCell", () => {
+  const base: AgentHealth = {
+    vendor: "claude",
+    harness_id: "claude-code",
+    installed: true,
+    version: "claude 1.2.3",
+    bin: "claude",
+    mcp_registered: true,
+    mcp_registrable: true,
+    status: "ready",
+    hint: null,
+  };
+
+  it("shows current → latest and an update badge when outdated", () => {
+    const html = renderToString(<AgentVersionCell agent={base} latest="2.0.0" />);
+    expect(html).toContain("1.2.3");
+    expect(html).toContain("2.0.0");
+    expect(html).toContain("可更新");
+  });
+
+  it("omits the update badge when current matches latest", () => {
+    const html = renderToString(<AgentVersionCell agent={base} latest="1.2.3" />);
+    expect(html).toContain("1.2.3");
+    expect(html).not.toContain("可更新");
   });
 });
 
