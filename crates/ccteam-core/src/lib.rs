@@ -273,8 +273,8 @@ pub use queries::{
     WorkflowSummary,
 };
 pub use roles::{
-    agents_dir, list_default_library_skills, list_library_skills, list_roles, list_skills,
-    read_role, LibrarySkillSummary, RoleDetail, RoleSummary, SkillSummary,
+    agents_dir, list_default_library_skills, list_default_library_skills_in, list_library_skills,
+    list_roles, list_skills, read_role, LibrarySkillSummary, RoleDetail, RoleSummary, SkillSummary,
 };
 // v0.8.24 Track D — multi-host registry.
 pub use host::read_hostname;
