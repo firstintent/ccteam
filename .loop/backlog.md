@@ -15,6 +15,12 @@
 
 ## 当前卡
 
+### GOV-CE-1 AGENTS.md 上下文工程瘦身(owner 直驱 2026-07-26)
+- **状态**:完成(ab275be) · **冲突域**:`AGENTS.md + .loop/` · **建议入口**:规划(控制)会话(治理面)
+- **验证**:最低门绿(fmt-check + writeback);AGENTS.md **178→147 行 / 45.7KB→30.4KB(字符 -33%)**;§三红线表 + vendor 红线 + §五纪律 + §六坑**逐字未动**(diff 逐行复核;§三唯一笔误 `(project,role)` 已还原);CLAUDE.md 软链完好;仓内无 §七 悬空引用(代码注释 `PRD §七` 指 v0.8.11 PRD,无关)。
+- **背景**:owner 指令按 @trq212 帖治理本仓;grok s116 抓帖核实 = Anthropic《The new rules of context engineering for Claude 5 generation models》(2026-07-24,Claude Code 对 Opus 5 / Fable 5 删 ~80% 系统提示词、coding 评测无损;Then→Now 六法则:规则→判断 / 示例→接口 / 前置堆料→渐进披露 / 重复→工具自描述 / CLAUDE.md 记忆→auto-memory / 瘦 spec→富引用)。
+- **规格**:删 = §〇 对 §三/§四 的复述、协议/API/路由枚举(家 = 代码 + tech-design 指针表)、版本考古叙事(家 = `.loop/history.md` + docs-local)、§七(并入 §六 fmt 条)、退役命令 necrology(clap `--help` 即自描述接口);留 = 红线 / 纪律 / 实战坑 / 文档地图(帖子的 KEEP 类:契约 + 治理 + 项目私有事实)。红线与流程语义零变更;「已退役概念」脚注去重为 §〇 尾注一行。
+
 ### DX-DOCTOR-1 doctor 体检面重排 + daemon 启动自动注册五 vendor MCP(owner 直驱 2026-07-25)
 - **状态**:完成(4b1fc4d) · **冲突域**:`crates/ccteam-cli + crates/ccteam-core(host_registry/mcp_register) + crates/ccteam-web(routes/hosts)` · **建议入口**:codex 委派(cct-codex)+ grok 对抗 review
 - **验证**:codex s113 三轮(实现 + F1-F3 + R1-R4)+ grok s114 侦察与对抗 review(verdict FIX,4 发现全采纳:probe 不查退出码 / override 判据过松会误建 vendor 配置 / hint 门 healthy 向无测试 / SPA fixture 只编码翻转前形态);fmt + clippy 0 warnings;doctor 契约测试重写 + autoreg 密封测试(HOME/CCTEAM_HOME/五 vendor env/PATH 全 pin,断言不逃逸沙箱)+ 纯渲染单测(daemon hint 双向 + 静默 pass 计数);真机目验 daemon up/down 两态输出。基线:本机 = HERM-1 三红 + `resume_*` 族瞬时红(gateway_resumes_dead_session_on_next_turn,3/3 复跑绿,本卡 diff 零碰 ccteam-im)之外全绿;vitest 422 / tsc 干净;干净环境仲裁待 dev→main PR CI(本机无 gh,开 PR 在 owner)。
