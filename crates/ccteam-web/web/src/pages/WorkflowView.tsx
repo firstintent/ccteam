@@ -317,8 +317,8 @@ export default function WorkflowView({
                 {flowRow(
                   "ccteam",
                   zh
-                    ? "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp 自检"
-                    : "8 tools · status / chat_send_file / screenshot / session_* · doctor --verify-mcp",
+                    ? "7 tools · status / chat_send_file / session_* · doctor --verify-mcp 自检"
+                    : "7 tools · status / chat_send_file / session_* · doctor --verify-mcp",
                   mcp?.ccteam_registered ? (
                     <span className="badge ok">{t("mcpOk")}</span>
                   ) : (

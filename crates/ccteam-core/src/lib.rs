@@ -93,7 +93,6 @@ pub mod queries;
 // v0.8.6 W5b ResDisk — read-side reader for project-scoped agent roles
 // (`.claude/agents/<role>.md`). Write side lives in `admin_actions`.
 pub mod roles;
-pub mod screenshot;
 // v0.8.7 review-fix (R-M1) — per-session cto-gate secret (mint + ct_eq).
 pub mod session_secret;
 pub mod silence_classifier;
@@ -286,10 +285,6 @@ pub use host_registry::{
     HostJoinResponse, HostProjectReport, HostRecord, HostRegistry, HostReport, JoinToken,
     JoinTokenStore, SatelliteSelf, VendorAvailability, AGENT_PROBE_SPECS,
     DEFAULT_HEARTBEAT_TTL_SECS, LOCAL_HOST, LOCAL_HOST as REGISTRY_LOCAL_HOST,
-};
-pub use screenshot::{
-    probe_font as probe_screenshot_font, render_screenshot, vt100_color_to_rgb, ScreenshotResult,
-    FONT_ENV as SCREENSHOT_FONT_ENV,
 };
 pub use silence_classifier::{
     classify as classify_silence, load_retry_count as load_limbo_retry_count,

@@ -55,7 +55,7 @@ pub type AdapterFactory = Arc<
 /// - `Claude` + `StreamJson` (the default) → [`ClaudeStreamJsonAdapter`] —
 ///   the lightweight NDJSON chat path (no PTY / pane / hook chain).
 /// - `Claude` + `Terminal` → [`ClaudeTuiAdapter`] — the advanced tmux-PTY
-///   path (byte-faithful terminal mirror / attach / screenshot).
+///   path (byte-faithful terminal mirror / attach).
 /// - `Codex` → [`CodexAppServerAdapter`] regardless of protocol (codex
 ///   always drives via its app-server JSON-RPC control plane).
 ///

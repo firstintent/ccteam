@@ -363,7 +363,7 @@ export interface CreateSessionOpts {
   permission_mode?: "skip" | "hitl";
   /** Wire protocol for the new session. Omitted → server defaults to
    *  `"stream-json"` (the薄/default path); pass `"terminal"` for the advanced
-   *  pane-backed session (terminal mirror / attach / screenshot). */
+   *  pane-backed session (terminal mirror / attach). */
   protocol?: "stream-json" | "terminal" | "acp";
   /** v0.8.24 A-U3 — explicit model id (overrides the role's `model:`
    *  frontmatter); omit for the vendor default. */

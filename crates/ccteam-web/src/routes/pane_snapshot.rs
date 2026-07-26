@@ -6,8 +6,8 @@
 //! backends are byte-faithful here: tmux via `capture-pane -e`, rmux via a
 //! raw-byte backlog drain (`output_stream`). This deliberately stays
 //! snapshot-only: no WebSocket, no input forwarding, and no PTY resize
-//! path. The existing PNG `/screenshot/<slug>.png` route remains as a
-//! fallback.
+//! path. (The old PNG `/screenshot/<slug>.png` fallback was removed
+//! 2026-07-26 with the screenshot surface cull.)
 //!
 //! `GET /api/<slug>/<sid>/pane-snapshot.ansi` is the **per-session** variant.
 //! v0.8.8 B5: F1 removed the project-level pane, so the sid is resolved via the

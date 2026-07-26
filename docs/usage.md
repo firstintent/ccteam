@@ -226,7 +226,6 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
 /stop <id>                 Destroy a session.
-/screen [id]               Screenshot the current screen. Omit id for current.
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.

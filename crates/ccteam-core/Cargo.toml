@@ -46,14 +46,6 @@ getrandom.workspace = true
 # flow now that ClaudeCodeAdapter no longer owns a tmux session.
 libc = "0.2"
 
-# V0.2.2 F38 — terminal screenshot pipeline (vt100 + imageproc DIY).
-# All four crates are pure Rust; no system C deps (libfontconfig /
-# libfreetype). See `docs/versions/v0-2-2/prd.md` §7 for the full rationale.
-vt100 = "0.15"
-image = { version = "0.25", default-features = false, features = ["png"] }
-imageproc = { version = "0.25", default-features = false }
-ab_glyph = "0.2"
-
 # V0.6.0 Wave 3 F112 §C — `~/.ccteam/preferences.toml` runtime parser
 # + serializer (vendor fallback prefs). Promoted from dev-dependencies
 # so `preferences::load` / `preferences::save` are available in non-test

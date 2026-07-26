@@ -226,7 +226,7 @@ impl PermissionMode {
 ///   ([`crate::ClaudeStreamJsonAdapter`]). No PTY / pane / hook chain.
 /// - `Terminal` — the advanced path: a tmux PTY + `claude` TUI
 ///   ([`crate::execution::claude_tui::ClaudeTuiAdapter`]); needed only when
-///   the user wants the byte-faithful terminal mirror / attach / screenshot.
+///   the user wants the byte-faithful terminal mirror / attach.
 ///
 /// Named `protocol` (NOT `backend`) per PRD §七 ②: `backend` is reserved for
 /// the v0.9 **host** axis. Codex sessions carry a protocol value too but it
@@ -237,7 +237,7 @@ pub enum SessionProtocol {
     /// `stream-json` — the薄/default chat channel.
     #[default]
     StreamJson,
-    /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / screenshot).
+    /// `terminal` — tmux PTY + TUI (advanced; terminal mirror / attach).
     Terminal,
     /// `acp` — Agent Client Protocol stdio (Grok Build). Honest meta value;
     /// Claude has no ACP arm.

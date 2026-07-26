@@ -22,6 +22,12 @@
 - **规格**:protocol.rs 定义+本地执行+import、dispatch.rs `is_screenshot_call`/`execute_user_screenshot`、groups.rs `Screenshot` 组(未知 token 既有忽略语义兜底旧 `CCTEAM_DISABLE_TOOLS=screenshot`)、cli mcp_serve 期望集/内嵌测试、doctor_verify_mcp/mcp_e2e/mcp_subprefix/mcp_disable_groups、web mcp_tenant_bearer_test(screenshot 拒绝测例改 cull 回归守卫);文档数字与清单同步(§五.7 家规)。
 - **DoD**:`doctor --verify-mcp` = 7 工具 0 STUB;`make check` clippy 0;基线无新红(删除面净减测试在案);writeback 绿。
 
+### MCP-CULL-2 screenshot 关联面全删(owner 扩令 2026-07-26「screenshot 关联的一并删」)
+- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-core(screenshot/paths/deps) + crates/ccteam-web(routes/tests/SPA 文案) + crates/ccteam-im(gateway /screen) + crates/ccteam-harness(注释) + docs` · **建议入口**:规划(控制)会话(契约扩令)
+- **背景**:MCP-CULL-1 收口报告列明保留面(web `/screenshot` 路由 / core `render_screenshot` / IM `/screen`),owner 明示一并删。SPA WorkflowView 「8 tools …/screenshot/…」文案系首轮漏网,随卡清。
+- **规格**:删 core `screenshot` 模块 + `paths` 两 helper + vt100/image/imageproc/ab_glyph 四依赖(harness 自有 vt100 为 web 终端/快照用途,不动);删 web `/screenshot` 路由 + `screenshot_test.rs` + auth/state/pane_snapshot 注释残留;删 IM `/screen` 命令(spec + handler);harness 注释去 screenshot 提法(capture 函数被 web 终端/快照使用,保留);docs(AGENTS 红线行措辞 / tech-design / usage±cn `/screen` 行)同步。基线数字随删测试净减 —— 逐只列账,非回归。
+- **DoD**:workspace 零 screenshot 符号残留(注释与「用户报错截图」语义除外);`make check` clippy 0;`make test-baseline` 红不增、减少数与删除测试清单吻合;`make web-check` 绿(SPA 文案);writeback 绿。
+
 ### MCP-DX-2 外部反馈第二轮:关键词可搜性 + protocol 诚实校验 + 单项目默认(owner 直驱 2026-07-26)
 - **状态**:完成(1ab85da) · **冲突域**:`crates/ccteam-im/src/mcp`(与 MCP-CULL-1 同域,同会话串行) · **建议入口**:规划(控制)会话
 - **验证**:有牙实锤 = 四处缺陷态突变(protocol 静默覆盖复原 / admin·tenant 默认各拆线 / spawn 描述反引号回归)恰咬红对应 4 只新/强化测试,复原全绿(112→116)。A:spawn 描述 vendor 名纯文本 + 反断言(任何 `` `vendor` `` 形态不得回潮);instructions 补单项目默认语义。B:`resolve_session_protocol` 单元测试覆盖五 vendor 派生/一致接受/冲突错误(错误文案含「omit `protocol`」恢复指引)/terminal 拒绝/typo 报错;schema 参数保留(wire 形状不变),描述改「OMIT——derived from vendor」。C:admin 恰一注册项目自动默认(fixture gateway 无 config watcher → 确定性 `unknown project: robchat` 证默认已命中)+ tenant 恰一可见项目走全 execute 路径落 `project:"alice"`;既有 missing-project 错误测试改双项目 fixture,byte-identical 防枚举断言保持。门禁同 MCP-CULL-1(同 commit)。

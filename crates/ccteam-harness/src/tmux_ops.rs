@@ -344,7 +344,7 @@ impl TmuxSession {
 /// silence-classifier path). `with_ansi=true` runs `tmux capture-pane
 /// -e -p` so escape sequences round-trip — useful when the captured
 /// text will be shown to the user (eg. NL translation that quotes a
-/// short snippet). F38 screenshot rendering uses `capture_pane_with_ansi`
+/// short snippet). The web pane-snapshot route uses `capture_pane_with_ansi`
 /// instead (which returns raw bytes for `vt100::Parser`).
 pub fn capture_pane_tail(slug: &str, lines: usize, with_ansi: bool) -> Option<String> {
     let session = session_name_for_slug(slug);
@@ -387,7 +387,7 @@ pub fn capture_pane_tail_from_session(
 /// machine (`vt100::Parser`) for rendering.
 ///
 /// `lines` is the scrollback depth (`-S -<n>`). Use a small value
-/// (~50) for screenshots so big projects don't dump the full history.
+/// (~50) so big projects don't dump the full history.
 ///
 /// Returns `Ok(None)` (not Err) when the session doesn't exist or
 /// tmux fails — callers degrade gracefully (no PNG produced) rather

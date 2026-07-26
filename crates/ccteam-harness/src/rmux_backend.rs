@@ -27,7 +27,7 @@
 //! - `capture` — best-effort raw-byte drain of the daemon's retained
 //!   output backlog via `output_stream_starting_at(Oldest)` +
 //!   `poll_once`. `with_ansi` is honored: `true` → raw byte-faithful
-//!   ANSI (web terminal / snapshot / screenshot depend on it); `false`
+//!   ANSI (web terminal / snapshot depend on it); `false`
 //!   → the drained bytes rendered through a vt100 state machine to
 //!   plain text (so `peek`/CLI never leak control sequences to the
 //!   user's terminal). NOT the rendered `snapshot()` grid.
@@ -631,7 +631,7 @@ impl PaneBackend for RmuxBackend {
     /// `with_ansi` is **honored** (it gates the drained bytes' shape):
     /// - `true` → the concatenated bytes are returned **raw** (full,
     ///   byte-faithful ANSI). The web terminal / pane-snapshot /
-    ///   screenshot callers all pass `true` and depend on this.
+    ///   snapshot callers all pass `true` and depend on this.
     /// - `false` → the raw bytes are rendered through a vt100 state
     ///   machine ([`ansi_bytes_to_plain_text`]) to **plain text** with
     ///   every control sequence (mouse-tracking, alt-screen, color,
@@ -697,7 +697,7 @@ impl PaneBackend for RmuxBackend {
 
         if with_ansi {
             // Byte-faithful path: return the raw backlog UNCHANGED. The web
-            // terminal / pane-snapshot / screenshot callers depend on this.
+            // terminal / pane-snapshot callers depend on this.
             return Ok(raw);
         }
 
@@ -780,7 +780,7 @@ fn ansi_bytes_to_plain_text(raw: &[u8], cols: u16, rows: u16) -> Vec<u8> {
     let cols = cols.max(1);
     let rows = rows.max(1);
     // scrollback = 0: we render only the current screen grid (the tail),
-    // mirroring screenshot.rs's `Parser::new(rows, cols, 0)`.
+    // zero scrollback: the grid is a fixed-size viewport.
     let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(raw);
     // `Screen::contents` returns the rendered grid as plain text (one

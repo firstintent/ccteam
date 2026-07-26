@@ -1216,15 +1216,6 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
-        name: "/screen",
-        arg_hint: Some("[id]"),
-        // v0.9.x (owner req) — dropped from the menu: the terminal protocol is
-        // frozen/deprecated and default stream-json sessions have no pane, so
-        // /screen is niche. Still works if typed for a terminal session.
-        help: "screenshot a session's pane (bare = current)",
-        in_menu: false,
-    },
-    GatewayCommandSpec {
         name: "/rename",
         arg_hint: Some("<title>"),
         help: "rename the current session's title (rule-based, no LLM)",
@@ -2059,10 +2050,10 @@ impl Gateway {
             return Ok(vec![reply]);
         }
         // A gateway command may handle itself ENTIRELY via the event sink and
-        // return no inline reply — a screenshot (`/screen`), or a project /
-        // session picker delivered as text + inline buttons (`/projects`,
-        // `/sessions`). It must NOT fall through to `submit_to_current` below,
-        // where its `/command` text would be shipped to the agent verbatim.
+        // return no inline reply — a project / session picker delivered as
+        // text + inline buttons (`/projects`, `/sessions`). It must NOT fall
+        // through to `submit_to_current` below, where its `/command` text
+        // would be shipped to the agent verbatim.
         if Self::is_gateway_command(text) {
             return Ok(Vec::new());
         }
@@ -2437,79 +2428,6 @@ impl Gateway {
                 Ok(Some(format!(
                     "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
                 )))
-            }
-            "/screen" => {
-                // v0.8.10 — capture a session's pane to a PNG and send it as an
-                // image, so the IM user can SEE the live claude/codex TUI state
-                // (e.g. a /model "Switch model?" confirmation or picker that has
-                // no hook and so can't be forwarded otherwise). This is the
-                // read-only screenshot path (ccteam-core render_screenshot: tmux
-                // capture → vt100 → imageproc PNG) — it shows the user a picture,
-                // it does NOT parse the pane for control flow (the no-scrape red
-                // line). `/screen <sid>` targets a session; bare `/screen` shoots
-                // the current one.
-                let sid = match parts.next() {
-                    Some(id) => id.to_string(),
-                    None => self
-                        .current_session
-                        .read()
-                        .unwrap()
-                        .get(chat)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("/screen 需要一个活动会话(或 /screen <sid>)"))?,
-                };
-                let slug = self
-                    .sessions
-                    .get(&sid)
-                    .filter(|s| Self::chat_can_access(chat, s))
-                    .map(|s| s.project.clone())
-                    .ok_or_else(|| anyhow!("unknown session for this chat: {sid}"))?;
-                // v0.8.11 E2 — a stream-json session has no pane to capture;
-                // refuse with a human message instead of a generic degrade.
-                if self
-                    .sessions
-                    .get(&sid)
-                    .map(|s| s.protocol.is_stream_json())
-                    .unwrap_or(false)
-                {
-                    return Ok(Some(format!(
-                        "会话 {sid} 是 stream-json 通道(无终端 pane),没法截图 —— 它的回复直接走聊天。要终端镜像/截图,用 `/new … terminal` 起一个终端通道会话。"
-                    )));
-                }
-                let paths = self
-                    .project_paths
-                    .clone()
-                    .ok_or_else(|| anyhow!("screenshot 暂不可用(daemon 缺少 paths 上下文)"))?;
-                match ccteam_core::render_screenshot(&paths, &slug, Some(sid.as_str()), 50) {
-                    Ok(Some(png)) => {
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
-                        self.emit_user_signal(GatewayEvent {
-                            id: format!("gateway-screenshot-{sid}-{nanos}"),
-                            channel: chat.channel.clone(),
-                            chat_id: chat.chat_id.clone(),
-                            thread_ts: None,
-                            content: String::new(),
-                            kind: GatewayEventKind::Answer,
-                            attachments: vec![crate::transport::OutboundFile {
-                                path: png.to_string_lossy().to_string(),
-                                caption: Some(format!("📸 {sid} ({slug})")),
-                                kind: crate::transport::OutboundFileKind::Photo,
-                            }],
-                            options: Vec::new(),
-                            sid: Some(sid.clone()),
-                            slug: Some(slug.clone()),
-                        });
-                        Ok(None)
-                    }
-                    Ok(None) => Ok(Some(
-                        "截图降级失败(tmux 缺失 / session 未找到 / 字体失败 / IO)—— 看 daemon stderr。"
-                            .to_string(),
-                    )),
-                    Err(err) => Ok(Some(format!("截图出错: {err}"))),
-                }
             }
             "/cd" => {
                 let project = parts
@@ -2951,8 +2869,8 @@ impl Gateway {
     }
 
     /// Emit a picker message (a project/session list) carrying inline `options`
-    /// to a button-capable channel, via the user-signal sink — the same egress
-    /// `/screen` uses. Delivers text + buttons as ONE message
+    /// to a button-capable channel, via the user-signal sink.
+    /// Delivers text + buttons as ONE message
     /// (`spawn_gateway_event_consumer` calls `.with_options`), so the caller
     /// returns no separate inline reply.
     fn emit_list_options(&self, chat: &ChatKey, content: String, options: Vec<MessageOption>) {
@@ -6112,7 +6030,7 @@ impl Gateway {
     }
 
     /// Session access scope — visibility (`/sessions`) AND addressing
-    /// (`/use` / `/stop` / `/screen`).
+    /// (`/use` / `/stop`).
     ///
     /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared user pool**: a
     /// chat reaches the sessions it OWNS, PLUS every session created by the web

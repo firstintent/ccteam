@@ -1,8 +1,10 @@
 //! Axum routers for the ccteam web layer.
 //!
 //! M5.0 shipped `/health`. M5.1 added `dashboard` / `project` /
-//! `assets`. M5.2 added `screenshot` (`/screenshot/<slug>.png`) — the pane
+//! `assets`. The pane
 //! snapshot route adds raw ANSI bytes for browser-side xterm.js rendering
+//! — M5.2's PNG `/screenshot/<slug>.png` route was **removed 2026-07-26**
+//! (tmux-era screenshot surface culled with the MCP tool)
 //! — and a `sse`/`harness_sse` progress-file SSE pair **removed in v0.9.0
 //! W4** (superseded by the gateway-broadcast-backed `agents`/`sessions_api`
 //! SSE endpoints). **M5.3** mounts `actions` (`POST
@@ -53,7 +55,6 @@ pub mod project;
 pub mod projects;
 pub mod pty_ws;
 pub mod roles;
-pub mod screenshot;
 // Web composer attachments: project-scoped uploads + skill picker (the turn
 // side lives in `sessions_api::handle_session_turn`'s `attachments[]`).
 pub mod session;
@@ -89,7 +90,6 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(session::router())
         .merge(assets::router())
         .merge(pane_snapshot::router())
-        .merge(screenshot::router())
         .merge(actions::router())
         .merge(internal_hook::router())
         // v0.8.7 W5 (Item E) — the ENTIRE `/api/v1` resource surface

@@ -225,7 +225,7 @@ impl AppState {
     /// pending into web (gateway is attached separately via
     /// [`Self::with_gateway`]) so `POST /mcp` drives the live session map.
     /// Standalone `ccteam web` never calls this — protocol-core tools
-    /// (`status` / `screenshot` / `tools/list`) still work; gateway-backed
+    /// (`status` / `tools/list`) still work; gateway-backed
     /// tools return MCP `isError`.
     pub fn with_mcp(
         mut self,

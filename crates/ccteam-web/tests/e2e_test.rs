@@ -1,6 +1,6 @@
 //! V0.3 M5.4 — End-to-end happy-path canary.
 //!
-//! Each milestone (M5.1 dashboard / M5.2 screenshot / M5.3 write actions)
+//! Each milestone (M5.1 dashboard / M5.2 pane snapshot / M5.3 write actions)
 //! ships its own focused integration suite. This test exists to catch the
 //! *cross-layer regression* the per-milestone tests miss: the same fixture
 //! project must survive the F59 legacy redirects, the F52 JSON data API used
