@@ -96,7 +96,7 @@ describe("listProjectSkills", () => {
   });
 });
 
-// v0.9.9 — the user-level global skill library (admin-only endpoint).
+// v0.9.9 — the user-level global skill library.
 describe("listLibrarySkills", () => {
   it("GETs /api/v1/skills and unwraps {skills} (nested ids; source optional)", async () => {
     const skills: LibrarySkillSummary[] = [
@@ -121,11 +121,11 @@ describe("listLibrarySkills", () => {
     expect(init?.method ?? "GET").toBe("GET");
   });
 
-  it("lifts the 403 admin-only error body", async () => {
+  it("lifts an API error body", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(
-      jsonResponse(403, { error: "admin only" }),
+      jsonResponse(500, { error: "library unavailable" }),
     );
-    await expect(listLibrarySkills()).rejects.toThrow("admin only");
+    await expect(listLibrarySkills()).rejects.toThrow("library unavailable");
   });
 
   it("maps 401 to UNAUTHENTICATED", async () => {

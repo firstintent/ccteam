@@ -9,34 +9,25 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Json,
 };
 
-use crate::auth::{deny_non_admin, Identity};
 use crate::state::AppState;
 
 /// `GET /api/v1/skills`
 ///
-/// Lists the admin's user-level global skill library as
+/// Lists the user-level global skill library as
 /// `{skills:[{id, description, path}]}`. Nested ids are preserved and sorted
-/// by the core scanner. Tenant identities are denied because the library is a
-/// daemon-user global surface rather than a tenant-owned resource.
+/// by the core scanner.
 #[utoipa::path(
     get,
     path = "/api/v1/skills",
     tag = "skills",
     responses(
         (status = 200, description = "Global skill library sorted by id", body = serde_json::Value),
-        (status = 403, description = "Admin only"),
     ),
 )]
-pub(crate) async fn handle_list_library_skills(
-    State(app): State<AppState>,
-    Extension(identity): Extension<Identity>,
-) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
+pub(crate) async fn handle_list_library_skills(State(app): State<AppState>) -> Response {
     let skills = ccteam_core::list_library_skills(&app.paths.skills_dir());
     (StatusCode::OK, Json(serde_json::json!({"skills": skills}))).into_response()
 }

@@ -37,14 +37,11 @@ export default function WorkflowView({
   onNav,
   onOpenMarket,
   lang: langProp,
-  isAdmin = false,
 }: {
   tab?: string;
   onNav?: (tab: TabId) => void;
   onOpenMarket?: () => void;
   lang?: Lang;
-  /** Gates the MCP register form (backend POST is admin-only regardless). */
-  isAdmin?: boolean;
 } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
@@ -355,8 +352,7 @@ export default function WorkflowView({
                     ),
                   )}
               </div>
-              {isAdmin ? (
-                <div className="form" data-testid="mcp-register-form">
+              <div className="form" data-testid="mcp-register-form">
                   <label style={{ fontSize: 13, fontWeight: 600 }}>
                     {zh ? "注册第三方 MCP server" : "Register a third-party MCP server"}
                   </label>
@@ -443,14 +439,7 @@ export default function WorkflowView({
                       playwright
                     </button>
                   </div>
-                </div>
-              ) : (
-                <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>
-                  {zh
-                    ? "第三方 MCP server 注册(写项目 .mcp.json)仅 admin 可操作。"
-                    : "Registering a third-party MCP server (project .mcp.json write) is admin-only."}
-                </p>
-              )}
+              </div>
             </>
           ) : null}
 

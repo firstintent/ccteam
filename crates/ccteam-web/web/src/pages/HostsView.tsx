@@ -273,7 +273,7 @@ export function JoinCard({
         if (!cancelled) setInfo(i);
       })
       .catch(() => {
-        // Non-admin (403) or transient failure: keep the placeholder, no CTA.
+        // Authentication or transient failure: keep the placeholder, no CTA.
         if (!cancelled) setAllowed(false);
       });
     return () => {

@@ -281,7 +281,7 @@ async fn join_registers_host_and_heartbeat_online_offline() {
 }
 
 #[tokio::test]
-async fn non_admin_403_on_hosts_and_join() {
+async fn tenant_can_manage_hosts_tokens_but_cannot_join_as_a_host() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(&paths.root).unwrap();
@@ -297,7 +297,7 @@ async fn non_admin_403_on_hosts_and_join() {
     let c = client();
     let tauth = format!("Bearer ccteam:{tenant_tok}");
 
-    // List + mint are hard admin-only (deny_non_admin).
+    // Host discovery + join-token management are shared operational surfaces.
     for path in ["/api/v1/hosts", "/api/v1/hosts/join-token"] {
         let r = if path.ends_with("join-token") {
             c.post(format!("http://{addr}{path}"))
@@ -313,17 +313,21 @@ async fn non_admin_403_on_hosts_and_join() {
                 .await
                 .unwrap()
         };
-        assert_eq!(r.status(), 403, "tenant must be 403 on {path}");
+        let expected = if path.ends_with("join-token") {
+            201
+        } else {
+            200
+        };
+        assert_eq!(r.status(), expected, "tenant reaches {path}");
     }
-    // GET join-token (read) is equally admin-only — a tenant must never see
-    // a join token (fail-closed).
+    // The token just minted is readable by the same tenant.
     let r = c
         .get(format!("http://{addr}/api/v1/hosts/join-token"))
         .header("Authorization", &tauth)
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "tenant must be 403 on GET join-token");
+    assert_eq!(r.status(), 200, "tenant reaches GET join-token");
     // Join: tenant is neither admin nor join-token identity → 403 (after a
     // well-formed body so the extractor does not 422 first).
     let r = c

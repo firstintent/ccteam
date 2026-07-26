@@ -9,7 +9,7 @@
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
 //   - attach menu (＋): upload files/photos + attach skills in TWO sections —
-//     the project-local list and, admins only, the user-level global library
+//     the project-local list and the user-level global library
 //     (`GET /api/v1/skills`; a library pick rides the turn as
 //     `{kind:"skill", scope:"global"}`, never an install). Picked
 //     files upload immediately (chips show progress), paste/drag-drop attach
@@ -208,38 +208,34 @@ export function attachmentsBlockSend(items: ComposerAttachment[]): boolean {
   return items.some((a) => a.status === "uploading");
 }
 
-/** The attach-menu skill lists: the project list always, the user-level
- *  global library ONLY for admins (the endpoint itself is admin-only — a
- *  non-admin must not even fire the request). `global === null` = not asked. */
+/** The attach-menu skill lists: project-local and user-level global library. */
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with the composer so it's unit-testable in node.
-export function fetchSkillLists(
-  slug: string,
-  isAdmin: boolean,
-): { project: Promise<SkillSummary[]>; global: Promise<LibrarySkillSummary[]> | null } {
+export function fetchSkillLists(slug: string): {
+  project: Promise<SkillSummary[]>;
+  global: Promise<LibrarySkillSummary[]>;
+} {
   return {
     project: listProjectSkills(slug),
-    global: isAdmin ? listLibrarySkills() : null,
+    global: listLibrarySkills(),
   };
 }
 
 /** The attach menu's skill area — two sections: the project-local list
- *  (existing behavior) and, admins only, the user-level Global library.
+ *  (existing behavior) and the user-level Global library.
  *  Picking a library skill attaches `{kind:"skill", scope:"global"}` — it
  *  never installs anything. Extracted as a pure presentational component so
  *  the admin/non-admin split is render-testable in the node vitest env. */
 export function SkillMenuSections({
   lang,
-  isAdmin,
   skills,
   globalSkills,
   attachments,
   onToggleSkill,
 }: {
   lang: Lang;
-  isAdmin: boolean;
   /** `null` = still loading. */
   skills: SkillSummary[] | null;
-  /** `null` = still loading (or never fetched — non-admin). */
+  /** `null` = still loading. */
   globalSkills: LibrarySkillSummary[] | null;
   attachments: ComposerAttachment[];
   onToggleSkill: (name: string, scope: "project" | "global") => void;
@@ -273,37 +269,33 @@ export function SkillMenuSections({
           );
         })
       )}
-      {isAdmin ? (
-        <>
-          <div className="sel-group" data-testid="skill-section-global">
-            {t("attachSkillGlobal")}
-          </div>
-          {globalSkills === null ? (
-            <div className="sel-item muted skill-row">…</div>
-          ) : globalSkills.length === 0 ? (
-            <div className="sel-item muted skill-row">{t("noGlobalSkills")}</div>
-          ) : (
-            globalSkills.map((g) => {
-              const on = attachments.some(
-                (a) => a.kind === "skill" && a.name === g.id && a.scope === "global",
-              );
-              return (
-                <button
-                  key={g.id}
-                  type="button"
-                  className={`sel-item skill-row ${on ? "selected" : ""}`}
-                  data-testid={`skill-global-${g.id}`}
-                  onClick={() => onToggleSkill(g.id, "global")}
-                  title={g.description || g.id}
-                >
-                  {g.id}
-                  <span className="check">✓</span>
-                </button>
-              );
-            })
-          )}
-        </>
-      ) : null}
+      <div className="sel-group" data-testid="skill-section-global">
+        {t("attachSkillGlobal")}
+      </div>
+      {globalSkills === null ? (
+        <div className="sel-item muted skill-row">…</div>
+      ) : globalSkills.length === 0 ? (
+        <div className="sel-item muted skill-row">{t("noGlobalSkills")}</div>
+      ) : (
+        globalSkills.map((g) => {
+          const on = attachments.some(
+            (a) => a.kind === "skill" && a.name === g.id && a.scope === "global",
+          );
+          return (
+            <button
+              key={g.id}
+              type="button"
+              className={`sel-item skill-row ${on ? "selected" : ""}`}
+              data-testid={`skill-global-${g.id}`}
+              onClick={() => onToggleSkill(g.id, "global")}
+              title={g.description || g.id}
+            >
+              {g.id}
+              <span className="check">✓</span>
+            </button>
+          );
+        })
+      )}
     </>
   );
 }
@@ -540,28 +532,28 @@ export function ChatComposer({
   }, [uploadSlug, t]);
 
   /** Expand/collapse the folded skills submenu; fetch the lists lazily on
-   *  first expand — the project list always, the global library only for
-   *  admins (the render-phase reset clears both caches on a project switch). */
+   *  first expand (the render-phase reset clears both caches on a project switch). */
   const toggleSkillsOpen = useCallback(() => {
     setSkillsOpen((open) => {
       const next = !open;
-      if (next && uploadSlug && (skills === null || (isAdmin && globalSkills === null))) {
-        const lists = fetchSkillLists(uploadSlug, isAdmin);
-        // One list may already be cached (e.g. /me resolved admin AFTER the
-        // first expand) — refresh only the stale one, and settle the other so
-        // its promise can't go unhandled.
+      if (next && uploadSlug && (skills === null || globalSkills === null)) {
+        const lists = fetchSkillLists(uploadSlug);
+        // One list may already be cached — refresh only the stale one, and
+        // settle the other so its promise can't go unhandled.
         if (skills === null) {
           lists.project.then(setSkills).catch(() => setSkills([]));
         } else {
           lists.project.catch(() => {});
         }
-        if (lists.global && globalSkills === null) {
+        if (globalSkills === null) {
           lists.global.then(setGlobalSkills).catch(() => setGlobalSkills([]));
+        } else {
+          lists.global.catch(() => {});
         }
       }
       return next;
     });
-  }, [skills, globalSkills, uploadSlug, isAdmin]);
+  }, [skills, globalSkills, uploadSlug]);
 
   // ---- send ------------------------------------------------------------------
 
@@ -964,7 +956,6 @@ export function ChatComposer({
             {skillsOpen ? (
               <SkillMenuSections
                 lang={lang}
-                isAdmin={isAdmin}
                 skills={skills}
                 globalSkills={globalSkills}
                 attachments={attachments}

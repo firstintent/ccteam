@@ -12,10 +12,8 @@
 //! vendor's own trust prompts. Env values are masked on read so a
 //! token-bearing entry never echoes.
 //!
-//! ACL: GET rides the project ACL (`auth::project_acl_layer` covers every
-//! `/projects/{slug}/*` route). POST (the config write) is additionally
-//! **admin-only** (`deny_non_admin`) — same posture as the hosts page's
-//! `register-mcp` write.
+//! ACL: GET and POST both ride the project ACL
+//! (`auth::project_acl_layer` covers every `/projects/{slug}/*` route).
 
 use std::collections::BTreeMap;
 
@@ -23,13 +21,12 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use utoipa::ToSchema;
 
-use crate::auth::{deny_non_admin, Identity};
 use crate::state::AppState;
 
 /// One declared server from the project `.mcp.json` (masked view).
@@ -224,7 +221,7 @@ fn entry_from_form(form: &RegisterMcpServerForm) -> Result<Value, String> {
 
 /// `POST /api/v1/projects/{slug}/mcp-servers` — idempotently merge one
 /// third-party server into the project `.mcp.json` (vendor-native config;
-/// Claude Code picks it up on its next start). **Admin-only** write; ccteam
+/// Claude Code picks it up on its next start). Project-owner write; ccteam
 /// executes/downloads NOTHING here.
 #[utoipa::path(
     post,
@@ -235,20 +232,14 @@ fn entry_from_form(form: &RegisterMcpServerForm) -> Result<Value, String> {
     responses(
         (status = 201, description = "Merged; `{ok, name, path}`", body = serde_json::Value),
         (status = 400, description = "Bad name / bad entry (url XOR command)"),
-        (status = 403, description = "Non-admin"),
         (status = 404, description = "Unknown project"),
     ),
 )]
 pub(crate) async fn handle_register_mcp_server(
     State(app): State<AppState>,
-    Extension(identity): Extension<Identity>,
     Path(slug): Path<String>,
     Json(form): Json<RegisterMcpServerForm>,
 ) -> Response {
-    // Config write → admin-only (same posture as hosts register-mcp).
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     if let Some(resp) = reject_unknown_project(&app, &slug) {
         return resp;
     }

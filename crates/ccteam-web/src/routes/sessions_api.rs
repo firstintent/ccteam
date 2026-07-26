@@ -667,7 +667,7 @@ pub struct TurnAttachment {
     #[serde(default)]
     pub name: Option<String>,
     /// Skill source: omitted / `"project"` keeps the project-local behavior;
-    /// `"global"` resolves a nested id in the admin's user-level library.
+    /// `"global"` resolves a nested id in the user-level global library.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -838,11 +838,6 @@ pub(crate) async fn handle_session_turn(
         .attachments
         .iter()
         .any(|att| att.scope.as_deref() == Some("global"));
-    if has_global_attachment {
-        if let Some(deny) = crate::auth::deny_non_admin(&identity) {
-            return deny;
-        }
-    }
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };

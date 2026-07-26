@@ -32,8 +32,9 @@
 //!   `null` when **no** project configures a cap.
 //!
 //! Merged into the `/api/v1` [`OpenApiRouter`] (see [`super::openapi`]) so it
-//! sits behind the same web-token gate as the rest of the resource API — this
-//! module writes **zero** auth code.
+//! sits behind the same web-token gate as the rest of the resource API.
+//! Daemon aggregates stay global; tenant session rows are filtered through the
+//! project-owner ACL.
 
 use std::collections::BTreeMap;
 
@@ -45,7 +46,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{deny_non_admin, Identity};
+use crate::auth::Identity;
 use crate::state::AppState;
 
 /// `GET /api/v1/status` response — the daemon-wide snapshot the cost pill +
@@ -173,10 +174,6 @@ pub(crate) async fn handle_status(
     State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
 ) -> Response {
-    // v0.8.18 档1 — the daemon-wide status/cost fleet is an operator/admin view.
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
     // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
@@ -231,6 +228,8 @@ pub(crate) async fn handle_status(
     let (active_watches, notified_24h, denied_24h) =
         ccteam_im::delegation::fleet_delegations(&app.paths);
 
+    retain_visible_session_rows(&app, &identity, &mut session_rows);
+
     Json(StatusResponse {
         daemon_healthy,
         sessions_live,
@@ -246,6 +245,19 @@ pub(crate) async fn handle_status(
         },
     })
     .into_response()
+}
+
+/// Keep daemon-wide aggregates global while hiding per-session rows whose
+/// project the caller does not own. Admins retain the unfiltered fleet view.
+fn retain_visible_session_rows(
+    app: &AppState,
+    identity: &Identity,
+    rows: &mut Vec<SessionCostRow>,
+) {
+    if identity.is_admin {
+        return;
+    }
+    rows.retain(|row| crate::routes::api_v1::can_see_project(app, identity, &row.project));
 }
 
 /// Per-session priced accumulator — sum of priced turns + a count of turns
@@ -487,5 +499,32 @@ mod tests {
         assert_eq!(rows[0].host, "local");
         assert_eq!(rows[1].sid, "s2");
         assert_eq!(rows[1].host, "sat-east");
+    }
+
+    #[test]
+    fn tenant_status_rows_are_filtered_by_project_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        for (slug, owner) in [("alice", "user:u1"), ("bob", "user:u2")] {
+            let path = paths.project_state(slug);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut state = ccteam_core::ProjectState::initial_for_team(slug.into(), "dev".into());
+            state.owner = Some(owner.into());
+            state.save(&path).unwrap();
+        }
+        let app = AppState::new(paths);
+        let mut rows = build_session_cost_rows(
+            &app.paths,
+            &[view("s1", "alice", "claude"), view("s2", "bob", "codex")],
+        );
+        let mut admin_rows = rows.clone();
+        retain_visible_session_rows(&app, &Identity::admin(), &mut admin_rows);
+        assert_eq!(admin_rows.len(), 2, "admin fleet rows stay unfiltered");
+
+        retain_visible_session_rows(&app, &Identity::tenant("u1".into()), &mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sid, "s1");
+        assert_eq!(rows[0].project, "alice");
     }
 }

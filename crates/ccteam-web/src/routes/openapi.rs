@@ -116,17 +116,17 @@ async fn serve_scalar_js() -> impl IntoResponse {
                        Auth: the same web-token gate as every other `/api/v1` route \
                        (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie). \
                        Also available (not REST / not in this spec): `POST /mcp` — \
-                       streamable HTTP MCP (admin bearer always required).",
+                       streamable HTTP MCP (authenticated caller bearer required).",
         version = env!("CARGO_PKG_VERSION"),
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
-        (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join; reverse control channel + exec dial-back ride WS at /hosts/channel and /hosts/exec/{nonce}; register-mcp; admin-only list)"),
+        (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join; reverse control channel + exec dial-back ride WS at /hosts/channel and /hosts/exec/{nonce}; register-mcp)"),
         (name = "users", description = "档1 per-user web tenant management (admin-gated; web-first, no CLI — mint personal links, list, delete)"),
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
-        (name = "skills", description = "Admin-only user-level global skill library"),
+        (name = "skills", description = "User-level global skill library"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
         (name = "auth", description = "Web-token introspection"),
@@ -197,8 +197,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::api_v1::handle_active_sessions))
         .routes(routes!(super::api_v1::handle_job_log))
         .routes(routes!(super::api_v1::handle_active_sessions_aggregate))
-        // v0.8.24 F1.12 — project third-party MCP servers (GET list shares
-        // the path with the admin-only POST register).
+        // v0.8.24 F1.12 — project third-party MCP servers (GET list + POST
+        // register both ride the project-owner ACL).
         .routes(routes!(
             super::mcp_servers::handle_list_mcp_servers,
             super::mcp_servers::handle_register_mcp_server

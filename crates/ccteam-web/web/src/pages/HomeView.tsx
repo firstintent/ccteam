@@ -266,7 +266,7 @@ export default function HomeView({
     };
   }, [project]);
 
-  // Hosts (admin data): tenants/errors gracefully HIDE the dimension. Details
+  // Hosts: load shared operational data; errors gracefully HIDE the dimension. Details
   // (per-host agent probe + registered projects) drive the project→host and
   // host→vendor binding below; a failed detail marks the host not spawnable.
   useEffect(() => {
@@ -491,9 +491,9 @@ export default function HomeView({
               </span>
             ) : null}
 
-            {/* 角色 — admin-only beta surface (v0.8.20 F4, AGENTS.md §五.8):
-                a tenant always launches roleless. */}
-            {isAdmin && !(isNewProject && effectiveHost !== "local") ? (
+            {/* 角色 — v0.8.20 F4 graduated to stable. Remote new-project
+                creation still cannot inspect roles before the project exists. */}
+            {!(isNewProject && effectiveHost !== "local") ? (
             <CtxSelect
               value={
                 <>

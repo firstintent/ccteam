@@ -209,7 +209,7 @@ impl Identity {
 }
 
 /// `Some(403)` unless the caller is the admin/owner — the shared gate for every
-/// admin-only route (user management, IM credentials, hosts, global config).
+/// admin-only route (user management and global IM credentials).
 pub fn deny_non_admin(identity: &Identity) -> Option<Response> {
     if identity.is_admin {
         None

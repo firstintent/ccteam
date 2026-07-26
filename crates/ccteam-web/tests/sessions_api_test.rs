@@ -1282,10 +1282,10 @@ async fn global_skill_attach_rejects_invalid_missing_and_unknown_scope() {
     assert_eq!(body["error"], "invalid attachment scope: workspace");
 }
 
-/// The global library is owner-wide rather than tenant-owned: tenants cannot
-/// list it or attach from it, even in a session belonging to their own project.
+/// The global library is shared: a tenant can list and attach from it in a
+/// session belonging to their own project.
 #[tokio::test]
-async fn global_skill_list_and_attach_are_admin_only() {
+async fn tenant_can_list_and_attach_global_skills_in_own_session() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let project_dir = paths.projects_root.join("demo");
@@ -1328,7 +1328,7 @@ async fn global_skill_list_and_attach_are_admin_only() {
         .send()
         .await
         .unwrap();
-    assert_eq!(listed.status(), 403);
+    assert_eq!(listed.status(), 200);
 
     let created = client
         .post(format!("{base}/projects/demo/sessions"))
@@ -1352,7 +1352,7 @@ async fn global_skill_list_and_attach_are_admin_only() {
         .send()
         .await
         .unwrap();
-    assert_eq!(attached.status(), 403);
+    assert_eq!(attached.status(), 202);
 }
 
 /// A daemon-local library path is meaningless to a satellite session. The

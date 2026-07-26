@@ -98,6 +98,7 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     expect(html).toContain("⌘K");
     expect(html).toContain('data-testid="side-new"');
     expect(html).toContain('data-testid="side-flow"');
+    expect(html).toContain('data-testid="side-team"');
     expect(html).toContain('data-testid="side-settings"');
     // Old top-bar remnants must not exist.
     expect(html).not.toContain("ccteam chat");
@@ -118,6 +119,7 @@ describe("ChatConsole shell (prototype .app layout)", () => {
       "搜索会话",
       "新建会话",
       "工作流",
+      "团队",
       "mini-blank",
       "设置",
       'class="avatar"',

@@ -151,7 +151,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     joinTokenCopy: "复制命令",
     joinTokenCopied: "已复制",
     joinTokenCopyFailed: "复制失败 —— 请手动选中上方命令复制。",
-    joinTokenHint: "join token 仅 admin 可见;凭它任何机器都能注册为卫星节点,请勿外传。",
+    joinTokenHint: "凭 join token 任何机器都能注册为卫星节点,请勿外传。",
     hostsUnit: "台",
     marketDesc: "来自 ccteam-hub 的 role / skill / workflow / plugin,按类型安装并做 sha256 校验。",
     install: "安装",
@@ -372,8 +372,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     joinTokenCopy: "Copy command",
     joinTokenCopied: "Copied",
     joinTokenCopyFailed: "Copy failed — select the command above and copy manually.",
-    joinTokenHint:
-      "The join token is admin-only; any machine holding it can register as a satellite — do not share.",
+    joinTokenHint: "Any machine holding the join token can register as a satellite — do not share.",
     hostsUnit: "",
     marketDesc: "Roles, skills, workflows, and plugins from ccteam-hub, installed by type with sha256 verification.",
     install: "Install",

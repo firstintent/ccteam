@@ -13,9 +13,10 @@ import { getImConfig, type ImConfigStatus } from "../lib/configApi";
 import { makeT, type Lang } from "../lib/i18n";
 import { getToken } from "../lib/token";
 import { getUserLink, listUsers, type TenantView } from "../lib/usersApi";
+import { useMe } from "../hooks/useMe";
 import { toastBus } from "../lib/toastBus";
 import { JoinCard } from "./HostsView";
-import { LarkSection, TelegramSection } from "./SettingsPage";
+import { LarkSection, MyImSection, TelegramSection } from "./SettingsPage";
 
 const CODE_PRE_CLASS =
   "max-h-80 overflow-auto rounded-lg border border-surface-700 bg-surface-950 p-3 text-[11px] text-text-secondary";
@@ -62,6 +63,7 @@ async function copyWithToast(value: string, success: string) {
 
 export default function AccessView({ lang }: { lang: Lang }) {
   const t = makeT(lang);
+  const { isAdmin } = useMe();
   const origin = typeof window !== "undefined" && window.location ? window.location.origin : "";
   const token = getToken() ?? "";
   const mcpSnippet = useMemo(() => externalMcpConfig(origin, token), [origin, token]);
@@ -73,6 +75,7 @@ export default function AccessView({ lang }: { lang: Lang }) {
   const [configError, setConfigError] = useState<string | null>(null);
 
   const reloadConfig = useCallback(() => {
+    if (!isAdmin) return;
     getImConfig()
       .then((next) => {
         setConfig(next);
@@ -82,9 +85,10 @@ export default function AccessView({ lang }: { lang: Lang }) {
         const message = error instanceof Error ? error.message : String(error);
         if (message !== "UNAUTHENTICATED") setConfigError(message);
       });
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
+    if (!isAdmin) return;
     let cancelled = false;
     getImConfig()
       .then((next) => {
@@ -98,7 +102,7 @@ export default function AccessView({ lang }: { lang: Lang }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAdmin]);
 
   return (
     <div data-testid="settings-access" className="flex flex-col gap-7">
@@ -112,46 +116,56 @@ export default function AccessView({ lang }: { lang: Lang }) {
         contentTestId="access-im"
         label={t("accessPeopleGroup")}
       >
-        {config?.transport_warning ? (
-          <div
-            data-testid="settings-transport-warning"
-            role="status"
-            className="lg:col-span-2 rounded-lg border border-brand-500/30 bg-brand-500/10 px-3 py-2 font-mono text-[11px] text-brand-400"
-          >
-            {config.transport_warning}
-          </div>
-        ) : null}
-        {configError ? (
-          <div
-            data-testid="settings-error"
-            role="alert"
-            className="lg:col-span-2 rounded-lg border border-status-error/30 bg-status-error/10 px-3 py-2 font-mono text-[11px] text-status-error"
-          >
-            {t("accessConfigError")}: {configError}
-          </div>
-        ) : null}
-        {config ? (
+        {isAdmin ? (
           <>
-            <TelegramSection lang={lang} status={config.telegram} onSaved={reloadConfig} />
-            <LarkSection lang={lang} status={config.lark} onSaved={reloadConfig} />
+            {config?.transport_warning ? (
+              <div
+                data-testid="settings-transport-warning"
+                role="status"
+                className="lg:col-span-2 rounded-lg border border-brand-500/30 bg-brand-500/10 px-3 py-2 font-mono text-[11px] text-brand-400"
+              >
+                {config.transport_warning}
+              </div>
+            ) : null}
+            {configError ? (
+              <div
+                data-testid="settings-error"
+                role="alert"
+                className="lg:col-span-2 rounded-lg border border-status-error/30 bg-status-error/10 px-3 py-2 font-mono text-[11px] text-status-error"
+              >
+                {t("accessConfigError")}: {configError}
+              </div>
+            ) : null}
+            {config ? (
+              <>
+                <TelegramSection lang={lang} status={config.telegram} onSaved={reloadConfig} />
+                <LarkSection lang={lang} status={config.lark} onSaved={reloadConfig} />
+              </>
+            ) : (
+              <>
+                <CredentialPlaceholder
+                  testId="settings-telegram"
+                  icon={<Send />}
+                  title="Telegram"
+                  loadingLabel={t("loading")}
+                />
+                <CredentialPlaceholder
+                  testId="settings-lark"
+                  icon={<MessageSquare />}
+                  title="Lark / 飞书"
+                  loadingLabel={t("loading")}
+                />
+              </>
+            )}
+            <LoginLinksCard lang={lang} className="lg:col-span-2" />
           </>
         ) : (
-          <>
-            <CredentialPlaceholder
-              testId="settings-telegram"
-              icon={<Send />}
-              title="Telegram"
-              loadingLabel={t("loading")}
-            />
-            <CredentialPlaceholder
-              testId="settings-lark"
-              icon={<MessageSquare />}
-              title="Lark / 飞书"
-              loadingLabel={t("loading")}
-            />
-          </>
+          <Card data-testid="access-my-im" className="lg:col-span-2">
+            <CardContent>
+              <MyImSection />
+            </CardContent>
+          </Card>
         )}
-        <LoginLinksCard lang={lang} className="lg:col-span-2" />
       </AccessGroup>
 
       <AccessGroup testId="access-programs" label={t("accessProgramsGroup")}>

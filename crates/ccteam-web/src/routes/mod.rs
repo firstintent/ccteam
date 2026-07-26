@@ -58,8 +58,8 @@ pub mod roles;
 // Web composer attachments: project-scoped uploads + skill picker (the turn
 // side lives in `sessions_api::handle_session_turn`'s `attachments[]`).
 pub mod session;
-// v0.9.9 W3 — admin-only user-level global skill library
-// (`GET /api/v1/skills`). Project-local skill listing remains in `uploads`.
+// v0.9.9 W3 — user-level global skill library (`GET /api/v1/skills`).
+// Project-local skill listing remains in `uploads`.
 pub mod skills;
 pub mod uploads;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.

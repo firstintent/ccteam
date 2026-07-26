@@ -52,7 +52,7 @@ export default function App() {
         <Route path="/settings/status" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/settings/hosts" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/settings/:tab" element={<ChatConsole />} />
-        {/* v0.9.0 W4 — 团队/Team view (admin-only nav entry; beta-gate). */}
+        {/* v0.9.0 W4 — 团队/Team view; backend data is identity-filtered. */}
         <Route path="/agents" element={<ChatConsole />} />
         {/* legacy flat routes → the new IA */}
         <Route path="/settings/market" element={<Navigate to="/flow/market" replace />} />

@@ -8,9 +8,9 @@
 //                               keyed by sid → atomic per-sid state reset).
 //   工作流 (`/flow/:tab?`)     — Skills / Roles / MCP / 自进化
 //                               (WorkflowView, set-nav layout).
-//   设置 (`/settings/:tab?`)   — 运维总览 / 插件市场 / 通用 / 账号 / 管理员
-//                               (SettingsView, set-nav layout; admin-gated
-//                               panels stay fail-closed via useMe).
+//   设置 (`/settings/:tab?`)   — 运维总览 / 接入 / 通用 / 账号 / 管理员
+//                               (SettingsView, set-nav layout; only user
+//                               management stays fail-closed via useMe).
 //
 // The sidebar (Sidebar.tsx) is the single navigation axis: ⌘K search,
 // 「新建会话」→ Home, 「工作流」, per-project session groups (live + stopped
@@ -51,8 +51,7 @@ export function shellViewFor(pathname: string): ShellView {
   if (pathname.startsWith("/chat/s/")) return "conv";
   if (pathname.startsWith("/flow")) return "flow";
   if (pathname.startsWith("/settings")) return "settings";
-  // v0.9.0 W4 — 团队/Team view (admin-only nav; the route itself isn't gated,
-  // see AgentsView's module doc).
+  // v0.9.0 W4 — 团队/Team view; backend graph/SSE responses are identity-filtered.
   if (pathname.startsWith("/agents")) return "agents";
   return "home";
 }
@@ -322,7 +321,6 @@ export default function ChatConsole() {
         flowActive={view === "flow"}
         settingsActive={view === "settings"}
         teamActive={view === "agents"}
-        showTeam={isAdmin}
         userName={displayName}
         userInitial={initial}
         avatarColor={settings.avatar}
@@ -375,7 +373,6 @@ export default function ChatConsole() {
             onNav={(t) => navigate(`/flow/${t}`)}
             onOpenMarket={() => navigate("/flow/market")}
             lang={lang}
-            isAdmin={isAdmin}
           />
         ) : view === "settings" ? (
           <SettingsView
@@ -385,7 +382,6 @@ export default function ChatConsole() {
         ) : view === "agents" ? (
           <AgentsView
             lang={lang}
-            isAdmin={isAdmin}
             onOpenChat={(newSid) => navigate(`/chat/s/${encodeURIComponent(newSid)}`)}
           />
         ) : (

@@ -1,6 +1,6 @@
-// v0.8.18 档1 — GET /api/v1/me: the caller's identity, so the SPA shows
-// admin-only surfaces (Status, 主机, IM credentials, user management) only to
-// the owner. Backend SoT: crates/ccteam-web/src/routes/api_v1.rs (handle_me).
+// v0.8.18 档1 — GET /api/v1/me: the caller's identity, so the SPA keeps user
+// management + global IM credentials owner-only while opening shared and
+// project-owned surfaces. Backend SoT: routes/api_v1.rs (handle_me).
 
 export interface Me {
   /** `"admin"` for the owner (bootstrap token), else the tenant id. */

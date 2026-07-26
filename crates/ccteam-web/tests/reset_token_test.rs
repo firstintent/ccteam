@@ -1,8 +1,8 @@
-//! v0.8.24 — admin self-serve web-token rotation (`POST /api/v1/me/reset-token`).
+//! v0.8.24 — self-serve web-token rotation (`POST /api/v1/me/reset-token`).
 //!
-//! Proves: 200 + new wire token; the file is rewritten atomically; the OLD
-//! token is dead immediately and the NEW one works without a restart (live
-//! `AuthState::rotate`); tenant → 403; auth-disabled → 400.
+//! Proves: admin + tenant both rotate only their own token; the OLD token is
+//! dead immediately and the NEW one works without a restart; auth-disabled →
+//! 400.
 
 use std::net::SocketAddr;
 
@@ -91,7 +91,7 @@ async fn admin_reset_rotates_live_and_persists() {
 }
 
 #[tokio::test]
-async fn tenant_reset_is_403_and_disabled_auth_is_400() {
+async fn tenant_reset_rotates_only_the_caller_and_disabled_auth_is_400() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(&paths.root).unwrap();
@@ -100,19 +100,60 @@ async fn tenant_reset_is_403_and_disabled_auth_is_400() {
     let tenant = reg.add("alice");
     reg.save(&paths.users_dir()).unwrap();
 
+    let tenant_id = tenant.id.clone();
+    let old_tenant_hex = tenant.web_token.clone();
     let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;
     let c = client();
-    let r = c
+    let body: serde_json::Value = c
         .post(format!("http://{addr}/api/v1/me/reset-token"))
-        .header(
-            "Authorization",
-            format!("Bearer ccteam:{}", tenant.web_token),
-        )
+        .header("Authorization", format!("Bearer ccteam:{old_tenant_hex}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wire = body["wire_token"].as_str().unwrap();
+    let new_tenant_hex = wire.strip_prefix("ccteam:").unwrap();
+    assert_ne!(new_tenant_hex, old_tenant_hex);
+
+    let r = c
+        .get(format!("http://{addr}/api/v1/me"))
+        .header("Authorization", format!("Bearer ccteam:{old_tenant_hex}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 403, "tenant must not rotate the admin token");
+    assert_eq!(r.status(), 401, "old tenant token dies immediately");
+
+    let me: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/me"))
+        .header("Authorization", format!("Bearer ccteam:{new_tenant_hex}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["id"], tenant_id);
+    assert_eq!(me["is_admin"], false);
+
+    let admin: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/me"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin["is_admin"], true, "admin token is unaffected");
 
     // Auth disabled → 400 (no token in use).
     let tmp2 = tempfile::TempDir::new().unwrap();

@@ -1,13 +1,12 @@
 // v0.8.24 Track A — 设置 top-level view (prototype `#view-settings`):
-// set-nav second column of sub-pages. Tabs: admin sees 运维总览 / 接入 /
-// 通用 / 账号 / 管理员; a tenant sees ONLY 通用 / 账号. 运维总览
-// combines Status + Hosts; 管理员 carries user management.
+// set-nav second column of sub-pages. Every identity sees 运维总览 / 接入 /
+// 通用 / 账号; only an admin sees 管理员. 运维总览 combines Status + Hosts;
+// 管理员 carries user management.
 //
-// ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / 管理员 are
-// admin-only nav items (the backend 403s regardless; this is the UI层
-// beta/visibility gate). The 账号 panel absorbs the old AvatarMenu entirely
-// (头像 / 昵称 / 语言入口 / 登出 + web token); tenants keep the self-serve
-// 「我的 IM bot」 there, while global Telegram/Lark credentials move to Access.
+// ACL (fail-closed via useMe): only 管理员 is an admin-only nav item. The 账号
+// panel absorbs the old AvatarMenu entirely (头像 / 昵称 / 语言入口 / 登出 +
+// web token); tenant self-serve IM and global admin credentials live as the
+// two identity-specific shapes of Access.
 
 import { useMemo, useState } from "react";
 import {
@@ -19,7 +18,7 @@ import {
 } from "lucide-react";
 import HostsView from "./HostsView";
 import StatusView from "./StatusView";
-import { MyImSection, UserManagementSection } from "./SettingsPage";
+import { UserManagementSection } from "./SettingsPage";
 import AccessView from "./AccessView";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
@@ -32,8 +31,8 @@ import { toastBus } from "../lib/toastBus";
 export type SettingsTab = "ops" | "access" | "general" | "account" | "admin";
 
 const ITEMS: { id: SettingsTab; labelKey: string; adminOnly: boolean; icon: React.ReactNode }[] = [
-  { id: "ops", labelKey: "setOps", adminOnly: true, icon: <Activity /> },
-  { id: "access", labelKey: "setAccess", adminOnly: true, icon: <PlugZap /> },
+  { id: "ops", labelKey: "setOps", adminOnly: false, icon: <Activity /> },
+  { id: "access", labelKey: "setAccess", adminOnly: false, icon: <PlugZap /> },
   { id: "general", labelKey: "setGeneral", adminOnly: false, icon: <SlidersHorizontal /> },
   { id: "account", labelKey: "setAccount", adminOnly: false, icon: <User /> },
   { id: "admin", labelKey: "setAdmin", adminOnly: true, icon: <Users /> },
@@ -53,7 +52,7 @@ export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): S
   const visible = visibleSettingsItems(isAdmin);
   const normalized = tab === "hosts" || tab === "status" ? "ops" : tab;
   if (normalized && (visible as string[]).includes(normalized)) return normalized as SettingsTab;
-  return isAdmin ? "ops" : "general";
+  return "ops";
 }
 
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
@@ -109,8 +108,8 @@ export default function SettingsView({
           className={`set-detail-inner fade-in ${settingsDetailWidthClass(active)}`}
           key={active}
         >
-          {active === "ops" && isAdmin ? <OpsPanel lang={lang} /> : null}
-          {active === "access" && isAdmin ? <AccessView lang={lang} /> : null}
+          {active === "ops" ? <OpsPanel lang={lang} /> : null}
+          {active === "access" ? <AccessView lang={lang} /> : null}
 
           {active === "admin" && isAdmin ? <AdminPanel lang={lang} /> : null}
 
@@ -266,7 +265,7 @@ export function AccountPanel({
 }) {
   const t = makeT(lang);
   const initial = ((displayName || "").trim() || handle || "C").slice(0, 1).toUpperCase();
-  // v0.8.24 — admin self-serve web-token reset: two-step inline confirm
+  // v0.8.24 — self-serve web-token reset: two-step inline confirm
   // (arm → confirm), then store the NEW token locally at once (the old one
   // is already dead server-side; the fetch interceptor picks the new Bearer
   // up on the next request — session uninterrupted, no re-login).
@@ -373,27 +372,25 @@ export function AccountPanel({
             <button type="button" className="btn ghost mini" onClick={copyToken}>
               {lang === "en" ? "Copy token" : "复制 token"}
             </button>
-            {isAdmin ? (
-              <button
-                type="button"
-                className={`btn mini ${resetArmed ? "primary" : "ghost"}`}
-                data-testid="account-reset-token"
-                disabled={resetBusy}
-                onClick={() => void doReset()}
-              >
-                {resetBusy
+            <button
+              type="button"
+              className={`btn mini ${resetArmed ? "primary" : "ghost"}`}
+              data-testid="account-reset-token"
+              disabled={resetBusy}
+              onClick={() => void doReset()}
+            >
+              {resetBusy
+                ? lang === "en"
+                  ? "Rotating…"
+                  : "重置中…"
+                : resetArmed
                   ? lang === "en"
-                    ? "Rotating…"
-                    : "重置中…"
-                  : resetArmed
-                    ? lang === "en"
-                      ? "Confirm reset? (old token dies at once)"
-                      : "确认重置?(旧 token 立即失效)"
-                    : lang === "en"
-                      ? "Reset token"
-                      : "重置 web token"}
-              </button>
-            ) : null}
+                    ? "Confirm reset? (old token dies at once)"
+                    : "确认重置?(旧 token 立即失效)"
+                  : lang === "en"
+                    ? "Reset token"
+                    : "重置 web token"}
+            </button>
             {resetArmed && !resetBusy ? (
               <button
                 type="button"
@@ -412,10 +409,6 @@ export function AccountPanel({
           </button>
         </div>
       </div>
-
-      {/* Tenant self-serve IM stays under Account. Global admin credentials
-          live under the admin-only Access tab. */}
-      {!isAdmin ? <MyImSection /> : null}
     </div>
   );
 }
