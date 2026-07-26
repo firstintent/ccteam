@@ -507,7 +507,7 @@ mod tests {
     /// bare-name status beacon alias added 2026-07-26).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
-        "claude_codex_grok_kimi_opencode_status",
+        "grok_claude_codex_kimi",
         "session_collect",
         "session_dispatch",
         "session_list",

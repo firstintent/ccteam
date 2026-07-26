@@ -132,7 +132,7 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
             "tool name {n:?} must not embed the server prefix (client namespaces by server key)"
         );
         let ok = n == "status"
-            || n == "claude_codex_grok_kimi_opencode_status"
+            || n == "grok_claude_codex_kimi"
             || n.starts_with("admin_")
             || n.starts_with("workflow_")
             || n.starts_with("chat_")
@@ -240,7 +240,7 @@ fn status_keeps_singleton_name_in_listing() {
         "status must survive without sub-prefix"
     );
     assert!(
-        names.contains(&"claude_codex_grok_kimi_opencode_status".to_string()),
+        names.contains(&"grok_claude_codex_kimi".to_string()),
         "the bare-name beacon alias must be listed"
     );
     // Sanity: the culled screenshot singleton stays gone.

@@ -113,10 +113,7 @@ fn group_set(names: &[String]) -> HashSet<&'static str> {
     for n in names {
         // Wire names are bare (client namespaces by server key).
         let bare = n.as_str();
-        if bare == "status"
-            || bare == "claude_codex_grok_kimi_opencode_status"
-            || bare.starts_with("admin_")
-        {
+        if bare == "status" || bare == "grok_claude_codex_kimi" || bare.starts_with("admin_") {
             out.insert("admin");
         } else if bare.starts_with("workflow_") {
             out.insert("workflow");

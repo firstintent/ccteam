@@ -44,6 +44,7 @@ describe("WorkflowView", () => {
     expect(admin).toContain('data-testid="mcp-rows"');
     // Templates prefill only — nothing auto-executes (copy says so).
     expect(admin).toContain("不执行");
+    expect(admin).toContain("grok_claude_codex_kimi");
 
     const tenant = renderToString(<WorkflowView tab="mcp" />);
     expect(tenant).not.toContain('data-testid="mcp-register-form"');

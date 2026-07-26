@@ -47,6 +47,12 @@ pub struct CcteamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects_root: Option<PathBuf>,
 
+    /// Optional project slug used by admin MCP `session_spawn` after the
+    /// explicit/cwd/sole-project tiers. The slug is validated against the
+    /// live catalog at use time; an absent or stale value is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_project: Option<String>,
+
     /// Every project under ccteam management — daemon roster reads
     /// this list instead of walking the filesystem. Empty on a fresh
     /// install; `ccteam init` appends one entry per successful install.
@@ -169,6 +175,7 @@ impl Default for CcteamConfig {
     fn default() -> Self {
         Self {
             projects_root: None,
+            default_project: None,
             projects: Vec::new(),
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
@@ -385,6 +392,7 @@ mod tests {
         let entry = sample_entry("foo", &PathBuf::from("/home/rob/code/foo"));
         let cfg = CcteamConfig {
             projects_root: Some(PathBuf::from("/work/repos")),
+            default_project: Some("foo".to_string()),
             projects: vec![entry.clone()],
             watchdog: None,
             claude_jobs_retention_days: default_claude_jobs_retention_days(),

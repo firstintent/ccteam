@@ -282,7 +282,7 @@ There is no skill to install — the ccteam MCP server ships its own instruction
 
 ### Model Routing
 
-A session deciding whom to spawn never has to guess. One `status` call (the MCP tool) answers with a **vendor panel** for the host your current project is bound to: which vendors are installed and their versions, an honest auth signal (`ready` / `not_ready` / `unknown` — sitting on PATH never masquerades as logged in), budget state, and whether the snapshot is fresh or stale. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
+A session deciding whom to spawn never has to guess. One `status` call (the MCP tool, also exposed through the byte-identical discovery alias `grok_claude_codex_kimi`) answers with a **vendor panel** for the host your current project is bound to: which vendors are installed and their versions, an honest auth signal (`ready` / `not_ready` / `unknown` — sitting on PATH never masquerades as logged in), budget state, and whether the snapshot is fresh or stale. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
 
 Your division of labor is plain markdown you own; ccteam carries it to any session that asks, on any host, and never parses, merges, or executes it:
 

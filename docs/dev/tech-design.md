@@ -488,12 +488,12 @@ You are a reviewer agent. ...
 
 #### 提供的 MCP:`ccteam`(**8 工具**,0 STUB)
 
-MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_tool / chat bot 3,`admin_ls`→`status`;2026-07-26 删 tmux 时代遗留 `screenshot` 并 owner 扩令把关联面一并退役:web `/screenshot/<slug>.png` 路由、core 渲染管线(vt100/image/imageproc/ab_glyph 四依赖)、IM `/screen` 命令;同日新增 `status` 的**裸名发现别名** `claude_codex_grok_kimi_opencode_status` —— 纯 alias 同响应,治「宿主抹掉描述只显工具名」时的第一轮发现失败,名字自 `AgentVendor::ALL` 派生(测试锁死,opencode 殿后 = owner 钦点),owner 拍板 alias 而非改名 = 后续随时可改可删)。wire 名裸(`session_spawn` 等),客户端按 server key 加命名空间(模型见 `mcp__ccteam__session_spawn`),**server name 不变**(`ccteam`):
+MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_tool / chat bot 3,`admin_ls`→`status`;2026-07-26 删 tmux 时代遗留 `screenshot` 并 owner 扩令把关联面一并退役:web `/screenshot/<slug>.png` 路由、core 渲染管线(vt100/image/imageproc/ab_glyph 四依赖)、IM `/screen` 命令;同日新增 `status` 的**裸名发现别名** `grok_claude_codex_kimi` —— 纯 alias 同响应,治「宿主抹掉描述只显工具名」时的第一轮发现失败;名字为 owner 钦点 literal,便于以 grok 领衔搜索发现)。wire 名裸(`session_spawn` 等),客户端按 server key 加命名空间(模型见 `mcp__ccteam__session_spawn`),**server name 不变**(`ccteam`):
 
 | Group(子前缀) | 工具数 | 工具 |
 |---|---|---|
 | `status`(admin 组,无子前缀) | 1 | 发现面:项目/daemon 健康/今日成本 + caller 项目绑定主机的 vendor 面板 + 已装 vendor 的 session_spawn 配方 + advisory 模型目录 + routing notes |
-| `claude_codex_grok_kimi_opencode_status`(admin 组) | 1 | `status` 的裸名发现别名(纯 alias,响应逐字节一致) |
+| `grok_claude_codex_kimi`(admin 组) | 1 | `status` 的裸名发现别名(纯 alias,响应逐字节一致) |
 | `chat_` | 1 | send_file(把 daemon 文件系统上的文件发回 caller 绑定 chat,与文本回复同 outbound funnel) |
 | `session_` | 5 | A2A 调度:spawn / dispatch / collect / list / stop(**daemon 校验 per-session principal + project 维度**,best-effort defense-in-depth 非硬边界;调度门与护栏 = AGENTS §三红线) |
 

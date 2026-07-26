@@ -266,7 +266,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 
 ### 模型路由
 
-会话决定叫谁干活时不必猜。一次 `status` 调用(MCP 工具)就返回**厂商面板**——按你当前项目绑定的主机出:各 vendor 装没装、版本、诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录)、预算态、快照新鲜还是过期。面板旁边还有一份 **advisory 模型目录**(runtime 最近所见 + hub `models.json`,来源分开标注,永不当 spawn 白名单),以及你的**分工笔记**,原文透传。
+会话决定叫谁干活时不必猜。一次 `status` 调用(MCP 工具,另有响应逐字节等同的发现别名 `grok_claude_codex_kimi`)就返回**厂商面板**——按你当前项目绑定的主机出:各 vendor 装没装、版本、诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录)、预算态、快照新鲜还是过期。面板旁边还有一份 **advisory 模型目录**(runtime 最近所见 + hub `models.json`,来源分开标注,永不当 spawn 白名单),以及你的**分工笔记**,原文透传。
 
 你的分工是你自己写的 dumb markdown;ccteam 负责把它带给任何开口问的会话(在任何主机上都拿到同一份),但永不解析、不合并、不执行:
 

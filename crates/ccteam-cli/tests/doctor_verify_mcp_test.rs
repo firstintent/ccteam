@@ -89,7 +89,8 @@ fn json_output_schema_includes_per_group_and_tool_list() {
     assert_eq!(names, sorted, "tool_list must be sorted for stable output");
     // Spot-check a known tool from each surviving group is present.
     assert!(names.contains(&"status"));
-    assert!(names.contains(&"claude_codex_grok_kimi_opencode_status"));
+    assert!(names.contains(&"grok_claude_codex_kimi"));
+    assert!(!names.contains(&concat!("claude_codex_grok_kimi_", "opencode_status")));
     assert!(names.contains(&"chat_send_file"));
     assert!(names.contains(&"session_spawn"));
     // Culled / retired tools are gone from the live surface.

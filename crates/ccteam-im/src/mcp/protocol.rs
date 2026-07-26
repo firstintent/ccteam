@@ -70,7 +70,7 @@ looked at the file they sent.";
 /// sorts last. The name is derived from [`ccteam_harness::AgentVendor::ALL`]
 /// (test-enforced), so adding a vendor forces this name to grow in the
 /// same PR.
-pub const STATUS_BEACON_TOOL_NAME: &str = "claude_codex_grok_kimi_opencode_status";
+pub const STATUS_BEACON_TOOL_NAME: &str = "grok_claude_codex_kimi";
 
 /// Full tool names in the session group, registration order.
 pub const SESSION_TOOL_NAMES: &[&str] = &[
@@ -407,7 +407,7 @@ mod tests {
     /// day — owner-ordered both).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
-        "claude_codex_grok_kimi_opencode_status",
+        "grok_claude_codex_kimi",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -549,22 +549,8 @@ mod tests {
     /// `mcp__ccteam__` client prefix under the 64-char tool-name cap, so a
     /// sixth vendor forces a conscious rename in the same PR.
     #[tokio::test]
-    async fn status_beacon_is_a_pure_alias_with_vendor_derived_name() {
-        // Name derivation: every vendor wire token, opencode last.
-        let mut order: Vec<String> = ccteam_harness::AgentVendor::ALL
-            .iter()
-            .map(|v| {
-                serde_json::to_value(v)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .filter(|v| v != "opencode")
-            .collect();
-        order.push("opencode".to_string());
-        let expected = format!("{}_status", order.join("_"));
-        assert_eq!(STATUS_BEACON_TOOL_NAME, expected);
+    async fn status_beacon_is_a_pure_alias_with_owner_pinned_literal_name() {
+        assert_eq!(STATUS_BEACON_TOOL_NAME, "grok_claude_codex_kimi");
         assert!(
             "mcp__ccteam__".len() + STATUS_BEACON_TOOL_NAME.len() <= 64,
             "beacon name must fit the 64-char tool-name cap with the client prefix"
@@ -599,6 +585,18 @@ mod tests {
             .unwrap();
         assert_eq!(via_status["result"], via_beacon["result"]);
         assert_eq!(via_beacon["result"]["isError"], false);
+
+        let old = handle_request(
+            &paths,
+            &call(concat!("claude_codex_grok_kimi_", "opencode_status")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old["result"]["isError"], true);
+        assert!(old["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
     }
 
     /// MCP-DX-1 — `status` is the discovery surface (vendor availability per

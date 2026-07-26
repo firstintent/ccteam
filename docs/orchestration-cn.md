@@ -135,6 +135,6 @@
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi 不再一片空白)。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本/token、`parent_sid`),按最近活跃排序。支持 `{project?, activity?, limit?}` 过滤(默认最多 30 行,截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
 - **`session_stop`** — 显式关掉一个 `sid`(状态留盘,可冷恢复)。ccteam 只有两个自动刹车:每日预算触顶拒新活、live 容量超限优雅挤停最闲的会话——**创建永不因容量失败**。
-- 另加 **`status`**(daemon 健康 + 会话 + 今日成本,外加 caller 项目绑定主机的厂商面板——各 vendor 安装/auth/预算、已装 vendor 的 spawn 配方、advisory 模型目录、原文透传的分工笔记;见 §6)、其裸名发现别名 **`claude_codex_grok_kimi_opencode_status`**(响应完全一致;专治只显示工具名的宿主搜不到 vendor 关键词),与 **`chat_send_file`**(把 daemon 文件系统上的文件发回你绑定的 chat)。
+- 另加 **`status`**(daemon 健康 + 会话 + 今日成本,外加 caller 项目绑定主机的厂商面板——各 vendor 安装/auth/预算、已装 vendor 的 spawn 配方、advisory 模型目录、原文透传的分工笔记;见 §6)、其裸名发现别名 **`grok_claude_codex_kimi`**(响应完全一致;专治只显示工具名的宿主搜不到 vendor 关键词),与 **`chat_send_file`**(把 daemon 文件系统上的文件发回你绑定的 chat)。
 
 **身份 & 信任(说实话):** ccteam 拉起的会话带 per-session `(sid, secret)`,只能操作自己项目;你自己的主会话走 admin token fallback,能管全舰队。per-session secret 是**单 OS 用户下的纵深防御,不是硬边界**——同 uid 进程终归能读到彼此的 env。它买到的是:agent 不会*误*跨项目、每个动作都归因到已认证的调用方。真隔离(per-agent OS 用户 / sandbox)当前刻意不做。

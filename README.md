@@ -74,7 +74,7 @@ Under all four modes are the same **eight MCP tools**, available to every sessio
 
 ```text
 session_spawn · session_dispatch · session_collect · session_list · session_stop
-status (+ its discovery alias claude_codex_grok_kimi_opencode_status) · chat_send_file
+status (+ its discovery alias grok_claude_codex_kimi) · chat_send_file
 ```
 
 The daemon routes and records — at-least-once notifications across restarts, idempotency keys, a child's turn written to disk before its parent is told, guardrails that refuse runaway fan-out with a reason. When a web-driven session finishes autonomous work while nobody is watching the console, the final answer is mirrored to your IM; the IM `/status` card shows your session's working children at a glance. It never schedules; *when* to delegate lives in prompts you version.

@@ -138,7 +138,7 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
     names.sort();
     let mut expected = vec![
         "chat_send_file",
-        "claude_codex_grok_kimi_opencode_status",
+        "grok_claude_codex_kimi",
         "session_collect",
         "session_dispatch",
         "session_list",
