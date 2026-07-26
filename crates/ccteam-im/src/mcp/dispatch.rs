@@ -3676,6 +3676,17 @@ mod session_tool_tests {
             }
             Ok(ccteam_harness::TurnId::new(format!("turn-{}", h.identity)))
         }
+        async fn submit_turn_routed(
+            &self,
+            h: &ccteam_harness::ThreadHandle,
+            input: ccteam_harness::TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> std::result::Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError>
+        {
+            self.submit_turn(h, input)
+                .await
+                .map(ccteam_harness::TurnSubmission::started)
+        }
         fn events(
             &self,
             h: &ccteam_harness::ThreadHandle,

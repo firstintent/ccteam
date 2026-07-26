@@ -2637,6 +2637,14 @@ mod tests {
         ) -> Result<ccteam_harness::TurnId, ccteam_harness::HarnessError> {
             unimplemented!("not exercised by these tests")
         }
+        async fn submit_turn_routed(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+            _input: ccteam_harness::TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError> {
+            unimplemented!("not exercised by these tests")
+        }
         fn events(
             &self,
             _h: &ccteam_harness::ThreadHandle,

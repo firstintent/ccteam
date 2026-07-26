@@ -96,6 +96,17 @@ impl HarnessAdapter for MockAdapter {
         Ok(TurnId::new(format!("mock-turn-{}", h.identity)))
     }
 
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(stream::empty())
     }

@@ -9,7 +9,7 @@ use ccteam_harness::execution::grok_acp::spawn_spec::{build_argv, GrokSpawnInput
 use ccteam_harness::{
     write_session_meta, AgentSpecBrief, AgentVendor, ExecutionMode, GrokAcpAdapter, HarnessAdapter,
     PermissionMode, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx, ThreadEvent,
-    ThreadItemDetails, TurnInput, GROK_BIN_ENV,
+    ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting, GROK_BIN_ENV,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -177,12 +177,11 @@ async fn handshake_prompt_final_only_on_fake() {
 }
 
 /// Mid-turn steer: a second `submit_turn` fired before the first turn finalizes
-/// must be QUEUED (not hard-rejected with "a turn is already in progress"), then
-/// run as its own turn once the first completes — matching grok's native prompt
-/// queue. Regression for the daemon steering an ACP session like Claude/Codex.
+/// must be injected into that active turn without cancelling it. Grok returns
+/// the active turn id and produces one combined final answer.
 #[tokio::test]
 #[serial]
-async fn mid_turn_submit_queues_second_turn() {
+async fn mid_turn_submit_interjects_active_turn_by_default() {
     install_fake();
     let tmp = TempDir::new().unwrap();
     let adapter = GrokAcpAdapter::new();
@@ -202,12 +201,102 @@ async fn mid_turn_submit_queues_second_turn() {
     let mut stream = adapter.events(&handle);
     let collector = tokio::spawn(async move {
         let mut finals = Vec::new();
-        let mut completed = 0;
         while let Some(ev) = stream.next().await {
             match ev {
                 ThreadEvent::ItemCompleted { item } => {
                     if let ThreadItemDetails::AgentMessage(t) = item.details {
                         finals.push(t);
+                    }
+                }
+                ThreadEvent::TurnCompleted { .. } => {
+                    break;
+                }
+                ThreadEvent::TurnFailed { err, .. } => panic!("turn failed: {err:?}"),
+                _ => {}
+            }
+        }
+        finals
+    });
+
+    // Fire both messages back-to-back. The second lands while the first is
+    // active and must use Grok's no-cancel `_x.ai/interject` extension.
+    let first = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("one".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .expect("first submit ok");
+    let second_submit = adapter.submit_turn_routed(
+        &handle,
+        TurnInput::UserText("two".into()),
+        TurnRouting::Inject,
+    );
+    let third_submit = adapter.submit_turn_routed(
+        &handle,
+        TurnInput::UserText("three".into()),
+        TurnRouting::Inject,
+    );
+    let (second, third) = tokio::join!(second_submit, third_submit);
+    let mut second = second.expect("second submit must interject, not reject");
+    let mut third = third.expect("third submit must preserve concurrent FIFO");
+    assert_eq!(
+        first.turn_id, second.turn_id,
+        "interjection belongs to the active turn"
+    );
+    assert_eq!(
+        first.turn_id, third.turn_id,
+        "every interjection reuses the active turn"
+    );
+    assert_eq!(first.disposition, TurnDisposition::Started);
+    assert_eq!(second.disposition, TurnDisposition::Injected);
+    assert_eq!(third.disposition, TurnDisposition::Injected);
+    assert_ne!(second.input_id, third.input_id);
+    assert_ne!(first.input_id, second.input_id);
+    second.release_completion();
+    third.release_completion();
+
+    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    assert_eq!(finals.len(), 1, "interjection keeps one turn boundary");
+    assert_eq!(finals[0], "echo:one|interject:two|three");
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// If Grok completes between the local active-turn check and reading the
+/// interjection, the message must become a distinct FIFO follow-up rather than
+/// disappear or land in a later unrelated turn.
+#[tokio::test]
+#[serial]
+async fn completion_edge_interject_degrades_losslessly_to_queue() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-late"),
+        )
+        .await
+        .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut finals = Vec::new();
+        let mut completed = 0;
+        while let Some(event) = stream.next().await {
+            match event {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(text) = item.details {
+                        finals.push(text);
                     }
                 }
                 ThreadEvent::TurnCompleted { .. } => {
@@ -223,26 +312,110 @@ async fn mid_turn_submit_queues_second_turn() {
         finals
     });
 
-    // Fire both turns back-to-back. The second lands while the first is still
-    // in flight → it must queue and return Ok (never a SubmitFailed).
     let first = adapter
-        .submit_turn(&handle, TurnInput::UserText("one".into()))
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("__late_base__".into()),
+            TurnRouting::Inject,
+        )
         .await
-        .expect("first submit ok");
-    let second = adapter
-        .submit_turn(&handle, TurnInput::UserText("two".into()))
+        .unwrap();
+    let mut late = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("__finish_before_interject__".into()),
+            TurnRouting::Inject,
+        )
         .await
-        .expect("second submit must queue, not reject");
-    assert_ne!(first.0, second.0, "queued turn gets its own id");
+        .expect("late interject is retained as queue");
+    assert_eq!(first.disposition, TurnDisposition::Started);
+    assert_eq!(late.disposition, TurnDisposition::Queued);
+    assert_ne!(first.turn_id, late.turn_id);
+    late.release_completion();
 
     let finals = tokio::time::timeout(Duration::from_secs(10), collector)
         .await
         .expect("collector timeout")
         .expect("collector join");
+    assert_eq!(
+        finals,
+        vec!["echo:__late_base__", "echo:__finish_before_interject__"]
+    );
 
-    assert_eq!(finals.len(), 2, "both queued turns produce an answer");
-    assert_eq!(finals[0], "echo:one", "first turn runs first (FIFO)");
-    assert_eq!(finals[1], "echo:two", "queued turn drains after the first");
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// The lower layer retains a distinct FIFO route for a future composer toggle.
+/// Unlike Inject, Queue returns a new id and produces a second turn boundary.
+#[tokio::test]
+#[serial]
+async fn explicit_queue_retains_two_fifo_turns() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-queue"),
+        )
+        .await
+        .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut finals = Vec::new();
+        let mut completed = 0;
+        while let Some(event) = stream.next().await {
+            match event {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(text) = item.details {
+                        finals.push(text);
+                    }
+                }
+                ThreadEvent::TurnCompleted { .. } => {
+                    completed += 1;
+                    if completed == 2 {
+                        break;
+                    }
+                }
+                ThreadEvent::TurnFailed { err, .. } => panic!("turn failed: {err:?}"),
+                _ => {}
+            }
+        }
+        finals
+    });
+
+    let first = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("one".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .expect("first queue submit starts immediately");
+    let second = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("two".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .expect("second queue submit is retained");
+    assert_ne!(
+        first.turn_id.0, second.turn_id.0,
+        "queued follow-up gets its own turn id"
+    );
+    assert_eq!(first.disposition, TurnDisposition::Started);
+    assert_eq!(second.disposition, TurnDisposition::Queued);
+
+    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+    assert_eq!(finals, vec!["echo:one", "echo:two"]);
 
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();

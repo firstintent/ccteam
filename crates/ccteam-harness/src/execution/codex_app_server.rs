@@ -64,7 +64,7 @@ use crate::execution::session_meta::read_session_meta;
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
     SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
-    TurnInput, UnifiedTokenUsage,
+    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
 };
 use crate::{
     ChoiceOption, ChoicePrompt, ChoiceSelection, ContextUsage, Directive, DirectiveOutcome,
@@ -1841,11 +1841,17 @@ impl HarnessAdapter for CodexAppServerAdapter {
         })
     }
 
-    async fn submit_turn(
+    async fn submit_turn_routed(
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        if routing == TurnRouting::Queue {
+            return Err(HarnessError::NotImplemented {
+                reason: "codex app-server does not expose a distinct queued-turn channel".into(),
+            });
+        }
         // Deterministic precondition: guarantee this thread is resident on the
         // current connection (resume-once-per-epoch) BEFORE sending the turn,
         // so `turn/start` can never hit `thread not found`.
@@ -1860,6 +1866,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
             })?;
         }
         let items = turn_input_to_items(input)?;
+        let input_id = TurnSubmission::mint_input_id();
         // v0.8.5 D2.2 — active-turn interjection: if the tracker shows an
         // in-flight turn for this thread, steer it (`turn/steer` with the
         // required `expectedTurnId` precondition) rather than starting a new
@@ -1870,11 +1877,13 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .tracker_snapshot(&h.identity)
             .await
             .and_then(|t| t.active_turn);
+        let was_active = active_turn.is_some();
         let (method, params) = if let Some(expected) = active_turn {
             (
                 "turn/steer",
                 json!({
                     "threadId": h.identity,
+                    "clientUserMessageId": input_id.clone(),
                     "input": items,
                     "expectedTurnId": expected,
                 }),
@@ -1882,6 +1891,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
         } else {
             let mut params = json!({
                 "threadId": h.identity,
+                "clientUserMessageId": input_id.clone(),
                 "input": items,
             });
             self.apply_overrides(&h.identity, &mut params).await;
@@ -1905,7 +1915,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let turn_id = pluck_turn_id(&result).ok_or_else(|| {
             HarnessError::SubmitFailed(format!("{method} response missing turn.id: {result}"))
         })?;
-        Ok(TurnId(turn_id))
+        let turn_id = TurnId(turn_id);
+        if was_active {
+            Ok(TurnSubmission::injected_with_input_id(turn_id, input_id))
+        } else {
+            Ok(TurnSubmission::started_with_input_id(turn_id, input_id))
+        }
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
