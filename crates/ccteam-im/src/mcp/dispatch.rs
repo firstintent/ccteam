@@ -29,7 +29,7 @@ pub type GatewayHandle = Arc<Mutex<Gateway>>;
 ///
 /// Fields are `Option` so a socket connection still works when IM / web
 /// pieces are not wired (structured errors for stateful tools; protocol
-/// core still serves `status` / `screenshot` / `tools/list`).
+/// core still serves `status` / `tools/list`).
 pub struct McpDispatch {
     /// ccteam path layout (home + projects root).
     pub paths: CcteamPaths,
@@ -179,8 +179,6 @@ impl McpDispatch {
             )
         } else if is_status_call(&req) {
             Some(execute_status(&req, self.gateway.as_ref(), caller.clone(), &self.paths).await)
-        } else if is_screenshot_call(&req) && caller.user_id().is_some() {
-            Some(execute_user_screenshot(&req, &caller, &self.paths).await)
         } else if is_reload_call(&req) {
             if caller.user_id().is_some() {
                 return Some(internal_bus_not_exposed(&req));
@@ -274,6 +272,18 @@ fn admin_project_catalog_hint(paths: Option<&CcteamPaths>) -> String {
         " — no projects are registered yet (run `ccteam init` in a project directory, or IM `/newproject`)".to_string()
     } else {
         format!(" — registered projects: {}", format_slug_list(&slugs))
+    }
+}
+
+/// MCP-DX-2 — the sole registered project, when the catalog holds exactly
+/// one. Used as the unambiguous default for an admin `session_spawn` that
+/// names no project (two or more candidates keep the explicit-or-error
+/// contract; zero keeps the "no projects registered" hint).
+fn sole_registered_project(paths: Option<&CcteamPaths>) -> Option<String> {
+    let slugs = registered_project_slugs(paths?);
+    match slugs.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -1145,41 +1155,6 @@ fn is_status_call(req: &serde_json::Value) -> bool {
         && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("status")
 }
 
-fn is_screenshot_call(req: &serde_json::Value) -> bool {
-    req.get("method").and_then(|method| method.as_str()) == Some("tools/call")
-        && req.pointer("/params/name").and_then(|name| name.as_str()) == Some("screenshot")
-}
-
-async fn execute_user_screenshot(
-    req: &serde_json::Value,
-    caller: &McpCaller,
-    paths: &CcteamPaths,
-) -> serde_json::Value {
-    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let Some(slug) = req
-        .pointer("/params/arguments/slug")
-        .and_then(|slug| slug.as_str())
-        .filter(|slug| !slug.is_empty())
-    else {
-        return session_tool_response(id, "screenshot: missing `slug`".to_string(), true);
-    };
-    let Some(user_id) = caller.user_id() else {
-        return session_tool_response(id, "screenshot: project not found".to_string(), true);
-    };
-    if !user_can_see_project(paths, user_id, slug) {
-        return session_tool_response(id, "screenshot: project not found".to_string(), true);
-    }
-    protocol::handle_request(paths, req)
-        .await
-        .unwrap_or_else(|| {
-            session_tool_response(
-                id,
-                "screenshot: request produced no response".to_string(),
-                true,
-            )
-        })
-}
-
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
 /// vendor panel + routing notes appended for the caller's project's bound
 /// host. Ambient (session principal) is scoped to its OWN project — any
@@ -1468,18 +1443,31 @@ async fn authorize_user_session_tool(
             // function of identity, not of the probed input): actionable
             // recovery without existence disclosure.
             let hint = || user_project_list_hint(&visible_user_projects(paths, user_id));
-            let project = args
+            let explicit = args
                 .get("project")
                 .and_then(|project| project.as_str())
                 .map(str::trim)
                 .filter(|project| !project.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly{}",
-                        hint()
-                    )
-                })?;
-            if !user_can_see_project(paths, user_id, project) {
+                .map(str::to_string);
+            let project = match explicit {
+                Some(project) => project,
+                // MCP-DX-2 — exactly one visible project is an unambiguous
+                // default (identity-derived, same disclosure surface as the
+                // hint); two or more keep the explicit-or-error contract.
+                None => match visible_user_projects(paths, user_id).as_slice() {
+                    [only] => {
+                        args["project"] = serde_json::json!(only);
+                        only.clone()
+                    }
+                    _ => {
+                        return Err(format!(
+                            "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly{}",
+                            hint()
+                        ));
+                    }
+                },
+            };
+            if !user_can_see_project(paths, user_id, &project) {
                 return Err(format!("session_spawn: project not found{}", hint()));
             }
         }
@@ -1585,13 +1573,17 @@ async fn run_session_spawn_at(
             .filter(|s| !s.is_empty())
             .map(String::from)
             .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
-        McpCaller::Admin => args
+        McpCaller::Admin => match args
             .get("project")
             .or_else(|| args.get("_caller_slug"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(String::from)
-            .ok_or_else(|| {
+        {
+            Some(explicit) => explicit.to_string(),
+            // MCP-DX-2 — a single-project install has exactly one honest
+            // answer; external MCP hosts (cwd outside any registered
+            // project) otherwise dead-end on `missing project` forever.
+            None => sole_registered_project(paths).ok_or_else(|| {
                 format!(
                     "session_spawn: missing `project` — pass the target project slug explicitly, \
                      or run from inside a registered project directory (cwd is resolved for local \
@@ -1599,6 +1591,7 @@ async fn run_session_spawn_at(
                     admin_project_catalog_hint(paths)
                 )
             })?,
+        },
         McpCaller::User { .. } => args
             .get("project")
             .and_then(|v| v.as_str())
@@ -1616,19 +1609,9 @@ async fn run_session_spawn_at(
         args.get("permission_mode").and_then(|v| v.as_str()),
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
-    // Protocol: agents get `stream-json | acp` only — `terminal` is frozen and
-    // never exposed to agents. Grok/opencode/kimi are always ACP (honest meta).
-    let protocol = parse_session_protocol(args)?;
-    let protocol = if matches!(
-        vendor,
-        ccteam_harness::AgentVendor::Grok
-            | ccteam_harness::AgentVendor::Opencode
-            | ccteam_harness::AgentVendor::Kimi
-    ) {
-        ccteam_harness::SessionProtocol::Acp
-    } else {
-        protocol
-    };
+    // Protocol is DERIVED from the vendor; an explicit value is only
+    // validated (conflict = actionable error, never a silent override).
+    let protocol = resolve_session_protocol(args, vendor)?;
     // Optional model/effort (composer facets). Grok effort is dropped (its
     // value set is undocumented — an invalid value would fail the spawn),
     // mirroring the REST `spawn_tuning_from_form` contract.
@@ -1994,24 +1977,52 @@ fn mark_idempotent_replay(body: &str) -> String {
     }
 }
 
-/// Parse the optional `protocol` arg for `session_spawn`. Agents may select
-/// `stream-json` (default) or `acp` only — `terminal` (tmux/PTY) is frozen and
-/// NEVER exposed to agents (an explicit reject keeps the red line legible even
-/// if a caller bypasses the schema enum).
-fn parse_session_protocol(
+/// Resolve the wire protocol for `session_spawn`. The channel is DERIVED
+/// from the vendor — claude/codex drive stream-json, grok/opencode/kimi are
+/// ACP-only (Claude has no ACP arm; the codex value is informational) — so
+/// the optional `protocol` arg carries no choice and is only VALIDATED:
+/// omitted/empty → derived value; a matching explicit value is accepted; a
+/// conflicting one is an actionable error. MCP-DX-2 (external-agent
+/// feedback): the pre-2026-07-26 behaviour silently overrode a mismatch, so
+/// `spawn{vendor:grok, protocol:"stream-json"}` produced a different session
+/// channel than the caller asked for with no signal. `terminal` (tmux/PTY)
+/// stays an explicit reject — frozen and NEVER exposed to agents (kept
+/// legible even if a caller bypasses the schema enum).
+fn resolve_session_protocol(
     args: &serde_json::Value,
+    vendor: ccteam_harness::AgentVendor,
 ) -> std::result::Result<ccteam_harness::SessionProtocol, String> {
-    let raw = args.get("protocol").and_then(|v| v.as_str());
-    if let Some(r) = raw {
-        let low = r.trim().to_ascii_lowercase();
-        if low == "terminal" || low == "tmux" {
-            return Err(
-                "session_spawn: protocol `terminal` is not available to agents (use `stream-json` or `acp`)"
-                    .to_string(),
-            );
+    let derived = match vendor {
+        ccteam_harness::AgentVendor::Grok
+        | ccteam_harness::AgentVendor::Opencode
+        | ccteam_harness::AgentVendor::Kimi => ccteam_harness::SessionProtocol::Acp,
+        ccteam_harness::AgentVendor::Claude | ccteam_harness::AgentVendor::Codex => {
+            ccteam_harness::SessionProtocol::StreamJson
         }
+    };
+    let raw = args.get("protocol").and_then(|v| v.as_str());
+    let Some(requested) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(derived);
+    };
+    let low = requested.to_ascii_lowercase();
+    if low == "terminal" || low == "tmux" {
+        return Err(
+            "session_spawn: protocol `terminal` is not available to agents (omit `protocol` — it is derived from the vendor)"
+                .to_string(),
+        );
     }
-    ccteam_harness::SessionProtocol::parse_opt(raw).map_err(|e| format!("session_spawn: {e}"))
+    let parsed = ccteam_harness::SessionProtocol::parse_opt(Some(requested))
+        .map_err(|e| format!("session_spawn: {e}"))?;
+    if parsed != derived {
+        return Err(format!(
+            "session_spawn: protocol `{}` does not apply to vendor `{}` — {} sessions run `{}`; omit `protocol` (it is derived from the vendor)",
+            parsed.as_str(),
+            session_vendor_wire(vendor),
+            session_vendor_wire(vendor),
+            derived.as_str(),
+        ));
+    }
+    Ok(derived)
 }
 
 /// Lowercase wire string for a spawned session's vendor (response field).
@@ -4049,6 +4060,10 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
+        // MCP-DX-2 — a SECOND visible project keeps `project` genuinely
+        // ambiguous (with exactly one, spawn now auto-defaults; see
+        // `user_spawn_missing_project_defaults_to_sole_visible`).
+        seed_owned_project(&paths, "alice2", "user:ualice");
         let caller = McpCaller::User {
             user_id: "ualice".into(),
         };
@@ -4065,10 +4080,9 @@ mod session_tool_tests {
         assert!(missing_text.contains("missing `project`"), "{missing_text}");
         // MCP-DX-1 — actionable recovery: the error enumerates the caller's
         // OWN projects (identity-derived, never input-derived).
-        assert!(
-            missing_text.contains("your projects: alice"),
-            "{missing_text}"
-        );
+        assert!(missing_text.contains("your projects:"), "{missing_text}");
+        assert!(missing_text.contains("alice"), "{missing_text}");
+        assert!(missing_text.contains("alice2"), "{missing_text}");
         assert!(!missing_text.contains("bob"), "{missing_text}");
 
         // A foreign and a nonexistent project must stay BYTE-IDENTICAL (no
@@ -4099,6 +4113,34 @@ mod session_tool_tests {
             denied_texts.windows(2).all(|pair| pair[0] == pair[1]),
             "foreign vs unknown project errors must be byte-identical: {denied_texts:?}"
         );
+    }
+
+    /// MCP-DX-2 — a tenant with exactly ONE visible project no longer needs
+    /// to name it: spawn auto-defaults into it (identity-derived, the same
+    /// disclosure surface as the own-projects hint).
+    #[tokio::test]
+    async fn user_spawn_missing_project_defaults_to_sole_visible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = execute_session_tool_with_paths(
+            &call("session_spawn", json!({"vendor": "claude"})),
+            Some(&gateway),
+            McpCaller::User {
+                user_id: "ualice".into(),
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            body["project"], "alice",
+            "the sole visible project must be the default target: {body}"
+        );
+        assert_eq!(body["caller"], "user:ualice");
     }
 
     /// MCP-DX-1 — "did you mean" suggests close/contained names only; a wild
@@ -4157,8 +4199,55 @@ mod session_tool_tests {
 
     /// MCP-DX-1 — the admin missing-`project` error enumerates the catalog
     /// (or says it is empty) so recovery needs no second discovery call.
+    /// MCP-DX-2 narrowed the error path to catalogs of TWO OR MORE (a sole
+    /// registered project now auto-defaults; see the companion test).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_spawn_missing_project_lists_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        seed_owned_project(&paths, "robchat", "user:web-api");
+        seed_owned_project(&paths, "demo", "user:web-api");
+        let err = run_session_spawn_at(
+            &json!({"vendor": "claude"}),
+            &gw,
+            McpCaller::Admin,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("missing `project`"), "{err}");
+        assert!(err.contains("registered projects: "), "{err}");
+        assert!(err.contains("robchat"), "{err}");
+        assert!(err.contains("demo"), "{err}");
+
+        let empty = CcteamPaths {
+            root: tmp.path().join("home-empty"),
+            projects_root: tmp.path().join("projects-empty"),
+        };
+        let err = run_session_spawn_at(
+            &json!({"vendor": "claude"}),
+            &gw,
+            McpCaller::Admin,
+            Some(&empty),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no projects are registered yet"), "{err}");
+    }
+
+    /// MCP-DX-2 — with exactly ONE registered project, an admin spawn that
+    /// names no project defaults to it instead of dead-ending (external MCP
+    /// hosts run with a cwd outside any registered project, so `missing
+    /// project` used to be unrecoverable without a docs lookup). The fixture
+    /// gateway has no config watcher, so the resolved slug deterministically
+    /// surfaces as the gateway's own "unknown project: robchat" — proof the
+    /// default fired and named the sole catalog entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_missing_project_defaults_to_sole_registered() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let paths = CcteamPaths {
@@ -4174,22 +4263,78 @@ mod session_tool_tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("missing `project`"), "{err}");
-        assert!(err.contains("registered projects: robchat"), "{err}");
+        assert!(
+            err.starts_with("session_spawn: unknown project: robchat"),
+            "sole registered project must be the default target, got: {err}"
+        );
+        assert!(!err.contains("missing `project`"), "{err}");
+    }
 
-        let empty = CcteamPaths {
-            root: tmp.path().join("home-empty"),
-            projects_root: tmp.path().join("projects-empty"),
+    /// MCP-DX-2 — the wire protocol is DERIVED from the vendor; an explicit
+    /// mismatch is an actionable error, never the old silent override
+    /// (external agents passed `stream-json` for grok and got an acp session
+    /// with no signal).
+    #[test]
+    fn spawn_protocol_is_derived_and_mismatch_is_actionable() {
+        use ccteam_harness::{AgentVendor, SessionProtocol};
+        // Omitted → derived per vendor.
+        for (vendor, derived) in [
+            (AgentVendor::Claude, SessionProtocol::StreamJson),
+            (AgentVendor::Codex, SessionProtocol::StreamJson),
+            (AgentVendor::Grok, SessionProtocol::Acp),
+            (AgentVendor::Opencode, SessionProtocol::Acp),
+            (AgentVendor::Kimi, SessionProtocol::Acp),
+        ] {
+            assert_eq!(
+                resolve_session_protocol(&json!({}), vendor).unwrap(),
+                derived
+            );
+        }
+        // Matching explicit value is accepted (harmless redundancy).
+        assert_eq!(
+            resolve_session_protocol(&json!({"protocol": "acp"}), AgentVendor::Grok).unwrap(),
+            SessionProtocol::Acp
+        );
+        assert_eq!(
+            resolve_session_protocol(&json!({"protocol": "stream-json"}), AgentVendor::Claude)
+                .unwrap(),
+            SessionProtocol::StreamJson
+        );
+        // Conflict → error naming the vendor's actual channel + the fix.
+        let err = resolve_session_protocol(&json!({"protocol": "stream-json"}), AgentVendor::Grok)
+            .unwrap_err();
+        assert!(err.contains("grok sessions run `acp`"), "{err}");
+        assert!(err.contains("omit `protocol`"), "{err}");
+        let err =
+            resolve_session_protocol(&json!({"protocol": "acp"}), AgentVendor::Claude).unwrap_err();
+        assert!(err.contains("claude sessions run `stream-json`"), "{err}");
+        // `terminal` stays an explicit reject; a typo still surfaces.
+        let err = resolve_session_protocol(&json!({"protocol": "terminal"}), AgentVendor::Claude)
+            .unwrap_err();
+        assert!(err.contains("not available to agents"), "{err}");
+        assert!(
+            resolve_session_protocol(&json!({"protocol": "bogus"}), AgentVendor::Claude).is_err()
+        );
+    }
+
+    /// MCP-DX-2 — pure resolution rule: exactly one catalog entry → that
+    /// slug; zero or several → no default.
+    #[test]
+    fn sole_registered_project_requires_exactly_one_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
         };
-        let err = run_session_spawn_at(
-            &json!({"vendor": "claude"}),
-            &gw,
-            McpCaller::Admin,
-            Some(&empty),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("no projects are registered yet"), "{err}");
+        assert_eq!(sole_registered_project(None), None);
+        assert_eq!(sole_registered_project(Some(&paths)), None);
+        seed_owned_project(&paths, "robchat", "user:web-api");
+        assert_eq!(
+            sole_registered_project(Some(&paths)).as_deref(),
+            Some("robchat")
+        );
+        seed_owned_project(&paths, "demo", "user:web-api");
+        assert_eq!(sole_registered_project(Some(&paths)), None);
     }
 
     /// MCP-DX-1 — an inline-wait completion carries submit→completion timing
@@ -4315,8 +4460,11 @@ mod session_tool_tests {
         assert_eq!(body["total"], 1);
     }
 
+    /// 2026-07-26 cull — `screenshot` fell out of the MCP surface entirely;
+    /// any caller (tenant included) now gets the protocol core's unknown-tool
+    /// error, never a renderer path.
     #[tokio::test]
-    async fn user_screenshot_rejects_foreign_project_before_protocol_fallback() {
+    async fn screenshot_is_unknown_tool_after_cull() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
@@ -4336,10 +4484,8 @@ mod session_tool_tests {
             .await
             .unwrap();
         assert_eq!(response["result"]["isError"], true, "{response}");
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            "screenshot: project not found"
-        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unknown tool: screenshot"), "{text}");
     }
 
     /// v0.9 T4 review fix — the internal-bus methods are refused on the admin

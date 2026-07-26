@@ -1,7 +1,7 @@
 //! Transport-agnostic MCP protocol core (JSON-RPC value-in / value-out).
 //!
-//! Speaks `initialize` / `tools/list` / `tools/call` for the **local** tools
-//! (`status`, `screenshot`). Stateful tools (`chat_send_file`, `session_*`)
+//! Speaks `initialize` / `tools/list` / `tools/call` for the **local** tool
+//! (`status`). Stateful tools (`chat_send_file`, `session_*`)
 //! are listed in `tools/list` but only dispatched by [`super::dispatch::McpDispatch`]
 //! (daemon socket / future HTTP). The stdio process in `ccteam-cli` forwards
 //! those tools to the daemon over `mcp.sock` before falling through here.
@@ -9,10 +9,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use ccteam_core::{
-    check_daemon_health, collect_projects, cost_summary, render_screenshot, CcteamPaths,
-    DaemonHealth,
-};
+use ccteam_core::{check_daemon_health, collect_projects, cost_summary, CcteamPaths, DaemonHealth};
 
 use super::groups;
 
@@ -53,8 +50,8 @@ binding. `session_dispatch` sends follow-up tasks \
 out to vendor CLIs (`codex exec`, `claude -p`, …) for this: a raw CLI run has no session id, no transcript, no cost \
 tracking, no completion notification, and is invisible to the team — it bypasses the bridge. The tools work both \
 from ccteam-spawned sessions (per-session principal) and from a plain local session running inside a registered \
-project (same-user admin fallback; `session_spawn` then targets the project of your working directory, or an \
-explicit `project`).\n\n\
+project (same-user admin fallback; `session_spawn` then targets the project of your working directory, an explicit \
+`project`, or — when exactly one project is registered — that project).\n\n\
 CHAT ROUTING: ccteam routes IM (Telegram / web) chats to you and back. \
 An inbound chat message may arrive wrapped in a `<channel source=\"…\" chat_id=\"…\" user=\"…\" message_id=\"…\">` tag.\n\n\
 ATTACHMENTS (important): if a `<channel …>` tag carries an `image_path=\"/abs/path\"` attribute, immediately `Read` that file — \
@@ -80,7 +77,7 @@ pub fn is_session_tool(name: &str) -> bool {
 /// Dispatch a single JSON-RPC message. Returns `Some(response)` for
 /// requests (which carry an `id`) and `None` for notifications.
 ///
-/// `tools/call` only handles **local** tools (`status`, `screenshot`).
+/// `tools/call` only handles the **local** tool (`status`).
 /// Unknown tools (including stateful `chat_send_file` / `session_*` when
 /// reached without a prior intercept) return `isError: true`.
 pub async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
@@ -146,32 +143,14 @@ fn tools_list_response() -> Value {
     json!({ "tools": tools })
 }
 
-/// Single source of truth for the MCP tool surface (v0.9 T1):
-/// `status` (1) + `screenshot` (1) + `chat_send_file` (1) +
-/// session (5) = **8 total**.
+/// Single source of truth for the MCP tool surface:
+/// `status` (1) + `chat_send_file` (1) + session (5) = **7 total**.
 pub fn tool_definitions() -> Vec<Value> {
-    let mut tools: Vec<Value> = vec![
-        json!({
-            "name": "status",
-            "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
-            "inputSchema": object_schema(&[]),
-        }),
-        json!({
-            "name": "screenshot",
-            "description": "Render the current tmux pane of a project to a PNG under <project>/.ccteam/screenshots/<utc>.png. Pure Rust pipeline (vt100 → imageproc), no system deps. Returns the absolute path on success or a reason on graceful degrade. V0.2.2 F38.",
-            "inputSchema": json!({
-                "type": "object",
-                "properties": {
-                    "slug": { "type": "string", "description": "Project slug." },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Scrollback depth to capture (default 50)."
-                    }
-                },
-                "required": ["slug"],
-            }),
-        }),
-    ];
+    let mut tools: Vec<Value> = vec![json!({
+        "name": "status",
+        "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
+        "inputSchema": object_schema(&[]),
+    })];
     tools.extend(chat_tool_definitions());
     tools.extend(session_tool_definitions());
     tools
@@ -181,7 +160,7 @@ pub fn tool_definitions() -> Vec<Value> {
 pub fn chat_tool_definitions() -> Vec<Value> {
     vec![json!({
         "name": "chat_send_file",
-        "description": "V0.8.4 P2b — send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web). Zero addressing params: your identity comes from the spawn-injected CCTEAM_CHAT_SLUG / CCTEAM_CHAT_ROLE env, and the daemon resolves your home chat from the registry. `path` must be on the daemon's filesystem (shared with you under tmux). `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). To send a rendered screenshot, compose with `screenshot`: it returns a PNG path → pass that to chat_send_file. Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
+        "description": "Send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web) — a chat user cannot open a local path, so this is how a generated artifact (chart, report, photo) actually reaches them. Zero addressing params: the daemon resolves your home chat from your session identity. `path` must be on the daemon's filesystem. `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).",
         "inputSchema": json!({
             "type": "object",
             "properties": {
@@ -199,7 +178,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn an agent session — `vendor`: `claude` (default) | `codex` | `grok` | `opencode` | `kimi` — in YOUR OWN project; always mints a NEW `s{n}` sid. `grok` = fast live web/X search; `claude`/`codex` = coding agents for repo work; `status` shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch (async + ONE completion notification when the child's turn completes and it goes idle; see `wait_seconds`/`notify`); the response then adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
+            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex = coding agents for repo work; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch (async + ONE completion notification when the child's turn completes and it goes idle; see `wait_seconds`/`notify`); the response then adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -207,16 +186,16 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "vendor": {
                         "type": "string",
                         "enum": ["claude", "codex", "grok", "opencode", "kimi"],
-                        "description": "Harness vendor (lowercase). Default `claude`."
+                        "description": "Harness vendor (lowercase). Default claude."
                     },
                     "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
                     "effort": { "type": "string", "description": "Optional reasoning-effort token (vendor-specific value set). Ignored for grok (undocumented value set)." },
                     "protocol": {
                         "type": "string",
                         "enum": ["stream-json", "acp"],
-                        "description": "Session channel. `stream-json` (default) for claude/codex; `acp` for grok/opencode/kimi (forced). `terminal` is not available to agents."
+                        "description": "OMIT — the session channel is derived from the vendor (claude/codex = stream-json, grok/opencode/kimi = acp); an explicit value that conflicts with the vendor is an error. `terminal` is not available to agents."
                     },
-                    "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Local callers default to the project resolved from the working directory." },
+                    "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Omitted: your working directory's project, else the sole registered project; `status` lists every slug." },
                     "permission_mode": {
                         "type": "string",
                         "enum": ["skip", "hitl"],
@@ -303,16 +282,14 @@ fn object_schema(props: &[(&str, &str, &str)]) -> Value {
     })
 }
 
-/// Local-only `tools/call` dispatch (`status` + `screenshot`).
+/// Local-only `tools/call` dispatch (`status`).
 async fn call_tool(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
         "status" => Ok(text_content(tool_ls(paths)?)),
-        "screenshot" => Ok(text_content(tool_screenshot(paths, &args)?)),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -395,31 +372,6 @@ fn daemon_health_json(health: &DaemonHealth) -> Value {
     }
 }
 
-fn tool_screenshot(paths: &CcteamPaths, args: &Value) -> Result<String> {
-    let slug = arg_string(args, "slug")?;
-    let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    match render_screenshot(paths, &slug, None, lines)? {
-        Some(path) => Ok(serde_json::to_string_pretty(&json!({
-            "ok": true,
-            "slug": slug,
-            "path": path.to_string_lossy(),
-        }))?),
-        None => Ok(serde_json::to_string_pretty(&json!({
-            "ok": false,
-            "slug": slug,
-            "reason": "screenshot rendering degraded; check daemon stderr for warn details \
-                      (tmux missing, session not found, font failed, or IO failure)",
-        }))?),
-    }
-}
-
-fn arg_string(args: &Value, name: &str) -> Result<String> {
-    args.get(name)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("missing required argument `{name}`"))
-}
-
 fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -435,10 +387,10 @@ fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
+    /// Exact set of MCP tool names (7 tools; `screenshot` culled 2026-07-26
+    /// as tmux-era legacy — the web `/screenshot/<slug>.png` route stays).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
-        "screenshot",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -449,7 +401,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        assert_eq!(tool_definitions().len(), 8);
+        assert_eq!(tool_definitions().len(), 7);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
@@ -469,7 +421,7 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 8, "tool names must be unique");
+        assert_eq!(names.len(), 7, "tool names must be unique");
         for tool in &tools {
             // Wire names are BARE: the MCP client namespaces by server key
             // (`mcp__ccteam__session_spawn`), so a baked-in `ccteam__`
@@ -481,23 +433,6 @@ mod tests {
             );
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
-    }
-
-    #[test]
-    fn screenshot_tool_definition_present_with_optional_lines() {
-        let tools = tool_definitions();
-        let s = tools
-            .iter()
-            .find(|t| t["name"] == "screenshot")
-            .expect("screenshot tool registered");
-        let req: Vec<&str> = s["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(req, vec!["slug"]);
-        assert_eq!(s["inputSchema"]["properties"]["lines"]["type"], "integer");
     }
 
     #[test]
@@ -565,20 +500,27 @@ mod tests {
     /// MCP-DX-1 — external-agent feedback: callers searching for "grok" (or
     /// any vendor keyword) must hit the spawn tool without reading a 500-char
     /// paragraph. The five vendor names live in the FIRST sentence.
+    ///
+    /// MCP-DX-2 hardening: vendor keywords must be PLAIN TEXT. A host-side
+    /// keyword matcher tokenizes the description — backtick-wrapped `grok`
+    /// was measured to miss, so `session_spawn` was undiscoverable by the
+    /// very keyword it advertises (the plain-text `status` description
+    /// matched fine, which confirmed the diagnosis).
     #[test]
     fn session_spawn_description_front_loads_all_vendors() {
         let defs = session_tool_definitions();
         let spawn = defs.iter().find(|t| t["name"] == "session_spawn").unwrap();
-        let head: String = spawn["description"]
-            .as_str()
-            .unwrap()
-            .chars()
-            .take(140)
-            .collect();
+        let description = spawn["description"].as_str().unwrap();
+        let head: String = description.chars().take(140).collect();
         for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
             assert!(
                 head.contains(vendor),
                 "vendor `{vendor}` must appear in the first 140 chars (discoverability): {head}"
+            );
+            assert!(
+                !description.contains(&format!("`{vendor}`")),
+                "vendor keyword {vendor} must be plain text in the spawn description \
+                 (backticks defeat host keyword matchers)"
             );
         }
     }
@@ -799,7 +741,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 7);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();
@@ -816,6 +758,8 @@ mod tests {
             "ccteam__chat_list_bots",
             "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
+            // 2026-07-26 cull: tmux-era pane screenshot (web route stays).
+            "screenshot",
             // Pre-rename prefixed wire names (client namespaces by server
             // key; the baked-in prefix rendered as mcp__ccteam__ccteam__*).
             "ccteam__status",
@@ -874,8 +818,10 @@ mod tests {
         assert_eq!(slugs, vec!["alice"]);
     }
 
+    /// 2026-07-26 cull — `screenshot` (tmux-era pane render) is no longer an
+    /// MCP tool; a call must fail as UNKNOWN, not degrade gracefully.
     #[tokio::test]
-    async fn handle_tools_call_screenshot_degrades_when_session_missing() {
+    async fn handle_tools_call_screenshot_is_unknown_after_cull() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -891,11 +837,11 @@ mod tests {
             }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("\"ok\": false"),
-            "expected ok=false on graceful degrade, got: {text}"
+            text.contains("unknown tool: screenshot"),
+            "expected unknown-tool error, got: {text}"
         );
     }
 

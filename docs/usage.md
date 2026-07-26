@@ -98,7 +98,7 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (Automatic)
 
-Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -153,7 +153,7 @@ The console is built on a token-authenticated HTTP API you can use directly:
 
 ### External agents over MCP (`POST /mcp`)
 
-Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same eight tools a managed session has:
+Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same seven tools a managed session has:
 
 ```
 POST http://<host>:7331/mcp
@@ -264,7 +264,7 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 
 - **Messages without a prefix** go to the current session.
 - **Non-gateway slash commands** (`/compact`, `/clear`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons.
-- **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files and screenshots back to chat.
+- **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files back to chat.
 - **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
 
 ### Human-in-the-Loop (HITL)
@@ -378,7 +378,7 @@ The global library and project skills never mix: nothing links or copies from th
 ```bash
 ccteam status                      # Daemon + projects/sessions + web token/url lines.
 ccteam session ls                  # Gateway session status; degrades when daemon is offline.
-ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
+ccteam doctor --verify-mcp         # MCP surface check: 7 tools / 0 stubs; drift exits 1.
 ```
 
 Restart daemon only; sessions reconnect by id afterward:

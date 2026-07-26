@@ -4813,7 +4813,10 @@ mod tests {
         // total_tools must match the mcp_serve spec — keeps F171 in
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
-        assert_eq!(report.total_tools, 8, "ships 8 tools (v0.9 T1 cull)");
+        assert_eq!(
+            report.total_tools, 7,
+            "ships 7 tools (v0.9 T1 cull + 2026-07-26 screenshot cull)"
+        );
     }
 
     #[test]

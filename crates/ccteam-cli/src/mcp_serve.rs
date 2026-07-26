@@ -502,10 +502,9 @@ mod tests {
     use super::*;
     use ccteam_im::mcp::MCP_PROTOCOL_VERSION;
 
-    /// Exact set of MCP tool names after the v0.9 T1 cull (8 tools).
+    /// Exact set of MCP tool names (7 tools; `screenshot` culled 2026-07-26).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "chat_send_file",
-        "screenshot",
         "session_collect",
         "session_dispatch",
         "session_list",
@@ -516,7 +515,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        assert_eq!(tool_definitions().len(), 8);
+        assert_eq!(tool_definitions().len(), 7);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
@@ -536,30 +535,13 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 8, "tool names must be unique");
+        assert_eq!(names.len(), 7, "tool names must be unique");
         for tool in &tools {
             // Wire names are BARE — the client namespaces by server key
             // (`mcp__ccteam__session_spawn`); a baked-in prefix doubles up.
             assert!(!tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
-    }
-
-    #[test]
-    fn screenshot_tool_definition_present_with_optional_lines() {
-        let tools = tool_definitions();
-        let s = tools
-            .iter()
-            .find(|t| t["name"] == "screenshot")
-            .expect("screenshot tool registered");
-        let req: Vec<&str> = s["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(req, vec!["slug"]);
-        assert_eq!(s["inputSchema"]["properties"]["lines"]["type"], "integer");
     }
 
     #[test]
@@ -795,7 +777,7 @@ mod tests {
         });
         let resp = handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 7);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();
@@ -812,6 +794,8 @@ mod tests {
             "ccteam__chat_list_bots",
             "ccteam__chat_lifecycle",
             "ccteam__workflow_show",
+            // 2026-07-26 cull: tmux-era pane screenshot (web route stays).
+            "screenshot",
             // Pre-rename prefixed wire names — no compat alias.
             "ccteam__status",
             "ccteam__screenshot",
@@ -823,8 +807,10 @@ mod tests {
         }
     }
 
+    /// 2026-07-26 cull — a stdio `screenshot` call must fall through to the
+    /// protocol core's unknown-tool error (no local renderer path left).
     #[tokio::test]
-    async fn handle_tools_call_screenshot_degrades_when_session_missing() {
+    async fn handle_tools_call_screenshot_is_unknown_after_cull() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -840,11 +826,11 @@ mod tests {
             }
         });
         let resp = handle_request(&paths, &req).await.unwrap();
-        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("\"ok\": false"),
-            "expected ok=false on graceful degrade, got: {text}"
+            text.contains("unknown tool: screenshot"),
+            "expected unknown-tool error, got: {text}"
         );
     }
 

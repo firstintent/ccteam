@@ -15,6 +15,19 @@
 
 ## 当前卡
 
+### MCP-CULL-1 删除 MCP `screenshot` 工具(owner 直驱 2026-07-26;工具面 8→7)
+- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests) + docs + AGENTS.md` · **建议入口**:规划(控制)会话(涉契约 + 治理面)
+- **背景**:owner 指令「删除 mcp__ccteam__screenshot,这个是 tmux 时代的遗留产物」= MCP wire 契约变更签核(登记 state.md)。范围仅 MCP 工具面:web REST `/screenshot/<slug>.png`、core `render_screenshot`、IM `/screen` 命令 = terminal 协议维护面,owner 未点名,不动。`chat_send_file` 同问评估结论 = **保留**(真 IM 外发通道:Telegram/Lark 用户无法打开 daemon 本地路径,file 送达与文本回复同 funnel,与 tmux 无关;两条 caller 路径 sid-era 均活);其描述陈旧文案(tmux 共享盘/screenshot 组合/V0.8.4 考古)随卡刷新。
+- **规格**:protocol.rs 定义+本地执行+import、dispatch.rs `is_screenshot_call`/`execute_user_screenshot`、groups.rs `Screenshot` 组(未知 token 既有忽略语义兜底旧 `CCTEAM_DISABLE_TOOLS=screenshot`)、cli mcp_serve 期望集/内嵌测试、doctor_verify_mcp/mcp_e2e/mcp_subprefix/mcp_disable_groups、web mcp_tenant_bearer_test(screenshot 拒绝测例改 cull 回归守卫);文档数字与清单同步(§五.7 家规)。
+- **DoD**:`doctor --verify-mcp` = 7 工具 0 STUB;`make check` clippy 0;基线无新红(删除面净减测试在案);writeback 绿。
+
+### MCP-DX-2 外部反馈第二轮:关键词可搜性 + protocol 诚实校验 + 单项目默认(owner 直驱 2026-07-26)
+- **状态**:进行中(规划会话·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp`(与 MCP-CULL-1 同域,同会话串行) · **建议入口**:规划(控制)会话
+- **背景**:QoderWork + WorkBuddy 第二轮调用复盘(owner 转交 2026-07-26)。代码核对实锤三缺口:① spawn 主描述 vendor 名全反引号包裹 → 宿主 ToolSearch 分词不命中(同宿主实测 status 纯文本正常命中 = 对照实证);② `protocol` 参数对 grok/opencode/kimi **静默覆盖**成 acp(QoderWork「静默失败」踩坑;adapter.rs 实锤 Claude 无 ACP 臂、codex 值仅 informational → 参数零信息量);③ 恰一注册项目时 missing `project` 仍硬报错(WorkBuddy P1;外部宿主 cwd 不在项目内必撞)。
+- **规格**:A. spawn 主描述 vendor 关键词纯文本化(status 已是),测试加反断言(描述不得含反引号包裹的 vendor 名);B. protocol 静默覆盖 → 派生 + 校验:省略 = vendor 派生(claude/codex=stream-json,grok/opencode/kimi=acp),显式一致 = 接受,显式冲突 = 可操作错误(schema 参数保留,wire 形状不变;terminal 拒绝语义不动);C. admin/tenant 恰一(可见)项目自动默认进该项目 + `project` 参数描述加发现提示(status 列 slug);既有 missing-project 错误路径测试改双项目 fixture(语义翻转),新增单项目默认 + protocol 冲突定向测试。
+- **明确不做**(沿 MCP-DX-1 决议 + 本轮裁定):新工具 grok_search / beacon status / session_spawn_advanced / project_list(钢线「改进 ≠ 加法」;spawn+task+wait_seconds 已是一次调用拿结果,QoderWork 自己也确认好使);工具改名嵌 vendor 关键词(wire 契约变更,未授权,且 WorkBuddy 宿主抹描述属宿主缺陷);collect 结构化/turn 过滤(家 = P1-2 + A2A-OBS-1);grok 完成账本缺 tokens/cost(vendor usage 不上报,家 = A2A-OBS-4「usage 诚实外显」+ OBS-5E 捕获核查);描述整体再瘦身(MCP-DX-1 已 -792 字符,本轮只做关键词修正不重排)。
+- **DoD**:定向测试先红后绿留痕;`make check` clippy 0;基线只增;writeback 绿。
+
 ### GOV-CE-3 §三红线增删(owner 签核 2026-07-26「批A B C」+「E删除」)
 - **状态**:完成(23d0cef) · **冲突域**:`AGENTS.md + docs/dev/tech-design.md + .loop/` · **建议入口**:规划(控制)会话(人工门:红线)
 - **验证**:行级 diff 恰为 +3/-1 —— 新增「引擎零 LLM」「daemon 无自主内容决策循环」(紧跟 No prompt injection,引擎中立三连)+「vendor 配置足迹 = 只写自家 MCP 注册」(挨「不改写 CLAUDE.md」写入边界组);删 README 行 = **迁家非删规则**(§五.7 措辞补全为唯一家,tech-design R11 注记);AGENTS.md 146→148 行 / 27.0K→27.7K;最低门绿(fmt-check + writeback)。

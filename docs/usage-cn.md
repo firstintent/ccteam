@@ -85,7 +85,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件、截图等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -137,7 +137,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 外部 Agent 直连 MCP(`POST /mcp`)
 
-任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
+任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 7 个工具:
 
 ```
 POST http://<host>:7331/mcp
@@ -248,7 +248,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 
 - **不带前缀的消息** → 发给当前会话。
 - **非网关的 `/命令`**(`/compact`、`/clear`、`/model` …)→ 透传给当前 agent;弹窗型(如 `/model`)会弹**选项按钮**,点一下即应用。
-- **发图 / 发文件 + 一句说明** → agent 自动读取(报错截图、日志都行);agent 也能把文件 / 截图发回你的 chat。
+- **发图 / 发文件 + 一句说明** → agent 自动读取(报错截图、日志都行);agent 也能把文件发回你的 chat。
 - **回合进行中** → 一条活的进度消息(形如 `⏳ working… · 🔧 bash ×3`),最终答案单独成条(会提醒);超长回答自动分片;agent 中途要你拿主意时会弹**选项按钮**,点一下喂回答案、它继续往下跑。
 
 ### 人工批准(HITL)
@@ -355,7 +355,7 @@ ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/sk
 ```bash
 ccteam status                  # daemon + 项目/会话 + 末尾两行 web token/url
 ccteam session ls              # 网关会话状态(daemon 离线降级标注)
-ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
+ccteam doctor --verify-mcp     # MCP 表面验收(7 工具 / 0 stub,漂移退出码 1)
 ```
 
 重启(只停 daemon,重启后按会话 id 自动接回):
