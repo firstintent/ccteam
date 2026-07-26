@@ -15,6 +15,11 @@
 
 ## 当前卡
 
+### GOV-CE-3 §三红线增删(owner 签核 2026-07-26「批A B C」+「E删除」)
+- **状态**:完成(23d0cef) · **冲突域**:`AGENTS.md + docs/dev/tech-design.md + .loop/` · **建议入口**:规划(控制)会话(人工门:红线)
+- **验证**:行级 diff 恰为 +3/-1 —— 新增「引擎零 LLM」「daemon 无自主内容决策循环」(紧跟 No prompt injection,引擎中立三连)+「vendor 配置足迹 = 只写自家 MCP 注册」(挨「不改写 CLAUDE.md」写入边界组);删 README 行 = **迁家非删规则**(§五.7 措辞补全为唯一家,tech-design R11 注记);AGENTS.md 146→148 行 / 27.0K→27.7K;最低门绿(fmt-check + writeback)。
+- **规格**:字面 = owner 已批 chat 提案(A/B/C/E);**D(never-execute 并入 #15)未批不动**。A = 引擎不调用任何 LLM,推理只在 agent session 内(自 tech-design web 章升格);B = vendor 全局配置唯一写 = 幂等注册自家 MCP 条目(DX-DOCTOR-1 偏差裁决引用过的事实红线成文);C = daemon 只响应消息/排程/连接、不产生任务不选择工作(自 §〇 叙述升格)。
+
 ### GOV-CE-2 §三红线表述治理(owner 签核 2026-07-26)
 - **状态**:完成(f0c834c) · **冲突域**:`AGENTS.md + docs/dev/tech-design.md + .loop/` · **建议入口**:规划(控制)会话(人工门:红线)
 - **验证**:变更行恰为已批 12 行,**「不动」7 行零字节未入 diff**(filtered diff 复核);`会话 = resume-by-session-id` 行并入 `session = 独立一等实体`(术语保留可 grep);§三 12,524→9,137 字符(-27%),AGENTS.md 147→146 行 / 30.4K→27.0K(自 GOV-CE-1 前累计 -41%);最低门绿(fmt-check + writeback)。
@@ -56,7 +61,7 @@
 ### A2A-W5 A2A 线收尾:三场景真机 smoke + README/usage 重写
 - **状态**:待排 · **冲突域**:`README.md + docs/`(smoke 零代码)· **建议入口**:规划(控制)会话(涉治理面写权)
 - **背景**:v0.9.0–0.9.2 A2A 底座已落,W5 是 ship gate 前最后一步;hub 示例配方 = `team-brain` agent(grok 跨模型 review 已跑通;cct-codex/cct-grok wrapper skill 已于 2026-07-21 退役 —— MCP server instructions 原生覆盖,owner 拍板)。
-- **规格**:① 三场景真机 smoke(单机委派 / 跨 vendor / 卫星跨机),结果留痕 `docs-local/versions/`;② root README + `docs/usage.md` 把 A2A 融入当前能力描述(README 英文、不写版本时间轴,§三红线)。
+- **规格**:① 三场景真机 smoke(单机委派 / 跨 vendor / 卫星跨机),结果留痕 `docs-local/versions/`;② root README + `docs/usage.md` 把 A2A 融入当前能力描述(README 英文、不写版本时间轴,规则家 = AGENTS §五.7)。
 - **DoD**:三场景各一次全链路通过记录;docs-only 面走最低门(fmt + writeback);writeback 绿。
 
 ### FB-2 subagent 事件污染 live model 外显与计费捕获

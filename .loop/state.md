@@ -31,7 +31,7 @@
 | 分支治理 = dev + PR 攒版本(常态规则,非一次性) | **已生效** —— owner 2026-07-22:「后续新功能开发一律在 dev 分支开发,提交 PR;多个提交累计组成一个版本,owner 合并 PR 后复用 dev 重复」;取代旧 direct-on-main。**2026-07-24 owner 补充拍板:合并方式 = merge commit(非 squash)**(main 含完整历史、免每轮和解——v0.9.8/v0.9.9 两轮 squash 和解成本实证)+ 周期开始即开 draft PR(dev 推送借 PR 跑 CI);均已固化 AGENTS.md §五「分支与推送」 |
 | 外部 Agent MCP 接入 Phase 1(研究稿 `docs-local/research/external-agent-mcp-symmetric-architecture.md` 待拍板 D1–D10) | **已签核消耗** —— owner 2026-07-23「实现这个需求」= 按稿内推荐默认拍板,授权范围仅 Phase 1(主 daemon WebUser MCP,tenant token 直用为 MVP);Phase 2(独立 MCP token)/3(卫星 relay)/4(多 Authority)未授权;8-tool wire schema 不变 |
 | v0.9.9 需求决策委托 + 开工(全局 skill 库 PRD FREEZE 解锁) | **已签核消耗** —— owner 2026-07-24「review v0-9-9 版本需求→不恰当处由规划决策改良→完成开发→治理沉淀清理→提 PR,owner 合并」;规划决议落 `docs-local/versions/v0-9-9/decisions.md`(O1–O5 钉死 + ADJ-1 全局面 admin-only + ADJ-2 rm 防误删 + ADJ-3 并入复盘 P0-1 wait 240,**wire schema 不变、additive 字段**;复盘其余排 A2A-OBS 卡)。merge 权仍在 owner |
-| AGENTS §三红线**表述**治理(GOV-CE-2:瘦身 + resume-by-sid 行并入 session 一等实体行,语义零变更) | **已签核消耗** —— owner 2026-07-26「批准」chat 提案(逐行判定 + 重写样例);落地 `f0c834c`。红线**增删**类变更(引擎零 LLM / vendor 足迹唯一写 / daemon 不 tick 升格 / never-execute 并入 #15 / README 行迁出 §三)= **另案已提待批**,未授权不动 |
+| AGENTS §三红线**表述**治理(GOV-CE-2:瘦身 + resume-by-sid 行并入 session 一等实体行,语义零变更) | **已签核消耗** —— owner 2026-07-26「批准」chat 提案(逐行判定 + 重写样例);落地 `f0c834c`。红线**增删**类变更 = **A/B/C/E 已签核消耗**(owner 2026-07-26「批A B C」+ 追加「E删除」,落地 `23d0cef`:新增 引擎零 LLM / daemon 无自主内容决策循环 / vendor 配置足迹唯一写,README 行迁家 §五.7);**D(never-execute 并入 #15)未批不动** |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训
