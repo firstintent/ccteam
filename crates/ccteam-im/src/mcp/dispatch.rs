@@ -1549,10 +1549,10 @@ async fn run_session_tool(
 /// Ambient caller can only spawn into that project. Admin (HTTP front door)
 /// names the target with an explicit `project` (fleet-wide).
 ///
-/// Facets mirror the REST `CreateSessionForm`: `{role?, vendor?, model?,
-/// effort?, protocol?, permission_mode?, title?}`. `role` empty/absent =
-/// roleless (bare vendor reads the project CLAUDE.md/AGENTS.md). `title` is
-/// metadata/ledger only — NEVER concatenated into any prompt.
+/// MCP facets are `{role?, vendor?, model?, effort?, permission_mode?, title?}`.
+/// `role` empty/absent = roleless (bare vendor reads the project
+/// CLAUDE.md/AGENTS.md). `title` is metadata/ledger only — NEVER concatenated
+/// into any prompt.
 async fn run_session_spawn_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -1561,6 +1561,9 @@ async fn run_session_spawn_at(
 ) -> std::result::Result<String, String> {
     if args.get("host").is_some() {
         return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
+    }
+    if args.get("protocol").is_some() {
+        return Err(PROTOCOL_SPAWN_PARAM_REMOVED.to_string());
     }
     // Roleless is a first-class form; absent or "" both mean roleless.
     let role = args
@@ -1615,9 +1618,7 @@ async fn run_session_spawn_at(
         args.get("permission_mode").and_then(|v| v.as_str()),
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
-    // Protocol is DERIVED from the vendor; an explicit value is only
-    // validated (conflict = actionable error, never a silent override).
-    let protocol = resolve_session_protocol(args, vendor)?;
+    let protocol = derive_session_protocol(vendor);
     // Optional model/effort (composer facets). Grok effort is dropped (its
     // value set is undocumented — an invalid value would fail the spawn),
     // mirroring the REST `spawn_tuning_from_form` contract.
@@ -1983,52 +1984,22 @@ fn mark_idempotent_replay(body: &str) -> String {
     }
 }
 
-/// Resolve the wire protocol for `session_spawn`. The channel is DERIVED
-/// from the vendor — claude/codex drive stream-json, grok/opencode/kimi are
-/// ACP-only (Claude has no ACP arm; the codex value is informational) — so
-/// the optional `protocol` arg carries no choice and is only VALIDATED:
-/// omitted/empty → derived value; a matching explicit value is accepted; a
-/// conflicting one is an actionable error. MCP-DX-2 (external-agent
-/// feedback): the pre-2026-07-26 behaviour silently overrode a mismatch, so
-/// `spawn{vendor:grok, protocol:"stream-json"}` produced a different session
-/// channel than the caller asked for with no signal. `terminal` (tmux/PTY)
-/// stays an explicit reject — frozen and NEVER exposed to agents (kept
-/// legible even if a caller bypasses the schema enum).
-fn resolve_session_protocol(
-    args: &serde_json::Value,
-    vendor: ccteam_harness::AgentVendor,
-) -> std::result::Result<ccteam_harness::SessionProtocol, String> {
-    let derived = match vendor {
+/// Stable error for the removed MCP `session_spawn.protocol` input.
+pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "session_spawn: `protocol` was removed; the channel is derived from `vendor` (claude/codex = stream-json, grok/opencode/kimi = acp) — omit `protocol`";
+
+/// Derive the sole wire channel for an MCP-spawned vendor session:
+/// claude/codex = stream-json; grok/opencode/kimi = acp. The `protocol`
+/// parameter was removed on 2026-07-26, mirroring the earlier `host` removal:
+/// callers must omit a facet that carries no choice.
+fn derive_session_protocol(vendor: ccteam_harness::AgentVendor) -> ccteam_harness::SessionProtocol {
+    match vendor {
         ccteam_harness::AgentVendor::Grok
         | ccteam_harness::AgentVendor::Opencode
         | ccteam_harness::AgentVendor::Kimi => ccteam_harness::SessionProtocol::Acp,
         ccteam_harness::AgentVendor::Claude | ccteam_harness::AgentVendor::Codex => {
             ccteam_harness::SessionProtocol::StreamJson
         }
-    };
-    let raw = args.get("protocol").and_then(|v| v.as_str());
-    let Some(requested) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(derived);
-    };
-    let low = requested.to_ascii_lowercase();
-    if low == "terminal" || low == "tmux" {
-        return Err(
-            "session_spawn: protocol `terminal` is not available to agents (omit `protocol` — it is derived from the vendor)"
-                .to_string(),
-        );
     }
-    let parsed = ccteam_harness::SessionProtocol::parse_opt(Some(requested))
-        .map_err(|e| format!("session_spawn: {e}"))?;
-    if parsed != derived {
-        return Err(format!(
-            "session_spawn: protocol `{}` does not apply to vendor `{}` — {} sessions run `{}`; omit `protocol` (it is derived from the vendor)",
-            parsed.as_str(),
-            session_vendor_wire(vendor),
-            session_vendor_wire(vendor),
-            derived.as_str(),
-        ));
-    }
-    Ok(derived)
 }
 
 /// Lowercase wire string for a spawned session's vendor (response field).
@@ -4276,14 +4247,12 @@ mod session_tool_tests {
         assert!(!err.contains("missing `project`"), "{err}");
     }
 
-    /// MCP-DX-2 — the wire protocol is DERIVED from the vendor; an explicit
-    /// mismatch is an actionable error, never the old silent override
-    /// (external agents passed `stream-json` for grok and got an acp session
-    /// with no signal).
-    #[test]
-    fn spawn_protocol_is_derived_and_mismatch_is_actionable() {
+    /// MCP-CULL-3 — the wire protocol is derived from the vendor, and the
+    /// removed input parameter is rejected for every value (including a
+    /// formerly accepted matching value).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_protocol_is_derived_and_removed_param_is_rejected() {
         use ccteam_harness::{AgentVendor, SessionProtocol};
-        // Omitted → derived per vendor.
         for (vendor, derived) in [
             (AgentVendor::Claude, SessionProtocol::StreamJson),
             (AgentVendor::Codex, SessionProtocol::StreamJson),
@@ -4291,36 +4260,23 @@ mod session_tool_tests {
             (AgentVendor::Opencode, SessionProtocol::Acp),
             (AgentVendor::Kimi, SessionProtocol::Acp),
         ] {
-            assert_eq!(
-                resolve_session_protocol(&json!({}), vendor).unwrap(),
-                derived
-            );
+            assert_eq!(derive_session_protocol(vendor), derived);
         }
-        // Matching explicit value is accepted (harmless redundancy).
-        assert_eq!(
-            resolve_session_protocol(&json!({"protocol": "acp"}), AgentVendor::Grok).unwrap(),
-            SessionProtocol::Acp
-        );
-        assert_eq!(
-            resolve_session_protocol(&json!({"protocol": "stream-json"}), AgentVendor::Claude)
-                .unwrap(),
-            SessionProtocol::StreamJson
-        );
-        // Conflict → error naming the vendor's actual channel + the fix.
-        let err = resolve_session_protocol(&json!({"protocol": "stream-json"}), AgentVendor::Grok)
-            .unwrap_err();
-        assert!(err.contains("grok sessions run `acp`"), "{err}");
-        assert!(err.contains("omit `protocol`"), "{err}");
-        let err =
-            resolve_session_protocol(&json!({"protocol": "acp"}), AgentVendor::Claude).unwrap_err();
-        assert!(err.contains("claude sessions run `stream-json`"), "{err}");
-        // `terminal` stays an explicit reject; a typo still surfaces.
-        let err = resolve_session_protocol(&json!({"protocol": "terminal"}), AgentVendor::Claude)
-            .unwrap_err();
-        assert!(err.contains("not available to agents"), "{err}");
-        assert!(
-            resolve_session_protocol(&json!({"protocol": "bogus"}), AgentVendor::Claude).is_err()
-        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        for args in [
+            json!({"vendor": "grok", "protocol": "acp"}),
+            json!({"vendor": "grok", "protocol": "stream-json"}),
+            json!({"vendor": "claude", "protocol": "terminal"}),
+            json!({"vendor": "claude", "protocol": "bogus"}),
+            json!({"vendor": "claude", "protocol": null}),
+        ] {
+            let err = run_session_spawn_at(&args, &gw, McpCaller::Admin, None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, PROTOCOL_SPAWN_PARAM_REMOVED);
+        }
     }
 
     /// MCP-DX-2 — pure resolution rule: exactly one catalog entry → that

@@ -16,10 +16,11 @@
 ## 当前卡
 
 ### MCP-CULL-3 session_spawn `protocol` 参数删除(owner 直驱 2026-07-26;wire 契约变更)
-- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
+- **状态**:完成(9638ce9) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
 - **背景**:外部 agent 反馈「grok 必须 acp 只藏在描述括号里,第一次即踩坑」。MCP-DX-2(1ab85da)已把静默覆盖修成派生+冲突可操作错误但为守 wire 形状保留了字段;owner 本日追加拍板:**字段整个删掉** —— 每个 vendor 只有一种最佳协议(claude/codex=stream-json,grok/opencode/kimi=acp),调用方零选择;terminal/tmux 面后续另案退役。先例 = host 参数删除(`HOST_SPAWN_PARAM_REMOVED`,v0.9.2:schema 不列 + 传入即硬错)。
 - **规格**:A. schema 删 `protocol` property(protocol.rs session_spawn inputSchema);B. dispatch 镜像 host 门:`args.get("protocol").is_some()` → 稳定可操作错误(错误文案含 vendor→channel 派生表 + omit 指引;terminal 不再特判,任意值同一错误);`resolve_session_protocol` 简化为纯派生 `derive_session_protocol(vendor)`;spawn 响应/list 的 `protocol` 输出字段保留(观测面);C. 测试翻转:protocol.rs facet 测试 + cli mcp_session_tools schema 测试(protocol 出 presence 列表 + 加 absence 断言,镜像 host)+ dispatch 派生/removal 测试重写(五 vendor 派生 + 任意显式值(含此前被接受的一致值)同错);D. docs:orchestration.md(+cn)facet 列表去 `protocol?`、措辞改「无 protocol 参数,通道由 vendor 派生,传入即硬错(同 host)」——cn 版仍是 DX-2 前旧文(「强制 protocol:"acp"」括号即反馈踩坑点)一并修。**边界零碰**:REST CreateSessionForm/web SPA 协议选择(admin beta,terminal/rmux 退役另案)、内部 SessionProtocol/adapter/session_meta、IM/CLI 命令面。
 - **DoD**:翻转测试对旧代码红、新代码绿(留痕);`make check` clippy 0;`make test-baseline` 红不增(本机 HERM-1 三红口径)、数目净变逐只对账;fmt 干净;writeback 绿。
+- **验证**:有牙 red→green:仅翻测试后旧源上 CLI schema 测试明确红(`protocol` 仍存在),IM 定向测试因 `derive_session_protocol`/`PROTOCOL_SPAWN_PARAM_REMOVED` 尚不存在编译红;实现后 CLI schema + IM schema + 五 vendor 派生/显式值拒绝定向测试全绿(含匹配 acp、冲突值、terminal、bogus、null 同一稳定错误)。门禁:`cargo fmt --all -- --check` 绿;`make check` clippy 0 warnings;`make test-baseline` 1664 绿 + 1 个 HERM-1 已登记红(`web_chat_bridge…survives_restart`),对照锚 1662 绿 + 同族 3 红总数同为 1665——本卡重写 1 测试为 1 测试,净测试数 0,另两只宿主泄漏红本轮转绿,无新增红;`writeback.sh` 绿。残留:`resolve_session_protocol` 0 命中;指定 doctor/e2e/subprefix/web 测试无 spawn 调用传 `protocol`;`"protocol"` 仅余拒绝门/缺席断言/拒绝门测试与 spawn 响应观测字段。
 
 ### MCP-CULL-1 删除 MCP `screenshot` 工具(owner 直驱 2026-07-26;工具面 8→7)
 - **状态**:完成(1ab85da) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests) + docs + AGENTS.md` · **建议入口**:规划(控制)会话(涉契约 + 治理面)

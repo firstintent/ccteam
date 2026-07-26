@@ -210,11 +210,6 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     },
                     "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
                     "effort": { "type": "string", "description": "Optional reasoning-effort token (vendor-specific value set). Ignored for grok (undocumented value set)." },
-                    "protocol": {
-                        "type": "string",
-                        "enum": ["stream-json", "acp"],
-                        "description": "OMIT — the session channel is derived from the vendor (claude/codex = stream-json, grok/opencode/kimi = acp); an explicit value that conflicts with the vendor is an error. `terminal` is not available to agents."
-                    },
                     "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Omitted: your working directory's project, else the sole registered project; `status` lists every slug." },
                     "permission_mode": {
                         "type": "string",
@@ -683,25 +678,16 @@ mod tests {
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
 
         // v0.9.0 W1 (G1) — new facets are present.
-        for key in ["model", "effort", "protocol", "title"] {
+        for key in ["model", "effort", "title"] {
             assert!(
                 props[key].is_object(),
                 "session_spawn schema must carry `{key}`"
             );
         }
         assert!(props.get("host").is_none());
-
-        // protocol enum = stream-json | acp ONLY — terminal is NEVER exposed.
-        let protos: Vec<&str> = props["protocol"]["enum"]
-            .as_array()
-            .expect("protocol has an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(protos, vec!["stream-json", "acp"]);
         assert!(
-            !protos.contains(&"terminal"),
-            "terminal must not be exposed to agents"
+            props.get("protocol").is_none(),
+            "session_spawn schema must not carry removed `protocol`"
         );
 
         // role is now OPTIONAL (roleless is a first-class form) → required = [].

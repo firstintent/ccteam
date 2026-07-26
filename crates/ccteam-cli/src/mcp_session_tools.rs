@@ -337,17 +337,9 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
-        // New facets present; protocol enum excludes terminal. v0.9.1 adds the
-        // one-call spawn+dispatch trio (task / wait_seconds / notify).
-        for key in [
-            "model",
-            "effort",
-            "protocol",
-            "title",
-            "task",
-            "wait_seconds",
-            "notify",
-        ] {
+        // New facets present. v0.9.1 adds the one-call spawn+dispatch trio
+        // (task / wait_seconds / notify).
+        for key in ["model", "effort", "title", "task", "wait_seconds", "notify"] {
             assert!(props[key].is_object(), "schema must carry `{key}`");
         }
         // v0.9.2 — host is a PROJECT binding, not a spawn facet: the schema
@@ -356,13 +348,10 @@ mod tests {
             props.get("host").is_none_or(|v| v.is_null()),
             "schema must NOT carry `host` (v0.9.2: execution host is inherited from the project)"
         );
-        let protos: Vec<&str> = props["protocol"]["enum"]
-            .as_array()
-            .expect("protocol enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(protos, vec!["stream-json", "acp"]);
+        assert!(
+            props.get("protocol").is_none_or(|v| v.is_null()),
+            "schema must NOT carry removed `protocol`"
+        );
         // role is optional now → required is empty.
         let required = spawn["inputSchema"]["required"].as_array().unwrap();
         assert!(
