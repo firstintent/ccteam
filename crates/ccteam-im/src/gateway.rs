@@ -5825,12 +5825,16 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
-        if provisional_inject
-            && matches!(
-                submitted.disposition,
-                TurnDisposition::Started | TurnDisposition::Queued
-            )
-        {
+        if submitted.disposition == TurnDisposition::Started {
+            // Adapter truth wins over the pre-submit Gateway marker. A dead
+            // mid-turn session can retain a stale Some until reactive resume;
+            // once the retried adapter starts a NEW vendor turn, reset both its
+            // elapsed clock and turn-scoped steer state unconditionally.
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = Some(Instant::now());
+            }
+            session.steered_this_turn.store(false, Ordering::SeqCst);
+        } else if provisional_inject && submitted.disposition == TurnDisposition::Queued {
             let still_active = session
                 .turn_started_at
                 .lock()
@@ -10821,6 +10825,42 @@ mod tests {
             fake.routings.lock().await.as_slice(),
             &[TurnRouting::Inject, TurnRouting::Inject],
             "the application route is explicitly Inject for every message"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_submission_refreshes_stale_working_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        let stale = Instant::now() - std::time::Duration::from_secs(90);
+        *gateway.sessions[&sid].turn_started_at.lock().unwrap() = Some(stale);
+
+        // The fake has no active adapter submission, so despite the stale
+        // Gateway marker it honestly reports this accepted message as Started.
+        gateway
+            .submit_to_sid(&sid, "after resume".into())
+            .await
+            .unwrap();
+        let refreshed = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("new turn remains in flight");
+        assert!(
+            refreshed > stale + std::time::Duration::from_secs(60),
+            "Started disposition must replace stale turn_started_at"
         );
     }
 

@@ -171,6 +171,26 @@ def main() -> None:
             },
         )
 
+    def finish_self_started_interjection(text: str) -> None:
+        """Model real Grok: an idle interject starts work without session/prompt."""
+        answer = f"echo:{text}"
+        mid = len(answer) // 2 or 1
+        for chunk in [answer[:mid], answer[mid:]]:
+            notif(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": chunk},
+                    },
+                },
+            )
+        notif(
+            "_x.ai/session/prompt_complete",
+            {"sessionId": session_id},
+        )
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -358,27 +378,34 @@ def main() -> None:
                 err(req_id, -32602, "Invalid params: unknown sessionId")
                 continue
             # Deterministic completion-edge fixture: resolve the active prompt
-            # just before this interjection is admitted. The client must turn
-            # the resulting -32000 into a lossless FIFO follow-up.
+            # just before this interjection is admitted. Real Grok still
+            # returns queued, then self-starts a new answer turn without a
+            # session/prompt request outstanding.
             if text == "__finish_before_interject__":
                 with active_prompt_lock:
                     finishing = active_prompt
                 if finishing is not None:
                     finish_prompt(finishing)
             with active_prompt_lock:
-                if active_prompt is None:
-                    err(req_id, -32000, "no active turn")
-                    continue
-                active_prompt["interjections"].append(text)
-            interjection_id = str(uuid.uuid4())
+                prompt = active_prompt
+                if prompt is not None:
+                    prompt["interjections"].append(text)
             reply(req_id, {"result": {"status": "queued"}})
             notif(
                 "_x.ai/session/interjection",
                 {
                     "sessionId": session_id,
-                    "interjectionId": interjection_id,
+                    "text": text,
                 },
             )
+            if prompt is None:
+                # Let the client receive the admission response and release
+                # its completion reservation before the vendor-started chunks.
+                timer = threading.Timer(
+                    0.1, finish_self_started_interjection, args=(text,)
+                )
+                timer.daemon = True
+                timer.start()
             continue
 
         if method == "session/cancel":

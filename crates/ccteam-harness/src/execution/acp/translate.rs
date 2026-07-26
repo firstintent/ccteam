@@ -1,11 +1,11 @@
 //! Final-only translate: ACP notifications + prompt response → ThreadEvent.
 //!
-//! Turn-end SoT = matching `session/prompt` JSON-RPC **response** (not
-//! `turn_completed` notifications). Buffer only `agent_message_chunk`;
-//! drop thoughts and `isReplay` frames from the **final answer**, but emit
-//! throttled mid-stream liveness events so the gateway silence watchdog
-//! sees that a long think / long draft is still alive (ACP vendors otherwise
-//! surface zero `ThreadEvent`s between tool calls and turn end).
+//! Client-started turn-end SoT = matching `session/prompt` JSON-RPC response.
+//! A vendor that admits an idle control message can also self-start a turn;
+//! that exceptional turn is opened by its first content update and finalized
+//! by its own boundary notification. Buffer only `agent_message_chunk`; drop
+//! thoughts and `isReplay` frames from the final answer, but emit throttled
+//! mid-stream liveness events so the gateway silence watchdog sees long work.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -19,14 +19,14 @@ use super::protocol::{
     AvailableCommand,
 };
 use super::transport::{AcpWriteBarrier, Notification};
-use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails};
+use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
 
 /// Min gap between liveness `ThreadEvent`s for message/thought chunks.
 /// Chunks arrive many times per second; the watchdog only needs a periodic
 /// pulse. First chunk of a streak always emits (interval elapsed).
 const LIVENESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Per-turn buffer while a prompt is in flight.
+/// Per-turn final-text buffer for either a client- or vendor-started turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnBuffer {
     pub turn_id: String,
@@ -120,7 +120,17 @@ impl Drop for AcpInjectionReservation {
 /// Shared live state for one ACP session.
 #[derive(Debug, Default)]
 pub struct SessionTranslateState {
+    /// Client-started `session/prompt` turn, owned/finalized by the runner.
     pub buffer: Option<TurnBuffer>,
+    /// Opt-in for vendors such as Grok that can admit an interjection while
+    /// idle and then emit a turn without a matching `session/prompt` request.
+    /// Kimi/OpenCode leave this false, preserving their existing behavior.
+    pub capture_vendor_started_turns: bool,
+    /// The client-started prompt's boundary was observed, so later chunks must
+    /// never be appended to its sealed buffer while its RPC response races in.
+    pub prompt_boundary_seen: bool,
+    /// A turn opened by vendor content rather than by `session/prompt`.
+    pub vendor_started_buffer: Option<TurnBuffer>,
     /// Turns steered in while `buffer` is occupied, `(turn_id, text)`, FIFO.
     /// ACP `session/prompt` is a single-turn RPC and `buffer` holds exactly one
     /// turn, so a second concurrent prompt would clobber it. The gateway (like
@@ -174,14 +184,33 @@ impl SessionTranslateState {
         self.turn_done = Some(done);
         self.prompt_sent = prompt_sent;
         self.injection_gate = Some(Arc::new(AcpInjectionGate::default()));
+        self.prompt_boundary_seen = false;
         // Fresh turn → first thought/message chunk should emit immediately.
         self.last_liveness_at = None;
     }
 
-    pub fn append_message(&mut self, chunk: &str) {
-        if let Some(b) = self.buffer.as_mut() {
+    fn append_message(&mut self, chunk: &str, vendor_started: bool) {
+        let target = if vendor_started {
+            self.vendor_started_buffer.as_mut()
+        } else {
+            self.buffer.as_mut()
+        };
+        if let Some(b) = target {
             b.text.push_str(chunk);
         }
+    }
+
+    fn begin_vendor_started_turn(&mut self) -> Option<ThreadEvent> {
+        if self.vendor_started_buffer.is_some() {
+            return None;
+        }
+        let turn_id = super::turn_runner::next_acp_turn_id();
+        self.vendor_started_buffer = Some(TurnBuffer {
+            turn_id: turn_id.clone(),
+            text: String::new(),
+        });
+        self.last_liveness_at = None;
+        Some(ThreadEvent::TurnStarted { turn_id })
     }
 
     /// Signal (once) that the turn boundary was reached.
@@ -194,12 +223,13 @@ impl SessionTranslateState {
     pub fn take_buffer(&mut self) -> Option<TurnBuffer> {
         self.prompt_sent = None;
         self.injection_gate = None;
+        self.prompt_boundary_seen = false;
         self.buffer.take()
     }
 }
 
-/// Apply one notification. Returns optional mid-stream events (tools).
-/// Does **not** emit final agent message — that waits for the prompt response.
+/// Apply one notification. Client-started final messages wait for the prompt
+/// response; an opted-in vendor-started turn finalizes on its own boundary.
 pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -> Vec<ThreadEvent> {
     // Drop full replay frames from session/load (isReplay covers top-level and
     // nested `update._meta.isReplay`).
@@ -207,21 +237,42 @@ pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -
         return Vec::new();
     }
 
-    // Turn boundary (FIFO-ordered after every chunk) → release the finalize
-    // barrier. Must run before the vendor-noise skip below.
+    // A vendor-started turn has no prompt response, so its own FIFO boundary is
+    // authoritative and must emit a normal canonical completion here.
     if is_turn_boundary(&n.method, &n.params) {
+        if state.vendor_started_buffer.is_some() {
+            return finalize_vendor_started_turn(state);
+        }
+        // The prompt buffer stays present until its JSON-RPC result carries
+        // usage/model. Mark it sealed now so a newly self-started answer cannot
+        // tear onto the old text during that response race.
+        if state.buffer.is_some() {
+            state.prompt_boundary_seen = true;
+        }
         state.signal_turn_done();
         return Vec::new();
     }
 
     // Standard session/update path (`session/update` or `_x.ai/session/update`).
     if n.method == "session/update" || n.method.ends_with("session/update") {
-        return apply_session_update(state, &n.params);
+        let vendor_started = state.capture_vendor_started_turns
+            && (state.vendor_started_buffer.is_some()
+                || state.prompt_boundary_seen
+                || state.buffer.is_none())
+            && session_update_has_turn_content(&n.params);
+        let mut events = Vec::new();
+        if vendor_started {
+            if let Some(started) = state.begin_vendor_started_turn() {
+                events.push(started);
+            }
+        }
+        events.extend(apply_session_update(state, &n.params, vendor_started));
+        return events;
     }
 
     // Grok acknowledgement for `_x.ai/interject`. It confirms control-plane
-    // admission only; the injected user echo arrives through session/update
-    // and the active prompt response remains the sole turn boundary.
+    // admission only; content and any vendor-started boundary arrive through
+    // their own notifications.
     if n.method.ends_with("session/interjection") {
         return Vec::new();
     }
@@ -277,7 +328,11 @@ fn apply_model_changed(state: &mut SessionTranslateState, params: &Value) {
     }
 }
 
-fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Vec<ThreadEvent> {
+fn apply_session_update(
+    state: &mut SessionTranslateState,
+    params: &Value,
+    vendor_started: bool,
+) -> Vec<ThreadEvent> {
     let update = params
         .get("update")
         .cloned()
@@ -293,7 +348,7 @@ fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Ve
         "agent_message_chunk" => {
             let text = extract_chunk_text(&update).unwrap_or_default();
             if !text.is_empty() {
-                state.append_message(&text);
+                state.append_message(&text, vendor_started);
             }
             // Final answer still waits for the prompt response (buffer only).
             // Emit a throttled ItemUpdated so the gateway activity counter
@@ -393,6 +448,22 @@ fn apply_session_update(state: &mut SessionTranslateState, params: &Value) -> Ve
     }
 }
 
+fn session_update_has_turn_content(params: &Value) -> bool {
+    let update = params.get("update").unwrap_or(params);
+    let kind = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match kind {
+        "agent_message_chunk" | "agent_thought_chunk" => {
+            extract_chunk_text(update).is_some_and(|text| !text.is_empty())
+        }
+        "tool_call" | "tool_call_update" => true,
+        _ => false,
+    }
+}
+
 fn extract_chunk_text(update: &Value) -> Option<String> {
     if let Some(content) = update.get("content") {
         return content_text(content);
@@ -420,8 +491,9 @@ fn maybe_liveness_event(
     }
     state.last_liveness_at = Some(now);
     let turn_id = state
-        .buffer
+        .vendor_started_buffer
         .as_ref()
+        .or(state.buffer.as_ref())
         .map(|b| b.turn_id.as_str())
         .unwrap_or("pending");
     vec![ThreadEvent::ItemUpdated {
@@ -431,6 +503,27 @@ fn maybe_liveness_event(
             details,
         },
     }]
+}
+
+fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<ThreadEvent> {
+    let Some(buf) = state.vendor_started_buffer.take() else {
+        return Vec::new();
+    };
+    state.last_liveness_at = None;
+    let turn_id = buf.turn_id;
+    vec![
+        ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: format!("{turn_id}-msg"),
+                details: ThreadItemDetails::AgentMessage(buf.text),
+            },
+        },
+        ThreadEvent::TurnCompleted {
+            turn_id,
+            usage: UnifiedTokenUsage::default(),
+            model: state.model.clone(),
+        },
+    ]
 }
 
 /// Finalize a turn from the `session/prompt` response (authoritative).
@@ -700,11 +793,113 @@ mod tests {
                 method: "_x.ai/session/interjection".into(),
                 params: json!({
                     "sessionId": "s1",
-                    "interjectionId": "i1"
+                    "text": "new direction"
                 }),
             },
         );
         assert!(out.is_empty());
         assert!(state.warned_methods.is_empty());
+    }
+
+    #[test]
+    fn vendor_started_content_after_prompt_boundary_is_distinct_and_finalizes() {
+        let mut state = SessionTranslateState {
+            capture_vendor_started_turns: true,
+            ..Default::default()
+        };
+        state.begin_turn("client-turn", Arc::new(Notify::new()));
+        apply_notification(
+            &mut state,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"old answer"}
+                    }
+                }),
+            },
+        );
+        apply_notification(
+            &mut state,
+            &Notification {
+                method: "_x.ai/session/prompt_complete".into(),
+                params: json!({}),
+            },
+        );
+
+        let opened = apply_notification(
+            &mut state,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"self started"}
+                    }
+                }),
+            },
+        );
+        let synthetic_id = opened
+            .iter()
+            .find_map(|event| match event {
+                ThreadEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                _ => None,
+            })
+            .expect("content opens a synthetic turn");
+        assert_eq!(state.buffer.as_ref().unwrap().text, "old answer");
+        assert_eq!(
+            state.vendor_started_buffer.as_ref().unwrap().text,
+            "self started"
+        );
+
+        let synthetic_done = apply_notification(
+            &mut state,
+            &Notification {
+                method: "_x.ai/session/prompt_complete".into(),
+                params: json!({}),
+            },
+        );
+        assert!(matches!(
+            &synthetic_done[0],
+            ThreadEvent::ItemCompleted { item }
+                if matches!(&item.details, ThreadItemDetails::AgentMessage(text) if text == "self started")
+        ));
+        assert!(matches!(
+            &synthetic_done[1],
+            ThreadEvent::TurnCompleted { turn_id, .. } if turn_id == &synthetic_id
+        ));
+
+        let client_done = finalize_from_prompt_result(&mut state, &json!({}));
+        assert!(matches!(
+            &client_done[0],
+            ThreadEvent::ItemCompleted { item }
+                if matches!(&item.details, ThreadItemDetails::AgentMessage(text) if text == "old answer")
+        ));
+        assert!(matches!(
+            &client_done[1],
+            ThreadEvent::TurnCompleted { turn_id, .. } if turn_id == "client-turn"
+        ));
+    }
+
+    #[test]
+    fn bufferless_content_is_inert_without_vendor_started_opt_in() {
+        let mut state = SessionTranslateState::default();
+        let events = apply_notification(
+            &mut state,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"unowned"}
+                    }
+                }),
+            },
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ThreadEvent::TurnStarted { .. })));
+        assert!(state.vendor_started_buffer.is_none());
     }
 }

@@ -230,6 +230,7 @@ impl GrokAcpAdapter {
             model: info.model,
             window_tokens: info.window,
             effort: info.effort,
+            capture_vendor_started_turns: true,
             ..Default::default()
         }));
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
@@ -382,10 +383,10 @@ impl GrokAcpAdapter {
                     match response {
                         Ok(response) => response,
                         Err(error) if grok_interject_missed_active_turn(&error) => {
-                            // The vendor completed just before it read the already-
-                            // reserved control request. The runner is waiting on
-                            // this reservation, so append a lossless follow-up
-                            // before releasing it; it cannot jump to another turn.
+                            // Defensive compatibility for a Grok build that
+                            // explicitly rejects an idle interject. Current Grok
+                            // instead admits it and self-starts a turn; the shared
+                            // ACP translator captures that normal path.
                             let queued_id = {
                                 let mut state = live.state.lock().map_err(|_| {
                                     HarnessError::Io("grok state lock poisoned".into())
@@ -614,16 +615,6 @@ impl HarnessAdapter for GrokAcpAdapter {
             }
         }
         Ok(handle)
-    }
-
-    async fn submit_turn(
-        &self,
-        h: &ThreadHandle,
-        input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
-        self.submit_with_routing(h, input, TurnRouting::Inject)
-            .await
-            .map(|submitted| submitted.turn_id)
     }
 
     async fn submit_turn_routed(

@@ -269,12 +269,13 @@ async fn mid_turn_submit_interjects_active_turn_by_default() {
     clear_fake();
 }
 
-/// If Grok completes between the local active-turn check and reading the
-/// interjection, the message must become a distinct FIFO follow-up rather than
-/// disappear or land in a later unrelated turn.
+/// Real Grok admits an interjection even after its active turn completed, then
+/// self-starts an answer without a matching `session/prompt` request. That
+/// answer must surface as its own synthetic turn instead of being dropped or
+/// glued onto the completed prompt's buffer.
 #[tokio::test]
 #[serial]
-async fn completion_edge_interject_degrades_losslessly_to_queue() {
+async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
     install_fake();
     let tmp = TempDir::new().unwrap();
     let adapter = GrokAcpAdapter::new();
@@ -290,18 +291,20 @@ async fn completion_edge_interject_degrades_losslessly_to_queue() {
 
     let mut stream = adapter.events(&handle);
     let collector = tokio::spawn(async move {
+        let mut started = Vec::new();
         let mut finals = Vec::new();
-        let mut completed = 0;
+        let mut completed = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
+                ThreadEvent::TurnStarted { turn_id } => started.push(turn_id),
                 ThreadEvent::ItemCompleted { item } => {
                     if let ThreadItemDetails::AgentMessage(text) = item.details {
-                        finals.push(text);
+                        finals.push((item.id, text));
                     }
                 }
-                ThreadEvent::TurnCompleted { .. } => {
-                    completed += 1;
-                    if completed == 2 {
+                ThreadEvent::TurnCompleted { turn_id, .. } => {
+                    completed.push(turn_id);
+                    if completed.len() == 2 {
                         break;
                     }
                 }
@@ -309,7 +312,7 @@ async fn completion_edge_interject_degrades_losslessly_to_queue() {
                 _ => {}
             }
         }
-        finals
+        (started, finals, completed)
     });
 
     let first = adapter
@@ -327,19 +330,28 @@ async fn completion_edge_interject_degrades_losslessly_to_queue() {
             TurnRouting::Inject,
         )
         .await
-        .expect("late interject is retained as queue");
+        .expect("late interject is admitted");
     assert_eq!(first.disposition, TurnDisposition::Started);
-    assert_eq!(late.disposition, TurnDisposition::Queued);
-    assert_ne!(first.turn_id, late.turn_id);
+    assert_eq!(late.disposition, TurnDisposition::Injected);
+    assert_eq!(first.turn_id, late.turn_id);
     late.release_completion();
 
-    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+    let (started, finals, completed) = tokio::time::timeout(Duration::from_secs(5), collector)
         .await
-        .expect("collector timeout")
+        .expect("vendor-self-started turn completion was not surfaced")
         .expect("collector join");
-    assert_eq!(
-        finals,
-        vec!["echo:__late_base__", "echo:__finish_before_interject__"]
+    assert_eq!(started.len(), 2, "normal + vendor-self-started turns");
+    assert_eq!(completed.len(), 2, "both turns must complete canonically");
+    assert_ne!(completed[0], completed[1]);
+    assert!(finals.iter().any(|(_, text)| text == "echo:__late_base__"));
+    assert!(finals
+        .iter()
+        .any(|(_, text)| text == "echo:__finish_before_interject__"));
+    assert!(
+        finals.iter().all(|(_, text)| {
+            text == "echo:__late_base__" || text == "echo:__finish_before_interject__"
+        }),
+        "turn answers must not be torn together: {finals:?}"
     );
 
     adapter.close_thread(&handle).await.unwrap();

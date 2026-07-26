@@ -555,16 +555,6 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         Ok(handle)
     }
 
-    async fn submit_turn(
-        &self,
-        h: &ThreadHandle,
-        input: TurnInput,
-    ) -> Result<TurnId, HarnessError> {
-        self.submit_with_routing(h, input, TurnRouting::Inject)
-            .await
-            .map(|submitted| submitted.turn_id)
-    }
-
     async fn submit_turn_routed(
         &self,
         h: &ThreadHandle,

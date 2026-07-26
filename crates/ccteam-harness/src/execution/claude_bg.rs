@@ -273,8 +273,13 @@ impl HarnessAdapter for ClaudeBgAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        _routing: TurnRouting,
+        routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
+        if routing == TurnRouting::Queue {
+            return Err(HarnessError::NotImplemented {
+                reason: "claude bg does not expose a distinct queued-turn channel".into(),
+            });
+        }
         self.submit_turn(h, input)
             .await
             .map(TurnSubmission::started)
@@ -382,5 +387,30 @@ impl HarnessAdapter for ClaudeBgAdapter {
 
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         Ok(ThreadStatus::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn routed_queue_is_rejected_honestly() {
+        let handle = ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Bg,
+            identity: "job-1".into(),
+            started_at: Utc::now(),
+            raw_extras: serde_json::json!({}),
+        };
+        let error = ClaudeBgAdapter::new()
+            .submit_turn_routed(
+                &handle,
+                TurnInput::UserText("later".into()),
+                TurnRouting::Queue,
+            )
+            .await
+            .expect_err("queue path is unsupported");
+        assert!(matches!(error, HarnessError::NotImplemented { .. }));
     }
 }

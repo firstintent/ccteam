@@ -83,6 +83,10 @@ fn seed_role(project_dir: &std::path::Path, role: &str) {
     .unwrap();
 }
 
+fn created_session_receipt(sid: &str) -> String {
+    format!("created session {sid}\n↓ 查看状态 → /status")
+}
+
 // ----- stub adapter — records submit_turn -----------------------------
 
 #[derive(Debug, Default)]
@@ -574,7 +578,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     // command reply) + the answer. GatewayAdapter emits no tool events, so
     // there is no progress seed either.
     assert_eq!(content_counts.len(), 2, "got {content_counts:?}");
-    assert_eq!(content_counts.get("created session s1"), Some(&1));
+    assert_eq!(content_counts.get(&created_session_receipt("s1")), Some(&1));
     let echo_matches = content_counts
         .keys()
         .filter(|c| c.starts_with(echo))
@@ -1107,7 +1111,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         "发送失败: simulated submit failure。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。";
     assert_eq!(
         contents,
-        vec!["created session s1".to_string(), expected.to_string()]
+        vec![created_session_receipt("s1"), expected.to_string()]
     );
     assert!(!contents[1].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1318,7 +1322,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         .collect();
     // V0.8.4 P1 (F1): no folded "submitted … turn …" ack → created + timeout.
     assert_eq!(contents.len(), 2, "created + timeout (ack folded away)");
-    assert_eq!(contents[0], "created session s1");
+    assert_eq!(contents[0], created_session_receipt("s1"));
     // v0.8.9: the watchdog INTERRUPTS the stalled turn (handle_directive `esc`
     // → Ok here) and notifies. v0.8.15: idle-based — this stub emits NO events
     // (stream::empty), so it idles out and the message reads "went silent".
@@ -1421,7 +1425,7 @@ async fn daemon_routes_ws_channel_to_gateway_over_real_socket() {
         .await
         .unwrap();
     let created = recv_ws_send(&mut socket).await;
-    assert_eq!(created.content, "created session s1");
+    assert_eq!(created.content, created_session_receipt("s1"));
     assert_eq!(created.recipient, "chat-1");
 
     socket
@@ -1476,7 +1480,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
     send_ws_text(&mut first_socket, "ws-r1-new", "/new claude helper").await;
     assert_eq!(
         recv_ws_send(&mut first_socket).await.content,
-        "created session s1"
+        created_session_receipt("s1")
     );
     send_ws_text(&mut first_socket, "ws-r1-msg", "before restart").await;
     // V0.8.4 P1 (F1): ack folded away — the answer is the only send. Carries
@@ -1513,8 +1517,8 @@ async fn daemon_restart_preserves_ws_gateway_session() {
 
     assert_eq!(
         adapter.starts.load(Ordering::SeqCst),
-        1,
-        "restart must reuse persisted s1 instead of spawning s2"
+        2,
+        "each daemon starts/resumes the persisted s1 exactly once"
     );
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -1541,7 +1545,7 @@ async fn daemon_restart_preserves_ws_gateway_session() {
     // above it.
     assert_eq!(
         sent_contents,
-        vec!["created session s1".to_string(), first_reply, second_reply,]
+        vec![created_session_receipt("s1"), first_reply, second_reply,]
     );
 }
 
@@ -1679,7 +1683,7 @@ async fn real_ws_dual_harness_smoke() {
             recv_ws_send_with_timeout(&mut socket, Duration::from_secs(10))
                 .await
                 .content,
-            "created session s1"
+            created_session_receipt("s1")
         );
         "s2"
     } else {
@@ -1690,7 +1694,7 @@ async fn real_ws_dual_harness_smoke() {
         recv_ws_send_with_timeout(&mut socket, Duration::from_secs(20))
             .await
             .content,
-        format!("created session {claude_sid}")
+        created_session_receipt(claude_sid)
     );
     send_ws_text(&mut socket, "real-ws-sessions", "/sessions").await;
     let sessions = recv_ws_send_with_timeout(&mut socket, Duration::from_secs(5))

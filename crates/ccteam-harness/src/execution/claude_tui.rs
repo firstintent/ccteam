@@ -909,6 +909,11 @@ impl HarnessAdapter for ClaudeTuiAdapter {
                 reason: "claude terminal does not expose a distinct queued-turn channel".into(),
             });
         }
+        // The frozen terminal protocol can type into either an idle composer or
+        // the active turn but cannot distinguish them without scraping pane
+        // state. Reporting Injected is safe: Gateway consults this disposition
+        // only when its own turn marker was already in flight; the idle path
+        // stamps a new turn before submission and does not branch on it.
         self.submit_turn(h, input)
             .await
             .map(TurnSubmission::injected)
