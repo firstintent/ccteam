@@ -96,9 +96,9 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
-### Register MCP (One-Time)
+### Register MCP (Automatic)
 
-Open the **Hosts** page and click **Register ccteam MCP**. This writes ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **all five vendors** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The Hosts page also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, screenshots, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -379,7 +379,6 @@ The global library and project skills never mix: nothing links or copies from th
 ccteam status                      # Daemon + projects/sessions + web token/url lines.
 ccteam session ls                  # Gateway session status; degrades when daemon is offline.
 ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
-ccteam doctor --check-cost-orphan  # Cost ledger reconciliation.
 ```
 
 Restart daemon only; sessions reconnect by id afterward:

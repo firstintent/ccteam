@@ -85,7 +85,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-进 **主机** 页,点 **「注册 ccteam MCP」**。这一步把 ccteam 自己的工具(雇会话/派活、发文件、截图等)写进**全部五个 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件、截图等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -356,7 +356,6 @@ ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/sk
 ccteam status                  # daemon + 项目/会话 + 末尾两行 web token/url
 ccteam session ls              # 网关会话状态(daemon 离线降级标注)
 ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
-ccteam doctor --check-cost-orphan   # 成本 ledger 对账
 ```
 
 重启(只停 daemon,重启后按会话 id 自动接回):

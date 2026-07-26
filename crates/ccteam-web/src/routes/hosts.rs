@@ -150,9 +150,12 @@ fn mcp_registered(vendor: &str) -> bool {
         "codex" => ccteam_core::mcp_register::resolve_codex_config_path()
             .map(|p| ccteam_core::mcp_register::codex_mcp_registered(&p))
             .unwrap_or(false),
-        // Grok MCP registration not wired in MVP (L18: best-effort, non-blocking).
-        "grok" => false,
-        "opencode" => false,
+        "grok" => ccteam_core::mcp_register::resolve_grok_config_path()
+            .map(|p| ccteam_core::mcp_register::grok_mcp_registered(&p))
+            .unwrap_or(false),
+        "opencode" => ccteam_core::mcp_register::resolve_opencode_config_path()
+            .map(|p| ccteam_core::mcp_register::opencode_mcp_registered(&p))
+            .unwrap_or(false),
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
@@ -397,11 +400,11 @@ pub(crate) async fn handle_host_detail(
     }
 }
 
-/// Query for `POST .../register-mcp` — optional `?vendor=claude|codex`
-/// (omitted ⇒ register every vendor).
+/// Query for `POST .../register-mcp` — optional vendor selector (one of the
+/// vendors advertised by `AGENT_PROBE_SPECS`; omitted ⇒ register all).
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 pub struct RegisterMcpQuery {
-    /// Restrict to one vendor (`claude` / `codex`); omit to register all.
+    /// Restrict to one registrable vendor; omit to register all.
     #[serde(default)]
     pub vendor: Option<String>,
 }
@@ -465,10 +468,15 @@ pub(crate) async fn handle_register_mcp(
         }
         Some(v) if AGENT_PROBE_SPECS.iter().any(|s| s.vendor == v) => Some(v.to_string()),
         Some(other) => {
+            let expected = AGENT_PROBE_SPECS
+                .iter()
+                .map(|spec| spec.vendor)
+                .collect::<Vec<_>>()
+                .join("|");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("unknown vendor: {other} (expected claude|codex)")
+                    "error": format!("unknown vendor: {other} (expected {expected})")
                 })),
             )
                 .into_response();
@@ -1072,25 +1080,16 @@ mod tests {
 
     #[test]
     fn classify_status_non_registrable_vendor_is_ready_when_installed() {
-        // grok/ACP has no config-file MCP seam: an installed binary is all
-        // there is to configure, so it reads `ready` (never `needs_config`)
-        // and offers no register CTA.
+        // No current vendor is non-registrable; retain branch coverage for a
+        // future ACP-only vendor with no global config seam.
         assert_eq!(classify_status(true, false, false), "ready");
         assert_eq!(classify_status(false, false, false), "not_installed");
     }
 
     #[test]
-    fn grok_spec_is_not_mcp_registrable() {
-        let grok = AGENT_PROBE_SPECS
-            .iter()
-            .find(|s| s.vendor == "grok")
-            .unwrap();
-        assert!(!grok.mcp_registrable);
-        let claude = AGENT_PROBE_SPECS
-            .iter()
-            .find(|s| s.vendor == "claude")
-            .unwrap();
-        assert!(claude.mcp_registrable);
+    fn all_five_specs_are_mcp_registrable() {
+        assert_eq!(AGENT_PROBE_SPECS.len(), 5);
+        assert!(AGENT_PROBE_SPECS.iter().all(|spec| spec.mcp_registrable));
     }
 
     #[test]

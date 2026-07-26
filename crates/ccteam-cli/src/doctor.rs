@@ -1,29 +1,17 @@
 //! Bare `ccteam doctor` readiness checkup.
 //!
-//! A bare `ccteam doctor` (no flags) reports the "is my machine ready to
-//! run ccteam" checks — the five vendor binaries (claude / codex / grok /
-//! opencode / kimi) and their auth, tmux, MCP registration, daemon
-//! health, pricing staleness, and `~/.ccteam` home-layout drift — as one
-//! `[PASS]/[WARN]/[FAIL]/[SKIP]` line per check plus a summary line, and
-//! reports exit code 1 iff any check is FAIL. `main::run_doctor` calls
-//! [`run_readiness_checkup`] for every invocation that is not
-//! `--verify-mcp`.
+//! A bare invocation reports one consolidated row per vendor plus ccteam and
+//! project readiness advisories. It exits 1 only when the required Claude Code
+//! binary is missing; warnings are informational because daemon startup can
+//! self-heal vendor MCP registration.
 //!
-//! Every probe here is read-only: it never starts/stops/restarts the
-//! daemon (`ccteam_core::check_daemon_health` is a read-only socket
-//! ping) and never writes to a vendor config (MCP registration is
-//! read-only via `ccteam_core::mcp_register::{claude,codex}_mcp_registered`;
-//! the writer is `ccteam config mcp`, which stays a separate explicit
-//! step per the "ccteam writes nothing but its own MCP registration, and
-//! only when asked" red line).
-//!
-//! The historical one-shot migration / repair flags (`--migrate-*`,
-//! `--install-*`, `--reset-shipped-teams`, `--gc-claude-jobs`, ...) were
-//! removed outright (pre-v1.0 = no back-compat shims). `--verify-mcp`
-//! (the MCP tool-surface / STUB invariant self-check CLAUDE.md calls out
-//! by name) is a different concern (dev/CI invariant, not end-user
-//! readiness) and short-circuits in `main::run_doctor` before this.
+//! Every probe here is read-only: doctor never starts or changes the daemon and
+//! never writes vendor configuration. Registration writers are `ccteam config`,
+//! the web `POST .../register-mcp` endpoint, and daemon-start auto-registration.
+//! `--verify-mcp` remains a separate dev/CI invariant handled by
+//! `main::run_doctor` before this module is called.
 
+use std::io::IsTerminal;
 use std::process::Command;
 
 use ccteam_core::{CcteamPaths, Vendor};
@@ -40,10 +28,27 @@ pub enum CheckStatus {
 impl CheckStatus {
     fn label(self) -> &'static str {
         match self {
-            CheckStatus::Pass => "PASS",
-            CheckStatus::Warn => "WARN",
-            CheckStatus::Fail => "FAIL",
-            CheckStatus::Skip => "SKIP",
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Pass => 0,
+            Self::Skip => 1,
+            Self::Warn => 2,
+            Self::Fail => 3,
+        }
+    }
+
+    fn worst(self, other: Self) -> Self {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
         }
     }
 }
@@ -57,6 +62,7 @@ struct CheckLine {
 
 impl CheckLine {
     fn new(status: CheckStatus, name: &'static str, detail: impl Into<String>) -> Self {
+        debug_assert!(name.chars().count() <= 9, "doctor row name is too wide");
         Self {
             status,
             name,
@@ -65,559 +71,510 @@ impl CheckLine {
     }
 }
 
-/// Run the full readiness checkup and render it. Returns `(report,
-/// any_fail)`; the caller exits 1 iff `any_fail`.
-pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
-    let claude = check_claude_binary();
-    let codex = check_codex_binary();
-    let grok = check_grok_binary();
-    let opencode = check_opencode_binary();
-    let kimi = check_kimi_binary();
-    let codex_present = codex.status == CheckStatus::Pass;
-    let tmux = check_tmux();
-    let mcp_claude = check_mcp_claude();
-    let mcp_codex = check_mcp_codex(codex_present);
-    let mcp_kimi = check_mcp_kimi();
-    let daemon = check_daemon(paths);
-    let legacy_service = check_legacy_service();
-    let updates = check_updates(paths);
-    let pricing = check_pricing();
-    let home = check_home_layout(paths);
-    let project_skills = check_project_skill_faces(paths);
-    let auth_claude = check_vendor_auth_claude();
-    let auth_codex = check_vendor_auth_codex();
-    let auth_grok = check_vendor_auth_grok();
-    let auth_opencode = check_vendor_auth_opencode();
-    let auth_kimi = check_vendor_auth_kimi();
+#[derive(Default)]
+struct Counts {
+    pass: usize,
+    warn: usize,
+    fail: usize,
+    skip: usize,
+}
 
-    let checks = [
-        claude,
-        codex,
-        grok,
-        opencode,
-        kimi,
-        tmux,
-        mcp_claude,
-        mcp_codex,
-        mcp_kimi,
-        daemon,
-        legacy_service,
-        updates,
-        pricing,
-        home,
-        project_skills,
-        auth_claude,
-        auth_codex,
-        auth_grok,
-        auth_opencode,
-        auth_kimi,
-    ];
-
-    let mut pass = 0usize;
-    let mut warn = 0usize;
-    let mut fail = 0usize;
-    let mut skip = 0usize;
-
-    let mut out = String::from("ccteam doctor: readiness checkup\n");
-    out.push_str("=================================\n\n");
-    for c in &checks {
-        match c.status {
-            CheckStatus::Pass => pass += 1,
-            CheckStatus::Warn => warn += 1,
-            CheckStatus::Fail => fail += 1,
-            CheckStatus::Skip => skip += 1,
+impl Counts {
+    fn add(&mut self, status: CheckStatus) {
+        match status {
+            CheckStatus::Pass => self.pass += 1,
+            CheckStatus::Warn => self.warn += 1,
+            CheckStatus::Fail => self.fail += 1,
+            CheckStatus::Skip => self.skip += 1,
         }
-        out.push_str(&format!(
-            "[{:<4}] {:<16} {}\n",
-            c.status.label(),
-            format!("{}:", c.name),
-            c.detail
-        ));
     }
 
-    let any_fail = fail > 0;
-    out.push('\n');
-    if any_fail {
-        out.push_str(&format!(
-            "summary: {pass} pass, {warn} warn, {fail} fail, {skip} skip — NOT READY \
-             (fix the FAIL line(s) above; `ccteam config mcp` covers MCP registration).\n",
-        ));
+    fn summary(&self) -> String {
+        let mut parts = vec![format!("{} pass", self.pass)];
+        if self.warn > 0 {
+            parts.push(format!("{} warn", self.warn));
+        }
+        if self.fail > 0 {
+            parts.push(format!("{} fail", self.fail));
+        }
+        if self.skip > 0 {
+            parts.push(format!("{} skip", self.skip));
+        }
+        parts.join(", ")
+    }
+}
+
+struct ReportRow {
+    line: CheckLine,
+    suppress_when_pass: bool,
+}
+
+impl ReportRow {
+    fn visible(line: CheckLine) -> Self {
+        Self {
+            line,
+            suppress_when_pass: false,
+        }
+    }
+
+    fn advisory(line: CheckLine) -> Self {
+        Self {
+            line,
+            suppress_when_pass: true,
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        !(self.suppress_when_pass && self.line.status == CheckStatus::Pass)
+    }
+}
+
+/// Fully probed readiness state. Rendering this value is pure: it performs no
+/// environment, filesystem, process, or daemon access.
+struct ReadinessReport {
+    agents: Vec<ReportRow>,
+    ccteam: Vec<ReportRow>,
+    projects: Vec<ReportRow>,
+    daemon_healthy: bool,
+}
+
+/// Run the full readiness checkup and render it. Returns `(report, any_fail)`;
+/// the caller exits 1 iff `any_fail`.
+pub fn run_readiness_checkup(paths: &CcteamPaths) -> (String, bool) {
+    let report = gather_readiness(paths);
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    render_readiness(&report, color)
+}
+
+fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
+    let agents = vec![
+        ReportRow::visible(check_agent(
+            "claude",
+            ccteam_core::CLAUDE_BIN_ENV,
+            "claude",
+            true,
+            check_vendor_auth_claude,
+        )),
+        ReportRow::visible(check_agent(
+            "codex",
+            ccteam_core::CODEX_BIN_ENV,
+            "codex",
+            false,
+            check_vendor_auth_codex,
+        )),
+        ReportRow::visible(check_agent(
+            "grok",
+            ccteam_core::GROK_BIN_ENV,
+            "grok",
+            false,
+            check_vendor_auth_grok,
+        )),
+        ReportRow::visible(check_agent(
+            "opencode",
+            ccteam_core::OPENCODE_BIN_ENV,
+            "opencode",
+            false,
+            check_vendor_auth_opencode,
+        )),
+        ReportRow::visible(check_agent(
+            "kimi",
+            ccteam_core::KIMI_BIN_ENV,
+            "kimi",
+            false,
+            check_vendor_auth_kimi,
+        )),
+    ];
+
+    let daemon_probe = ccteam_core::daemon::probe_daemon(paths);
+    let daemon_healthy = daemon_probe.ready;
+    let daemon_version = daemon_probe.version;
+    let daemon = if daemon_probe.ready {
+        CheckLine::new(
+            CheckStatus::Pass,
+            "daemon",
+            daemon_version
+                .clone()
+                .map(|version| format!("running (v{version})"))
+                .unwrap_or_else(|| "running".to_string()),
+        )
     } else {
-        out.push_str(&format!(
-            "summary: {pass} pass, {warn} warn, {fail} fail, {skip} skip — READY \
-             (WARN/SKIP lines are informational, not blocking).\n",
-        ));
+        CheckLine::new(CheckStatus::Warn, "daemon", "not running")
+    };
+    let version = check_version(paths, daemon_healthy.then_some(daemon_version).flatten());
+    let host_skew = check_host_skew(paths);
+    let mut ccteam = vec![
+        ReportRow::visible(daemon),
+        ReportRow::advisory(check_legacy_service()),
+        ReportRow::visible(version),
+    ];
+    if host_skew.is_empty() {
+        ccteam.push(ReportRow::advisory(CheckLine::new(
+            CheckStatus::Pass,
+            "hosts",
+            "fleet versions aligned",
+        )));
+    } else {
+        ccteam.extend(host_skew.into_iter().map(ReportRow::visible));
+    }
+    ccteam.push(ReportRow::visible(check_pricing()));
+    ccteam.push(ReportRow::visible(check_home_layout(paths)));
+
+    ReadinessReport {
+        agents,
+        ccteam,
+        projects: vec![ReportRow::advisory(check_project_skill_faces(paths))],
+        daemon_healthy,
+    }
+}
+
+fn render_readiness(report: &ReadinessReport, color: bool) -> (String, bool) {
+    let mut counts = Counts::default();
+    let mut out = String::from("ccteam doctor — readiness checkup\n\n");
+
+    render_section(&mut out, "agents", &report.agents, color, &mut counts);
+    render_section(&mut out, "ccteam", &report.ccteam, color, &mut counts);
+    render_section(&mut out, "projects", &report.projects, color, &mut counts);
+
+    let any_fail = counts.fail > 0;
+    out.push_str("summary: ");
+    out.push_str(&counts.summary());
+    if any_fail {
+        out.push_str(" — NOT READY (fix the FAIL lines above)\n");
+    } else {
+        out.push_str(" — READY (WARN is informational, not blocking)\n");
+    }
+    if !report.daemon_healthy {
+        out.push_str("\ndaemon not running — start it:  ccteam daemon start\n");
     }
     (out, any_fail)
 }
 
-/// `claude` is ccteam's primary, always-required vendor (the default
-/// `stream-json` protocol spawns it directly) — a missing binary is a
-/// hard FAIL, not a WARN. Honors `CCTEAM_CLAUDE_BIN` exactly like every
-/// spawn path (`ccteam_core::CLAUDE_BIN_ENV`).
-fn check_claude_binary() -> CheckLine {
-    probe_binary(
-        "claude binary",
-        ccteam_core::CLAUDE_BIN_ENV,
-        "claude",
-        CheckStatus::Fail,
-        "install the Claude Code CLI, or point",
-    )
+fn render_section(
+    out: &mut String,
+    title: &str,
+    rows: &[ReportRow],
+    color: bool,
+    counts: &mut Counts,
+) {
+    for row in rows {
+        counts.add(row.line.status);
+    }
+    if !rows.iter().any(ReportRow::is_visible) {
+        return;
+    }
+    out.push_str(title);
+    out.push('\n');
+    for row in rows.iter().filter(|row| row.is_visible()) {
+        let token = status_token(row.line.status, color);
+        out.push_str(&format!(
+            "  {token} {:<10}{}\n",
+            row.line.name, row.line.detail
+        ));
+    }
+    out.push('\n');
 }
 
-/// codex is best-effort / optional (Claude is the only fully supported
-/// vendor today) — a missing binary WARNs, it never fails the checkup.
-fn check_codex_binary() -> CheckLine {
-    probe_binary(
-        "codex binary",
-        ccteam_core::CODEX_BIN_ENV,
-        "codex",
-        CheckStatus::Warn,
-        "install the Codex CLI (optional), or point",
-    )
+fn status_token(status: CheckStatus, color: bool) -> String {
+    let plain = format!("[{}]", status.label());
+    if !color {
+        return plain;
+    }
+    let ansi = match status {
+        CheckStatus::Pass => "32",
+        CheckStatus::Warn => "33",
+        CheckStatus::Fail => "31",
+        CheckStatus::Skip => "2",
+    };
+    format!("\x1b[{ansi}m{plain}\x1b[0m")
 }
 
-/// grok is optional (v0.8.23 third vendor) — missing binary WARNs only.
-fn check_grok_binary() -> CheckLine {
-    probe_binary(
-        "grok binary",
-        ccteam_core::GROK_BIN_ENV,
-        "grok",
-        CheckStatus::Warn,
-        "install the Grok Build CLI (optional), or point",
-    )
+struct BinaryCheck {
+    installed: bool,
+    status: CheckStatus,
+    detail: String,
 }
 
-/// opencode is optional (v0.8.24 fourth vendor) — missing binary WARNs only.
-fn check_opencode_binary() -> CheckLine {
-    probe_binary(
-        "opencode binary",
-        ccteam_core::OPENCODE_BIN_ENV,
-        "opencode",
-        CheckStatus::Warn,
-        "install the OpenCode CLI (optional), or point",
-    )
+struct AuthCheck {
+    ok: Option<bool>,
+    login_hint: &'static str,
 }
 
-/// kimi is optional (fifth vendor) — missing binary WARNs only.
-fn check_kimi_binary() -> CheckLine {
-    probe_binary(
-        "kimi binary",
-        ccteam_core::KIMI_BIN_ENV,
-        "kimi",
-        CheckStatus::Warn,
-        "install the Kimi Code CLI (optional), or point",
-    )
+struct McpCheck {
+    status: CheckStatus,
+    detail: String,
 }
 
-/// Shared `<bin> --version` probe. `missing_status` lets the two callers
-/// above pick FAIL (claude, required) vs WARN (codex, optional) for the
-/// same "binary not resolvable" outcome.
-fn probe_binary(
+fn check_agent(
     name: &'static str,
     env_var: &str,
     default_bin: &str,
-    missing_status: CheckStatus,
-    fix_hint: &str,
+    required: bool,
+    auth_check: fn() -> AuthCheck,
 ) -> CheckLine {
+    let binary = probe_binary(env_var, default_bin, required);
+    if !binary.installed {
+        return CheckLine::new(binary.status, name, binary.detail);
+    }
+
+    let auth = auth_check();
+    let mcp = check_vendor_mcp(name);
+    let mut status = binary.status.worst(mcp.status);
+    let mut details = vec![binary.detail];
+    match auth.ok {
+        Some(true) => details.push("auth ok".to_string()),
+        Some(false) => {
+            status = status.worst(CheckStatus::Warn);
+            details.push(format!("auth missing — {}", auth.login_hint));
+        }
+        None => {}
+    }
+    details.push(mcp.detail);
+    CheckLine::new(status, name, details.join(" · "))
+}
+
+/// Shared `<bin> --version` probe. Doctor executes only this read-only version
+/// command; daemon-start's registration gate uses a separate no-exec resolver.
+fn probe_binary(env_var: &str, default_bin: &str, required: bool) -> BinaryCheck {
     let bin = std::env::var(env_var).unwrap_or_else(|_| default_bin.to_string());
     match Command::new(&bin).arg("--version").output() {
-        Ok(out) => {
-            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let detail = if version.is_empty() {
-                format!("resolved `{bin}`")
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = if !stdout.is_empty() {
+                stdout
+            } else if !stderr.is_empty() {
+                stderr
             } else {
-                format!("{bin} — {version}")
+                format!("resolved `{bin}`")
             };
-            CheckLine::new(CheckStatus::Pass, name, detail)
+            BinaryCheck {
+                installed: true,
+                status: CheckStatus::Pass,
+                detail,
+            }
         }
-        Err(err) => CheckLine::new(
-            missing_status,
-            name,
-            format!("`{bin}` not resolvable ({err}) — {fix_hint} {env_var} at its path"),
-        ),
+        Ok(out) => {
+            let reason = out
+                .status
+                .code()
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "terminated by signal".to_string());
+            BinaryCheck {
+                installed: false,
+                status: if required {
+                    CheckStatus::Fail
+                } else {
+                    CheckStatus::Warn
+                },
+                detail: format!(
+                    "`{bin} --version` failed ({reason}) — reinstall or point {env_var} at a working binary"
+                ),
+            }
+        }
+        Err(_) => {
+            let detail = if required {
+                format!("not installed — install the Claude Code CLI or point {env_var} at it")
+            } else {
+                format!("not installed (optional) — install it or point {env_var} at it")
+            };
+            BinaryCheck {
+                installed: false,
+                status: if required {
+                    CheckStatus::Fail
+                } else {
+                    CheckStatus::Warn
+                },
+                detail,
+            }
+        }
     }
 }
 
-/// v0.8.24 F5 — per-vendor auth status at WARN level (missing credentials).
-fn check_vendor_auth_claude() -> CheckLine {
-    // Claude Code stores OAuth/API key under ~/.claude or CLAUDE_CONFIG_HOME.
+fn check_vendor_auth_claude() -> AuthCheck {
     let home = std::env::var("CLAUDE_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .ok()
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
-    let ok = home
-        .as_ref()
-        .map(|h| {
-            h.join(".credentials.json").exists()
-                || h.join("credentials.json").exists()
-                || std::env::var("ANTHROPIC_API_KEY").is_ok()
-        })
-        .unwrap_or_else(|| std::env::var("ANTHROPIC_API_KEY").is_ok());
-    if ok {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "claude auth",
-            "credentials present (file or ANTHROPIC_API_KEY)",
-        )
-    } else {
-        CheckLine::new(
-            CheckStatus::Warn,
-            "claude auth",
-            "no credentials found — run `claude auth login` or set ANTHROPIC_API_KEY",
-        )
+    let ok = home.as_ref().is_some_and(|h| {
+        h.join(".credentials.json").exists() || h.join("credentials.json").exists()
+    }) || std::env::var("ANTHROPIC_API_KEY").is_ok();
+    AuthCheck {
+        ok: Some(ok),
+        login_hint: "run `claude auth login` or set ANTHROPIC_API_KEY",
     }
 }
 
-fn check_vendor_auth_codex() -> CheckLine {
-    let home = dirs::home_dir().map(|h| h.join(".codex"));
-    let ok = home
-        .as_ref()
-        .map(|h| h.join("auth.json").exists() || h.join("config.toml").exists())
-        .unwrap_or(false)
+// Daemon-start MCP auto-registration creates the vendor config files, so those
+// files alone must never impersonate a successful vendor login.
+fn check_vendor_auth_codex() -> AuthCheck {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+    let ok = home.as_ref().is_some_and(|h| h.join("auth.json").exists())
         || std::env::var("OPENAI_API_KEY").is_ok();
-    if ok {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "codex auth",
-            "credentials present (file or OPENAI_API_KEY)",
-        )
-    } else {
-        CheckLine::new(
-            CheckStatus::Warn,
-            "codex auth",
-            "no credentials found — run `codex login` or set OPENAI_API_KEY",
-        )
+    AuthCheck {
+        ok: Some(ok),
+        login_hint: "run `codex login` or set OPENAI_API_KEY",
     }
 }
 
-fn check_vendor_auth_grok() -> CheckLine {
+fn check_vendor_auth_grok() -> AuthCheck {
     let ok = std::env::var("XAI_API_KEY").is_ok()
-        || dirs::home_dir()
-            .map(|h| h.join(".grok").exists() || h.join(".config/grok").exists())
-            .unwrap_or(false);
-    if ok {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "grok auth",
-            "credentials present (env or config dir)",
-        )
-    } else {
-        CheckLine::new(
-            CheckStatus::Warn,
-            "grok auth",
-            "no credentials found — set XAI_API_KEY or log in via grok CLI",
-        )
+        || dirs::home_dir().is_some_and(|home| {
+            home.join(".config/grok").exists()
+                || dir_contains_entry_other_than(&home.join(".grok"), "config.toml")
+        });
+    AuthCheck {
+        ok: ok.then_some(true),
+        login_hint: "",
     }
 }
 
-fn check_vendor_auth_opencode() -> CheckLine {
+fn check_vendor_auth_opencode() -> AuthCheck {
     let ok = std::env::var("OPENAI_API_KEY").is_ok()
-        || dirs::home_dir()
-            .map(|h| {
-                h.join(".local/share/opencode").exists()
-                    || h.join(".config/opencode").exists()
-                    || h.join(".opencode").exists()
-            })
-            .unwrap_or(false);
-    if ok {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "opencode auth",
-            "credentials present (provider config or env)",
-        )
-    } else {
-        CheckLine::new(
-            CheckStatus::Warn,
-            "opencode auth",
-            "no credentials found — run `opencode auth login` for a provider",
-        )
+        || dirs::home_dir().is_some_and(|home| {
+            home.join(".local/share/opencode").exists()
+                || home.join(".opencode").exists()
+                || dir_contains_entry_other_than(&home.join(".config/opencode"), "opencode.json")
+        });
+    AuthCheck {
+        ok: ok.then_some(true),
+        login_hint: "",
     }
 }
 
-fn check_vendor_auth_kimi() -> CheckLine {
+fn dir_contains_entry_other_than(dir: &std::path::Path, excluded: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name() != std::ffi::OsStr::new(excluded))
+    })
+}
+
+fn check_vendor_auth_kimi() -> AuthCheck {
     let kimi_home = std::env::var_os("KIMI_CODE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".kimi-code")));
     let ok = std::env::var("MOONSHOT_API_KEY").is_ok()
         || kimi_home
             .as_ref()
-            .map(|h| h.join("credentials").exists() || h.join("oauth").exists())
-            .unwrap_or(false);
-    if ok {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "kimi auth",
-            "credentials present (oauth store or MOONSHOT_API_KEY)",
-        )
-    } else {
-        CheckLine::new(
-            CheckStatus::Warn,
-            "kimi auth",
-            "no credentials found — run `kimi login` or set MOONSHOT_API_KEY",
-        )
+            .is_some_and(|h| h.join("credentials").exists() || h.join("oauth").exists());
+    AuthCheck {
+        ok: Some(ok),
+        login_hint: "run `kimi login` or set MOONSHOT_API_KEY",
     }
 }
 
-/// `tmux` is only needed for the `terminal` session protocol (the
-/// bundled rmux backend works with no external tmux) — WARN, not FAIL.
-fn check_tmux() -> CheckLine {
-    match ccteam_core::tmux::tmux_version() {
-        Some(version) => CheckLine::new(CheckStatus::Pass, "tmux", version),
-        None => CheckLine::new(
-            CheckStatus::Warn,
-            "tmux",
-            "not found on PATH — only needed for the `terminal` session protocol \
-             (the default stream-json protocol and the bundled rmux backend don't need it)"
-                .to_string(),
-        ),
-    }
-}
-
-/// Is the ccteam MCP server registered in Claude's `~/.claude.json`?
-/// Read-only (`ccteam_core::mcp_register::claude_mcp_registered`); the
-/// writer is the explicit `ccteam config mcp` step. Missing = FAIL:
-/// without this, the `session_*` / chat / admin MCP tools the cto role
-/// depends on are unreachable.
-fn check_mcp_claude() -> CheckLine {
-    match ccteam_core::projects::resolve_claude_json_path() {
-        Ok(path) => {
-            if ccteam_core::mcp_register::claude_mcp_registered(&path) {
-                CheckLine::new(
-                    CheckStatus::Pass,
-                    "MCP (claude)",
-                    format!("registered in {}", path.display()),
-                )
-            } else {
-                CheckLine::new(
-                    CheckStatus::Fail,
-                    "MCP (claude)",
-                    format!(
-                        "ccteam MCP server not registered in {} — fix: `ccteam config mcp`",
-                        path.display()
-                    ),
-                )
-            }
-        }
-        Err(err) => CheckLine::new(
-            CheckStatus::Warn,
-            "MCP (claude)",
-            format!("could not resolve ~/.claude.json: {err}"),
-        ),
-    }
-}
-
-/// Codex equivalent of [`check_mcp_claude`], but WARN (not FAIL) since
-/// codex is optional; SKIPped outright when the codex binary itself
-/// isn't present (nothing to register against).
-fn check_mcp_codex(codex_present: bool) -> CheckLine {
-    if !codex_present {
-        return CheckLine::new(
-            CheckStatus::Skip,
-            "MCP (codex)",
-            "codex binary not found — skipping registration check".to_string(),
-        );
-    }
-    match ccteam_core::mcp_register::resolve_codex_config_path() {
-        Ok(path) => {
-            if ccteam_core::mcp_register::codex_mcp_registered(&path) {
-                CheckLine::new(
-                    CheckStatus::Pass,
-                    "MCP (codex)",
-                    format!("registered in {}", path.display()),
-                )
-            } else {
-                CheckLine::new(
-                    CheckStatus::Warn,
-                    "MCP (codex)",
-                    format!(
-                        "ccteam MCP server not registered in {} — fix: `ccteam config mcp`",
-                        path.display()
-                    ),
-                )
-            }
-        }
-        Err(err) => CheckLine::new(
-            CheckStatus::Warn,
-            "MCP (codex)",
-            format!("could not resolve codex config.toml: {err}"),
-        ),
-    }
-}
-
-/// Kimi equivalent of [`check_mcp_codex`] (WARN, kimi is optional): the
-/// global `$KIMI_CODE_HOME/mcp.json` entry lets a plain `kimi` main session
-/// orchestrate.
-fn check_mcp_kimi() -> CheckLine {
-    match ccteam_core::mcp_register::resolve_kimi_config_path() {
-        Ok(path) => {
-            if ccteam_core::mcp_register::kimi_mcp_registered(&path) {
-                CheckLine::new(
-                    CheckStatus::Pass,
-                    "MCP (kimi)",
-                    format!("registered in {}", path.display()),
-                )
-            } else {
-                CheckLine::new(
-                    CheckStatus::Warn,
-                    "MCP (kimi)",
-                    format!(
-                        "ccteam MCP server not registered in {} — fix: `ccteam config mcp`",
-                        path.display()
-                    ),
-                )
-            }
-        }
-        Err(err) => CheckLine::new(
-            CheckStatus::Warn,
-            "MCP (kimi)",
-            format!("could not resolve kimi mcp.json: {err}"),
-        ),
-    }
-}
-
-/// Read-only daemon liveness ping — NEVER starts/stops/restarts the
-/// daemon (CLAUDE.md red line). A down daemon WARNs (perfectly normal
-/// before the first `ccteam daemon start`), it doesn't fail the checkup.
-fn check_daemon(paths: &CcteamPaths) -> CheckLine {
-    let health = ccteam_core::check_daemon_health(paths);
-    let status = if health.is_healthy() {
-        CheckStatus::Pass
-    } else {
-        CheckStatus::Warn
+fn check_vendor_mcp(vendor: &str) -> McpCheck {
+    let resolved = match vendor {
+        "claude" => ccteam_core::projects::resolve_claude_json_path().map(|path| {
+            let registered = ccteam_core::mcp_register::claude_mcp_registered(&path);
+            (path, registered)
+        }),
+        "codex" => ccteam_core::mcp_register::resolve_codex_config_path().map(|path| {
+            let registered = ccteam_core::mcp_register::codex_mcp_registered(&path);
+            (path, registered)
+        }),
+        "grok" => ccteam_core::mcp_register::resolve_grok_config_path().map(|path| {
+            let registered = ccteam_core::mcp_register::grok_mcp_registered(&path);
+            (path, registered)
+        }),
+        "opencode" => ccteam_core::mcp_register::resolve_opencode_config_path().map(|path| {
+            let registered = ccteam_core::mcp_register::opencode_mcp_registered(&path);
+            (path, registered)
+        }),
+        "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path().map(|path| {
+            let registered = ccteam_core::mcp_register::kimi_mcp_registered(&path);
+            (path, registered)
+        }),
+        _ => unreachable!("doctor vendor list is closed"),
     };
-    CheckLine::new(status, "daemon", health.describe())
+
+    match resolved {
+        Ok((_, true)) => McpCheck {
+            status: CheckStatus::Pass,
+            detail: "MCP registered".to_string(),
+        },
+        Ok((_, false)) => McpCheck {
+            status: CheckStatus::Warn,
+            detail: "MCP not registered — auto-registers at `ccteam daemon start` (or `ccteam config mcp`)".to_string(),
+        },
+        Err(err) => McpCheck {
+            status: CheckStatus::Warn,
+            detail: format!("MCP state unknown ({err})"),
+        },
+    }
 }
 
-/// v0.9.7 — residual legacy systemd/launchd unit detection (read-only;
-/// the actual migration lives in `ccteam daemon start`'s takeover
-/// pre-step, never in doctor). Installer-written unit → WARN with the
-/// one-command migration; hand-written unit → WARN with guidance only
-/// (ccteam never deletes it).
+/// Residual legacy systemd/launchd unit detection. The clean result is hidden;
+/// detected units keep the existing migration text.
 fn check_legacy_service() -> CheckLine {
     let paths = crate::legacy_takeover::LegacyServicePaths::from_env();
     match crate::legacy_takeover::detect_legacy_unit(&paths) {
         None => CheckLine::new(
             CheckStatus::Pass,
-            "legacy service",
-            "no legacy systemd/launchd ccteam unit (pid-detach self-management)",
+            "legacy",
+            "no legacy service unit",
         ),
         Some((path, true)) => CheckLine::new(
             CheckStatus::Warn,
-            "legacy service",
+            "legacy",
             format!(
-                "legacy installer-written ccteam unit at {} — systemd/launchd management is \
-                 retired; migrate with `ccteam daemon start` (auto-takeover: stops + removes \
-                 the unit, restarts detached)",
+                "legacy installer-written ccteam unit at {} — systemd/launchd management is retired; migrate with `ccteam daemon start` (auto-takeover: stops + removes the unit, restarts detached)",
                 path.display()
             ),
         ),
         Some((path, false)) => CheckLine::new(
             CheckStatus::Warn,
-            "legacy service",
+            "legacy",
             format!(
-                "service unit at {} was not written by the ccteam installer — ccteam will not \
-                 manage or delete it; its instance counts as \"not managed\" for \
-                 `ccteam daemon stop`. Remove it manually if you want ccteam self-management",
+                "service unit at {} was not written by the ccteam installer — ccteam will not manage or delete it; its instance counts as \"not managed\" for `ccteam daemon stop`. Remove it manually if you want ccteam self-management",
                 path.display()
             ),
         ),
     }
 }
 
-/// v0.9.7 (PRD F3.5/F3.6) — install channel + version skew + fleet skew.
-///
-/// Reports: install channel · `current_exe` · on-disk binary version ·
-/// running-daemon version (from the versioned probe) with a
-/// restart-needed note if it lags the binary · cached latest release (with
-/// `update available → …` or `up to date`) · one line per registered
-/// satellite whose version differs (F3.6). WARN iff a newer ccteam is
-/// available, the running daemon lags the binary, or a satellite is
-/// skewed; otherwise PASS. **Cache-only** for the latest-version display —
-/// the doctor never blocks on a network fetch (the ≥20h refresh is driven
-/// by `ccteam status`); a missing cache / down daemon is informational,
-/// never FAIL.
-fn check_updates(paths: &CcteamPaths) -> CheckLine {
+fn check_version(paths: &CcteamPaths, daemon_version: Option<String>) -> CheckLine {
     let channel = ccteam_core::install_channel::detect(paths);
     let binary_version = env!("CARGO_PKG_VERSION");
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    let probe = ccteam_core::daemon::probe_daemon(paths);
     let cache = ccteam_core::version_check::cached_latest(paths).unwrap_or_default();
-    let update_avail = ccteam_core::version_check::update_available(&cache, binary_version);
-
-    let mut warn = false;
-    let mut parts: Vec<String> = vec![
-        format!("channel {}", channel.as_str()),
-        format!("exe {exe}"),
-        format!("binary {binary_version}"),
-    ];
-
-    // Running daemon version vs the on-disk binary.
-    if probe.ready {
-        match &probe.version {
-            Some(v) if v == binary_version => parts.push(format!("daemon {v}")),
-            Some(v) => {
-                warn = true;
-                parts.push(format!(
-                    "daemon {v} (RESTART NEEDED: `ccteam daemon restart` to load the new binary)"
-                ));
-            }
-            None => parts.push("daemon running (version unknown)".to_string()),
-        }
-    } else {
-        parts.push("daemon not running".to_string());
-    }
-
-    // Latest release, from the cache only (no network here).
-    match &update_avail {
+    let update_available = ccteam_core::version_check::update_available(&cache, binary_version);
+    let mut status = CheckStatus::Pass;
+    let latest = match update_available {
         Some(latest) => {
-            warn = true;
-            let action =
-                if ccteam_core::install_channel::suggested_update_command(&channel).is_some() {
-                    "run `ccteam update`".to_string()
-                } else {
-                    format!("reinstall from {}", ccteam_core::install_channel::REPO_URL)
-                };
-            parts.push(format!(
-                "update available {binary_version} → {latest}: {action}"
-            ));
+            status = CheckStatus::Warn;
+            format!("update available → {latest}: run `ccteam update`")
         }
-        None if cache.latest_version.is_some() => parts.push("up to date".to_string()),
-        None => parts.push(
-            "latest unknown (no cached check yet — `ccteam status` refreshes it)".to_string(),
-        ),
+        None if cache.latest_version.is_some() => "up to date".to_string(),
+        None => "latest not checked yet".to_string(),
+    };
+    let mut detail = format!("{binary_version} ({}) · {latest}", channel.as_str());
+    if let Some(version) = daemon_version.filter(|version| version != binary_version) {
+        status = CheckStatus::Warn;
+        detail.push_str(&format!(
+            " · daemon runs {version} — restart: `ccteam daemon restart`"
+        ));
     }
-
-    // Fleet version skew (F3.6) — shared with `ccteam status`.
-    for line in crate::update::fleet_version_skew(paths, binary_version) {
-        warn = true;
-        parts.push(line);
-    }
-
-    CheckLine::new(
-        if warn {
-            CheckStatus::Warn
-        } else {
-            CheckStatus::Pass
-        },
-        "updates",
-        parts.join("; "),
-    )
+    CheckLine::new(status, "version", detail)
 }
 
-/// V0.5.0 F92's staleness threshold (>180 days) re-derived per vendor —
-/// pure readout, always WARN-max (never fails the checkup).
+fn check_host_skew(paths: &CcteamPaths) -> Vec<CheckLine> {
+    crate::update::fleet_version_skew(paths, env!("CARGO_PKG_VERSION"))
+        .into_iter()
+        .map(|detail| CheckLine::new(CheckStatus::Warn, "hosts", detail))
+        .collect()
+}
+
 fn check_pricing() -> CheckLine {
     const WARN_DAYS: i64 = 180;
     let today = chrono::Utc::now().date_naive();
     let mut worst: Option<i64> = None;
     for &vendor in Vendor::ALL {
         let raw = ccteam_core::pricing_schema_version_for(vendor);
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
-            let age = (today - d).num_days();
-            if worst.is_none_or(|w| age > w) {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+            let age = (today - date).num_days();
+            if worst.is_none_or(|current| age > current) {
                 worst = Some(age);
             }
         }
@@ -625,35 +582,27 @@ fn check_pricing() -> CheckLine {
     match worst {
         Some(age) if age > WARN_DAYS => CheckLine::new(
             CheckStatus::Warn,
-            "pricing tables",
-            format!(
-                "embedded rate sheet is {age}d old (>{WARN_DAYS}d) — upgrade ccteam for \
-                 current pricing"
-            ),
+            "pricing",
+            format!("rate sheet {age}d old (>{WARN_DAYS}d) — upgrade ccteam for current pricing"),
         ),
         Some(age) => CheckLine::new(
             CheckStatus::Pass,
-            "pricing tables",
-            format!("{age}d old (fresh)"),
+            "pricing",
+            format!("rate sheet {age}d old (fresh)"),
         ),
         None => CheckLine::new(
             CheckStatus::Skip,
-            "pricing tables",
-            "could not parse embedded schema_version".to_string(),
+            "pricing",
+            "could not parse embedded schema_version",
         ),
     }
 }
 
-/// `~/.ccteam` home-layout drift, re-derived from
-/// `ccteam_core::canonical_home_dirs()` (the init-time directory
-/// manifest). SKIP when the home doesn't exist yet (fresh install —
-/// nothing to compare); otherwise WARN on any top-level dir the current
-/// architecture no longer writes.
 fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
     if !paths.root.exists() {
         return CheckLine::new(
             CheckStatus::Skip,
-            "home layout",
+            "home",
             format!(
                 "{} does not exist yet (fresh install)",
                 paths.root.display()
@@ -663,55 +612,53 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
     let Ok(entries) = std::fs::read_dir(&paths.root) else {
         return CheckLine::new(
             CheckStatus::Skip,
-            "home layout",
+            "home",
             format!("could not read {}", paths.root.display()),
         );
     };
-    let mut unexpected: Vec<String> = Vec::new();
+    let mut unexpected = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if ccteam_core::canonical_home_dirs().contains(&name) {
-            continue;
+        if !ccteam_core::canonical_home_dirs().contains(&name) {
+            unexpected.push(name.to_string());
         }
-        unexpected.push(name.to_string());
     }
     if unexpected.is_empty() {
         CheckLine::new(
             CheckStatus::Pass,
-            "home layout",
+            "home",
             format!("{} matches the canonical layout", paths.root.display()),
         )
     } else {
         unexpected.sort();
         CheckLine::new(
             CheckStatus::Warn,
-            "home layout",
+            "home",
             format!(
                 "{} unexpected dir(s) under {} (orchestrator-era leftovers, safe to `rm -rf`): {}",
                 unexpected.len(),
                 paths.root.display(),
-                unexpected.join(", "),
+                unexpected.join(", ")
             ),
         )
     }
 }
 
 /// Advisory-only scan for registered projects that still use a real legacy
-/// `.claude/skills` directory. One aggregate line avoids flooding doctor on
-/// large catalogs; migration remains an explicit user command.
+/// `.claude/skills` directory. A clean result is counted but hidden.
 fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
     let config = match ccteam_core::load_ccteam_config(&paths.root) {
         Ok(config) => config,
         Err(err) => {
             return CheckLine::new(
                 CheckStatus::Skip,
-                "project skills",
+                "skills",
                 format!("could not read registered projects: {err}"),
             );
         }
@@ -727,31 +674,85 @@ fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
         }
     }
     if legacy.is_empty() {
-        CheckLine::new(
-            CheckStatus::Pass,
-            "project skills",
-            "registered projects use the neutral skill face (or have no project skills)",
-        )
+        CheckLine::new(CheckStatus::Pass, "skills", "no legacy project skill dirs")
     } else {
         legacy.sort();
         CheckLine::new(
             CheckStatus::Warn,
-            "project skills",
+            "skills",
             format!(
-                "legacy real .claude/skills dir in project(s): {} — migrate each with `ccteam skill migrate-project --project <slug>`",
+                "legacy .claude/skills dir in: {} — migrate: `ccteam skill migrate-project --project <slug>`",
                 legacy.join(", ")
             ),
         )
     }
 }
 
-// `run_readiness_checkup` (the only public entry here now that the bare
-// invocation is decided inline in `main::run_doctor`) is exercised
-// end-to-end (with full `CCTEAM_CLAUDE_BIN` / `CLAUDE_CONFIG_HOME` /
-// `CCTEAM_HOME` / `HOME` sandboxing) by
-// `crates/ccteam-cli/tests/doctor_readiness_test.rs` — deliberately NOT
-// as a lib `#[cfg(test)] mod tests` here: several of its probes
-// (claude/codex/tmux binaries, `~/.claude.json`, `~/.ccteam`) read
-// ambient process env / the real filesystem when not overridden, which a
-// lib unit test (sharing the test binary's real env with every other lib
-// test) cannot safely sandbox. See CLAUDE.md §六.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report_with_daemon(daemon_healthy: bool) -> ReadinessReport {
+        ReadinessReport {
+            agents: vec![ReportRow::visible(CheckLine::new(
+                CheckStatus::Pass,
+                "claude",
+                "test",
+            ))],
+            ccteam: vec![ReportRow::visible(CheckLine::new(
+                if daemon_healthy {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Warn
+                },
+                "daemon",
+                if daemon_healthy {
+                    "running"
+                } else {
+                    "not running"
+                },
+            ))],
+            projects: Vec::new(),
+            daemon_healthy,
+        }
+    }
+
+    #[test]
+    fn renderer_healthy_daemon_ends_on_summary_without_start_hint() {
+        let (output, any_fail) = render_readiness(&report_with_daemon(true), false);
+        assert!(!any_fail);
+        assert!(!output.contains("daemon not running — start it"));
+        assert!(output
+            .lines()
+            .rfind(|line| !line.is_empty())
+            .is_some_and(|line| line.starts_with("summary:")));
+    }
+
+    #[test]
+    fn renderer_unhealthy_daemon_ends_on_start_hint() {
+        let (output, any_fail) = render_readiness(&report_with_daemon(false), false);
+        assert!(!any_fail);
+        assert_eq!(
+            output.lines().rfind(|line| !line.is_empty()),
+            Some("daemon not running — start it:  ccteam daemon start")
+        );
+    }
+
+    #[test]
+    fn renderer_counts_a_suppressed_clean_advisory() {
+        let report = ReadinessReport {
+            agents: Vec::new(),
+            ccteam: vec![ReportRow::advisory(CheckLine::new(
+                CheckStatus::Pass,
+                "legacy",
+                "clean but hidden",
+            ))],
+            projects: Vec::new(),
+            daemon_healthy: true,
+        };
+        let (output, any_fail) = render_readiness(&report, false);
+        assert!(!any_fail);
+        assert!(output.contains("summary: 1 pass — READY"));
+        assert!(!output.contains("clean but hidden"));
+    }
+}

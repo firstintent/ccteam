@@ -47,7 +47,8 @@ const HOST: HostDetail = {
       hint: "codex not found on PATH",
     },
     {
-      // grok/ACP: installed, no config-file MCP seam → ready, no register CTA.
+      // Retained non-registrable shape models satellite rows, whose host-detail
+      // fold forces mcp_registrable=false even for globally registrable vendors.
       vendor: "grok",
       harness_id: "grok",
       installed: true,
@@ -59,7 +60,7 @@ const HOST: HostDetail = {
       hint: null,
     },
     {
-      // opencode/ACP (4th vendor): same protocol-borne MCP as grok.
+      // Same satellite-fold shape for OpenCode.
       vendor: "opencode",
       harness_id: "opencode",
       installed: true,
@@ -125,9 +126,32 @@ describe("HostDetailCards (seeded)", () => {
     expect(html).toContain('data-testid="register-mcp-claude"');
     // codex is not installed → no register button (ccteam never installs a CLI).
     expect(html).not.toContain('data-testid="register-mcp-codex"');
-    // grok/ACP has no config-file MCP seam → ready, never a (no-op) CTA.
+    // Satellite-shaped non-registrable row → never a no-op CTA.
     expect(html).not.toContain('data-testid="register-mcp-grok"');
     expect(html).toContain("随会话协议");
+  });
+
+  it("shows the register-MCP CTA for local Grok when its config is missing", () => {
+    const localGrok: HostDetail = {
+      ...HOST,
+      agents: [
+        {
+          vendor: "grok",
+          harness_id: "grok",
+          installed: true,
+          version: "grok 0.2.112",
+          bin: "grok",
+          mcp_registered: false,
+          mcp_registrable: true,
+          status: "needs_config",
+          hint: "register the ccteam MCP server",
+        },
+      ],
+    };
+    const html = renderToString(
+      <HostDetailCards host={localGrok} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).toContain('data-testid="register-mcp-grok"');
   });
 
   it("renders a ready agent with the 就绪 badge and no register button", () => {

@@ -123,6 +123,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/sessions/{sid}/resolve"),
         ("GET", "/api/v1/sessions/{sid}/events"),
         ("POST", "/api/v1/sessions/{sid}/stop"),
+        ("GET", "/api/v1/sessions/{sid}/scheduled"),
+        ("POST", "/api/v1/sessions/{sid}/scheduled"),
+        ("DELETE", "/api/v1/sessions/{sid}/scheduled/{id}"),
         // v0.8.19 — interrupt the running turn (non-destructive; keeps session).
         ("POST", "/api/v1/sessions/{sid}/interrupt"),
         // v0.8.21 — history resume + external session import.

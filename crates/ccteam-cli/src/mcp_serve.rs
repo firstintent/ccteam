@@ -9,7 +9,7 @@
 //! - **No LLM in-process** (Symphony anti-pattern, tech-design §3.1).
 //! - Protocol core + tool schemas live in [`ccteam_im::mcp`] (v0.9 T3);
 //!   this module owns the **stdio loop**, client-side socket forwards
-//!   for stateful tools, and `install_mcp` / `install_codex_mcp`.
+//!   for stateful tools, and vendor MCP registration orchestration.
 //!
 //! Wire format: each side sends one JSON object per line, terminated
 //! by `\n`. Notifications (no `id`) get no reply. Errors follow the
@@ -441,27 +441,60 @@ pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
     Ok(mcp_json)
 }
 
-/// Daemon-start self-heal: if the global Codex `config.toml` still carries a
-/// legacy stdio `[mcp_servers.ccteam]` entry (written by a pre-HTTP ccteam),
-/// rewrite it to the current HTTP form so per-thread session overrides don't
-/// collide with it under Codex's deep config merge — the `thread/start` failure
-/// `url is not supported for stdio in mcp_servers.ccteam` that otherwise blocks
-/// every `/new codex` session until the operator manually reruns `ccteam config`.
+/// Best-effort daemon-start registration for every installed/configured vendor.
 ///
-/// Narrow + idempotent: a missing config, a config with no ccteam entry, or an
-/// already-HTTP entry is a no-op (`Ok(None)`) — so we never create a Codex
-/// config for a non-Codex user, only migrate an entry ccteam itself wrote.
-/// Returns the config path when a migration was performed.
-pub fn heal_codex_mcp_if_stale() -> Result<Option<std::path::PathBuf>> {
-    let config_toml = ccteam_core::mcp_register::resolve_codex_config_path()?;
-    if !ccteam_core::mcp_register::codex_mcp_entry_stale(&config_toml) {
+/// The gate is deliberately read-only and never executes a vendor binary: an
+/// explicit binary override must exist, a default binary must be executable on
+/// `PATH`, or the vendor config file must already exist. `Ok(None)` means the
+/// vendor was absent and was skipped; errors are returned per vendor so callers
+/// can report every outcome without aborting daemon startup.
+pub fn auto_register_vendor_mcp() -> Vec<(&'static str, Result<Option<std::path::PathBuf>>)> {
+    ccteam_core::host_registry::AGENT_PROBE_SPECS
+        .iter()
+        .map(|spec| {
+            let result = auto_register_one(spec);
+            if matches!(result, Ok(None)) {
+                tracing::debug!(
+                    vendor = spec.vendor,
+                    "vendor absent; skipping MCP registration"
+                );
+            }
+            (spec.vendor, result)
+        })
+        .collect()
+}
+
+fn auto_register_one(
+    spec: &ccteam_core::host_registry::AgentProbeSpec,
+) -> Result<Option<std::path::PathBuf>> {
+    let should_register = if ccteam_core::host_registry::bin_resolvable(spec) {
+        true
+    } else {
+        vendor_config_path(spec.vendor)?.exists()
+    };
+    if !should_register {
         return Ok(None);
     }
-    let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
-    install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
-    Ok(Some(config_toml))
+    let path = match spec.vendor {
+        "claude" => install_mcp(),
+        "codex" => install_codex_mcp(),
+        "grok" => install_grok_mcp(),
+        "opencode" => install_opencode_mcp(),
+        "kimi" => install_kimi_mcp(),
+        other => anyhow::bail!("unsupported MCP registration vendor: {other}"),
+    }?;
+    Ok(Some(path))
+}
+
+fn vendor_config_path(vendor: &str) -> Result<std::path::PathBuf> {
+    match vendor {
+        "claude" => ccteam_core::projects::resolve_claude_json_path(),
+        "codex" => ccteam_core::mcp_register::resolve_codex_config_path(),
+        "grok" => ccteam_core::mcp_register::resolve_grok_config_path(),
+        "opencode" => ccteam_core::mcp_register::resolve_opencode_config_path(),
+        "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path(),
+        other => anyhow::bail!("unsupported MCP registration vendor: {other}"),
+    }
 }
 
 #[cfg(test)]

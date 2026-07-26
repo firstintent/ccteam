@@ -77,9 +77,7 @@ pub struct AgentProbeSpec {
     pub default_bin: &'static str,
     /// Whether ccteam registers its MCP server into a persistent vendor
     /// config file for this vendor (claude `~/.claude.json` / codex
-    /// `config.toml` / kimi `mcp.json`). `false` for vendors whose MCP rides
-    /// the session protocol (grok/opencode ACP): nothing to register on the
-    /// host page, no `needs_config` state, and `register-mcp` rejects it.
+    /// `config.toml` / kimi `mcp.json`).
     pub mcp_registrable: bool,
 }
 
@@ -104,15 +102,14 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         harness_id: "grok",
         bin_env: ccteam_harness::GROK_BIN_ENV,
         default_bin: "grok",
-        // grok/ACP has no config-file MCP seam — nothing to register here.
-        mcp_registrable: false,
+        mcp_registrable: true,
     },
     AgentProbeSpec {
         vendor: "opencode",
         harness_id: "opencode",
         bin_env: ccteam_harness::OPENCODE_BIN_ENV,
         default_bin: "opencode",
-        mcp_registrable: false,
+        mcp_registrable: true,
     },
     AgentProbeSpec {
         vendor: "kimi",
@@ -135,6 +132,39 @@ impl AgentProbeSpec {
 /// `PATH` name. The single resolver every probe call site shares.
 pub fn resolve_bin(spec: &AgentProbeSpec) -> String {
     std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
+}
+
+/// Whether a vendor binary is resolvable without executing it.
+///
+/// An explicit `CCTEAM_*_BIN` override is authoritative and counts when that
+/// path exists. Otherwise the default binary name is scanned on `PATH`; Unix
+/// candidates must be regular files with at least one executable bit.
+pub fn bin_resolvable(spec: &AgentProbeSpec) -> bool {
+    if let Some(path) = std::env::var_os(spec.bin_env) {
+        return path_is_executable(std::path::Path::new(&path));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| path_is_executable(&dir.join(spec.default_bin)))
+}
+
+fn path_is_executable(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// One vendor's availability on THIS machine — the normalized snapshot the
@@ -997,16 +1027,32 @@ mod tests {
     #[test]
     fn agent_probe_specs_carry_harness_id_and_mcp_registrable() {
         // The web host page + capabilities matrix now read these off the
-        // shared spec (no parallel table). claude/codex/kimi register into a
-        // config file; grok/opencode ride the ACP session protocol.
+        // shared spec (no parallel table). All current vendors have a global
+        // config-file MCP registration seam.
         let by = |v: &str| AgentProbeSpec::by_vendor(v).unwrap();
         assert_eq!(by("claude").harness_id, "claude-code");
-        assert!(by("claude").mcp_registrable);
-        assert!(by("codex").mcp_registrable);
-        assert!(by("kimi").mcp_registrable);
-        assert!(!by("grok").mcp_registrable);
-        assert!(!by("opencode").mcp_registrable);
+        assert!(AGENT_PROBE_SPECS.iter().all(|spec| spec.mcp_registrable));
         assert!(AgentProbeSpec::by_vendor("gemini").is_none());
+    }
+
+    #[test]
+    fn path_resolver_requires_a_file_and_unix_exec_bit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("vendor-bin");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&path, permissions.clone()).unwrap();
+            assert!(!path_is_executable(&path));
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        assert!(path_is_executable(&path));
+        assert!(!path_is_executable(tmp.path()));
+        assert!(!path_is_executable(&tmp.path().join("missing")));
     }
 
     #[test]
