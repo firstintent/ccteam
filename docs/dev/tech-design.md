@@ -492,7 +492,7 @@ MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_
 
 | Group(子前缀) | 工具数 | 工具 |
 |---|---|---|
-| `status`(admin 组,无子前缀) | 1 | 发现面:项目/daemon 健康/今日成本 + caller 项目绑定主机的 vendor 面板 + 已装 vendor 的 session_spawn 配方 + advisory 模型目录 + routing notes |
+| `status`(admin 组,无子前缀) | 1 | 发现面:瘦项目摘要(`{slug,cost_24h_usd}`)+ daemon `{status,message}` + caller 项目绑定主机的 vendor 面板 + 已装 vendor 的 session_spawn 配方 + advisory 模型目录 + routing notes |
 | `grok_claude_codex_kimi`(admin 组) | 1 | `status` 的裸名发现别名(纯 alias,响应逐字节一致) |
 | `chat_` | 1 | send_file(把 daemon 文件系统上的文件发回 caller 绑定 chat,与文本回复同 outbound funnel) |
 | `session_` | 5 | A2A 调度:spawn / dispatch / collect / list / stop(**daemon 校验 per-session principal + project 维度**,best-effort defense-in-depth 非硬边界;调度门与护栏 = AGENTS §三红线) |

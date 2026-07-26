@@ -21,11 +21,6 @@ const SERVER_NAME: &str = "ccteam";
 /// Workspace-synced version of this crate (same workspace version as the binary).
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Must match `ccteam_flow::MAX_CONCURRENT_PROJECTS` (orchestrator hard cap).
-/// Duplicated here so `ccteam-im` does not depend on `ccteam-flow` while the
-/// `status` tool body shape stays identical.
-const MAX_CONCURRENT_PROJECTS: usize = 3;
-
 /// Server `instructions` surfaced to the agent on `initialize`.
 ///
 /// Two load-bearing conventions:
@@ -313,7 +308,7 @@ fn text_content(body: String) -> Vec<Value> {
     vec![json!({ "type": "text", "text": body })]
 }
 
-/// Base `status` JSON body (projects + orchestrator + daemon health). The
+/// Base `status` JSON body (slim projects + daemon health). The
 /// daemon-aware dispatch path reuses this verbatim, then appends the vendor
 /// panel + routing notes (see [`super::dispatch`]).
 pub(crate) fn tool_ls(paths: &CcteamPaths) -> Result<String> {
@@ -333,10 +328,6 @@ fn tool_ls_matching(
     mut visible: impl FnMut(&ccteam_core::ProjectState) -> bool,
 ) -> Result<String> {
     let projects = collect_projects(paths)?;
-    // V0.4.0 F60: active_count was derived from `phase_state == InFlight`;
-    // with the phase state machine deleted F66 will recompute this from
-    // `state.sessions` (live agent count).
-    let active_count = 0usize;
     let arr: Vec<Value> = projects
         .iter()
         .filter(|project| visible(&project.state))
@@ -345,43 +336,26 @@ fn tool_ls_matching(
                 .unwrap_or_default();
             json!({
                 "slug": p.state.slug,
-                "team": p.state.team,
-                "current_phase": p.state.current_phase,
-                "phase_state": match p.state.phase_state {
-                    ccteam_core::PhaseState::Idle => "idle",
-                    ccteam_core::PhaseState::Done => "done",
-                },
-                "cost_used_usd": cost.cost_total_usd,
                 "cost_24h_usd": cost.cost_24h_usd,
-                "cost_active_usd": cost.cost_active_usd,
-                "tmux_session": p.state.tmux_session,
-                "age_seconds": p.age_seconds,
             })
         })
         .collect();
     let health = check_daemon_health(paths);
     let body = json!({
         "projects": arr,
-        "orchestrator": {
-            "active_count": active_count,
-            "max_concurrent": MAX_CONCURRENT_PROJECTS,
-            "daemon_health": daemon_health_json(&health),
-        },
+        "daemon": daemon_health_json(&health),
     });
     Ok(serde_json::to_string_pretty(&body)?)
 }
 
 fn daemon_health_json(health: &DaemonHealth) -> Value {
     match health {
-        DaemonHealth::Healthy { socket } => json!({
+        DaemonHealth::Healthy { .. } => json!({
             "status": "healthy",
-            "socket": socket.display().to_string(),
             "message": health.describe(),
         }),
-        DaemonHealth::Unreachable { socket, reason } => json!({
+        DaemonHealth::Unreachable { .. } => json!({
             "status": "unreachable",
-            "socket": socket.display().to_string(),
-            "reason": reason,
             "message": health.describe(),
         }),
     }
@@ -883,6 +857,82 @@ mod tests {
         assert_eq!(slugs, vec!["alice"]);
     }
 
+    #[test]
+    fn status_base_has_slim_exact_key_sets_for_admin_and_tenant() {
+        use std::collections::BTreeSet;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let slug = "slim";
+        let dir = paths.projects_root.join(slug);
+        std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+        let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+        state.owner = Some("user:ualice".to_string());
+        state.save(&CcteamPaths::project_state_in(&dir)).unwrap();
+        ccteam_core::config::upsert_project(
+            &paths.root,
+            ccteam_core::ProjectEntry {
+                slug: slug.to_string(),
+                path: dir,
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        for body in [
+            tool_ls(&paths).unwrap(),
+            tool_ls_for_user(&paths, "ualice").unwrap(),
+        ] {
+            let body: Value = serde_json::from_str(&body).unwrap();
+            let top: BTreeSet<_> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(top, BTreeSet::from(["daemon", "projects"]));
+            let project = body["projects"].as_array().unwrap().first().unwrap();
+            let project_keys: BTreeSet<_> = project
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(project_keys, BTreeSet::from(["cost_24h_usd", "slug"]));
+            let daemon_keys: BTreeSet<_> = body["daemon"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(daemon_keys, BTreeSet::from(["message", "status"]));
+            for dead in [
+                "team",
+                "current_phase",
+                "phase_state",
+                "cost_used_usd",
+                "cost_active_usd",
+                "tmux_session",
+                "age_seconds",
+                "orchestrator",
+                "socket",
+                "reason",
+            ] {
+                assert!(
+                    !body.to_string().contains(&format!("\"{dead}\"")),
+                    "{dead} reappeared: {body}"
+                );
+            }
+        }
+    }
+
     /// 2026-07-26 cull — `screenshot` (tmux-era pane render) is no longer an
     /// MCP tool; a call must fail as UNKNOWN, not degrade gracefully.
     #[tokio::test]
@@ -979,7 +1029,7 @@ mod tests {
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
-            parsed["orchestrator"]["daemon_health"]["status"], "unreachable",
+            parsed["daemon"]["status"], "unreachable",
             "status must annotate daemon health when daemon is down"
         );
     }

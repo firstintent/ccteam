@@ -906,7 +906,7 @@ mod tests {
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(
-            parsed["orchestrator"]["daemon_health"]["status"], "unreachable",
+            parsed["daemon"]["status"], "unreachable",
             "status must annotate daemon health when daemon is down"
         );
     }

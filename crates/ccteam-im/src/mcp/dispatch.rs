@@ -1185,7 +1185,7 @@ async fn execute_status(
         return execute_user_status(id, &args, paths, user_id).await;
     }
 
-    // Base body (projects + orchestrator + daemon health), reused verbatim
+    // Base body (slim projects + daemon health), reused verbatim
     // from the protocol core so the daemon-aware path never drifts from the
     // local fallback.
     let base = super::protocol::tool_ls(paths).unwrap_or_else(|_| "{}".to_string());

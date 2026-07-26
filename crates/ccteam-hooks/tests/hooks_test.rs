@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use ccteam_core::{CcteamPaths, Parallelism, PhaseState, ProjectState, TeamKind};
+use ccteam_core::{CcteamPaths, Parallelism, ProjectState, TeamKind};
 use ccteam_hooks::progress_append;
 
 struct Fixture {
@@ -53,7 +53,6 @@ impl Fixture {
             tmux_session: format!("ccteam-{slug}"),
             claude_session_id: None,
             claude_pid: None,
-            phase_state: PhaseState::Idle,
             current_phase: "implement".into(),
             parallelism: Parallelism::Solo,
             phase_history: Vec::new(),

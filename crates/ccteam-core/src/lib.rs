@@ -298,7 +298,7 @@ pub use stall::{
     ProgressStallStatus, StallLevel, StallThresholds, STALL_ESCALATE_SECONDS,
     STALL_SUSPICIOUS_SECONDS, STALL_WARN_SECONDS,
 };
-pub use state::{Parallelism, PhaseHistoryEntry, PhaseState, ProjectState};
+pub use state::{Parallelism, PhaseHistoryEntry, ProjectState};
 pub use team::{
     CostPolicy, CriticDimensionSpec, CriticStrictness, DomainRule, EscalateGrammarExtension,
     EscalateRoute, GoldenRuleEnforcement, HarnessKind, ProtocolRule, RetroFieldKind,
