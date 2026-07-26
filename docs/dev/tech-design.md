@@ -12,9 +12,9 @@
 
 **R-code 速查**(简写 ↔ CLAUDE.md §三):
 
-- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目走 `<projects_root>/<team>-<slug>/`(slug 撞名数字累加)· `R11` root README.md 英文且不含版本进展
+- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid;§三已并入「session = 独立一等实体」行)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目 slug = `slugify(目录名)` + 撞名数字累加,`ccteam init` 可就地初始化 · `R11` root README.md 英文且不含版本进展
 
-> **已退役的旧红线**(新架构打破,勿再引用):**「session = role」keystone**(session 已升为**独立一等实体 + 持久 sid**、role 是属性;同 role 可并存多 session、pane/turns 按 sid —— 见 §2.1)、「每次 spawn = fresh 1M context」(chat 复用 context 是 feature;仅 autonomous bg 适用)、「fix-loop 撞 3 次 escalate / AgentPath depth」(属推后的 `ccteam-flow` 引擎)、「HITL approval state SoT / 第 4 mode」(**编排级**批准仍推后,`ApprovalIR` 仅类型占位;**per-session** HITL 已落地,走 `PermissionMode::Hitl` + `PermissionRequest` hook,见 §6.5;非 hitl session 仍 `--dangerously-skip-permissions`)、「`ccteam init` 落 AGENTS.md → CLAUDE.md symlink」(ccteam **不**生成/接管项目 CLAUDE.md/AGENTS.md)。
+> 已退役概念的一行清单在 CLAUDE.md §〇 尾注(本文档不再重复);R-code 与 §三行名的全量对齐校对 = TD-SYNC-1 卡。
 
 ---
 
