@@ -7,13 +7,13 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.10` 攒齐在 dev**(2026-07-26 ship gate 落盘,owner 拍板「这些功能够一个版本」;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**dev→main PR #170 ready 且 CI 三 job 全绿**(run 30207750892,头 `f003cd14` 含 HERM-1A 竞态修复;merge blocker 已解除)。**owner 流程指令(2026-07-26)**:owner 人肉测试 → **新 session 执行 release**(tag/部署仍 HELD 等 owner 显式发话;merge ≠ 发布)。**2026-07-27 PR 追加**:接入页改版 ACCESS-IA-1(`e2e7850`)· web ACL 收敛 WEB-ACL-1(`1025450`)· **外部提交 `ae24cb3b`**(作者 `ccm`,harness `submit_turn_routed` 活跃 turn 注入/排队路由;无对应卡,规划初审内容不踩红线(明注「用户 turn 路由非 prompt 注入」、flow 测试仅 Mock 补 trait),**来源待 owner 确认**)—— PR 头前移,CI 按新头重跑。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh 已装可用**(`~/.local/bin/gh`,firstintent 已登录,PR 操作可由规划执行;旧「本机无 gh」记载作废)。
-- **在做**:无 —— v0.9.10 全部收口(owner 追加的四项已全落:MCP-DX-3 `0a0b26f` / STATUS-SLIM-1 `421e316`(裁决收窄为 wire 瘦身,残量 = STATE-CULL-1 候选)/ HERM-1 A+B `3413364`+`9537720` 全密封 / 收尾修订本 commit)。**基线锚 = 1683/0 · vitest 43/436(2026-07-27 追加后,明细见下基线节)**。**Release 流程(owner 指令)**:owner 人肉测试(需 rebuild:`make install` → `ccteam daemon restart`)→ 合 PR #170(merge commit)→ 新 session 按惯例走 tag/部署(仍 HELD 等 owner 显式发话)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated);完成卡蒸馏留待下一版 ship gate。委派子会话 s135–s138 idle 可停;s153(本版全程工作会话)idle 备查。
+- **版本线**:workspace **`0.9.10` 发布执行中**(owner 2026-07-26 深夜授权,登记下表人工门;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**`ae24cb3` 来源已确认 = owner 直驱 codex s131**(无卡口头令,活跃消息 vendor 注入):规划全量 review + **真机 grok 冒烟**发现 P0(完成边竞态丢答案:真机 idle interject 返 `queued` 并自发 turn 自答、`-32000` 降级臂死代码、无主 chunks 被静默丢弃)+ P1(Started 后陈旧 `turn_started_at` 不重盖)等 5 项 → codex s131 修复 **`f3ea8bf`**(vendor 自发 turn 合成收口 `capture_vendor_started_turns`、Started 无条件重盖时钟、bg 拒 Queue、tui 注释、去重复 override)已验收(红→绿在案:`completion_edge_interject_surfaces_vendor_self_started_turn` / `started_submission_refreshes_stale_working_start`)。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh = `/opt/homebrew/bin/gh`**(firstintent,repo+workflow scope;旧 `~/.local/bin/gh` 记载作废)。
+- **在做**:**release 执行链**(规划执行,owner 睡前令「明早 github release 见新版二进制」):治理提交推 dev → PR #170 CI 三 job 按新头绿 → merge(merge commit)→ tag `v0.9.10` → `release.yml` 四平台 + SHA256SUMS 绿 → `/releases/latest` 验证 → `target/debug` 清理(owner 令;daemon 跑 `target/release` 不受影响)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / TEST-MACOS-1 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated);v0.9.10 完成卡已蒸馏移出(本 ship gate)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`)= **1683/0 预期**(2026-07-27 本机实测全绿:1669 锚(HERM-1 后)+ WEB-ACL-1 +1(core rotate test)+ 外部 `ae24cb3b` +13;此前逐卡对账沉 git 史;干净环境仲裁 = PR #170 CI)
+- 确定性口径 `make test-baseline`(`--lib --bins`)= **1687/0 预期(干净环境;仲裁 = PR #170 CI)**(1683 + `f3ea8bf` +4:gateway Started 重盖 / translate 合成 turn ×2 / bg 拒 Queue)。本机默认 shell 实测 **1686 绿 + 1 红** = `roles::list_library_skills…` = **macOS TMPDIR 形状族**(`fs::canonicalize` /var→/private/var vs 字面断言;先于 `ae24cb3`、Linux CI 绿;TMPDIR 已 canonical 的会话本机也全绿——此前「本机全绿」与新会话红并存的成因;已登记 verify README「macOS 宿主两族」+ 修卡 TEST-MACOS-1)
 - `ccteam-web` 全量:lib + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,非回归)· vitest **436**(43 文件;上口径 422 + ACCESS-IA-1 +12 + WEB-ACL-1 +2)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
@@ -21,6 +21,7 @@
 
 | 事项 | 状态 |
 |---|---|
+| **v0.9.10 发布(merge PR #170 + tag + release.yml)** | **已签核·执行中(结果由规划回填)** —— owner 2026-07-26 深夜:「codex完成后,你验收通过后,就进行仓库治理沉淀和文档维护,之后直接tag + release。……明天要能在github release看到新版本二进制包」= 挂验收条件的一次性授权(merge 含于链内,否则无从 tag);验收已过(`f3ea8bf`,门禁证据见基线节) |
 | **tag + 部署** | **已消耗(v0.9.8 已发布)** —— owner 2026-07-23「人肉测过了,打tag、发release」→ 正式 `v0.9.8` tag(main squash `ad1c7c2`)推送,release.yml 全绿(四平台 tarball + SHA256SUMS);`/releases/latest` → v0.9.8,全体用户经 `install.sh`/`ccteam update` 可拿到(v0.9.8 无 rc,owner 已先行人肉测)。上一次 = v0.9.7(`2922f7a`,rc 先行)。**常态不变:push main ≠ 发布,下个版本 tag 仍需 owner 显式发话** |
 | V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);merge PR #165 = owner 2026-07-22「已经合并」;`825ae7d` squash 落 main |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
@@ -43,6 +44,7 @@
 
 ## 未固化教训
 
+- **fixture-only 验证限界**(ae24cb3 review 实锤):fake 只证「客户端实现了 fixture 定义的合同」,不证 vendor 真机行为——真机 grok idle interject 返 `queued` 且**自发 turn** 自答,代码嗅探的 `-32000` 臂是死代码,P0 丢答案由**真机冒烟**揭示(fake 恒绿)。新 vendor wire 行为面收口前上真机冒烟(与 A2A-OBS-3 manual-gate 同旨);冒烟脚本模式:纯 stdio JSON-RPC 直驱 vendor binary,留痕 idle/mid-turn 两态响应形状。
 - **vendor 容量中断 = 委派链故障模式**(v0.9.9 FIX1 尾段 codex「model at capacity」,turn 断在门禁前):恢复路径 = `session_collect` 读账本中间记录 → 接手方按其结论收尾,不重做已完成的归因;工作品外部化(worktree/commit)= 会话可弃性。**产品侧主体已固化**(owner 复盘驱动,`2a2b38a`:TurnFailed/终态 Error 贯穿 DelegationSignal,通知冠 VENDOR ERROR = 修「假成功」;TurnStarted 刷 last_active = 消挤停误排);余量 = A2A-OBS-5/OBS-2 卡。恢复纪律候选固化 → verify/README 运行纪律。
 - **「同机同红」stash 对照只证「非本 diff 所致」,不证「环境态」**(HERM-1 ① 误归因复盘:对照基线 origin/dev 当时可能已含回归;且「CI 绿」快照会过期)——跨环境同断言复现 = 优先判真回归;flake 归档必须记录首见 CI run 边界,定期复核。
 - **委派卡「单 commit 含窄写回」⇒ 卡面 sha 无法自引用**(MCP-CULL-3 卡面 9638ce9 vs 实推 9c2a89e,amend 后漂移,规划 review 校正):委派 brief 应改为「实现 commit → 写回 commit 分离」(与规划自身的 loop: 收口同构),或规划收口时校正 sha。

@@ -111,7 +111,11 @@ pub trait HarnessAdapter: Send + Sync {
     fn name(&self) -> &'static str;                 // "claude-tui" / "codex-app-server" / ...
     fn vendor(&self) -> AgentVendor;                // Claude | Codex
     async fn start_thread(&self, spec: &AgentSpecBrief, ctx: &SpawnCtx) -> Result<ThreadHandle, HarnessError>;
-    async fn submit_turn(&self, h: &ThreadHandle, input: TurnInput) -> Result<TurnId, HarnessError>;
+    // 契约方法(v0.9.10):显式路由的用户消息提交。活跃 turn 中 Inject=并入当前 vendor turn、
+    // Queue=FIFO 独立 turn;不支持的路径显式降级(如实上报 Queued)或 NotImplemented,绝不静默变语义。
+    // submit_turn(h, input) 仍在,但已是默认 helper = submit_turn_routed(…, Inject)。
+    async fn submit_turn_routed(&self, h: &ThreadHandle, input: TurnInput, routing: TurnRouting)
+        -> Result<TurnSubmission, HarnessError>;    // TurnSubmission{turn_id, input_id, disposition: Started|Injected|Queued}
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError>;
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError>;
@@ -122,6 +126,7 @@ pub trait HarnessAdapter: Send + Sync {
 ```
 
 - **`AgentSpecBrief`** 携带 `role`(spawn argv 用它拼 `--agent <role>`,**空 role = roleless 省略 `--agent`**)+ slug + cwd + sid(session-name 按 sid)。role-as-attribute 的落点就在这里:`spec.role` → claude argv 的 `--agent` 槽位(可空)。
+- **活跃消息路由**(v0.9.10):应用层对每条用户消息统一请求 `TurnRouting::Inject`(与红线「完成通知 live=vendor steer」同构)——claude stream-json/terminal 原生并入、codex 走 `turn/steer`(带 `clientUserMessageId` 回执);**grok = `_x.ai/interject` 原生中途注入**(真机实证 2026-07-26:idle interject 同样被 admit 并由 vendor **自发 turn** 自答,共享 ACP translate 以合成 turn 收口该输出,答案永不丢、不撕裂旧 turn);kimi/opencode 无原生通道 → **诚实降级** FIFO(`Queued` 如实上报)。turns.jsonl 用户记录按 per-input 唯一 `input_id` 落盘(多次注入共享一个 vendor turn 也不重键)。
 - **`CanonicalEvent`** 是 `ThreadEvent` 的中立别名(`ThreadStarted` / `TurnStarted` / `TurnCompleted{usage}` / `TurnFailed` / `Item{Started,Updated,Completed}` / `Error`);schema 对齐 Codex `ThreadEvent`,两 vendor 的 emitter 1:1 映射进 gateway。`events()` 守 **final-only 契约**(rustdoc 钉死):一个 turn 的最终 agent 文本**恰好一次**经 `ItemCompleted(AgentMessage)` 吐出,`ItemUpdated` 仅 delta/presentation、consumer 可丢;token usage / plan / rate-limit 等非终态遥测**不**进此流(旁路镜像 `progress.jsonl`,经 `thread_status` 查询)。gateway 的取文本逻辑依赖此契约,故契约住 adapter trait。
 - **`ExecutionMode`** 三态(`ThreadHandle::mode`):`InProc`(in-process subagent,占位)/ `Bg`(`claude --bg` / `codex exec --json` 单轮 fresh-context)/ `Chat`(tmux + claude TUI / `codex app-server` UDS,多轮 context 复用 —— IM/web 路径全走这个)。
 - **resume 语义**:`Chat` 形态 resume-by-session-id —— Claude 用 deterministic 的 sid session 名 lossless 续接,Codex 用 thread id app-server resume;`Bg` 形态每次 spawn fresh,`resume_thread` 返回 `NotImplemented`。
@@ -369,8 +374,9 @@ ccteam-cli (bin)
    │     (首条消息触发 HarnessAdapter::start_thread,以 `claude --agent reviewer --name <session-name>` 启动;
    │      已存在则按 sid 复用 ThreadHandle)
    │
-   ▼  HarnessAdapter::submit_turn(handle, TurnInput::UserText("看一下..."))
-   │     Claude: tmux send-keys -l "<text>" Enter
+   ▼  HarnessAdapter::submit_turn_routed(handle, TurnInput::UserText("看一下..."), TurnRouting::Inject)
+   │     Claude(stream-json 默认): NDJSON user line;session 空闲=开新 turn,turn 进行中=原生并入
+   │     (codex=turn/steer,grok=_x.ai/interject;kimi/opencode 无原生通道→诚实降级 FIFO 独立 turn)
    │
    ▼  gateway 立刻回入口:"submitted <session> turn <id>"
    │
@@ -663,6 +669,7 @@ MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_
 | Claude 命令面 gate | 四通道 `handle_directive`(prompt 透传 / BRIDGE_SAFE local / arg-popup `NeedsChoice` / panel-only `Rejected`)+ `/esc`→Escape + `ensure_chat_hooks_installed` 追加 `AskUserQuestion` matcher = `crates/ccteam-harness/src/execution/claude_tui.rs` | `cargo test -p ccteam-harness --test claude_tui_test` |
 | **Claude stream-json adapter(v0.8.11 协议轴)** | `crates/ccteam-harness/src/execution/claude_stream_json/`:`spawn_spec.rs`(`build_argv` —— 不带 `-p`、`--input-format/--output-format stream-json`、`--session-id`\|`--resume` 互斥、`--agent` 仅 persona、**禁 `--append-system-prompt`**;`deterministic_session_uuid(slug,sid)` 无状态 resume key)· `transport.rs`(`StreamJsonTransport::{connect_stdio, spawn_from_io<R,W>, send_line, subscribe, request_control, wait_for_init, wait_closed, shutdown}` —— 消费端不持 `Child`)· `protocol.rs`(NDJSON wire 类型 + `user_text_line` / `can_use_tool_response_line`)· `translate.rs`(`StreamTranslator::{ingest, on_close}` → `ThreadEvent`;in-flight 关闭→人话 `TurnFailed`)· `bridge.rs`(`classify_slash` 三类 + `CanUseToolResolver`/`FnResolver`/`ApprovalDecision`)· `mod.rs`(`ClaudeStreamJsonAdapter` + `SessionIdentity{sid,vendor_uuid,host}` + HITL dispatcher) | `cargo test -p ccteam-harness --test claude_stream_json_test`(fake-vendor e2e:spawn→init→turn→slash→HITL→idle→resume→故障矩阵) |
 | **共享 ACP core + OpenCode / Grok**(v0.8.24)| `execution/acp/`(transport + protocol + translate,`InboundPolicy::AutoAllowPermission`)· `execution/opencode_acp/`(`OpencodeAcpAdapter`,`opencode acp`,resume 优先 `session/resume`)· `execution/grok_acp/` re-export 共享 core· `AgentVendor::Opencode` + `OPENCODE_BIN_ENV`· `UnifiedTokenUsage.reported_cost_usd` + `resolve_turn_cost`(`Vendor::Opencode` 无价表)| `cargo test -p ccteam-harness --test opencode_acp_test`;`cargo test -p ccteam-harness --test grok_acp_test` |
+| **(v0.9.10)活跃消息 vendor 注入路由** | 契约类型 `TurnRouting`/`TurnDisposition`/`TurnSubmission`(completion fence)+ `submit_turn_routed` = `crates/ccteam-harness/src/adapter.rs`;ACP 共享路由状态机 = `execution/acp/turn_runner.rs`(`route_acp_turn` + 注入 gate/写屏障)+ `execution/acp/translate.rs`(gate RAII;`capture_vendor_started_turns` = grok 自发 turn 合成收口,防完成边竞态丢答案)· Grok 原生注入 = `execution/grok_acp/mod.rs`(`_x.ai/interject`;-32000 仅防御兼容臂)· codex steer 回执 = `execution/codex_app_server.rs`(`clientUserMessageId`)· gateway 提交路由/steer 标记/Started 重盖时钟 = `ccteam-im/src/gateway.rs` | `cargo test -p ccteam-harness --test grok_acp_test`(注入/完成边/显式 Queue 三场景);`-p ccteam-harness --lib translate`;`-p ccteam-im --lib gateway`(inject 保时钟/降级回滚/Started 重盖);真机冒烟 grok interject 2026-07-26 在案 |
 | **curated MCP + evolution**(v0.8.24 C)| curated MCP = `execution/mcp_config.rs` + stream-json spawn 写 `chat/<sid>/mcp.json`· evolution = `routes/evolution.rs`(读 `experience.jsonl`)| `cargo test -p ccteam-web --test hosts_multihost_test`(hosts)+ openapi |
 | **protocol 轴 + 创建面 + 工厂三路由** | `SessionProtocol{StreamJson(默认), Terminal, Acp}` = `crates/ccteam-harness/src/adapter.rs`;`default_adapter_factory(vendor, protocol)` vendor-first(Claude 按 protocol·Grok/OpenCode/Kimi→ACP·Codex→app-server)= `crates/ccteam-im/src/daemon.rs`;gateway `start_session`/`create_session_api_on_host` 带 `protocol`+`host`、`GatewaySession`/`SessionView` 持久化走 `meta.json`、`/new … terminal` 解析、pump 写 `chat_turn_completed`= `gateway.rs`;web `CreateSessionForm` = `sessions_api.rs`;SPA 4-way runtime + Workflow = `web/src/pages/{ChatConsole,WorkflowView}.tsx` | `cargo test -p ccteam-im daemon`;`cargo test -p ccteam-web` |
 | Codex 命令面 + transport | 六类映射 `handle_directive` + 三层 resolution + 两段式 + `CodexThreadTracker`(消费 `thread/tokenUsage/updated`)+ `resolve_codex_transport()`(socket→UDS / 默认 stdio)= `crates/ccteam-harness/src/execution/codex_app_server.rs`;per-vendor 单例工厂 `default_adapter_factory` = `crates/ccteam-im/src/daemon.rs` | `cargo test -p ccteam-harness --test codex_app_server_test` |

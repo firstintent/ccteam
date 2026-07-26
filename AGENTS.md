@@ -25,8 +25,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.10`(dev 攒齐待 owner 合 PR #170;tag/部署 HELD 等 owner 显式发话) |
-| 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker)+ restart-restore 竞态修复(恢复期 `/sessions` 确定性)+ 接入页宽屏改版(REST API 卡)+ web ACL 收敛(admin 专属只剩用户管理与全局 bot 凭据,权限 = token 身份 × 项目归属) |
+| Workspace version | `0.9.10`(owner 2026-07-26 授权发布:merge PR #170 + tag 由规划执行;进度/结果登记 `.loop/state.md`) |
+| 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker)+ restart-restore 竞态修复(恢复期 `/sessions` 确定性)+ 接入页宽屏改版(REST API 卡)+ web ACL 收敛(admin 专属只剩用户管理与全局 bot 凭据,权限 = token 身份 × 项目归属)+ 活跃消息 vendor 原生注入(adapter `TurnRouting` 契约;grok `_x.ai/interject` 真机实证 + vendor 自发 turn 合成收口防丢答;kimi/opencode 诚实降级 FIFO) |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
 > 开发一律落 `dev` 分支 + dev→main PR 攒版本,main 不直推(§五「分支与推送」);主分支 HEAD 以 `git rev-parse origin/main` 为准。
@@ -143,6 +143,6 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 - **(terminal 协议)`claude [--agent <role>] --name/--resume` argv 可能漂移** — `--agent` 非空 role 才加(空=roleless 裸 claude);pane/name 按 sid(`chat_session_name(slug, sid)`);`CCTEAM_CLAUDE_BIN` env override 让测试不依赖真实 binary;生产改 `claude_tui.rs` 的 `spec_for_new`/`spec_for_resume`(stream-json 默认路在 `claude_stream_json/spawn_spec.rs`)
 - **(terminal 协议)`--agent` 顶层 turn 偶发也触发 `SubagentStop`**(session 被建模为 implicit-main 的 subagent);`Stop` 始终触发,turn 完成可靠 —— **不会双发 IM 回复**(回复只走 transcript-content track,hook track 仅写 progress)。stream-json 默认路无 hook,不涉此坑
 - **WSL2 / inotify-busy 宿主** `fs.inotify.max_user_instances` 易触顶,本机跑见大批 watcher/SSE/web e2e 502;`ccteam-web` 的 4 个 `ws_*` 走 tmux pipe-pane PTY(sandbox 不能流)→ **环境层**,non-WSL / 大 limit 机 OR CI 复测;不计入 baseline
-- **`gh auth token` 没 `workflow` scope** ── 改 `.github/workflows/*` 的 PR HTTPS 推会被 403 拒绝。改用 SSH 推 `git push -u git@github.com:firstintent/ccteam.git <branch>:<branch>`
+- **改 `.github/workflows/*` 需 token 带 `workflow` scope**(缺则 HTTPS 推 403;fallback = SSH 推 `git@github.com:firstintent/ccteam.git`)。本机 gh = `/opt/homebrew/bin/gh`(firstintent,含 repo+workflow scope,2026-07-26 核)
 - **`cargo fmt --all` commit 前必跑,一律 fmt 干净**(`rustfmt.toml` pin stable rustfmt;CI gate `check.yml::fmt` 的 `cargo fmt --all -- --check` 不过 PR 不能 merge;单文件 `rustfmt --edition 2021 <files>` 直调等价;无「drift 维持现状」特例)
 - **本文件 ≤200 行** — 越长 cache 越贵,Claude 越忽略
