@@ -1,9 +1,9 @@
 // v0.8.24 Track A — 工作流 top-level view (prototype `#view-flow`):
-// a set-nav second column (232px, 「工作流」) with four sub-pages —
-// Skills / Roles / MCP Servers / 自进化 — each a prototype-styled detail page.
+// a set-nav second column (232px, 「工作流」) with five sub-pages —
+// Skills / Roles / Plugins / MCP Servers / 自进化.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, Package, Server, User } from "lucide-react";
+import { Activity, Package, Server, ShoppingBag, User } from "lucide-react";
 import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
 import {
@@ -16,12 +16,14 @@ import {
 import { fetchDashboard } from "../lib/dashboardApi";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
+import MarketplaceView from "./MarketplaceView";
 
-type TabId = "skills" | "roles" | "mcp" | "evolution";
+type TabId = "skills" | "roles" | "market" | "mcp" | "evolution";
 
 const TABS: { id: TabId; label: string; labelKey?: string; subKey: string; icon: React.ReactNode }[] = [
   { id: "skills", label: "Skills", subKey: "skillsSub", icon: <Package /> },
   { id: "roles", label: "Roles", subKey: "rolesSub", icon: <User /> },
+  { id: "market", label: "Plugins", labelKey: "marketTab", subKey: "marketSub", icon: <ShoppingBag /> },
   { id: "mcp", label: "MCP Servers", subKey: "mcpSub", icon: <Server /> },
   { id: "evolution", label: "自进化", labelKey: "evolve", subKey: "evolveSub", icon: <Activity /> },
 ];
@@ -84,6 +86,8 @@ export default function WorkflowView({
       } else if (tab === "skills") {
         const idx = await getProjectMarketplace(slug);
         setSkills((idx.plugins ?? []).filter((p) => p.type === "skill"));
+      } else if (tab === "market") {
+        return;
       } else if (tab === "evolution") {
         setEvolution(await getEvolution(slug));
       } else if (tab === "mcp") {
@@ -293,6 +297,16 @@ export default function WorkflowView({
                   {t("installMarket")}
                 </button>
               </div>
+            </>
+          ) : null}
+
+          {tab === "market" ? (
+            <>
+              <header>
+                <h1>{t("setMarket")}</h1>
+                <p>{t("marketDesc")}</p>
+              </header>
+              <MarketplaceView embedded />
             </>
           ) : null}
 

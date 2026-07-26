@@ -56,6 +56,7 @@ import {
   filterPlugins,
   installable,
   installedStatusLabel,
+  needsProjectTarget,
   skillLibraryStatusLabel,
 } from "../lib/marketplaceFormat";
 import { makeT, type Lang } from "../lib/i18n";
@@ -89,7 +90,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
   const [refreshing, setRefreshing] = useState(false);
 
   // ---- filters -----------------------------------------------------------
-  const [category, setCategory] = useState<HubPlugin["type"]>("agent");
+  const [category, setCategory] = useState<HubPlugin["type"]>("skill");
   const [source, setSource] = useState<string>(SRC_ALL);
   const [query, setQuery] = useState("");
 
@@ -257,7 +258,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
             <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
             <p className="mt-1 text-sm text-text-secondary">
               浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents
-              等开源。装到所选项目。
+              等开源。skill 装入全局库,agent/plugin 按所选项目安装。
             </p>
           </div>
         )}
@@ -275,25 +276,30 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
 
       {/* filter bar: project target · category seg · source · search */}
       <div className="mt-4 flex flex-wrap items-center gap-2.5">
-        <label className="flex items-center gap-1.5 text-xs text-text-dim">
-          安装到
-          <Combobox
-            value={project}
-            onChange={(v) => {
-              // Switching the install target re-fetches (the load effect keys
-              // on `project`); show the loading state immediately for feedback.
-              setProject(v);
-              setState({ kind: "loading" });
-            }}
-            options={projectOptions}
-            searchable={projects.length > 8}
-            placeholder="（无项目 · 仅浏览）"
-            searchPlaceholder="搜索项目…"
-            ariaLabel="安装目标项目"
-            className="min-w-[160px]"
-            buttonClassName="h-8 text-xs"
-          />
-        </label>
+        {needsProjectTarget(category) ? (
+          <label
+            data-testid="market-project-picker"
+            className="flex items-center gap-1.5 text-xs text-text-dim"
+          >
+            安装到
+            <Combobox
+              value={project}
+              onChange={(v) => {
+                // Switching the install target re-fetches (the load effect keys
+                // on `project`); show the loading state immediately for feedback.
+                setProject(v);
+                setState({ kind: "loading" });
+              }}
+              options={projectOptions}
+              searchable={projects.length > 8}
+              placeholder="（无项目 · 仅浏览）"
+              searchPlaceholder="搜索项目…"
+              ariaLabel="安装目标项目"
+              className="min-w-[160px]"
+              buttonClassName="h-8 text-xs"
+            />
+          </label>
+        ) : null}
 
         <div className="flex items-center gap-0.5 rounded-md bg-surface-800 p-0.5" role="tablist">
           {CATEGORIES.map((c) => (

@@ -45,7 +45,7 @@ describe("shellViewFor routes the four views", () => {
     expect(shellViewFor("/flow")).toBe("flow");
     expect(shellViewFor("/flow/evolution")).toBe("flow");
     expect(shellViewFor("/settings")).toBe("settings");
-    expect(shellViewFor("/settings/market")).toBe("settings");
+    expect(shellViewFor("/flow/market")).toBe("flow");
     expect(shellViewFor("/anything-else")).toBe("home");
   });
 });
@@ -88,7 +88,7 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     expect(flow).toContain('data-testid="workflow-tab-skills"');
     const settings = routed("/settings");
     expect(settings).toContain('data-testid="settings-view"');
-    expect(settings).toContain('data-testid="set-item-market"');
+    expect(settings).toContain('data-testid="set-item-general"');
   });
 
   it("has NO full-width top bar — nav lives in the sidebar", () => {

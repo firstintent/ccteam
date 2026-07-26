@@ -215,9 +215,10 @@ describe("JoinCard", () => {
     expect(html).not.toContain('data-testid="join-copy"');
   });
 
-  it("HostsView embeds the join card", () => {
+  it("HostsView points to Settings · Access instead of embedding the join card", () => {
     const html = renderToString(<HostsView />);
-    expect(html).toContain('data-testid="join-card"');
-    expect(html).toContain('data-testid="join-command"');
+    expect(html).not.toContain('data-testid="join-card"');
+    expect(html).toContain('href="/settings/access"');
+    expect(html).toContain("连接新主机 → 设置·接入");
   });
 });

@@ -9,11 +9,15 @@ import { t, type Lang } from "./i18n";
  *  the seg button shows; "Agents / Roles" covers the `agent` type (a role IS an
  *  agent `.md`). */
 export const CATEGORIES: { type: HubPlugin["type"]; label: string }[] = [
-  { type: "agent", label: "Agents / Roles" },
   { type: "skill", label: "Skills" },
+  { type: "agent", label: "Agents / Roles" },
   { type: "workflow", label: "Workflows" },
   { type: "plugin", label: "Plugins" },
 ];
+
+export function needsProjectTarget(type: HubPlugin["type"]): boolean {
+  return type === "agent" || type === "plugin";
+}
 
 /** Human label for a plugin's install button / pill, per `installed_status`.
  *  `not_installed` → an action ("安装"); the other two name the current state. */

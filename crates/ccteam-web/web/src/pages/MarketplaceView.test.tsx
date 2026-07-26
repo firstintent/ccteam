@@ -28,6 +28,7 @@ import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import MarketplaceView, { InstallButton, PluginCard } from "./MarketplaceView";
 import type { HubPlugin, InstalledStatus } from "../lib/marketplaceApi";
+import { CATEGORIES, needsProjectTarget } from "../lib/marketplaceFormat";
 
 const realFetch = globalThis.fetch;
 
@@ -66,8 +67,23 @@ describe("MarketplaceView initial render", () => {
     expect(html).toContain('data-testid="marketplace-view"');
     expect(html).toContain('data-testid="marketplace-loading"');
     // The category seg tabs + search box render immediately (static chrome).
-    expect(html).toContain("Agents / Roles");
+    expect(html).toContain("Skills");
+    expect(html.indexOf("Skills")).toBeLessThan(html.indexOf("Agents / Roles"));
+    expect(html).not.toContain('data-testid="market-project-picker"');
     expect(html).toContain("全部来源");
+  });
+});
+
+describe("marketplace category install target semantics", () => {
+  it("orders skills first and defaults the rendered tab to skill", () => {
+    expect(CATEGORIES.map((c) => c.type)).toEqual(["skill", "agent", "workflow", "plugin"]);
+  });
+
+  it("shows the project target only for agent/plugin categories", () => {
+    expect(needsProjectTarget("agent")).toBe(true);
+    expect(needsProjectTarget("plugin")).toBe(true);
+    expect(needsProjectTarget("skill")).toBe(false);
+    expect(needsProjectTarget("workflow")).toBe(false);
   });
 });
 

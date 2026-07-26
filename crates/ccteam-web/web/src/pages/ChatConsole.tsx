@@ -373,7 +373,7 @@ export default function ChatConsole() {
           <WorkflowView
             tab={routeTab}
             onNav={(t) => navigate(`/flow/${t}`)}
-            onOpenMarket={() => navigate("/settings/market")}
+            onOpenMarket={() => navigate("/flow/market")}
             lang={lang}
             isAdmin={isAdmin}
           />
@@ -381,7 +381,6 @@ export default function ChatConsole() {
           <SettingsView
             tab={routeTab}
             onNav={(t) => navigate(`/settings/${t}`)}
-            rail={railSessions}
           />
         ) : view === "agents" ? (
           <AgentsView

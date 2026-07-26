@@ -1,7 +1,7 @@
 // v0.8.8 F4 — Settings panels: the admin's GLOBAL IM credentials
 // (Telegram + Lark), the tenant's self-serve 「我的 IM bot」, and the
 // admin-only user management table. SettingsView places them: credentials
-// under 设置→账号 (admin), MyImSection under 账号 (tenant), and
+// under 设置→接入 (admin), MyImSection under 账号 (tenant), and
 // UserManagementSection on the standalone 管理员 · Admin tab.
 // Backend SoT: `crates/ccteam-web/src/routes/im_config.rs` (+ `users.rs`);
 // clients: `lib/configApi.ts` + `lib/usersApi.ts`.

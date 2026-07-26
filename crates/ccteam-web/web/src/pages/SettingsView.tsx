@@ -1,27 +1,26 @@
 // v0.8.24 Track A — 设置 top-level view (prototype `#view-settings`):
-// set-nav second column of sub-pages. Tabs: admin sees 运维总览 / 插件市场 /
-// 通用 / 账号 / 管理员; a tenant sees ONLY 插件市场 / 通用 / 账号. 运维总览
+// set-nav second column of sub-pages. Tabs: admin sees 运维总览 / 接入 /
+// 通用 / 账号 / 管理员; a tenant sees ONLY 通用 / 账号. 运维总览
 // combines Status + Hosts; 管理员 carries user management.
 //
 // ACL (红线 §1.6-3, fail-closed via useMe): 运维总览 / 管理员 are
 // admin-only nav items (the backend 403s regardless; this is the UI层
 // beta/visibility gate). The 账号 panel absorbs the old AvatarMenu entirely
-// (头像 / 昵称 / 语言入口 / 登出 + web token) plus IM: a tenant gets the
-// self-serve 「我的 IM bot」, an admin gets the global Telegram/Lark
-// credentials (no standalone IM tab).
+// (头像 / 昵称 / 语言入口 / 登出 + web token); tenants keep the self-serve
+// 「我的 IM bot」 there, while global Telegram/Lark credentials move to Access.
 
 import { useMemo, useState } from "react";
 import {
   Activity,
-  Package,
+  PlugZap,
   SlidersHorizontal,
   User,
   Users,
 } from "lucide-react";
 import HostsView from "./HostsView";
-import MarketplaceView from "./MarketplaceView";
 import StatusView from "./StatusView";
-import SettingsPage, { MyImSection, UserManagementSection } from "./SettingsPage";
+import { MyImSection, UserManagementSection } from "./SettingsPage";
+import AccessView from "./AccessView";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -29,13 +28,12 @@ import { useMe } from "../hooks/useMe";
 import { clearToken, getToken, saveToken } from "../lib/token";
 import { resetToken } from "../lib/meApi";
 import { toastBus } from "../lib/toastBus";
-import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
-export type SettingsTab = "ops" | "market" | "general" | "account" | "admin";
+export type SettingsTab = "ops" | "access" | "general" | "account" | "admin";
 
 const ITEMS: { id: SettingsTab; labelKey: string; adminOnly: boolean; icon: React.ReactNode }[] = [
   { id: "ops", labelKey: "setOps", adminOnly: true, icon: <Activity /> },
-  { id: "market", labelKey: "setMarket", adminOnly: false, icon: <Package /> },
+  { id: "access", labelKey: "setAccess", adminOnly: true, icon: <PlugZap /> },
   { id: "general", labelKey: "setGeneral", adminOnly: false, icon: <SlidersHorizontal /> },
   { id: "account", labelKey: "setAccount", adminOnly: false, icon: <User /> },
   { id: "admin", labelKey: "setAdmin", adminOnly: true, icon: <Users /> },
@@ -55,7 +53,7 @@ export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): S
   const visible = visibleSettingsItems(isAdmin);
   const normalized = tab === "hosts" || tab === "status" ? "ops" : tab;
   if (normalized && (visible as string[]).includes(normalized)) return normalized as SettingsTab;
-  return isAdmin ? "ops" : "market";
+  return isAdmin ? "ops" : "general";
 }
 
 const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
@@ -63,11 +61,9 @@ const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
 export default function SettingsView({
   tab: routeTab,
   onNav,
-  rail = [],
 }: {
   tab?: string;
   onNav?: (tab: SettingsTab) => void;
-  rail?: SessionSummary[];
 }) {
   const { settings, update } = useWebSettings();
   const lang = settings.language;
@@ -103,20 +99,11 @@ export default function SettingsView({
 
       <div className="set-detail">
         <div
-          className={`set-detail-inner fade-in ${active === "market" ? "wide" : ""} ${active === "ops" ? "ops-wide" : ""}`}
+          className={`set-detail-inner fade-in ${active === "ops" ? "ops-wide" : ""}`}
           key={active}
         >
-          {active === "ops" && isAdmin ? <OpsPanel lang={lang} rail={rail} /> : null}
-
-          {active === "market" ? (
-            <>
-              <header>
-                <h1>{t("setMarket")}</h1>
-                <p>{t("marketDesc")}</p>
-              </header>
-              <MarketplaceView embedded />
-            </>
-          ) : null}
+          {active === "ops" && isAdmin ? <OpsPanel lang={lang} /> : null}
+          {active === "access" && isAdmin ? <AccessView lang={lang} /> : null}
 
           {active === "admin" && isAdmin ? <AdminPanel lang={lang} /> : null}
 
@@ -146,11 +133,11 @@ export default function SettingsView({
   );
 }
 
-export function OpsPanel({ lang, rail }: { lang: Lang; rail: SessionSummary[] }) {
+export function OpsPanel({ lang }: { lang: Lang }) {
   return (
     <div className="ops-grid" data-testid="ops-view">
       <section className="ops-panel" aria-label="Status">
-        <StatusView rail={rail} />
+        <StatusView />
       </section>
       <section className="ops-panel" aria-label="Hosts">
         <HostsView lang={lang} />
@@ -412,11 +399,9 @@ export function AccountPanel({
         </div>
       </div>
 
-      {/* IM under 账号: a tenant gets the self-serve 「我的 IM bot」
-          (v0.8.20 F2); an admin gets the GLOBAL Telegram/Lark credentials
-          (SettingsPage, admin-gated + fail-closed). User management is NOT
-          here — it lives on the admin-only 管理员 tab. */}
-      {isAdmin ? <SettingsPage /> : <MyImSection />}
+      {/* Tenant self-serve IM stays under Account. Global admin credentials
+          live under the admin-only Access tab. */}
+      {!isAdmin ? <MyImSection /> : null}
     </div>
   );
 }

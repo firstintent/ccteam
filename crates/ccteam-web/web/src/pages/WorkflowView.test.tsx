@@ -16,14 +16,23 @@ import WorkflowView from "./WorkflowView";
 import { evolutionUrl, mcpServersUrl } from "../lib/workflowApi";
 
 describe("WorkflowView", () => {
-  it("renders the four workflow tabs", () => {
+  it("renders five workflow tabs with marketplace between roles and MCP", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(<WorkflowView />);
     expect(html).toContain("workflow-view");
     expect(html).toContain("workflow-tab-skills");
     expect(html).toContain("workflow-tab-roles");
+    expect(html).toContain("workflow-tab-market");
     expect(html).toContain("workflow-tab-mcp");
     expect(html).toContain("workflow-tab-evolution");
+    expect(html.indexOf("workflow-tab-roles")).toBeLessThan(html.indexOf("workflow-tab-market"));
+    expect(html.indexOf("workflow-tab-market")).toBeLessThan(html.indexOf("workflow-tab-mcp"));
+  });
+
+  it("renders MarketplaceView in the market tab", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(<WorkflowView tab="market" />);
+    expect(html).toContain('data-testid="marketplace-view"');
   });
 
   it("MCP tab: admin sees the register form + prefill templates; tenant does not", () => {

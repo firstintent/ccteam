@@ -2,8 +2,8 @@
 // hosts four mutually-exclusive views:
 //   /                → Home (landing; lazy-create on first message)
 //   /chat/s/:sid     → Conversation
-//   /flow/:tab?      → 工作流 (Skills/Roles/MCP/自进化)
-//   /settings/:tab?  → 设置 (运维总览/插件市场/通用/账号/管理员)
+//   /flow/:tab?      → 工作流 (Skills/Roles/插件市场/MCP/自进化)
+//   /settings/:tab?  → 设置 (运维总览/接入/通用/账号/管理员)
 // Legacy flat routes (marketplace/status/hosts/workflow) redirect into the
 // new IA so old deep links keep working.
 
@@ -55,7 +55,8 @@ export default function App() {
         {/* v0.9.0 W4 — 团队/Team view (admin-only nav entry; beta-gate). */}
         <Route path="/agents" element={<ChatConsole />} />
         {/* legacy flat routes → the new IA */}
-        <Route path="/marketplace" element={<Navigate to="/settings/market" replace />} />
+        <Route path="/settings/market" element={<Navigate to="/flow/market" replace />} />
+        <Route path="/marketplace" element={<Navigate to="/flow/market" replace />} />
         <Route path="/status" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/hosts" element={<Navigate to="/settings/ops" replace />} />
         <Route path="/workflow" element={<Navigate to="/flow" replace />} />

@@ -2,8 +2,8 @@
 //
 // Per machine: host-head (status dot · hostname · 本机/远程 badge · os/arch ·
 // ccteam version · 重新探测) + one `agent-row` per vendor (dot+name | bin |
-// version | MCP badge / register CTA) + the 「连接新主机(卫星节点)」 join
-// card. The ONLY write is register-mcp (ccteam's own server into the vendor
+// version | MCP badge / register CTA) + a Settings · Access pointer for joining
+// satellites. The ONLY write is register-mcp (ccteam's own server into the vendor
 // config — never a vendor login, never a CLI install).
 //
 // Data: GET /api/v1/hosts (registry) fanned into GET /api/v1/hosts/{host};
@@ -229,7 +229,11 @@ export default function HostsView({ lang = "zh" }: { lang?: Lang } = {}) {
         )
       )}
 
-      <JoinCard lang={lang} />
+      <p className="text-xs text-text-muted">
+        <a className="text-brand-400 hover:underline" href="/settings/access">
+          {t("hostsAccessPointer")}
+        </a>
+      </p>
     </div>
   );
 }
