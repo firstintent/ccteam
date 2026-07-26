@@ -56,6 +56,13 @@ export function resolveSettingsTab(tab: string | undefined, isAdmin: boolean): S
   return isAdmin ? "ops" : "general";
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
+export function settingsDetailWidthClass(active: SettingsTab): string {
+  if (active === "ops") return "ops-wide";
+  if (active === "access") return "access-wide";
+  return "";
+}
+
 const AVATARS = ["#f59e0b", "#3b82f6", "#22c55e", "#a855f7", "#64748b"];
 
 export default function SettingsView({
@@ -99,7 +106,7 @@ export default function SettingsView({
 
       <div className="set-detail">
         <div
-          className={`set-detail-inner fade-in ${active === "ops" ? "ops-wide" : ""}`}
+          className={`set-detail-inner fade-in ${settingsDetailWidthClass(active)}`}
           key={active}
         >
           {active === "ops" && isAdmin ? <OpsPanel lang={lang} /> : null}

@@ -719,6 +719,7 @@ html.dark .dot.off { background: #4b4e57; }
 .set-detail-inner > header p { color: var(--text-muted); font-size: 13.5px; font-weight: 300; margin-top: 6px; line-height: 1.5; }
 .set-detail-inner.wide { max-width: 980px; }
 .set-detail-inner.ops-wide { width: 100%; max-width: 1440px; }
+.set-detail-inner.access-wide { width: 100%; max-width: 1200px; }
 /* Vertical ops stack: daemon health first, then full-width host cards. */
 .ops-stack { display: flex; flex-direction: column; gap: 22px; width: 100%; }
 .ops-stack > header h1 { font-size: 21px; font-weight: 600; }
@@ -812,6 +813,7 @@ html.dark .dot.off { background: #4b4e57; }
 .host-project-path { color: var(--text-faint); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .join-card { border: 1px dashed var(--border); border-radius: var(--radius-card); padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.join-card.bare { border: 0; border-radius: 0; padding: 0; }
 .join-card h4 { font-size: 14.5px; font-weight: 600; }
 .join-card p { font-size: 13px; color: var(--text-muted); font-weight: 300; line-height: 1.5; }
 .join-card pre {

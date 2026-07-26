@@ -1,53 +1,27 @@
-// v0.8.8 F4 — SettingsPage smoke tests.
+// v0.8.8 F4 — Settings section smoke tests.
 //
-// SettingsPage = the admin's GLOBAL IM credentials panel (Telegram + Lark);
-// SettingsView embeds it under 设置→账号 for admins. User management moved to
-// the 管理员 · Admin tab (UserManagementSection, exported here).
+// AccessView owns the admin's masked IM-status fetch and composes the named
+// Telegram/Lark sections. User management stays on the 管理员 · Admin tab.
 //
-// No DOM env (no jsdom): use React's `renderToString` to assert the initial
-// HTML shape, mirroring SessionsListPage.test.tsx. The page's success state
-// needs the async getImConfig() to resolve (renderToString won't await), so
-// we assert:
-//   - the page's loading placeholder before the fetch resolves
-//   - the two section sub-components render their key data-testids + that the
+// No DOM env (no jsdom): use React's `renderToString` to assert each named
+// section's initial HTML shape, mirroring SessionsListPage.test.tsx. We assert:
+//   - configured sections default to compact masked summaries
+//   - unconfigured sections default to empty forms, and that the
 //     masked status NEVER echoes a plaintext secret (red-line guard)
 // Interactive paths (token save → chat_id poll loop, overwrite confirm) are
 // covered by configApi.test.ts + manual / Playwright host E2E.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { renderToString } from "react-dom/server";
-import { MemoryRouter } from "react-router-dom";
-import SettingsPage, {
+import {
   LarkSection,
+  MyImSection,
   TelegramSection,
   UserManagementSection,
 } from "./SettingsPage";
 
-const realFetch = globalThis.fetch;
-
-describe("SettingsPage initial render", () => {
-  beforeEach(() => {
-    // Never-resolving fetch keeps the page in its loading state.
-    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-  });
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    vi.restoreAllMocks();
-  });
-
-  it("renders the loading placeholder before the fetch resolves", () => {
-    const html = renderToString(
-      <MemoryRouter>
-        <SettingsPage />
-      </MemoryRouter>,
-    );
-    expect(html).toContain('data-testid="settings-loading"');
-    expect(html).toContain("loading settings");
-  });
-});
-
 describe("Settings sections", () => {
-  it("TelegramSection (configured) renders its testid + masked fingerprint, never the token", () => {
+  it("TelegramSection (configured) defaults to its compact masked summary", () => {
     const html = renderToString(
       <TelegramSection
         status={{ configured: true, bot_token_last4: "…wxyz", chat_id_count: 1 }}
@@ -55,12 +29,12 @@ describe("Settings sections", () => {
       />,
     );
     expect(html).toContain('data-testid="settings-telegram"');
+    expect(html).toContain('data-testid="settings-telegram-summary"');
     expect(html).toContain("…wxyz");
-    // The password input must start empty (no pre-filled secret): the masked
-    // fingerprint is shown as text, but the <input> renders value="".
-    expect(html).toContain('type="password"');
-    expect(html).toContain('value=""');
-    // The fingerprint must NOT appear as an input value (only as label text).
+    expect(html).toContain("bound chats");
+    expect(html).toContain("重置");
+    // Collapsed means no secret field exists until the operator explicitly edits.
+    expect(html).not.toContain('type="password"');
     expect(html).not.toContain('value="…wxyz"');
   });
 
@@ -74,6 +48,7 @@ describe("Settings sections", () => {
     // copy). Also assert the readout shows no fingerprint (em-dash) and the
     // token field still renders empty (red line: never pre-filled).
     expect(html).toContain("未配置");
+    expect(html).toContain('data-testid="settings-telegram-token"');
     expect(html).toContain('type="password"');
     expect(html).toContain('value=""');
   });
@@ -91,17 +66,30 @@ describe("Settings sections", () => {
       />,
     );
     expect(html).toContain('data-testid="settings-lark"');
+    expect(html).toContain('data-testid="settings-lark-summary"');
     expect(html).toContain("…cli9");
     expect(html).toContain("Feishu (CN)");
+    expect(html).not.toContain('type="password"');
   });
 
-  it("LarkSection (unconfigured) warns the empty allowlist is fail-closed", () => {
+  it("LarkSection (unconfigured) uses the compact two-column form and region segment", () => {
     const html = renderToString(
       <LarkSection status={null} onSaved={() => {}} />,
     );
     expect(html).toContain('data-testid="settings-lark"');
+    expect(html).toContain("sm:grid-cols-2");
+    expect(html).toContain('data-testid="settings-lark-region"');
+    expect(html).toContain('rows="2"');
+    expect(html).toContain('type="password"');
+    expect(html).toContain('value=""');
     // Default textarea is empty → fail-closed warning is visible.
     expect(html).toContain("fail-closed");
+  });
+
+  it("keeps the tenant MyImSection named export available to Account", () => {
+    const html = renderToString(<MyImSection />);
+    expect(html).toContain('data-testid="settings-my-im"');
+    expect(html).toContain("我的 IM bot · My bot");
   });
 
   it("UserManagementSection (管理员 tab content) renders its testid + heading", () => {

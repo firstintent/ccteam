@@ -43,7 +43,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link2, MessageSquare, Send, Users } from "lucide-react";
 import {
-  getImConfig,
   pollTelegramChatId,
   saveLark,
   saveTelegramToken,
@@ -65,7 +64,7 @@ import {
   type PutMyImForm,
   type TenantView,
 } from "../lib/usersApi";
-import { useMe } from "../hooks/useMe";
+import { makeT, type Lang } from "../lib/i18n";
 import {
   Badge,
   Button,
@@ -82,130 +81,9 @@ import {
 /** Poll interval for the async Telegram `chat_id` capture. */
 const CHAT_ID_POLL_MS = 1500;
 
-export default function SettingsPage() {
-  // v0.8.18 档1 — this panel is admin-only (global IM credentials are GLOBAL
-  // daemon config); a tenant gets their self-serve MyImSection instead.
-  const { me } = useMe();
-  const [config, setConfig] = useState<ImConfigStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Re-fetch helper so a successful save can refresh the masked status.
-  const reload = useCallback(() => {
-    getImConfig()
-      .then((c) => setConfig(c))
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg !== "UNAUTHENTICATED") setError(msg);
-      });
-  }, []);
-
-  useEffect(() => {
-    // Tenants never load the global IM config (the endpoint 403s for them).
-    if (!me?.is_admin) return;
-    let cancelled = false;
-    getImConfig()
-      .then((c) => {
-        if (!cancelled) setConfig(c);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg !== "UNAUTHENTICATED") setError(msg);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [me]);
-
-  // While the identity loads (and the test's never-resolving fetch), show the
-  // loading placeholder.
-  if (me === null) {
-    return (
-      <div data-testid="settings-loading" className="p-4 text-xs text-text-dim font-mono">
-        loading settings…
-      </div>
-    );
-  }
-  // v0.8.24 A4 — the global IM credentials are an admin-only panel
-  // (SettingsView renders it under 账号 for admins); a tenant reaching this
-  // component directly still only gets its self-serve "我的 IM bot"
-  // (fail-closed — the global credentials 403 anyway).
-  if (!me.is_admin) {
-    return (
-      <div data-testid="settings-tenant" className="flex flex-col gap-6">
-        <MyImSection />
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div
-        data-testid="settings-error"
-        className="p-4 text-xs text-status-error font-mono"
-        role="alert"
-      >
-        failed to load settings: {error}
-      </div>
-    );
-  }
-  if (config === null) {
-    return (
-      <div data-testid="settings-loading" className="p-4 text-xs text-text-dim font-mono">
-        loading settings…
-      </div>
-    );
-  }
-
-  return (
-    <div data-testid="settings-page" className="flex flex-col gap-6">
-      <section className="flex flex-col gap-4">
-        <SectionHeading
-          title="IM 凭据 · Credentials"
-          badge="管理员 · 全局"
-          subtitle="连一个聊天通道,ccteam 才能找到你。下次重启生效。"
-        />
-
-        {config.transport_warning ? (
-          <div
-            data-testid="settings-transport-warning"
-            role="status"
-            className="text-[11px] font-mono text-brand-400 bg-brand-500/10 border border-brand-500/30 rounded-lg px-3 py-2"
-          >
-            {config.transport_warning}
-          </div>
-        ) : null}
-
-        <TelegramSection status={config.telegram} onSaved={reload} />
-        <LarkSection status={config.lark} onSaved={reload} />
-      </section>
-    </div>
-  );
-}
-
 // --------------------------------------------------------------------------
 // Shared chrome
 // --------------------------------------------------------------------------
-
-/** A section heading: title + an admin-scope badge + a one-line lede. */
-function SectionHeading({
-  title,
-  badge,
-  subtitle,
-}: {
-  title: string;
-  badge: string;
-  subtitle: string;
-}) {
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-center gap-2">
-        <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
-        <Badge variant="idle">{badge}</Badge>
-      </div>
-      <p className="text-[11px] text-text-muted">{subtitle}</p>
-    </div>
-  );
-}
 
 /** One row of the right-side label→mono status read-out. `ok` greens it. */
 function ReadoutRow({ label, value, ok }: { label: string; value: string; ok?: boolean }) {
@@ -221,13 +99,9 @@ function ReadoutRow({ label, value, ok }: { label: string; value: string; ok?: b
   );
 }
 
-/** The right-side read-out column (a hairline-separated label→value stack). */
+/** Compact label→value status stack shared by the collapsed summaries. */
 function Readout({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col gap-2 text-[11px] sm:border-l sm:border-surface-800 sm:pl-4">
-      {children}
-    </div>
-  );
+  return <div className="flex flex-col gap-2 text-[11px]">{children}</div>;
 }
 
 // --------------------------------------------------------------------------
@@ -235,13 +109,17 @@ function Readout({ children }: { children: React.ReactNode }) {
 // --------------------------------------------------------------------------
 
 export function TelegramSection({
+  lang = "zh",
   status,
   onSaved,
 }: {
+  lang?: Lang;
   status: ImConfigStatus["telegram"];
   onSaved: () => void;
 }) {
+  const t = makeT(lang);
   const configured = status?.configured ?? false;
+  const [editing, setEditing] = useState(!configured);
   const [token, setToken] = useState("");
   const [pending, setPending] = useState(false);
   // Two-step confirm gate when overwriting an existing token.
@@ -304,6 +182,7 @@ export function TelegramSection({
         `Telegram saved (@${res.bot_username}). Now DM the bot to bind your chat.`,
       );
       setToken("");
+      setEditing(false);
       onSaved();
       // Kick off the async chat_id capture.
       setChatIdStatus("pending");
@@ -344,6 +223,12 @@ export function TelegramSection({
 
   const bound = (status?.chat_id_count ?? 0) > 0;
 
+  function cancelEdit() {
+    setToken("");
+    setConfirming(false);
+    setEditing(false);
+  }
+
   return (
     <Card data-testid="settings-telegram">
       <CardHeader>
@@ -356,8 +241,8 @@ export function TelegramSection({
         )}
       </CardHeader>
 
-      <CardContent className="grid gap-5 sm:grid-cols-[1fr_220px]">
-        <div className="flex flex-col gap-3">
+      {editing ? (
+        <CardContent className="flex flex-col gap-3">
           <form onSubmit={handleSubmit} className="flex flex-col gap-2">
             <Label htmlFor="settings-telegram-token">
               {configured ? "重置 bot token" : "Bot token"}
@@ -366,6 +251,7 @@ export function TelegramSection({
                 fingerprint is text-only, never the input value. */}
             <Input
               id="settings-telegram-token"
+              data-testid="settings-telegram-token"
               type="password"
               autoComplete="off"
               value={token}
@@ -397,39 +283,56 @@ export function TelegramSection({
                   </Button>
                 </>
               ) : (
-                <Button
-                  type="submit"
-                  size="sm"
-                  disabled={pending || token.trim().length === 0}
-                >
-                  {pending ? "保存中…" : configured ? "重置 token" : "保存 token"}
-                </Button>
+                <>
+                  {configured ? (
+                    <Button variant="ghost" size="sm" onClick={cancelEdit} disabled={pending}>
+                      取消
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={pending || token.trim().length === 0}
+                  >
+                    {pending ? "保存中…" : configured ? "重置 token" : "保存 token"}
+                  </Button>
+                </>
               )}
             </div>
           </form>
           <p className="text-[10px] font-mono text-text-dim leading-relaxed">
             token 永不回显,仅显末 4 位;重置走两步确认(破坏性)。从 @BotFather 取 token,保存后 DM 机器人绑定你的 chat。
           </p>
-        </div>
-
-        <Readout>
-          <ReadoutRow
-            label="bot token"
-            value={configured && status ? `(set, ${status.bot_token_last4})` : "—"}
-            ok={configured}
-          />
-          <ReadoutRow
-            label="bound chats"
-            value={configured && status ? String(status.chat_id_count) : "—"}
-            ok={bound}
-          />
-          {configured && status && status.chat_id_count === 0 ? (
-            <p className="text-[11px] font-mono text-status-error leading-relaxed">
-              尚未绑定 chat —— 设好 token 后在下方 DM 机器人。
-            </p>
-          ) : null}
-        </Readout>
-      </CardContent>
+        </CardContent>
+      ) : (
+        <CardContent data-testid="settings-telegram-summary" className="flex flex-col gap-3">
+          <Readout>
+            <ReadoutRow
+              label="bot token"
+              value={configured && status ? `(set, ${status.bot_token_last4})` : "—"}
+              ok={configured}
+            />
+            <ReadoutRow
+              label="bound chats"
+              value={configured && status ? String(status.chat_id_count) : "—"}
+              ok={bound}
+            />
+            {configured && status && status.chat_id_count === 0 ? (
+              <p className="text-[11px] font-mono text-status-error leading-relaxed">
+                尚未绑定 chat —— 设好 token 后在下方 DM 机器人。
+              </p>
+            ) : null}
+          </Readout>
+          <Button
+            variant="outline"
+            size="sm"
+            className="self-end"
+            onClick={() => setEditing(true)}
+          >
+            {t("accessResetCredentials")}
+          </Button>
+        </CardContent>
+      )}
 
       <ChatIdCapture status={chatIdStatus} chatIdLast4={chatIdLast4} onRetry={retryCapture} />
 
@@ -502,13 +405,17 @@ function parseUserIds(raw: string): string[] {
 }
 
 export function LarkSection({
+  lang = "zh",
   status,
   onSaved,
 }: {
+  lang?: Lang;
   status: ImConfigStatus["lark"];
   onSaved: () => void;
 }) {
+  const t = makeT(lang);
   const configured = status?.configured ?? false;
+  const [editing, setEditing] = useState(!configured);
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
   const [useFeishu, setUseFeishu] = useState(status?.use_feishu ?? true);
@@ -533,6 +440,7 @@ export function LarkSection({
       setAppId("");
       setAppSecret("");
       setUserIdsRaw("");
+      setEditing(false);
       onSaved();
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
@@ -553,6 +461,15 @@ export function LarkSection({
     void persist();
   }
 
+  function cancelEdit() {
+    setAppId("");
+    setAppSecret("");
+    setUserIdsRaw("");
+    setUseFeishu(status?.use_feishu ?? true);
+    setConfirming(false);
+    setEditing(false);
+  }
+
   return (
     <Card data-testid="settings-lark">
       <CardHeader>
@@ -565,144 +482,174 @@ export function LarkSection({
         )}
       </CardHeader>
 
-      <CardContent className="grid gap-5 sm:grid-cols-[1fr_220px]">
-        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="settings-lark-appid">App ID</Label>
-            <Input
-              id="settings-lark-appid"
-              type="text"
-              autoComplete="off"
-              value={appId}
-              onChange={(e) => {
-                setAppId(e.target.value);
-                if (confirming) setConfirming(false);
-              }}
-              disabled={pending}
-              spellCheck={false}
-              placeholder="cli_…"
-              className="font-mono"
-            />
-          </div>
-
-          <div className="flex flex-col gap-1.5">
-            {/* Red line: app secret field always starts EMPTY. */}
-            <Label htmlFor="settings-lark-secret">App secret</Label>
-            <Input
-              id="settings-lark-secret"
-              type="password"
-              autoComplete="off"
-              value={appSecret}
-              onChange={(e) => {
-                setAppSecret(e.target.value);
-                if (confirming) setConfirming(false);
-              }}
-              disabled={pending}
-              spellCheck={false}
-              placeholder="(永不回显)"
-              className="font-mono"
-            />
-          </div>
-
-          <fieldset className="flex flex-col gap-1.5">
-            <legend className="text-xs font-medium text-text-dim pb-1">区域 · Region</legend>
-            <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
-              <input
-                type="radio"
-                name="settings-lark-region"
-                checked={useFeishu}
-                onChange={() => setUseFeishu(true)}
-                disabled={pending}
-                className="accent-brand-500"
-              />
-              Feishu (CN)
-            </label>
-            <label className="flex items-center gap-2 text-[11px] font-mono text-text-secondary cursor-pointer">
-              <input
-                type="radio"
-                name="settings-lark-region"
-                checked={!useFeishu}
-                onChange={() => setUseFeishu(false)}
-                disabled={pending}
-                className="accent-brand-500"
-              />
-              Lark (international)
-            </label>
-          </fieldset>
-
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="settings-lark-users">允许的 open_id(逗号或换行分隔)</Label>
-            <Textarea
-              id="settings-lark-users"
-              value={userIdsRaw}
-              onChange={(e) => setUserIdsRaw(e.target.value)}
-              disabled={pending}
-              rows={3}
-              spellCheck={false}
-              placeholder="ou_abc…, ou_def…"
-              className="font-mono"
-            />
-            {userIds.length === 0 ? (
-              <p className="text-[11px] font-mono text-status-error">
-                空 allowlist = fail-closed:机器人谁也不回。
-              </p>
-            ) : (
-              <p className="text-[11px] font-mono text-text-dim">
-                {userIds.length} user{userIds.length === 1 ? "" : "s"} allowed.
-              </p>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2 justify-end">
-            {confirming ? (
-              <>
-                <span className="text-[11px] font-mono text-status-error mr-auto">
-                  覆盖已配置的 Lark 凭据?
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setConfirming(false)}
+      {editing ? (
+        <CardContent>
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="settings-lark-appid">App ID</Label>
+                <Input
+                  id="settings-lark-appid"
+                  type="text"
+                  autoComplete="off"
+                  value={appId}
+                  onChange={(e) => {
+                    setAppId(e.target.value);
+                    if (confirming) setConfirming(false);
+                  }}
                   disabled={pending}
-                >
-                  取消
-                </Button>
-                <Button type="submit" size="sm" variant="destructive" disabled={!canSubmit}>
-                  {pending ? "保存中…" : "确认覆盖"}
-                </Button>
-              </>
-            ) : (
-              <Button type="submit" size="sm" disabled={!canSubmit}>
-                {pending ? "保存中…" : configured ? "重置凭据" : "保存"}
-              </Button>
-            )}
-          </div>
-        </form>
+                  spellCheck={false}
+                  placeholder="cli_…"
+                  className="font-mono"
+                />
+              </div>
 
-        <Readout>
-          <ReadoutRow
-            label="app id"
-            value={configured && status ? `(set, ${status.app_id_last4})` : "—"}
-            ok={configured}
-          />
-          <ReadoutRow
-            label="region"
-            value={
-              configured && status
-                ? status.use_feishu
-                  ? "Feishu (CN)"
-                  : "Lark (intl)"
-                : useFeishu
-                  ? "Feishu (CN)"
-                  : "Lark (intl)"
-            }
-          />
-          <ReadoutRow
-            label="allowed users"
-            value={configured && status ? String(status.allowed_user_id_count) : "—"}
-          />
-        </Readout>
-      </CardContent>
+              <div className="flex flex-col gap-1.5">
+                {/* Red line: app secret field always starts EMPTY. */}
+                <Label htmlFor="settings-lark-secret">App secret</Label>
+                <Input
+                  id="settings-lark-secret"
+                  type="password"
+                  autoComplete="off"
+                  value={appSecret}
+                  onChange={(e) => {
+                    setAppSecret(e.target.value);
+                    if (confirming) setConfirming(false);
+                  }}
+                  disabled={pending}
+                  spellCheck={false}
+                  placeholder="(永不回显)"
+                  className="font-mono"
+                />
+              </div>
+            </div>
+
+            <fieldset className="flex flex-col gap-1.5">
+              <legend className="text-xs font-medium text-text-dim pb-1">区域 · Region</legend>
+              <div
+                data-testid="settings-lark-region"
+                className="grid grid-cols-2 rounded-md border border-surface-700 bg-surface-950 p-0.5"
+              >
+                <button
+                  type="button"
+                  aria-pressed={useFeishu}
+                  onClick={() => setUseFeishu(true)}
+                  disabled={pending}
+                  className={`rounded px-3 py-1.5 text-[11px] font-mono transition-colors ${
+                    useFeishu
+                      ? "bg-brand-500/15 text-brand-400"
+                      : "text-text-dim hover:bg-surface-800 hover:text-text-secondary"
+                  }`}
+                >
+                  Feishu CN
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={!useFeishu}
+                  onClick={() => setUseFeishu(false)}
+                  disabled={pending}
+                  className={`rounded px-3 py-1.5 text-[11px] font-mono transition-colors ${
+                    !useFeishu
+                      ? "bg-brand-500/15 text-brand-400"
+                      : "text-text-dim hover:bg-surface-800 hover:text-text-secondary"
+                  }`}
+                >
+                  Lark intl
+                </button>
+              </div>
+            </fieldset>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="settings-lark-users">允许的 open_id(逗号或换行分隔)</Label>
+              <Textarea
+                id="settings-lark-users"
+                value={userIdsRaw}
+                onChange={(e) => setUserIdsRaw(e.target.value)}
+                disabled={pending}
+                rows={2}
+                spellCheck={false}
+                placeholder="ou_abc…, ou_def…"
+                className="font-mono"
+              />
+              {userIds.length === 0 ? (
+                <p className="text-[11px] font-mono text-status-error">
+                  空 allowlist = fail-closed:机器人谁也不回。
+                </p>
+              ) : (
+                <p className="text-[11px] font-mono text-text-dim">
+                  {userIds.length} user{userIds.length === 1 ? "" : "s"} allowed.
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 justify-end">
+              {confirming ? (
+                <>
+                  <span className="text-[11px] font-mono text-status-error mr-auto">
+                    覆盖已配置的 Lark 凭据?
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setConfirming(false)}
+                    disabled={pending}
+                  >
+                    取消
+                  </Button>
+                  <Button type="submit" size="sm" variant="destructive" disabled={!canSubmit}>
+                    {pending ? "保存中…" : "确认覆盖"}
+                  </Button>
+                </>
+              ) : (
+                <>
+                  {configured ? (
+                    <Button variant="ghost" size="sm" onClick={cancelEdit} disabled={pending}>
+                      取消
+                    </Button>
+                  ) : null}
+                  <Button type="submit" size="sm" disabled={!canSubmit}>
+                    {pending ? "保存中…" : configured ? "重置凭据" : "保存"}
+                  </Button>
+                </>
+              )}
+            </div>
+          </form>
+        </CardContent>
+      ) : (
+        <CardContent data-testid="settings-lark-summary" className="flex flex-col gap-3">
+          <Readout>
+            <ReadoutRow
+              label="app id"
+              value={configured && status ? `(set, ${status.app_id_last4})` : "—"}
+              ok={configured}
+            />
+            <ReadoutRow
+              label="region"
+              value={
+                configured && status
+                  ? status.use_feishu
+                    ? "Feishu (CN)"
+                    : "Lark (intl)"
+                  : useFeishu
+                    ? "Feishu (CN)"
+                    : "Lark (intl)"
+              }
+            />
+            <ReadoutRow
+              label="allowed users"
+              value={configured && status ? String(status.allowed_user_id_count) : "—"}
+            />
+          </Readout>
+          <Button
+            variant="outline"
+            size="sm"
+            className="self-end"
+            onClick={() => setEditing(true)}
+          >
+            {t("accessResetCredentials")}
+          </Button>
+        </CardContent>
+      )}
 
       <CardFooter>app secret 永不回显;重配显「(set, ····wxyz)」+ 空白框 · 下次重启生效</CardFooter>
     </Card>

@@ -255,7 +255,10 @@ export default function HostsView({
  *  origin + newest valid join token from `GET /hosts/join-token`) with a
  *  copy button; offers minting when no valid token exists yet. Admin-only
  *  data — a 403 (tenant) keeps the placeholder command and hides actions. */
-export function JoinCard({ lang = "zh" }: { lang?: Lang } = {}) {
+export function JoinCard({
+  lang = "zh",
+  bare = false,
+}: { lang?: Lang; /** remove the standalone shell when nested in a shared Card */ bare?: boolean } = {}) {
   const t = makeT(lang);
   const [info, setInfo] = useState<JoinTokenInfo | null>(null);
   const [allowed, setAllowed] = useState(true);
@@ -315,7 +318,7 @@ ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
   };
 
   return (
-    <div className="join-card" data-testid="join-card">
+    <div className={`join-card${bare ? " bare" : ""}`} data-testid="join-card">
       <h4>{t("joinTitle")}</h4>
       <p>{t("joinDesc")}</p>
       <pre data-testid="join-command">{command}</pre>

@@ -14,7 +14,11 @@ vi.hoisted(() => {
 });
 
 import { renderToString } from "react-dom/server";
-import AccessView, { externalMcpConfig, LoginLinkRow } from "./AccessView";
+import AccessView, {
+  externalMcpConfig,
+  externalRestSnippet,
+  LoginLinkRow,
+} from "./AccessView";
 
 describe("AccessView", () => {
   beforeEach(() => {
@@ -28,15 +32,43 @@ describe("AccessView", () => {
     expect(JSON.parse(json)).toEqual({ mcpServers: { ccteam: { transport: "http", url: "https://team.example/mcp", headers: { Authorization: "Bearer fake-login-token" }, disabled: false } } });
   });
 
-  it("renders all four access cards and the MCP copy action", () => {
+  it("renders all six access cards in people → programs → machines order", () => {
     const html = renderToString(<AccessView lang="zh" />);
-    expect(html).toContain('data-testid="access-mcp"');
-    expect(html).toContain('data-testid="access-satellite"');
-    expect(html).toContain('data-testid="access-im"');
+    expect(html).toContain('data-testid="settings-telegram"');
+    expect(html).toContain('data-testid="settings-lark"');
     expect(html).toContain('data-testid="access-login-links"');
+    expect(html).toContain('data-testid="access-im"');
+    expect(html).toContain('data-testid="access-mcp"');
+    expect(html).toContain('data-testid="access-api"');
+    expect(html).toContain('data-testid="access-satellite"');
     expect(html).toContain('data-testid="access-mcp-copy"');
+    const people = html.indexOf('data-testid="access-people"');
+    const programs = html.indexOf('data-testid="access-programs"');
+    const machines = html.indexOf('data-testid="access-machines"');
+    expect(people).toBeGreaterThan(-1);
+    expect(people).toBeLessThan(programs);
+    expect(programs).toBeLessThan(machines);
     expect(html).toContain("https://team.example/mcp");
     expect(html).toContain("fake-login-token");
+  });
+
+  it("inlines the real origin and token in the REST example and links the API docs", () => {
+    const html = renderToString(<AccessView lang="en" />);
+    expect(html).toContain('data-testid="access-api-snippet"');
+    expect(html).toContain("TOKEN=&#x27;fake-login-token&#x27;");
+    expect(html).toContain("https://team.example/api/v1/projects/&lt;project-slug&gt;/sessions");
+    expect(html).toContain('href="/api/docs"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain("/api/v1/openapi.json");
+  });
+
+  it("builds the three-step REST example with the documented resource routes", () => {
+    const snippet = externalRestSnippet("https://team.example", "real-token", "en");
+    expect(snippet).toContain("TOKEN='real-token'");
+    expect(snippet).toContain("/api/v1/projects/<project-slug>/sessions");
+    expect(snippet).toContain("/api/v1/sessions/s42/turn");
+    expect(snippet).toContain("/api/v1/sessions/s42/events");
+    expect(snippet).toContain("claude|codex|grok|opencode|kimi");
   });
 
   it("renders a compact tenant row with its copy-login-link action", () => {

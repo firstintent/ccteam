@@ -25,6 +25,7 @@ import SettingsView, {
   OpsPanel,
   maskToken,
   resolveSettingsTab,
+  settingsDetailWidthClass,
   visibleSettingsItems,
 } from "./SettingsView";
 
@@ -68,6 +69,19 @@ describe("resolveSettingsTab", () => {
   it("defaults: admin → ops, tenant → general", () => {
     expect(resolveSettingsTab(undefined, true)).toBe("ops");
     expect(resolveSettingsTab(undefined, false)).toBe("general");
+  });
+});
+
+describe("settings detail width", () => {
+  it("widens Access independently from the wider Ops surface", () => {
+    expect(settingsDetailWidthClass("access")).toBe("access-wide");
+    expect(settingsDetailWidthClass("ops")).toBe("ops-wide");
+    expect(settingsDetailWidthClass("account")).toBe("");
+
+    const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
+    expect(css).toMatch(
+      /\.set-detail-inner\.access-wide\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1200px/s,
+    );
   });
 });
 
@@ -242,8 +256,6 @@ describe("AccountPanel (absorbs the old AvatarMenu)", () => {
   });
 
   it("admin account panel no longer embeds global Telegram/Lark credentials", () => {
-    // Never-resolving fetch keeps the embedded SettingsPage in its loading
-    // state (its own useMe gate) — enough to prove it is mounted for admin.
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
     const html = renderToString(
       <AccountPanel
