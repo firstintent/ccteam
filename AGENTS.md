@@ -25,7 +25,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.10`(owner 2026-07-26 授权发布:merge PR #170 + tag 由规划执行;进度/结果登记 `.loop/state.md`) |
+| Workspace version | `0.9.10`(**已发布** 2026-07-26:main `180e91b` + tag,四平台二进制在 `/releases/latest`;下版 tag 仍需 owner 显式发话) |
 | 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker)+ restart-restore 竞态修复(恢复期 `/sessions` 确定性)+ 接入页宽屏改版(REST API 卡)+ web ACL 收敛(admin 专属只剩用户管理与全局 bot 凭据,权限 = token 身份 × 项目归属)+ 活跃消息 vendor 原生注入(adapter `TurnRouting` 契约;grok `_x.ai/interject` 真机实证 + vendor 自发 turn 合成收口防丢答;kimi/opencode 诚实降级 FIFO) |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 

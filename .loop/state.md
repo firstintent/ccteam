@@ -7,8 +7,8 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.10` 发布执行中**(owner 2026-07-26 深夜授权,登记下表人工门;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**`ae24cb3` 来源已确认 = owner 直驱 codex s131**(无卡口头令,活跃消息 vendor 注入):规划全量 review + **真机 grok 冒烟**发现 P0(完成边竞态丢答案:真机 idle interject 返 `queued` 并自发 turn 自答、`-32000` 降级臂死代码、无主 chunks 被静默丢弃)+ P1(Started 后陈旧 `turn_started_at` 不重盖)等 5 项 → codex s131 修复 **`f3ea8bf`**(vendor 自发 turn 合成收口 `capture_vendor_started_turns`、Started 无条件重盖时钟、bg 拒 Queue、tui 注释、去重复 override)已验收(红→绿在案:`completion_edge_interject_surfaces_vendor_self_started_turn` / `started_submission_refreshes_stale_working_start`)。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh = `/opt/homebrew/bin/gh`**(firstintent,repo+workflow scope;旧 `~/.local/bin/gh` 记载作废)。
-- **在做**:**release 执行链**(规划执行,owner 睡前令「明早 github release 见新版二进制」):治理提交推 dev → PR #170 CI 三 job 按新头绿 → merge(merge commit)→ tag `v0.9.10` → `release.yml` 四平台 + SHA256SUMS 绿 → `/releases/latest` 验证 → `target/debug` 清理(owner 令;daemon 跑 `target/release` 不受影响)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / TEST-MACOS-1 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated);v0.9.10 完成卡已蒸馏移出(本 ship gate)。
+- **版本线**:workspace **`0.9.10` 已发布**(2026-07-26,owner 深夜授权规划全链执行,登记下表人工门;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**`ae24cb3` 来源已确认 = owner 直驱 codex s131**(无卡口头令,活跃消息 vendor 注入):规划全量 review + **真机 grok 冒烟**发现 P0(完成边竞态丢答案:真机 idle interject 返 `queued` 并自发 turn 自答、`-32000` 降级臂死代码、无主 chunks 被静默丢弃)+ P1(Started 后陈旧 `turn_started_at` 不重盖)等 5 项 → codex s131 修复 **`f3ea8bf`**(vendor 自发 turn 合成收口 `capture_vendor_started_turns`、Started 无条件重盖时钟、bg 拒 Queue、tui 注释、去重复 override)已验收(红→绿在案:`completion_edge_interject_surfaces_vendor_self_started_turn` / `started_submission_refreshes_stale_working_start`)。**最近发布 = v0.9.10**(main `180e91b` + tag;上一 tag = v0.9.8,v0.9.9 合 main 未 tag)。**本机 gh = `/opt/homebrew/bin/gh`**(firstintent,repo+workflow scope;旧 `~/.local/bin/gh` 记载作废)。
+- **在做**:无 —— **v0.9.10 已发布**(2026-07-26:治理提交 `9934218` → PR #170 CI 三 job 绿(干净环境仲裁 1687/0 实证)→ merge `180e91b` → tag `v0.9.10` → release run 30218361955 success,四平台 tarball + SHA256SUMS,`/releases/latest` 已指向;本机 `target/debug` 已按 owner 令清理,daemon 跑 `target/release` 不受影响)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / TEST-MACOS-1 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
@@ -21,7 +21,7 @@
 
 | 事项 | 状态 |
 |---|---|
-| **v0.9.10 发布(merge PR #170 + tag + release.yml)** | **已签核·执行中(结果由规划回填)** —— owner 2026-07-26 深夜:「codex完成后,你验收通过后,就进行仓库治理沉淀和文档维护,之后直接tag + release。……明天要能在github release看到新版本二进制包」= 挂验收条件的一次性授权(merge 含于链内,否则无从 tag);验收已过(`f3ea8bf`,门禁证据见基线节) |
+| **v0.9.10 发布(merge PR #170 + tag + release.yml)** | **已消耗(v0.9.10 已发布 2026-07-26)** —— owner 深夜授权「验收通过后…直接tag + release,明早 github release 见二进制」;执行链全绿:merge `180e91b` → tag `v0.9.10` → release run 30218361955 success(四平台 tarball + SHA256SUMS,`/releases/latest` 已指向);常态不变:下个版本 tag 仍需 owner 显式发话 |
 | **tag + 部署** | **已消耗(v0.9.8 已发布)** —— owner 2026-07-23「人肉测过了,打tag、发release」→ 正式 `v0.9.8` tag(main squash `ad1c7c2`)推送,release.yml 全绿(四平台 tarball + SHA256SUMS);`/releases/latest` → v0.9.8,全体用户经 `install.sh`/`ccteam update` 可拿到(v0.9.8 无 rc,owner 已先行人肉测)。上一次 = v0.9.7(`2922f7a`,rc 先行)。**常态不变:push main ≠ 发布,下个版本 tag 仍需 owner 显式发话** |
 | V097(v0.9.7 daemon 重构 + update)W0 拍板 | **已签核消耗** —— owner 2026-07-22「install.sh 检测 systemctl…你来调度进入开发,提交 dev,发 PR」;废 systemd/launchd 先期拍板 + D1–D8 按 PRD v4 默认全「是」消耗(**含 D2 `daemon stop --force` SIGKILL 例外,仅 daemon 自身,agent session 零碰**);merge PR #165 = owner 2026-07-22「已经合并」;`825ae7d` squash 落 main |
 | v0.9.6 compare 契约删除(REST `/compare`×2 + IM `/compare` + web tab) | **已签核消耗** —— owner 2026-07-21 会话拍板「compare 去掉,改会话内编排」,落 dev(T4) |
