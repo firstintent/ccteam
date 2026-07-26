@@ -7,14 +7,14 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.10` 攒齐在 dev**(2026-07-26 ship gate 落盘,owner 拍板「这些功能够一个版本」;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**dev→main PR #170 ready 且 CI 三 job 全绿**(run 30207750892,头 `f003cd14` 含 HERM-1A 竞态修复;merge blocker 已解除)。**owner 流程指令(2026-07-26)**:owner 人肉测试 → **新 session 执行 release**(tag/部署仍 HELD 等 owner 显式发话;merge ≠ 发布)。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh 已装可用**(`~/.local/bin/gh`,firstintent 已登录,PR 操作可由规划执行;旧「本机无 gh」记载作废)。
-- **在做**:无 —— v0.9.10 全部收口(owner 追加的四项已全落:MCP-DX-3 `0a0b26f` / STATUS-SLIM-1 `421e316`(裁决收窄为 wire 瘦身,残量 = STATE-CULL-1 候选)/ HERM-1 A+B `3413364`+`9537720` 全密封 / 收尾修订本 commit)。**基线锚 = 1669/0(本机实测全绿,HERM-1 三只谜红全清)**。**Release 流程(owner 指令)**:owner 人肉测试(需 rebuild:`make install` → `ccteam daemon restart`)→ 合 PR #170(merge commit)→ 新 session 按惯例走 tag/部署(仍 HELD 等 owner 显式发话)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated);完成卡蒸馏留待下一版 ship gate。委派子会话 s135–s138 idle 可停;s153(本版全程工作会话)idle 备查。
+- **版本线**:workspace **`0.9.10` 攒齐在 dev**(2026-07-26 ship gate 落盘,owner 拍板「这些功能够一个版本」;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**dev→main PR #170 ready 且 CI 三 job 全绿**(run 30207750892,头 `f003cd14` 含 HERM-1A 竞态修复;merge blocker 已解除)。**owner 流程指令(2026-07-26)**:owner 人肉测试 → **新 session 执行 release**(tag/部署仍 HELD 等 owner 显式发话;merge ≠ 发布)。**2026-07-27 PR 追加**:接入页改版 ACCESS-IA-1(`e2e7850`)· web ACL 收敛 WEB-ACL-1(`1025450`)· **外部提交 `ae24cb3b`**(作者 `ccm`,harness `submit_turn_routed` 活跃 turn 注入/排队路由;无对应卡,规划初审内容不踩红线(明注「用户 turn 路由非 prompt 注入」、flow 测试仅 Mock 补 trait),**来源待 owner 确认**)—— PR 头前移,CI 按新头重跑。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh 已装可用**(`~/.local/bin/gh`,firstintent 已登录,PR 操作可由规划执行;旧「本机无 gh」记载作废)。
+- **在做**:无 —— v0.9.10 全部收口(owner 追加的四项已全落:MCP-DX-3 `0a0b26f` / STATUS-SLIM-1 `421e316`(裁决收窄为 wire 瘦身,残量 = STATE-CULL-1 候选)/ HERM-1 A+B `3413364`+`9537720` 全密封 / 收尾修订本 commit)。**基线锚 = 1683/0 · vitest 43/436(2026-07-27 追加后,明细见下基线节)**。**Release 流程(owner 指令)**:owner 人肉测试(需 rebuild:`make install` → `ccteam daemon restart`)→ 合 PR #170(merge commit)→ 新 session 按惯例走 tag/部署(仍 HELD 等 owner 显式发话)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated);完成卡蒸馏留待下一版 ship gate。委派子会话 s135–s138 idle 可停;s153(本版全程工作会话)idle 备查。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`)= **1667/0 预期**(v0.9.10 全卡累计:1658 + CULL-1/DX-2 +14 − CULL-2 −12 + BEACON +2 + CULL-3 ±0 + IM-HINT +2 + DX-DOCTOR/其余在 1658 锚内;干净环境仲裁 = PR #170 CI。本机 live-daemon 宿主 2026-07-26 实测 **1666 绿 + 1 红** = HERM-1 族 `web_chat_bridge…survives_restart`(卡在案,另两只本轮转绿,宿主态泄漏非回归))
-- `ccteam-web` 全量:lib + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,非回归)· vitest **422**(v0.9.10 净 0:fleet −7 / Access +4 / Market +2 / WF market +1 已对账)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
+- 确定性口径 `make test-baseline`(`--lib --bins`)= **1683/0 预期**(2026-07-27 本机实测全绿:1669 锚(HERM-1 后)+ WEB-ACL-1 +1(core rotate test)+ 外部 `ae24cb3b` +13;此前逐卡对账沉 git 史;干净环境仲裁 = PR #170 CI)
+- `ccteam-web` 全量:lib + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,非回归)· vitest **436**(43 文件;上口径 422 + ACCESS-IA-1 +12 + WEB-ACL-1 +2)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)
@@ -38,6 +38,7 @@
 | MCP beacon 别名改名(wire 契约变更:`claude_codex_grok_kimi_opencode_status` → `grok_claude_codex_kimi`,旧名即删) | **已签核消耗** —— owner 2026-07-26 IM「必须优化 a」钦点新字面(grok 打头、去 `_status`、opencode 出列);仍为 status 纯别名(BEACON-1 决议「纯别名方便随时改」正是为此);落地 = MCP-DX-3(codex 委派) |
 | spawn project 默认梯扩展(解析语义变更 + `config.yaml` 新键 `default_project` + `~/.ccteam/default_project` scratch 自动供给 + 响应 `project_source` 字段) | **已签核消耗** —— owner 2026-07-26 IM「必须优化 b」拍板服务端默认项目方向,「还有更好的方式吗」= 授权规划定形(五级梯 + configured 键 + lazy scratch);tenant 语义零变;落地 = MCP-DX-3 |
 | status 返回瘦身(MCP status JSON 形变 + core `ProjectState` 退役字段 team/phase/tmux_session 全链清除) | **已签核消耗** —— owner 2026-07-26 IM「status 返回冗余…从架构多层通用性和对称性去修」+「省 token…不能变 token 刺客」+「其他省 token 也你来决定,功能优先其次省 token」;落地 = STATUS-SLIM-1(codex 委派,排 MCP-DX-3 后) |
+| web ACL 收敛(§三 ACL 行「全局·运维面仅 admin」修订 + REST 契约 403→200 放开(status/hosts/skills/项目 MCP 注册/global-attach)+ tenant 自助 reset-token) | **已签核消耗** —— owner 2026-07-27「除了新增用户,其他的功能应该放开给普通用户…在web进行调整。权限的底层逻辑应该是用户token和绑定的项目」;落地 = WEB-ACL-1(`1025450`),红线行文随治理收口 commit 同步。边界判定(规划,owner 如要更宽另令):全局 bot 凭据 `/config/im` 保持 admin(身份对称 —— tenant 家 = `/me/im`,各人管各人凭据);terminal 协议 UI 门保持(冻结面非本令);登录链接卡 admin(= 他人 token 面) |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训

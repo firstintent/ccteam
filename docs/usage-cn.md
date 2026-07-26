@@ -79,7 +79,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ## 一、Web 控制台(推荐)
 
-打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / 插件市场 / MCP / 自进化(只读)。**设置**含 运维总览(daemon 健康 + 主机,admin)/ 接入(外部 Agent MCP 配置、卫星加入、IM 凭据、用户登录链接,admin)/ 通用 / 账号。主题**默认浅色**(可切深色)。
+打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / 插件市场 / MCP / 自进化(只读)。**设置**含 运维总览(daemon 健康 + 主机)/ 接入(外部 Agent MCP 配置、开发者 REST API、卫星加入、IM 凭据 —— 管理员管全局 bot,普通用户配自己的 bot;用户登录链接仍仅管理员)/ 通用 / 账号(人人可自助重置 token);仅「管理员(用户管理)」为管理员专属。主题**默认浅色**(可切深色)。
 
 > **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
 
@@ -93,18 +93,18 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode)、可选力度、spawn 前 HITL 开关。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`(管理员可选);租户默认 roleless。建好回句柄 `s<N>`。
+- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode)、可选力度、spawn 前 HITL 开关。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
 - **历史会话与恢复**:会话列表下点「更多历史 (N) ▸」展开已**停止但未销毁**的会话(灰显)。点任意一个即从磁盘 `meta.json` **冷恢复**(cold-resume) —— 停止的会话、甚至 daemon 重启前的会话都不丢,随时可恢复(手机上 `/use <sid>` 同样能恢复)。「+ 导入历史会话」对话框还能发现你在 ccteam 之外用原生 `claude` 跑过的会话(按工作目录内容匹配),一键**收编**成普通 ccteam 会话,对话原文保留。
 - **定时发送**:点输入框旁的**时钟**进入定时模式 → 填写「再过 **N 分钟** / **N 小时**」(或点快捷 `+15m` / `+30m` / `+1h` / `+2h`),也可选一个**本机时钟**上的绝对时间——界面会统一换算成相对延迟,浏览器时区与 daemon 时区不会打架;下方预览预计本机发送时刻 → 写正文 → 发送。排队条在**输入框上方**,按发送时间排序,点 **×** 取消。到点后正文作为**普通用户消息**进入该会话。定时模式**不能**带附件/技能。上限:每会话最多 20 条 pending,最远约 **7 天**。失败条目会标红并保留 24 小时。
 
-> 部分高级选项(terminal/rmux 协议、在 Web 里选角色、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
+> 部分高级选项(terminal/rmux 协议、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
 
 ### 插件市场:装角色 / 技能 / 工作流
 
-**插件市场** 页(在**工作流**下;默认打开 Skills 分类,项目选择器只在装进项目的类型(agent/plugin)出现)浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库(管理员可见);全局库与项目之间不软链、不复制。
+**插件市场** 页(在**工作流**下;默认打开 Skills 分类,项目选择器只在装进项目的类型(agent/plugin)出现)浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库;全局库与项目之间不软链、不复制。
 
 ### 配置 Telegram / 飞书
 
