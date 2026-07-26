@@ -1281,12 +1281,22 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 /// vendor passthroughs (`/model`, `/compact`, …) are not gateway commands and
 /// never reach this. Web is unaffected — its control face (`submit_web_sid`)
 /// does not call this, and web navigates by GUI.
+const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
+const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
+
 fn command_next_hint(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => "↓ 查看状态 → /status",
-        "/stop" | "/rename" | "/cd" | "/newproject" => "↓ 本项目会话 → /sessions",
+        "/new" | "/use" | "/role" | "/interrupt" => NEXT_HINT_STATUS,
+        "/stop" | "/rename" | "/cd" | "/newproject" => NEXT_HINT_SESSIONS,
         _ => return None,
     })
+}
+
+fn append_next_hint(reply: &mut String, hint: &str) {
+    if !reply.is_empty() {
+        reply.push('\n');
+    }
+    reply.push_str(hint);
 }
 
 impl Gateway {
@@ -2041,10 +2051,7 @@ impl Gateway {
             if chat.channel != "web" {
                 if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
                 {
-                    if !reply.is_empty() {
-                        reply.push('\n');
-                    }
-                    reply.push_str(hint);
+                    append_next_hint(&mut reply, hint);
                 }
             }
             return Ok(vec![reply]);
@@ -2112,7 +2119,13 @@ impl Gateway {
             }
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
-        self.submit_to_current(&chat, message_id, turn).await
+        let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
+        if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
+            if let Some(last) = replies.last_mut() {
+                append_next_hint(last, NEXT_HINT_STATUS);
+            }
+        }
+        Ok(replies)
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
@@ -2722,10 +2735,18 @@ impl Gateway {
     /// or reads as an unknown target.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
         if let Some(slug) = nav.strip_prefix("cd:") {
-            return Ok(vec![self.change_project(chat, slug)?]);
+            let mut reply = self.change_project(chat, slug)?;
+            if chat.channel != "web" {
+                append_next_hint(&mut reply, NEXT_HINT_SESSIONS);
+            }
+            return Ok(vec![reply]);
         }
         if let Some(sid) = nav.strip_prefix("use:") {
-            return Ok(vec![self.use_session(chat, sid).await?]);
+            let mut reply = self.use_session(chat, sid).await?;
+            if chat.channel != "web" {
+                append_next_hint(&mut reply, NEXT_HINT_STATUS);
+            }
+            return Ok(vec![reply]);
         }
         Ok(vec!["invalid selection".to_string()])
     }
@@ -13837,11 +13858,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies.len(), 1);
-        assert!(
-            replies[0].starts_with("project set to beta"),
-            "{}",
-            replies[0]
+        assert_eq!(
+            replies,
+            vec![
+                "project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"
+            ]
         );
         assert_eq!(gateway.current_project_for(&chat), "beta");
 
@@ -13861,7 +13882,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["using session s1"]);
+        assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
         assert_eq!(gateway.current_project_for(&chat), "alpha");
         assert_eq!(
             gateway.current_session.read().unwrap().get(&chat).cloned(),
@@ -15659,6 +15680,53 @@ mod tests {
                 .unwrap();
             assert_eq!(reply, vec![expected.to_string()]);
         }
+    }
+
+    #[tokio::test]
+    async fn im_model_receipt_appends_status_hint() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::Done {
+                receipt: "已切换 model → opus（live）".into(),
+            });
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-im");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let replies = gateway
+            .handle_text("mock", "chat-1", "alice", "/model opus")
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["已切换 model → opus（live）\n↓ 查看状态 → /status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_model_receipt_stays_byte_identical() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.directive_script
+            .lock()
+            .await
+            .push_back(DirectiveOutcome::Done {
+                receipt: "已切换 model → opus（live）".into(),
+            });
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-web");
+        gateway
+            .handle_text("web", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        let replies = gateway
+            .handle_text("web", "chat-1", "alice", "/model opus")
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["已切换 model → opus（live）"]);
     }
 
     /// Concept lock (arch-refactor §8-4 + §8-5): a `NeedsChoice` registers a
