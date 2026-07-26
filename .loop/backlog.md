@@ -15,6 +15,12 @@
 
 ## 当前卡
 
+### MCP-CULL-3 session_spawn `protocol` 参数删除(owner 直驱 2026-07-26;wire 契约变更)
+- **状态**:进行中(codex 委派·2026-07-26) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli(mcp_session_tools 测试) + docs/orchestration` · **建议入口**:codex 委派(规划发卡 + review)
+- **背景**:外部 agent 反馈「grok 必须 acp 只藏在描述括号里,第一次即踩坑」。MCP-DX-2(1ab85da)已把静默覆盖修成派生+冲突可操作错误但为守 wire 形状保留了字段;owner 本日追加拍板:**字段整个删掉** —— 每个 vendor 只有一种最佳协议(claude/codex=stream-json,grok/opencode/kimi=acp),调用方零选择;terminal/tmux 面后续另案退役。先例 = host 参数删除(`HOST_SPAWN_PARAM_REMOVED`,v0.9.2:schema 不列 + 传入即硬错)。
+- **规格**:A. schema 删 `protocol` property(protocol.rs session_spawn inputSchema);B. dispatch 镜像 host 门:`args.get("protocol").is_some()` → 稳定可操作错误(错误文案含 vendor→channel 派生表 + omit 指引;terminal 不再特判,任意值同一错误);`resolve_session_protocol` 简化为纯派生 `derive_session_protocol(vendor)`;spawn 响应/list 的 `protocol` 输出字段保留(观测面);C. 测试翻转:protocol.rs facet 测试 + cli mcp_session_tools schema 测试(protocol 出 presence 列表 + 加 absence 断言,镜像 host)+ dispatch 派生/removal 测试重写(五 vendor 派生 + 任意显式值(含此前被接受的一致值)同错);D. docs:orchestration.md(+cn)facet 列表去 `protocol?`、措辞改「无 protocol 参数,通道由 vendor 派生,传入即硬错(同 host)」——cn 版仍是 DX-2 前旧文(「强制 protocol:"acp"」括号即反馈踩坑点)一并修。**边界零碰**:REST CreateSessionForm/web SPA 协议选择(admin beta,terminal/rmux 退役另案)、内部 SessionProtocol/adapter/session_meta、IM/CLI 命令面。
+- **DoD**:翻转测试对旧代码红、新代码绿(留痕);`make check` clippy 0;`make test-baseline` 红不增(本机 HERM-1 三红口径)、数目净变逐只对账;fmt 干净;writeback 绿。
+
 ### MCP-CULL-1 删除 MCP `screenshot` 工具(owner 直驱 2026-07-26;工具面 8→7)
 - **状态**:完成(1ab85da) · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-web(tests) + docs + AGENTS.md` · **建议入口**:规划(控制)会话(涉契约 + 治理面)
 - **验证**:`doctor --verify-mcp` 定向测试 = 7 工具 0 STUB(json + human 两版式);protocol/dispatch/groups/mcp_serve 四处定义与执行路径全删,screenshot 调用 = `unknown tool` 定向测试(im/cli/web 三层);`CCTEAM_DISABLE_TOOLS=screenshot` 陈旧 token 走 unknown-token 忽略路径(定向测试);web `/screenshot` 路由、core `render_screenshot`、IM `/screen` 零碰(diff 复核);web tenant 测例改用 `status{project}` 保住 User-vs-Admin 路由边界断言。门禁:`make check` clippy 0;`make test-baseline` 1672 绿 + 3 红 = HERM-1 登记同三只(文件零碰),对照 MCP-DX-1 锚净 +2 与新增测试数吻合;fmt 干净;writeback 绿。文档:AGENTS §〇×2/§三(红线行 screenshot 提法改 web 端点,owner cull 令的后果性措辞)/§四 + README + usage(+cn) + orchestration(+cn) + tech-design MCP census(15 时代陈表顺带重写为现势 7 工具,TD-SYNC-1 范围其余不动)。
