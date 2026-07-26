@@ -7,8 +7,8 @@
 
 ## 当前焦点
 
-- **版本线**:workspace **`0.9.10` 攒齐在 dev**(2026-07-26 ship gate 落盘,owner 拍板「这些功能够一个版本」;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**dev→main PR #170 已转 ready,但 CI test job 红 —— owner 勿合,等 HERM-1(A) 修绿**(`web_chat_bridge…survives_restart` :722 restart 后 `/sessions` 1/2,restart-restore 竞态真回归,本机稳红/CI 多红偶绿,codex 在修;fmt/clippy 两 job 绿);**tag/部署 HELD** 等 owner 显式发话(merge ≠ 发布)。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh 已装可用**(`~/.local/bin/gh`,firstintent 已登录,PR 操作可由规划执行;旧「本机无 gh」记载作废)。
-- **在做**:无(v0.9.10 ship gate 已落盘,等 owner 合 PR #170)。本版完成卡明细已蒸馏出队列 → `.loop/history.md` v0.9.10 行 + `docs-local/versions/v0-9-10/README.md`。队列现势卡 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / HERM-1(基线口径内宿主态泄漏,本机现余 1 只)+ 下一版候选 A2A-OBS-1..5(V094 gated)。委派子会话 s135–s138(v0.9.9)+ s153/s154(本版)idle 备查,下轮顺手停。
+- **版本线**:workspace **`0.9.10` 攒齐在 dev**(2026-07-26 ship gate 落盘,owner 拍板「这些功能够一个版本」;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**dev→main PR #170 ready 且 CI 三 job 全绿**(run 30207750892,头 `f003cd14` 含 HERM-1A 竞态修复;merge blocker 已解除)。**owner 流程指令(2026-07-26)**:owner 人肉测试 → **新 session 执行 release**(tag/部署仍 HELD 等 owner 显式发话;merge ≠ 发布)。上一版 v0.9.9 已合 main(`7dfd271`,未 tag);最近发布 = v0.9.8(`ad1c7c2` + tag)。**本机 gh 已装可用**(`~/.local/bin/gh`,firstintent 已登录,PR 操作可由规划执行;旧「本机无 gh」记载作废)。
+- **在做(规划会话 2026-07-26 收口交接,下个 session 起手必读)**:① **MCP-DX-3 已派 s153 未收口**——首派后 s153 只回开工确认即显 idle(A2A-OBS-2 idle/working 矛盾形态,turn 可能仍在跑),已补 nudge dispatch;**下个 session 第一件事 = 核 origin/dev 有无其两 commit 落地并 review**(卡面 + 完整 brief 在 s153 账本 `session_collect{sid:s153}`;未落地则按卡面重派)。② **STATUS-SLIM-1 待排**(排 DX-3 后同域串行,卡面自包含)。③ HERM-1 卡余 B(两只宿主泄漏密封),A 已完成且 CI 仲裁绿。④ DX-3/STATUS-SLIM 落地后补:AGENTS §四 别名新名 + §一 headline + history 行 + PR #170 描述追加。队列其余 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 + 候选 A2A-OBS-1..5(V094 gated)。委派子会话 s135–s138 idle 备查可停;**s153 勿停**(在册工作会话)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
