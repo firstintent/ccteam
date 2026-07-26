@@ -44,8 +44,8 @@ use tokio::sync::{broadcast, Mutex};
 use crate::{
     ccteam_root_from_env, pluck_f64, pluck_pct, pluck_str, AgentSpecBrief, AgentVendor,
     ExecutionMode, HarnessAdapter, HarnessError, HarnessSnapshot, SpawnCtx, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, UnifiedTokenUsage,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER,
+    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId, TurnInput, TurnRouting,
+    TurnSubmission, UnifiedTokenUsage, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
 };
 use ccteam_cost::{
     append_budget_ledger_row, load_budget_ledger, sum_advise_today, Vendor as CostVendor,
@@ -476,6 +476,22 @@ impl HarnessAdapter for CodexExecAdapter {
         }
 
         Ok(turn_id)
+    }
+
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        if routing == TurnRouting::Queue {
+            return Err(HarnessError::NotImplemented {
+                reason: "codex exec does not expose a distinct queued-turn channel".into(),
+            });
+        }
+        self.submit_turn(h, input)
+            .await
+            .map(TurnSubmission::started)
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

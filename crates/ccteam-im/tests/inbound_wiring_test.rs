@@ -170,6 +170,17 @@ impl HarnessAdapter for GatewayAdapter {
         Ok(TurnId::new("gateway-turn"))
     }
 
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         let events = Arc::clone(&self.events);
         Box::pin(futures::stream::unfold((), move |_| {
@@ -254,6 +265,17 @@ impl HarnessAdapter for FailingGatewayAdapter {
         Ok(TurnId::new("failing-stub-turn"))
     }
 
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(futures::stream::empty())
     }
@@ -315,6 +337,16 @@ impl HarnessAdapter for StubAdapter {
             self.submitted_payloads.lock().await.push(s);
         }
         Ok(TurnId::new("stub-turn"))
+    }
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
     }
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(futures::stream::empty())
@@ -1120,6 +1152,16 @@ impl HarnessAdapter for StreamingGatewayAdapter {
         _input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
         Ok(TurnId::new("streaming-turn"))
+    }
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
     }
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         // 15 reasoning ticks @ 20ms = 300ms of activity (past the 200ms idle

@@ -337,6 +337,17 @@ mod tests {
             )))
         }
 
+        async fn submit_turn_routed(
+            &self,
+            h: &ThreadHandle,
+            input: TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+            self.submit_turn(h, input)
+                .await
+                .map(ccteam_harness::TurnSubmission::started)
+        }
+
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let identity = h.identity.clone();
             let queues = Arc::clone(&self.state.event_queues);

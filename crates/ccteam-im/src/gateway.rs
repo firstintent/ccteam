@@ -21,7 +21,8 @@ use ccteam_harness::{
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnInput,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnDisposition,
+    TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -3971,6 +3972,20 @@ impl Gateway {
                         if let Ok(mut last) = session.last_event_at.lock() {
                             *last = Some(Instant::now());
                         }
+                        // A queued adapter submission starts only after its
+                        // predecessor completes. The submit call cannot stamp
+                        // that future boundary, so canonical TurnStarted is the
+                        // authority that opens a fresh working window when the
+                        // previous TurnCompleted already cleared it. Native
+                        // same-turn Inject emits no second TurnStarted and thus
+                        // preserves the original elapsed time.
+                        if matches!(&evt, ThreadEvent::TurnStarted { .. }) {
+                            if let Ok(mut started) = session.turn_started_at.lock() {
+                                if started.is_none() {
+                                    *started = Some(Instant::now());
+                                }
+                            }
+                        }
                         // 👀 ack clear: the FIRST event of a turn is the moment
                         // the silent gap ends (💭 thinking / first progress), so
                         // remove the ack reaction added at dispatch. TAKE the
@@ -5155,25 +5170,14 @@ impl Gateway {
     /// prompts never land in the mirror and a session reopened from history
     /// (`GET /sessions/{sid}`) shows only the agent's replies (the user's
     /// messages "disappear" on session switch). Appended at submit time as a
-    /// user-only record; the pump later appends the assistant-only record for
-    /// the same turn, and `historyToRows` renders them as a user row then an
-    /// assistant row in append order. Best-effort: warns on failure, never
-    /// blocks the turn; holds no gateway lock (O_APPEND atomic write).
+    /// user-only record keyed by the submission's unique input id; the pump
+    /// later appends the assistant-only vendor-turn record. `historyToRows`
+    /// renders both in append order without duplicate row keys when several
+    /// inputs join one vendor turn. Best-effort: warns on failure, never blocks
+    /// the turn; holds no gateway lock (O_APPEND atomic write).
     fn mirror_user_turn(&self, session: &GatewaySession, user_text: &str, turn_id: &str) {
         if user_text.is_empty() {
             return;
-        }
-        // v0.9 T5 — mid-turn steer: a user message mirrored while a prior turn
-        // is still in flight (agent has already produced events). The opening
-        // prompt of a turn is mirrored after submit, usually before the pump
-        // drains → activity still 0 → not steered.
-        let in_flight = session
-            .turn_started_at
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
-        if in_flight && session.activity_events.load(Ordering::SeqCst) > 0 {
-            session.steered_this_turn.store(true, Ordering::SeqCst);
         }
         let Some(project_dir) = self.projects.get(&session.project).cloned() else {
             return;
@@ -5695,10 +5699,10 @@ impl Gateway {
             *target = chat.clone();
         }
         // v0.8.19 `/status` — a real Turn is now in flight: stamp its start (the
-        // pump clears it on `TurnCompleted`). Done for EVERY turn (web included,
-        // unlike the IM-only 👀 ack below) so `/status` shows 🔵 working with the
-        // elapsed time. Directives never reach here (they early-returned above),
-        // so a `/model` switch is correctly NOT counted as a working turn.
+        // pump clears it on `TurnCompleted`). A same-turn Inject preserves the
+        // original timestamp; resetting it here made any long-running turn look
+        // newly started whenever another message arrived. Directives never
+        // reach here, so a `/model` switch is not counted as a working turn.
         // v0.9 T5 — if a prior turn was still in flight this is a mid-turn
         // steer; otherwise clear the steered flag for a fresh turn.
         let was_in_flight = session
@@ -5706,13 +5710,20 @@ impl Gateway {
             .lock()
             .map(|g| g.is_some())
             .unwrap_or(false);
-        if was_in_flight {
-            session.steered_this_turn.store(true, Ordering::SeqCst);
-        } else {
+        let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
+        let requested_routing = TurnRouting::Inject;
+        let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
+        if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
-        }
-        if let Ok(mut started) = session.turn_started_at.lock() {
-            *started = Some(Instant::now());
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = Some(Instant::now());
+            }
+        } else if provisional_inject {
+            // Mark before awaiting the vendor acknowledgement: the active turn
+            // may complete immediately after accepting an interjection. An
+            // adapter that reports an actual Queue below rolls this provisional
+            // bit back while the original turn is still active.
+            session.steered_this_turn.store(true, Ordering::SeqCst);
         }
         // 👀 ack: add the transient "received, processing" reaction on the
         // inbound IM message the moment this turn is dispatched, filling the
@@ -5755,7 +5766,7 @@ impl Gateway {
         // session so the retry sees the resumed thread/adapter.
         let submit_wait = gateway_submit_timeout_duration();
         let mut attempt: u8 = 0;
-        let turn_id = loop {
+        let submitted = loop {
             attempt += 1;
             let outcome = {
                 let session = self
@@ -5764,24 +5775,48 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
                 tokio::time::timeout(
                     submit_wait,
-                    session
-                        .adapter
-                        .submit_turn(&session.thread, TurnInput::UserText(payload.clone())),
+                    session.adapter.submit_turn_routed(
+                        &session.thread,
+                        TurnInput::UserText(payload.clone()),
+                        requested_routing,
+                    ),
                 )
                 .await
             };
             match outcome {
                 Err(_) => {
-                    return Err(anyhow!(
+                    break Err(anyhow!(
                         "submit timed out after {submit_wait:?} for {session_id}"
-                    ))
+                    ));
                 }
-                Ok(Ok(id)) => break id,
+                Ok(Ok(submitted)) => break Ok(submitted),
                 Ok(Err(HarnessError::ThreadDied(_))) if attempt == 1 => {
-                    self.resume_dead_session(session_id).await?;
+                    if let Err(error) = self.resume_dead_session(session_id).await {
+                        break Err(error);
+                    }
                     continue;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(error)) => break Err(error.into()),
+            }
+        };
+        let mut submitted = match submitted {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                if provisional_inject {
+                    if let Some(session) = self.sessions.get(session_id) {
+                        let still_active = session
+                            .turn_started_at
+                            .lock()
+                            .map(|started| started.is_some())
+                            .unwrap_or(false);
+                        if still_active {
+                            session
+                                .steered_this_turn
+                                .store(prior_steered, Ordering::SeqCst);
+                        }
+                    }
+                }
+                return Err(error);
             }
         };
         // Re-fetch the session (a retry may have swapped its thread/adapter) for
@@ -5790,10 +5825,32 @@ impl Gateway {
             .sessions
             .get(session_id)
             .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+        if provisional_inject
+            && matches!(
+                submitted.disposition,
+                TurnDisposition::Started | TurnDisposition::Queued
+            )
+        {
+            let still_active = session
+                .turn_started_at
+                .lock()
+                .map(|started| started.is_some())
+                .unwrap_or(false);
+            if still_active {
+                session
+                    .steered_this_turn
+                    .store(prior_steered, Ordering::SeqCst);
+            }
+        }
+        let turn_id = submitted.turn_id.clone();
         if let Ok(mut origins) = session.turn_origins.lock() {
             origins.insert(turn_id.0.clone(), origin);
         }
-        self.mirror_user_turn(session, &user_text, &turn_id.0);
+        self.mirror_user_turn(session, &user_text, &submitted.input_id);
+        // Grok's native interjection path may hold its TurnCompleted boundary
+        // until the accepted input is registered above. Release only after
+        // origin and transcript bookkeeping are visible.
+        submitted.release_completion();
         let drained = self
             .after_turn_submitted(session, start_visible_events, &turn_id.0)
             .await?;
@@ -10274,6 +10331,8 @@ mod tests {
         vendor: AgentVendor,
         starts: AtomicUsize,
         submissions: Arc<Mutex<Vec<(String, String)>>>,
+        routings: Arc<Mutex<Vec<TurnRouting>>>,
+        degrade_inject_to_queue: bool,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
         /// Notified whenever an event is pushed so `events()` can wait rather
         /// than terminate when the queue is momentarily empty (fixes the
@@ -10343,6 +10402,8 @@ mod tests {
                 vendor,
                 starts: AtomicUsize::new(0),
                 submissions: Arc::new(Mutex::new(Vec::new())),
+                routings: Arc::new(Mutex::new(Vec::new())),
+                degrade_inject_to_queue: false,
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 events_notify: Arc::new(tokio::sync::Notify::new()),
                 event_delay: std::time::Duration::ZERO,
@@ -10373,6 +10434,11 @@ mod tests {
 
         fn with_turn_started(mut self) -> Self {
             self.emit_turn_started = true;
+            self
+        }
+
+        fn with_inject_degraded_to_queue(mut self) -> Self {
+            self.degrade_inject_to_queue = true;
             self
         }
 
@@ -10518,6 +10584,30 @@ mod tests {
             // Wake any pump task that is waiting in `events()` for new work.
             self.events_notify.notify_one();
             Ok(TurnId::new(turn_id))
+        }
+
+        async fn submit_turn_routed(
+            &self,
+            h: &ThreadHandle,
+            input: TurnInput,
+            routing: TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+            self.routings.lock().await.push(routing);
+            let had_active = !self.submissions.lock().await.is_empty();
+            let disposition =
+                if self.degrade_inject_to_queue && had_active && routing == TurnRouting::Inject {
+                    TurnDisposition::Queued
+                } else if had_active && routing == TurnRouting::Inject {
+                    TurnDisposition::Injected
+                } else {
+                    TurnDisposition::Started
+                };
+            let turn_id = self.submit_turn(h, input).await?;
+            Ok(match disposition {
+                TurnDisposition::Started => ccteam_harness::TurnSubmission::started(turn_id),
+                TurnDisposition::Injected => ccteam_harness::TurnSubmission::injected(turn_id),
+                TurnDisposition::Queued => ccteam_harness::TurnSubmission::queued(turn_id),
+            })
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -10686,6 +10776,118 @@ mod tests {
             fake.submissions.lock().await.as_slice(),
             &[("alpha-reviewer-s1".to_string(), "hi".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn mid_turn_inject_preserves_original_working_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        // This sink-less fake emits an answer but no TurnCompleted boundary,
+        // leaving the first vendor turn marked in flight for the steer below.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        let first_started = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("first turn start");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        gateway.submit_to_sid(&sid, "steer".into()).await.unwrap();
+        let after_steer = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("turn remains active");
+        assert_eq!(after_steer, first_started, "Inject must not reset elapsed");
+        assert!(
+            gateway.sessions[&sid]
+                .steered_this_turn
+                .load(Ordering::SeqCst),
+            "same-turn submit is recorded as steered"
+        );
+        assert_eq!(
+            fake.routings.lock().await.as_slice(),
+            &[TurnRouting::Inject, TurnRouting::Inject],
+            "the application route is explicitly Inject for every message"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_inject_is_reported_as_queue_not_steer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default().with_inject_degraded_to_queue());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        gateway.submit_to_sid(&sid, "queued".into()).await.unwrap();
+        assert!(
+            !gateway.sessions[&sid]
+                .steered_this_turn
+                .load(Ordering::SeqCst),
+            "adapter-reported Queue must roll back provisional steer state"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_started_reopens_working_window_for_queued_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let identity = gateway.sessions[&sid].thread.identity.clone();
+        *gateway.sessions[&sid].turn_started_at.lock().unwrap() = None;
+        fake.events.lock().await.push_back((
+            identity,
+            ThreadEvent::TurnStarted {
+                turn_id: "queued-2".into(),
+            },
+        ));
+        fake.events_notify.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if gateway.session_turn_in_flight(&sid) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event pump stamps queued TurnStarted");
     }
 
     /// V0.8.6 W5b — the resource-API spine: create a session via

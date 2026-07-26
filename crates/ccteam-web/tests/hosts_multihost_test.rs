@@ -497,6 +497,14 @@ async fn gateway_create_on_offline_host_fails_clean() {
         ) -> Result<TurnId, HarnessError> {
             unreachable!()
         }
+        async fn submit_turn_routed(
+            &self,
+            _h: &ThreadHandle,
+            _input: TurnInput,
+            _routing: ccteam_harness::TurnRouting,
+        ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+            unreachable!()
+        }
         fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             Box::pin(stream::empty())
         }

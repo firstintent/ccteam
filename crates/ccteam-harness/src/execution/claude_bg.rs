@@ -52,7 +52,7 @@ use crate::{
     default_backend, parse_backgrounded_short_id, parse_pid_from_state, sigterm_pid,
     state_json_path, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError,
     MuxSessionId, MuxSessionKind, MuxSessionSpec, SpawnCtx, ThreadEvent, ThreadHandle, TurnId,
-    TurnInput, CLAUDE_BIN_ENV,
+    TurnInput, TurnRouting, TurnSubmission, CLAUDE_BIN_ENV,
 };
 use crate::{Directive, DirectiveOutcome, ThreadStatus};
 
@@ -267,6 +267,17 @@ impl HarnessAdapter for ClaudeBgAdapter {
         // `SpawnCtx::extra_args` at `start_thread` time. We synthesize
         // a turn id keyed on the job_id so caller code can correlate.
         Ok(TurnId::new(format!("bg-{}", h.identity)))
+    }
+
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(TurnSubmission::started)
     }
 
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

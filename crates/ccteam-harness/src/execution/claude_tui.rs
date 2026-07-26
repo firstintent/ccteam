@@ -61,7 +61,8 @@ use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput, TurnRouting,
+    TurnSubmission,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -895,6 +896,22 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             "latency claude.sendkeys"
         );
         Ok(TurnId::new(turn_id))
+    }
+
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        if routing == TurnRouting::Queue {
+            return Err(HarnessError::NotImplemented {
+                reason: "claude terminal does not expose a distinct queued-turn channel".into(),
+            });
+        }
+        self.submit_turn(h, input)
+            .await
+            .map(TurnSubmission::injected)
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

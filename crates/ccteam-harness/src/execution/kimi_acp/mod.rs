@@ -33,13 +33,13 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::execution::acp::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
+use crate::execution::acp::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
     ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use protocol::{
@@ -310,6 +310,73 @@ impl KimiAcpAdapter {
             goal: None,
         }
     }
+
+    async fn submit_with_routing(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        let live = self.get_live(&h.identity).ok_or_else(|| {
+            HarnessError::ThreadDied(format!("kimi session {} not live", h.identity))
+        })?;
+        let text = match input {
+            TurnInput::UserText(t) => t,
+            other => {
+                return Err(HarnessError::SubmitFailed(format!(
+                    "kimi_acp: unsupported turn input {other:?}"
+                )));
+            }
+        };
+
+        // Kimi 0.29.1 has an internal `turn.steer`, but its ACP adapter exposes
+        // only `session/prompt` -> `Session.prompt` (busy while active). Keep
+        // the application intent as Inject and degrade explicitly to the shared
+        // FIFO until Kimi exposes a native ACP interjection method.
+        let route = {
+            let mut state = live
+                .state
+                .lock()
+                .map_err(|_| HarnessError::Io("kimi state lock poisoned".into()))?;
+            route_acp_turn(&mut state, &text, routing, false)
+        };
+        match route {
+            AcpTurnRoute::Start {
+                turn_id,
+                turn_done,
+                prompt_sent,
+            } => {
+                AcpTurnRunner {
+                    transport: Arc::clone(&live.transport),
+                    state: Arc::clone(&live.state),
+                    event_tx: live.event_tx.clone(),
+                    session_id: live.session_id.clone(),
+                    tuning: AcpTurnTuning {
+                        finalize_barrier: FINALIZE_BARRIER,
+                        post_finalize_sleep: None,
+                        label: "kimi",
+                    },
+                }
+                .spawn(turn_id.clone(), turn_done, prompt_sent, text);
+                Ok(TurnSubmission::started(TurnId(turn_id)))
+            }
+            AcpTurnRoute::Queue {
+                turn_id,
+                degraded_from_inject,
+            } => {
+                if degraded_from_inject {
+                    tracing::debug!(
+                        turn_id = %turn_id,
+                        "kimi ACP has no native interject method; queued active-turn message"
+                    );
+                }
+                Ok(TurnSubmission::queued(TurnId(turn_id)))
+            }
+            AcpTurnRoute::Inject { .. } => Err(HarnessError::Io(
+                "kimi ACP routing selected unsupported native inject".into(),
+            )),
+        }
+    }
 }
 
 fn spawn_notif_dispatcher(
@@ -500,61 +567,18 @@ impl HarnessAdapter for KimiAcpAdapter {
         h: &ThreadHandle,
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
-        let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("kimi session {} not live", h.identity))
-        })?;
+        self.submit_with_routing(h, input, TurnRouting::Inject)
+            .await
+            .map(|submitted| submitted.turn_id)
+    }
 
-        let text = match input {
-            TurnInput::UserText(t) => t,
-            other => {
-                return Err(HarnessError::SubmitFailed(format!(
-                    "kimi_acp: unsupported turn input {other:?}"
-                )));
-            }
-        };
-
-        // Unique per-process id (timestamp + seq) so two turns steered in the
-        // same millisecond never collide in the pending queue / experience log.
-        let turn_id = next_acp_turn_id();
-        // Barrier the dispatcher fires on the turn boundary so finalize sees
-        // every buffered chunk (see FINALIZE_BARRIER / SessionTranslateState).
-        let turn_done = Arc::new(tokio::sync::Notify::new());
-        // Reserve the buffer if idle (→ spawn the runner) or queue behind the
-        // in-flight turn (the runner drains FIFO). The gateway steers by firing
-        // a fresh submit_turn mid-turn, exactly like Claude/Codex; ACP prompts
-        // serialize natively, so we queue rather than reject.
-        let spawn_runner = {
-            let mut st = live
-                .state
-                .lock()
-                .map_err(|_| HarnessError::Io("kimi state lock poisoned".into()))?;
-            if st.buffer.is_some() {
-                st.pending.push_back((turn_id.clone(), text.clone()));
-                false
-            } else {
-                st.begin_turn(turn_id.clone(), Arc::clone(&turn_done));
-                true
-            }
-        };
-
-        if spawn_runner {
-            AcpTurnRunner {
-                transport: Arc::clone(&live.transport),
-                state: Arc::clone(&live.state),
-                event_tx: live.event_tx.clone(),
-                session_id: live.session_id.clone(),
-                tuning: AcpTurnTuning {
-                    finalize_barrier: FINALIZE_BARRIER,
-                    // Kimi's ACP `session/update` stream carries no usage
-                    // (PRD §2) — nothing races the response worth waiting for.
-                    post_finalize_sleep: None,
-                    label: "kimi",
-                },
-            }
-            .spawn(turn_id.clone(), turn_done, text);
-        }
-
-        Ok(TurnId(turn_id))
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        routing: TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_with_routing(h, input, routing).await
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

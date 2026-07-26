@@ -3,6 +3,7 @@
 
 Speaks JSON-RPC 2.0 over stdin/stdout. Supports:
   initialize → notifications/initialized → session/new|load → session/prompt
+  active session/prompt + _x.ai/interject (same-turn, no cancellation)
 Emits agent_thought_chunk + agent_message_chunk, then prompt response with usage.
 Also emits noise: _x.ai/* notifications, string-id skills-reload, isReplay on load.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import uuid
 
 SESSION_ID = "019f4547-0000-7000-8000-00000000cafe"
@@ -31,10 +33,13 @@ KNOWN = {
     },
 }
 
+EMIT_LOCK = threading.Lock()
+
 
 def emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with EMIT_LOCK:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 def notif(method: str, params: dict) -> None:
@@ -103,6 +108,68 @@ def main() -> None:
         except (IndexError, ValueError):
             pass
     loaded = False
+    active_prompt = None
+    active_prompt_lock = threading.Lock()
+
+    def finish_prompt(prompt: dict) -> None:
+        nonlocal active_prompt
+        with active_prompt_lock:
+            if active_prompt is not prompt:
+                return
+            active_prompt = None
+            text = prompt["text"]
+            interjections = list(prompt["interjections"])
+
+        answer = f"echo:{text}" if text else "echo:"
+        if interjections:
+            answer += "|interject:" + "|".join(interjections)
+        # Answer chunks.
+        mid = len(answer) // 2 or 1
+        notif(
+            "session/update",
+            {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": answer[:mid]},
+                },
+            },
+        )
+        notif(
+            "session/update",
+            {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": answer[mid:]},
+                },
+            },
+        )
+        # Redundant turn_completed noise (not SoT), followed by the Grok
+        # prompt-complete extension used by the real interjection path.
+        notif(
+            "_x.ai/session_notification",
+            {"type": "turn_completed", "stop_reason": "end_turn"},
+        )
+        notif(
+            "_x.ai/session/prompt_complete",
+            {"sessionId": session_id},
+        )
+        reply(
+            prompt["req_id"],
+            {
+                "stopReason": "end_turn",
+                "_meta": {
+                    "inputTokens": 100,
+                    "outputTokens": 10,
+                    "cachedReadTokens": 20,
+                    "reasoningTokens": 5,
+                    "totalTokens": 110,
+                    "modelId": current_model,
+                    "promptId": str(uuid.uuid4()),
+                },
+            },
+        )
 
     for line in sys.stdin:
         line = line.strip()
@@ -252,7 +319,16 @@ def main() -> None:
             for block in params.get("prompt") or []:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text") or ""
-            answer = f"echo:{text}" if text else "echo:"
+            with active_prompt_lock:
+                if active_prompt is not None:
+                    err(req_id, -32000, "a turn is already in progress")
+                    continue
+                prompt = {
+                    "req_id": req_id,
+                    "text": text,
+                    "interjections": [],
+                }
+                active_prompt = prompt
             # Thought (must NOT enter final).
             notif(
                 "session/update",
@@ -265,46 +341,42 @@ def main() -> None:
                     },
                 },
             )
-            # Answer chunks.
-            mid = len(answer) // 2 or 1
+            # Keep stdin draining while the prompt is active so the fake can
+            # receive `_x.ai/interject`, just like the real Grok ACP process.
+            delay = 1.0 if text == "__late_base__" else 0.15
+            timer = threading.Timer(delay, finish_prompt, args=(prompt,))
+            timer.daemon = True
+            timer.start()
+            continue
+
+        if method == "_x.ai/interject":
+            text = params.get("text")
+            if not isinstance(text, str):
+                err(req_id, -32602, "Invalid params: text required")
+                continue
+            if params.get("sessionId") != session_id:
+                err(req_id, -32602, "Invalid params: unknown sessionId")
+                continue
+            # Deterministic completion-edge fixture: resolve the active prompt
+            # just before this interjection is admitted. The client must turn
+            # the resulting -32000 into a lossless FIFO follow-up.
+            if text == "__finish_before_interject__":
+                with active_prompt_lock:
+                    finishing = active_prompt
+                if finishing is not None:
+                    finish_prompt(finishing)
+            with active_prompt_lock:
+                if active_prompt is None:
+                    err(req_id, -32000, "no active turn")
+                    continue
+                active_prompt["interjections"].append(text)
+            interjection_id = str(uuid.uuid4())
+            reply(req_id, {"result": {"status": "queued"}})
             notif(
-                "session/update",
+                "_x.ai/session/interjection",
                 {
                     "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": answer[:mid]},
-                    },
-                },
-            )
-            notif(
-                "session/update",
-                {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": answer[mid:]},
-                    },
-                },
-            )
-            # Redundant turn_completed noise (not SoT).
-            notif(
-                "_x.ai/session_notification",
-                {"type": "turn_completed", "stop_reason": "end_turn"},
-            )
-            reply(
-                req_id,
-                {
-                    "stopReason": "end_turn",
-                    "_meta": {
-                        "inputTokens": 100,
-                        "outputTokens": 10,
-                        "cachedReadTokens": 20,
-                        "reasoningTokens": 5,
-                        "totalTokens": 110,
-                        "modelId": current_model,
-                        "promptId": str(uuid.uuid4()),
-                    },
+                    "interjectionId": interjection_id,
                 },
             )
             continue

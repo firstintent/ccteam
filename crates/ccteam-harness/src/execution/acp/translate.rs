@@ -18,7 +18,7 @@ use super::protocol::{
     content_text, cost_from_usage_update, is_replay, is_turn_boundary, usage_from_prompt_result,
     AvailableCommand,
 };
-use super::transport::Notification;
+use super::transport::{AcpWriteBarrier, Notification};
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails};
 
 /// Min gap between liveness `ThreadEvent`s for message/thought chunks.
@@ -31,6 +31,90 @@ const LIVENESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub struct TurnBuffer {
     pub turn_id: String,
     pub text: String,
+}
+
+#[derive(Debug)]
+struct InjectionGateState {
+    accepting: bool,
+    pending: usize,
+}
+
+/// Per-turn coordinator for native ACP interjections.
+///
+/// A submit reserves the active turn while holding `SessionTranslateState`'s
+/// lock. Once `session/prompt` resolves, the runner seals this gate under the
+/// same lock and waits for every reservation to finish before it finalizes the
+/// turn or starts a queued successor. This prevents a late interjection from
+/// crossing a vendor turn boundary.
+#[derive(Debug)]
+pub struct AcpInjectionGate {
+    state: StdMutex<InjectionGateState>,
+    drained: Notify,
+}
+
+impl Default for AcpInjectionGate {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(InjectionGateState {
+                accepting: true,
+                pending: 0,
+            }),
+            drained: Notify::new(),
+        }
+    }
+}
+
+impl AcpInjectionGate {
+    pub fn reserve(self: &Arc<Self>) -> Option<AcpInjectionReservation> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.accepting {
+            return None;
+        }
+        state.pending += 1;
+        Some(AcpInjectionReservation {
+            gate: Some(Arc::clone(self)),
+        })
+    }
+
+    pub fn seal(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.accepting = false;
+        if state.pending == 0 {
+            self.drained.notify_one();
+        }
+    }
+
+    pub async fn wait_drained(&self) {
+        loop {
+            if self.state.lock().unwrap_or_else(|e| e.into_inner()).pending == 0 {
+                return;
+            }
+            self.drained.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending = state.pending.saturating_sub(1);
+        if state.pending == 0 {
+            self.drained.notify_one();
+        }
+    }
+}
+
+/// RAII reservation so cancellation of a timed-out submit can never strand
+/// the turn runner behind an unreleased injection gate.
+#[derive(Debug)]
+pub struct AcpInjectionReservation {
+    gate: Option<Arc<AcpInjectionGate>>,
+}
+
+impl Drop for AcpInjectionReservation {
+    fn drop(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.release();
+        }
+    }
 }
 
 /// Shared live state for one ACP session.
@@ -49,6 +133,12 @@ pub struct SessionTranslateState {
     /// every `agent_message_chunk`. The submit task awaits this before
     /// finalizing so no trailing chunk is lost to the buffer/finalize race.
     pub turn_done: Option<Arc<Notify>>,
+    /// Released once the active `session/prompt` request has entered the ACP
+    /// transport's FIFO writer. Native interjection requests wait on it so a
+    /// back-to-back message can never overtake the prompt it is steering.
+    pub prompt_sent: Option<Arc<AcpWriteBarrier>>,
+    /// Registration gate for native interjections targeting this turn.
+    pub injection_gate: Option<Arc<AcpInjectionGate>>,
     pub available_commands: Vec<AvailableCommand>,
     pub model: Option<String>,
     pub window_tokens: Option<u64>,
@@ -68,11 +158,22 @@ pub struct SessionTranslateState {
 
 impl SessionTranslateState {
     pub fn begin_turn(&mut self, turn_id: impl Into<String>, done: Arc<Notify>) {
+        self.begin_turn_with_prompt_barrier(turn_id, done, None);
+    }
+
+    pub fn begin_turn_with_prompt_barrier(
+        &mut self,
+        turn_id: impl Into<String>,
+        done: Arc<Notify>,
+        prompt_sent: Option<Arc<AcpWriteBarrier>>,
+    ) {
         self.buffer = Some(TurnBuffer {
             turn_id: turn_id.into(),
             text: String::new(),
         });
         self.turn_done = Some(done);
+        self.prompt_sent = prompt_sent;
+        self.injection_gate = Some(Arc::new(AcpInjectionGate::default()));
         // Fresh turn → first thought/message chunk should emit immediately.
         self.last_liveness_at = None;
     }
@@ -91,6 +192,8 @@ impl SessionTranslateState {
     }
 
     pub fn take_buffer(&mut self) -> Option<TurnBuffer> {
+        self.prompt_sent = None;
+        self.injection_gate = None;
         self.buffer.take()
     }
 }
@@ -114,6 +217,13 @@ pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -
     // Standard session/update path (`session/update` or `_x.ai/session/update`).
     if n.method == "session/update" || n.method.ends_with("session/update") {
         return apply_session_update(state, &n.params);
+    }
+
+    // Grok acknowledgement for `_x.ai/interject`. It confirms control-plane
+    // admission only; the injected user echo arrives through session/update
+    // and the active prompt response remains the sole turn boundary.
+    if n.method.ends_with("session/interjection") {
+        return Vec::new();
     }
 
     // Grok live model switch: `_x.ai/session_notification` with
@@ -579,5 +689,22 @@ mod tests {
             done.notified().now_or_never().is_some(),
             "turn boundary must have signalled the barrier"
         );
+    }
+
+    #[test]
+    fn grok_interjection_ack_is_known_control_plane_noise() {
+        let mut state = SessionTranslateState::default();
+        let out = apply_notification(
+            &mut state,
+            &Notification {
+                method: "_x.ai/session/interjection".into(),
+                params: json!({
+                    "sessionId": "s1",
+                    "interjectionId": "i1"
+                }),
+            },
+        );
+        assert!(out.is_empty());
+        assert!(state.warned_methods.is_empty());
     }
 }

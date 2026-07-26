@@ -20,4 +20,4 @@ pub use translate::{
     SessionTranslateState, TurnBuffer,
 };
 pub use transport::{AcpTransport, InboundPolicy, JsonRpcError, Notification};
-pub use turn_runner::{next_acp_turn_id, AcpTurnRunner, AcpTurnTuning};
+pub use turn_runner::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};
