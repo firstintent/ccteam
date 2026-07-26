@@ -35,6 +35,8 @@
 | MCP `screenshot` 工具删除(wire 契约变更,8→7)+ 关联面全删扩令 | **已签核消耗** —— owner 2026-07-26 IM「删除 mcp__ccteam__screenshot,这个是 tmux 时代的遗留产物」= MCP 工具面(1ab85da);同日追加「screenshot 关联的一并删」= web `/screenshot` 路由 + core 渲染管线与四依赖 + IM `/screen` 全退役(614ed9b);§三「不解析终端输出」行措辞随令两次同步(语义不变,pane-snapshot 仍为只读路径);chat_send_file 同问评估 = 保留(IM 外发通道,报告 owner 无异议) |
 | MCP 裸名发现别名(wire 契约变更,7→8) | **已签核消耗** —— owner 2026-07-26「改吧…opencode排到最后」→ 中途改令「纯别名把」「方便后续随时改」= 新增 `claude_codex_grok_kimi_opencode_status`(status 纯 alias,ffcf817);名字自 AgentVendor::ALL 派生测试锁死,后续改/删只动别名不动 status |
 | MCP `session_spawn` `protocol` 参数删除(wire 契约变更:schema property 删除 + 传入即硬错) | **已签核消耗** —— owner 2026-07-26 IM「在 mcp 调用的时候删掉协议字段…每个 vendor 只选一种最佳的协议…这个字段用默认,没必要让调用方去传」;每 vendor 恰一通道(claude/codex=stream-json,grok/opencode/kimi=acp),先例对齐 host 参数(`HOST_SPAWN_PARAM_REMOVED`);落地 = MCP-CULL-3(codex 委派);REST/web 协议面(terminal/rmux admin beta)不在本令,退役另案 |
+| MCP beacon 别名改名(wire 契约变更:`claude_codex_grok_kimi_opencode_status` → `grok_claude_codex_kimi`,旧名即删) | **已签核消耗** —— owner 2026-07-26 IM「必须优化 a」钦点新字面(grok 打头、去 `_status`、opencode 出列);仍为 status 纯别名(BEACON-1 决议「纯别名方便随时改」正是为此);落地 = MCP-DX-3(codex 委派) |
+| spawn project 默认梯扩展(解析语义变更 + `config.yaml` 新键 `default_project` + `~/.ccteam/default_project` scratch 自动供给 + 响应 `project_source` 字段) | **已签核消耗** —— owner 2026-07-26 IM「必须优化 b」拍板服务端默认项目方向,「还有更好的方式吗」= 授权规划定形(五级梯 + configured 键 + lazy scratch);tenant 语义零变;落地 = MCP-DX-3 |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训

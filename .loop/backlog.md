@@ -15,6 +15,12 @@
 
 ## 当前卡
 
+### MCP-DX-3 外部反馈第三轮:beacon 别名改名 + project 默认梯(owner 直驱 2026-07-26「必须优化」两项)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/mcp + crates/ccteam-cli + crates/ccteam-core(config/projects) + crates/ccteam-web(SPA 文案/tests) + docs` · **建议入口**:codex 委派(规划发卡 + review;**域串行**:与 HERM-1A 同前缀 `crates/ccteam-im`+`ccteam-cli`,等其收口后接续派 s153)
+- **背景**:第三轮外部复盘(robchat 宿主,旧二进制)。**已是现势不再动**:wait 240 诚实上限(v0.9.9)/ collect `total_chars`+`truncated`(响应实测有,定向测试在案)/ 完成遥测 tokens·cost(MCP-DX-1)/ 单项目默认+可操作错误(MCP-DX-1/2)。**拒绝项**(记录在案):grok_search/quick_search 高层工具(钢线「改进≠加法」,A 改名即发现面答案)/ project schema enum(宿主缓存 tools/list → 新项目被客户端 schema 拒)/ spawn `reuse:true`(破「永铸新 sid」契约+上下文污染;dispatch-to-existing 已是复用正道,session_list 描述已导)/ 智能截断(账本指针+`since` 游标可取全文)/ status 并 verbose 参数(纯别名为裸名宿主而生,响应等同零认知成本)/ wait 心跳保活(家 = A2A-OBS-4 族已记)。
+- **规格**:A. 别名改名(owner 钦点字面):`claude_codex_grok_kimi_opencode_status` → **`grok_claude_codex_kimi`**(仍 = status 纯别名、响应逐字节等同;grok 打头 = 搜索发现面,去 `_status` 尾缀,opencode 出列;旧名即删无 shim,pre-v1)。三路同判(protocol 定义 / dispatch is_status_call / cli forward_status)+ doctor --verify-mcp 期望集同步;等价测试保留;MCP-BEACON-1 派生锁测试(全员恰一次+opencode 殿后)按 owner 新字面替换为**字面锁**(64 上限断言保留);文档/SPA 名字清扫(README/usage±cn/orchestration±cn/tech-design census/WorkflowView 文案;AGENTS §四 = 规划收口时改)。B. project 默认梯(owner 拍板「服务端默认项目」+ 规划设计定形):Admin 缺省解析 = explicit > `_caller_slug`(cwd,既有)> sole(既有)> **configured**(`~/.ccteam/config.yaml` 新可选键 `default_project: <slug>`,use-time 校验存在,无效跳过不报错)> **scratch 自动供给**(`~/.ccteam/default_project` 就地 init + catalog 注册;按**路径**反查已注册条目,slug 钉 `default` 撞名累加;lazy 首用创建、幂等;真项目 = scaffold/账本/ACL 全常规);tenant 语义零变(仍须点名,sole-visible 默认在案)。spawn 响应加 additive **`project_source`**(`explicit|principal|cwd|sole|configured|scratch`,诚实观测);missing-project 死胡同对 admin 消失,错误路径仅剩 tenant 未点名。
+- **DoD**:定向测试先红后绿(A 字面锁+等价;B 梯级:configured 命中 / 无效 configured 跳过 / scratch 首用创建+二次幂等复用 / `project_source` 各值);doctor --verify-mcp 8 工具 0 STUB(新名);`make check` clippy 0;`make test-baseline` 只增;`make web-check` 绿;fmt 干净;writeback 绿;两 commit 收口(实现→写回)。
+
 ### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
 - **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
 - **背景**:GOV-CE-2 排查实锤 §0 R-code 速查漂移(R1「文件系统是状态面」/R9「crate 拓扑」不在现行 §三;R10 旧 `<team>-<slug>` 路径已随卡修正)+ 正文残留 v0.9.0 前状态(§6.x 仍写「`ccteam init` 种默认 `cto.md`」)。v0.9.10 ship gate 已顺带把三处 web 导航描述改现势(§2 前端落地注 / §6.6 统一 chat-shell 段 / 指针表 web 行),其余仍待全文轮。
@@ -75,7 +81,7 @@
 ### A2A-OBS-3 ACP 首事件计时 + stop tombstone + 真机 smoke
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(acp)` · **建议入口**:dev 会话(排期 = owner 点名下一版时)
 - **背景**:复盘 P1-1/2/4(s130/s131 零输出无法复盘;stop 后 collect 只得 unknown)。
-- **规格**:per-turn 记 `prompt_sent_at/first_event_at/first_tool_at` 等计时(记录不注入,超阈显 starting/silent 不 kill);stopped session 按 TTL 留 tombstone(倾向 24h:sid/task/title/state=stopped/时间戳/turns 指针);kimi 真机首 turn smoke 进 manual gate(不进确定性基线)。
+- **规格**:per-turn 记 `prompt_sent_at/first_event_at/first_tool_at` 等计时(记录不注入,超阈显 starting/silent 不 kill);stopped session 按 TTL 留 tombstone(倾向 24h:sid/task/title/state=stopped/时间戳/turns 指针);kimi 真机首 turn smoke 进 manual gate(不进确定性基线);候选补项(外部反馈第三轮):stale/stuck 行附静态映射 `suggested_action`(如 retry_dispatch/stop_and_respawn,纯查表零 LLM)。
 - **DoD**:计时点齐可解释 s130 类事故;stop 后 collect 得 tombstone 非 unknown。
 
 ### A2A-OBS-4 完成通知 metadata-first + usage 诚实外显
