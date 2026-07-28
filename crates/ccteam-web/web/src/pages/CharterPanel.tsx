@@ -1,9 +1,13 @@
-// v0.9.11 TEAM-2 — 分工 charter tab body (Team page). Three blocks:
+// v0.9.11 TEAM-2 — 分工 charter tab body (Team page). Four blocks:
 //
 // - Vendor roster: one card per (host, vendor) from the hosts agent report —
 //   installed/version/status straight off the API (never invented), plus
 //   live-session count + Σcost aggregated from the SAME graph nodes the
 //   topology tab already fetched (passed down as a prop, no refetch).
+// - 编队起手 playbook cards (TEAM-3): the shared formation definitions from
+//   `lib/playbooks.ts` (same array the Home launcher renders — UI
+//   documentation only, no shipped prompts/personas); the 起手 CTA hands off
+//   to the Home composer via one-shot router state `{ playbook: id }`.
 // - Charter editor: per-project `.ccteam/routing.md` (division-of-labor
 //   charter). project source → editable; global source → read-only fallback
 //   with 拷入起稿 / 空白起稿 CTAs; none → 空白起稿. Saving PUTs the PROJECT
@@ -15,12 +19,14 @@
 // the hook-free views below are exported for the SSR test suite.
 
 import { useEffect, useReducer, useState } from "react";
+import { Link } from "react-router-dom";
 import type { AgentNode } from "../lib/agentsApi";
 import { charterReducer, initialCharter, type CharterState } from "../lib/charterState";
 import { fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
 import { getHostDetail, getHosts, type AgentHealth } from "../lib/hostsApi";
 import { getRouting, putRouting } from "../lib/routingApi";
 import { makeT, type Lang } from "../lib/i18n";
+import { PLAYBOOKS } from "../lib/playbooks";
 import { VendorChip } from "../components/VendorChip";
 import { Markdown } from "../components/Markdown";
 
@@ -91,6 +97,51 @@ export function VendorRosterCards({
           }),
         )}
       </div>
+    </section>
+  );
+}
+
+/** 编队起手 formation cards — hook-free presentational (exported for node-env
+ *  tests) over the SAME `lib/playbooks.ts` array the Home launcher renders.
+ *  Each card = icon + name + one-line description + vendor lineup chips; the
+ *  起手 CTA is a plain `Link` to the Home composer carrying one-shot router
+ *  state `{ playbook: id }` (HomeView applies it like a card click). The
+ *  subdued honesty line keeps the promise exact: prefill only, orchestration
+ *  happens inside the spawned session. */
+export function PlaybookCards({ lang: langProp }: { lang?: Lang }) {
+  const t = makeT(langProp ?? "zh");
+  return (
+    <section className="charter-playbooks-section">
+      <h3>{t("playbookSection")}</h3>
+      <div className="charter-playbooks" data-testid="charter-playbooks">
+        {PLAYBOOKS.map(({ id, key, Icon, vendors }) => (
+          <div key={id} className="charter-playbook-card" data-testid={`playbook-${id}`}>
+            <div className="charter-playbook-head">
+              <Icon />
+              <span className="charter-playbook-name">{t(`${key}T`)}</span>
+            </div>
+            <div className="charter-playbook-desc">{t(`${key}D`)}</div>
+            <div className="charter-playbook-foot">
+              <span className="vs">
+                {vendors.map((v) => (
+                  <VendorChip key={v} vendor={v} />
+                ))}
+              </span>
+              <Link
+                className="btn ghost mini"
+                to="/"
+                state={{ playbook: id }}
+                data-testid={`playbook-launch-${id}`}
+              >
+                {t("playbookLaunch")}
+              </Link>
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="charter-note" data-testid="playbook-honesty">
+        {t("playbookHonesty")}
+      </p>
     </section>
   );
 }
@@ -335,9 +386,7 @@ export default function CharterPanel({
     <div className="agents-charter" data-testid="charter-panel">
       <VendorRosterCards hosts={roster} nodes={nodes} lang={lang} />
 
-      {/* TEAM-3 slot: 编队起手 playbook cards land HERE (between the roster
-          and the charter editor) — a playbook picked from here seeds the
-          charter draft / spawns the formation. */}
+      <PlaybookCards lang={lang} />
 
       <section className="charter-editor-section">
         <div className="charter-editor-head">

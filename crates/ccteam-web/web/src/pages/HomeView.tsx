@@ -6,6 +6,11 @@
 // the 快速开始 two-column template grid (picking a card prefills the
 // composer — recents live in the sidebar rail, not here).
 //
+// v0.9.11 TEAM-3: the template cards are the shared 编队起手 formation
+// playbooks (`lib/playbooks.ts`, also rendered on the Team page 分工 tab);
+// the Team page 起手 CTA lands here as one-shot router state
+// `{ playbook: id }` and applies the SAME composer patch as a card click.
+//
 // LAZY-CREATE: the session is created when the FIRST message is sent —
 // POST /projects (only for an inline 「＋ 新建项目…」 path) → POST
 // /projects/{slug}/sessions (vendor/protocol/host/hitl/role + v0.8.24 A-U3
@@ -14,17 +19,8 @@
 // first turn → navigate to the Conversation view.
 
 import { useEffect, useRef, useState } from "react";
-import {
-  Code,
-  Folder,
-  GitBranch,
-  Globe,
-  Layers,
-  Scale,
-  ShieldCheck,
-  Users,
-  Zap,
-} from "lucide-react";
+import { Folder, GitBranch, Globe } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { ChatComposer } from "../components/ChatComposer";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
@@ -38,7 +34,6 @@ import {
   wireEffort,
   wireProtocol,
   type ComposerDraft,
-  type VendorId,
 } from "../lib/vendors";
 import { createProject as apiCreateProject } from "../lib/dashboardApi";
 import {
@@ -48,31 +43,7 @@ import {
 } from "../lib/sessionsApi";
 import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../lib/hostsApi";
 import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
-
-/** 快速开始 template cards (the grid replacing the old 最近会话 recents —
- *  those live in the sidebar rail). The set showcases ccteam's headline
- *  feature — multi-vendor delegation: the 协作 flagship, the face-off and
- *  cross-review moves, plus each harness on its strength (codex codes
- *  steady / grok is fastest / kimi is cost-effective):
- *  a click prefills the composer with `<key>P` from the i18n table (`<key>T`
- *  = title, `<key>D` = description) AND switches the model draft to
- *  `vendors[0]` so the session really spawns on that harness (lazy-create
- *  untouched — the session is born on send). `vendors` also renders as
- *  brand chips on the card; the 协作 flagship wears all four and leaves the
- *  actual fan-out to session_spawn/dispatch from the claude brain. */
-const TEMPLATES: ReadonlyArray<{
-  id: string;
-  key: string;
-  Icon: typeof Users;
-  vendors: readonly VendorId[];
-}> = [
-  { id: "team", key: "tplTeam", Icon: Users, vendors: ["claude", "codex", "grok", "kimi"] },
-  { id: "compare", key: "tplCompare", Icon: Scale, vendors: ["claude", "codex", "grok"] },
-  { id: "review", key: "tplReview", Icon: ShieldCheck, vendors: ["claude", "codex"] },
-  { id: "code", key: "tplCode", Icon: Code, vendors: ["codex"] },
-  { id: "fast", key: "tplFast", Icon: Zap, vendors: ["grok"] },
-  { id: "bulk", key: "tplBulk", Icon: Layers, vendors: ["kimi"] },
-];
+import { applyPlaybook, playbookFromState, PLAYBOOKS } from "../lib/playbooks";
 
 export interface ProjectHostIdentity {
   host: string;
@@ -237,6 +208,35 @@ export default function HomeView({
   const [pending, setPending] = useState(false);
   // 快速开始 template pick → composer draft text (bump-nonce channel).
   const [prefill, setPrefill] = useState({ text: "", nonce: 0 });
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  // ONE playbook-application path for both entries (card click here, Team
+  // page 起手 handoff below): prefill the composer AND aim the spawn at the
+  // formation's lead harness (host binding may still normalize, same as a
+  // manual pick). Lazy-create untouched — the session is born on send.
+  const pickPlaybook = (id: string) => {
+    const patch = applyPlaybook(id, lang);
+    if (!patch) return;
+    setPrefill((cur) => ({ text: patch.text, nonce: cur.nonce + 1 }));
+    setDraft((cur) => normalizeDraft({ ...cur, vendor: patch.vendor }));
+  };
+
+  // Team page 起手 CTA lands `{ state: { playbook: id } }` on `/`: apply it
+  // exactly like a card click. setState-during-render with a change guard
+  // (the ChatComposer prefill pattern) keyed on location.key applies each
+  // handoff once; the effect only replace-clears the history entry so a
+  // refresh / back-forward doesn't re-apply (one-shot; a StrictMode re-run
+  // is benign — the same patch just bumps the prefill nonce again).
+  const routedPlaybook = playbookFromState(location.state);
+  const [appliedRouteKey, setAppliedRouteKey] = useState<string | null>(null);
+  if (routedPlaybook && location.key !== appliedRouteKey) {
+    setAppliedRouteKey(location.key);
+    pickPlaybook(routedPlaybook);
+  }
+  useEffect(() => {
+    if (playbookFromState(location.state)) navigate(location.pathname, { replace: true });
+  }, [location.state, location.pathname, navigate]);
 
   // Persist the model/effort/protocol/hitl draft.
   useEffect(() => {
@@ -583,20 +583,14 @@ export default function HomeView({
         <div className="quickstart">
           <h3>{t("quickStart")}</h3>
           <div className="tpl-grid" data-testid="template-grid">
-            {TEMPLATES.map(({ id, key, Icon, vendors }) => (
+            {PLAYBOOKS.map(({ id, key, Icon, vendors }) => (
               <button
                 key={id}
                 type="button"
                 className="tpl-card"
                 data-testid={`tpl-${id}`}
                 title={t(`${key}P`)}
-                onClick={() => {
-                  setPrefill((cur) => ({ text: t(`${key}P`), nonce: cur.nonce + 1 }));
-                  // Vendor-strength cards also aim the spawn at their harness
-                  // (host binding may still normalize, same as a manual pick).
-                  const vendor = vendors[0];
-                  if (vendor) setDraft((cur) => normalizeDraft({ ...cur, vendor }));
-                }}
+                onClick={() => pickPlaybook(id)}
               >
                 <div className="t">
                   <Icon />

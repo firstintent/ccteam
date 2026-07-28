@@ -1,12 +1,15 @@
-// v0.9.11 TEAM-2 — charter tab (roster + editor) node-env suite. Same
-// conventions as AgentsView.test.tsx: `renderToString` proves structure;
-// click wiring on the hook-free views is exercised by walking the element
-// tree. The full save chain is covered piecewise (node env, no DOM):
-// button → onSave here, PUT wire shape in routingApi.test.ts, and the
-// saved-state transition in charterState.test.ts.
+// v0.9.11 TEAM-2/3 — charter tab (roster + 编队起手 playbooks + editor)
+// node-env suite. Same conventions as AgentsView.test.tsx: `renderToString`
+// proves structure (Links need a Router context → MemoryRouter); click/link
+// wiring on the hook-free views is exercised by walking the element tree.
+// The full save chain is covered piecewise (node env, no DOM): button →
+// onSave here, PUT wire shape in routingApi.test.ts, and the saved-state
+// transition in charterState.test.ts. The playbook DEFINITIONS (6 entries,
+// vendors, i18n completeness) are pinned in lib/playbooks.test.ts.
 
 import { describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
+import { Link, MemoryRouter } from "react-router-dom";
 
 vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -19,8 +22,14 @@ vi.hoisted(() => {
   }
 });
 
-import CharterPanel, { CharterEditorView, VendorRosterCards, type RosterHost } from "./CharterPanel";
+import CharterPanel, {
+  CharterEditorView,
+  PlaybookCards,
+  VendorRosterCards,
+  type RosterHost,
+} from "./CharterPanel";
 import { charterReducer, initialCharter, type CharterState } from "../lib/charterState";
+import { PLAYBOOKS } from "../lib/playbooks";
 import type { RoutingDoc } from "../lib/routingApi";
 import type { AgentNode } from "../lib/agentsApi";
 import type { AgentHealth } from "../lib/hostsApi";
@@ -253,11 +262,87 @@ describe("CharterEditorView (state machine faces)", () => {
   });
 });
 
+/** Collect every react-router `Link` in a (hook-free) component's element
+ *  tree, in render order — proves the CTA target + one-shot state payload. */
+function collectLinks(
+  el: unknown,
+  out: { to: unknown; state: unknown }[] = [],
+): { to: unknown; state: unknown }[] {
+  if (el == null || typeof el !== "object") return out;
+  if (Array.isArray(el)) {
+    for (const child of el) collectLinks(child, out);
+    return out;
+  }
+  const node = el as {
+    type?: unknown;
+    props?: { to?: unknown; state?: unknown; children?: unknown };
+  };
+  if (node.props) {
+    if (node.type === Link) out.push({ to: node.props.to, state: node.props.state });
+    collectLinks(node.props.children, out);
+  }
+  return out;
+}
+
+describe("PlaybookCards (编队起手 formations)", () => {
+  it("renders one card per shared playbook: icon+name+description+lineup+起手", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <PlaybookCards />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('data-testid="charter-playbooks"');
+    expect(html).toContain("编队起手");
+    for (const pb of PLAYBOOKS) {
+      expect(html).toContain(`data-testid="playbook-${pb.id}"`);
+      expect(html).toContain(`data-testid="playbook-launch-${pb.id}"`);
+    }
+    expect(html).toContain("总控-工班");
+    expect(html).toContain("金字塔用工");
+    // Lineup chips span all five harnesses across the deck.
+    for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
+      expect(html).toContain(`data-vendor="${vendor}"`);
+    }
+    // The CTA is a real link into the Home launcher.
+    expect(html).toContain('href="/"');
+    // Honesty line sits under the cards: prefill only, orchestration
+    // happens in-session via session_* — never a shipped prompt.
+    expect(html).toContain('data-testid="playbook-honesty"');
+    expect(html).toContain("session_*");
+  });
+
+  it("every 起手 CTA targets `/` with its own one-shot { playbook } state", () => {
+    const links = collectLinks(PlaybookCards({}));
+    expect(links).toHaveLength(PLAYBOOKS.length);
+    links.forEach((link, i) => {
+      expect(link.to).toBe("/");
+      expect(link.state).toEqual({ playbook: PLAYBOOKS[i]!.id });
+    });
+  });
+
+  it("speaks the shell language (en)", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <PlaybookCards lang="en" />
+      </MemoryRouter>,
+    );
+    expect(html).toContain("Formation playbooks");
+    expect(html).toContain("Commander + crews");
+    expect(html).toContain("Pyramid staffing");
+    expect(html).toContain("orchestration happens inside the session");
+  });
+});
+
 describe("CharterPanel (shell smoke)", () => {
-  it("renders roster/editor scaffolding + the standing honesty note", () => {
+  it("renders roster/playbooks/editor scaffolding + the standing honesty note", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const html = renderToString(<CharterPanel nodes={[]} />);
+    const html = renderToString(
+      <MemoryRouter>
+        <CharterPanel nodes={[]} />
+      </MemoryRouter>,
+    );
     expect(html).toContain('data-testid="charter-panel"');
+    expect(html).toContain('data-testid="charter-playbooks"');
     expect(html).toContain('data-testid="charter-honesty"');
     expect(html).toContain("MCP status");
     expect(html).toContain("分工宪章");
@@ -265,7 +350,11 @@ describe("CharterPanel (shell smoke)", () => {
 
   it("renders in English when lang='en'", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const html = renderToString(<CharterPanel nodes={[]} lang="en" />);
+    const html = renderToString(
+      <MemoryRouter>
+        <CharterPanel nodes={[]} lang="en" />
+      </MemoryRouter>,
+    );
     expect(html).toContain("Division-of-labor charter");
     expect(html).toContain("never injected");
   });
