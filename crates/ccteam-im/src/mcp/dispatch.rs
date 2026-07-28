@@ -2306,6 +2306,67 @@ fn parse_notify_mode(
     }
 }
 
+/// The completion-notification route for one dispatch. A managed ambient
+/// caller has a parent session transport; admin/user front doors do not.
+/// `notify:off` is distinct from a missing route so it stays intentional and
+/// does not produce an operational warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionNotificationRoute {
+    ParentSession,
+    Disabled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InlineWaitWindow {
+    requested_seconds: u64,
+    effective_seconds: u64,
+}
+
+impl CompletionNotificationRoute {
+    fn resolve(caller_sid: &str, notify: ccteam_harness::NotifyMode) -> Self {
+        if notify == ccteam_harness::NotifyMode::Off {
+            Self::Disabled
+        } else if caller_sid.is_empty() {
+            Self::Unavailable
+        } else {
+            Self::ParentSession
+        }
+    }
+
+    fn deliverable(self) -> bool {
+        self == Self::ParentSession
+    }
+
+    fn async_hint(self) -> &'static str {
+        match self {
+            Self::ParentSession => {
+                "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid})."
+            }
+            Self::Disabled => {
+                "the child runs asynchronously; notifications are disabled; poll session_collect{sid}."
+            }
+            Self::Unavailable => {
+                "the child runs asynchronously; this caller has no completion notification channel; poll session_collect{sid}."
+            }
+        }
+    }
+
+    fn pending_hint(self) -> &'static str {
+        match self {
+            Self::ParentSession => {
+                "still running; you will be notified on completion, or poll session_collect{sid}."
+            }
+            Self::Disabled => {
+                "still running; notifications are disabled; poll session_collect{sid}."
+            }
+            Self::Unavailable => {
+                "still running; this caller has no completion notification channel; poll session_collect{sid}."
+            }
+        }
+    }
+}
+
 /// Derive a short ledger/display label from a spawn's first task: first
 /// non-empty line, capped at 60 chars (with an ellipsis when cut). Display
 /// only — never fed back into any prompt.
@@ -2340,6 +2401,7 @@ async fn dispatch_task(
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
+    let notification_route = CompletionNotificationRoute::resolve(caller_sid, notify);
     let (turn_id, rx) = {
         let mut gw = gateway.lock().await;
         // Subscribe BEFORE submitting so a fast child can't answer before we
@@ -2377,6 +2439,15 @@ async fn dispatch_task(
         }
         (turn_id, rx)
     };
+    if notification_route == CompletionNotificationRoute::Unavailable {
+        tracing::warn!(
+            tool,
+            child_sid = %sid,
+            turn_id = %turn_id,
+            notify = notify.as_str(),
+            "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
+        );
+    }
 
     // ---- wait branch (OFF the gateway lock) ----
     if let Some(rx) = rx {
@@ -2384,10 +2455,13 @@ async fn dispatch_task(
             gateway,
             sid,
             &turn_id,
-            requested_wait_seconds,
-            effective_wait_seconds,
+            InlineWaitWindow {
+                requested_seconds: requested_wait_seconds,
+                effective_seconds: effective_wait_seconds,
+            },
             rx,
             is_delegation,
+            notification_route,
         )
         .await)
     } else {
@@ -2395,10 +2469,12 @@ async fn dispatch_task(
         m.insert("turn_id".to_string(), serde_json::json!(turn_id));
         m.insert("status".to_string(), serde_json::json!("dispatched"));
         m.insert(
+            "notify_deliverable".to_string(),
+            serde_json::json!(notification_route.deliverable()),
+        );
+        m.insert(
             "hint".to_string(),
-            serde_json::json!(
-                "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid})."
-            ),
+            serde_json::json!(notification_route.async_hint()),
         );
         Ok(m)
     }
@@ -2408,34 +2484,44 @@ async fn dispatch_task(
 /// an over-ceiling request actually reaches its shorter effective deadline.
 fn pending_dispatch_response(
     turn_id: &str,
-    requested_wait_seconds: u64,
-    effective_wait_seconds: u64,
+    wait: InlineWaitWindow,
     hit_effective_deadline: bool,
+    notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut response = serde_json::Map::new();
     response.insert("turn_id".to_string(), serde_json::json!(turn_id));
     response.insert("status".to_string(), serde_json::json!("pending"));
-    if hit_effective_deadline && requested_wait_seconds > effective_wait_seconds {
+    response.insert(
+        "notify_deliverable".to_string(),
+        serde_json::json!(notification_route.deliverable()),
+    );
+    if hit_effective_deadline && wait.requested_seconds > wait.effective_seconds {
         response.insert(
             "requested_wait_seconds".to_string(),
-            serde_json::json!(requested_wait_seconds),
+            serde_json::json!(wait.requested_seconds),
         );
         response.insert(
             "effective_wait_seconds".to_string(),
-            serde_json::json!(effective_wait_seconds),
+            serde_json::json!(wait.effective_seconds),
         );
+        let notification = match notification_route {
+            CompletionNotificationRoute::ParentSession => "or await the completion notification.",
+            CompletionNotificationRoute::Disabled => "notifications are disabled.",
+            CompletionNotificationRoute::Unavailable => {
+                "this caller has no completion notification channel."
+            }
+        };
         response.insert(
             "hint".to_string(),
             serde_json::json!(format!(
-                "inline wait capped at {effective_wait_seconds}s; task continues — poll session_collect{{sid, since:turn_id}} or await the completion notification if enabled."
+                "inline wait capped at {}s; task continues — poll session_collect{{sid, since:turn_id}} {notification}",
+                wait.effective_seconds
             )),
         );
     } else {
         response.insert(
             "hint".to_string(),
-            serde_json::json!(
-                "still running; you will be notified on completion, or poll session_collect{sid}."
-            ),
+            serde_json::json!(notification_route.pending_hint()),
         );
     }
     response
@@ -2458,21 +2544,21 @@ fn pending_dispatch_response(
 /// the child's first checkpoint note (and disarmed the real completion's
 /// watch). After a frame arrives, completion additionally requires the child's
 /// turn to no longer be in flight (`session_turn_in_flight`, the same cell the
-/// pump clears on `TurnCompleted`), re-checked on a short poll tick.
+/// pump clears on completion or failure), re-checked on a short poll tick.
 async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
     turn_id: &str,
-    requested_wait_seconds: u64,
-    effective_wait_seconds: u64,
+    wait: InlineWaitWindow,
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
+    notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
     // submit→completion is an honest task-duration approximation for a wait
     // that covers the whole task.
     let wait_started = tokio::time::Instant::now();
-    let deadline = wait_started + std::time::Duration::from_secs(effective_wait_seconds);
+    let deadline = wait_started + std::time::Duration::from_secs(wait.effective_seconds);
     // Re-check cadence for "answer seen, is the turn still in flight?".
     const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
     let mut saw_answer = false;
@@ -2494,7 +2580,7 @@ async fn dispatch_wait_for_completion(
         }
         // While mid-turn with an answer already seen, wake at least every
         // BOUNDARY_POLL to re-check the in-flight cell (the pump clears it on
-        // `TurnCompleted`, which emits no Answer frame of its own).
+        // the terminal boundary, which emits no separate completion frame).
         let wait_slice = if saw_answer {
             remaining.min(BOUNDARY_POLL)
         } else {
@@ -2520,9 +2606,9 @@ async fn dispatch_wait_for_completion(
     if !completed {
         return pending_dispatch_response(
             turn_id,
-            requested_wait_seconds,
-            effective_wait_seconds,
+            wait,
             hit_effective_deadline,
+            notification_route,
         );
     }
 
@@ -2532,7 +2618,7 @@ async fn dispatch_wait_for_completion(
         let gw = gateway.lock().await;
         gw.session_resolve(child_sid)
     };
-    let (result_text, result_turn, cost_usd, tokens_total) = resolved
+    let (result_record, cost_usd, tokens_total) = resolved
         .as_ref()
         .map(|r| {
             let last =
@@ -2547,18 +2633,21 @@ async fn dispatch_wait_for_completion(
                     .ok()
                     .map(|m| (m.cost_usd, m.tokens_total))
                     .unwrap_or((None, None));
-            match last {
-                Some(t) => (t.assistant, Some(t.turn_id), cost, tokens),
-                None => (String::new(), None, cost, tokens),
-            }
+            (last, cost, tokens)
         })
-        .unwrap_or((String::new(), None, None, None));
+        .unwrap_or((None, None, None));
+    let raw_result_text = result_record
+        .as_ref()
+        .map(|turn| turn.assistant.as_str())
+        .unwrap_or_default();
     let result_text = crate::delegation::truncate_head_tail_with_marker(
-        &result_text,
+        raw_result_text,
         INLINE_RESULT_MAX_CHARS,
         |omitted| crate::delegation::full_answer_marker(omitted, child_sid),
     )
     .text;
+    let result_turn = result_record.as_ref().map(|turn| turn.turn_id.clone());
+    let failed = result_record.as_ref().is_some_and(|turn| turn.failed());
 
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
@@ -2568,9 +2657,28 @@ async fn dispatch_wait_for_completion(
 
     let mut m = serde_json::Map::new();
     m.insert("turn_id".to_string(), serde_json::json!(turn_id));
-    m.insert("status".to_string(), serde_json::json!("completed"));
+    m.insert(
+        "status".to_string(),
+        serde_json::json!(if failed { "failed" } else { "completed" }),
+    );
+    m.insert(
+        "notify_deliverable".to_string(),
+        serde_json::json!(notification_route.deliverable()),
+    );
     m.insert("result_text".to_string(), serde_json::json!(result_text));
     m.insert("result_turn".to_string(), serde_json::json!(result_turn));
+    if let Some(kind) = result_record
+        .as_ref()
+        .and_then(|turn| turn.error_kind.as_deref())
+    {
+        m.insert("error_kind".to_string(), serde_json::json!(kind));
+    }
+    if let Some(error) = result_record
+        .as_ref()
+        .and_then(|turn| turn.error.as_deref())
+    {
+        m.insert("error".to_string(), serde_json::json!(error));
+    }
     // Additive telemetry (MCP-DX-1): submit→completion duration (0.1s
     // resolution) + the child's session ledger, so a waiting caller can log
     // per-vendor speed/cost without a second collect round-trip.
@@ -2616,11 +2724,21 @@ fn page_collected_turns(
         .iter()
         .filter(|t| !t.assistant.is_empty())
         .map(|t| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "turn_id": t.turn_id,
                 "ts": t.ts.to_rfc3339(),
                 "content": t.assistant,
-            })
+            });
+            if let Some(outcome) = t.outcome.as_deref() {
+                row["outcome"] = serde_json::json!(outcome);
+            }
+            if let Some(kind) = t.error_kind.as_deref() {
+                row["error_kind"] = serde_json::json!(kind);
+            }
+            if let Some(error) = t.error.as_deref() {
+                row["error"] = serde_json::json!(error);
+            }
+            row
         })
         .collect();
     let truncated = rows.len() > n;
@@ -3587,6 +3705,9 @@ mod session_tool_tests {
         /// the pump folds into an `Answer` (for the dispatch-wait tests).
         /// Default false = empty event stream (existing principal tests).
         answer: bool,
+        /// Optional terminal failure in place of the normal echo + completed
+        /// boundary. Used to prove MCP wait/collect preserve canonical errors.
+        turn_failure: Option<ccteam_harness::ThreadErrorEvent>,
         /// v0.9.5 — when true (with `answer`), `submit_turn` prepends an
         /// interim narration message BEFORE the echo answer + boundary
         /// (models a codex child narrating checkpoints inside one turn).
@@ -3649,28 +3770,38 @@ mod session_tool_tests {
                         },
                     ));
                 }
-                q.push_back((
-                    h.identity.clone(),
-                    ccteam_harness::ThreadEvent::ItemCompleted {
-                        item: ccteam_harness::ThreadItem {
-                            id: "msg-1".into(),
-                            details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
-                                "echo: {text}"
-                            )),
+                if let Some(err) = self.turn_failure.clone() {
+                    q.push_back((
+                        h.identity.clone(),
+                        ccteam_harness::ThreadEvent::TurnFailed {
+                            turn_id: format!("turn-{}", h.identity),
+                            err,
                         },
-                    },
-                ));
-                // Every REAL adapter follows the answer with a turn boundary —
-                // required since v0.9.5: a `wait_seconds` dispatch completes on
-                // the boundary (turn no longer in flight), not the first frame.
-                q.push_back((
-                    h.identity.clone(),
-                    ccteam_harness::ThreadEvent::TurnCompleted {
-                        turn_id: format!("turn-{}", h.identity),
-                        usage: Default::default(),
-                        model: None,
-                    },
-                ));
+                    ));
+                } else {
+                    q.push_back((
+                        h.identity.clone(),
+                        ccteam_harness::ThreadEvent::ItemCompleted {
+                            item: ccteam_harness::ThreadItem {
+                                id: "msg-1".into(),
+                                details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
+                                    "echo: {text}"
+                                )),
+                            },
+                        },
+                    ));
+                    // Every REAL adapter follows the answer with a turn boundary —
+                    // required since v0.9.5: a `wait_seconds` dispatch completes on
+                    // the boundary (turn no longer in flight), not the first frame.
+                    q.push_back((
+                        h.identity.clone(),
+                        ccteam_harness::ThreadEvent::TurnCompleted {
+                            turn_id: format!("turn-{}", h.identity),
+                            usage: Default::default(),
+                            model: None,
+                        },
+                    ));
+                }
                 drop(q);
                 self.notify.notify_one();
             }
@@ -4823,6 +4954,9 @@ mod session_tool_tests {
             assistant: format!("a-{id}"),
             usage: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         }
     }
 
@@ -4956,7 +5090,7 @@ mod session_tool_tests {
         delay_ms: u64,
         project_dir: &std::path::Path,
     ) -> (GatewayHandle, String) {
-        dispatch_gateway_opts(answer, false, delay_ms, project_dir).await
+        dispatch_gateway_opts(answer, false, delay_ms, None, project_dir).await
     }
 
     /// [`dispatch_gateway`] with the narration knob (v0.9.5 wait-boundary test).
@@ -4964,6 +5098,7 @@ mod session_tool_tests {
         answer: bool,
         narrate: bool,
         delay_ms: u64,
+        turn_failure: Option<ccteam_harness::ThreadErrorEvent>,
         project_dir: &std::path::Path,
     ) -> (GatewayHandle, String) {
         let factory: std::sync::Arc<
@@ -4977,6 +5112,7 @@ mod session_tool_tests {
         > = std::sync::Arc::new(move |_, _| {
             std::sync::Arc::new(StubAdapter {
                 answer,
+                turn_failure: turn_failure.clone(),
                 narrate,
                 event_delay_ms: delay_ms,
                 ..Default::default()
@@ -5271,6 +5407,91 @@ mod session_tool_tests {
             "turn_id present: {r}"
         );
         assert_eq!(r["parent_sid"], json!(principal));
+        assert_eq!(r["notify_deliverable"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_fallback_async_calls_report_notification_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+
+        let spawned = parse(
+            &run_session_spawn(
+                &json!({
+                    "project": "alpha",
+                    "vendor": "claude",
+                    "task": "first task"
+                }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        let spawned_sid = spawned["sid"].as_str().unwrap();
+        assert_eq!(spawned["caller"], "admin");
+        assert_eq!(spawned["parent_sid"], serde_json::Value::Null);
+        assert_eq!(spawned["notify_deliverable"], false);
+        let hint = spawned["hint"].as_str().unwrap();
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        assert!(!hint.contains("you will be notified"), "{hint}");
+        assert!(
+            ccteam_harness::read_delegation_watch(tmp.path(), spawned_sid).is_none(),
+            "an admin fallback caller has no parent watch"
+        );
+
+        let child = parse(
+            &run_session_spawn(
+                &json!({ "project": "alpha", "vendor": "claude" }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatched = parse(
+            &run_session_dispatch(
+                &json!({ "sid": child, "task": "follow-up" }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dispatched["notify_deliverable"], false);
+        let hint = dispatched["hint"].as_str().unwrap();
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        assert!(!hint.contains("you will be notified"), "{hint}");
+        assert!(ccteam_harness::read_delegation_watch(tmp.path(), &child).is_none());
+
+        let off_child = parse(
+            &run_session_spawn(
+                &json!({ "project": "alpha", "vendor": "claude" }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let off = parse(
+            &run_session_dispatch(
+                &json!({ "sid": off_child, "task": "ledger only", "notify": "off" }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(off["notify_deliverable"], false);
+        let hint = off["hint"].as_str().unwrap();
+        assert!(hint.contains("notifications are disabled"), "{hint}");
+        assert!(!hint.contains("you will be notified"), "{hint}");
     }
 
     /// v0.9.1 — `session_spawn{task, wait_seconds}` with an answering child
@@ -5301,6 +5522,71 @@ mod session_tool_tests {
         assert!(result.ends_with("TAIL"));
         assert!(result.contains("truncated"));
         assert!(result.contains("session_collect{sid:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn inline_wait_and_collect_surface_terminal_failure_outcome() {
+        const CAPACITY_ERROR: &str = "Selected model is at capacity. Please try a different model.";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway_opts(
+            true,
+            false,
+            10,
+            Some(ccteam_harness::ThreadErrorEvent {
+                kind: "server_overloaded".into(),
+                message: CAPACITY_ERROR.into(),
+            }),
+            tmp.path(),
+        )
+        .await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let waited = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({
+                        "sid": child,
+                        "task": "run the task",
+                        "wait_seconds": 6,
+                        "notify": "off"
+                    }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(waited["status"], "failed", "{waited}");
+        assert_eq!(waited["error_kind"], "server_overloaded");
+        assert_eq!(waited["error"], CAPACITY_ERROR);
+        assert_eq!(waited["result_text"], CAPACITY_ERROR);
+
+        let collected = parse(
+            &run_session_collect(
+                &ambient(&principal, "alpha", json!({ "sid": child, "tail": true })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(collected["turns"][0]["outcome"], "failed");
+        assert_eq!(collected["turns"][0]["error_kind"], "server_overloaded");
+        assert_eq!(collected["turns"][0]["error"], CAPACITY_ERROR);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5336,6 +5622,9 @@ mod session_tool_tests {
                 assistant: answer,
                 usage: serde_json::Value::Null,
                 tool_calls: Vec::new(),
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();
@@ -5567,7 +5856,7 @@ mod session_tool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn dispatch_wait_skips_interim_narration_and_returns_final_answer() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (gw, principal) = dispatch_gateway_opts(true, true, 0, tmp.path()).await;
+        let (gw, principal) = dispatch_gateway_opts(true, true, 0, None, tmp.path()).await;
         let child = parse(
             &run_session_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "codex" })),

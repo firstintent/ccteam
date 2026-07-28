@@ -27,6 +27,7 @@ pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
 pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
 pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
 pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
+pub const AGENT_DONE: &str = "agent_done";
 /// v0.9.2 — a live session was gracefully stopped to admit another session
 /// under the daemon-wide capacity limit.
 pub const SESSION_EVICTED: &str = "session_evicted";
@@ -203,6 +204,69 @@ pub fn build_chat_turn_completed_event(
         ev["model"] = Value::String(model.to_string());
     }
     ev
+}
+
+/// Build the terminal success row consumed by progress and cost queries.
+/// Keeping the complete `agent_done` shape here makes this module the sole
+/// schema authority; adapters only translate vendor events into these fields.
+#[allow(clippy::too_many_arguments)]
+pub fn build_agent_done_completed_event(
+    role: &str,
+    session_id: &str,
+    slug: &str,
+    vendor: &str,
+    thread_id: &str,
+    turn_id: &str,
+    usage: &ccteam_cost::UnifiedTokenUsage,
+    cost_usd: Option<f64>,
+) -> Value {
+    let mut event = json!({
+        "event": AGENT_DONE,
+        "role": role,
+        "session_id": session_id,
+        "slug": slug,
+        "status": "completed",
+        "vendor": vendor,
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(cost_usd) = cost_usd {
+        event["cost_usd"] = json!(cost_usd);
+    }
+    event
+}
+
+/// Build a terminal vendor-error row. `turn_id` is absent for failures that
+/// happen before a vendor turn is established (for example, connect errors).
+#[allow(clippy::too_many_arguments)]
+pub fn build_agent_done_errored_event(
+    role: &str,
+    session_id: &str,
+    slug: &str,
+    vendor: &str,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    error_kind: &str,
+    error: &str,
+) -> Value {
+    let mut event = json!({
+        "event": AGENT_DONE,
+        "role": role,
+        "session_id": session_id,
+        "slug": slug,
+        "status": "errored",
+        "vendor": vendor,
+        "error_kind": error_kind,
+        "error": error,
+        "thread_id": thread_id,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(turn_id) = turn_id.filter(|value| !value.is_empty()) {
+        event["turn_id"] = Value::String(turn_id.to_string());
+    }
+    event
 }
 
 pub fn build_chat_session_reset_event(role: &str, sid: &str) -> Value {
@@ -526,6 +590,36 @@ mod tests {
         assert_eq!(event["sid"], "s9");
         assert_eq!(event["reason"], "capacity");
         assert!(event["ts"].is_string());
+    }
+
+    #[test]
+    fn errored_agent_done_preserves_kind_and_optional_turn() {
+        let with_turn = build_agent_done_errored_event(
+            "worker",
+            "s9",
+            "demo",
+            "codex",
+            "thread-1",
+            Some("turn-2"),
+            "server_overloaded",
+            "at capacity",
+        );
+        assert_eq!(with_turn["event"], AGENT_DONE);
+        assert_eq!(with_turn["status"], "errored");
+        assert_eq!(with_turn["error_kind"], "server_overloaded");
+        assert_eq!(with_turn["turn_id"], "turn-2");
+
+        let without_turn = build_agent_done_errored_event(
+            "worker",
+            "s9",
+            "demo",
+            "codex",
+            "thread-1",
+            None,
+            "connect",
+            "connection failed",
+        );
+        assert!(without_turn.get("turn_id").is_none());
     }
 
     #[test]

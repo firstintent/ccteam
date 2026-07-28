@@ -62,6 +62,23 @@ pub struct TurnRecord {
     /// the file with full tool-input bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallSummary>,
+    /// Terminal outcome when this row represents a failed vendor turn.
+    /// Successful/interim rows omit the field so existing JSONL stays compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Stable canonical/vendor error kind (`server_overloaded`, `transport`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    /// Human-readable terminal error returned by the vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl TurnRecord {
+    /// Whether this row is the terminal failure boundary for its vendor turn.
+    pub fn failed(&self) -> bool {
+        self.outcome.as_deref() == Some("failed")
+    }
 }
 
 /// Compact tool-call entry: `name`, optional file-path / arg excerpt.
@@ -164,6 +181,9 @@ mod tests {
             assistant: assistant.to_string(),
             usage: Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         }
     }
 
@@ -230,5 +250,40 @@ mod tests {
         fs::write(&path, format!("{good}\n{{not-json\n{good}\n   \n")).unwrap();
         let read = read_all_turns(tmp.path(), "carol").unwrap();
         assert_eq!(read.len(), 2);
+    }
+
+    #[test]
+    fn failure_outcome_survives_turn_record_round_trip() {
+        let raw = serde_json::json!({
+            "turn_id": "t-failed",
+            "ts": "2026-07-28T08:11:01Z",
+            "vendor": "codex",
+            "role": "reviewer",
+            "assistant": "Selected model is at capacity.",
+            "outcome": "failed",
+            "error_kind": "server_overloaded",
+            "error": "Selected model is at capacity."
+        });
+        let record: TurnRecord = serde_json::from_value(raw).unwrap();
+        let encoded = serde_json::to_value(record).unwrap();
+        assert_eq!(encoded["outcome"], "failed");
+        assert_eq!(encoded["error_kind"], "server_overloaded");
+        assert_eq!(encoded["error"], "Selected model is at capacity.");
+    }
+
+    #[test]
+    fn pre_outcome_turn_record_remains_compatible() {
+        let raw = serde_json::json!({
+            "turn_id": "t-old",
+            "ts": "2026-07-28T08:00:00Z",
+            "vendor": "claude",
+            "role": "",
+            "assistant": "done"
+        });
+        let record: TurnRecord = serde_json::from_value(raw).unwrap();
+        let encoded = serde_json::to_value(record).unwrap();
+        assert!(encoded.get("outcome").is_none());
+        assert!(encoded.get("error_kind").is_none());
+        assert!(encoded.get("error").is_none());
     }
 }

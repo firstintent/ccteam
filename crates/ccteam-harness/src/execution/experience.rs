@@ -622,6 +622,9 @@ mod tests {
                 assistant: "hello".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();

@@ -52,7 +52,8 @@ use tokio::sync::Mutex;
 
 use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, JsonRpcError, Notification};
 use crate::execution::progress_bridge::{
-    append_event, build_chat_session_reset_event_with_reason, build_codex_plan_updated_event,
+    append_event, build_agent_done_completed_event, build_agent_done_errored_event,
+    build_chat_session_reset_event_with_reason, build_codex_plan_updated_event,
     build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
     progress_jsonl_from_env,
 };
@@ -3020,7 +3021,8 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                     .unwrap_or("")
                     .to_string(),
                 err: ThreadErrorEvent {
-                    kind: "turn_failed".into(),
+                    kind: codex_error_kind(&notif.params)
+                        .unwrap_or_else(|| "turn_failed".to_string()),
                     message: notif
                         .params
                         .get("error")
@@ -3098,6 +3100,23 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
     }
 }
 
+/// Preserve Codex's typed terminal error discriminator instead of forcing
+/// every failure to `turn_failed`. The live v2 wire is camelCase while stored
+/// rollout fixtures may be snake_case; normalize either to ccteam's stable
+/// snake_case event vocabulary. Payload-bearing enum variants are objects, so
+/// their sole top-level key is the discriminator.
+fn codex_error_kind(params: &Value) -> Option<String> {
+    let error = params.get("error")?;
+    let info = error
+        .get("codexErrorInfo")
+        .or_else(|| error.get("codex_error_info"))?;
+    match info {
+        Value::String(kind) if !kind.is_empty() => Some(camel_to_snake(kind)),
+        Value::Object(fields) => fields.keys().next().map(|kind| camel_to_snake(kind)),
+        _ => None,
+    }
+}
+
 /// V0.6.1 F122 — translate a [`ThreadEvent`] into the `progress.jsonl`
 /// row the cost/budget pipelines consume. Mirrors the orchestrator's
 /// own `translate_thread_event` shape (vendor-tagged `agent_done`) so
@@ -3125,46 +3144,30 @@ pub fn build_progress_line(
             // surfaces the unpriced model.
             let priced_model = model.as_deref().or(ctx.model.as_deref()).unwrap_or("");
             let cost = ccteam_cost::estimate_cost(usage, ccteam_cost::Vendor::Codex, priced_model);
-            let mut row = json!({
-                "event": "agent_done",
-                "role": ctx.role,
-                "session_id": ctx.sid,
-                "slug": ctx.slug,
-                "status": "completed",
-                "vendor": "codex",
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "usage": serde_json::to_value(usage).unwrap_or(Value::Null),
-                "ts": Utc::now().to_rfc3339(),
-            });
-            if let Some(cost) = cost {
-                row["cost_usd"] = json!(cost);
-            }
-            Some(row)
+            Some(build_agent_done_completed_event(
+                &ctx.role, &ctx.sid, &ctx.slug, "codex", thread_id, turn_id, usage, cost,
+            ))
         }
-        ThreadEvent::TurnFailed { turn_id, err } => Some(json!({
-            "event": "agent_done",
-            "role": ctx.role,
-            "session_id": ctx.sid,
-            "slug": ctx.slug,
-            "status": "errored",
-            "vendor": "codex",
-            "error": err.message,
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "ts": Utc::now().to_rfc3339(),
-        })),
-        ThreadEvent::Error(err) => Some(json!({
-            "event": "agent_done",
-            "role": ctx.role,
-            "session_id": ctx.sid,
-            "slug": ctx.slug,
-            "status": "errored",
-            "vendor": "codex",
-            "error": err.message,
-            "thread_id": thread_id,
-            "ts": Utc::now().to_rfc3339(),
-        })),
+        ThreadEvent::TurnFailed { turn_id, err } => Some(build_agent_done_errored_event(
+            &ctx.role,
+            &ctx.sid,
+            &ctx.slug,
+            "codex",
+            thread_id,
+            Some(turn_id),
+            &err.kind,
+            &err.message,
+        )),
+        ThreadEvent::Error(err) => Some(build_agent_done_errored_event(
+            &ctx.role,
+            &ctx.sid,
+            &ctx.slug,
+            "codex",
+            thread_id,
+            None,
+            &err.kind,
+            &err.message,
+        )),
         ThreadEvent::ThreadStarted { .. }
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::ItemStarted { .. }
@@ -3864,6 +3867,47 @@ mod tests {
             }
             other => panic!("expected TurnFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translate_error_notification_preserves_typed_server_overloaded_kind() {
+        let n = Notification {
+            method: "error".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "willRetry": false,
+                "error": {
+                    "message": "Selected model is at capacity. Please try a different model.",
+                    "codexErrorInfo": "serverOverloaded"
+                },
+            }),
+        };
+        let e = translate_notification(&n, "t-1").expect("terminal error must surface");
+        match &e {
+            ThreadEvent::TurnFailed { err, .. } => {
+                assert_eq!(err.kind, "server_overloaded");
+                assert_eq!(
+                    err.message,
+                    "Selected model is at capacity. Please try a different model."
+                );
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+        let progress = build_progress_line(
+            &e,
+            "t-1",
+            &ProgressBridgeCtx {
+                progress_path: PathBuf::new(),
+                role: String::new(),
+                sid: "s1".into(),
+                slug: "demo".into(),
+                model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(progress["status"], "errored");
+        assert_eq!(progress["error_kind"], "server_overloaded");
     }
 
     #[test]

@@ -17,6 +17,9 @@ fn turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
         assistant: assistant.into(),
         usage: Value::Null,
         tool_calls: vec![],
+        outcome: None,
+        error_kind: None,
+        error: None,
     }
 }
 

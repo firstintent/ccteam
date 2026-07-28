@@ -142,14 +142,14 @@ struct GatewaySession {
     /// v0.8.19 — `/status` fleet-health tracking. When a real **Turn** is
     /// submitted (the Turn branch of `submit_resolved`, NOT a directive) this
     /// is set to `Some(Instant::now())`; the event pump clears it to `None` on
-    /// `ThreadEvent::TurnCompleted`. `/status` reads it to know whether a turn
+    /// every terminal canonical boundary. `/status` reads it to know whether a turn
     /// is in flight (→ 🔵 working, showing `now - start`) or the session is
     /// idle (`None` → 🟢). Shared (`Arc<Mutex>`) so the detached pump clears
     /// the same cell the submit path set. PULL-only signal — nothing acts on it
     /// except the `/status` render.
     turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
     /// v0.9 T5 — set when a user turn is mirrored while a prior turn is still
-    /// in flight (mid-turn steer). Cleared on `TurnCompleted` after the
+    /// in flight (mid-turn steer). Cleared on the terminal boundary after the
     /// experience writer reads it. Shared with `mirror_user_turn` + pump.
     steered_this_turn: Arc<AtomicBool>,
     /// v0.8.19 — timestamp of the most recent pump event for this session
@@ -4294,6 +4294,23 @@ impl Gateway {
                                 );
                             }
                         }
+                        // A canonical failure is a terminal turn boundary too.
+                        // Leaving the submit-side marker set makes inline waits
+                        // time out and reports the failed session as still
+                        // working even though every adapter has ended the turn.
+                        if matches!(
+                            &evt,
+                            ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)
+                        ) {
+                            activity_at_turn_start = None;
+                            session.steered_this_turn.store(false, Ordering::SeqCst);
+                            if let Ok(mut started) = session.turn_started_at.lock() {
+                                *started = None;
+                            }
+                            if let Ok(mut act) = session.latest_activity.lock() {
+                                *act = None;
+                            }
+                        }
                         // v0.8.11 E4 — for a paneless session (no hooks:
                         // stream-json AND acp), the pump mirrors each completed
                         // turn to progress.jsonl with the sid, so the
@@ -4370,6 +4387,7 @@ impl Gateway {
                             // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
                             // 只 warn,绝不阻断回复投递。
                             if let Some(dir) = project_dir.as_ref() {
+                                let failure = thread_event_failure(&evt);
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                                     turn_id: format!("{session_id}-{seq}"),
                                     ts: chrono::Utc::now(),
@@ -4381,6 +4399,9 @@ impl Gateway {
                                     assistant: text.clone(),
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
+                                    outcome: failure.map(|_| "failed".to_string()),
+                                    error_kind: failure.map(|err| err.kind.clone()),
+                                    error: failure.map(|err| err.message.clone()),
                                 };
                                 match ccteam_harness::execution::turns_mirror::append_turn(
                                     dir,
@@ -5306,6 +5327,9 @@ impl Gateway {
             assistant: String::new(),
             usage: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         if let Err(err) =
             ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
@@ -8172,7 +8196,7 @@ impl Gateway {
 
     /// v0.9.5 feedback fix — is `sid`'s vendor turn still in flight? Reads the
     /// same `turn_started_at` cell the submit path sets and the pump clears on
-    /// `TurnCompleted` (protocol-independent). `false` for an unknown sid. A
+    /// every terminal boundary (protocol-independent). `false` for an unknown sid. A
     /// `wait_seconds` dispatch uses this to keep waiting past interim assistant
     /// messages (codex narrates mid-turn) until the TASK actually finishes.
     pub fn session_turn_in_flight(&self, sid: &str) -> bool {
@@ -9593,6 +9617,14 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     }
 }
 
+/// Canonical terminal failure carried by an event, independent of vendor.
+fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErrorEvent> {
+    match evt {
+        ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err),
+        _ => None,
+    }
+}
+
 /// Whether this item is long-running work that can legitimately go silent
 /// between start and complete (tools, shell, search — not the final answer).
 fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
@@ -9615,7 +9647,9 @@ fn track_open_work_items(open: &mut std::collections::HashSet<String>, evt: &Thr
         ThreadEvent::ItemCompleted { item } if is_openable_work_item(&item.details) => {
             open.remove(&item.id);
         }
-        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } => {
+        ThreadEvent::TurnCompleted { .. }
+        | ThreadEvent::TurnFailed { .. }
+        | ThreadEvent::Error(_) => {
             open.clear();
         }
         _ => {}
@@ -12585,6 +12619,9 @@ mod tests {
             assistant: who.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(&project_dir, &sid1, &mk("t1", "from-sid1")).unwrap();
         append_turn(&project_dir, &sid2, &mk("t2", "from-sid2")).unwrap();
@@ -14257,6 +14294,9 @@ mod tests {
                 assistant: "LGTM, two nits inline.".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();
@@ -18769,6 +18809,17 @@ mod tests {
         assert!(notification
             .user
             .contains(&format!("session_collect{{sid:{child_sid}, tail:true}}")));
+
+        let child_failure =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &child_sid)
+                .unwrap()
+                .into_iter()
+                .find(|turn| turn.assistant == CAPACITY_ERROR)
+                .expect("vendor failure is durably mirrored in the child ledger");
+        let child_failure = serde_json::to_value(child_failure).unwrap();
+        assert_eq!(child_failure["outcome"], "failed");
+        assert_eq!(child_failure["error_kind"], "turn_failed");
+        assert_eq!(child_failure["error"], CAPACITY_ERROR);
     }
 
     /// v0.9.5 feedback fix (P0) — a codex-shaped chatty child (several
@@ -19240,6 +19291,9 @@ mod tests {
                 assistant: "the research is done".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();
@@ -19327,6 +19381,9 @@ mod tests {
                     assistant: format!("checkpoint {n}"),
                     usage: serde_json::Value::Null,
                     tool_calls: vec![],
+                    outcome: None,
+                    error_kind: None,
+                    error: None,
                 },
             )
             .unwrap();

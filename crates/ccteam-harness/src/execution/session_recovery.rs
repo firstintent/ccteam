@@ -150,6 +150,9 @@ mod tests {
             assistant: assistant.into(),
             usage: Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         }
     }
 
@@ -217,6 +220,9 @@ mod tests {
             assistant: "".into(),
             usage: Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         let s = format_recovery_prompt(&[turn]);
         assert!(!s.contains("[user] "));

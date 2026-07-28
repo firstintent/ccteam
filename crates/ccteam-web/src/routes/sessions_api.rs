@@ -2049,6 +2049,9 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(project_dir, sid, &mk("t1", "review the diff", "LGTM")).unwrap();
         append_turn(project_dir, sid, &mk("t2", "and the tests?", "all green")).unwrap();
@@ -2089,6 +2092,9 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
@@ -2123,6 +2129,9 @@ mod tests {
             assistant: "done — s2".into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         let ev = turn_to_event(&turn);
         assert_eq!(ev["turn_id"], "t9");
