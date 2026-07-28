@@ -1,5 +1,12 @@
+// v0.9.11 TEAM-1 — topology-first team view. Node-env suite (no DOM):
+// `renderToString` proves structure/links (Links need a Router context →
+// MemoryRouter); click wiring on the hook-free presentational components
+// (AgentsTicker / VendorKpiChips) is exercised by walking their element tree
+// and invoking `onClick` directly.
+
 import { describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 
 vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12,99 +19,106 @@ vi.hoisted(() => {
   }
 });
 
-import AgentsView, { AgentsRoster, AgentsTree } from "./AgentsView";
-import { flattenDelegationTree } from "../lib/agentsTree";
-import type { AgentEdge, AgentNode } from "../lib/agentsApi";
+import AgentsView, {
+  AgentsPanel,
+  AgentsTicker,
+  AgentsTree,
+  VendorKpiChips,
+} from "./AgentsView";
+import { emptyFold } from "./chatTranscript";
+import type { AgentNode } from "../lib/agentsApi";
+import type { TimestampedAgentsEvent } from "../lib/agentsReducer";
+
+function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
+  return {
+    sid: "s0",
+    slug: "demo",
+    role: "brain",
+    vendor: "claude",
+    host: "local",
+    status: "live",
+    depth: 0,
+    last_active: "2026-01-01T00:00:00Z",
+    turn_count: 3,
+    ...over,
+  };
+}
+
+function delegationEvent(over: Partial<TimestampedAgentsEvent> = {}): TimestampedAgentsEvent {
+  return {
+    kind: "delegation",
+    content: "",
+    relation: "dispatched",
+    parent_sid: "s0",
+    child_sid: "s1",
+    receivedAt: Date.now(),
+    ...over,
+  };
+}
+
+type ClickHandler = (e?: unknown) => void;
+
+/** Collect every `onClick` prop in a (hook-free) component's element tree,
+ *  in render order — the node-env stand-in for a DOM click. */
+function collectOnClicks(el: unknown, out: ClickHandler[] = []): ClickHandler[] {
+  if (el == null || typeof el !== "object") return out;
+  if (Array.isArray(el)) {
+    for (const child of el) collectOnClicks(child, out);
+    return out;
+  }
+  const props = (el as { props?: { onClick?: unknown; children?: unknown } }).props;
+  if (props) {
+    if (typeof props.onClick === "function") out.push(props.onClick as ClickHandler);
+    collectOnClicks(props.children, out);
+  }
+  return out;
+}
 
 describe("AgentsView (shell smoke)", () => {
-  it("renders the team-view container, KPI strip + tabs (data loads async, never under SSR)", () => {
+  it("renders the team-view container + KPI strip; roster/timeline tabs are gone", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const html = renderToString(<AgentsView />);
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsView />
+      </MemoryRouter>,
+    );
     expect(html).toContain('data-testid="agents-view"');
     expect(html).toContain('data-testid="agents-canvas"');
     expect(html).toContain('data-testid="agents-kpis"');
-    expect(html).toContain('data-testid="agents-tab-roster"');
-    expect(html).toContain('data-testid="agents-tab-timeline"');
-    expect(html).toContain('data-testid="agents-tab-topology"');
     expect(html).toContain("团队");
-  });
-
-  it("the timeline tab renders the timeline strip", () => {
-    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const html = renderToString(<AgentsView initialTab="timeline" />);
-    expect(html).toContain('data-testid="agents-timeline"');
+    expect(html).not.toContain("agents-tab-");
+    expect(html).not.toContain("agents-roster");
+    expect(html).not.toContain("agents-timeline");
   });
 
   it("renders in English when lang='en'", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
-    const html = renderToString(<AgentsView lang="en" />);
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsView lang="en" />
+      </MemoryRouter>,
+    );
     expect(html).toContain("Team");
   });
 });
 
-describe("AgentsRoster (pure presentational, fixture-driven)", () => {
-  function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
-    return {
-      sid: "s0",
-      slug: "demo",
-      role: "brain",
-      vendor: "claude",
-      host: "local",
-      status: "live",
-      depth: 0,
-      last_active: "2026-01-01T00:00:00Z",
-      turn_count: 3,
-      ...over,
-    };
-  }
-
-  it("renders one row per session, children indented under parents", () => {
-    const rows = flattenDelegationTree([
-      fixtureNode({ sid: "s0" }),
-      fixtureNode({ sid: "s1", parent_sid: "s0", vendor: "codex", cost_usd: 0.42 }),
-    ]);
-    const html = renderToString(
-      <AgentsRoster rows={rows} selected="s1" pulsing={new Set(["s0"])} onSelect={() => {}} />,
-    );
-    expect(html).toContain('data-testid="agents-roster"');
-    expect(html).toContain('data-testid="agents-roster-row-s0"');
-    expect(html).toContain('data-testid="agents-roster-row-s1"');
-    // Selected row carries the class; costs render; child is elbow-indented.
-    expect(html).toMatch(/agents-roster-row selected"[^>]*data-testid="agents-roster-row-s1"/);
-    expect(html).toContain("$0.4200");
-    expect(html).toContain("agents-roster-elbow");
-  });
-});
-
 describe("AgentsTree (SSR-safe, fixture-driven)", () => {
-  function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
-    return {
-      sid: "s0",
-      slug: "demo",
-      role: "brain",
-      vendor: "claude",
-      host: "local",
-      status: "live",
-      depth: 0,
-      last_active: "2026-01-01T00:00:00Z",
-      turn_count: 3,
-      ...over,
-    };
-  }
+  const nodes: AgentNode[] = [
+    fixtureNode({ sid: "s0", role: "brain" }),
+    fixtureNode({ sid: "s1", role: "worker", vendor: "grok", depth: 1, parent_sid: "s0" }),
+    fixtureNode({ sid: "s2", role: "worker2", vendor: "codex", depth: 2, parent_sid: "s1" }),
+    fixtureNode({ sid: "s3", slug: "other", role: "root", vendor: "opencode" }),
+  ];
 
   it("renders nested delegation rows grouped across projects", () => {
-    const nodes: AgentNode[] = [
-      fixtureNode({ sid: "s0", role: "brain" }),
-      fixtureNode({ sid: "s1", role: "worker", vendor: "grok", depth: 1, parent_sid: "s0" }),
-      fixtureNode({ sid: "s2", role: "worker2", vendor: "codex", depth: 2, parent_sid: "s1" }),
-      fixtureNode({ sid: "s3", slug: "other", role: "root", vendor: "opencode" }),
-    ];
-    const edges: AgentEdge[] = [
+    const edges = [
       { parent: "s0", child: "s1", active: true },
       { parent: "s1", child: "s2", active: false },
     ];
     const html = renderToString(
-      <AgentsTree nodes={nodes} edges={edges} selected="s1" pulsing={new Set(["s2"])} onSelect={() => {}} />,
+      <MemoryRouter>
+        <AgentsTree nodes={nodes} edges={edges} selected="s1" pulsing={new Set(["s2"])} onSelect={() => {}} />
+      </MemoryRouter>,
     );
     expect(html).toContain('data-testid="agents-tree"');
     expect(html).toContain('data-testid="agents-tree-project-demo"');
@@ -115,5 +129,136 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
     expect(html).toMatch(/aria-level="3"[^>]*data-testid="agents-tree-row-s2"/);
     expect(html).toContain("agents-tree-indent has-parent");
     expect(html).toContain("chip opencode");
+  });
+
+  it("every row carries a real open link to its chat route", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsTree nodes={nodes} edges={[]} selected={null} pulsing={new Set()} onSelect={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('href="/chat/s/s0"');
+    expect(html).toContain('href="/chat/s/s1"');
+    expect(html).toContain('href="/chat/s/s3"');
+    expect(html).toContain("打开 ↗");
+  });
+
+  it("host badge renders only when the graph spans more than one host", () => {
+    const multiHostNodes = [fixtureNode({ sid: "s0" }), fixtureNode({ sid: "s1", host: "gpu-1" })];
+    const single = renderToString(
+      <MemoryRouter>
+        <AgentsTree nodes={multiHostNodes} edges={[]} hosts={["local"]} selected={null} pulsing={new Set()} onSelect={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(single).not.toContain("agents-tree-host");
+    expect(single).not.toContain("with-host");
+
+    const multi = renderToString(
+      <MemoryRouter>
+        <AgentsTree
+          nodes={multiHostNodes}
+          edges={[]}
+          hosts={["local", "gpu-1"]}
+          selected={null}
+          pulsing={new Set()}
+          onSelect={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(multi).toContain("agents-tree with-host");
+    expect(multi).toContain("agents-tree-host");
+    expect(multi).toContain("gpu-1");
+  });
+});
+
+describe("AgentsPanel (pure presentational)", () => {
+  it("the 打开会话 action is a real link to the session's chat route", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsPanel
+          node={fixtureNode({ sid: "s7", vendor: "codex", cost_usd: 0.42 })}
+          pulsing={new Set()}
+          activityFold={emptyFold()}
+          history={[]}
+        />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('data-testid="agents-panel"');
+    expect(html).toMatch(/data-testid="agents-open-chat"[^>]*href="\/chat\/s\/s7"|href="\/chat\/s\/s7"[^>]*data-testid="agents-open-chat"/);
+    expect(html).toContain("打开会话");
+    expect(html).toContain("$0.4200");
+    expect(html).toContain("codex");
+  });
+});
+
+describe("AgentsTicker (recent dispatches)", () => {
+  it("hidden when there are no delegation events", () => {
+    const html = renderToString(
+      <AgentsTicker events={[delegationEvent({ kind: "answer" })]} onSelect={() => {}} />,
+    );
+    expect(html).toBe("");
+  });
+
+  it("shows the last 5 delegation events, newest first", () => {
+    const events = [1, 2, 3, 4, 5, 6].map((i) =>
+      delegationEvent({ child_sid: `c${i}`, receivedAt: 1000 * i }),
+    );
+    const html = renderToString(<AgentsTicker events={events} onSelect={() => {}} />);
+    expect(html).toContain('data-testid="agents-ticker"');
+    expect(html).toContain("s0 → c6");
+    expect(html).toContain("dispatched");
+    expect(html).not.toContain("c1"); // capped at 5
+    expect(html.indexOf("c6")).toBeLessThan(html.indexOf("c5")); // newest first
+  });
+
+  it("clicking an entry selects the child session", () => {
+    const onSelect = vi.fn();
+    const clicks = collectOnClicks(AgentsTicker({ events: [delegationEvent()], onSelect }));
+    expect(clicks).toHaveLength(1);
+    clicks[0]!();
+    expect(onSelect).toHaveBeenCalledWith("s1");
+  });
+});
+
+describe("VendorKpiChips (per-vendor rollup + topology filter)", () => {
+  const nodes = [
+    fixtureNode({ sid: "s0", vendor: "claude", status: "live", cost_usd: 0.3 }),
+    fixtureNode({ sid: "s1", vendor: "claude", status: "idle", cost_usd: 0.2 }),
+    fixtureNode({ sid: "s2", vendor: "grok", status: "live", cost_usd: 0.05, parent_sid: "s0" }),
+  ];
+
+  it("renders one chip per vendor with live count + Σcost; the active vendor is highlighted", () => {
+    const html = renderToString(<VendorKpiChips nodes={nodes} active="grok" onToggle={() => {}} />);
+    expect(html).toContain('data-testid="agents-vendor-chips"');
+    expect(html).toContain('data-testid="agents-vendor-chip-claude"');
+    expect(html).toContain("●1"); // claude: 1 live of 2 sessions
+    expect(html).toContain("$0.50"); // claude: 0.3 + 0.2
+    expect(html).toContain("$0.05"); // grok
+    expect(html).toMatch(/agents-vendor-chip active"[^>]*data-testid="agents-vendor-chip-grok"/);
+    expect(renderToString(<VendorKpiChips nodes={[]} active={null} onToggle={() => {}} />)).toBe("");
+  });
+
+  it("clicking a chip toggles the vendor filter; filtered orphans render as roots", () => {
+    const onToggle = vi.fn();
+    const clicks = collectOnClicks(VendorKpiChips({ nodes, active: null, onToggle }));
+    expect(clicks).toHaveLength(2); // claude, grok (sorted)
+    clicks[0]!();
+    expect(onToggle).toHaveBeenCalledWith("claude");
+
+    // The view feeds the tree only the filtered vendor's nodes — a child
+    // whose parent got filtered out is promoted to a root (never dropped).
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsTree
+          nodes={nodes.filter((n) => n.vendor === "grok")}
+          edges={[]}
+          selected={null}
+          pulsing={new Set()}
+          onSelect={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(html).not.toContain('data-testid="agents-tree-row-s0"');
+    expect(html).toMatch(/aria-level="1"[^>]*data-testid="agents-tree-row-s2"/);
   });
 });

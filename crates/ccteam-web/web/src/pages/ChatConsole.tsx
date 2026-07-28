@@ -409,10 +409,7 @@ export default function ChatConsole() {
             onNav={(t) => navigate(`/settings/${t}`)}
           />
         ) : view === "agents" ? (
-          <AgentsView
-            lang={lang}
-            onOpenChat={(newSid) => navigate(`/chat/s/${encodeURIComponent(newSid)}`)}
-          />
+          <AgentsView lang={lang} />
         ) : (
           <HomeView
             lang={lang}
