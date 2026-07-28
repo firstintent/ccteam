@@ -834,6 +834,54 @@ async fn rename_session_over_http_happy_path_and_validation() {
         .unwrap();
     assert_eq!(live.as_array().unwrap()[0]["title"], "Fix the login bug");
 
+    // Every rename reports what the VENDOR's own title surface did with it,
+    // so the UI never implies a sync that didn't happen. This fake vendor has
+    // no title API (like the ACP vendors) → `unsupported`.
+    assert_eq!(body["vendor"], "claude");
+    assert_eq!(body["vendor_sync"]["state"], "unsupported");
+    assert!(body["previous"].is_null(), "first rename replaced nothing");
+
+    // Renaming again reports what it replaced (the web toast shows it).
+    let again: Value = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "Fix the logout bug"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["previous"], "Fix the login bug");
+    assert_eq!(again["title"], "Fix the logout bug");
+
+    // A STOPPED session renames exactly like a live one — meta.json outlives
+    // the live map, and the rail offers rename on history rows.
+    let stopped = client
+        .post(format!("{base}/sessions/{sid}/stop"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), 200);
+    let after_stop = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "archived work"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_stop.status(),
+        200,
+        "a stopped session must still be renameable"
+    );
+    assert_eq!(
+        after_stop.json::<Value>().await.unwrap()["title"],
+        "archived work"
+    );
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["title"], "archived work");
+    assert_eq!(meta["title_source"], "user");
+
     // Unknown sid → 404.
     let unknown = client
         .patch(format!("{base}/sessions/s999"))

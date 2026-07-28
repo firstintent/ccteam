@@ -98,6 +98,10 @@ async fn daemon_registers_command_menu_per_channel() {
         ("/role", "<role>"),
         ("/stop", "<id>"),
         ("/interrupt", "[id]"),
+        // Rename joined the menu with the session-title system's second half
+        // (vendor sync + rename-any-session): an affordance nobody can find
+        // is not an affordance.
+        ("/rename", "[<id>] <title>"),
         ("/newproject", "<slug> <path>"),
     ] {
         let spec = expected

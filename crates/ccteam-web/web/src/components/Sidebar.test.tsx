@@ -134,6 +134,21 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("srow  hist");
   });
 
+  it("offers rename on every row — live AND stopped — when the shell wires it", () => {
+    const html = renderSidebar([row({ sid: "s1" }), row({ sid: "s2", history: true })], {
+      onRenameRow: () => {},
+    });
+    // One pencil per row (a stopped session is renameable too).
+    expect(html.match(/aria-label="重命名\(双击标题也可以\) s\d"/g) ?? []).toHaveLength(2);
+    // The row tooltip advertises the double-click shortcut.
+    expect(html).toContain("重命名(双击标题也可以)");
+  });
+
+  it("renders no rename affordance when the shell does not wire one", () => {
+    const html = renderSidebar([row()]);
+    expect(html).not.toContain("重命名");
+  });
+
   it("puts the project-bound remote host on the group header and marks offline", () => {
     const html = renderSidebar([row()], {
       projectHosts: { demo: { host: "claude-dev-04", online: false } },

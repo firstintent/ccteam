@@ -306,6 +306,16 @@ button { font-family: inherit; cursor: pointer; }
 .srow:hover .stop { display: flex; }
 .srow .stop:hover { color: var(--red); border-color: #F5C6C6; }
 .srow .stop svg { width: 10px; height: 10px; }
+.srow .stop.rename:hover { color: var(--text); border-color: var(--border-strong, var(--border)); }
+.srow .stop.rename svg { width: 11px; height: 11px; }
+/* Inline rename: the field takes the label's exact place, so the row doesn't
+   reflow when editing starts. */
+.rename-input {
+  min-width: 0; font: inherit; color: var(--text);
+  background: var(--bg-card); border: 1px solid var(--accent, var(--border));
+  border-radius: 6px; padding: 1px 6px; outline: none;
+}
+.srow .rename-input { flex: 1; }
 .side-bottom { border-top: 1px solid var(--border-soft); padding: 8px 0 10px; display: flex; flex-direction: column; gap: 2px; }
 .side-user { display: flex; align-items: center; gap: 9px; padding: 7px 20px 2px; font-size: 13px; color: var(--text-muted); }
 
@@ -616,6 +626,12 @@ html.dark .dot.off { background: #4b4e57; }
   padding: 13px 24px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap;
 }
 .conv-head .title { font-size: 15px; font-weight: 600; }
+/* The rename pencil stays out of the way until the header is hovered (it is
+   still keyboard-reachable and announced — only the paint is conditional). */
+.conv-head .rename-title { opacity: 0; transition: opacity .12s; margin-left: -6px; }
+.conv-head:hover .rename-title,
+.conv-head .rename-title:focus-visible { opacity: 1; }
+.conv-head .rename-input { font-size: 15px; font-weight: 600; min-width: 220px; }
 .conv-head .meta { display: flex; align-items: center; gap: 8px; }
 .tabs { display: flex; gap: 2px; margin-left: auto; background: var(--bg-soft); border-radius: 9px; padding: 3px; }
 .tab { padding: 4.5px 16px; border-radius: 7px; font-size: 13px; color: var(--text-muted); background: none; border: none; }

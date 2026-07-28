@@ -38,14 +38,41 @@ const SESSION: SessionSummary = {
   status: "live",
 };
 
-function render(session: SessionSummary | null = SESSION) {
+function render(
+  session: SessionSummary | null = SESSION,
+  onRename?: (sid: string, title: string) => void,
+) {
   // CostPill (conv-head) navigates → needs a Router context under SSR.
   return renderToString(
     <MemoryRouter>
-      <SessionView sid="s9" session={session} />
+      <SessionView sid="s9" session={session} onRename={onRename} />
     </MemoryRouter>,
   );
 }
+
+describe("conversation header rename affordance", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    vi.spyOn(globalThis.localStorage, "getItem").mockReturnValue(null);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("offers the rename control (and the keyboard hint) when the shell wires it", () => {
+    const html = render({ ...SESSION, title: "Fix the login bug" }, () => {});
+    expect(html).toContain('data-testid="conv-rename"');
+    expect(html).toContain("Fix the login bug");
+    // The title itself advertises the double-click + key hints.
+    expect(html).toContain("回车保存,Esc 取消");
+  });
+
+  it("renders a plain title with no control when renaming is not wired", () => {
+    const html = render({ ...SESSION, title: "Fix the login bug" });
+    expect(html).toContain('data-testid="conv-title"');
+    expect(html).not.toContain('data-testid="conv-rename"');
+  });
+});
 
 describe("SessionView mount-empty invariant (key={sid} remount)", () => {
   beforeEach(() => {

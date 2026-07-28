@@ -21,8 +21,8 @@ use ccteam_harness::{
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnDisposition,
-    TurnInput, TurnRouting,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
+    TitleSync, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -557,12 +557,13 @@ pub enum GatewayEventKind {
         reason: Option<String>,
     },
     /// v0.9.2 — a session lifecycle transition for live web surfaces. These
-    /// frames are broadcast-only (no IM delivery); the durable state twin is a
-    /// progress event such as `session_evicted`.
+    /// frames are broadcast-only (no IM delivery); the durable state twin is
+    /// whatever already persisted the change — a progress event
+    /// (`session_evicted`) or `meta.json` itself (`renamed`).
     SessionLifecycle {
-        /// Lifecycle state, currently `evicted`.
+        /// Lifecycle state: `evicted` | `renamed`.
         state: String,
-        /// Machine-readable cause, currently `capacity`.
+        /// Machine-readable cause: `capacity` (evicted) | `user` (renamed).
         reason: String,
     },
     /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
@@ -912,6 +913,25 @@ pub struct SessionResolve {
     pub project: String,
     /// Absolute working dir hosting `.ccteam/chat/<sid>/turns.jsonl`.
     pub project_dir: PathBuf,
+}
+
+/// What [`Gateway::rename_session`] hands its callers — everything both
+/// frontends need to render an honest receipt without re-deriving anything:
+/// the title actually stored (rule-truncated), what it replaced, and what the
+/// VENDOR did with it. Kept as one value so the IM receipt and the web PATCH
+/// response describe the same rename in the same terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRename {
+    /// The renamed session's sid.
+    pub sid: String,
+    /// The cleaned title actually persisted to `meta.json`.
+    pub title: String,
+    /// The title this replaced; `None` when the session had none yet.
+    pub previous: Option<String>,
+    /// Vendor, stringified — the subject of `vendor_sync`'s message.
+    pub vendor: String,
+    /// Whether the vendor's own title surface took the new title.
+    pub vendor_sync: TitleSync,
 }
 
 /// v0.9.0 W1 (F1) — the authenticated identity of a `session_*` MCP caller,
@@ -1267,9 +1287,9 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/rename",
-        arg_hint: Some("<title>"),
-        help: "rename the current session's title (rule-based, no LLM)",
-        in_menu: false,
+        arg_hint: Some("[<id>] <title>"),
+        help: "rename a session (bare = current; syncs the vendor's own title)",
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/newproject",
@@ -2388,21 +2408,42 @@ impl Gateway {
                 // contain spaces, so this must NOT be whitespace-split.
                 let mut it = trimmed.splitn(2, char::is_whitespace);
                 let _cmd = it.next();
-                let raw_title = it.next().unwrap_or("").trim();
-                if raw_title.is_empty() {
-                    return Err(anyhow!("用法: /rename <新标题>(重命名当前会话)"));
+                let rest = it.next().unwrap_or("").trim();
+                if rest.is_empty() {
+                    return Err(anyhow!(
+                        "用法: /rename [<sid>] <新标题>(省略 sid = 重命名当前会话)"
+                    ));
                 }
-                let sid = self
-                    .current_session
-                    .read()
-                    .unwrap()
-                    .get(chat)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!("/rename 需要一个活动会话:先 /new 或发条消息再重命名。")
-                    })?;
-                let title = self.rename_session(&sid, raw_title)?;
-                Ok(Some(format!("已重命名 {sid} → {title}")))
+                // `[<sid>] <title>` — same leading-id convention as
+                // /stop /use /interrupt. Splitting only when a REMAINDER
+                // follows keeps `/rename s3` meaning "title the current
+                // session s3", not "rename s3 to nothing".
+                let (sid, raw_title) = match split_leading_sid(rest) {
+                    Some((sid, title)) => (sid.to_string(), title),
+                    None => {
+                        let sid = self
+                            .current_session
+                            .read()
+                            .unwrap()
+                            .get(chat)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "/rename 需要一个活动会话:先 /new 或发条消息,\
+                                     也可以 /rename <sid> <新标题> 指名重命名。"
+                                )
+                            })?;
+                        (sid, rest)
+                    }
+                };
+                // Own-only, live or stopped (a history session is renameable
+                // too) — same visibility rule every other sid-addressed
+                // command applies.
+                if !self.chat_can_access_sid(chat, &sid) {
+                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                }
+                let renamed = self.rename_session(&sid, raw_title).await?;
+                Ok(Some(render_rename_receipt(&renamed)))
             }
             "/use" => {
                 let arg = parts
@@ -6247,6 +6288,21 @@ impl Gateway {
         self.chat_owner_visible(chat, &session.owner)
     }
 
+    /// [`Self::chat_can_access`] for a BARE sid, live or stopped: the live map
+    /// first (O(1)), else the on-disk `meta.json`'s owner — the same two-rung
+    /// ladder [`Self::project_slug_for_sid`] and the scheduled-entry gate walk.
+    /// One gate for every sid-addressed command that must also reach history
+    /// sessions (`/rename` today), so "stopped" never becomes an ACL hole:
+    /// an unknown sid and a foreign one are indistinguishable (`false`).
+    fn chat_can_access_sid(&self, chat: &ChatKey, sid: &str) -> bool {
+        if let Some(session) = self.sessions.get(sid) {
+            return self.chat_can_access(chat, session);
+        }
+        self.find_meta_for_sid(sid)
+            .map(|(_slug, _dir, meta)| self.owner_identity_visible(chat, &meta.owner))
+            .unwrap_or(false)
+    }
+
     /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
     /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
     /// iff (a) it owns it, or (b) the session sits in the WEB-CONSOLE pool of
@@ -8662,33 +8718,112 @@ impl Gateway {
         Ok(())
     }
 
-    /// v0.8.22 P1 — rename a LIVE session's user-facing title. An explicit
-    /// user action ⇒ `TitleSource::User`, which `apply_title` treats as
-    /// STICKY (never later overwritten by the first-message auto-title or a
-    /// vendor `ai-title`). Applies the same rule-based [`truncate_title`] the
-    /// auto-title path uses (no LLM, ever) and returns the cleaned title
-    /// actually stored. This is the ACL-less core shared by the IM `/rename`
-    /// command (targets the chat's own current session — already
-    /// ownership-scoped by `current_session`) and the web `PATCH
-    /// /api/v1/sessions/{sid}` route (project-ACL'd via `gate_sid` first).
-    /// Sync (no `.await`): a plain meta.json read-modify-write.
-    pub fn rename_session(&self, sid: &str, raw_title: &str) -> Result<String> {
-        let session = self
-            .sessions
-            .get(sid)
-            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
-        let dir = self
-            .projects
-            .get(&session.project)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+    /// Rename a session's user-facing title — the ACL-less core every frontend
+    /// shares (IM `/rename`, web `PATCH /api/v1/sessions/{sid}`), so the two
+    /// can never diverge in what a rename means.
+    ///
+    /// Three things happen, in this order:
+    ///
+    /// 1. **ccteam SoT** — the cleaned title (the same rule-based
+    ///    [`truncate_title`] the auto-title path uses; no LLM, ever) lands in
+    ///    `meta.json` as `TitleSource::User`, which `apply_title` treats as
+    ///    STICKY (never overwritten later by the first-message auto-title or a
+    ///    vendor `ai-title`).
+    /// 2. **vendor mirror** — the same title is pushed to the vendor's OWN
+    ///    title surface via [`HarnessAdapter::set_session_title`], so the
+    ///    session reads identically in `claude --resume`'s picker / codex's
+    ///    thread list. Best-effort by design: the vendor answer is REPORTED
+    ///    ([`TitleSync`]), never fatal — meta.json is the SoT and the user's
+    ///    rename must not fail because a vendor has no title API.
+    /// 3. **live surfaces** — a `SessionLifecycle{state:"renamed"}` broadcast,
+    ///    the same frame capacity eviction uses, so every open web console
+    ///    refreshes its rail the moment an IM `/rename` lands (and vice versa).
+    ///
+    /// Works on a LIVE **or a STOPPED** session: `meta.json` outlives the live
+    /// map, so the sid is resolved from the live map first and from the
+    /// on-disk metas otherwise (the same ladder [`Self::project_slug_for_sid`]
+    /// walks). A stopped session simply has no live thread to hand the vendor
+    /// push, which the adapter reports as [`TitleSync::Deferred`].
+    pub async fn rename_session(&self, sid: &str, raw_title: &str) -> Result<SessionRename> {
         let cleaned =
             truncate_title(raw_title).ok_or_else(|| anyhow!("title must not be blank"))?;
+        // Resolve (project dir, vendor, adapter, live thread) for a live OR a
+        // stopped session. A stopped one has no adapter instance in the live
+        // map, so mint one from the same factory every spawn path uses — it is
+        // a plain value (no child process) until something spawns through it.
+        let (dir, vendor, adapter, thread) = match self.sessions.get(sid) {
+            Some(session) => {
+                let dir = self
+                    .projects
+                    .get(&session.project)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+                (
+                    dir,
+                    session.vendor,
+                    Arc::clone(&session.adapter),
+                    Some(session.thread.clone()),
+                )
+            }
+            None => {
+                let (_slug, dir, meta) = self.find_meta_for_sid(sid)?;
+                let adapter = (self.adapter_factory)(meta.vendor, meta.protocol);
+                (dir, meta.vendor, adapter, None)
+            }
+        };
+
         let mut meta = read_session_meta(&dir, sid)
             .map_err(|e| anyhow!("meta.json missing for session {sid}: {e}"))?;
+        let previous = meta.title.clone();
         apply_title(&mut meta, cleaned.clone(), TitleSource::User);
         write_session_meta(&dir, &meta)?;
-        Ok(cleaned)
+
+        let target = SessionTitleTarget {
+            sid: sid.to_string(),
+            vendor_uuid: meta.vendor_uuid.clone(),
+            project_dir: dir,
+            thread,
+        };
+        let vendor_sync = match adapter.set_session_title(&target, &cleaned).await {
+            Ok(sync) => sync,
+            Err(err) => {
+                // The ccteam-side rename already succeeded; say what the vendor
+                // did rather than failing a rename the user can see took.
+                tracing::warn!(%sid, %err, "ccteam-im: vendor title push failed");
+                TitleSync::Deferred(format!("vendor push failed: {err}"))
+            }
+        };
+
+        self.emit_session_renamed(sid, &meta.slug);
+        Ok(SessionRename {
+            sid: sid.to_string(),
+            title: cleaned,
+            previous,
+            vendor: vendor_str(vendor).to_string(),
+            vendor_sync,
+        })
+    }
+
+    /// Broadcast-only twin of a rename for live web surfaces (the durable state
+    /// twin is `meta.json` itself, already written by the caller). Same frame
+    /// family as [`Self::emit_session_evicted`], so the SPA's existing
+    /// `session_lifecycle` listener refreshes the rail with no client change.
+    fn emit_session_renamed(&self, sid: &str, slug: &str) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!("session-renamed-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session renamed: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "renamed".to_string(),
+                reason: "user".to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
     }
 }
 
@@ -8739,6 +8874,36 @@ fn activity_marker(activity: &str) -> &'static str {
         "stuck" => "🔴 stuck",
         _ => "⚪ unknown",
     }
+}
+
+/// Split a `/rename` argument into an explicit `[<sid>] <title>` pair. A
+/// leading `s<N>` token counts as a TARGET only when a title follows it, so
+/// `/rename s3` still titles the current session `s3` rather than trying to
+/// rename `s3` to nothing. Pure — unit-tested directly.
+fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
+    let (head, tail) = rest.split_once(char::is_whitespace)?;
+    let looks_like_sid = head
+        .strip_prefix('s')
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    let title = tail.trim();
+    (looks_like_sid && !title.is_empty()).then_some((head, title))
+}
+
+/// The `/rename` receipt: which session changed, from what to what, and how
+/// far the new title travelled. The vendor clause is NEVER omitted — a title
+/// that only exists ccteam-side must not read as though the vendor adopted it.
+fn render_rename_receipt(r: &SessionRename) -> String {
+    let mut out = match r.previous.as_deref().filter(|p| !p.is_empty()) {
+        Some(prev) => format!("已重命名 {} 「{prev}」→「{}」", r.sid, r.title),
+        None => format!("已重命名 {} →「{}」", r.sid, r.title),
+    };
+    out.push('\n');
+    out.push_str(&match &r.vendor_sync {
+        TitleSync::Pushed => format!("· 已同步到 {} 自己的会话标题", r.vendor),
+        TitleSync::Deferred(reason) => format!("· 仅 ccteam 侧({reason})"),
+        TitleSync::Unsupported => format!("· 仅 ccteam 侧({} 无会话标题接口)", r.vendor),
+    });
+    out
 }
 
 /// v0.8.23 review §3.2-5 (item 2a) — the compact "which session just spoke"
@@ -10603,6 +10768,14 @@ mod tests {
         /// order, so the `/interrupt` test can assert the gateway invoked the
         /// adapter's interrupt (not destroy).
         interrupts: Arc<Mutex<Vec<String>>>,
+        /// `set_session_title` pushes, in call order: `(sid, title, live)` —
+        /// `live` records whether a thread handle came with it, which is what
+        /// separates a rename on a live session from one on a stopped one.
+        title_pushes: Arc<Mutex<Vec<(String, String, bool)>>>,
+        /// When set, this fake claims a vendor title surface and answers
+        /// `Pushed`; off by default so the honest "this vendor has no title
+        /// API" wording stays the default under test.
+        title_surface: bool,
         /// Liveness reported by `thread_is_live`. A test flips this to `false`
         /// to simulate the child exiting out from under a held handle (crash /
         /// OOM / long idle); `start_thread` flips it back `true` so a resume
@@ -10658,6 +10831,8 @@ mod tests {
                 emit_turn_started: false,
                 turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
+                title_pushes: Arc::new(Mutex::new(Vec::new())),
+                title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
             }
@@ -10682,6 +10857,13 @@ mod tests {
 
         fn with_turn_failure(mut self, message: impl Into<String>) -> Self {
             self.turn_failure = Some(message.into());
+            self
+        }
+
+        /// Opt into a vendor that HAS a session-title surface (claude/codex);
+        /// the default fake reports `Unsupported` like an ACP vendor.
+        fn with_title_surface(mut self) -> Self {
+            self.title_surface = true;
             self
         }
 
@@ -10925,6 +11107,23 @@ mod tests {
 
         fn thread_is_live(&self, _h: &ThreadHandle) -> bool {
             self.live.load(Ordering::SeqCst)
+        }
+
+        async fn set_session_title(
+            &self,
+            target: &SessionTitleTarget,
+            title: &str,
+        ) -> Result<TitleSync, HarnessError> {
+            self.title_pushes.lock().await.push((
+                target.sid.clone(),
+                title.to_string(),
+                target.thread.is_some(),
+            ));
+            Ok(if self.title_surface {
+                TitleSync::Pushed
+            } else {
+                TitleSync::Unsupported
+            })
         }
     }
 
@@ -14182,7 +14381,10 @@ mod tests {
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        gateway.rename_session("s2", "A long review title").unwrap();
+        gateway
+            .rename_session("s2", "A long review title")
+            .await
+            .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let opts = gateway.session_switch_options(&chat, false);
         assert_eq!(opts.len(), 2, "{opts:?}");
@@ -14226,7 +14428,7 @@ mod tests {
             .await
             .unwrap();
         let long = "A really really long session title that keeps going";
-        gateway.rename_session("s1", long).unwrap();
+        gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let opts = gateway.session_switch_options(&chat, false);
         let label = opts[0].label.trim_end_matches('\u{2800}');
@@ -17782,9 +17984,15 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/rename  my   custom title  ")
             .await
             .unwrap();
+        // The receipt names the session, the new title, and — always — what
+        // the vendor did with it (this fake vendor has no title surface, so
+        // the honest answer is "ccteam-side only").
         assert_eq!(
             renamed,
-            vec!["已重命名 s1 → my custom title\n↓ 本项目会话 → /sessions"]
+            vec![
+                "已重命名 s1 →「my custom title」\n· 仅 ccteam 侧(claude 无会话标题接口)\
+                 \n↓ 本项目会话 → /sessions"
+            ]
         );
 
         // The title moved off the /sessions text row onto the switch button.
@@ -17820,6 +18028,183 @@ mod tests {
             s1_button(&gateway).as_deref(),
             Some("✓ s1 claude (my custom title)"),
             "an explicit /rename must survive a later message (sticky user title)"
+        );
+    }
+
+    /// `[<sid>] <title>` parsing: a leading `s<N>` is a TARGET only when a
+    /// title follows it, so `/rename s3` still titles the CURRENT session
+    /// "s3" instead of silently renaming a different session to nothing.
+    #[test]
+    fn rename_arg_splits_a_leading_sid_only_when_a_title_follows() {
+        assert_eq!(
+            split_leading_sid("s12 release checklist"),
+            Some(("s12", "release checklist"))
+        );
+        // Extra whitespace around the title is the caller's to trim.
+        assert_eq!(
+            split_leading_sid("s3   spaced  out "),
+            Some(("s3", "spaced  out"))
+        );
+        // No remainder ⇒ the whole thing is a title for the current session.
+        assert_eq!(split_leading_sid("s3"), None);
+        assert_eq!(split_leading_sid("s3   "), None);
+        // Not a sid shape ⇒ plain title, even when it starts with `s`.
+        assert_eq!(split_leading_sid("session cleanup"), None);
+        assert_eq!(split_leading_sid("s12a bad shape"), None);
+        assert_eq!(split_leading_sid("ship the rename"), None);
+    }
+
+    /// `/rename <sid> <title>` renames a session that is NOT the current one —
+    /// the same leading-id convention `/stop` / `/use` / `/interrupt` take —
+    /// and the receipt names the session actually renamed (so a mis-parse is
+    /// visible immediately rather than silently retitling the current chat).
+    #[tokio::test]
+    async fn gateway_rename_targets_an_explicit_sid() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        // s2 is current; rename s1 by id.
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename s1 the older one")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("已重命名 s1 →「the older one」"),
+            "receipt must name the targeted sid: {:?}",
+            reply
+        );
+        let s1 = read_session_meta(tmp.path(), "s1").unwrap();
+        let s2 = read_session_meta(tmp.path(), "s2").unwrap();
+        assert_eq!(s1.title.as_deref(), Some("the older one"));
+        assert_eq!(s1.title_source, Some(TitleSource::User));
+        assert!(s2.title.is_none(), "the current session must be untouched");
+    }
+
+    /// A sid another chat owns is not renameable — and reads exactly like an
+    /// unknown one (no existence disclosure), matching `/stop`'s answer.
+    #[tokio::test]
+    async fn gateway_rename_refuses_a_foreign_sid() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-2", "bob", "/new claude cto")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-2", "bob", "/rename s1 not mine")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("unknown session for this chat: s1"),
+            "{:?}",
+            reply
+        );
+        let unknown = gateway
+            .handle_text("mock", "chat-2", "bob", "/rename s99 nope")
+            .await
+            .unwrap();
+        assert!(
+            unknown[0].starts_with("unknown session for this chat: s99"),
+            "a foreign sid and an unknown sid must read identically: {:?}",
+            unknown
+        );
+        assert!(read_session_meta(tmp.path(), "s1").unwrap().title.is_none());
+    }
+
+    /// A STOPPED session is renameable: `meta.json` outlives the live map, and
+    /// the web rail offers rename on history rows. The vendor push still runs,
+    /// with NO live thread — which is exactly what tells a vendor whose title
+    /// surface is an RPC (codex) to answer `Deferred`.
+    #[tokio::test]
+    async fn gateway_rename_works_on_a_stopped_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/stop s1")
+            .await
+            .unwrap();
+        assert!(!gateway.is_session_live("s1"));
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename s1 archived work")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("已重命名 s1 →「archived work」"),
+            "a stopped session must rename like a live one: {:?}",
+            reply
+        );
+        let meta = read_session_meta(tmp.path(), "s1").unwrap();
+        assert_eq!(meta.title.as_deref(), Some("archived work"));
+        let pushes = fake.title_pushes.lock().await.clone();
+        assert_eq!(
+            pushes,
+            vec![("s1".to_string(), "archived work".to_string(), false)],
+            "the vendor push must run with no live thread"
+        );
+    }
+
+    /// The rename reaches the VENDOR's own title surface, and the receipt says
+    /// so — the whole point of wiring it through the adapter rather than only
+    /// writing ccteam's meta.json.
+    #[tokio::test]
+    async fn gateway_rename_pushes_the_title_to_the_vendor() {
+        let fake = Arc::new(FakeAdapter::default().with_title_surface());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename ship it")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].contains("已同步到 claude 自己的会话标题"),
+            "a real push must be reported as synced: {:?}",
+            reply
+        );
+        let pushes = fake.title_pushes.lock().await.clone();
+        assert_eq!(
+            pushes,
+            vec![("s1".to_string(), "ship it".to_string(), true)],
+            "the live session's push carries its thread handle"
+        );
+
+        // Renaming again shows what it replaced.
+        let again = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename ship it twice")
+            .await
+            .unwrap();
+        assert!(
+            again[0].starts_with("已重命名 s1 「ship it」→「ship it twice」"),
+            "the receipt must show the previous title: {:?}",
+            again
         );
     }
 

@@ -3,7 +3,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { railSessionLabel, relativeTime, relativeTimeEn, relativeTimeZh } from "./railHelpers";
+import {
+  railSessionLabel,
+  relativeTime,
+  relativeTimeEn,
+  relativeTimeZh,
+  renameToastText,
+} from "./railHelpers";
 
 describe("railSessionLabel", () => {
   it("prefers the title when set", () => {
@@ -72,5 +78,41 @@ describe("relativeTime (language switch)", () => {
     const secondsAgo = (s: number) => new Date(Date.now() - s * 1000).toISOString();
     expect(relativeTime("zh", secondsAgo(5 * 60))).toBe("5分钟前");
     expect(relativeTime("en", secondsAgo(5 * 60))).toBe("5m");
+  });
+});
+
+describe("renameToastText", () => {
+  const base = { sid: "s7", title: "ship it", vendor: "claude" };
+
+  it("says so when the vendor's own title took the rename", () => {
+    expect(renameToastText("zh", { ...base, vendor_sync: { state: "pushed" } })).toBe(
+      "已重命名 s7 →「ship it」 · 已同步到 claude",
+    );
+    expect(renameToastText("en", { ...base, vendor_sync: { state: "pushed" } })).toBe(
+      "Renamed s7 → “ship it” · synced to claude",
+    );
+  });
+
+  it("never implies a sync a vendor cannot do", () => {
+    expect(
+      renameToastText("zh", { ...base, vendor: "grok", vendor_sync: { state: "unsupported" } }),
+    ).toBe("已重命名 s7 →「ship it」 · 仅 ccteam 侧(grok 无会话标题接口)");
+    expect(
+      renameToastText("en", { ...base, vendor: "grok", vendor_sync: { state: "unsupported" } }),
+    ).toBe("Renamed s7 → “ship it” · ccteam-side only (grok has no session-title API)");
+  });
+
+  it("passes the server's reason through for a deferred push", () => {
+    expect(
+      renameToastText("zh", {
+        ...base,
+        vendor: "codex",
+        vendor_sync: { state: "deferred", detail: "resume the session to sync" },
+      }),
+    ).toBe("已重命名 s7 →「ship it」 · 仅 ccteam 侧(resume the session to sync)");
+  });
+
+  it("degrades to the plain line when the server reports no sync field", () => {
+    expect(renameToastText("zh", base)).toBe("已重命名 s7 →「ship it」");
   });
 });

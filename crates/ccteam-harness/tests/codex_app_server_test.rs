@@ -11,7 +11,7 @@ use ccteam_harness::execution::codex_app_server::{
 use ccteam_harness::execution::codex_jsonrpc::Notification;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoiceSelection, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, TurnInput,
+    HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadEvent, TitleSync, TurnInput,
 };
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -1447,6 +1447,60 @@ async fn d2_rpc_direct_map_methods_and_params() {
     drop(peer);
     let _ = std::fs::remove_file(&sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A ccteam rename (IM `/rename` / web PATCH) reaches codex's OWN thread name
+/// over the same `thread/name/set` wire the in-thread `/rename` directive uses
+/// — one implementation, so the two surfaces cannot drift.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn set_session_title_pushes_thread_name_set() {
+    let (adapter, h, seen, peer, sock) = d2_start("d2-title").await;
+
+    let target = SessionTitleTarget {
+        sid: "s42".into(),
+        vendor_uuid: h.identity.clone(),
+        project_dir: std::env::temp_dir(),
+        thread: Some(h.clone()),
+    };
+    let sync = adapter
+        .set_session_title(&target, "release checklist")
+        .await
+        .unwrap();
+    assert_eq!(sync, TitleSync::Pushed);
+
+    let frames = seen.lock().unwrap().clone();
+    assert_eq!(
+        find_frame(&frames, "thread/name/set").unwrap()["params"],
+        json!({ "threadId": "tid-d2", "name": "release checklist" })
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A STOPPED codex session has no connection to name — the honest answer is
+/// `Deferred` (the ccteam-side title still stands), never a fake success and
+/// never an error the frontends would have to render as a failed rename.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn set_session_title_without_a_live_thread_is_deferred() {
+    let adapter = CodexAppServerAdapter::new();
+    let target = SessionTitleTarget {
+        sid: "s43".into(),
+        vendor_uuid: "tid-gone".into(),
+        project_dir: std::env::temp_dir(),
+        thread: None,
+    };
+    let sync = adapter.set_session_title(&target, "later").await.unwrap();
+    match sync {
+        TitleSync::Deferred(reason) => assert!(
+            reason.contains("resume"),
+            "the reason must tell the user what unblocks it: {reason}"
+        ),
+        other => panic!("expected Deferred for a stopped codex session, got {other:?}"),
+    }
 }
 
 /// D2.1 — /fork sends thread/fork and surfaces the new thread id from the

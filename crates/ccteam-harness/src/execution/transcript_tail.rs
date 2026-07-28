@@ -181,6 +181,13 @@ pub fn anthropic_project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(resolve_project_dir_in(&base, cwd))
 }
 
+/// [`anthropic_project_dir`] against an explicitly supplied Claude projects
+/// root — the injection seam (same shape as [`discover_active_session_in`]) so
+/// tests never touch the real `~/.claude/projects/`.
+pub fn anthropic_project_dir_in(claude_projects_root: &Path, cwd: &Path) -> PathBuf {
+    resolve_project_dir_in(claude_projects_root, cwd)
+}
+
 fn resolve_project_dir_in(base: &Path, cwd: &Path) -> PathBuf {
     let raw = base.join(encode_project_cwd(cwd));
     if raw.exists() {

@@ -16,6 +16,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Folder,
+  Pencil,
   Plus,
   Search,
   Settings,
@@ -23,6 +24,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { CcLogo } from "./Logo";
+import { InlineRename } from "./InlineRename";
 import { VendorChip } from "./VendorChip";
 import { makeT, tShowMore, type Lang } from "../lib/i18n";
 
@@ -107,6 +109,7 @@ export function Sidebar({
   onOpenTeam,
   onOpenRow,
   onStopRow,
+  onRenameRow,
 }: {
   lang: Lang;
   collapsed: boolean;
@@ -133,10 +136,15 @@ export function Sidebar({
   onOpenTeam?: () => void;
   onOpenRow: (row: RailRow) => void;
   onStopRow: (row: RailRow) => void;
+  /** Rename a row's session (live or stopped) — double-click a row, or use
+   *  its ✎ button. Optional so embedding surfaces can omit the affordance. */
+  onRenameRow?: (sid: string, title: string) => void;
 }) {
   const t = makeT(lang);
   const [closedWs, setClosedWs] = useState<Record<string, boolean>>({});
   const [expandedWs, setExpandedWs] = useState<Record<string, boolean>>({});
+  /** sid currently being renamed inline (at most one at a time). */
+  const [renaming, setRenaming] = useState<string | null>(null);
 
   const q = query.trim();
   const filtered = filterRows(rows, q);
@@ -277,15 +285,47 @@ export function Sidebar({
                               className={`srow ${row.sid === activeSid ? "active" : ""} ${row.history ? "hist" : ""}`}
                               role="button"
                               tabIndex={0}
-                              title={`${row.sid} · ${row.vendor}${row.model ? ` ${row.model}` : ""}${row.history ? ` · ${t("historySec")}` : ""}`}
-                              onClick={() => onOpenRow(row)}
+                              title={`${row.sid} · ${row.vendor}${row.model ? ` ${row.model}` : ""}${row.history ? ` · ${t("historySec")}` : ""}${onRenameRow ? ` · ${t("renameTip")}` : ""}`}
+                              onClick={() => {
+                                if (renaming !== row.sid) onOpenRow(row);
+                              }}
+                              onDoubleClick={() => {
+                                if (onRenameRow) setRenaming(row.sid);
+                              }}
                               onKeyDown={(e) => {
-                                if (e.key === "Enter") onOpenRow(row);
+                                if (e.key === "Enter" && renaming !== row.sid) onOpenRow(row);
                               }}
                             >
                               <VendorChip vendor={row.vendor} />
-                              <span className="name">{row.label}</span>
-                              {rowStoppable(row) ? (
+                              {renaming === row.sid && onRenameRow ? (
+                                <InlineRename
+                                  className="name rename-input"
+                                  initial={row.label}
+                                  ariaLabel={`${t("renameTip")} ${row.sid}`}
+                                  onSubmit={(title) => {
+                                    setRenaming(null);
+                                    onRenameRow(row.sid, title);
+                                  }}
+                                  onCancel={() => setRenaming(null)}
+                                />
+                              ) : (
+                                <span className="name">{row.label}</span>
+                              )}
+                              {onRenameRow && renaming !== row.sid ? (
+                                <button
+                                  type="button"
+                                  className="stop rename"
+                                  title={t("renameTip")}
+                                  aria-label={`${t("renameTip")} ${row.sid}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setRenaming(row.sid);
+                                  }}
+                                >
+                                  <Pencil />
+                                </button>
+                              ) : null}
+                              {rowStoppable(row) && renaming !== row.sid ? (
                                 <button
                                   type="button"
                                   className="stop"

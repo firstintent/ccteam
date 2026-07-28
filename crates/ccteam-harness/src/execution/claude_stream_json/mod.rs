@@ -1786,6 +1786,29 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         }
         Ok(())
     }
+
+    /// Claude's title surface is its transcript's `custom-title` entry (the
+    /// SDK `renameSession` contract), NOT a control_request — the stream-json
+    /// control channel has no title subtype. Writing the file also means a
+    /// rename works on a stopped session, so the whole push lives in the
+    /// shared vendor helper; the live map only supplies a fresher uuid.
+    async fn set_session_title(
+        &self,
+        target: &crate::SessionTitleTarget,
+        title: &str,
+    ) -> Result<crate::TitleSync, HarnessError> {
+        let mut target = target.clone();
+        if let Some(live) = target
+            .thread
+            .as_ref()
+            .and_then(|t| self.lookup(&t.identity))
+        {
+            target.vendor_uuid = live.identity.vendor_uuid.clone();
+        }
+        Ok(crate::execution::vendor_title::push_claude_custom_title(
+            &target, title,
+        ))
+    }
 }
 
 #[cfg(test)]

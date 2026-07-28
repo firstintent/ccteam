@@ -482,14 +482,21 @@ pub struct RenameSessionRequest {
 
 /// `PATCH /api/v1/sessions/{sid}`
 ///
-/// Rename a LIVE session's user-facing title. The title is rule-based
-/// truncated server-side (whitespace-collapsed, capped ~40 chars — never an
-/// LLM call) and recorded as `TitleSource::User`, which is STICKY: it is
-/// never later overwritten by the first-message auto-title or a vendor
-/// `ai-title` (see [`ccteam_harness::apply_title`]'s precedence). 200
-/// `{sid, title}` with the cleaned title actually stored. 400 for a blank
-/// title. 404 unknown/inaccessible session (project-ACL'd via `gate_sid`,
-/// same as every other `/sessions/{sid}/*` route). 503 no gateway.
+/// Rename a session's user-facing title — live **or stopped** (a history row
+/// in the rail is renameable exactly like a live one; `meta.json` outlives the
+/// live map). The title is rule-based truncated server-side
+/// (whitespace-collapsed, capped ~40 chars — never an LLM call) and recorded
+/// as `TitleSource::User`, which is STICKY: it is never later overwritten by
+/// the first-message auto-title or a vendor `ai-title` (see
+/// [`ccteam_harness::apply_title`]'s precedence).
+///
+/// 200 `{sid, title, previous, vendor, vendor_sync:{state, detail?}}` — the
+/// cleaned title actually stored plus what the VENDOR's own title surface did
+/// with it (`pushed` | `deferred` | `unsupported`), so the UI can tell the
+/// user honestly whether the rename crossed the vendor boundary instead of
+/// implying it always does. 400 for a blank title. 404 unknown/inaccessible
+/// session (project-ACL'd via `gate_sid`, same as every other
+/// `/sessions/{sid}/*` route). 503 no gateway.
 #[utoipa::path(
     patch,
     path = "/api/v1/sessions/{sid}",
@@ -497,7 +504,7 @@ pub struct RenameSessionRequest {
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     request_body = RenameSessionRequest,
     responses(
-        (status = 200, description = "Renamed `{sid, title}`", body = serde_json::Value),
+        (status = 200, description = "Renamed `{sid, title, previous, vendor, vendor_sync}`", body = serde_json::Value),
         (status = 400, description = "Blank title"),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
@@ -524,15 +531,40 @@ pub(crate) async fn handle_patch_session(
     };
     let result = {
         let guard = gw.lock().await;
-        guard.rename_session(&sid, &body.title)
+        // Held across the vendor push, like `interrupt_session`'s adapter call:
+        // the push is one file append / one RPC, and serializing renames keeps
+        // meta.json's read-modify-write atomic against a concurrent rename.
+        guard.rename_session(&sid, &body.title).await
     };
     match result {
-        Ok(title) => Json(json!({"sid": sid, "title": title})).into_response(),
+        Ok(renamed) => Json(rename_payload(&renamed)).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "rename_session failed");
             unknown_session(&sid)
         }
     }
+}
+
+/// Serialize a [`SessionRename`] for the PATCH response. Split out so the
+/// wire shape — including the vendor-sync report the SPA renders — is
+/// unit-testable without a live gateway.
+fn rename_payload(renamed: &ccteam_im::gateway::SessionRename) -> serde_json::Value {
+    let (state, detail) = match &renamed.vendor_sync {
+        ccteam_harness::TitleSync::Pushed => ("pushed", None),
+        ccteam_harness::TitleSync::Deferred(reason) => ("deferred", Some(reason.clone())),
+        ccteam_harness::TitleSync::Unsupported => ("unsupported", None),
+    };
+    let mut sync = json!({ "state": state });
+    if let Some(detail) = detail {
+        sync["detail"] = json!(detail);
+    }
+    json!({
+        "sid": renamed.sid,
+        "title": renamed.title,
+        "previous": renamed.previous,
+        "vendor": renamed.vendor,
+        "vendor_sync": sync,
+    })
 }
 
 /// Reconstruct a session's history from its ccteam-owned transcript mirror

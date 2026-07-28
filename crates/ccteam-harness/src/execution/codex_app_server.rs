@@ -522,6 +522,19 @@ impl CodexAppServerAdapter {
         Ok(conn.client)
     }
 
+    /// `thread/name/set` (`thread.rs:660`) — the ONE place codex's thread name
+    /// is written, shared by the user-typed `/rename` directive and the
+    /// cross-surface [`HarnessAdapter::set_session_title`] push, so an IM/web
+    /// rename and an in-thread `/rename` can never drift apart.
+    async fn set_thread_name(&self, tid: &str, name: &str) -> Result<(), HarnessError> {
+        let client = self.client().await?;
+        client
+            .call("thread/name/set", json!({ "threadId": tid, "name": name }))
+            .await
+            .map_err(|e| HarnessError::SubmitFailed(format!("thread/name/set: {e:#}")))?;
+        Ok(())
+    }
+
     /// Mark `tid` as loaded on the current connection (called after a
     /// successful `thread/start` / `thread/resume`). Best-effort: a connection
     /// failure here just means the next [`ensure_thread_loaded`] re-resumes.
@@ -876,13 +889,7 @@ impl CodexAppServerAdapter {
                         reason: "usage: /rename <new name>".to_string(),
                     }
                 } else {
-                    let client = self.client().await?;
-                    client
-                        .call("thread/name/set", json!({ "threadId": tid, "name": args }))
-                        .await
-                        .map_err(|e| {
-                            HarnessError::SubmitFailed(format!("thread/name/set: {e:#}"))
-                        })?;
+                    self.set_thread_name(tid, args).await?;
                     DirectiveOutcome::Done {
                         receipt: format!("renamed thread to \"{args}\"."),
                     }
@@ -2250,6 +2257,30 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}")))?;
         Ok(())
+    }
+
+    /// Codex's title surface is the `thread/name/set` RPC (`thread.rs:660`) —
+    /// the same call the `/rename` directive makes, so an IM/web rename and a
+    /// user-typed `/rename` land on one implementation. It needs a live
+    /// connection with the thread resident, so a STOPPED session is an honest
+    /// [`TitleSync::Deferred`]: unlike Claude there is no file to write.
+    async fn set_session_title(
+        &self,
+        target: &crate::SessionTitleTarget,
+        title: &str,
+    ) -> Result<crate::TitleSync, HarnessError> {
+        let Some(thread) = target.thread.as_ref() else {
+            return Ok(crate::TitleSync::Deferred(
+                "codex thread names are set over a live connection; resume the session to sync"
+                    .into(),
+            ));
+        };
+        let tid = thread.identity.as_str();
+        // Same precondition every thread-scoped directive takes: the thread
+        // must be resident on THIS connection or the RPC 404s.
+        let _ = self.ensure_thread_loaded(tid).await?;
+        self.set_thread_name(tid, title).await?;
+        Ok(crate::TitleSync::Pushed)
     }
 }
 

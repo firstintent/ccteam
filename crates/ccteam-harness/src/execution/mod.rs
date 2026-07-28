@@ -26,6 +26,7 @@ pub mod session_recovery;
 pub mod transcript_tail;
 pub mod turns_mirror;
 pub mod typed_events;
+pub mod vendor_title;
 
 pub use claude_bg::ClaudeBgAdapter;
 pub use claude_stream_json::ClaudeStreamJsonAdapter;

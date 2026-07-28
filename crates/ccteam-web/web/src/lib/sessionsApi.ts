@@ -315,17 +315,36 @@ export function stopSession(sid: string): Promise<{ stopped: boolean }> {
   return postJson<{ stopped: boolean }>(`${sessionUrl(sid)}/stop`, {});
 }
 
+/** What the VENDOR's own title surface did with a rename:
+ *  - `pushed` — claude's transcript `custom-title` / codex's `thread/name/set`
+ *    now carries it, so the session reads the same in the vendor's own UI.
+ *  - `deferred` — the vendor HAS a title surface but it wasn't reachable
+ *    (stopped session / no transcript yet); `detail` says why.
+ *  - `unsupported` — that vendor exposes no session-title API at all. */
+export interface VendorTitleSync {
+  state: "pushed" | "deferred" | "unsupported";
+  detail?: string;
+}
+
+/** `PATCH /api/v1/sessions/{sid}` result. */
+export interface RenameResult {
+  sid: string;
+  title: string;
+  /** The title this replaced; `null` when the session had none yet. */
+  previous?: string | null;
+  vendor?: string;
+  vendor_sync?: VendorTitleSync;
+}
+
 /** `PATCH /api/v1/sessions/{sid}` — rename a session's user-facing title
- *  (v0.8.22 P1 session-title system). The server rule-truncates the title
- *  (whitespace-collapsed, capped ~40 chars — never an LLM call) and records
- *  it as the STICKY user-source (never later overwritten by the
- *  first-message auto-title or a vendor `ai-title`). Returns the cleaned
- *  title actually stored. */
-export function renameSession(
-  sid: string,
-  title: string,
-): Promise<{ sid: string; title: string }> {
-  return patchJson<{ sid: string; title: string }>(sessionUrl(sid), { title });
+ *  (v0.8.22 P1 session-title system). Works on a live OR a stopped session.
+ *  The server rule-truncates the title (whitespace-collapsed, capped ~40
+ *  chars — never an LLM call), records it as the STICKY user-source (never
+ *  later overwritten by the first-message auto-title or a vendor `ai-title`),
+ *  and mirrors it to the vendor's own title surface — `vendor_sync` reports
+ *  what actually happened there. */
+export function renameSession(sid: string, title: string): Promise<RenameResult> {
+  return patchJson<RenameResult>(sessionUrl(sid), { title });
 }
 
 /** `POST /api/v1/sessions/{sid}/interrupt` — interrupt the session's

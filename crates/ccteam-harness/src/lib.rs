@@ -52,11 +52,11 @@ pub use adapter::{
     ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
     ContextUsage, Directive, DirectiveOutcome, ExecutionMode, GoalStatus, HarnessAdapter,
     HarnessError, HarnessSnapshot, PermissionMode, RunningTask, SessionHandle, SessionProtocol,
-    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, ThreadStatus, TurnDisposition, TurnId, TurnInput, TurnRouting,
-    TurnSubmission, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
-    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent,
+    ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus, TitleSync, TurnDisposition, TurnId,
+    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV,
+    CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES,
+    DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,

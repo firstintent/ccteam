@@ -614,6 +614,47 @@ pub enum DirectiveOutcome {
     Redirect { hint: String },
 }
 
+// ── vendor-side session title (the write half of the title system) ──────────
+
+/// Which session a [`HarnessAdapter::set_session_title`] push targets.
+/// Deliberately NOT a bare [`ThreadHandle`]: a rename is legal on a STOPPED
+/// session too (its `meta.json` is the SoT and outlives the live map), so the
+/// target carries the on-disk coordinates every adapter can resolve from, and
+/// `thread` is `Some` only while the session happens to be live. An adapter
+/// whose title surface is a file (Claude's transcript `custom-title` entry)
+/// therefore works in both states; one whose surface is a live RPC (Codex
+/// `thread/name/set`) answers [`TitleSync::Deferred`] when `thread` is `None`.
+#[derive(Debug, Clone)]
+pub struct SessionTitleTarget {
+    /// ccteam session id (`s{n}`).
+    pub sid: String,
+    /// The vendor's own session id as recorded in `meta.json` (Claude session
+    /// UUID / Codex thread id / ACP session id). May be empty for vendors that
+    /// don't expose one.
+    pub vendor_uuid: String,
+    /// The project working dir the session runs in — also where ccteam's
+    /// per-session state (`.ccteam/chat/<sid>/`) lives.
+    pub project_dir: PathBuf,
+    /// Live handle when the session is currently in the gateway's live map.
+    pub thread: Option<ThreadHandle>,
+}
+
+/// What happened on the VENDOR side when ccteam pushed a user rename.
+/// Reported verbatim to the user (IM receipt / web toast) so a title that
+/// only exists ccteam-side never reads as if the vendor had adopted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum TitleSync {
+    /// The vendor's own title surface now carries the new title.
+    Pushed,
+    /// The vendor HAS a title surface, but it could not be reached right now
+    /// (no live thread, or the vendor hasn't filed a transcript yet). The
+    /// ccteam-side title stands; `detail` says why.
+    Deferred(String),
+    /// The vendor exposes no session-title surface at all — ccteam-side only.
+    Unsupported,
+}
+
 /// A choice the user must make, produced either by an adapter
 /// ([`DirectiveOutcome::NeedsChoice`]) or by an agent question (the chat
 /// `AskUserQuestion` hook). Channel-neutral: each channel renders it its
@@ -1145,6 +1186,34 @@ pub trait HarnessAdapter: Send + Sync {
                 self.name()
             ),
         })
+    }
+
+    /// Push an explicit user rename to the VENDOR's own session-title surface,
+    /// so a session renamed in ccteam reads the same way in the vendor's native
+    /// UI (`claude --resume`'s picker, `codex`'s thread list).
+    ///
+    /// ccteam's `meta.json` stays the SoT for the title — this is a one-way
+    /// mirror of an explicit `TitleSource::User` rename, never of the
+    /// rule-based auto-title or of a title ccteam ADOPTED from the vendor
+    /// (mirroring those back would fight the vendor's own heuristics).
+    ///
+    /// **Not a prompt** (red line): every implementation writes vendor session
+    /// METADATA through that vendor's documented external-writer path — the
+    /// Claude transcript's `custom-title` entry (the SDK `renameSession`
+    /// contract), Codex's `thread/name/set` RPC. Nothing enters the model's
+    /// conversation and no pane is driven.
+    ///
+    /// The default answer is [`TitleSync::Unsupported`]: a vendor with no title
+    /// surface degrades HONESTLY (the frontends say so) rather than silently
+    /// pretending the push landed. `Err` is reserved for a surface that exists
+    /// and genuinely failed.
+    async fn set_session_title(
+        &self,
+        target: &SessionTitleTarget,
+        title: &str,
+    ) -> Result<TitleSync, HarnessError> {
+        let _ = (target, title);
+        Ok(TitleSync::Unsupported)
     }
 }
 
