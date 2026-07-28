@@ -402,23 +402,39 @@ async fn read_sse_seq_until(resp: reqwest::Response, pred: impl Fn(&str) -> bool
 /// approval, not just reconnects". A BRAND-NEW SSE connection (no
 /// `Last-Event-ID` at all) while an approval is outstanding for that sid must
 /// still render the approve/deny prompt.
+///
+/// The session is CREATED first (the same fixture pattern as every other
+/// gateway-attached test here): `gate_sid` resolves sid → project before
+/// serving the stream and fails closed on a sid it can't place (074e284f), so
+/// the sid must exist as a real session — as on a live daemon, where a HITL
+/// prompt only ever fires on a spawned session.
 #[tokio::test]
 async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
-    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
-        factory,
-        "demo",
-        paths.projects_root.join("demo"),
-    );
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
-    seed_pending_approval(&gateway, "s1", "ptok").await;
 
-    let addr = spawn_server(AppState::new(paths).with_gateway(gateway)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+    let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    seed_pending_approval(&gateway, &sid, "ptok").await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/{sid}/events"))
         .await
         .expect("sse get");
     assert_eq!(resp.status(), 200);
@@ -447,22 +463,35 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
 async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
-    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
-        factory,
-        "demo",
-        paths.projects_root.join("demo"),
-    );
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
     let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
 
-    // Connection #1 observes the first HITL prompt for s1 and records its
-    // seq (the SSE frame's `id:` line) as the watermark it'll reconnect
+    // The sid under test is a REAL spawned session (see the fresh-connect
+    // test above: `gate_sid` fails closed on a sid it can't resolve to a
+    // project).
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Connection #1 observes the first HITL prompt for the sid and records
+    // its seq (the SSE frame's `id:` line) as the watermark it'll reconnect
     // with.
-    seed_pending_approval(&gateway, "s1", "first").await;
-    let resp1 = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+    seed_pending_approval(&gateway, &sid, "first").await;
+    let resp1 = reqwest::get(format!("http://{addr}/api/v1/sessions/{sid}/events"))
         .await
         .unwrap();
     let seq1 = read_sse_seq_until(resp1, |d| d.contains("first"))
@@ -476,12 +505,12 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     // outstanding per sid at a time, matching the real HITL flow).
     let pending = gateway.lock().await.pending_handle();
     pending.lock().await.take_by_token("first");
-    seed_pending_approval(&gateway, "s1", "second").await;
+    seed_pending_approval(&gateway, &sid, "second").await;
 
     // Connection #2 reconnects naming seq1 as its watermark: it must see the
     // second approval (the gap), not a re-delivery of the first.
     let resp2 = reqwest::get(format!(
-        "http://{addr}/api/v1/sessions/s1/events?last_event_id={seq1}"
+        "http://{addr}/api/v1/sessions/{sid}/events?last_event_id={seq1}"
     ))
     .await
     .unwrap();
