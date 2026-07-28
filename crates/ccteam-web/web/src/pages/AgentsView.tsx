@@ -1,11 +1,15 @@
-// 团队/Team view — topology-first (v0.9.11 TEAM-1). The roster + timeline
-// tabs are gone; the live delegation topology is the single canvas (a later
-// card adds a "charter" tab beside it):
+// 团队/Team view — topology-first (v0.9.11 TEAM-1) + 分工 charter tab
+// (TEAM-2). The legacy roster/timeline tabs are gone; a two-tab seg picks
+// between the live topology canvas and the division-of-labor charter
+// (`pages/CharterPanel.tsx`), while the KPI strip / vendor chips / ticker
+// stay global above the seg:
 //
 // - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
 //   designed to stay readable with 100+ sessions. Every row (and the detail
 //   panel) links to the real chat route `/chat/s/<sid>` — right/middle-click
 //   open-in-new-tab works because these are real hyperlinks.
+// - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
+//   reuses this view's graph nodes for its aggregation — no refetch).
 // - KPI strip (live / working / active dispatches / total cost) + per-vendor
 //   chips (live count + Σcost per vendor; clicking a chip filters the
 //   topology to that vendor, clicking it again clears the filter).
@@ -36,6 +40,7 @@ import { vendorDotClass } from "../lib/vendors";
 import { makeT, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
+import CharterPanel from "./CharterPanel";
 
 const PULSE_WINDOW_MS = 60_000;
 const GRAPH_REFRESH_MS = 15_000;
@@ -334,10 +339,48 @@ export function AgentsPanel({
   );
 }
 
-export default function AgentsView({ lang: langProp }: { lang?: Lang } = {}) {
+/** Team tab seg (拓扑 | 分工) — hook-free presentational (exported for
+ *  node-env tests). Sits below the global KPI/chips/ticker strip. */
+export function TeamTabSeg({
+  tab,
+  lang: langProp,
+  onSwitch,
+}: {
+  tab: "topology" | "charter";
+  lang?: Lang;
+  onSwitch: (tab: "topology" | "charter") => void;
+}) {
+  const t = makeT(langProp ?? "zh");
+  return (
+    <div className="seg agents-seg" data-testid="agents-seg">
+      <button
+        type="button"
+        className={tab === "topology" ? "active" : ""}
+        data-testid="agents-seg-topology"
+        onClick={() => onSwitch("topology")}
+      >
+        {t("teamTabTopology")}
+      </button>
+      <button
+        type="button"
+        className={tab === "charter" ? "active" : ""}
+        data-testid="agents-seg-charter"
+        onClick={() => onSwitch("charter")}
+      >
+        {t("teamTabCharter")}
+      </button>
+    </div>
+  );
+}
+
+export default function AgentsView({
+  lang: langProp,
+  initialTab,
+}: { lang?: Lang; initialTab?: "topology" | "charter" } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
 
+  const [tab, setTab] = useState<"topology" | "charter">(initialTab ?? "topology");
   const [graph, setGraph] = useState<AgentsGraphResponse>({ nodes: [], edges: [], hosts: [] });
   const [edges, setEdges] = useState<AgentEdge[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -470,42 +513,47 @@ export default function AgentsView({ lang: langProp }: { lang?: Lang } = {}) {
         onToggle={(vendor) => setVendorFilter((current) => (current === vendor ? null : vendor))}
       />
       <AgentsTicker events={timestamped} lang={lang} onSelect={setSelected} />
+      <TeamTabSeg tab={tab} lang={lang} onSwitch={setTab} />
 
-      <div className="agents-body">
-        <div className="agents-canvas" data-testid="agents-canvas">
-          {loading ? (
-            <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }}>{t("loading")}</p>
-          ) : empty ? (
-            <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }} data-testid="agents-empty">
-              {t("teamEmpty")}
-            </p>
-          ) : (
-            <AgentsTree
-              nodes={visibleNodes}
-              edges={edges}
-              hosts={graph.hosts}
-              selected={selected}
+      {tab === "charter" ? (
+        <CharterPanel nodes={graph.nodes} lang={lang} />
+      ) : (
+        <div className="agents-body">
+          <div className="agents-canvas" data-testid="agents-canvas">
+            {loading ? (
+              <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }}>{t("loading")}</p>
+            ) : empty ? (
+              <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }} data-testid="agents-empty">
+                {t("teamEmpty")}
+              </p>
+            ) : (
+              <AgentsTree
+                nodes={visibleNodes}
+                edges={edges}
+                hosts={graph.hosts}
+                selected={selected}
+                pulsing={pulsing}
+                lang={lang}
+                onSelect={setSelected}
+              />
+            )}
+          </div>
+
+          {selectedNode ? (
+            <AgentsPanel
+              node={selectedNode}
               pulsing={pulsing}
+              activityFold={activityFold}
+              history={historyBySid[selectedNode.sid] ?? []}
               lang={lang}
-              onSelect={setSelected}
             />
-          )}
+          ) : graph.nodes.length > 0 ? (
+            <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
+              <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
+            </aside>
+          ) : null}
         </div>
-
-        {selectedNode ? (
-          <AgentsPanel
-            node={selectedNode}
-            pulsing={pulsing}
-            activityFold={activityFold}
-            history={historyBySid[selectedNode.sid] ?? []}
-            lang={lang}
-          />
-        ) : graph.nodes.length > 0 ? (
-          <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
-            <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
-          </aside>
-        ) : null}
-      </div>
+      )}
     </section>
   );
 }

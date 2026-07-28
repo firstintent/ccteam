@@ -1167,3 +1167,32 @@ select:focus-visible,
   .agents-body { flex-direction: column; }
   .agents-panel { width: 100%; border-left: none; border-top: 1px solid var(--border); }
 }
+/* v0.9.11 TEAM-2 — 拓扑|分工 tab seg + charter tab (roster cards + editor). */
+.agents-seg { margin: 0 28px 8px; }
+.agents-charter { flex: 1; overflow-y: auto; padding: 4px 28px 24px; display: flex; flex-direction: column; gap: 18px; }
+.charter-roster-section h3, .charter-editor-head h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 8px; }
+.charter-roster { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.charter-roster-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.charter-roster-head { display: flex; align-items: center; gap: 8px; }
+.charter-roster-vendor { font-weight: 600; color: var(--text); }
+.charter-roster-host { margin-left: auto; color: var(--text-faint); font-size: 11px; }
+.charter-roster-head .badge { margin-left: auto; }
+.charter-roster-host + .badge { margin-left: 0; }
+.charter-roster-meta { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.charter-roster-hint { color: var(--text-faint); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.charter-roster-stats { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.charter-roster-live { color: var(--green); font-variant-numeric: tabular-nums; }
+.charter-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.charter-project-pick { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
+.charter-project-pick select { padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-card); color: var(--text); font-size: 12.5px; }
+.charter-editor { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.charter-path { color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.charter-editor-bar { display: flex; align-items: center; gap: 10px; }
+.charter-receipt { margin-left: auto; color: var(--text-faint); font-size: 11.5px; }
+.charter-textarea { width: 100%; min-height: 320px; resize: vertical; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft); color: var(--text); font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; }
+.charter-preview { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; background: var(--bg-soft); }
+.charter-ctas { display: flex; gap: 8px; }
+.charter-muted { color: var(--text-faint); font-size: 12.5px; }
+.charter-muted .mono { font-family: var(--font-mono); font-size: 11px; }
+.charter-error { color: var(--red-text); font-size: 12.5px; }
+.charter-note { color: var(--text-faint); font-size: 11.5px; margin-top: 10px; }

@@ -52,6 +52,10 @@ chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# v0.9.11 TEAM-2 — the routing-charter endpoints report the same lower-hex
+# sha256 the MCP `status` vendor panel does for the same file. (Was dev-only
+# for the marketplace test fixture; the routes now need it at runtime.)
+sha2 = { workspace = true }
 # V0.5.0 F96 — Agent Teams `.claude/agents/<agentType>.md` frontmatter
 # parsing (Anthropic teammate definitions). `subagent_resolver` splits
 # `--- yaml --- body` and feeds the front block through `serde_yaml`.
@@ -138,10 +142,8 @@ nix = { version = "0.29", default-features = false, features = ["signal", "fs"] 
 tempfile = "3"
 async-trait.workspace = true
 reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
-# v0.8.9 Phase 2 — marketplace route round-trip test computes the
-# `content_sha` its fake hub advertises (so the install integrity check
-# passes), mirroring `ccteam-im`'s `hub_test` fixture.
-sha2 = { workspace = true }
+# (sha2 moved to [dependencies] for the routing-charter endpoints; the
+# marketplace test fixture keeps using it from there.)
 # V0.3 M5.2 — SSE integration tests need to read the streaming body
 # line by line. `tokio-util` exposes `StreamReader` (bytes stream →
 # AsyncRead); `futures-util` provides the `StreamExt::map` adapter

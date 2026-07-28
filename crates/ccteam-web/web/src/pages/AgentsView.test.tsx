@@ -23,6 +23,7 @@ import AgentsView, {
   AgentsPanel,
   AgentsTicker,
   AgentsTree,
+  TeamTabSeg,
   VendorKpiChips,
 } from "./AgentsView";
 import { emptyFold } from "./chatTranscript";
@@ -99,6 +100,51 @@ describe("AgentsView (shell smoke)", () => {
       </MemoryRouter>,
     );
     expect(html).toContain("Team");
+  });
+
+  // v0.9.11 TEAM-2 — 拓扑|分工 seg between the ticker and the body.
+  it("renders the tab seg with topology default; initialTab='charter' swaps in the charter panel", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsView />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('data-testid="agents-seg"');
+    expect(html).toContain('data-testid="agents-canvas"');
+    expect(html).not.toContain('data-testid="charter-panel"');
+
+    const charter = renderToString(
+      <MemoryRouter>
+        <AgentsView initialTab="charter" />
+      </MemoryRouter>,
+    );
+    expect(charter).toContain('data-testid="charter-panel"');
+    expect(charter).not.toContain('data-testid="agents-canvas"');
+    // The KPI strip stays global above the seg on both tabs.
+    expect(charter).toContain('data-testid="agents-kpis"');
+  });
+});
+
+describe("TeamTabSeg (拓扑 | 分工)", () => {
+  it("renders both tabs, active one highlighted", () => {
+    const html = renderToString(<TeamTabSeg tab="topology" onSwitch={() => {}} />);
+    expect(html).toContain('data-testid="agents-seg"');
+    expect(html).toContain("拓扑");
+    expect(html).toContain("分工");
+    expect(html).toMatch(/class="active"[^>]*data-testid="agents-seg-topology"/);
+    const charterActive = renderToString(<TeamTabSeg tab="charter" onSwitch={() => {}} />);
+    expect(charterActive).toMatch(/class="active"[^>]*data-testid="agents-seg-charter"/);
+  });
+
+  it("clicking a tab switches to it", () => {
+    const onSwitch = vi.fn();
+    const clicks = collectOnClicks(TeamTabSeg({ tab: "topology", onSwitch }));
+    expect(clicks).toHaveLength(2); // [拓扑, 分工]
+    clicks[1]!();
+    expect(onSwitch).toHaveBeenCalledWith("charter");
+    clicks[0]!();
+    expect(onSwitch).toHaveBeenCalledWith("topology");
   });
 });
 

@@ -126,6 +126,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
+        (name = "routing", description = "Project division-of-labor charter (`.ccteam/routing.md` — advisory markdown agents pull via the MCP `status` tool; global `~/.ccteam/routing.md` is the read-only fallback)"),
         (name = "skills", description = "User-level global skill library"),
         (name = "sessions", description = "Live gateway sessions (spawn / turn / events / stop)"),
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
@@ -208,6 +209,11 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(
             super::roles::handle_get_role,
             super::roles::handle_put_role
+        ))
+        // v0.9.11 TEAM-2 — division-of-labor charter (GET + PUT share the path)
+        .routes(routes!(
+            super::routing::handle_get_routing,
+            super::routing::handle_put_routing
         ))
         // composer attachments — project uploads + installed-skill picker
         .routes(routes!(super::uploads::handle_project_upload))

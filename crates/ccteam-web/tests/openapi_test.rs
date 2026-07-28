@@ -106,6 +106,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/projects/{slug}/roles"),
         ("GET", "/api/v1/projects/{slug}/roles/{role}"),
         ("PUT", "/api/v1/projects/{slug}/roles/{role}"),
+        // v0.9.11 TEAM-2 — division-of-labor charter (routing.md)
+        ("GET", "/api/v1/projects/{slug}/routing"),
+        ("PUT", "/api/v1/projects/{slug}/routing"),
         // composer attachments — project uploads + installed-skill picker
         ("POST", "/api/v1/projects/{slug}/uploads"),
         ("GET", "/api/v1/projects/{slug}/skills"),
