@@ -6,6 +6,7 @@
 // reconnect-dedup logic can never drift apart.
 
 import { useEffect, useRef, useState } from "react";
+import { createAuthedEventSource } from "../lib/authedEventSource";
 import { shouldAcceptEventSeq } from "./useSessionEvents";
 import type { SessionActivity } from "./useSessionEvents";
 
@@ -114,7 +115,10 @@ export function useAgentsEvents(
   const [lastError, setLastError] = useState<string | null>(null);
   const [gatewayUnavailable, setGatewayUnavailable] = useState(false);
   const lastSeenSeqRef = useRef(0);
-  const esRef = useRef<EventSource | null>(null);
+  // fetch-backed (Bearer + cookie), same as useSessionEvents — native
+  // EventSource is cookie-only and 401s when localStorage Bearer is the
+  // only live auth path.
+  const esRef = useRef<ReturnType<typeof createAuthedEventSource> | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
 
@@ -155,7 +159,7 @@ export function useAgentsEvents(
 
     const connect = () => {
       if (cancelled) return;
-      const es = new EventSource(agentsEventsUrl(lastSeenSeqRef.current));
+      const es = createAuthedEventSource(agentsEventsUrl(lastSeenSeqRef.current));
       esRef.current = es;
 
       es.addEventListener("open", () => {

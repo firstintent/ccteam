@@ -299,6 +299,13 @@ pub(crate) async fn handle_me(
 /// picked up by auth's per-request registry read. In both cases the response
 /// is the only reveal of the new token and the old token dies immediately.
 /// 400 when auth is disabled (loopback — there is no token in use).
+///
+/// Note (Bearer re-mint interaction): when the caller had no valid cookie and
+/// authenticated with Bearer, `auth_layer` may Set-Cookie the **old** bare
+/// hex on this response (it re-mints from the request Bearer before the
+/// handler's rotate is visible). The SPA must replace localStorage with the
+/// returned `wire_token`; the next REST call re-mints a cookie from the new
+/// hex. Do not treat the Set-Cookie on this response as authoritative.
 #[utoipa::path(
     post,
     path = "/api/v1/me/reset-token",

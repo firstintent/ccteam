@@ -147,6 +147,224 @@ async fn auth_enabled_accepts_valid_bearer_header() {
     assert_eq!(resp.status(), 200);
 }
 
+/// Regression: SPA localStorage Bearer can desync from the HttpOnly
+/// `ccteam_token` cookie (cookie expired/cleared/blocked; Bearer still
+/// valid). Native EventSource cannot send Authorization, so it 401'd
+/// forever while REST still worked. Bearer auth must re-mint the session
+/// cookie so cookie-only clients (EventSource / WebSocket) heal after any
+/// successful REST call.
+#[tokio::test]
+async fn bearer_auth_remints_session_cookie() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    // No cookie — only Bearer (the desynced SPA state).
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "Bearer alone must authenticate");
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("Bearer path must Set-Cookie to re-mint the session cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
+        "cookie must store bare hex: {set_cookie}"
+    );
+    assert!(
+        set_cookie.to_lowercase().contains("httponly"),
+        "cookie must be HttpOnly: {set_cookie}"
+    );
+    assert!(
+        set_cookie.to_lowercase().contains("max-age=604800"),
+        "cookie must carry a 7-day Max-Age: {set_cookie}"
+    );
+
+    // The reminted cookie alone (no Bearer) must now open the same gate —
+    // this is what EventSource / WS need after the first REST heal.
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Cookie", format!("ccteam_token={TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "cookie reminted from Bearer must authenticate alone"
+    );
+}
+
+/// Production symptom was on the SSE route itself (`GET …/events` 401), not
+/// `/auth/token`. Bearer-only against the live SSE path must stream AND
+/// re-mint the cookie (so a subsequent cookie-only client heals too).
+#[tokio::test]
+async fn bearer_auth_remints_cookie_on_sse_events_route() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    // No-gateway SSE still returns 200 text/event-stream (gateway_unavailable
+    // frame) — enough to prove the middleware gate + Set-Cookie on a streaming
+    // response without spinning a live gateway.
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/sessions/s1/events"))
+        .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "Bearer-only SSE must not 401");
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ctype.starts_with("text/event-stream"),
+        "expected event-stream, got {ctype}"
+    );
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("SSE Bearer path must Set-Cookie (stream headers land before body)")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
+        "SSE response must re-mint session cookie: {set_cookie}"
+    );
+}
+
+/// Valid cookie short-circuits before Bearer re-mint → no Set-Cookie (locks
+/// non-sliding Max-Age + the v0.8.20 cookie-before-header order).
+#[tokio::test]
+async fn valid_cookie_path_does_not_set_cookie() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Cookie", format!("ccteam_token={TOKEN_HEX}"))
+        // Stale/different Bearer must NOT force a re-mint when cookie is valid.
+        .header("Authorization", format!("Bearer ccteam:{TOKEN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "valid cookie path must not re-mint (would turn Max-Age into a sliding window)"
+    );
+}
+
+/// Tenant Bearer re-mints a cookie carrying the tenant hex; that cookie alone
+/// must resolve as the same tenant (ownership-leak boundary).
+#[tokio::test]
+async fn tenant_bearer_remints_tenant_cookie() {
+    use ccteam_core::tenants::TenantRegistry;
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    let tenant_hex = tenant.web_token.clone();
+    reg.save(&paths.users_dir()).unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_hex}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "tenant Bearer must authenticate");
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("tenant Bearer must re-mint cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains(&format!("ccteam_token={tenant_hex}")),
+        "cookie must be the tenant hex, not admin: {set_cookie}"
+    );
+    assert!(
+        !set_cookie.contains(&format!("ccteam_token={TOKEN_HEX}")),
+        "must not mint the admin token for a tenant Bearer"
+    );
+
+    // Cookie alone → same identity (auth/token returns the caller's wire token).
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Cookie", format!("ccteam_token={tenant_hex}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["wire_token"].as_str(),
+        Some(format!("ccteam:{tenant_hex}").as_str()),
+        "cookie reminted from tenant Bearer must resolve as that tenant"
+    );
+}
+
+/// Host join / agent tokens authenticate a non-web principal and must NEVER
+/// receive the SPA session cookie (would let a satellite token open the web UI).
+#[tokio::test]
+async fn host_join_token_does_not_mint_session_cookie() {
+    use ccteam_core::host_registry::{join_tokens_path_in, JoinTokenStore};
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut store = JoinTokenStore::default();
+    let join_hex = store.mint(None, None).token.clone();
+    store
+        .save(&join_tokens_path_in(&paths.root))
+        .expect("persist join tokens");
+
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn(state).await;
+
+    // Any gated route that host-join can pass the middleware on. /auth/token
+    // is fine — we only care that auth_layer does not Set-Cookie.
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/auth/token"))
+        .header("Authorization", format!("Bearer ccteam:{join_hex}"))
+        .send()
+        .await
+        .unwrap();
+    // Host-join is authenticated (not 401). Whether the handler returns 200
+    // or another non-401 is immaterial for the cookie invariant.
+    assert_ne!(
+        resp.status(),
+        401,
+        "join token must resolve in auth_layer (got {})",
+        resp.status()
+    );
+    if let Some(sc) = resp.headers().get("set-cookie") {
+        let sc = sc.to_str().unwrap_or("");
+        assert!(
+            !sc.contains("ccteam_token="),
+            "host join token must not receive SPA session cookie: {sc}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn auth_enabled_rejects_wrong_bearer_token() {
     let tmp = TempDir::new().unwrap();

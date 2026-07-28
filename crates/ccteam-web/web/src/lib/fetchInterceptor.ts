@@ -70,6 +70,10 @@ export function installFetchErrorToasts(): void {
     const sameOrigin = isSameOrigin(rawUrl);
 
     const patchedInit = attachAuthHeader(sameOrigin, init);
+    // SSE streams (createAuthedEventSource) retry with backoff and surface
+    // their own lastError — toasting every 5xx/network blip on reconnect
+    // would spam the user (up to 7 session + 7 agents retries).
+    const isEventStream = acceptIsEventStream(patchedInit);
 
     try {
       const res = await original(input, patchedInit);
@@ -85,7 +89,7 @@ export function installFetchErrorToasts(): void {
           handleTokenAuthFailure();
         }
       }
-      if (isApi && res.status >= 500) {
+      if (isApi && res.status >= 500 && !isEventStream) {
         reportError(`Server error ${res.status} from ${path}`);
       }
       return res;
@@ -97,7 +101,7 @@ export function installFetchErrorToasts(): void {
       ) {
         throw err;
       }
-      if (isApi) {
+      if (isApi && !isEventStream) {
         reportError(
           `Network error contacting ${path}. Check your connection.`,
         );
@@ -105,6 +109,15 @@ export function installFetchErrorToasts(): void {
       throw err;
     }
   };
+}
+
+/** True when the request asks for an SSE body (`Accept: text/event-stream`).
+ *  Used to suppress reconnect toast spam from long-lived event streams. */
+function acceptIsEventStream(init: RequestInit | undefined): boolean {
+  if (!init?.headers) return false;
+  const headers = new Headers(init.headers);
+  const accept = headers.get("Accept") ?? headers.get("accept") ?? "";
+  return accept.includes("text/event-stream");
 }
 
 // 401 with no `login_required` body: token is dead, missing, or revoked.
