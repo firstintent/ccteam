@@ -8,6 +8,10 @@
 //! (every session that ever existed, on disk, per project) ⋈
 //! [`ccteam_im::gateway::Gateway::session_views`] (which of those are
 //! currently tracked in memory ⇒ `"live"`) ⋈
+//! [`ccteam_harness::HarnessAdapter::thread_status`] per live sid (resolved
+//! under the same lock, awaited after it drops — the SAME statusline source
+//! `GET /sessions/{sid}/status` serves, via
+//! [`super::sessions_api::resolved_thread_status`] ⇒ `nodes[].model`) ⋈
 //! [`ccteam_im::gateway::Gateway::armed_delegation_watch_sids`] (a
 //! best-effort seed for `edges[].active`, corrected live by the SSE
 //! `dispatched`/`completed` frames — see `AgentsView`'s reducer).
@@ -62,9 +66,12 @@ pub struct AgentNode {
     pub slug: String,
     pub role: String,
     pub vendor: String,
-    /// Not tracked on `meta.json`/`SessionView` today (spawn-time model
-    /// override isn't persisted) — always `null`. Reserved wire shape for
-    /// when it is.
+    /// The model the session is running RIGHT NOW — for `"live"` nodes only,
+    /// read from the same per-session statusline source as
+    /// `GET /api/v1/sessions/{sid}/status` (`thread_status`, so mid-session
+    /// model switches are reflected). `null` for idle nodes (nothing live to
+    /// report — the spawn-time `meta.json` model override is deliberately not
+    /// echoed) and for live sessions with no statusline yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub host: String,
@@ -147,12 +154,16 @@ fn normalize_host(host: &str) -> String {
 
 /// Build the graph snapshot for exactly the given (already ACL-filtered)
 /// `slugs`, from a live-session-view lookup + armed-watch set the caller
-/// resolved under the gateway lock. Pure over its inputs (`project_dir` +
-/// these maps) so it's unit-testable without a server.
+/// resolved under the gateway lock, plus `live_models` — the per-live-sid
+/// statusline model the caller read AFTER dropping that lock (only live sids
+/// ever appear in it, so an idle node's `model` is honestly `None`). Pure
+/// over its inputs (`project_dir` + these maps) so it's unit-testable
+/// without a server.
 pub(crate) fn build_agents_graph(
     project_dir_for: impl Fn(&str) -> std::path::PathBuf,
     slugs: &[String],
     live_by_sid: &HashMap<String, SessionView>,
+    live_models: &HashMap<String, String>,
     armed_watches: &HashSet<String>,
 ) -> AgentsGraphResponse {
     let mut nodes = Vec::new();
@@ -172,7 +183,7 @@ pub(crate) fn build_agents_graph(
                 slug: slug.clone(),
                 role: m.role.clone(),
                 vendor: ccteam_im::delegation::vendor_key(m.vendor).to_string(),
-                model: None,
+                model: live_models.get(&m.sid).cloned(),
                 host,
                 status: status.to_string(),
                 parent_sid: m.parent_sid.clone(),
@@ -238,21 +249,45 @@ pub(crate) async fn handle_agents_graph(
         Some(slug) => vec![slug.clone()],
         None => visible_project_slugs(&app, &identity),
     };
-    let (live_by_sid, armed_watches): (HashMap<String, SessionView>, HashSet<String>) = {
+    let (live_by_sid, armed_watches, live_handles) = {
         let guard = gw.lock().await;
-        let live = guard
+        let live: HashMap<String, SessionView> = guard
             .session_views()
             .into_iter()
             .map(|v| (v.sid.clone(), v))
             .collect();
         let armed = guard.armed_delegation_watch_sids();
-        (live, armed)
+        // `(adapter, thread)` clones for every live sid, resolved under this
+        // same single lock acquisition — the `thread_status` I/O below runs
+        // only after the guard drops (the status endpoint's lock-drop
+        // discipline).
+        let handles: Vec<_> = live
+            .keys()
+            .filter_map(|sid| {
+                guard
+                    .session_status_handle(sid)
+                    .map(|(adapter, thread)| (sid.clone(), adapter, thread))
+            })
+            .collect();
+        (live, armed, handles)
     };
+    // The live-model join: N per-live-sid statusline reads per snapshot (the
+    // SPA refreshes at 15s), through the SAME helper `GET
+    // /sessions/{sid}/status` serves — one source of truth for what a
+    // session is running.
+    let mut live_models: HashMap<String, String> = HashMap::new();
+    for (sid, adapter, thread) in live_handles {
+        let status = super::sessions_api::resolved_thread_status(adapter, thread, &sid).await;
+        if let Some(model) = status.model {
+            live_models.insert(sid, model);
+        }
+    }
     let paths = app.paths.clone();
     let graph = build_agents_graph(
         |slug| paths.project_dir(slug),
         &slugs,
         &live_by_sid,
+        &live_models,
         &armed_watches,
     );
     Json(graph).into_response()
@@ -446,6 +481,7 @@ mod tests {
             },
             &["demo".to_string()],
             &live,
+            &HashMap::new(),
             &armed,
         );
         assert_eq!(graph.nodes.len(), 2);
@@ -501,9 +537,79 @@ mod tests {
             |_| dir.clone(),
             &["demo".to_string()],
             &live,
+            &HashMap::new(),
             &HashSet::new(),
         );
         assert_eq!(graph.nodes[0].status, "live");
+    }
+
+    /// TEAM-4 — `nodes[].model` comes from the caller's post-lock statusline
+    /// join (`live_models`), never from `meta.json`: the live sid carries its
+    /// reported model, the idle sid stays honestly `None`.
+    #[test]
+    fn build_agents_graph_joins_live_model_only_for_live_nodes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        meta(
+            &dir,
+            "s1",
+            "brain",
+            ccteam_harness::AgentVendor::Claude,
+            None,
+            0,
+        );
+        meta(
+            &dir,
+            "s2",
+            "worker",
+            ccteam_harness::AgentVendor::Grok,
+            Some("s1"),
+            1,
+        );
+        let mut live: HashMap<String, SessionView> = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            SessionView {
+                sid: "s1".to_string(),
+                project: "demo".to_string(),
+                role: "brain".to_string(),
+                vendor: "claude".to_string(),
+                permission_mode: "skip".to_string(),
+                protocol: "stream-json".to_string(),
+                host: "local".to_string(),
+                current: false,
+                status: "live".to_string(),
+                last_activity_seconds: None,
+                created_at: String::new(),
+                last_active: String::new(),
+                title: None,
+                turn_count: 0,
+                cost_usd: None,
+                tokens_total: None,
+                model: None,
+                waiting_approval: false,
+                parent_sid: None,
+                delegation_depth: 0,
+            },
+        );
+        let live_models: HashMap<String, String> = [("s1".to_string(), "fable-5".to_string())]
+            .into_iter()
+            .collect();
+        let graph = build_agents_graph(
+            |_| dir.clone(),
+            &["demo".to_string()],
+            &live,
+            &live_models,
+            &HashSet::new(),
+        );
+        let by_sid = |sid: &str| graph.nodes.iter().find(|n| n.sid == sid).unwrap();
+        assert_eq!(by_sid("s1").model.as_deref(), Some("fable-5"));
+        assert_eq!(
+            by_sid("s2").model,
+            None,
+            "an idle node has nothing live to report"
+        );
     }
 
     #[test]

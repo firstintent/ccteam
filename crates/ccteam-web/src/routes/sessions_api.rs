@@ -52,6 +52,7 @@
 //! written yet. A `sid` unknown to the gateway is a 404.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -64,7 +65,10 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_harness::{AgentVendor, ChoicePrompt, PermissionMode, SessionProtocol, ThreadStatus};
+use ccteam_harness::{
+    AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
+    ThreadStatus,
+};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
@@ -600,6 +604,30 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
     })
 }
 
+/// One live session's [`ThreadStatus`], awaited AFTER the caller has dropped
+/// the gateway lock (resolve `(adapter, thread)` via
+/// [`session_status_handle`](ccteam_im::gateway::Gateway::session_status_handle)
+/// under the lock first — `thread_status` does fs/transport I/O and must
+/// never run under the gateway mutex). A `thread_status` error degrades to
+/// the empty (all-null) status, never a 5xx. This is the single source of
+/// truth for a session's live statusline: shared by `GET
+/// /sessions/{sid}/status` and the team graph's per-live-node model join
+/// ([`super::agents::handle_agents_graph`]), so both report the same model.
+pub(crate) async fn resolved_thread_status(
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+    sid: &str,
+) -> ThreadStatus {
+    match adapter.thread_status(&thread).await {
+        Ok(s) => s,
+        Err(err) => {
+            // A statusless answer is valid — degrade to empty, never a 5xx.
+            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
+            ThreadStatus::default()
+        }
+    }
+}
+
 /// `GET /api/v1/sessions/{sid}/status`
 ///
 /// The session's live statusline — model + context-window usage — for the
@@ -607,11 +635,12 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 /// suffix). Resolves the sid → `(adapter, thread)` under the gateway lock
 /// (also the 404 gate), **drops the lock**, then awaits
 /// [`HarnessAdapter::thread_status`](ccteam_harness::HarnessAdapter::thread_status)
-/// — fs/transport I/O that must never run under the gateway mutex (same
-/// lock-drop discipline as the history endpoint). 200 `{sid, model, context,
-/// status_line}`; any field is `null` until there is something to report (a
-/// fresh session before its first turn). 404 unknown sid. 503 no gateway. A
-/// `thread_status` error degrades to the empty (all-null) status, never a 5xx.
+/// via [`resolved_thread_status`] — fs/transport I/O that must never run
+/// under the gateway mutex (same lock-drop discipline as the history
+/// endpoint). 200 `{sid, model, context, status_line}`; any field is `null`
+/// until there is something to report (a fresh session before its first
+/// turn). 404 unknown sid. 503 no gateway. A `thread_status` error degrades
+/// to the empty (all-null) status, never a 5xx.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{sid}/status",
@@ -643,14 +672,7 @@ pub(crate) async fn handle_session_status(
     let Some((adapter, thread)) = resolved else {
         return unknown_session(&sid);
     };
-    let status = match adapter.thread_status(&thread).await {
-        Ok(s) => s,
-        Err(err) => {
-            // A statusless answer is valid — degrade to empty, never a 5xx.
-            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
-            ThreadStatus::default()
-        }
-    };
+    let status = resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
             "used_tokens": c.used_tokens,

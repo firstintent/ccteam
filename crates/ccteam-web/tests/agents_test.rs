@@ -104,7 +104,13 @@ impl HarnessAdapter for FakeAdapter {
     }
 
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        Ok(ThreadStatus::default())
+        // Every LIVE session's statusline reports this model — the graph's
+        // model join (TEAM-4) reads it through the same source as
+        // `GET /sessions/{sid}/status`.
+        Ok(ThreadStatus {
+            model: Some("agents-test-model".to_string()),
+            ..ThreadStatus::default()
+        })
     }
 }
 
@@ -176,6 +182,40 @@ async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, Str
         .await
         .expect("create_delegated_session succeeds against a FakeAdapter");
     (gateway, outcome.sid)
+}
+
+/// Persist a `meta.json` for a sid the gateway does NOT track — an idle
+/// (stopped/evicted) session the graph must still list — optionally carrying
+/// a spawn-time `model` override, which the graph must NOT echo as a live
+/// model.
+fn idle_meta(project_dir: &std::path::Path, sid: &str, model: Option<&str>) {
+    let m = ccteam_harness::SessionMeta {
+        sid: sid.to_string(),
+        slug: "demo".to_string(),
+        vendor: AgentVendor::Claude,
+        protocol: SessionProtocol::StreamJson,
+        role: "worker".to_string(),
+        permission_mode: PermissionMode::Skip,
+        owner: "user:web".to_string(),
+        vendor_uuid: String::new(),
+        model: model.map(str::to_string),
+        host: String::new(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        last_active: "2026-01-01T00:00:00Z".to_string(),
+        origin: ccteam_harness::SessionOrigin::Ccteam,
+        title: None,
+        title_source: None,
+        turn_count: 0,
+        cost_usd: None,
+        tokens_total: None,
+        role_sha: None,
+        skills_sha: None,
+        trigger: None,
+        parent_sid: None,
+        spawned_by_role: None,
+        delegation_depth: 0,
+    };
+    ccteam_harness::write_session_meta(project_dir, &m).unwrap();
 }
 
 /// Open `path` as an SSE stream and return a line reader. Self-contained copy
@@ -322,6 +362,55 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// TEAM-4 — the graph joins each LIVE node with the model its session runs
+/// right now, read through the SAME statusline source as
+/// `GET /sessions/{sid}/status` (this file's `FakeAdapter` reports
+/// `agents-test-model` from `thread_status`). An idle (persisted-only) node
+/// stays `null` even though its `meta.json` carries a spawn-time `model`
+/// override — nothing live to report.
+#[tokio::test]
+async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = register_project(&paths, "demo", None);
+
+    let (gateway, child_sid) = spawn_delegated_child(project_dir.clone()).await;
+    idle_meta(&project_dir, "s9", Some("spawn-time-override"));
+
+    let gw = Arc::new(tokio::sync::Mutex::new(gateway));
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw);
+    let addr = spawn(state).await;
+
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/agents/graph"))
+        .header("Authorization", bearer(ADMIN_HEX))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    let node = |sid: &str| {
+        nodes
+            .iter()
+            .find(|n| n["sid"] == sid)
+            .unwrap_or_else(|| panic!("expected node {sid} in {body}"))
+    };
+    let live = node(&child_sid);
+    assert_eq!(live["status"], Value::String("live".to_string()));
+    assert_eq!(
+        live["model"],
+        Value::String("agents-test-model".to_string()),
+        "live node carries the statusline model: {body}"
+    );
+    let idle = node("s9");
+    assert_eq!(idle["status"], Value::String("idle".to_string()));
+    assert!(
+        idle["model"].is_null(),
+        "idle node must not echo the spawn-time meta model: {body}"
+    );
 }
 
 #[tokio::test]
