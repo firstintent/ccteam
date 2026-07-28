@@ -40,6 +40,7 @@
 | spawn project 默认梯扩展(解析语义变更 + `config.yaml` 新键 `default_project` + `~/.ccteam/default_project` scratch 自动供给 + 响应 `project_source` 字段) | **已签核消耗** —— owner 2026-07-26 IM「必须优化 b」拍板服务端默认项目方向,「还有更好的方式吗」= 授权规划定形(五级梯 + configured 键 + lazy scratch);tenant 语义零变;落地 = MCP-DX-3 |
 | status 返回瘦身(MCP status JSON 形变 + core `ProjectState` 退役字段 team/phase/tmux_session 全链清除) | **已签核消耗** —— owner 2026-07-26 IM「status 返回冗余…从架构多层通用性和对称性去修」+「省 token…不能变 token 刺客」+「其他省 token 也你来决定,功能优先其次省 token」;落地 = STATUS-SLIM-1(codex 委派,排 MCP-DX-3 后) |
 | web ACL 收敛(§三 ACL 行「全局·运维面仅 admin」修订 + REST 契约 403→200 放开(status/hosts/skills/项目 MCP 注册/global-attach)+ tenant 自助 reset-token) | **已签核消耗** —— owner 2026-07-27「除了新增用户,其他的功能应该放开给普通用户…在web进行调整。权限的底层逻辑应该是用户token和绑定的项目」;落地 = WEB-ACL-1(`1025450`),红线行文随治理收口 commit 同步。边界判定(规划,owner 如要更宽另令):全局 bot 凭据 `/config/im` 保持 admin(身份对称 —— tenant 家 = `/me/im`,各人管各人凭据);terminal 协议 UI 门保持(冻结面非本令);登录链接卡 admin(= 他人 token 面) |
+| 治病根优先于补丁(常态规则,非一次性) | **已生效** —— owner 2026-07-28:「从架构层的通用性来设计解决真正的病根,而不是补丁式的。把这条加入 agents.md」;已固化 AGENTS.md §五 总纲(两条判据:同形扫一遍 / 新入口自动被覆盖;并覆盖测试定性——「登记为 flake」常是病根未找到)。同日串用户扫荡为实锤来源 |
 | 改 AGENTS.md §三红线 / 降任何基线 / 改对外契约语义(REST `/api/v1` · MCP wire) | 须 owner 签核后才动 |
 
 ## 未固化教训

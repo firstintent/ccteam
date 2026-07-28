@@ -99,6 +99,11 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 ## 五、PR / 实现纪律
 
+> **总纲:治病根,通用解优先于补丁**(owner 令 2026-07-28)。先定位缺陷所在的**层**(身份解析 / 归属策略 / 资源解析 / 门),在那一层修**一次**;在症状点打补丁 = 制造债,且下一个入口还会再犯。两条判据:
+> ① **同形扫一遍** —— 一个 fallback 漏了,同形的通常还有几处。实锤(2026-07-28 串用户扫荡):ACL choke point 只认一种 URL 形状 · 身份解析 fail-open 成 admin · 项目解析回落 daemon 默认 —— 三处同病(**把调用方从未被授权的东西发出去**),分开补三次都是补丁,合起来才是一个修法。
+> ② **新入口自动被覆盖** —— 修完后新增路由 / 前端 / vendor / 租户若还要再补一次,说明补在了症状点。
+> 同样适用于测试:**「登记为 flake」常常是病根没找到** —— `resume_*` / `hook_*` 挂了整族的账,实为确定性缺陷(读错路径 + panic 泄漏 fault 开关 / 继承宿主 `CCTEAM_HOOKLESS`)。定性前先问「宿主给了它什么」。
+
 1. **每个改动映射**(commit/PR 描述均可):`requirements.md` 某条痛点 + `tech-design.md` 某节;改协议**以代码为 SoT**(同步 tech-design 末尾「协议→代码」指针表)
 2. **commit 用英语;agent prompt 用英语**(**产品化、简洁,非冗长**;hub vendored prompt 随上游);项目文档(CLAUDE.md / `docs/`)用中文
 3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 新旧状态数据不兼容时**不写迁移步骤/兼容分支**,直接「清旧数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重 `ccteam init`」;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
