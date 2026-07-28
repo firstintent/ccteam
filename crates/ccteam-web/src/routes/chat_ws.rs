@@ -67,9 +67,13 @@ fn resolve_chat_identity(
     if app.auth.enabled {
         return (identity.web_chat_id(), identity.id.clone());
     }
+    // With one local operator, the DEFAULT chat is that operator's console —
+    // a neutral label ("web-chat") would resolve to a tenant that owns no
+    // project. An explicit `chat_id` still selects a distinct chat.
+    let console = ccteam_core::identity::ADMIN_WEB_ID.to_string();
     (
-        query.chat_id.unwrap_or_else(|| "web-chat".to_string()),
-        query.user_id.unwrap_or_else(|| "web-user".to_string()),
+        query.chat_id.unwrap_or_else(|| console.clone()),
+        query.user_id.unwrap_or(console),
     )
 }
 

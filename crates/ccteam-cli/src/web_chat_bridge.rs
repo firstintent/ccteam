@@ -500,10 +500,13 @@ mod tests {
             .unwrap();
     }
 
+    /// The operator's own web console socket. `web-api` is the console's
+    /// identity (see `Identity::web_chat_id`); an arbitrary label would resolve
+    /// to a TENANT, which owns no project and therefore cannot spawn.
     async fn connect_chat(
         addr: SocketAddr,
     ) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-        connect_chat_as(addr, "chat-1", "alice").await
+        connect_chat_as(addr, "web-api", "web-api").await
     }
 
     async fn connect_chat_as(
@@ -627,7 +630,7 @@ mod tests {
             "state": "queued",
             "message": {
                 "content": content,
-                "recipient": "chat-1",
+                "recipient": "web-api",
                 "subject": null,
                 "thread_ts": null
             },
@@ -807,7 +810,7 @@ mod tests {
             .expect("chat-created project state");
         assert_eq!(
             state.owner.as_deref(),
-            Some("user:chat-1"),
+            Some("user:web-api"),
             "the creator owner must be stamped at the arbitrary project path before /cd applies its ACL"
         );
         let config = std::fs::read_to_string(ccteam_home.join("config.yaml")).unwrap();
@@ -845,13 +848,13 @@ mod tests {
         let stack = spawn_stack(paths.clone(), Arc::clone(&adapter_state)).await;
 
         // chat-1 (web) creates a session.
-        let mut s1 = connect_chat_as(stack.addr, "chat-1", "alice").await;
+        let mut s1 = connect_chat_as(stack.addr, "web-api", "web-api").await;
         send_text(&mut s1, "new", "/new claude reviewer").await;
         recv_reply_contains(&mut s1, "created session s1").await;
 
         // A SECOND socket for the SAME identity SEES it and can /use it — the
         // flow that matters (one user, two frontends/tabs).
-        let mut same = connect_chat_as(stack.addr, "chat-1", "alice").await;
+        let mut same = connect_chat_as(stack.addr, "web-api", "web-api").await;
         send_text(&mut same, "sessions", "/sessions").await;
         let listed = recv_sessions(&mut same).await;
         assert!(

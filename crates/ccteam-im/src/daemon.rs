@@ -357,6 +357,9 @@ where
             &initial,
         )))
     });
+    // Privilege is a NAMED chat, never "reached the bot": seed the operator
+    // roster from the same credentials the channels above were built from.
+    bind_operator_rosters(&mut *gateway.lock().await, &creds);
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
     // our own (standalone `ccteam-im run`).
@@ -522,6 +525,7 @@ where
             }
             Some(()) = reload_rx.recv() => {
                 reload_im_channels(
+                    &gateway,
                     &shared_channels,
                     &listeners,
                     &inbound_tx_for_reload,
@@ -589,7 +593,48 @@ fn spawn_channel_listener(
 /// consumers, and all agent sessions are left untouched. A byte-identical
 /// credentials doc is a no-op (a pref-only `ccteam config` must not blip the
 /// live IM listeners).
+/// Bind each global bot's OPERATOR ROSTER onto the gateway from `creds`, and
+/// warn about any bot that is reachable but names no owner.
+///
+/// The roster is that bot's credential allowlist — the list already means "the
+/// owner's chats" (onboarding seeds the owner's chat id into it). Making it the
+/// privilege source closes the hole where `"*"` (Lark's wildcard) meant EVERY
+/// sender resolved to the operator: `"*"` names nobody, so it now grants
+/// nobody. An allowlist that is absent/empty (the pre-configuration open mode)
+/// keeps the legacy single-operator assumption — locking a half-configured
+/// owner out of their own bot would be worse than the exposure — but says so
+/// loudly at startup.
+fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
+    let mut rosters: Vec<(&str, Vec<String>)> = Vec::new();
+    if let Some(tg) = creds.telegram.as_ref() {
+        rosters.push(("telegram", tg.allowed_chat_ids.clone()));
+    }
+    if let Some(lark) = creds.lark.as_ref() {
+        rosters.push(("lark", lark.allowed_user_ids.clone()));
+    }
+    if let Some(discord) = creds.discord.as_ref() {
+        rosters.push(("discord", discord.authorized_user_ids.clone()));
+    }
+    for (platform, allowlist) in rosters {
+        match gateway.bind_operator_allowlist(platform, allowlist) {
+            crate::gateway::OperatorBindingKind::Named => {}
+            crate::gateway::OperatorBindingKind::Wildcard => tracing::warn!(
+                channel = %platform,
+                "imd: the {platform} bot allows ANY sender (\"*\") — it names no owner, so \
+                 nobody is the operator through it; add your own chat id to take it back"
+            ),
+            crate::gateway::OperatorBindingKind::Unconfigured => tracing::warn!(
+                channel = %platform,
+                "imd: the {platform} bot has an EMPTY allowlist (open mode) — anyone who \
+                 finds it is served as the operator; add your own chat id to close it"
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn reload_im_channels(
+    gateway: &Arc<Mutex<Gateway>>,
     shared: &Arc<RwLock<ChannelMap>>,
     listeners: &Arc<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     inbound_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -622,6 +667,8 @@ async fn reload_im_channels(
     let mut rebuilt: ChannelMap = HashMap::new();
     let lark_probe_path = lark_open_id_probe_path_for(args);
     if creds_changed {
+        // The allowlist IS the operator roster — re-seed it with the channels.
+        bind_operator_rosters(&mut *gateway.lock().await, &new_creds);
         for (name, builder) in CHANNEL_BUILDERS {
             if let Some(ch) = builder(&new_creds, &bots, Some(lark_probe_path.as_path())) {
                 rebuilt.insert((*name).to_string(), ch);

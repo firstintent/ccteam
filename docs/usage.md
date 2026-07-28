@@ -106,7 +106,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json / terminal for Claude admin-only / ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
@@ -114,7 +114,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 - **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
 - **Schedule a message:** tap the **clock** on the composer to enter schedule mode. Enter **how many minutes and/or hours** from now (or tap chips `+15m` / `+30m` / `+1h` / `+2h`), or pick a **local-clock** datetime — the UI converts everything to a relative delay so browser timezone and daemon timezone never disagree. A preview shows the expected local send time. Type the text and send — the message joins a **queue above the input**, sorted by send time; cancel with **×**. At fire time the text is a normal user turn into that session. Schedule mode does not carry file/skill attachments. Caps: 20 pending per session, farthest **7 days** ahead. Failed deliveries stay in the queue (marked failed) for 24 hours so you can dismiss them.
 
-> Some advanced options (terminal/rmux protocol selection, history resume, and external session import) are currently admin-only. Regular users get the standard Claude / Codex / Grok / OpenCode / Kimi chat flow by default; advanced controls will open up as they stabilize.
+> Every logged-in user gets the same features. What you can reach is decided by **who you are and which projects you own**, not by a smaller menu: you see your own projects and the sessions in them, and nothing of anyone else's. The one exception is **Settings → Admin** (creating users and managing the shared bot credentials), which stays with the owner.
 
 ### Marketplace: Install Roles, Skills, and Workflows
 
@@ -186,7 +186,7 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 }
 ```
 
-`allowed_chat_ids` is the safety boundary. Only listed chats can reach the daemon. **Do not leave it empty in production.** To find a chat id, send the bot a message, then run `curl -s "https://api.telegram.org/bot<token>/getUpdates"` and look for `message.chat.id`.
+`allowed_chat_ids` is the safety boundary **and the owner roster**. Only listed chats can reach the daemon, and a listed chat is served as the box **owner** — so keep it to your own chats. **Do not leave it empty in production.** To find a chat id, send the bot a message, then run `curl -s "https://api.telegram.org/bot<token>/getUpdates"` and look for `message.chat.id`.
 
 **Feishu / Lark** can coexist with Telegram and uses native WebSocket long connection, with no public callback URL. In the developer console (Feishu: `open.feishu.cn`, Lark: `open.larksuite.com`), create an app, enable the bot, choose **WebSocket** event subscription, subscribe to `im.message.receive_v1`, grant `im:message` and `im:message:send_as_bot`, then copy App ID (`cli_...`) and App Secret. Configure through Web Settings / `ccteam config`, or add a `lark` block:
 
@@ -202,7 +202,8 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 ```
 
 - `use_feishu`: `true` for Feishu (China), `false` for Lark international.
-- `allowed_user_ids` is an open_id allowlist (`ou_...`). **Empty means reject everyone** (fail closed). To get your open_id, start with an empty list, message the bot, find `ignoring ou_xxxx (not in allowed_users)` in logs, and add that `ou_xxxx`.
+- `allowed_user_ids` is an open_id allowlist (`ou_...`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). To get your open_id, start with an empty list, message the bot, find `ignoring ou_xxxx (not in allowed_users)` in logs, and add that `ou_xxxx`.
+- The `"*"` wildcard lets **anyone** message the bot. It names nobody, so nobody is served as the owner through it: every sender is a guest who owns only what it creates and sees no project. The daemon warns about this at startup — put your own `ou_...` in the list to take the bot back.
 
 > Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu and Telegram are peers: text, rich text, images, and files are supported.
 
