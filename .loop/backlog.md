@@ -15,30 +15,6 @@
 
 ## 当前卡
 
-### TEAM-1 团队页拓扑整合:删 roster/timeline + 超链接化 + vendor chips + ticker(v0.9.11 wave)
-- **状态**:进行中(规划派工·2026-07-29) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:dev 会话(规划子代理,wave 内串行)
-- **背景**:owner 2026-07-29 直驱团队页重设计并全默认拍板,PRD = `docs-local/versions/v0-9-11/prd-team-page.md`。成员表 ≈ 拓扑树平铺(列几乎重合)、时间轴 30min 窗稀疏 → 两 tab 直删;「打开会话」现为 `navigate()` 非真链接,右键/新 tab 不可用。
-- **规格**:AgentsView 删「成员」「时间轴」两 tab(AgentsRoster/timeline 渲染、仅其存活的纯函数与测试、i18n 废 key 同清);树行 sid/标题、行尾「打开 ↗」、面板按钮 = react-router `<Link to="/chat/s/:sid">` 真 href;host badge(仅多 host);KPI 条下 per-vendor chips(live 数 + Σcost,点击过滤拓扑);最近委派 ticker(客户端 SSE log 尾 5 条 dispatched/completed/denied,相对时间,点击选中 sid);`v090-agents.spec.ts` 同步。
-- **DoD**:`make web-check` 绿;fmt;writeback 绿;wave 末 vitest ≥ 436(单卡删测试的净减由后续卡补回)。
-
-### TEAM-2 分工 tab:routing REST GET/PUT + 宪章编辑器 + vendor 名册(v0.9.11 wave)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web`(src+web) · **建议入口**:dev 会话(规划子代理)
-- **背景**:分工机制现状 = `<project>/.ccteam/routing.md`(项目优先 else 全局,MCP `status` 原文透传,PULL 不注入),web 零读写面;owner 指令 = 团队菜单下加分工管理编辑。
-- **规格**:REST `GET/PUT /api/v1/projects/{slug}/routing`(解析 = `CcteamPaths::{project_routing_notes,global_routing_notes}`,remote 项目同解析(daemon 侧数据目录);GET 返 exists/source(project|global|none)/path/content/sha256/updated_at,项目无文件回落 global 只读展示;PUT 原子写项目文件;URL 形状落 `project_acl_layer` 自动覆盖 + 显式 ACL 403 测试;OpenAPI 登记)。SPA:seg 恢复两 tab `topology|charter`;charter = vendor 名册卡(hosts API `AgentHealth` + graph 按 vendor 聚合 live/Σcost,auth 诚实态照旧)+ 宪章编辑器(项目选择器 → 编辑/预览/保存 + sha/时间;global fallback 只读 + 拷入起稿/空白起稿;常驻诚实说明:status PULL、advisory 不注入、>4k 截断指针)。全局 routing.md web 只读(owner 拍板)。
-- **DoD**:rust round-trip/fallback/ACL/原子写测试 + vitest 编辑器状态机测试;`make check`+`make test`+`make test-web`+`make web-check` 绿;fmt;writeback 绿。
-
-### TEAM-3 编队起手:playbooks 共享模块 + 团队页起手卡 + Home 模板对齐(v0.9.11 wave)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web` · **建议入口**:dev 会话(规划子代理,序列 #3)
-- **背景**:HomeView 已有 `HOME_TEMPLATES` 模板卡机制(点击 = 标题/描述预填 + vendor 切换);owner 要用例体现在团队菜单。内容红线判定(PRD §5):卡文案 = UI 文档性质合规;成段配方住 hub 不进 repo。
-- **规格**:模板定义迁共享模块 `lib/playbooks.ts`(唯一家):6 编队 = 总控-工班/主力-顾问/交叉互审/并行竞标/调研三角/金字塔用工(现 team→总控-工班、compare→并行竞标、review→交叉互审、bulk→金字塔用工语义承接,新增 主力-顾问(grok+claude)与 调研三角(grok+claude+codex),单 vendor 模板 code/fast 退役);HomeView 消费共享模块行为不变;团队页 charter tab「编队起手」区渲染同一数组为卡(名字 + 编队一句话 + 多 vendor 点),CTA →`navigate("/", {state:{playbook:id}})`,HomeView 读 state 应用模板(等价手点);任务文本不预填。i18n 文案按 PRD §4。
-- **DoD**:vitest(共享模块 + Home state 应用 + 团队卡 CTA);`make web-check` 绿;fmt;writeback 绿。
-
-### TEAM-4 graph live 节点 model join(v0.9.11 wave)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/src` · **建议入口**:dev 会话(规划子代理,序列 #4)
-- **背景**:`AgentNode.model` 恒 null(meta.json 不存 spawn override)→ 团队页「谁家什么模型在干活」不可视;`GET /sessions/{sid}/status` 已有 live model 单会话来源(sessions_api.rs:605 一带)。FB-2(subagent 污染 status.model)相邻不阻塞,本卡只消费现值。
-- **规格**:agents graph 路由对 live 节点复用 session status 同一 helper 取 model(单一事实来源);idle 节点保持 None 诚实;AgentNode doc 注释 + OpenAPI 同步;SPA 面板已渲染 model 无需改。
-- **DoD**:rust route 定向测试(live 带 model / idle 无);`make check`+`make test`+`make test-web` 绿;fmt;writeback 绿。
-
 ### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
 - **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
 - **背景**:GOV-CE-2 排查实锤 §0 R-code 速查漂移(R1「文件系统是状态面」/R9「crate 拓扑」不在现行 §三;R10 旧 `<team>-<slug>` 路径已随卡修正)+ 正文残留 v0.9.0 前状态(§6.x 仍写「`ccteam init` 种默认 `cto.md`」)。v0.9.10 ship gate 已顺带把三处 web 导航描述改现势(§2 前端落地注 / §6.6 统一 chat-shell 段 / 指针表 web 行),其余仍待全文轮。
@@ -122,4 +98,4 @@
 
 ## 历史波指针
 
-- **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
+- **v0.9.11**(团队页驾驶舱重设计:TEAM-1 `33545de5` 拓扑独占+真链接+chips+ticker / TEAM-2 `9609eb37` routing REST+宪章编辑器+名册 / TEAM-3 `670e335f` playbooks 6 编队 / TEAM-4 `e6704daf` live model join / wave 修复 `b20e1e96` sessions_api 封口;明细 → `docs-local/versions/v0-9-11/`)· **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)

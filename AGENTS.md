@@ -25,8 +25,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.10`(**已发布** 2026-07-26:main `180e91b` + tag,四平台二进制在 `/releases/latest`;下版 tag 仍需 owner 显式发话) |
-| 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker)+ restart-restore 竞态修复(恢复期 `/sessions` 确定性)+ 接入页宽屏改版(REST API 卡)+ web ACL 收敛(admin 专属只剩用户管理与全局 bot 凭据,权限 = token 身份 × 项目归属)+ 活跃消息 vendor 原生注入(adapter `TurnRouting` 契约;grok `_x.ai/interject` 真机实证 + vendor 自发 turn 合成收口防丢答;kimi/opencode 诚实降级 FIFO) |
+| Workspace version | `0.9.11`(**dev 已收口** 2026-07-29,PR #171 待 owner merge;**tag/发布 HELD** 待 owner 显式发话;最近发布 = v0.9.10 2026-07-26 `/releases/latest`) |
+| 本版 headline | 团队页驾驶舱重设计(owner 直驱 PRD 全默认拍板):拓扑独占(roster/timeline 两 tab 删)+ 会话真超链接(右键新 tab 对照父子)+ per-vendor KPI chips + 委派 ticker + live 节点 model join + 分工 charter tab(REST `GET/PUT /projects/{slug}/routing` 项目宪章编辑器(全局只读)+ vendor 名册)+ 编队起手(`lib/playbooks.ts` 6 编队唯一家,Home+团队双消费;文档编队目录 9 式双语)+ 周期同车 ACL 病根三修(具名 principal / 项目解析不越界 / session 单一归属策略)+ session rename 全链 + SSE 401 自愈 + 委派 vendor 失败外显 |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
 > 开发一律落 `dev` 分支 + dev→main PR 攒版本,main 不直推(§五「分支与推送」);主分支 HEAD 以 `git rev-parse origin/main` 为准。

@@ -102,6 +102,14 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 > 部分高级选项(terminal/rmux 协议、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
 
+### 团队页:拓扑与分工
+
+**团队**页是多 vendor 调度的驾驶舱,两个 tab:
+
+- **拓扑** —— 跨项目、跨主机的实时委派树:每会话一行(vendor 徽章、live 模型(live 会话显示真正在跑的模型)、状态点、成本、轮次),KPI 条下有 per-vendor 小计(live 数 + 花费,点击过滤)、最近委派滚动条,跨机时行上带 host 徽章。每个会话都是**真超链接** —— 右键/中键「打开 ↗」把父子会话开在两个浏览器 tab 里对照看。点行打开详情面板(模型/主机/父会话/深度/成本/实时活动/最近对话)。
+- **分工** —— 团队的分工管理:**vendor 名册**(按主机列 installed/版本/就绪态与修复提示,外加每家的 live 会话数与花费)+ **宪章编辑器** —— 就是 agent 经 `status` 工具读的那份项目级 `routing.md`。选项目、markdown 编辑/预览、保存;项目没有宪章时只读展示全局 `~/.ccteam/routing.md`,可一键「拷入起稿」(web 只写项目文件,全局文件的写入口仍在 CLI/文件系统)。诚实语义不变:宪章是 agent 主动 PULL 的建议文本(绝不注入),超 ~4k 字符在 `status` 里节选并给全文指针。
+- **编队起手** —— 分工 tab 上的六张卡(总控-工班 / 主力-顾问 / 交叉互审 / 并行竞标 / 调研三角 / 金字塔用工),点「起手」跳到首页 launcher 预填 vendor 阵容 —— 编排本身发生在你 spawn 的会话里。完整编队目录(含监工/值守/跨机三式)见 [orchestration-cn.md](orchestration-cn.md)。
+
 ### 插件市场:装角色 / 技能 / 工作流
 
 **插件市场** 页(在**工作流**下;默认打开 Skills 分类,项目选择器只在装进项目的类型(agent/plugin)出现)浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库;全局库与项目之间不软链、不复制。

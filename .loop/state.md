@@ -8,13 +8,13 @@
 ## 当前焦点
 
 - **版本线**:workspace **`0.9.10` 已发布**(2026-07-26,owner 深夜授权规划全链执行,登记下表人工门;一行史 = `.loop/history.md` v0.9.10 行,详档 = `docs-local/versions/v0-9-10/`)。**`ae24cb3` 来源已确认 = owner 直驱 codex s131**(无卡口头令,活跃消息 vendor 注入):规划全量 review + **真机 grok 冒烟**发现 P0(完成边竞态丢答案:真机 idle interject 返 `queued` 并自发 turn 自答、`-32000` 降级臂死代码、无主 chunks 被静默丢弃)+ P1(Started 后陈旧 `turn_started_at` 不重盖)等 5 项 → codex s131 修复 **`f3ea8bf`**(vendor 自发 turn 合成收口 `capture_vendor_started_turns`、Started 无条件重盖时钟、bg 拒 Queue、tui 注释、去重复 override)已验收(红→绿在案:`completion_edge_interject_surfaces_vendor_self_started_turn` / `started_submission_refreshes_stale_working_start`)。**最近发布 = v0.9.10**(main `180e91b` + tag;上一 tag = v0.9.8,v0.9.9 合 main 未 tag)。**本机 gh = `/opt/homebrew/bin/gh`**(firstintent,repo+workflow scope;旧 `~/.local/bin/gh` 记载作废)。
-- **在做**:**v0.9.11 团队页重设计 wave**(owner 2026-07-29 拍板 PRD `docs-local/versions/v0-9-11/prd-team-page.md` 全默认:两 tab 直删 / 全局 routing web 只读 / 起手卡文案入 repo;推 dev 进 PR #171,merge/tag 仍 owner)——TEAM-1..4 四卡已入队,规划子代理串行派工中。上一发布 = **v0.9.10**(2026-07-26,main `180e91b` + tag,release run 30218361955;本机 `target/debug` 已清理,daemon 跑 `target/release`)。队列其余现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / TEST-MACOS-1 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated)。
+- **在做**:无 —— **v0.9.11 已 dev 收口**(2026-07-29 owner 拍板当日完成:PRD 全默认 → TEAM-1..4 串行子代理派工全落(`33545de5`/`9609eb37`/`670e335f`/`e6704daf`)+ sessions_api 两红封口 `b20e1e96` + docs 双语四份 + ship-gate 治理同步;**PR #171 待 owner merge,tag/发布 HELD**)。上一发布 = **v0.9.10**(2026-07-26,main `180e91b` + tag)。队列现势 = TD-SYNC-1 / A2A-W5 / FB-2 / P1-1 / P1-2 / TEST-MACOS-1 + 候选 STATE-CULL-1 / A2A-OBS-1..5(V094 gated)。
 - **下一版**:A2A 可观测性补丁(A2A-OBS-1..4,蒸馏自 kimi 委派复盘)或 owner 另点;v0.9.4(npm 分发)gated 不变。
 
 ## 基线(口径与 env-flake 族见 `.loop/verify/README.md`;只增不减)
 
-- 确定性口径 `make test-baseline`(`--lib --bins`)= **1687/0 预期(干净环境;仲裁 = PR #170 CI)**(1683 + `f3ea8bf` +4:gateway Started 重盖 / translate 合成 turn ×2 / bg 拒 Queue)。本机默认 shell 实测 **1686 绿 + 1 红** = `roles::list_library_skills…` = **macOS TMPDIR 形状族**(`fs::canonicalize` /var→/private/var vs 字面断言;先于 `ae24cb3`、Linux CI 绿;TMPDIR 已 canonical 的会话本机也全绿——此前「本机全绿」与新会话红并存的成因;已登记 verify README「macOS 宿主两族」+ 修卡 TEST-MACOS-1)
-- `ccteam-web` 全量:lib + 集成套全绿,唯 `pty_ws_test` 3 个 `ws_*` 红 = 已登记 env-flake 族(live-daemon 宿主,非回归)· vitest **436**(43 文件;上口径 422 + ACCESS-IA-1 +12 + WEB-ACL-1 +2)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
+- 确定性口径 `make test-baseline`(`--lib --bins`)= **1707/0**(v0.9.11 收口,Linux dev 机(ccd)默认 shell 全绿实测;上口径 1687(v0.9.10 CI 仲裁)+20 = 周期同车修复 + wave 新测;干净环境仲裁 = PR #171 CI)。macOS 宿主两族(TMPDIR 形状 / UDS SUN_LEN)登记不变,修卡 TEST-MACOS-1,Linux 不受影响
+- `ccteam-web` 全量:**344 通过 + 3 红** = `pty_ws_test` `ws_*` 已登记 env-flake 族(live-daemon 宿主,非回归;sessions_api 两红已于 `b20e1e96` 封口清零)· vitest **488**(49 文件;上口径 436 + TEAM-1..3 +52 净增)· tsc/eslint 干净 · Playwright **7**(未重跑,沿用口径)
 - clippy **0 warnings**(`-D warnings`,含 ccteam-web)· `cargo fmt --all -- --check` 干净
 
 ## 人工门(不许任何 agent 在任务内自决;签核 = 一次性授权,登记于此)
@@ -46,6 +46,7 @@
 
 ## 未固化教训
 
+- **by-sid 门后的测试必须真实例化会话**(v0.9.11 wave 修复实锤):`074e284f` 把 `/sessions/{sid}/*` 全量走 sid→project 解析(live map → meta.json 扫描)后,凡「凭空 sid 打门」的 fixture 确定性 404 —— ACL 判正确、fixture 是病根,修法 = 补真实 spawn(HTTP create 先行),不是松门;同形已扫全 `crates/ccteam-web/tests/` 无他例(auth_test 的 no-gateway 探针是锁死契约、非侥幸)。改 by-sid/归属类门时先跑 `sessions_api_test` 族。
 - **fixture-only 验证限界**(ae24cb3 review 实锤):fake 只证「客户端实现了 fixture 定义的合同」,不证 vendor 真机行为——真机 grok idle interject 返 `queued` 且**自发 turn** 自答,代码嗅探的 `-32000` 臂是死代码,P0 丢答案由**真机冒烟**揭示(fake 恒绿)。新 vendor wire 行为面收口前上真机冒烟(与 A2A-OBS-3 manual-gate 同旨);冒烟脚本模式:纯 stdio JSON-RPC 直驱 vendor binary,留痕 idle/mid-turn 两态响应形状。
 - **vendor 容量中断 = 委派链故障模式**(v0.9.9 FIX1 尾段 codex「model at capacity」,turn 断在门禁前):恢复路径 = `session_collect` 读账本中间记录 → 接手方按其结论收尾,不重做已完成的归因;工作品外部化(worktree/commit)= 会话可弃性。**产品侧主体已固化**(owner 复盘驱动,`2a2b38a`:TurnFailed/终态 Error 贯穿 DelegationSignal,通知冠 VENDOR ERROR = 修「假成功」;TurnStarted 刷 last_active = 消挤停误排);余量 = A2A-OBS-5/OBS-2 卡。恢复纪律候选固化 → verify/README 运行纪律。
 - **「同机同红」stash 对照只证「非本 diff 所致」,不证「环境态」**(HERM-1 ① 误归因复盘:对照基线 origin/dev 当时可能已含回归;且「CI 绿」快照会过期)——跨环境同断言复现 = 优先判真回归;flake 归档必须记录首见 CI run 边界,定期复核。
