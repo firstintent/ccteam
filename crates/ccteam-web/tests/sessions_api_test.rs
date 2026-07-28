@@ -917,7 +917,7 @@ async fn rename_session_denies_cross_tenant_project() {
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
 
-    // v0.9.11 — the ADMIN is gated by the same rule. `can_see_owner` keeps the
+    // Cross-user fix (2026-07-28) — the ADMIN is gated by the same rule. `can_see_owner` keeps the
     // operator out of a tenant's PROJECT (`/projects/demo/*` 404s below), but
     // `gate_sid` used to short-circuit on `is_admin`, leaving every by-sid door
     // (read history/status/events, POST turn, stop, rename) open on exactly the

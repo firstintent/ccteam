@@ -124,7 +124,7 @@ export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): 
   }
 }
 
-/** Protocols a caller may pick for `vendor`. v0.9.11 — no admin gate: every
+/** Protocols a caller may pick for `vendor`. Cross-user fix (2026-07-28) — no admin gate: every
  *  logged-in user gets the same functional surface, and what they may reach is
  *  decided by identity × project ownership on the backend, not by hiding menu
  *  entries. (The claude `terminal` protocol stays frozen/maintenance-only —

@@ -6134,7 +6134,7 @@ impl Gateway {
     /// AND its own, and the tenant's web sees the bot's — CONVERGED. It inherits
     /// no other pool (other tenants + the admin pool stay hidden).
     ///
-    /// v0.9.11 — the pool leg is no longer a blanket "any `user:*` owner": with
+    /// Cross-user fix (2026-07-28) — the pool leg is no longer a blanket "any `user:*` owner": with
     /// per-user web tokens that handed the admin's global IM bot every tenant's
     /// sessions (and every tenant's console every other tenant's). It now routes
     /// through [`ccteam_core::identity::can_see_session_owner`], the session twin
@@ -14853,7 +14853,7 @@ mod tests {
         );
 
         // The admin/global bot: own + its OWN web console pool — NOT a
-        // tenant's. (v0.9.11 cross-user fix: the old blanket `user:*` pool
+        // tenant's. (the 2026-07-28 cross-user fix: the old blanket `user:*` pool
         // pushed tenants' sessions into the owner's IM bot, where a `/use` on a
         // listed sid then re-pointed that session's `reply_to` at the admin
         // chat — "IM receives another user's session messages".)
@@ -14912,7 +14912,7 @@ mod tests {
             "a tenant bot gets no admin pool"
         );
         // The admin/global bot sees its OWN web pool — never a tenant's (the
-        // cold-resume twin of the v0.9.11 cross-user fix).
+        // cold-resume twin of the 2026-07-28 cross-user fix).
         assert!(Gateway::owner_identity_visible(
             &admin_tg,
             &canonical_owner(&ChatKey::new("web", "web-api", "web-api")).identity()
@@ -15629,8 +15629,8 @@ mod tests {
         );
     }
 
-    /// v0.9.11 CROSS-USER REGRESSION (owner report: "IM receives other users'
-    /// session messages") — a TENANT's web-created session must not surface in
+    /// CROSS-USER REGRESSION (2026-07-28 owner report: "IM receives other
+    /// users' session messages") — a TENANT's web-created session must not surface in
     /// the admin/global IM bot. The old pool rule was a blanket "any `user:*`
     /// owner is shared", written when the web console had one (admin) identity;
     /// per-user web tokens then made every tenant's session visible there, and

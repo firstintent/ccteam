@@ -48,7 +48,7 @@ async fn handle_chat_ws(
         .on_upgrade(move |socket| run(socket, app, identity, chat_id, user_id))
 }
 
-/// v0.9.11 — the socket's `(chat_id, user_id)` is the caller's IDENTITY, not a
+/// Cross-user fix (2026-07-28) — the socket's `(chat_id, user_id)` is the caller's IDENTITY, not a
 /// client-chosen label. It keys everything downstream: the gateway `ChatKey`
 /// (→ session ownership + ACL) and the outbound filter that decides which
 /// socket receives a message. Taking it from the query string let any
@@ -392,7 +392,7 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
     Some(items)
 }
 
-/// The project picker this socket opens with. v0.9.11 — filtered through the
+/// The project picker this socket opens with. Cross-user fix (2026-07-28) — filtered through the
 /// SAME ownership policy as `GET /api/v1/projects`; it used to hand every
 /// connected chat the full project list of the box, leaking other users'
 /// project names.

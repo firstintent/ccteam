@@ -825,7 +825,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_chat_sessions_share_the_web_console_pool() {
-        // v0.8.18 柱2 档0 / v0.9.11 — the web console pool is per IDENTITY. A
+        // v0.8.18 柱2 档0 / cross-user fix (2026-07-28) — the web console pool is per IDENTITY. A
         // second socket for the SAME identity sees + drives its sessions (the
         // "create on web, drive from your phone" flow this test was written to
         // protect); a DIFFERENT web identity does not. The original "one shared

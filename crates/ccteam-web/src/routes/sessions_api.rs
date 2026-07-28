@@ -195,7 +195,7 @@ pub(crate) fn project_not_visible(slug: &str) -> Response {
 /// authorised caller reach a since-evicted session so the turn handler can
 /// cold-resume it (resume-by-sid) instead of 404-ing.
 ///
-/// v0.9.11 — the gate runs for the ADMIN too. It used to short-circuit on
+/// Cross-user fix (2026-07-28) — the gate runs for the ADMIN too. It used to short-circuit on
 /// `is_admin`, which contradicted the very policy it delegates to:
 /// `can_see_owner` deliberately keeps the admin OUT of a tenant's projects
 /// (`/api/v1/projects/<tenant-slug>/…` 404s), yet every by-sid door

@@ -16,7 +16,7 @@
 //! [`crate::auth::Identity::can_see_owner`] allows (mirrors the `/projects`
 //! collection filter, `api_v1::build_projects`) — both for the graph snapshot
 //! AND for every SSE frame. The operator is NOT exempt: `can_see_owner` keeps
-//! it out of a tenant's projects, so v0.9.11 stopped streaming those sessions'
+//! it out of a tenant's projects, so the 2026-07-28 cross-user fix stopped streaming those sessions'
 //! live answers into the team view. The two differ only on an unattributed
 //! frame (no resolvable `slug`): the operator still sees it, a tenant fails
 //! closed. `?slug=` narrows the graph to one project (still gated by
@@ -260,7 +260,7 @@ pub(crate) async fn handle_agents_graph(
 
 /// Which live frames an SSE subscriber may receive, resolved once per stream.
 ///
-/// v0.9.11 — the admin used to subscribe with NO filter, so the team view
+/// Cross-user fix (2026-07-28) — the admin used to subscribe with NO filter, so the team view
 /// streamed every tenant's answers/progress verbatim to the operator, on
 /// exactly the projects `can_see_owner` refuses to even list. Both identities
 /// now filter on the same visible-project set; they differ only in what to do
@@ -543,7 +543,7 @@ mod tests {
         );
         ev.slug = Some("adminproj".to_string());
         assert!(event_visible(&ev, &admin));
-        // v0.9.11 — but NOT a tenant's project. The admin used to subscribe
+        // Cross-user fix (2026-07-28) — but NOT a tenant's project. The admin used to subscribe
         // unfiltered, so the team view streamed every tenant's live answers.
         ev.slug = Some("tenantproj".to_string());
         assert!(

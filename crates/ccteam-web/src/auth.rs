@@ -264,7 +264,7 @@ pub async fn project_acl_layer(State(app): State<AppState>, req: Request, next: 
 ///   `resume`, `inject_decision`) and the pane snapshots,
 /// - `/ws/{slug}/pty`, `/ws/{slug}/{sid}/pty` — the live terminal sockets.
 ///
-/// v0.9.11 — the last two families used to sit OUTSIDE the choke point with no
+/// Cross-user fix (2026-07-28) — the last two families used to sit OUTSIDE the choke point with no
 /// identity check at all, so any authenticated tenant could snapshot or attach
 /// a PTY to another user's project (and POST its pause/resume/btw actions).
 /// `None` for the bare collection path (`/api/v1/projects`) and for the
@@ -781,7 +781,7 @@ mod tests {
         assert!(!is_public_shell_path("/apple"));
     }
 
-    /// v0.9.11 — the ACL choke point must recognise EVERY project-addressed
+    /// Cross-user fix (2026-07-28) — the ACL choke point must recognise EVERY project-addressed
     /// route family. The regression it guards: `/api/{slug}/…` (actions +
     /// pane snapshots) and `/ws/{slug}/…` (PTY) named a project but were not
     /// matched here, so they ran with no ownership check at all — a tenant

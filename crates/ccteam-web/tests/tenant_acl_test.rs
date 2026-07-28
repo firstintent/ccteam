@@ -536,7 +536,7 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     );
 }
 
-/// v0.9.11 CROSS-USER — the project-ownership choke point must cover EVERY
+/// CROSS-USER (2026-07-28 owner report) — the project-ownership choke point must cover EVERY
 /// project-addressed route family, not just `/api/v1/projects/{slug}/…`.
 ///
 /// The regression: the legacy action routes (`/api/{slug}/pause|resume|btw|

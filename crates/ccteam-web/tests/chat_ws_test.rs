@@ -240,7 +240,7 @@ async fn chat_ws_outbound_replies_are_scoped_by_chat_id() {
     let _ = ws_two.close(None).await;
 }
 
-/// v0.9.11 CROSS-USER — with auth ON the socket binds to the AUTHENTICATED
+/// CROSS-USER (2026-07-28 owner report) — with auth ON the socket binds to the AUTHENTICATED
 /// identity; `?chat_id=` is a client-supplied label and must not choose it.
 /// The regression: a tenant could connect as `chat_id=web-api` and receive
 /// (and drive) the admin console's chat, because `chat_id` keyed both the

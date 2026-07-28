@@ -43,7 +43,7 @@ describe("VENDORS registry (5-way)", () => {
 });
 
 describe("visibleProtocols (no admin gate — same menu for every user)", () => {
-  // v0.9.11 — the protocol menu used to hide claude `terminal` from tenants.
+  // Cross-user fix (2026-07-28) — the protocol menu used to hide claude `terminal` from tenants.
   // Function surfaces are open to every logged-in user; what a user may
   // actually reach is decided by identity × project ownership on the backend,
   // not by a hidden menu entry. The admin menu (Settings → 管理员) is the only
