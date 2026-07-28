@@ -23,11 +23,10 @@ import { renderToString } from "react-dom/server";
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
 
-function render(isAdmin = true) {
+function render() {
   return renderToString(
     <HomeView
       lang="zh"
-      isAdmin={isAdmin}
       projects={["ccteam", "demo"]}
       projectPaths={{ ccteam: "~/rob/ccteam" }}
       onLaunched={() => {}}
@@ -66,7 +65,6 @@ describe("HomeView (landing page)", () => {
     const html = renderToString(
       <HomeView
         lang="zh"
-        isAdmin
         projects={["ccteam"]}
         projectPaths={{ ccteam: "~/rob/ccteam" }}
         projectBranches={{ ccteam: "dev" }}
@@ -129,7 +127,6 @@ describe("HomeView (landing page)", () => {
     const html = renderToString(
       <HomeView
         lang="en"
-        isAdmin
         projects={["remote-proj"]}
         projectPaths={{ "remote-proj": "/srv/remote-proj" }}
         projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
@@ -191,7 +188,6 @@ describe("HomeView (landing page)", () => {
     const html = renderToString(
       <HomeView
         lang="en"
-        isAdmin
         projects={["ccteam"]}
         projectPaths={{ ccteam: "~/rob/ccteam" }}
         onLaunched={() => {}}

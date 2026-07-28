@@ -190,14 +190,18 @@ pub(crate) fn project_not_visible(slug: &str) -> Response {
 /// on-disk `meta.json`), then checks the caller may see it. Returns `Some(404)`
 /// when the sid is unknown OR its project isn't visible (the two are
 /// indistinguishable, so sids in other users' projects can't be probed).
-/// `None` = allowed (admin, no-gateway → the handler does its own check, or a
-/// visible project). Resolving *stopped* sessions here (not just live ones)
-/// lets an authorised caller reach a since-evicted session so the turn handler
-/// can cold-resume it (resume-by-sid) instead of 404-ing.
+/// `None` = allowed (no-gateway → the handler does its own check, or a visible
+/// project). Resolving *stopped* sessions here (not just live ones) lets an
+/// authorised caller reach a since-evicted session so the turn handler can
+/// cold-resume it (resume-by-sid) instead of 404-ing.
+///
+/// v0.9.11 — the gate runs for the ADMIN too. It used to short-circuit on
+/// `is_admin`, which contradicted the very policy it delegates to:
+/// `can_see_owner` deliberately keeps the admin OUT of a tenant's projects
+/// (`/api/v1/projects/<tenant-slug>/…` 404s), yet every by-sid door
+/// (`GET /sessions/{sid}`, `/status`, `/events`, `POST /turn`, `/stop`, …)
+/// stayed wide open on the same resources. One door, one policy.
 async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -> Option<Response> {
-    if identity.is_admin {
-        return None;
-    }
     // No live gateway → the handler runs its own no-gateway path; don't gate.
     let gw = app.gateway.as_ref()?;
     let project = {
@@ -863,9 +867,9 @@ pub(crate) async fn handle_session_turn(
             let Some(slug) = guard.project_slug_for_sid(&sid) else {
                 return unknown_session(&sid);
             };
-            // `gate_sid` already project-gated the caller (admin bypasses it);
-            // bind the resume to the resolved owning project so `resume_stopped_
-            // session`'s own ACL guard is satisfied (`exp == slug` holds).
+            // `gate_sid` already project-gated the caller; bind the resume to
+            // the resolved owning project so `resume_stopped_session`'s own ACL
+            // guard is satisfied (`exp == slug` holds).
             let caller_identity = identity.owner_tag();
             if let Err(err) = guard
                 .resume_stopped_session(&sid, &caller_identity, Some(&slug))

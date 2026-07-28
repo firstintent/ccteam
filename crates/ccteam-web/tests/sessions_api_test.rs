@@ -916,6 +916,37 @@ async fn rename_session_denies_cross_tenant_project() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
+
+    // v0.9.11 — the ADMIN is gated by the same rule. `can_see_owner` keeps the
+    // operator out of a tenant's PROJECT (`/projects/demo/*` 404s below), but
+    // `gate_sid` used to short-circuit on `is_admin`, leaving every by-sid door
+    // (read history/status/events, POST turn, stop, rename) open on exactly the
+    // resources the project door refuses. One door, one policy.
+    for (method, path) in [
+        ("GET", format!("{base}/sessions/{sid}")),
+        ("GET", format!("{base}/sessions/{sid}/status")),
+        ("GET", format!("{base}/projects/demo/sessions")),
+    ] {
+        let r = client
+            .request(method.parse().unwrap(), &path)
+            .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "admin must not reach {path}");
+    }
+    let admin_rename = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"title": "operator override"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_rename.status(),
+        404,
+        "admin must not drive a tenant's session"
+    );
 }
 
 // ── composer attachments (uploads + skills + turn weaving) ─────────────────────

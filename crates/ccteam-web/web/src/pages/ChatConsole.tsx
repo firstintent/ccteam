@@ -93,7 +93,7 @@ export default function ChatConsole() {
   const view = shellViewFor(location.pathname);
   const { settings } = useWebSettings();
   const lang = settings.language;
-  const { me, isAdmin } = useMe();
+  const { me } = useMe();
 
   // ---- cross-project session data (live + stopped history) -----------------
   const [railSessions, setRailSessions] = useState<SessionSummary[]>([]);
@@ -366,7 +366,7 @@ export default function ChatConsole() {
       <main className="main">
         {view === "conv" && sid ? (
           // KEY={sid}: fresh SessionView per switch — per-sid state resets atomically.
-          <SessionView key={sid} sid={sid} session={activeSession} lang={lang} isAdmin={isAdmin} />
+          <SessionView key={sid} sid={sid} session={activeSession} lang={lang} />
         ) : view === "flow" ? (
           <WorkflowView
             tab={routeTab}
@@ -387,7 +387,6 @@ export default function ChatConsole() {
         ) : (
           <HomeView
             lang={lang}
-            isAdmin={isAdmin}
             projects={projects}
             projectPaths={projectPaths}
             projectHosts={projectHosts}

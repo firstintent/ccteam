@@ -6114,39 +6114,41 @@ impl Gateway {
     /// Session access scope — visibility (`/sessions`) AND addressing
     /// (`/use` / `/stop`).
     ///
-    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared user pool**: a
-    /// chat reaches the sessions it OWNS, PLUS every session created by the web
-    /// console (`owner.channel == "user"`). The web console is ONE shared
-    /// operator identity (`web-api`) until 档1 gives per-user web tokens, so its
-    /// sessions must stay reachable from IM — the common single-user flow is
-    /// "create it on web, drive it from your phone". IM-created sessions stay
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + one's OWN web
+    /// console pool**: a chat reaches the sessions it OWNS, plus the sessions
+    /// created by the web console OF THE SAME IDENTITY (the admin's
+    /// `user:web-api`; a tenant's `user:<tenant>`) — the common single-user flow
+    /// is "create it on web, drive it from your phone". IM-created sessions stay
     /// PRIVATE to their chat: two distinct telegram `chat_id`s never see each
     /// other's IM-created sessions.
     ///
-    /// The two pre-0.8.18 leaks are still gone: a `web` QUERIER no longer sees
-    /// IM sessions (an IM session only matches `owner == chat`, never the web
-    /// clause), and the same-current-project leak (the v0.8.13 cross-frontend-
-    /// by-project sharing) is removed. Reply routing is unaffected (per-turn
-    /// submitter via `reply_to`). HONEST SCOPE: soft (UX) isolation under one OS
-    /// uid, NOT a security boundary.
+    /// The pre-0.8.18 leaks are still gone: a `web` QUERIER never sees IM
+    /// sessions (they are not in the `user:` pool), and the same-current-project
+    /// leak (the v0.8.13 cross-frontend-by-project sharing) is removed. Reply
+    /// routing is unaffected (per-turn submitter via `reply_to`). HONEST SCOPE:
+    /// soft (UX) isolation under one OS uid, NOT a security boundary.
     ///
     /// v0.8.20 — a PER-TENANT IM bot (channel `"<platform>@<tenant>"`) and that
     /// tenant's web console are ONE identity (`user:<tenant>`, via
     /// `canonical_owner`): the bot sees + drives the tenant's WEB-created sessions
-    /// AND its own, and the tenant's web sees the bot's — CONVERGED. It still
-    /// inherits NO shared pool (other tenants + the admin pool stay hidden); the
-    /// shared user pool stays the admin/global bot's operator view.
+    /// AND its own, and the tenant's web sees the bot's — CONVERGED. It inherits
+    /// no other pool (other tenants + the admin pool stay hidden).
+    ///
+    /// v0.9.11 — the pool leg is no longer a blanket "any `user:*` owner": with
+    /// per-user web tokens that handed the admin's global IM bot every tenant's
+    /// sessions (and every tenant's console every other tenant's). It now routes
+    /// through [`ccteam_core::identity::can_see_session_owner`], the session twin
+    /// of the project ACL — one policy, both frontends.
     fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
         Self::chat_owner_visible(chat, &session.owner)
     }
 
     /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
     /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
-    /// iff (a) it owns it, or (b) — for the admin/global bot + the web querier
-    /// ONLY — the session is in the shared user pool (`owner.channel == "user"`,
-    /// i.e. any web/tenant-created session). A per-tenant IM bot (channel
-    /// `"<platform>@<tenant>"`) sees ONLY what it owns: it gets neither the shared
-    /// pool nor other tenants' IM sessions.
+    /// iff (a) it owns it, or (b) the session sits in the WEB-CONSOLE pool of
+    /// the SAME identity (the admin's `user:web-api`, or a tenant's
+    /// `user:<tenant>`). Another identity's console — and any other IM chat —
+    /// stays hidden.
     fn chat_owner_visible(chat: &ChatKey, owner: &ChatKey) -> bool {
         // v0.8.21 Wave-2 — delegate to the identity-string rule. A session
         // rebuilt from `meta.json` (daemon restart) or cold-resumed carries an
@@ -6174,16 +6176,21 @@ impl Gateway {
     /// wrongly deny the legitimate owner. Comparing the user_id-free identity
     /// strings sidesteps the lossy round-trip entirely.
     fn owner_identity_visible(chat: &ChatKey, owner_identity: &str) -> bool {
-        // Own = the chat's canonical identity string.
-        if owner_identity == canonical_owner(chat).identity() {
-            return true;
-        }
-        // A per-tenant bot gets NO shared pool — only its own (above).
-        if crate::transport::is_tenant_bot_channel(&chat.channel) {
-            return false;
-        }
-        // Admin/global bot + web querier: the shared `user:` pool.
-        owner_identity.starts_with("user:")
+        // ONE policy for both frontends: own ⊕ the web-console pool this
+        // identity may see (`ccteam_core::identity::can_see_session_owner` —
+        // the session twin of the project ACL's `can_see_owner`, keyed on the
+        // same owner tags). The pool leg used to be a blanket "any `user:*`
+        // owner", which predates per-user web tokens: it leaked EVERY tenant's
+        // sessions into the admin's global IM bot (and into every other
+        // tenant's console), so a `/sessions` list — or a `/use` on a listed
+        // sid, which re-points `reply_to` — crossed users.
+        let (user_id, is_admin) = Self::project_acl_identity(chat);
+        ccteam_core::identity::can_see_session_owner(
+            &canonical_owner(chat).identity(),
+            &user_id,
+            is_admin,
+            owner_identity,
+        )
     }
 
     /// Map an IM/web chat to the shared core ownership identity `(user_id,
@@ -14845,14 +14852,24 @@ mod tests {
             "ubbb's bot doesn't see uaaa's sessions"
         );
 
-        // The admin/global bot keeps the operator view: own + the shared web
-        // pool (every owner.channel == "user", incl tenants' — oversight).
+        // The admin/global bot: own + its OWN web console pool — NOT a
+        // tenant's. (v0.9.11 cross-user fix: the old blanket `user:*` pool
+        // pushed tenants' sessions into the owner's IM bot, where a `/use` on a
+        // listed sid then re-pointed that session's `reply_to` at the admin
+        // chat — "IM receives another user's session messages".)
         assert!(Gateway::chat_owner_visible(&admin_tg, &admin_tg));
         assert!(Gateway::chat_owner_visible(&admin_tg, &web_admin));
         assert!(
-            Gateway::chat_owner_visible(&admin_tg, &web_a),
-            "the admin/global bot oversees all web sessions"
+            !Gateway::chat_owner_visible(&admin_tg, &web_a),
+            "the admin/global bot must NOT see a tenant's web sessions"
         );
+        // ... and symmetrically, a tenant's WEB console (channel "web", not a
+        // bot channel) sees neither the admin pool nor another tenant.
+        let web_console_a = ChatKey::new("web", "uaaa", "uaaa");
+        assert!(Gateway::chat_owner_visible(&web_console_a, &web_a));
+        assert!(!Gateway::chat_owner_visible(&web_console_a, &web_b));
+        assert!(!Gateway::chat_owner_visible(&web_console_a, &web_admin));
+        assert!(!Gateway::chat_owner_visible(&web_console_a, &admin_tg));
     }
 
     /// v0.8.21 cold-resume ACL — `owner_identity_visible` (the identity-string
@@ -14894,8 +14911,16 @@ mod tests {
             !Gateway::owner_identity_visible(&bot_a, &admin_owns),
             "a tenant bot gets no admin pool"
         );
-        // The admin/global bot oversees the shared web pool.
-        assert!(Gateway::owner_identity_visible(&admin_tg, &web_a));
+        // The admin/global bot sees its OWN web pool — never a tenant's (the
+        // cold-resume twin of the v0.9.11 cross-user fix).
+        assert!(Gateway::owner_identity_visible(
+            &admin_tg,
+            &canonical_owner(&ChatKey::new("web", "web-api", "web-api")).identity()
+        ));
+        assert!(
+            !Gateway::owner_identity_visible(&admin_tg, &web_a),
+            "the admin/global bot must NOT cold-resume a tenant's session"
+        );
     }
 
     /// IM PROJECT ACL — the multi-user isolation the leaky unfiltered project
@@ -15601,6 +15626,86 @@ mod tests {
             other,
             vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"],
             "ubbb's bot is isolated from uaaa"
+        );
+    }
+
+    /// v0.9.11 CROSS-USER REGRESSION (owner report: "IM receives other users'
+    /// session messages") — a TENANT's web-created session must not surface in
+    /// the admin/global IM bot. The old pool rule was a blanket "any `user:*`
+    /// owner is shared", written when the web console had one (admin) identity;
+    /// per-user web tokens then made every tenant's session visible there, and
+    /// `/use` on a listed sid re-points that session's `reply_to` at the admin
+    /// chat — so the tenant's answers/progress started landing in the owner's
+    /// Telegram. The legit admin case (`user:web-api` ↔ IM) is unchanged and
+    /// covered by `gateway_web_owned_session_visible_from_im`.
+    #[tokio::test]
+    async fn gateway_tenant_web_session_is_hidden_from_admin_im_bot() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        // Tenant uaaa creates a session on ITS web console → owner user:uaaa.
+        gateway
+            .handle_text("web", "uaaa", "uaaa", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // The owner's global Telegram bot must NOT list it …
+        let seen = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "339498819",
+            "rob",
+            "/sessions",
+        )
+        .await;
+        assert_eq!(
+            seen,
+            vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"],
+            "a tenant's web session must not reach the admin/global IM bot: {seen:?}"
+        );
+
+        // … and must not be able to ADDRESS it (which is what re-points
+        // `reply_to` and starts the cross-user push). Reads as unknown, so the
+        // sid's existence leaks nothing either.
+        let used = gateway
+            .handle_text("telegram", "339498819", "rob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(
+            used,
+            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+        );
+
+        // Another TENANT's web console is equally blind to it.
+        let other_tenant = gateway
+            .handle_text("web", "ubbb", "ubbb", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            !other_tenant.iter().any(|m| m.contains("s1")),
+            "one tenant's console must not see another's sessions: {other_tenant:?}"
+        );
+
+        // The owner keeps their own web console pool (no over-correction).
+        gateway
+            .handle_text("web", "web-api", "web-api", "/new claude api")
+            .await
+            .unwrap();
+        let admin_sees = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "339498819",
+            "rob",
+            "/sessions",
+        )
+        .await;
+        assert!(
+            admin_sees.iter().any(|m| m.contains("s2")),
+            "the admin bot still drives its OWN web console sessions: {admin_sees:?}"
         );
     }
 

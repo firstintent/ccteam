@@ -239,3 +239,75 @@ async fn chat_ws_outbound_replies_are_scoped_by_chat_id() {
     let _ = ws_one.close(None).await;
     let _ = ws_two.close(None).await;
 }
+
+/// v0.9.11 CROSS-USER — with auth ON the socket binds to the AUTHENTICATED
+/// identity; `?chat_id=` is a client-supplied label and must not choose it.
+/// The regression: a tenant could connect as `chat_id=web-api` and receive
+/// (and drive) the admin console's chat, because `chat_id` keyed both the
+/// gateway `ChatKey` and the outbound delivery filter. The project picker is
+/// filtered by the same ownership policy as `GET /api/v1/projects`.
+#[tokio::test]
+async fn chat_ws_binds_to_the_authenticated_identity_not_the_query() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    // A registered tenant, plus one admin-owned and one tenant-owned project.
+    let mut reg = ccteam_core::tenants::TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+    let tenant_id = tenant.id.clone();
+    for (slug, owner) in [
+        ("adminproj", "user:web-api".to_string()),
+        ("aliceproj", format!("user:{tenant_id}")),
+    ] {
+        let path = paths.project_state(slug);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut st = ccteam_core::ProjectState::initial_for_team(slug.into(), "dev".into());
+        st.owner = Some(owner);
+        st.save(&path).unwrap();
+    }
+
+    let (in_tx, _in_rx) = mpsc::channel(8);
+    let (out_tx, _) = broadcast::channel(8);
+    let backlog = Arc::new(Mutex::new(Vec::new()));
+    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into())).with_chat_bridge(
+        in_tx,
+        out_tx.clone(),
+        backlog.clone(),
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    let addr = spawn(state).await;
+
+    // The tenant ASKS for the admin console's chat id …
+    let mut req = ws_request_with_subprotocol(addr, "/ws/chat?chat_id=web-api&user_id=web-api");
+    req.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Bearer ccteam:{tenant_tok}")).unwrap(),
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+    // … and gets its OWN view: only the project it owns.
+    let frame = recv_server_frame(&mut ws).await;
+    let ServerChatFrame::Sessions { items } = frame else {
+        panic!("expected the initial Sessions frame");
+    };
+    let projects: Vec<&str> = items.iter().map(|i| i.project.as_str()).collect();
+    assert_eq!(
+        projects,
+        vec!["aliceproj"],
+        "the picker must not leak another user's projects"
+    );
+
+    // … and is NOT wired to the admin console's delivery target.
+    let outbound = WebSendMessage::new("admin console only", "web-api");
+    backlog.lock().await.push(outbound.clone());
+    out_tx.send(outbound).unwrap();
+    let leaked = tokio::time::timeout(std::time::Duration::from_millis(150), ws.next()).await;
+    assert!(
+        leaked.is_err(),
+        "a tenant socket must not receive the admin console's messages"
+    );
+    let _ = ws.close(None).await;
+}

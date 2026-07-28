@@ -12,12 +12,15 @@
 //! best-effort seed for `edges[].active`, corrected live by the SSE
 //! `dispatched`/`completed` frames — see `AgentsView`'s reducer).
 //!
-//! **ACL**: admin sees every project; a tenant sees only the projects
+//! **ACL**: every identity sees exactly the projects
 //! [`crate::auth::Identity::can_see_owner`] allows (mirrors the `/projects`
 //! collection filter, `api_v1::build_projects`) — both for the graph snapshot
-//! AND for every SSE frame (a frame with no resolvable `slug` is dropped for
-//! a tenant, fail-closed; only an admin sees it). `?slug=` narrows the graph
-//! to one project (still gated by [`super::api_v1::can_see_project`]).
+//! AND for every SSE frame. The operator is NOT exempt: `can_see_owner` keeps
+//! it out of a tenant's projects, so v0.9.11 stopped streaming those sessions'
+//! live answers into the team view. The two differ only on an unattributed
+//! frame (no resolvable `slug`): the operator still sees it, a tenant fails
+//! closed. `?slug=` narrows the graph to one project (still gated by
+//! [`super::api_v1::can_see_project`]).
 //!
 //! **Status honesty**: a node is `"live"` when the gateway currently tracks
 //! it (in the in-memory session map) and `"idle"` otherwise (its `meta.json`
@@ -255,14 +258,33 @@ pub(crate) async fn handle_agents_graph(
     Json(graph).into_response()
 }
 
-/// Whether `ev` is visible to `identity` given its already-resolved visible
-/// slug set (`None` for admin ⇒ everything visible; `Some(set)` for a tenant
-/// ⇒ only a frame whose `slug` is in `set` — fail-closed: a frame with no
-/// `slug` at all is dropped for a tenant).
-fn event_visible(ev: &GatewayEvent, visible: &Option<HashSet<String>>) -> bool {
-    match visible {
-        None => true,
-        Some(set) => ev.slug.as_deref().is_some_and(|s| set.contains(s)),
+/// Which live frames an SSE subscriber may receive, resolved once per stream.
+///
+/// v0.9.11 — the admin used to subscribe with NO filter, so the team view
+/// streamed every tenant's answers/progress verbatim to the operator, on
+/// exactly the projects `can_see_owner` refuses to even list. Both identities
+/// now filter on the same visible-project set; they differ only in what to do
+/// with an UNATTRIBUTED frame (no `slug`, e.g. a HITL prompt whose context
+/// carries no project): the operator keeps seeing those, a tenant fails closed.
+#[derive(Clone)]
+struct EventAcl {
+    visible: HashSet<String>,
+    allow_unattributed: bool,
+}
+
+impl EventAcl {
+    fn resolve(app: &AppState, identity: &Identity) -> Self {
+        Self {
+            visible: visible_project_slugs(app, identity).into_iter().collect(),
+            allow_unattributed: identity.is_admin,
+        }
+    }
+}
+
+fn event_visible(ev: &GatewayEvent, acl: &EventAcl) -> bool {
+    match ev.slug.as_deref() {
+        Some(slug) => acl.visible.contains(slug),
+        None => acl.allow_unattributed,
     }
 }
 
@@ -312,11 +334,7 @@ pub(crate) async fn handle_agents_events(
 ) -> Response {
     let last_id = parse_last_event_id(&headers, &query);
     let rx = app.gateway.as_ref().map(|_| app.global_ring.subscribe());
-    let visible: Option<HashSet<String>> = if identity.is_admin {
-        None
-    } else {
-        Some(visible_project_slugs(&app, &identity).into_iter().collect())
-    };
+    let visible = EventAcl::resolve(&app, &identity);
     let stream = match rx {
         Some(rx) => {
             let catchup: Vec<Event> = match last_id {
@@ -500,8 +518,8 @@ mod tests {
     }
 
     #[test]
-    fn event_visible_admin_sees_everything_including_no_slug() {
-        let ev = GatewayEvent {
+    fn event_visible_admin_keeps_unattributed_but_not_a_tenants_project() {
+        let mut ev = GatewayEvent {
             id: "e".into(),
             channel: String::new(),
             chat_id: String::new(),
@@ -513,7 +531,25 @@ mod tests {
             sid: None,
             slug: None,
         };
-        assert!(event_visible(&ev, &None));
+        // The operator's ACL: its own visible projects + unattributed frames
+        // (a HITL prompt carries no slug).
+        let admin = EventAcl {
+            visible: ["adminproj".to_string()].into_iter().collect(),
+            allow_unattributed: true,
+        };
+        assert!(
+            event_visible(&ev, &admin),
+            "unattributed frames still shown"
+        );
+        ev.slug = Some("adminproj".to_string());
+        assert!(event_visible(&ev, &admin));
+        // v0.9.11 — but NOT a tenant's project. The admin used to subscribe
+        // unfiltered, so the team view streamed every tenant's live answers.
+        ev.slug = Some("tenantproj".to_string());
+        assert!(
+            !event_visible(&ev, &admin),
+            "a tenant's session events must not reach the operator's team view"
+        );
     }
 
     #[test]
@@ -530,7 +566,10 @@ mod tests {
             sid: None,
             slug: None,
         };
-        let visible = Some(["demo".to_string()].into_iter().collect());
+        let visible = EventAcl {
+            visible: ["demo".to_string()].into_iter().collect(),
+            allow_unattributed: false,
+        };
         assert!(!event_visible(&ev, &visible));
     }
 
@@ -548,7 +587,10 @@ mod tests {
             sid: None,
             slug: Some("demo".to_string()),
         };
-        let visible = Some(["demo".to_string()].into_iter().collect());
+        let visible = EventAcl {
+            visible: ["demo".to_string()].into_iter().collect(),
+            allow_unattributed: false,
+        };
         assert!(event_visible(&ev, &visible));
         ev.slug = Some("other".to_string());
         assert!(!event_visible(&ev, &visible));

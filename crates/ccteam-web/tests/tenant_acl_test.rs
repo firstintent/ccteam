@@ -535,3 +535,81 @@ async fn per_tenant_im_config_self_serve_and_admin() {
         "an empty PUT clears (replace semantics)",
     );
 }
+
+/// v0.9.11 CROSS-USER — the project-ownership choke point must cover EVERY
+/// project-addressed route family, not just `/api/v1/projects/{slug}/…`.
+///
+/// The regression: the legacy action routes (`/api/{slug}/pause|resume|btw|
+/// inject_decision`), the pane snapshots (`/api/{slug}[/{sid}]/pane-snapshot
+/// .ansi`) and the live terminal sockets (`/ws/{slug}[/{sid}]/pty`) named a
+/// project but sat OUTSIDE `project_acl_layer` and extracted no `Identity` of
+/// their own — so any authenticated tenant could snapshot, attach a terminal
+/// to, or pause another user's project. A new route in those families is now
+/// covered automatically, which is the whole point of a choke point.
+#[tokio::test]
+async fn project_acl_covers_legacy_action_pane_and_pty_routes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+
+    // An admin-owned project the tenant must not reach by ANY door.
+    let state_path = paths.project_state("adminproj");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let mut st = ccteam_core::ProjectState::initial_for_team("adminproj".into(), "dev".into());
+    st.owner = Some("user:web-api".into());
+    st.save(&state_path).unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    for path in [
+        "/api/adminproj/pane-snapshot.ansi",
+        "/api/adminproj/s1/pane-snapshot.ansi",
+        "/ws/adminproj/pty",
+        "/ws/adminproj/s1/pty",
+    ] {
+        let r = c
+            .get(format!("http://{addr}{path}"))
+            .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "tenant must be gated off {path}");
+    }
+    for path in [
+        "/api/adminproj/pause",
+        "/api/adminproj/resume",
+        "/api/adminproj/btw",
+        "/api/adminproj/inject_decision",
+        "/api/adminproj/s1/pause",
+    ] {
+        let r = c
+            .post(format!("http://{addr}{path}"))
+            .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+            .json(&serde_json::json!({"text": "x", "decision": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "tenant must be gated off {path}");
+    }
+
+    // The owner still reaches its own project's doors (the gate ran and
+    // PASSED — these fail later, on the missing tmux/rmux pane, not at the ACL).
+    let r = c
+        .get(format!("http://{addr}/api/adminproj/pane-snapshot.ansi"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        r.status(),
+        404,
+        "the owner must still reach its own project's pane snapshot"
+    );
+}

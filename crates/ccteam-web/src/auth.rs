@@ -256,22 +256,57 @@ pub async fn project_acl_layer(State(app): State<AppState>, req: Request, next: 
     next.run(req).await
 }
 
-/// Extract `{slug}` from `/api/v1/projects/{slug}` or `…/{slug}/...`. `None` for
-/// the bare collection path (`/api/v1/projects`) or any non-project path.
+/// Extract the addressed project `{slug}` from ANY project-scoped path, so the
+/// one middleware covers every route family that names a project:
+///
+/// - `/api/v1/projects/{slug}[/...]` — the REST resource tree,
+/// - `/api/{slug}/...` — the legacy per-project action routes (`btw`, `pause`,
+///   `resume`, `inject_decision`) and the pane snapshots,
+/// - `/ws/{slug}/pty`, `/ws/{slug}/{sid}/pty` — the live terminal sockets.
+///
+/// v0.9.11 — the last two families used to sit OUTSIDE the choke point with no
+/// identity check at all, so any authenticated tenant could snapshot or attach
+/// a PTY to another user's project (and POST its pause/resume/btw actions).
+/// `None` for the bare collection path (`/api/v1/projects`) and for the
+/// non-project routes that share those prefixes (`/api/v1/...`, `/api/docs`,
+/// `/ws/chat`).
 fn project_slug_from_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/api/v1/projects/")?;
-    // Collection action: creates a new catalog entry and stamps the caller as
-    // owner, so it has the same ACL posture as POST /projects (there is no
-    // existing project slug to authorize yet).
-    if rest == "import" {
-        return None;
+    if let Some(rest) = path.strip_prefix("/api/v1/projects/") {
+        // Collection action: creates a new catalog entry and stamps the caller
+        // as owner, so it has the same ACL posture as POST /projects (there is
+        // no existing project slug to authorize yet).
+        if rest == "import" {
+            return None;
+        }
+        return non_empty(first_segment(rest));
     }
-    let slug = rest.split('/').next().unwrap_or(rest);
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
+    if let Some(rest) = path.strip_prefix("/api/") {
+        let head = first_segment(rest);
+        // `/api/v1/...` is the versioned tree (handled above); `/api/docs...`
+        // is the Scalar UI. Neither names a project.
+        if head == "v1" || head == "docs" {
+            return None;
+        }
+        return non_empty(head);
     }
+    if let Some(rest) = path.strip_prefix("/ws/") {
+        let head = first_segment(rest);
+        // `/ws/chat` is the browser chat socket — identity-scoped, not project-
+        // scoped (it binds to the caller's own identity, see `chat_ws`).
+        if head == "chat" {
+            return None;
+        }
+        return non_empty(head);
+    }
+    None
+}
+
+fn first_segment(rest: &str) -> &str {
+    rest.split('/').next().unwrap_or(rest)
+}
+
+fn non_empty(slug: &str) -> Option<&str> {
+    (!slug.is_empty()).then_some(slug)
 }
 
 /// Strip the `ccteam:` wire prefix from a presented token → the bare hex (the
@@ -744,6 +779,58 @@ mod tests {
         // No prefix-confusion: a path that merely starts with "/app" but is not
         // under the shell must not slip through.
         assert!(!is_public_shell_path("/apple"));
+    }
+
+    /// v0.9.11 — the ACL choke point must recognise EVERY project-addressed
+    /// route family. The regression it guards: `/api/{slug}/…` (actions +
+    /// pane snapshots) and `/ws/{slug}/…` (PTY) named a project but were not
+    /// matched here, so they ran with no ownership check at all — a tenant
+    /// could snapshot or attach a terminal to another user's project.
+    #[test]
+    fn project_slug_from_path_covers_every_project_addressed_family() {
+        // REST resource tree.
+        assert_eq!(
+            project_slug_from_path("/api/v1/projects/demo"),
+            Some("demo")
+        );
+        assert_eq!(
+            project_slug_from_path("/api/v1/projects/demo/sessions"),
+            Some("demo")
+        );
+        // Legacy per-project actions + pane snapshots.
+        assert_eq!(project_slug_from_path("/api/demo/pause"), Some("demo"));
+        assert_eq!(
+            project_slug_from_path("/api/demo/s7/inject_decision"),
+            Some("demo")
+        );
+        assert_eq!(
+            project_slug_from_path("/api/demo/pane-snapshot.ansi"),
+            Some("demo")
+        );
+        assert_eq!(
+            project_slug_from_path("/api/demo/s7/pane-snapshot.ansi"),
+            Some("demo")
+        );
+        // Live terminal sockets.
+        assert_eq!(project_slug_from_path("/ws/demo/pty"), Some("demo"));
+        assert_eq!(project_slug_from_path("/ws/demo/s7/pty"), Some("demo"));
+
+        // NOT project-addressed: the collection, the import action, the
+        // versioned tree, the docs UI, the identity-scoped chat socket, and
+        // anything outside these prefixes.
+        assert_eq!(project_slug_from_path("/api/v1/projects"), None);
+        assert_eq!(project_slug_from_path("/api/v1/projects/"), None);
+        assert_eq!(project_slug_from_path("/api/v1/projects/import"), None);
+        assert_eq!(project_slug_from_path("/api/v1/status"), None);
+        assert_eq!(project_slug_from_path("/api/v1/sessions/s1/turn"), None);
+        assert_eq!(project_slug_from_path("/api/docs"), None);
+        assert_eq!(
+            project_slug_from_path("/api/docs/scalar-standalone.js"),
+            None
+        );
+        assert_eq!(project_slug_from_path("/ws/chat"), None);
+        assert_eq!(project_slug_from_path("/app/chat/s/s1"), None);
+        assert_eq!(project_slug_from_path("/health"), None);
     }
 
     #[test]

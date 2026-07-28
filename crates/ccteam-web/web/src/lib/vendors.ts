@@ -17,8 +17,6 @@ export interface ProtocolOption {
   /** Menu sub-caption (transport hint). */
   sub: string;
   wire: "stream-json" | "terminal" | "acp";
-  /** Frozen/beta surfaces (claude terminal) are admin-only in the UI. */
-  adminOnly?: boolean;
 }
 
 export interface VendorSpec {
@@ -47,7 +45,7 @@ export const VENDORS: VendorSpec[] = [
     models: [MODEL_DEFAULT, "fable", "opus", "sonnet", "haiku"],
     protocols: [
       { id: "stream-json", label: "stream-json", sub: "NDJSON", wire: "stream-json" },
-      { id: "terminal", label: "terminal", sub: "tmux", wire: "terminal", adminOnly: true },
+      { id: "terminal", label: "terminal", sub: "tmux", wire: "terminal" },
     ],
   },
   {
@@ -126,11 +124,13 @@ export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): 
   }
 }
 
-/** Protocols a caller may pick for `vendor` — the claude `terminal` protocol
- *  is frozen (maintenance-only) and admin-gated in the UI (beta-gate; not a
- *  security boundary — the backend route is unchanged). */
-export function visibleProtocols(vendor: string, isAdmin: boolean): ProtocolOption[] {
-  return vendorSpec(vendor).protocols.filter((p) => isAdmin || !p.adminOnly);
+/** Protocols a caller may pick for `vendor`. v0.9.11 — no admin gate: every
+ *  logged-in user gets the same functional surface, and what they may reach is
+ *  decided by identity × project ownership on the backend, not by hiding menu
+ *  entries. (The claude `terminal` protocol stays frozen/maintenance-only —
+ *  that is a roadmap fact, not a per-user permission.) */
+export function visibleProtocols(vendor: string): ProtocolOption[] {
+  return vendorSpec(vendor).protocols;
 }
 
 /** The composer draft — what the Home lazy-create POSTs from. */

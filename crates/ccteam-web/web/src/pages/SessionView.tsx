@@ -78,12 +78,10 @@ export default function SessionView({
   sid,
   session,
   lang = "zh",
-  isAdmin = false,
 }: {
   sid: string;
   session: SessionSummary | null;
   lang?: Lang;
-  isAdmin?: boolean;
 }) {
   const t = makeT(lang);
   const [view, setView] = useState<"chat" | "terminal">("chat");
@@ -560,7 +558,6 @@ export default function SessionView({
                 draft={lockedDraft}
                 onDraftChange={() => {}}
                 locked
-                isAdmin={isAdmin}
                 modelLabel={statusModel ?? ""}
                 uploadSlug={session?.project}
                 onSchedule={scheduleText}

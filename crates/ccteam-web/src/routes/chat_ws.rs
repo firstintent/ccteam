@@ -12,13 +12,14 @@ use axum::{
     },
     response::Response,
     routing::get,
-    Router,
+    Extension, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
+use crate::auth::Identity;
 use crate::chat_protocol::{
     now_unix_seconds, timestamp_id, ClientChatFrame, ServerChatFrame, SessionItem,
     WebChannelMessage, WebSendMessage, SUBPROTOCOL,
@@ -38,16 +39,48 @@ pub fn router() -> Router<AppState> {
 async fn handle_chat_ws(
     ws: WebSocketUpgrade,
     State(app): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Query(query): Query<ChatQuery>,
 ) -> Response {
-    let chat_id = query.chat_id.unwrap_or_else(|| "web-chat".to_string());
-    let user_id = query.user_id.unwrap_or_else(|| "web-user".to_string());
+    let identity = identity.map_or_else(Identity::admin, |Extension(i)| i);
+    let (chat_id, user_id) = resolve_chat_identity(&app, &identity, query);
     ws.protocols([SUBPROTOCOL])
-        .on_upgrade(move |socket| run(socket, app, chat_id, user_id))
+        .on_upgrade(move |socket| run(socket, app, identity, chat_id, user_id))
 }
 
-async fn run(socket: WebSocket, app: AppState, chat_id: String, user_id: String) {
-    if let Err(err) = relay(socket, app, chat_id.clone(), user_id).await {
+/// v0.9.11 — the socket's `(chat_id, user_id)` is the caller's IDENTITY, not a
+/// client-chosen label. It keys everything downstream: the gateway `ChatKey`
+/// (→ session ownership + ACL) and the outbound filter that decides which
+/// socket receives a message. Taking it from the query string let any
+/// authenticated caller connect as `chat_id=web-api` and read/drive the
+/// admin's chat — the web twin of "an IM transport stamps the inbound channel,
+/// the sender never picks it".
+///
+/// With auth OFF (loopback / `--no-auth`) there is exactly one local operator
+/// and no identity to cross, so the query values still apply — that is also the
+/// seam the CLI web-chat bridge's tests drive.
+fn resolve_chat_identity(
+    app: &AppState,
+    identity: &Identity,
+    query: ChatQuery,
+) -> (String, String) {
+    if app.auth.enabled {
+        return (identity.web_chat_id(), identity.id.clone());
+    }
+    (
+        query.chat_id.unwrap_or_else(|| "web-chat".to_string()),
+        query.user_id.unwrap_or_else(|| "web-user".to_string()),
+    )
+}
+
+async fn run(
+    socket: WebSocket,
+    app: AppState,
+    identity: Identity,
+    chat_id: String,
+    user_id: String,
+) {
+    if let Err(err) = relay(socket, app, identity, chat_id.clone(), user_id).await {
         tracing::warn!(chat_id = %chat_id, error = %err, "chat_ws: relay loop exited");
     }
 }
@@ -55,6 +88,7 @@ async fn run(socket: WebSocket, app: AppState, chat_id: String, user_id: String)
 async fn relay(
     socket: WebSocket,
     app: AppState,
+    identity: Identity,
     chat_id: String,
     user_id: String,
 ) -> anyhow::Result<()> {
@@ -74,7 +108,7 @@ async fn relay(
     let inbound = app.chat_inbound.clone();
 
     let sessions = ServerChatFrame::Sessions {
-        items: session_items(&app),
+        items: session_items(&app, &identity),
     };
     send_frame(&mut tx, &sessions).await?;
     for message in take_backlog_for_target(&app, &chat_id).await {
@@ -89,7 +123,7 @@ async fn relay(
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ClientChatFrame>(&text) {
                         Ok(parsed) => {
-                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &mut tx)
+                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &identity, &mut tx)
                                 .await?;
                         }
                         // P1-2: a single malformed frame must not tear
@@ -105,7 +139,7 @@ async fn relay(
                         .and_then(|text| serde_json::from_str::<ClientChatFrame>(&text).ok())
                     {
                         Some(parsed) => {
-                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &mut tx)
+                            forward_client_frame(parsed, &chat_id, &user_id, &inbound, &app, &identity, &mut tx)
                                 .await?;
                         }
                         None => {
@@ -151,6 +185,7 @@ async fn forward_client_frame<S>(
     user_id: &str,
     inbound: &Option<mpsc::Sender<WebChannelMessage>>,
     app: &AppState,
+    identity: &Identity,
     tx: &mut S,
 ) -> anyhow::Result<()>
 where
@@ -168,7 +203,7 @@ where
     }
     if is_switch {
         let sessions = ServerChatFrame::Sessions {
-            items: session_items(app),
+            items: session_items(app, identity),
         };
         send_frame(tx, &sessions).await?;
     }
@@ -357,13 +392,20 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
     Some(items)
 }
 
-fn session_items(app: &AppState) -> Vec<SessionItem> {
+/// The project picker this socket opens with. v0.9.11 — filtered through the
+/// SAME ownership policy as `GET /api/v1/projects`; it used to hand every
+/// connected chat the full project list of the box, leaking other users'
+/// project names.
+fn session_items(app: &AppState, identity: &Identity) -> Vec<SessionItem> {
     let Ok(projects) = ccteam_core::collect_projects(&app.paths) else {
         return Vec::new();
     };
     let mut items = Vec::new();
     for project in projects {
         let state = project.state;
+        if !identity.can_see_owner(state.owner.as_deref()) {
+            continue;
+        }
         items.push(SessionItem {
             project: state.slug,
             session: None,

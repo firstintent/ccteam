@@ -193,7 +193,6 @@ export function NewProjectFields({
 
 export default function HomeView({
   lang,
-  isAdmin,
   projects,
   projectPaths,
   projectHosts = {},
@@ -203,7 +202,6 @@ export default function HomeView({
   onOpenSettings,
 }: {
   lang: Lang;
-  isAdmin: boolean;
   projects: string[];
   projectPaths: Record<string, string>;
   projectHosts?: Record<string, ProjectHostIdentity>;
@@ -555,7 +553,6 @@ export default function HomeView({
             lang={lang}
             placeholderKey="inputPh"
             disabled={pending}
-            isAdmin={isAdmin}
             draft={effectiveDraft}
             onDraftChange={setDraft}
             allowedVendors={hostVendors ?? undefined}
