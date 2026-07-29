@@ -1,4 +1,4 @@
-// v0.9.11 TEAM-2/3 — charter tab (roster + 编队起手 playbooks + editor)
+// v0.9.11 TEAM-2/3/6 — charter tab (roster + 编队起手 playbooks + editor)
 // node-env suite. Same conventions as AgentsView.test.tsx: `renderToString`
 // proves structure (Links need a Router context → MemoryRouter); click/link
 // wiring on the hook-free views is exercised by walking the element tree.
@@ -6,6 +6,15 @@
 // onSave here, PUT wire shape in routingApi.test.ts, and the saved-state
 // transition in charterState.test.ts. The playbook DEFINITIONS (6 entries,
 // vendors, i18n completeness) are pinned in lib/playbooks.test.ts.
+//
+// TEAM-6: `VendorRosterCards` stays hook-free (collapsed/confirmingHost are
+// props, not internal `useState`) precisely so it's directly callable here
+// the same way as `CharterEditorView`; the click-driven collapse/remove
+// ORCHESTRATION (`handleRosterRemoveClick`, sort order) lives in
+// `lib/charterRoster.ts` and is tested on its own in charterRoster.test.ts
+// (mocking `deleteHost`) — mirroring how `charterState.ts`'s reducer is
+// tested apart from the views that dispatch into it. This file only proves
+// VendorRosterCards renders/wires those pieces correctly.
 
 import { describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
@@ -22,13 +31,9 @@ vi.hoisted(() => {
   }
 });
 
-import CharterPanel, {
-  CharterEditorView,
-  PlaybookCards,
-  VendorRosterCards,
-  type RosterHost,
-} from "./CharterPanel";
+import CharterPanel, { CharterEditorView, PlaybookCards, VendorRosterCards } from "./CharterPanel";
 import { charterReducer, initialCharter, type CharterState } from "../lib/charterState";
+import type { RosterHost } from "../lib/charterRoster";
 import { PLAYBOOKS } from "../lib/playbooks";
 import type { RoutingDoc } from "../lib/routingApi";
 import type { AgentNode } from "../lib/agentsApi";
@@ -60,6 +65,16 @@ function fixtureAgent(over: Partial<AgentHealth> = {}): AgentHealth {
     mcp_registrable: true,
     status: "ready",
     hint: null,
+    ...over,
+  };
+}
+
+function fixtureHost(over: Partial<RosterHost> = {}): RosterHost {
+  return {
+    host: "local",
+    hostname: "box",
+    status: "online",
+    agents: [fixtureAgent()],
     ...over,
   };
 }
@@ -99,6 +114,29 @@ function collectOnClicks(el: unknown, out: ClickHandler[] = []): ClickHandler[] 
   return out;
 }
 
+/** Find the first element in a (hook-free) component's element tree whose
+ *  `data-testid` matches, returning its props — the node-env stand-in for
+ *  `screen.getByTestId(...)`. Needed alongside `collectOnClicks` once a
+ *  render can hold several same-shaped interactive elements (one remove
+ *  button per host group) that positional indexing would make fragile. */
+function findByTestId(
+  el: unknown,
+  testid: string,
+): { onClick?: ClickHandler; [key: string]: unknown } | null {
+  if (el == null || typeof el !== "object") return null;
+  if (Array.isArray(el)) {
+    for (const child of el) {
+      const found = findByTestId(child, testid);
+      if (found) return found;
+    }
+    return null;
+  }
+  const props = (el as { props?: { "data-testid"?: unknown; children?: unknown } }).props;
+  if (!props) return null;
+  if (props["data-testid"] === testid) return props as { onClick?: ClickHandler };
+  return findByTestId(props.children, testid);
+}
+
 const noHandlers = {
   onStartDraft: () => {},
   onEdit: () => {},
@@ -106,11 +144,12 @@ const noHandlers = {
   onSave: () => {},
 };
 
-describe("VendorRosterCards (health + graph aggregation)", () => {
+describe("VendorRosterCards (grouped by host — health + graph aggregation)", () => {
   const hosts: RosterHost[] = [
-    {
+    fixtureHost({
       host: "local",
       hostname: "box",
+      status: "online",
       agents: [
         fixtureAgent(),
         fixtureAgent({
@@ -121,7 +160,7 @@ describe("VendorRosterCards (health + graph aggregation)", () => {
         }),
         fixtureAgent({ vendor: "kimi", installed: false, version: null, status: "not_installed" }),
       ],
-    },
+    }),
   ];
   const nodes = [
     fixtureNode({ sid: "s0", vendor: "claude", status: "live", cost_usd: 0.25 }),
@@ -146,20 +185,126 @@ describe("VendorRosterCards (health + graph aggregation)", () => {
     expect(html).toContain("$0.02");
     // not_installed stays honest (no invented version/auth state).
     expect(html).toContain("未安装");
-    // Single host → no host label on cards.
-    expect(html).not.toContain("charter-roster-host");
   });
 
-  it("shows the host label only on a multi-host fleet; empty roster renders nothing", () => {
-    const multi = renderToString(
-      <VendorRosterCards
-        hosts={[...hosts, { host: "gpu-1", hostname: "gpu-1", agents: [fixtureAgent()] }]}
-        nodes={nodes}
-      />,
+  it("(a) renders each host as its own group section with hostname + ALWAYS-shown id + status", () => {
+    const html = renderToString(<VendorRosterCards hosts={hosts} nodes={nodes} />);
+    expect(html).toContain('data-testid="charter-roster-group-local"');
+    expect(html).toContain('data-testid="charter-roster-group-head-local"');
+    expect(html).toContain('data-testid="charter-roster-cards-local"');
+    expect(html).toContain(">box<"); // hostname, prominent
+    // The host id is ALWAYS shown — even for a single host — since that's
+    // exactly the disambiguator two same-named hosts need.
+    expect(html).toMatch(/charter-roster-group-id mono">local</);
+    expect(html).toContain("在线"); // online status label
+    // `local` never gets a remove button — it's the daemon's own machine.
+    expect(html).not.toContain('data-testid="charter-roster-remove-local"');
+  });
+
+  it("(a) an offline non-local host shows its offline status + id, and a remove button", () => {
+    const withSatellite: RosterHost[] = [
+      ...hosts,
+      fixtureHost({
+        host: "smoke-self",
+        hostname: "claude-dev-04",
+        status: "offline",
+        agents: [fixtureAgent({ vendor: "codex" })],
+      }),
+    ];
+    const html = renderToString(
+      <VendorRosterCards hosts={withSatellite} nodes={nodes} collapsed={new Set()} />,
     );
-    expect(multi).toContain("charter-roster-host");
-    expect(multi).toContain('data-testid="charter-roster-card-gpu-1-claude"');
-    expect(multi).toContain("$9.99"); // gpu-1's claude aggregates its own host only
+    expect(html).toContain('data-testid="charter-roster-group-smoke-self"');
+    expect(html).toMatch(/charter-roster-group-id mono">smoke-self</);
+    expect(html).toContain("离线"); // offline status label
+    expect(html).toContain('data-testid="charter-roster-remove-smoke-self"');
+    expect(html).toContain("移除"); // not armed yet → plain remove label
+  });
+
+  it("(b) sorts local first, then online before offline, keeping each bucket's own relative order", () => {
+    const scrambled: RosterHost[] = [
+      fixtureHost({ host: "b-offline", hostname: "b", status: "offline", agents: [] }),
+      fixtureHost({ host: "a-online", hostname: "a", status: "online", agents: [] }),
+      fixtureHost({ host: "local", hostname: "box", status: "online", agents: [] }),
+      fixtureHost({ host: "c-offline", hostname: "c", status: "offline", agents: [] }),
+    ];
+    const html = renderToString(<VendorRosterCards hosts={scrambled} nodes={[]} collapsed={new Set()} />);
+    const idx = (host: string) => html.indexOf(`data-testid="charter-roster-group-${host}"`);
+    expect(idx("local")).toBeGreaterThanOrEqual(0);
+    expect(idx("local")).toBeLessThan(idx("a-online"));
+    expect(idx("a-online")).toBeLessThan(idx("b-offline")); // online before offline
+    expect(idx("b-offline")).toBeLessThan(idx("c-offline")); // offline bucket keeps its own order
+  });
+
+  it("(c) an offline section's cards stay hidden while collapsed and appear once expanded", () => {
+    const withSatellite: RosterHost[] = [
+      fixtureHost({
+        host: "smoke-self",
+        hostname: "claude-dev-04",
+        status: "offline",
+        agents: [fixtureAgent({ vendor: "codex" })],
+      }),
+    ];
+    const collapsedHtml = renderToString(
+      <VendorRosterCards hosts={withSatellite} nodes={nodes} collapsed={new Set(["smoke-self"])} />,
+    );
+    expect(collapsedHtml).not.toContain('data-testid="charter-roster-cards-smoke-self"');
+    expect(collapsedHtml).not.toContain('data-testid="charter-roster-card-smoke-self-codex"');
+
+    const expandedHtml = renderToString(
+      <VendorRosterCards hosts={withSatellite} nodes={nodes} collapsed={new Set()} />,
+    );
+    expect(expandedHtml).toContain('data-testid="charter-roster-cards-smoke-self"');
+    expect(expandedHtml).toContain('data-testid="charter-roster-card-smoke-self-codex"');
+  });
+
+  it("(c) the group toggle button fires onToggleCollapse with that host's id", () => {
+    const withSatellite: RosterHost[] = [
+      fixtureHost({ host: "smoke-self", status: "offline", agents: [fixtureAgent({ vendor: "codex" })] }),
+    ];
+    const onToggleCollapse = vi.fn();
+    const el = VendorRosterCards({
+      hosts: withSatellite,
+      nodes,
+      collapsed: new Set(["smoke-self"]),
+      onToggleCollapse,
+    });
+    const toggle = findByTestId(el, "charter-roster-group-toggle-smoke-self");
+    expect(toggle?.onClick).toBeTypeOf("function");
+    toggle!.onClick!();
+    expect(onToggleCollapse).toHaveBeenCalledWith("smoke-self");
+  });
+
+  it("(d)/(e) clicking a host's remove button fires onRemoveClick(host, online) — never for local", () => {
+    const withHosts: RosterHost[] = [
+      fixtureHost({ host: "local", status: "online" }),
+      fixtureHost({ host: "smoke-self", status: "offline", agents: [] }),
+      fixtureHost({ host: "dxa347", status: "online", agents: [] }),
+    ];
+    const onRemoveClick = vi.fn();
+    const el = VendorRosterCards({ hosts: withHosts, nodes, collapsed: new Set(), onRemoveClick });
+    expect(findByTestId(el, "charter-roster-remove-local")).toBeNull();
+    findByTestId(el, "charter-roster-remove-smoke-self")!.onClick!();
+    expect(onRemoveClick).toHaveBeenCalledWith("smoke-self", false);
+    findByTestId(el, "charter-roster-remove-dxa347")!.onClick!();
+    expect(onRemoveClick).toHaveBeenCalledWith("dxa347", true);
+  });
+
+  it("confirmingHost flips that host's remove button to the confirm label only", () => {
+    const withHosts: RosterHost[] = [
+      fixtureHost({ host: "dxa347", status: "online", agents: [] }),
+      fixtureHost({ host: "smoke-self", status: "offline", agents: [] }),
+    ];
+    const html = renderToString(
+      <VendorRosterCards hosts={withHosts} nodes={nodes} collapsed={new Set()} confirmingHost="dxa347" />,
+    );
+    // dxa347's button is armed…
+    expect(html).toMatch(/data-testid="charter-roster-remove-dxa347">确定移除\?</);
+    // …smoke-self's is untouched.
+    expect(html).toMatch(/data-testid="charter-roster-remove-smoke-self">移除</);
+  });
+
+  it("empty roster renders nothing", () => {
     expect(renderToString(<VendorRosterCards hosts={[]} nodes={nodes} />)).toBe("");
   });
 });

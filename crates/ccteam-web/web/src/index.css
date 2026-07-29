@@ -1171,13 +1171,21 @@ select:focus-visible,
 .agents-seg { margin: 0 28px 8px; }
 .agents-charter { flex: 1; overflow-y: auto; padding: 4px 28px 24px; display: flex; flex-direction: column; gap: 18px; }
 .charter-roster-section h3, .charter-editor-head h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 8px; }
+/* v0.9.11 TEAM-6 — roster groups by host (one collapsible section each). */
+.charter-roster-groups { display: flex; flex-direction: column; gap: 16px; }
+.charter-roster-group-head { display: flex; align-items: center; gap: 8px; padding: 4px 2px 8px; border-bottom: 1px solid var(--border-soft); }
+.charter-roster-group-toggle { border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 4px; }
+.charter-roster-group-toggle:hover { color: var(--text); }
+.charter-roster-group-hostname { font-weight: 600; color: var(--text); font-size: 13px; }
+.charter-roster-group-id { color: var(--text-faint); font-size: 11px; }
+.charter-roster-group-status { color: var(--text-muted); font-size: 11.5px; }
+.charter-roster-remove { margin-left: auto; }
 .charter-roster { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.charter-roster-group .charter-roster { margin-top: 10px; }
 .charter-roster-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
 .charter-roster-head { display: flex; align-items: center; gap: 8px; }
 .charter-roster-vendor { font-weight: 600; color: var(--text); }
-.charter-roster-host { margin-left: auto; color: var(--text-faint); font-size: 11px; }
 .charter-roster-head .badge { margin-left: auto; }
-.charter-roster-host + .badge { margin-left: 0; }
 .charter-roster-meta { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .charter-roster-hint { color: var(--text-faint); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 .charter-roster-stats { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }

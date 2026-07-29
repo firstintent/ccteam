@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getHostDetail, getHosts, getJoinToken, mintJoinToken, registerMcp } from "./hostsApi";
+import { deleteHost, getHostDetail, getHosts, getJoinToken, mintJoinToken, registerMcp } from "./hostsApi";
 
 const realFetch = globalThis.fetch;
 
@@ -154,5 +154,53 @@ describe("hostsApi", () => {
     await expect(getHosts()).rejects.toThrow("UNAUTHENTICATED");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(500, {}));
     await expect(getHosts()).rejects.toThrow("HTTP 500");
+  });
+
+  it("deleteHost DELETEs /api/v1/hosts/{host} with no query by default", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { host: "dxa347" }));
+    const got = await deleteHost("dxa347");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/hosts/dxa347", {
+      method: "DELETE",
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    expect(got).toEqual({ host: "dxa347" });
+  });
+
+  it("deleteHost appends ?force=true when opts.force is set (and omits it when false)", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { host: "smoke-self" }));
+    await deleteHost("smoke-self", { force: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/hosts/smoke-self?force=true",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { host: "smoke-self" }));
+    await deleteHost("smoke-self", { force: false });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/v1/hosts/smoke-self",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("deleteHost surfaces the server's {error} body on a non-2xx (e.g. 409 online-without-force)", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(409, { error: "host dxa347 is online; pass ?force=true to remove a live satellite" }),
+    );
+    await expect(deleteHost("dxa347")).rejects.toThrow(
+      "host dxa347 is online; pass ?force=true to remove a live satellite",
+    );
+  });
+
+  it("deleteHost falls back to HTTP <status> when the error body has no usable message", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(404, {}));
+    await expect(deleteHost("nope")).rejects.toThrow("HTTP 404");
+  });
+
+  it("deleteHost maps 401 → UNAUTHENTICATED", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, {}));
+    await expect(deleteHost("dxa347")).rejects.toThrow("UNAUTHENTICATED");
   });
 });

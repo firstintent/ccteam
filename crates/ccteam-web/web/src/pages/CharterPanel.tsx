@@ -1,9 +1,15 @@
 // v0.9.11 TEAM-2 — 分工 charter tab body (Team page). Four blocks:
 //
-// - Vendor roster: one card per (host, vendor) from the hosts agent report —
-//   installed/version/status straight off the API (never invented), plus
-//   live-session count + Σcost aggregated from the SAME graph nodes the
-//   topology tab already fetched (passed down as a prop, no refetch).
+// - Vendor roster (TEAM-6: grouped by host): one collapsible section per
+//   host — header = hostname + ALWAYS-shown mono host-id badge (the
+//   disambiguator two hosts sharing an OS hostname need) + online/offline
+//   dot, then that host's per-vendor cards straight off the hosts agent
+//   report (installed/version/status never invented; live-session count +
+//   Σcost aggregated from the SAME graph nodes the topology tab already
+//   fetched, passed down as a prop, no refetch). Sort = `local` first, then
+//   online before offline; offline (non-local) sections start collapsed.
+//   Non-local headers carry a 移除/Remove button — offline fires the DELETE
+//   immediately, online arms a same-button two-click confirm first.
 // - 编队起手 playbook cards (TEAM-3): the shared formation definitions from
 //   `lib/playbooks.ts` (same array the Home launcher renders — UI
 //   documentation only, no shipped prompts/personas); the 起手 CTA hands off
@@ -16,26 +22,27 @@
 //   (advisory, never injected); >~4k chars is excerpted there.
 //
 // State machine = `lib/charterState.ts` (pure reducer, node-env tested);
-// the hook-free views below are exported for the SSR test suite.
+// roster grouping/remove orchestration = `lib/charterRoster.ts` (also pure,
+// also its own test file — kept out of this page module so its plain
+// `handleRosterRemoveClick` function doesn't trip
+// `react-refresh/only-export-components`). The hook-free views below are
+// exported for the SSR test suite.
 
 import { useEffect, useReducer, useState } from "react";
 import { Link } from "react-router-dom";
 import type { AgentNode } from "../lib/agentsApi";
 import { charterReducer, initialCharter, type CharterState } from "../lib/charterState";
+import { handleRosterRemoveClick, sortRosterHosts, type RosterHost } from "../lib/charterRoster";
 import { fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
-import { getHostDetail, getHosts, type AgentHealth } from "../lib/hostsApi";
+import { getHostDetail, getHosts } from "../lib/hostsApi";
 import { getRouting, putRouting } from "../lib/routingApi";
 import { makeT, type Lang } from "../lib/i18n";
 import { PLAYBOOKS } from "../lib/playbooks";
+import { toastBus } from "../lib/toastBus";
 import { VendorChip } from "../components/VendorChip";
 import { Markdown } from "../components/Markdown";
 
-/** One host's agent report, resolved for the roster. */
-export interface RosterHost {
-  host: string;
-  hostname: string;
-  agents: AgentHealth[];
-}
+export type { RosterHost } from "../lib/charterRoster";
 
 /** Status → badge class/label. Renders EXACTLY what the API reports — an
  *  unknown status falls through verbatim (honesty over prettiness). */
@@ -46,56 +53,121 @@ function rosterBadge(status: string, t: (key: string) => string): { cls: string;
   return { cls: "badge", label: status };
 }
 
+/** Shared empty-Set default for `VendorRosterCards`' `collapsed` prop — a
+ *  module-level constant so the default doesn't allocate a fresh Set (and
+ *  thus a fresh identity) on every render. */
+const EMPTY_COLLAPSED: Set<string> = new Set();
+
 /** Vendor roster cards — hook-free presentational (exported for node-env
- *  tests). `nodes` = the topology tab's graph nodes (prop-drilled, not
- *  refetched); live/Σcost aggregate over (host, vendor). */
+ *  tests): grouped one section per host (TEAM-6), `local` first then online
+ *  before offline (see {@link sortRosterHosts}). `nodes` = the topology
+ *  tab's graph nodes (prop-drilled, not refetched); live/Σcost aggregate
+ *  over (host, vendor). Collapse + remove-confirm are OWNED BY THE CALLER
+ *  (`collapsed` / `confirmingHost` state + callbacks) rather than internal
+ *  `useState`, precisely so this view stays hook-free and directly
+ *  callable from node-env tests (same reason {@link CharterEditorView}
+ *  externalizes its state) — `CharterPanel` below wires the actual
+ *  `useState<Set<string>>` (the AgentsTree collapsed-Set idiom) + the
+ *  {@link handleRosterRemoveClick} orchestration. */
 export function VendorRosterCards({
   hosts,
   nodes,
   lang: langProp,
+  collapsed = EMPTY_COLLAPSED,
+  onToggleCollapse = () => {},
+  confirmingHost = null,
+  onRemoveClick = () => {},
 }: {
   hosts: RosterHost[];
   nodes: AgentNode[];
   lang?: Lang;
+  /** Host ids currently collapsed (cards hidden, header stays). */
+  collapsed?: Set<string>;
+  onToggleCollapse?: (host: string) => void;
+  /** Host id currently armed for a second-click remove confirmation. */
+  confirmingHost?: string | null;
+  onRemoveClick?: (host: string, online: boolean) => void;
 }) {
   const t = makeT(langProp ?? "zh");
   if (hosts.length === 0) return null;
-  const showHost = hosts.length > 1;
+  const sorted = sortRosterHosts(hosts);
   return (
     <section className="charter-roster-section">
       <h3>{t("charterRoster")}</h3>
-      <div className="charter-roster" data-testid="charter-roster">
-        {hosts.flatMap(({ host, hostname, agents }) =>
-          agents.map((agent) => {
-            const mine = nodes.filter((n) => n.host === host && n.vendor === agent.vendor);
-            const live = mine.filter((n) => n.status === "live").length;
-            const cost = mine.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
-            const badge = rosterBadge(agent.status, t);
-            return (
-              <div
-                key={`${host}-${agent.vendor}`}
-                className="charter-roster-card"
-                data-testid={`charter-roster-card-${host}-${agent.vendor}`}
-              >
-                <div className="charter-roster-head">
-                  <VendorChip vendor={agent.vendor} />
-                  <span className="charter-roster-vendor">{agent.vendor}</span>
-                  {showHost ? <span className="charter-roster-host mono">{hostname || host}</span> : null}
-                  <span className={badge.cls}>{badge.label}</span>
-                </div>
-                <div className="charter-roster-meta mono">
-                  {agent.installed ? agent.version ?? "—" : t("notInstalled")}
-                </div>
-                {agent.hint ? <div className="charter-roster-hint mono">{agent.hint}</div> : null}
-                <div className="charter-roster-stats">
-                  <span className="charter-roster-live">{`●${live}`}</span>
-                  <span>{t("teamKpiLive")}</span>
-                  <span className="mono">{`$${cost.toFixed(2)}`}</span>
-                </div>
+      <div className="charter-roster-groups" data-testid="charter-roster">
+        {sorted.map(({ host, hostname, status, agents }) => {
+          const isLocal = host === "local";
+          const online = status === "online";
+          const isCollapsed = collapsed.has(host);
+          return (
+            <div
+              key={host}
+              className="charter-roster-group"
+              data-testid={`charter-roster-group-${host}`}
+            >
+              <div className="charter-roster-group-head" data-testid={`charter-roster-group-head-${host}`}>
+                <button
+                  type="button"
+                  className="charter-roster-group-toggle"
+                  aria-label={isCollapsed ? t("expand") : t("collapse")}
+                  aria-expanded={!isCollapsed}
+                  data-testid={`charter-roster-group-toggle-${host}`}
+                  onClick={() => onToggleCollapse(host)}
+                >
+                  {isCollapsed ? "›" : "⌄"}
+                </button>
+                <span className="charter-roster-group-hostname">{hostname || host}</span>
+                <span className="charter-roster-group-id mono">{host}</span>
+                <span className={online ? "dot on" : "dot off"} aria-hidden="true" />
+                <span className="charter-roster-group-status">
+                  {online ? t("rosterHostOnline") : t("rosterHostOffline")}
+                </span>
+                {!isLocal ? (
+                  <button
+                    type="button"
+                    className="btn ghost mini charter-roster-remove"
+                    data-testid={`charter-roster-remove-${host}`}
+                    onClick={() => onRemoveClick(host, online)}
+                  >
+                    {confirmingHost === host ? t("rosterRemoveConfirm") : t("rosterRemove")}
+                  </button>
+                ) : null}
               </div>
-            );
-          }),
-        )}
+              {!isCollapsed ? (
+                <div className="charter-roster" data-testid={`charter-roster-cards-${host}`}>
+                  {agents.map((agent) => {
+                    const mine = nodes.filter((n) => n.host === host && n.vendor === agent.vendor);
+                    const live = mine.filter((n) => n.status === "live").length;
+                    const cost = mine.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
+                    const badge = rosterBadge(agent.status, t);
+                    return (
+                      <div
+                        key={`${host}-${agent.vendor}`}
+                        className="charter-roster-card"
+                        data-testid={`charter-roster-card-${host}-${agent.vendor}`}
+                      >
+                        <div className="charter-roster-head">
+                          <VendorChip vendor={agent.vendor} />
+                          <span className="charter-roster-vendor">{agent.vendor}</span>
+                          <span className={badge.cls}>{badge.label}</span>
+                        </div>
+                        <div className="charter-roster-meta mono">
+                          {agent.installed ? agent.version ?? "—" : t("notInstalled")}
+                        </div>
+                        {agent.hint ? <div className="charter-roster-hint mono">{agent.hint}</div> : null}
+                        <div className="charter-roster-stats">
+                          <span className="charter-roster-live">{`●${live}`}</span>
+                          <span>{t("teamKpiLive")}</span>
+                          <span className="mono">{`$${cost.toFixed(2)}`}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -302,6 +374,11 @@ export default function CharterPanel({
   const [projects, setProjects] = useState<DashboardRow[] | null>(null);
   const [slug, setSlug] = useState<string | null>(null);
   const [roster, setRoster] = useState<RosterHost[]>([]);
+  // The AgentsTree collapsed-Set idiom (`useState<Set<string>>`, toggle on
+  // click) — seeded once with every offline non-local host when the roster
+  // first loads (see the effect below), then owned by the user's clicks.
+  const [rosterCollapsed, setRosterCollapsed] = useState<Set<string>>(() => new Set());
+  const [confirmingHost, setConfirmingHost] = useState<string | null>(null);
   const [state, dispatch] = useReducer(charterReducer, initialCharter);
 
   // Visible projects → picker options; default to the first one.
@@ -350,15 +427,24 @@ export default function CharterPanel({
       .then(async ({ hosts }) => {
         const detailed = await Promise.all(
           hosts.map(async (h) => {
+            const status = h.status ?? "online";
             try {
               const d = await getHostDetail(h.host);
-              return { host: h.host, hostname: d.hostname, agents: d.agents };
+              return { host: h.host, hostname: d.hostname, status, agents: d.agents };
             } catch {
-              return { host: h.host, hostname: h.hostname, agents: [] };
+              return { host: h.host, hostname: h.hostname, status, agents: [] };
             }
           }),
         );
-        if (!cancelled) setRoster(detailed);
+        if (!cancelled) {
+          setRoster(detailed);
+          // Offline satellites start collapsed (local + online start open).
+          setRosterCollapsed(
+            new Set(
+              detailed.filter((h) => h.host !== "local" && h.status !== "online").map((h) => h.host),
+            ),
+          );
+        }
       })
       .catch(() => {
         if (!cancelled) setRoster([]);
@@ -367,6 +453,26 @@ export default function CharterPanel({
       cancelled = true;
     };
   }, []);
+
+  const toggleRosterCollapsed = (host: string) => {
+    setRosterCollapsed((previous) => {
+      const next = new Set(previous);
+      if (next.has(host)) next.delete(host);
+      else next.add(host);
+      return next;
+    });
+  };
+
+  const onRosterRemoveClick = (host: string, online: boolean) => {
+    handleRosterRemoveClick({
+      host,
+      online,
+      confirmingHost,
+      setConfirmingHost,
+      setRoster,
+      onError: (message) => toastBus.handler?.error(message),
+    });
+  };
 
   const onSave = () => {
     if (!slug || state.draft == null || state.saving) return;
@@ -384,7 +490,15 @@ export default function CharterPanel({
 
   return (
     <div className="agents-charter" data-testid="charter-panel">
-      <VendorRosterCards hosts={roster} nodes={nodes} lang={lang} />
+      <VendorRosterCards
+        hosts={roster}
+        nodes={nodes}
+        lang={lang}
+        collapsed={rosterCollapsed}
+        onToggleCollapse={toggleRosterCollapsed}
+        confirmingHost={confirmingHost}
+        onRemoveClick={onRosterRemoveClick}
+      />
 
       <PlaybookCards lang={lang} />
 
