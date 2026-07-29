@@ -9,7 +9,8 @@
 //   panel) links to the real chat route `/chat/s/<sid>` — right/middle-click
 //   open-in-new-tab works because these are real hyperlinks.
 // - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
-//   reuses this view's graph nodes for its aggregation — no refetch).
+//   reuses this view's graph nodes for its aggregation — no refetch; picking
+//   a roster card lands back on the topology filtered to that vendor).
 // - KPI strip (live / working / active dispatches / total cost) + per-vendor
 //   chips (live count + Σcost per vendor; clicking a chip filters the
 //   topology to that vendor, clicking it again clears the filter).
@@ -516,7 +517,17 @@ export default function AgentsView({
       <TeamTabSeg tab={tab} lang={lang} onSwitch={setTab} />
 
       {tab === "charter" ? (
-        <CharterPanel nodes={graph.nodes} lang={lang} />
+        <CharterPanel
+          nodes={graph.nodes}
+          lang={lang}
+          // TEAM-7: a roster card answers "show me this vendor's sessions" —
+          // same `vendorFilter` state the KPI chips drive, so we land on an
+          // already-filtered topology with that chip active (click it to clear).
+          onVendorPick={(vendor) => {
+            setVendorFilter(vendor);
+            setTab("topology");
+          }}
+        />
       ) : (
         <div className="agents-body">
           <div className="agents-canvas" data-testid="agents-canvas">

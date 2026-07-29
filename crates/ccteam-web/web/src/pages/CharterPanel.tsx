@@ -9,7 +9,8 @@
 //   fetched, passed down as a prop, no refetch). Sort = `local` first, then
 //   online before offline; offline (non-local) sections start collapsed.
 //   Non-local headers carry a 移除/Remove button — offline fires the DELETE
-//   immediately, online arms a same-button two-click confirm first.
+//   immediately, online arms a same-button two-click confirm first. Cards
+//   click through to the topology tab filtered to that vendor (TEAM-7).
 // - 编队起手 playbook cards (TEAM-3): the shared formation definitions from
 //   `lib/playbooks.ts` (same array the Home launcher renders — UI
 //   documentation only, no shipped prompts/personas); the 起手 CTA hands off
@@ -68,7 +69,13 @@ const EMPTY_COLLAPSED: Set<string> = new Set();
  *  callable from node-env tests (same reason {@link CharterEditorView}
  *  externalizes its state) — `CharterPanel` below wires the actual
  *  `useState<Set<string>>` (the AgentsTree collapsed-Set idiom) + the
- *  {@link handleRosterRemoveClick} orchestration. */
+ *  {@link handleRosterRemoveClick} orchestration.
+ *
+ *  TEAM-7: a card answers "what is this vendor doing?" — with `onVendorPick`
+ *  it turns interactive (button role + Enter key + hover, like a tree row)
+ *  and hands the vendor up; the caller lands on the filtered topology. No
+ *  callback = pure display (no role, no pointer), so any other embedder of
+ *  this view keeps the old behavior. */
 export function VendorRosterCards({
   hosts,
   nodes,
@@ -77,6 +84,7 @@ export function VendorRosterCards({
   onToggleCollapse = () => {},
   confirmingHost = null,
   onRemoveClick = () => {},
+  onVendorPick,
 }: {
   hosts: RosterHost[];
   nodes: AgentNode[];
@@ -87,10 +95,13 @@ export function VendorRosterCards({
   /** Host id currently armed for a second-click remove confirmation. */
   confirmingHost?: string | null;
   onRemoveClick?: (host: string, online: boolean) => void;
+  /** Present = cards are clickable "show me this vendor's sessions". */
+  onVendorPick?: (vendor: string) => void;
 }) {
   const t = makeT(langProp ?? "zh");
   if (hosts.length === 0) return null;
   const sorted = sortRosterHosts(hosts);
+  const pickable = onVendorPick != null;
   return (
     <section className="charter-roster-section">
       <h3>{t("charterRoster")}</h3>
@@ -143,8 +154,19 @@ export function VendorRosterCards({
                     return (
                       <div
                         key={`${host}-${agent.vendor}`}
-                        className="charter-roster-card"
+                        className={pickable ? "charter-roster-card pickable" : "charter-roster-card"}
                         data-testid={`charter-roster-card-${host}-${agent.vendor}`}
+                        role={pickable ? "button" : undefined}
+                        tabIndex={pickable ? 0 : undefined}
+                        title={pickable ? t("rosterPickHint") : undefined}
+                        onClick={pickable ? () => onVendorPick?.(agent.vendor) : undefined}
+                        onKeyDown={
+                          pickable
+                            ? (event) => {
+                                if (event.key === "Enter") onVendorPick?.(agent.vendor);
+                              }
+                            : undefined
+                        }
                       >
                         <div className="charter-roster-head">
                           <VendorChip vendor={agent.vendor} />
@@ -361,13 +383,16 @@ export function CharterEditorView({
 }
 
 /** 分工 charter tab body. `nodes` come from AgentsView's already-fetched
- *  graph (single source for the roster aggregation). */
+ *  graph (single source for the roster aggregation); `onVendorPick` is that
+ *  same view's topology filter (TEAM-7), threaded straight to the roster. */
 export default function CharterPanel({
   nodes,
   lang: langProp,
+  onVendorPick,
 }: {
   nodes: AgentNode[];
   lang?: Lang;
+  onVendorPick?: (vendor: string) => void;
 }) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
@@ -498,6 +523,7 @@ export default function CharterPanel({
         onToggleCollapse={toggleRosterCollapsed}
         confirmingHost={confirmingHost}
         onRemoveClick={onRosterRemoveClick}
+        onVendorPick={onVendorPick}
       />
 
       <PlaybookCards lang={lang} />

@@ -308,3 +308,77 @@ describe("VendorKpiChips (per-vendor rollup + topology filter)", () => {
     expect(html).toMatch(/aria-level="1"[^>]*data-testid="agents-tree-row-s2"/);
   });
 });
+
+// v0.9.11 TEAM-7 — a charter-tab roster card clicks through to "this vendor's
+// sessions". The handler is two setState calls on the SAME `vendorFilter`/`tab`
+// state the chips drive, and a node-env server render can't observe a state
+// update (React drops a child-triggered parent update), so the interlock is
+// proven in its two halves: AgentsView really hands the charter panel a pick
+// handler (module-mocked panel captures the prop), and the landing state that
+// handler sets renders as the topology tab holding that vendor's rows only —
+// asserted through the same expression the view applies, exactly as the
+// chip-filter test above does.
+describe("roster vendor pick → filtered topology (TEAM-7)", () => {
+  const nodes = [
+    fixtureNode({ sid: "s0", vendor: "claude", status: "live" }),
+    fixtureNode({ sid: "s1", vendor: "codex", status: "live", cost_usd: 0.11, parent_sid: "s0" }),
+    fixtureNode({ sid: "s2", vendor: "grok", status: "idle" }),
+  ];
+
+  it("hands the charter tab a pick handler", async () => {
+    const seen: { onVendorPick?: (vendor: string) => void }[] = [];
+    vi.doMock("./CharterPanel", () => ({
+      default: (props: { onVendorPick?: (vendor: string) => void }) => {
+        seen.push(props);
+        return <div data-testid="charter-panel" />;
+      },
+    }));
+    try {
+      // The static import above is already cached, so the view has to be
+      // re-evaluated for the mocked panel to reach it (doMock keeps its
+      // registration across a module-registry reset).
+      vi.resetModules();
+      const { default: MountedAgentsView } = await import("./AgentsView");
+      globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+      renderToString(
+        <MemoryRouter>
+          <MountedAgentsView initialTab="charter" />
+        </MemoryRouter>,
+      );
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.onVendorPick).toBeTypeOf("function");
+    } finally {
+      vi.doUnmock("./CharterPanel");
+      vi.resetModules();
+    }
+  });
+
+  it("the picked vendor lands on a topology tab holding only that vendor's rows", () => {
+    const picked = "codex";
+
+    // …the tab half: `setTab("topology")` puts the seg (and the canvas) back.
+    const seg = renderToString(<TeamTabSeg tab="topology" onSwitch={() => {}} />);
+    expect(seg).toMatch(/class="active"[^>]*data-testid="agents-seg-topology"/);
+
+    // …the filter half: `setVendorFilter(picked)` is the tree's node source,
+    // so a filtered-out parent's child is promoted, never dropped.
+    const tree = renderToString(
+      <MemoryRouter>
+        <AgentsTree
+          nodes={nodes.filter((n) => n.vendor === picked)}
+          edges={[]}
+          selected={null}
+          pulsing={new Set()}
+          onSelect={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(tree).toMatch(/aria-level="1"[^>]*data-testid="agents-tree-row-s1"/);
+    expect(tree).not.toContain('data-testid="agents-tree-row-s0"');
+    expect(tree).not.toContain('data-testid="agents-tree-row-s2"');
+
+    // …and it IS the chips' filter, so that chip shows active (click = clear).
+    const chips = renderToString(<VendorKpiChips nodes={nodes} active={picked} onToggle={() => {}} />);
+    expect(chips).toMatch(/agents-vendor-chip active"[^>]*data-testid="agents-vendor-chip-codex"/);
+  });
+});

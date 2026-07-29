@@ -307,6 +307,55 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
   it("empty roster renders nothing", () => {
     expect(renderToString(<VendorRosterCards hosts={[]} nodes={nodes} />)).toBe("");
   });
+
+  // TEAM-7 — "what is this vendor doing?" → the caller's topology filter.
+  it("(TEAM-7) a card hands its own vendor up on click, and on Enter like a tree row", () => {
+    const onVendorPick = vi.fn();
+    const el = VendorRosterCards({ hosts, nodes, collapsed: new Set(), onVendorPick });
+
+    const codex = findByTestId(el, "charter-roster-card-local-codex")!;
+    expect(codex.role).toBe("button");
+    expect(codex.tabIndex).toBe(0);
+    expect(codex.title).toBe("查看该 vendor 的会话拓扑");
+    codex.onClick!();
+    expect(onVendorPick).toHaveBeenCalledWith("codex");
+
+    // Keyboard parity with AgentsView's tree rows: Enter picks, nothing else.
+    const onKeyDown = codex.onKeyDown as (event: { key: string }) => void;
+    onKeyDown({ key: "a" });
+    expect(onVendorPick).toHaveBeenCalledTimes(1);
+    onKeyDown({ key: "Enter" });
+    expect(onVendorPick).toHaveBeenCalledTimes(2);
+
+    // Each card carries its OWN vendor (never the section's first one).
+    findByTestId(el, "charter-roster-card-local-claude")!.onClick!();
+    expect(onVendorPick).toHaveBeenLastCalledWith("claude");
+  });
+
+  it("(TEAM-7) without the callback the card stays pure display (no role, no pointer)", () => {
+    const plain = renderToString(<VendorRosterCards hosts={hosts} nodes={nodes} />);
+    expect(plain).toContain('data-testid="charter-roster-card-local-claude"');
+    expect(plain).not.toContain('role="button"');
+    expect(plain).not.toContain("charter-roster-card pickable");
+    expect(plain).not.toContain("查看该 vendor 的会话拓扑");
+    expect(findByTestId(VendorRosterCards({ hosts, nodes }), "charter-roster-card-local-claude")!.onClick)
+      .toBeUndefined();
+
+    // With it, the hover/pointer affordance comes from the `pickable` modifier.
+    const picky = renderToString(
+      <VendorRosterCards hosts={hosts} nodes={nodes} onVendorPick={() => {}} />,
+    );
+    expect(picky).toContain("charter-roster-card pickable");
+    expect(picky).toContain('role="button"');
+    expect(picky).toContain('tabindex="0"');
+  });
+
+  it("(TEAM-7) the pick hint speaks the shell language", () => {
+    const en = renderToString(
+      <VendorRosterCards hosts={hosts} nodes={nodes} lang="en" onVendorPick={() => {}} />,
+    );
+    expect(en).toContain("View this vendor&#x27;s sessions in the topology");
+  });
 });
 
 describe("CharterEditorView (state machine faces)", () => {
