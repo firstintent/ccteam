@@ -7,6 +7,8 @@
 //   401 → throw Error("UNAUTHENTICATED")  (global TokenEntryGate kicks in)
 //   other non-2xx → throw Error("HTTP <status>")
 
+import { httpError } from "./httpError";
+
 /** One agent vendor's health on a host (`AgentHealth`). */
 export interface AgentHealth {
   vendor: string;
@@ -136,7 +138,7 @@ async function getJson<T>(url: string): Promise<T> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }
 
@@ -152,21 +154,8 @@ async function deleteJson<T>(url: string): Promise<T> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(await errorMessage(res));
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
-}
-
-/** Lift the server's `{error}` body text for a non-2xx (falls back to
- *  `HTTP <status>` when the body isn't JSON or carries no `error` string). */
-async function errorMessage(res: Response): Promise<string> {
-  const fallback = `HTTP ${res.status}`;
-  try {
-    const body = (await res.json()) as { error?: unknown };
-    if (typeof body.error === "string" && body.error.trim()) return body.error;
-    return fallback;
-  } catch {
-    return fallback;
-  }
 }
 
 async function postJson<T>(url: string, body?: unknown): Promise<T> {
@@ -185,6 +174,6 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }

@@ -44,8 +44,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, LarkOpenIdProbe, MessageOption, OutboundFile, OutboundFileKind,
-    SendMessage,
+    ChannelMessage, ChoiceReply, MessageOption, OutboundFile, OutboundFileKind,
+    RejectedSenderProbe, SendMessage,
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -874,53 +874,15 @@ impl LarkChannel {
         let Some(path) = self.open_id_probe_path.as_ref() else {
             return;
         };
-        let probe = LarkOpenIdProbe {
+        RejectedSenderProbe {
             channel: self.name.clone(),
-            open_id: decoded.open_id.clone(),
+            sender_id: decoded.open_id.clone(),
             chat_id: decoded.chat_id.clone(),
             message_id: decoded.message_id.clone(),
             timestamp: decoded.timestamp,
-        };
-        let line = match serde_json::to_string(&probe) {
-            Ok(line) => format!("{line}\n"),
-            Err(err) => {
-                tracing::warn!(error = %err, "Lark open_id probe encode failed");
-                return;
-            }
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                tracing::warn!(
-                    path = %parent.display(),
-                    error = %err,
-                    "Lark open_id probe dir create failed"
-                );
-                return;
-            }
         }
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-        {
-            Ok(mut file) => {
-                if let Err(err) = file.write_all(line.as_bytes()).await {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Lark open_id probe append failed"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "Lark open_id probe open failed"
-                );
-            }
-        }
+        .append_to(path)
+        .await;
     }
 
     /// Get or refresh the tenant access token (cached).

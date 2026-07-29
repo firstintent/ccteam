@@ -174,6 +174,14 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::users::handle_get_me_lark_open_id_candidates,
             super::users::handle_put_me_lark_allowed_users
         ))
+        // Telegram twin of the Lark discovery pair — a per-tenant bot is
+        // fail-closed, so the tenant needs a way to bind its own chat.
+        .routes(routes!(
+            super::users::handle_get_me_telegram_chat_id_candidates
+        ))
+        .routes(routes!(
+            super::users::handle_put_me_telegram_allowed_chats
+        ))
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))

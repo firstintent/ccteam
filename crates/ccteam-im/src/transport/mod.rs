@@ -133,26 +133,81 @@ pub fn tenant_of_bot_channel(channel: &str) -> Option<&str> {
     channel.split_once('@').map(|(_platform, tid)| tid)
 }
 
-/// Lark/Feishu setup helper event: an inbound message whose sender was parsed
-/// successfully but rejected by the provider-level `allowed_user_ids` gate.
+/// Setup-helper event: an inbound message whose sender was parsed successfully
+/// but rejected by the provider-level allowlist gate.
 ///
 /// The daemon records these to a small JSONL file so the web Settings flow can
-/// show the user their own `ou_...` open_id without asking them to inspect
-/// server logs. The message is still denied and never reaches the gateway.
+/// show a user the id to allow — their own Lark `ou_...` open_id, or their
+/// Telegram `chat_id` — without asking them to read server logs. The message is
+/// still denied and never reaches the gateway.
+///
+/// One shape for every platform on purpose: the discovery flow is identical, so
+/// a second struct would be the same fact living in two homes. [`Self::channel`]
+/// says which bot saw it and therefore how to read [`Self::sender_id`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LarkOpenIdProbe {
-    /// Channel key that saw the event: `"lark"` for the global/admin bot or
-    /// `"lark@<tenant_id>"` for a per-user bot.
+pub struct RejectedSenderProbe {
+    /// Channel key that saw the event: `"lark"` / `"telegram"` for the
+    /// global/admin bot, or `"<platform>@<tenant_id>"` for a per-user bot.
     pub channel: String,
-    /// Sender `open_id` (`ou_...`) to place in `allowed_user_ids`.
-    pub open_id: String,
-    /// Conversation id (`oc_...`), kept for diagnostics and masked by the web
-    /// API.
+    /// The id to place in the allowlist — a Lark sender `open_id` (`ou_...`),
+    /// or a Telegram `chat_id`.
+    pub sender_id: String,
+    /// Conversation id (Lark `oc_...`; for Telegram the same value as
+    /// [`Self::sender_id`]), kept for diagnostics and masked by the web API.
     pub chat_id: String,
-    /// Raw Lark/Feishu message id (`om_...`).
+    /// Raw provider message id (Lark `om_...`; Telegram the numeric id).
     pub message_id: String,
-    /// Event time in Unix seconds, copied from the Lark message when present.
+    /// Event time in Unix seconds, copied from the message when present.
     pub timestamp: u64,
+}
+
+impl RejectedSenderProbe {
+    /// Append this probe to `path` as one JSONL line, creating the parent dir.
+    ///
+    /// Best effort by construction: a discovery aid must never interfere with
+    /// message handling, so every failure logs a WARN and returns. Lives here
+    /// rather than in a provider so both Lark and Telegram write the one
+    /// format the web setup flow reads.
+    pub async fn append_to(&self, path: &std::path::Path) {
+        use tokio::io::AsyncWriteExt;
+        let line = match serde_json::to_string(self) {
+            Ok(line) => format!("{line}\n"),
+            Err(err) => {
+                tracing::warn!(error = %err, "rejected-sender probe encode failed");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(
+                    path = %parent.display(), error = %err,
+                    "rejected-sender probe dir create failed"
+                );
+                return;
+            }
+        }
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()).await {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "rejected-sender probe append failed"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "rejected-sender probe open failed"
+                );
+            }
+        }
+    }
 }
 
 /// How an [`OutboundFile`] should be sent (V0.8.4 P2b).

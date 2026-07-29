@@ -78,6 +78,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PUT", "/api/v1/me/im"),
         ("GET", "/api/v1/me/im/lark/open-id-candidates"),
         ("PUT", "/api/v1/me/im/lark/allowed-users"),
+        // Telegram twin — a per-tenant bot is fail-closed, so the tenant needs
+        // a way to discover and bind its own chat id.
+        ("GET", "/api/v1/me/im/telegram/chat-id-candidates"),
+        ("PUT", "/api/v1/me/im/telegram/allowed-chats"),
         ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),

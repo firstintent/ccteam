@@ -92,6 +92,36 @@ pub struct TenantRegistry {
     pub tenants: Vec<Tenant>,
 }
 
+/// Create `dir` 0700 (it holds per-tenant secret files).
+fn ensure_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(dir)?.permissions();
+        perm.set_mode(0o700);
+        let _ = std::fs::set_permissions(dir, perm);
+    }
+    Ok(())
+}
+
+/// Write one `<id>.json` atomically (tmp + rename) at 0600.
+fn write_tenant_file(dir: &Path, t: &Tenant) -> Result<()> {
+    let path = dir.join(format!("{}.json", t.id));
+    let json = serde_json::to_string_pretty(t).context("serialize Tenant")?;
+    let tmp = dir.join(format!("{}.json.tmp", t.id));
+    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&tmp)?.permissions();
+        perm.set_mode(0o600);
+        std::fs::set_permissions(&tmp, perm)?;
+    }
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))
+}
+
 impl TenantRegistry {
     /// v0.8.20 — load every tenant from `dir/<id>.json` (the per-user files under
     /// `~/.ccteam/secrets/users/`). A missing dir / unreadable / unparseable file
@@ -122,14 +152,7 @@ impl TenantRegistry {
     /// any stale `<id>.json` whose tenant was removed, so `load → remove → save`
     /// drops the file. Each file holds the tenant's web token + IM bot creds.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(dir)?.permissions();
-            perm.set_mode(0o700);
-            let _ = std::fs::set_permissions(dir, perm);
-        }
+        ensure_dir(dir)?;
         // Delete files for tenants no longer present (handles removal).
         let keep: std::collections::HashSet<&str> =
             self.tenants.iter().map(|t| t.id.as_str()).collect();
@@ -148,22 +171,25 @@ impl TenantRegistry {
         }
         // Write each tenant atomically + 0600 (it holds secret tokens).
         for t in &self.tenants {
-            let path = dir.join(format!("{}.json", t.id));
-            let json = serde_json::to_string_pretty(t).context("serialize Tenant")?;
-            let tmp = dir.join(format!("{}.json.tmp", t.id));
-            std::fs::write(&tmp, json.as_bytes())
-                .with_context(|| format!("write {}", tmp.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perm = std::fs::metadata(&tmp)?.permissions();
-                perm.set_mode(0o600);
-                std::fs::set_permissions(&tmp, perm)?;
-            }
-            std::fs::rename(&tmp, &path)
-                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+            write_tenant_file(dir, t)?;
         }
         Ok(())
+    }
+
+    /// Persist ONE tenant, touching only its own file.
+    ///
+    /// Prefer this over [`Self::save`] for every single-tenant edit. `save`
+    /// rewrites the whole directory and deletes any file it doesn't know about,
+    /// so under the usual load → mutate → save cycle two concurrent writers
+    /// race: whoever loaded first and saves last deletes the tenant the other
+    /// created in between. A per-file write has nothing to race over — the
+    /// directory sweep is only needed when a tenant was actually REMOVED.
+    pub fn save_one(&self, dir: &Path, id: &str) -> Result<()> {
+        let tenant = self
+            .by_id(id)
+            .with_context(|| format!("save_one: no tenant {id} in this registry"))?;
+        ensure_dir(dir)?;
+        write_tenant_file(dir, tenant)
     }
 
     /// Mint a new tenant: a fresh id (`u<8hex>`, collision-checked) + a per-user
@@ -352,6 +378,59 @@ mod tests {
         assert!(reg.remove(&a.id));
         assert!(!reg.remove(&a.id), "second remove is a no-op");
         assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn save_one_does_not_delete_a_concurrently_created_tenant() {
+        // The lost-update this closes: two handlers both `load()`, each mutates
+        // its own tenant, and the one that saves LAST used to sweep the
+        // directory against its stale snapshot — deleting the tenant the other
+        // just created. A single-tenant edit has no business touching any other
+        // tenant's file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("users");
+        let mut first = TenantRegistry::default();
+        let alice = first.add("alice");
+        first.save(&dir).unwrap();
+
+        // Handler A loads (sees only alice) and will save later.
+        let mut stale = TenantRegistry::load(&dir);
+
+        // Handler B creates bob in between and persists him.
+        let mut fresh = TenantRegistry::load(&dir);
+        let bob = fresh.add("bob");
+        fresh.save_one(&dir, &bob.id).unwrap();
+
+        // Handler A now writes its edit from the stale snapshot.
+        stale.set_telegram(
+            &alice.id,
+            Some(TenantTelegram {
+                bot_token: "111:AAA".into(),
+                allowed_chat_ids: vec!["42".into()],
+            }),
+        );
+        stale.save_one(&dir, &alice.id).unwrap();
+
+        let back = TenantRegistry::load(&dir);
+        assert!(back.by_id(&bob.id).is_some(), "bob must survive A's save");
+        assert_eq!(
+            back.by_id(&alice.id)
+                .unwrap()
+                .telegram
+                .as_ref()
+                .unwrap()
+                .allowed_chat_ids,
+            vec!["42"],
+            "and A's own edit must land",
+        );
+    }
+
+    #[test]
+    fn save_one_rejects_an_unknown_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(TenantRegistry::default()
+            .save_one(tmp.path(), "u-nope")
+            .is_err());
     }
 
     #[test]

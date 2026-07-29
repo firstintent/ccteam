@@ -2,6 +2,8 @@
 // management + global IM credentials owner-only while opening shared and
 // project-owned surfaces. Backend SoT: routes/api_v1.rs (handle_me).
 
+import { httpError } from "./httpError";
+
 export interface Me {
   /** `"admin"` for the owner (bootstrap token), else the tenant id. */
   id: string;
@@ -21,7 +23,7 @@ export async function getMe(): Promise<Me> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as Me;
 }
 
@@ -42,15 +44,6 @@ export async function resetToken(): Promise<{ wire_token: string }> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const j = (await res.json()) as { error?: string };
-      if (j.error) msg = j.error;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as { wire_token: string };
 }

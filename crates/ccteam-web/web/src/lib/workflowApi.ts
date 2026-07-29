@@ -1,5 +1,7 @@
 // v0.8.24 A3 — Workflow APIs: evolution and project MCP panels.
 
+import { httpError } from "./httpError";
+
 export interface EvolutionBucket {
   kind: string;
   id: string;
@@ -57,7 +59,7 @@ async function getJson<T>(url: string): Promise<T> {
     credentials: "same-origin",
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }
 
@@ -69,16 +71,7 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const j = (await res.json()) as { error?: string };
-      if (j.error) msg = j.error;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }
 
