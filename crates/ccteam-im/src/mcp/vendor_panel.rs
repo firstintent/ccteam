@@ -565,7 +565,7 @@ fn render_recipes(rows: &[PanelRow]) -> String {
             }
             "claude" => "session_spawn{vendor:\"claude\", task:\"…\"} — coding agent for repo work",
             "codex" => {
-                "session_spawn{vendor:\"codex\", task:\"…\"} — coding agent (long grinds; async + ONE completion notification)"
+                "session_spawn{vendor:\"codex\", task:\"…\"} — coding agent (long grinds; async; plain main sessions poll collect)"
             }
             "kimi" => "session_spawn{vendor:\"kimi\", task:\"…\"}",
             "opencode" => "session_spawn{vendor:\"opencode\", task:\"…\"}",

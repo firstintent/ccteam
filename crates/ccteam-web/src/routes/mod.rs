@@ -55,6 +55,9 @@ pub mod project;
 pub mod projects;
 pub mod pty_ws;
 pub mod roles;
+// v0.9.11 TEAM-2 — per-project division-of-labor charter (`routing.md`):
+// GET (project → global fallback → none) + PUT (project file only).
+pub mod routing;
 // Web composer attachments: project-scoped uploads + skill picker (the turn
 // side lives in `sessions_api::handle_session_turn`'s `attachments[]`).
 pub mod session;

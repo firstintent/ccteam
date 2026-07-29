@@ -29,8 +29,15 @@
 - **基线口径内的测试必须密封**:不得依赖 PATH 上的真实 vendor CLI、全局 env、或宿主特有状态——CI test job(`check.yml`,同口径)是干净环境仲裁。实锤:v0.9.9 CI 首跑咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻 → 本地恒绿假象);修法 = 注入缝(per-Gateway 可用性快照),非 env 突变、非 CI 装桩。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
-  `resume_*` · `ws_*` · `hook_*` · gateway 共享 `/tmp/alpha` 并行污染。
+  `ws_*` · gateway 共享 `/tmp/alpha` 并行污染。
   判 flake 前先在干净环境或 CI 复测;**禁「测试瞬时红就顺手改测试消红」**——先证据后定性,留账不冒充全绿。
+  **`resume_*` / `hook_*` 已于 2026-07-28 出族(根因定死、非 flake)**——两族都是「宿主态泄漏」的具体形态,登记在册反而掩盖了确定性缺陷:
+  ① `claude_stream_json_test resume_failure_*` 读 progress 路径漏了 `state/` 段(**永远读空文件**,处处确定性红);
+  它 panic 后不再执行自己的 `remove_var("FAKE_SJ_DIE_ON_RESUME")`,泄漏的 fault 开关又杀掉下一只 serial 的 resume spawn
+  → **一只真红伪装成两只 flake**。修法:路径修正 + 所有 fault 开关一律在 `setup()` 清(panic-safe)。
+  ② `hook_script_test` 三只(两红一**挂死**)= 进程继承了 ccteam 托管会话自己的 `CCTEAM_HOOKLESS=1`,
+  `hook.sh` 据此 `exit 0` → 桩从不被调用、一次性 listener 无人连接。修法:spawn 前 `env_remove` 整族 `CCTEAM_*` 会话变量。
+  **教训**:「只在 live-daemon 宿主红」≠ flake —— 先问「宿主给了它什么」(env / 端口 / 真实 home),十有八九是测试没密封。
   另:`remove_test t03/t17` = **确定性红非 flake**(v0.9.0 废 cto 后测试语义未跟,已立卡 P1-3),判基线单列、不得再增同类;
   注意 **CI 目前不跑测试**(只 fmt+clippy,P2-1 待补)——「CI 绿」不能当测试证据。
 - **macOS 宿主两族**(2026-07-26 ae24cb3 review 实锤,均先于该 commit、Linux CI 不受影响;修卡 = TEST-MACOS-1):

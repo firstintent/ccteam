@@ -306,6 +306,16 @@ button { font-family: inherit; cursor: pointer; }
 .srow:hover .stop { display: flex; }
 .srow .stop:hover { color: var(--red); border-color: #F5C6C6; }
 .srow .stop svg { width: 10px; height: 10px; }
+.srow .stop.rename:hover { color: var(--text); border-color: var(--border-strong, var(--border)); }
+.srow .stop.rename svg { width: 11px; height: 11px; }
+/* Inline rename: the field takes the label's exact place, so the row doesn't
+   reflow when editing starts. */
+.rename-input {
+  min-width: 0; font: inherit; color: var(--text);
+  background: var(--bg-card); border: 1px solid var(--accent, var(--border));
+  border-radius: 6px; padding: 1px 6px; outline: none;
+}
+.srow .rename-input { flex: 1; }
 .side-bottom { border-top: 1px solid var(--border-soft); padding: 8px 0 10px; display: flex; flex-direction: column; gap: 2px; }
 .side-user { display: flex; align-items: center; gap: 9px; padding: 7px 20px 2px; font-size: 13px; color: var(--text-muted); }
 
@@ -616,6 +626,12 @@ html.dark .dot.off { background: #4b4e57; }
   padding: 13px 24px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap;
 }
 .conv-head .title { font-size: 15px; font-weight: 600; }
+/* The rename pencil stays out of the way until the header is hovered (it is
+   still keyboard-reachable and announced — only the paint is conditional). */
+.conv-head .rename-title { opacity: 0; transition: opacity .12s; margin-left: -6px; }
+.conv-head:hover .rename-title,
+.conv-head .rename-title:focus-visible { opacity: 1; }
+.conv-head .rename-input { font-size: 15px; font-weight: 600; min-width: 220px; }
 .conv-head .meta { display: flex; align-items: center; gap: 8px; }
 .tabs { display: flex; gap: 2px; margin-left: auto; background: var(--bg-soft); border-radius: 9px; padding: 3px; }
 .tab { padding: 4.5px 16px; border-radius: 7px; font-size: 13px; color: var(--text-muted); background: none; border: none; }
@@ -729,6 +745,9 @@ html.dark .dot.off { background: #4b4e57; }
 .hosts-head-bar { display: flex; align-items: center; gap: 14px; }
 .hosts-head-copy { flex: 1; min-width: 0; }
 .hosts-section-title { font-size: 14px; font-weight: 600; letter-spacing: .2px; color: var(--text-muted); text-transform: uppercase; }
+.hosts-head-desc { font-size: 12.5px; color: var(--text-muted); font-weight: 300; line-height: 1.5; margin-top: 5px; }
+/* The Team-page pointer is a react-router Link wearing the ghost button skin. */
+.hosts-head-bar a.btn { text-decoration: none; white-space: nowrap; }
 
 /* Daemon health strip — always the first thing on 运维总览. */
 .daemon-strip {
@@ -750,67 +769,34 @@ html.dark .dot.off { background: #4b4e57; }
 .btn.ghost:hover { color: var(--text); background: var(--bg-soft); }
 .btn.mini { padding: 4px 11px; font-size: 12px; border-radius: 6px; }
 
-.host-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-card); overflow: hidden; }
-.host-card.offline { opacity: .55; }
-.host-head { display: flex; align-items: center; gap: 12px; padding: 15px 20px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
-.host-head .hn { font-size: 15.5px; font-weight: 600; display: flex; align-items: center; gap: 9px; }
 .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 500; border: 1px solid var(--border); color: var(--text-muted); }
 .badge.brand { background: var(--bg-soft); border-color: var(--border); color: var(--text); }
 .badge.ok { background: var(--green-soft); border-color: transparent; color: var(--green-text); }
 .badge.warn { background: var(--red-soft); border-color: transparent; color: var(--red-text); }
-.host-head .sys { color: var(--text-faint); font-size: 12px; font-family: var(--font-mono); }
-.host-head .act { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
-.agent-row {
-  display: grid; grid-template-columns: 140px minmax(0, 1fr) minmax(160px, auto) auto; gap: 14px; align-items: center;
-  padding: 12px 20px; border-bottom: 1px solid var(--border-soft);
+/* Host ACTION rows (设置→运维总览). One compact row per machine: identity on
+   the left, its to-do list on the right. The per-vendor health grid that used
+   to live here moved to the Team page's charter roster. */
+.host-actions {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 18px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
 }
-.agent-row:last-child { border-bottom: none; }
-.agent-row .v { display: flex; align-items: center; gap: 9px; font-weight: 500; font-size: 14px; }
-.agent-row .bin { font-family: var(--font-mono); font-size: 12px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-row .ver {
-  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end;
+.host-actions.offline { opacity: .6; }
+.host-actions-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.host-actions-name { font-size: 14px; font-weight: 600; }
+.host-actions-id { font-size: 11.5px; color: var(--text-faint); }
+.host-actions-items {
+  margin-left: auto; display: flex; align-items: center; gap: 8px 14px;
+  flex-wrap: wrap; justify-content: flex-end;
 }
-.agent-row .ver .ver-sep { color: var(--text-faint); }
-.agent-row .ver .ver-latest { color: var(--text-faint); }
-.agent-row .ver.stale .ver-cur { color: var(--text-muted); }
-.agent-row .ver .ver-latest.stale { color: var(--red-text); font-weight: 500; }
-.agent-row .ver .ver-upd { font-size: 10px; padding: 1px 7px; }
-.agent-row.absent .v, .agent-row.absent .ver { color: var(--text-faint); }
-/* All uninstalled vendors collapse into one quiet row (wide-screen friendly). */
-.agent-row.absent-group {
-  grid-template-columns: 140px 1fr;
-  background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
-  padding-top: 10px; padding-bottom: 10px;
+.host-actions-idle { font-size: 12.5px; color: var(--text-faint); }
+.host-action { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-muted); }
+.host-action-label { font-weight: 500; }
+.host-action-label.mono {
+  font-size: 12px; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.agent-row.absent-group .absent-label { color: var(--text-faint); font-weight: 500; font-size: 13px; gap: 8px; }
-.agent-row.absent-group .absent-count {
-  font-size: 11px; font-family: var(--font-mono); color: var(--text-faint);
-  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; line-height: 18px;
-}
-.agent-row.absent-group .absent-vendors { display: flex; flex-wrap: wrap; gap: 8px 12px; justify-content: flex-start; }
-.agent-row.absent-group .absent-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12.5px; color: var(--text-faint); font-weight: 500;
-}
-.host-projects { border-top: 1px solid var(--border-soft); }
-.host-projects-toggle {
-  width: 100%; display: flex; align-items: center; gap: 8px;
-  padding: 10px 20px; background: none; border: none; cursor: pointer;
-  color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
-  text-align: left;
-}
-.host-projects-toggle:hover { background: var(--bg-soft); color: var(--text-muted); }
-.host-projects-toggle .chev { display: inline-block; transition: transform .15s; font-size: 12px; width: 12px; }
-.host-projects-toggle .chev.open { transform: rotate(90deg); }
-.host-projects-title { font-size: 11px; letter-spacing: .5px; }
-.host-projects-count {
-  margin-left: 2px; font-family: var(--font-mono); font-size: 11px;
-  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; line-height: 16px;
-}
-.host-project-row { min-height: 34px; padding: 5px 20px; display: grid; grid-template-columns: 130px minmax(120px, 1fr) auto; gap: 12px; align-items: center; border-top: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); font-size: 12px; }
-.host-project-path { color: var(--text-faint); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .join-card { border: 1px dashed var(--border); border-radius: var(--radius-card); padding: 20px; display: flex; flex-direction: column; gap: 12px; }
 .join-card.bare { border: 0; border-radius: 0; padding: 0; }
@@ -872,9 +858,7 @@ html.dark .dot.off { background: #4b4e57; }
 @media (max-width: 900px) {
   .tpl-grid, .mk-grid { grid-template-columns: 1fr; }
   .stat-grid { grid-template-columns: 1fr; }
-  .agent-row { grid-template-columns: 110px 1fr auto; }
-  .agent-row .bin { display: none; }
-  .agent-row.absent-group { grid-template-columns: 1fr; }
+  .host-actions-items { margin-left: 0; width: 100%; justify-content: flex-start; }
   .daemon-strip-sub { margin-left: 0; width: 100%; }
 }
 @media (max-width: 820px) {
@@ -1085,7 +1069,8 @@ select:focus-visible,
     env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* 团队/Team view: scalable delegation tree + roster + detail panel + timeline. */
+/* 团队/Team view: scalable delegation topology + vendor chips + dispatch
+   ticker + detail panel. */
 .agents-view { padding: 0; overflow: hidden; }
 .agents-head { padding: 24px 28px 8px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .agents-head h1 { font-size: 21px; font-weight: 600; }
@@ -1093,26 +1078,33 @@ select:focus-visible,
 /* v0.9.1 — KPI strip (live / working / active dispatches / total cost). */
 .agents-kpis { display: flex; gap: 18px; align-items: baseline; font-size: 12.5px; color: var(--text-muted); padding-top: 6px; flex-wrap: wrap; }
 .agents-kpis b { font-size: 17px; font-weight: 600; color: var(--text); margin-right: 5px; font-variant-numeric: tabular-nums; }
-.agents-tabs { margin: 6px 28px 10px; align-self: flex-start; }
-/* 成员 roster (delegation tree table). */
-.agents-roster { display: flex; flex-direction: column; font-size: 13px; min-width: 640px; }
-.agents-roster-head, .agents-roster-row { display: grid; grid-template-columns: minmax(220px, 2.2fr) 110px 100px 90px 60px 110px 90px; gap: 8px; align-items: center; padding: 8px 10px; }
-.agents-roster-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--base); z-index: 1; }
-.agents-roster-row { border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); cursor: pointer; border-radius: 8px; }
-.agents-roster-row:hover { background: var(--bg-hover); }
-.agents-roster-row.selected { background: color-mix(in srgb, var(--claude) 9%, transparent); }
-.agents-roster-row .mono { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
-.agents-roster-name { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.agents-roster-name .t { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.agents-roster-sid { color: var(--text-faint); flex: none; }
-.agents-roster-elbow { color: var(--text-faint); font-size: 11px; flex: none; }
+/* v0.9.11 — links styled as buttons (row 打开 ↗ + panel 打开会话). */
+.agents-view a.btn { text-decoration: none; text-align: center; }
+/* v0.9.11 — per-vendor KPI chips (live count + Σcost; click = vendor filter). */
+.agents-vendor-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 28px 8px; }
+.agents-vendor-chip { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-card); color: var(--text-muted); font-size: 12px; cursor: pointer; }
+.agents-vendor-chip:hover { color: var(--text); background: var(--bg-soft); }
+.agents-vendor-chip.active { border-color: var(--claude); background: color-mix(in srgb, var(--claude) 9%, transparent); color: var(--text); }
+.agents-vendor-chip .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.agents-vendor-live { font-variant-numeric: tabular-nums; }
+/* v0.9.11 — recent-dispatch ticker (last 5 delegation frames, newest first). */
+.agents-ticker { display: flex; align-items: center; gap: 10px; margin: 0 28px 8px; font-size: 12px; color: var(--text-muted); overflow-x: auto; white-space: nowrap; }
+.agents-ticker-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-faint); flex: none; }
+.agents-ticker-item { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-muted); font-size: 12px; cursor: pointer; flex: none; }
+.agents-ticker-item:hover { background: var(--bg-hover); color: var(--text); }
+.agents-ticker-item .mono { font-family: var(--font-mono); font-size: 11.5px; }
+.agents-ticker-when { color: var(--text-faint); }
 .agents-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 .agents-canvas { flex: 1; overflow: auto; padding: 8px 20px; }
 .agents-tree { min-width: 720px; display: flex; flex-direction: column; gap: 10px; padding-bottom: 12px; }
 .agents-tree-project { width: max-content; min-width: 100%; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; background: var(--bg-card); }
 .agents-tree-project-head { height: 26px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--bg-soft); border-bottom: 1px solid var(--border-soft); color: var(--text-faint); font-size: 11px; }
 .agents-tree-project-head .mono { color: var(--text-muted); font-weight: 600; }
-.agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 78px 50px minmax(140px, 1fr) 8px 90px 86px 38px; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
+.agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 78px 50px minmax(140px, 1fr) 8px 90px 86px 38px auto; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
+/* Host badge column exists only when the graph spans >1 host. */
+.agents-tree.with-host .agents-tree-row { grid-template-columns: auto 18px 78px 50px minmax(140px, 1fr) 90px 8px 90px 86px 38px auto; }
+.agents-tree-host { color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agents-tree-open { justify-self: end; white-space: nowrap; }
 .agents-tree-row:last-child { border-bottom: none; }
 .agents-tree-row:hover { background: var(--bg-hover); }
 .agents-tree-row.selected { background: color-mix(in srgb, var(--claude) 9%, transparent); box-shadow: inset 2px 0 var(--claude); }
@@ -1139,18 +1131,71 @@ select:focus-visible,
 .agents-activity-line { font-size: 12.5px; color: var(--text-muted); font-family: var(--font-mono); }
 .agents-turns { display: flex; flex-direction: column; gap: 6px; }
 .agents-turn-row { display: flex; flex-direction: column; gap: 2px; border-bottom: 1px solid var(--border-soft); padding-bottom: 6px; }
-/* v0.9.1 — the timeline is a full tab now (was a fixed 180px bottom strip). */
-.agents-timeline { min-height: 240px; padding: 4px 8px; overflow: hidden; display: flex; flex-direction: column; }
-.agents-timeline h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 6px; }
-.agents-timeline-rows { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0; }
-.agents-timeline-row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: center; height: 28px; flex: 0 0 28px; }
-.agents-timeline-label { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agents-timeline-track { position: relative; height: 100%; background: var(--bg-soft); border-radius: 4px; }
-.agents-timeline-bar { position: absolute; top: 3px; bottom: 3px; background: var(--green); border-radius: 3px; }
-.agents-timeline-bar.active { background: var(--claude); }
-.agents-timeline-arrows { position: relative; height: 0; overflow: visible; }
-.agents-timeline-arrow { stroke: var(--text-faint); stroke-width: 1; stroke-dasharray: 2 2; }
 @media (max-width: 820px) {
   .agents-body { flex-direction: column; }
   .agents-panel { width: 100%; border-left: none; border-top: 1px solid var(--border); }
 }
+/* v0.9.11 TEAM-2 — 拓扑|分工 tab seg + charter tab (roster cards + editor). */
+.agents-seg { margin: 0 28px 8px; }
+.agents-charter { flex: 1; overflow-y: auto; padding: 4px 28px 24px; display: flex; flex-direction: column; gap: 18px; }
+.charter-roster-section h3, .charter-editor-head h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 8px; }
+/* v0.9.11 TEAM-6 — roster groups by host (one collapsible section each). */
+.charter-roster-groups { display: flex; flex-direction: column; gap: 16px; }
+.charter-roster-group-head { display: flex; align-items: center; gap: 8px; padding: 4px 2px 8px; border-bottom: 1px solid var(--border-soft); }
+.charter-roster-group-toggle { border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 4px; }
+.charter-roster-group-toggle:hover { color: var(--text); }
+.charter-roster-group-hostname { font-weight: 600; color: var(--text); font-size: 13px; }
+.charter-roster-group-id { color: var(--text-faint); font-size: 11px; }
+.charter-roster-group-status { color: var(--text-muted); font-size: 11.5px; }
+/* v0.9.11 TEAM-8 — how long an offline satellite has been out of touch. The
+   age itself stays subdued; past the stale threshold the 建议移除 hint and
+   the remove button take the same warn tokens `.badge.warn` /
+   `.project-host.offline` use. Emphasis only — nothing is ever auto-removed. */
+.charter-roster-group-age { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.charter-roster-group-stale { color: var(--red-text); font-size: 11.5px; }
+.charter-roster-remove { margin-left: auto; }
+.charter-roster-remove.warn { color: var(--red-text); background: var(--red-soft); border-color: color-mix(in srgb, var(--red-text) 35%, var(--border)); }
+.charter-roster-remove.warn:hover { color: var(--red-text); background: color-mix(in srgb, var(--red-soft) 70%, var(--bg-soft)); }
+.charter-roster { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.charter-roster-group .charter-roster { margin-top: 10px; }
+.charter-roster-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.charter-roster-head { display: flex; align-items: center; gap: 8px; }
+.charter-roster-vendor { font-weight: 600; color: var(--text); }
+.charter-roster-head .badge { margin-left: auto; }
+.charter-roster-meta { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.charter-roster-hint { color: var(--text-faint); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+/* v0.9.11 TEAM-10 — "a newer release exists" on the version line. Good news,
+   not a fault: it borrows `.badge.ok`'s green-text accent (subdued in both
+   themes) rather than the warn red the stale-host hint uses. */
+.charter-roster-update { color: var(--green-text); margin-left: 6px; }
+.charter-roster-stats { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.charter-roster-live { color: var(--green); font-variant-numeric: tabular-nums; }
+/* v0.9.11 TEAM-7 — a roster card is clickable ONLY when the caller handed
+   down `onVendorPick` (→ `.pickable`); same hover affordance as tree rows. */
+.charter-roster-card.pickable { cursor: pointer; }
+.charter-roster-card.pickable:hover { background: var(--bg-hover); border-color: var(--border); }
+/* v0.9.11 TEAM-3 — 编队起手 formation playbook cards (shared defs with Home). */
+.charter-playbooks-section h3 { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 8px; }
+.charter-playbooks { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+.charter-playbook-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.charter-playbook-head { display: flex; align-items: center; gap: 8px; }
+.charter-playbook-head > svg { width: 15px; height: 15px; color: var(--text-muted); flex: none; }
+.charter-playbook-name { font-weight: 600; color: var(--text); }
+.charter-playbook-desc { color: var(--text-faint); font-size: 12px; line-height: 1.5; flex: 1; }
+.charter-playbook-foot { display: flex; align-items: center; gap: 4px; }
+.charter-playbook-foot .vs { display: inline-flex; gap: 4px; }
+.charter-playbook-foot .btn { margin-left: auto; text-decoration: none; }
+.charter-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.charter-project-pick { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
+.charter-project-pick select { padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-card); color: var(--text); font-size: 12.5px; }
+.charter-editor { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.charter-path { color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.charter-editor-bar { display: flex; align-items: center; gap: 10px; }
+.charter-receipt { margin-left: auto; color: var(--text-faint); font-size: 11.5px; }
+.charter-textarea { width: 100%; min-height: 320px; resize: vertical; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft); color: var(--text); font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; }
+.charter-preview { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; background: var(--bg-soft); }
+.charter-ctas { display: flex; gap: 8px; }
+.charter-muted { color: var(--text-faint); font-size: 12.5px; }
+.charter-muted .mono { font-family: var(--font-mono); font-size: 11px; }
+.charter-error { color: var(--red-text); font-size: 12.5px; }
+.charter-note { color: var(--text-faint); font-size: 11.5px; margin-top: 10px; }

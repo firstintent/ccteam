@@ -25,8 +25,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.10`(owner 2026-07-26 授权发布:merge PR #170 + tag 由规划执行;进度/结果登记 `.loop/state.md`) |
-| 本版 headline | MCP 工具面治理(screenshot 全退役 + 裸名发现别名 + spawn `protocol` 参数删除(通道纯 vendor 派生)+ DX 净减法两轮)+ doctor 分组版式与五 vendor 启动自动注册 + web IA 改版(market 迁工作流 skills-first / ops 删 fleet 大表 / 新「接入 Access」聚合凭据四面)+ IM 回执「下一步」提示补全(/model + picker)+ restart-restore 竞态修复(恢复期 `/sessions` 确定性)+ 接入页宽屏改版(REST API 卡)+ web ACL 收敛(admin 专属只剩用户管理与全局 bot 凭据,权限 = token 身份 × 项目归属)+ 活跃消息 vendor 原生注入(adapter `TurnRouting` 契约;grok `_x.ai/interject` 真机实证 + vendor 自发 turn 合成收口防丢答;kimi/opencode 诚实降级 FIFO) |
+| Workspace version | `0.9.11`(**dev 已收口** 2026-07-29,PR #171 待 owner merge;**tag/发布 HELD** 待 owner 显式发话;最近发布 = v0.9.10 2026-07-26 `/releases/latest`) |
+| 本版 headline | 团队页驾驶舱重设计(owner 直驱 PRD 全默认拍板):拓扑独占(roster/timeline 两 tab 删)+ 会话真超链接(右键新 tab 对照父子)+ per-vendor KPI chips + 委派 ticker + live 节点 model join + 分工 charter tab(REST `GET/PUT /projects/{slug}/routing` 项目宪章编辑器(全局只读)+ vendor 名册按主机分组(在线/离线区分 + 移除主机))+ host 反注册(REST `DELETE /hosts/{id}` + CLI `host rm`,owner 实机截图追问「vendor 重复」驱动实锤根因 = 离线卫星残留撞 hostname)+ 名册收敛四连(卡点击过滤拓扑 / 离线时长+7 天建议清理 / 设置 HostsView 收敛为动作面(观察面归团队页)/ npm「可更新」提示迁名册)+ 编队起手(`lib/playbooks.ts` 6 编队唯一家,Home+团队双消费;文档编队目录 9 式双语)+ 周期同车 ACL 病根三修(具名 principal / 项目解析不越界 / session 单一归属策略)+ session rename 全链 + SSE 401 自愈 + 委派 vendor 失败外显 |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
 > 开发一律落 `dev` 分支 + dev→main PR 攒版本,main 不直推(§五「分支与推送」);主分支 HEAD 以 `git rev-parse origin/main` 为准。
@@ -61,7 +61,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | **daemon 无自主内容决策循环** | 只响应消息、排程与连接;**引擎不产生任务、不选择工作**,编排智能永在 agent 会话/用户空间 |
 | **`progress.jsonl` 是 state SoT** | `harness/progress_bridge` 是 schema 单一权威,`core` 只 re-export;chat 对话原文走 ccteam-owned `<project>/.ccteam/chat/<sid>/turns.jsonl`(**按 sid**;gateway `spawn_event_pump` 是 live daemon 唯一 turns writer)|
 | **session = 独立一等实体;role 是属性** | session 有持久 `sid`(`s<N>`,单调、扛 daemon 重启、不复用);**同一 role 可并存多 session**;turns/marker 全按 sid(terminal 协议的 pane/env 定位同样按 sid,命名细节以代码为准);会话生命周期 = **spawn-on-demand + 按 sid resume(resume-by-session-id)+ 容量挤停**(见「永不主动 kill」例外),**非**常驻吊着;chat 复用 context 是 feature |
-| **session ACL = 多用户软分区(IM 面 own/web 池 + web 面项目归属)** | **IM 面**(`chat_can_access`):一个 chat 只见/只控**自己建的** session + **web 控制台建的**(web 是单一共享操作台);IM chat 之间互相隔离,web 也不看 IM session;「同-current-project 互看」曾上线又被**反转删除,勿再加回**。**web 面 = 项目归属模型**:project 是归属单元(`ProjectState.owner`,显式字段、非路径派生),session 继承其 project 的归属(session.owner 只作回信路由);REST 全按 project 鉴权,**单一 choke point = `auth::project_acl_layer` 中间件**兜底所有 `/api/v1/projects/{slug}/*`(新路由自动覆盖),`/sessions/{sid}/*` 按其 project 门,集合面按身份过滤;admin 见全部、tenant 只见自己 owner 的。**admin 专属只剩两面**(owner 令 2026-07-27):用户管理 `/users*`(建/列/删/他人登录链接/代配 IM)+ 全局 bot 凭据 `/config/im`(= admin 自己的 IM;tenant 对称自助面 = `/me/im`),deny→403;hosts / status / 全局 skills / 项目 MCP 注册等其余面全体登录用户可用(status 会话行按项目归属过滤,人人可自转自己的 token);SPA 仅 管理员 tab 按 `GET /api/v1/me` 显隐(fail-closed)。owner 轴 = 合成身份 `user:<tenant>`(**非投递 channel**)。**诚实范围**:同 OS uid 下是**软隔离(UX)、非安全边界**;真隔离 = per-user OS user/sandbox(deferred)。web↔IM 同一人复联(`linked_chat`)deferred,tenant 当前 web-only |
+| **ACL = 一个身份解析器 + 一套归属策略,两个前端共用(fail-closed)** | **①身份**:`Gateway::principal` 是唯一解析器,三态 —— **Operator**(admin web token;或**在全局 bot 允许列表里被点名**的 chat)/ **Tenant**(`<platform>@<tenant>` bot 或 per-user web token → `user:<tenant>`)/ **Guest**(进了门但没被点名:只拥有自己建的,看不到任何 project)。**「够得着 bot」永不等于「是 operator」**:允许列表 = 点名册,`"*"` 通配**点名了零个人**故授权零个人(`bind_operator_allowlist`;空表 = 未配置,保留单人默认但 daemon 启动告警)。**②归属**:project 是归属单元(`ProjectState.owner` 显式字段),session 继承;唯一策略 = `ccteam_core::identity::{can_see_owner, can_see_session_owner}`,IM/web/MCP 全走它。session 可见 = **自己建的 ⊕ 自己身份的 web 控制台池**(admin `user:web-api` / tenant `user:<id>`);IM chat 之间互相隔离,web 不看 IM session;「同-current-project 互看」曾上线又被**反转删除,勿再加回**。**③解析永不越界**:`current_project_for` 只在**本人可见集**里落地(`/cd` 选的 → daemon 默认(可见时)→ 本人首个),无可见项目 = 拒绝并给下一步,**绝不回落 daemon 默认项目**(否则租户首条消息就在 owner 仓里开 agent)。**④门**:REST **单一 choke point = `auth::project_acl_layer`**,认全部项目寻址族(`/api/v1/projects/{slug}/*` · `/api/{slug}/*` 动作与 pane 快照 · `/ws/{slug}/*` PTY),新路由自动覆盖;`/sessions/{sid}/*` 按其 project 门(**admin 同样过门**,与 `can_see_owner` 不让 admin 进租户项目一致);集合面与 SSE 按身份过滤(operator 仅多收无 slug 帧);`/ws/chat` 身份取自认证态,**不认 query**。**admin 专属只剩两面**(owner 令 2026-07-27):用户管理 `/users*` + 全局 bot 凭据 `/config/im`(tenant 对称自助面 = `/me/im`),deny→403;其余面全体登录用户可用,SPA 仅 管理员 tab 按 `GET /api/v1/me` 显隐(fail-closed)。**诚实范围**:同 OS uid 下是**软隔离(UX)、非安全边界**;真隔离 = per-user OS user/sandbox(deferred)。web↔IM 同一人复联(`linked_chat`)deferred,tenant 当前 web-only |
 | **不解析终端输出** | 读 transcript jsonl + 官方 hooks fast event;**不 scrape pane**(`tmux capture-pane` 仅 dev 调试;screenshot 面已整体退役 2026-07-26,web 终端快照走 pane-snapshot 只读)|
 | **terminal 协议(tmux/rmux)冻结 = 维护-only,规划淘汰** | 新 vendor / 新功能**不得**新增 tmux/rmux/PTY 依赖(OpenCode 起新 harness 一律长驻 stdio:stream-json / ACP / app-server);既有 Claude `terminal` 协议只修不扩;逐字节终端镜像不再作为新功能的验收条件 |
 | **永不主动 kill 长 session** | 预算例外:`budgets.*.max_cost_usd_per_24h` 触顶 auto-disable。**容量挤停例外**:live > `sessions.max_live` 时**优雅停**最久无事件的合格会话 —— **HITL 挂起与新会话父链绝不挤,创建永不因容量失败**;被停 sid 可 resume,记 `session_evicted` progress + lifecycle 广播(挑选顺序细节以代码为准)。`project stop` / `project rm --force` 是用户**显式**命令;`/compact /new` 是合法 turn,`/new` 总铸新 sid |
@@ -99,6 +99,11 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 ## 五、PR / 实现纪律
 
+> **总纲:治病根,通用解优先于补丁**(owner 令 2026-07-28)。先定位缺陷所在的**层**(身份解析 / 归属策略 / 资源解析 / 门),在那一层修**一次**;在症状点打补丁 = 制造债,且下一个入口还会再犯。两条判据:
+> ① **同形扫一遍** —— 一个 fallback 漏了,同形的通常还有几处。实锤(2026-07-28 串用户扫荡):ACL choke point 只认一种 URL 形状 · 身份解析 fail-open 成 admin · 项目解析回落 daemon 默认 —— 三处同病(**把调用方从未被授权的东西发出去**),分开补三次都是补丁,合起来才是一个修法。
+> ② **新入口自动被覆盖** —— 修完后新增路由 / 前端 / vendor / 租户若还要再补一次,说明补在了症状点。
+> 同样适用于测试:**「登记为 flake」常常是病根没找到** —— `resume_*` / `hook_*` 挂了整族的账,实为确定性缺陷(读错路径 + panic 泄漏 fault 开关 / 继承宿主 `CCTEAM_HOOKLESS`)。定性前先问「宿主给了它什么」。
+
 1. **每个改动映射**(commit/PR 描述均可):`requirements.md` 某条痛点 + `tech-design.md` 某节;改协议**以代码为 SoT**(同步 tech-design 末尾「协议→代码」指针表)
 2. **commit 用英语;agent prompt 用英语**(**产品化、简洁,非冗长**;hub vendored prompt 随上游);项目文档(CLAUDE.md / `docs/`)用中文
 3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 新旧状态数据不兼容时**不写迁移步骤/兼容分支**,直接「清旧数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重 `ccteam init`」;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
@@ -109,7 +114,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
    - **内部 SoT**:本文 §一(只更 version 行 + 一行 headline)+ `.loop/state.md`(焦点/基线回填)+ `.loop/history.md`(一行蒸馏)+ backlog 完成卡蒸馏移出(**队列只持现势**)+ `docs/dev/tech-design.md` + workspace `Cargo.toml` version bump
    - **用户面**:root `README.md`(**英文**,始终反映当前能力,不含版本进展/时间轴/baseline/shipped 日期)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞(README 规则的唯一家 = 本条,原 §三行已迁出)
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
-8. **beta-gating(仅 UI 层,v0.8.20 起)** — 新/不稳定功能默认**只对 admin 展示**(SPA 按 `useMe().isAdmin` show/hide),普通用户只见生产稳定面;**非安全/权限边界** —— 真权限仍走 `deny_non_admin`/`can_see_project` 等既有 ACL(后端照常服务)。毕业为 stable 即移除该 UI 门。例:web 建-session 的 terminal/rmux 协议 + 角色选择 = admin-only,claude/codex stream-json = 全员。
+8. **beta-gating(仅 UI 层,v0.8.20 起;2026-07-28 owner 令收窄至「几乎不用」)** — **功能面默认对全体登录用户开放**,能不能碰由后端「身份 × 项目归属」判,不靠藏菜单;SPA 唯一 admin-only 面 = 设置→**管理员**(用户管理),`visibleSettingsItems` 有一行不变量测试锁死。新/不稳定功能确需只对 admin 展示时可临时按 `useMe().isAdmin` 藏,但**必须是临时的**,且**非安全/权限边界**(真权限仍走 `deny_non_admin`/`can_see_project`);毕业即移除。历史例(已退役):terminal/rmux 协议与角色选择曾 admin-only,现全员。
 
 ### 角色与写权(治理骨架;执法 = 声明 + 复核,**不做脚本硬防护**)
 

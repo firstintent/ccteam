@@ -31,17 +31,18 @@ import { fetchDashboard } from "../lib/dashboardApi";
 import {
   listHistorySessions,
   listSessions,
+  renameSession as apiRenameSession,
   resumeSession,
   stopSession as apiStopSession,
   type HistorySessionView,
   type SessionView as SessionSummary,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
-import { tStopped } from "../lib/i18n";
+import { t, tStopped } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { useMe } from "../hooks/useMe";
-import { railSessionLabel } from "./railHelpers";
+import { railSessionLabel, renameToastText } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
 
 type ShellView = "home" | "conv" | "flow" | "settings" | "agents";
@@ -93,7 +94,7 @@ export default function ChatConsole() {
   const view = shellViewFor(location.pathname);
   const { settings } = useWebSettings();
   const lang = settings.language;
-  const { me, isAdmin } = useMe();
+  const { me } = useMe();
 
   // ---- cross-project session data (live + stopped history) -----------------
   const [railSessions, setRailSessions] = useState<SessionSummary[]>([]);
@@ -290,6 +291,27 @@ export default function ChatConsole() {
     [refreshSessions, lang, sid, navigate],
   );
 
+  // One rename action for every surface that offers it (rail rows + the
+  // conversation header), so the toast, the refresh and the failure handling
+  // are identical wherever the user renames from. Live and stopped sessions
+  // take the same path — the server renames either.
+  const renameRow = useCallback(
+    async (targetSid: string, title: string) => {
+      try {
+        const result = await apiRenameSession(targetSid, title);
+        toastBus.handler?.info(renameToastText(lang, result));
+        // Awaited (not fire-and-forget) so the caller's optimistic title only
+        // clears once the rail carries the server's own cleaned title.
+        await refreshSessions();
+      } catch (e) {
+        toastBus.handler?.error(
+          `${t(lang, "renameFailed")}: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+    },
+    [refreshSessions, lang],
+  );
+
   const activeSession = useMemo(() => {
     const live = railSessions.find((s) => s.sid === sid);
     if (live) return live;
@@ -343,6 +365,7 @@ export default function ChatConsole() {
         }}
         onOpenRow={openRow}
         onStopRow={stopRow}
+        onRenameRow={renameRow}
       />
 
       {/* 移动端:抽屉入口 + 遮罩 (prototype .hamb / .side-backdrop) */}
@@ -366,7 +389,13 @@ export default function ChatConsole() {
       <main className="main">
         {view === "conv" && sid ? (
           // KEY={sid}: fresh SessionView per switch — per-sid state resets atomically.
-          <SessionView key={sid} sid={sid} session={activeSession} lang={lang} isAdmin={isAdmin} />
+          <SessionView
+            key={sid}
+            sid={sid}
+            session={activeSession}
+            lang={lang}
+            onRename={renameRow}
+          />
         ) : view === "flow" ? (
           <WorkflowView
             tab={routeTab}
@@ -380,14 +409,10 @@ export default function ChatConsole() {
             onNav={(t) => navigate(`/settings/${t}`)}
           />
         ) : view === "agents" ? (
-          <AgentsView
-            lang={lang}
-            onOpenChat={(newSid) => navigate(`/chat/s/${encodeURIComponent(newSid)}`)}
-          />
+          <AgentsView lang={lang} />
         ) : (
           <HomeView
             lang={lang}
-            isAdmin={isAdmin}
             projects={projects}
             projectPaths={projectPaths}
             projectHosts={projectHosts}

@@ -1167,6 +1167,22 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .map_err(|e| HarnessError::SubmitFailed(format!("send Escape (interrupt): {e}")))?;
         Ok(())
     }
+
+    /// Same vendor, same title surface as stream-json: the transcript's
+    /// `custom-title` entry. Kept identical on purpose — a Claude session's
+    /// title must not depend on which wire protocol drives it — and it adds no
+    /// tmux/PTY dependency, so the frozen terminal protocol stays frozen. The
+    /// shared helper prefers this protocol's `active-session-id` marker, which
+    /// is the only place the post-`/clear` uuid is known.
+    async fn set_session_title(
+        &self,
+        target: &crate::SessionTitleTarget,
+        title: &str,
+    ) -> Result<crate::TitleSync, HarnessError> {
+        Ok(crate::execution::vendor_title::push_claude_custom_title(
+            target, title,
+        ))
+    }
 }
 
 impl ClaudeTuiAdapter {

@@ -14,11 +14,15 @@
 // backoff 1s→30s cap / 7 retries, `reconnect_hint` → close+reopen, an sid
 // key so the effect only re-subscribes when the sid identity changes.
 //
-// Auth: EventSource cannot set an Authorization header, so this stream
-// authenticates via the `ccteam_token` cookie (same as the PTY WS), NOT the
-// localStorage Bearer the fetch interceptor injects on REST calls.
+// Auth: native EventSource cannot set an Authorization header. The SPA
+// keeps the token in localStorage (Bearer on REST) and the server sets an
+// HttpOnly `ccteam_token` cookie on `?token=` login — those two can desync.
+// We open the stream via `createAuthedEventSource` (fetch + Bearer +
+// credentials) so a missing cookie no longer 401s the live reply stream
+// while REST still works.
 
 import { useEffect, useRef, useState } from "react";
+import { createAuthedEventSource } from "../lib/authedEventSource";
 
 /** One selectable option on an approval ChoicePrompt (the SSE frame's
  *  `options[]`). `label` is the button text; `id` is the stable decision
@@ -246,7 +250,11 @@ export function startSessionEventStream(
   environment?: SessionEventStreamEnvironment,
 ): () => void {
   const env: SessionEventStreamEnvironment = environment ?? {
-    createEventSource: (url) => new EventSource(url),
+    // fetch-backed stream carries localStorage Bearer (and cookies). Native
+    // EventSource is cookie-only and 401s when the cookie is missing while
+    // the SPA still has a valid Bearer — the "send works, reply needs
+    // refresh" failure mode.
+    createEventSource: (url) => createAuthedEventSource(url),
     document,
     window,
     setTimer: (callback, delay) => setTimeout(callback, delay),

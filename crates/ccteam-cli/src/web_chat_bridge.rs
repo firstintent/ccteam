@@ -500,10 +500,13 @@ mod tests {
             .unwrap();
     }
 
+    /// The operator's own web console socket. `web-api` is the console's
+    /// identity (see `Identity::web_chat_id`); an arbitrary label would resolve
+    /// to a TENANT, which owns no project and therefore cannot spawn.
     async fn connect_chat(
         addr: SocketAddr,
     ) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-        connect_chat_as(addr, "chat-1", "alice").await
+        connect_chat_as(addr, "web-api", "web-api").await
     }
 
     async fn connect_chat_as(
@@ -627,7 +630,7 @@ mod tests {
             "state": "queued",
             "message": {
                 "content": content,
-                "recipient": "chat-1",
+                "recipient": "web-api",
                 "subject": null,
                 "thread_ts": null
             },
@@ -807,7 +810,7 @@ mod tests {
             .expect("chat-created project state");
         assert_eq!(
             state.owner.as_deref(),
-            Some("user:chat-1"),
+            Some("user:web-api"),
             "the creator owner must be stamped at the arbitrary project path before /cd applies its ACL"
         );
         let config = std::fs::read_to_string(ccteam_home.join("config.yaml")).unwrap();
@@ -825,11 +828,15 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_chat_sessions_share_the_web_console_pool() {
-        // v0.8.18 柱2 档0 — the web console is ONE shared operator pool (until
-        // 档1 per-user tokens): a session created from one web chat is visible +
-        // addressable from another web chat (the single-user "create on web,
-        // drive from phone" flow). IM-created sessions instead stay PRIVATE to
-        // their chat — covered by the gateway own-only tests.
+        // v0.8.18 柱2 档0 / cross-user fix (2026-07-28) — the web console pool is per IDENTITY. A
+        // second socket for the SAME identity sees + drives its sessions (the
+        // "create on web, drive from your phone" flow this test was written to
+        // protect); a DIFFERENT web identity does not. The original "one shared
+        // operator pool" premise was explicitly scoped "until 档1 per-user
+        // tokens" — those shipped, so two distinct web chat ids are two distinct
+        // users and must stay isolated (owner report: cross-user session
+        // leakage). IM-created sessions stay PRIVATE to their chat — covered by
+        // the gateway own-only tests.
         let _guard = env_lock();
         let home = TempDir::new().unwrap();
         let ccteam_home = home.path().join(".ccteam");
@@ -841,23 +848,36 @@ mod tests {
         let stack = spawn_stack(paths.clone(), Arc::clone(&adapter_state)).await;
 
         // chat-1 (web) creates a session.
-        let mut s1 = connect_chat_as(stack.addr, "chat-1", "alice").await;
+        let mut s1 = connect_chat_as(stack.addr, "web-api", "web-api").await;
         send_text(&mut s1, "new", "/new claude reviewer").await;
         recv_reply_contains(&mut s1, "created session s1").await;
 
-        // chat-2 (a different web chat) SEES it via the shared user pool and can
-        // /use it.
-        let mut s2 = connect_chat_as(stack.addr, "chat-2", "bob").await;
-        send_text(&mut s2, "sessions", "/sessions").await;
-        let listed = recv_sessions(&mut s2).await;
+        // A SECOND socket for the SAME identity SEES it and can /use it — the
+        // flow that matters (one user, two frontends/tabs).
+        let mut same = connect_chat_as(stack.addr, "web-api", "web-api").await;
+        send_text(&mut same, "sessions", "/sessions").await;
+        let listed = recv_sessions(&mut same).await;
         assert!(
             listed.iter().any(|s| s.session.as_deref() == Some("s1")),
-            "web chat-2 should see the shared web-pool session: {listed:?}"
+            "a second socket of the same identity should see its own session: {listed:?}"
+        );
+        send_text(&mut same, "use", "/use s1").await;
+        recv_reply_contains(&mut same, "using session s1").await;
+
+        // A DIFFERENT web identity sees NOTHING of it and cannot address it —
+        // /use reads as unknown, so the sid's existence leaks nothing either.
+        let mut s2 = connect_chat_as(stack.addr, "chat-2", "bob").await;
+        send_text(&mut s2, "sessions", "/sessions").await;
+        let other = recv_sessions(&mut s2).await;
+        assert!(
+            !other.iter().any(|s| s.session.as_deref() == Some("s1")),
+            "another web identity must not see chat-1's session: {other:?}"
         );
         send_text(&mut s2, "use", "/use s1").await;
-        recv_reply_contains(&mut s2, "using session s1").await;
+        recv_reply_contains(&mut s2, "unknown session for this chat: s1").await;
 
         drop(s1);
+        drop(same);
         drop(s2);
         stop_stack(stack).await;
     }

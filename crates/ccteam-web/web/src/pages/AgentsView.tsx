@@ -1,23 +1,30 @@
-// v0.9.1 团队/Team view — redesigned around the operator's real questions
-// (who is working, who is stuck, who spent what, who delegated to whom):
+// 团队/Team view — topology-first (v0.9.11 TEAM-1) + 分工 charter tab
+// (TEAM-2). The legacy roster/timeline tabs are gone; a two-tab seg picks
+// between the live topology canvas and the division-of-labor charter
+// (`pages/CharterPanel.tsx`), while the KPI strip / vendor chips / ticker
+// stay global above the seg:
 //
-// - 拓扑 topology (DEFAULT): a compact, collapsible delegation tree grouped
-//   by project, designed to stay readable with 100+ sessions.
-// - 成员 roster: a delegation tree TABLE — one row per session,
-//   children indented under their parent (process-tree shape). The common
-//   no-delegation case reads as a clean list, not scattered graph boxes.
-// - 时间轴 timeline: the 30-min dispatch strip (rows + arrows), unchanged
-//   semantics from v0.9.0 W4, now with full-height room.
+// - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
+//   designed to stay readable with 100+ sessions. Every row (and the detail
+//   panel) links to the real chat route `/chat/s/<sid>` — right/middle-click
+//   open-in-new-tab works because these are real hyperlinks.
+// - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
+//   reuses this view's graph nodes for its aggregation — no refetch; picking
+//   a roster card lands back on the topology filtered to that vendor).
+// - KPI strip (live / working / active dispatches / total cost) + per-vendor
+//   chips (live count + Σcost per vendor; clicking a chip filters the
+//   topology to that vendor, clicking it again clears the filter).
+// - dispatch ticker: the last 5 delegation frames off the global SSE,
+//   newest first — clicking one selects the child session.
+// - host badge on tree rows ONLY when the graph spans more than one host.
 //
-// A KPI strip (live / working / active dispatches / total cost) sits above
-// the tabs, computed client-side from the same graph+SSE data. The view is
-// available to every identity; the real ACL is the backend's
-// per-tenant graph/SSE filter.
-//
-// Live state comes from the global SSE (`useAgentsEvents`) folded through
-// `lib/agentsReducer.ts`; roster order from `lib/agentsTree.ts` (pure).
+// The view is available to every identity; the real ACL is the backend's
+// per-tenant graph/SSE filter. Live state comes from the global SSE
+// (`useAgentsEvents`) folded through `lib/agentsReducer.ts`; tree grouping
+// from `lib/agentsTree.ts` (pure).
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { fetchAgentsGraph, type AgentEdge, type AgentNode, type AgentsGraphResponse } from "../lib/agentsApi";
 import {
   applyDelegationEvent,
@@ -25,11 +32,7 @@ import {
   sidsActiveWithin,
   type TimestampedAgentsEvent,
 } from "../lib/agentsReducer";
-import {
-  flattenDelegationTree,
-  groupDelegationTrees,
-  type RosterRow,
-} from "../lib/agentsTree";
+import { groupDelegationTrees } from "../lib/agentsTree";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { VendorChip } from "../components/VendorChip";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
@@ -38,26 +41,30 @@ import { vendorDotClass } from "../lib/vendors";
 import { makeT, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
+import CharterPanel from "./CharterPanel";
 
 const PULSE_WINDOW_MS = 60_000;
-const TIMELINE_WINDOW_MS = 30 * 60 * 1000;
 const GRAPH_REFRESH_MS = 15_000;
 const EVENT_LOG_CAP = 500;
+const TICKER_SIZE = 5;
 
-export type AgentsTab = "roster" | "timeline" | "topology";
+const chatPath = (sid: string) => `/chat/s/${encodeURIComponent(sid)}`;
 
-/** Roster status dot: pulsing = actively working (amber), live = idle-live
+/** Tree status dot: pulsing = actively working (amber), live = idle-live
  *  (green), persisted-only = off (grey). */
-function rosterDotClass(node: AgentNode, pulsing: Set<string>): string {
+function treeDotClass(node: AgentNode, pulsing: Set<string>): string {
   if (node.status !== "live") return "dot off";
   return pulsing.has(node.sid) ? "dot busy" : "dot on";
 }
 
 /** Project-grouped, collapsible delegation tree. Component state contains
- *  only collapsed sids, so the initial render stays deterministic and SSR-safe. */
+ *  only collapsed sids, so the initial render stays deterministic and SSR-safe.
+ *  `hosts` = every host in the graph; the per-row host badge renders only
+ *  when there is more than one. */
 export function AgentsTree({
   nodes,
   edges,
+  hosts = [],
   selected,
   pulsing,
   lang: langProp,
@@ -65,6 +72,7 @@ export function AgentsTree({
 }: {
   nodes: AgentNode[];
   edges: AgentEdge[];
+  hosts?: string[];
   selected: string | null;
   pulsing: Set<string>;
   lang?: Lang;
@@ -78,6 +86,7 @@ export function AgentsTree({
     () => new Set(edges.filter((edge) => edge.active).map((edge) => edge.child)),
     [edges],
   );
+  const showHost = hosts.length > 1;
 
   const toggleCollapsed = (sid: string) => {
     setCollapsed((previous) => {
@@ -89,7 +98,12 @@ export function AgentsTree({
   };
 
   return (
-    <div className="agents-tree" data-testid="agents-tree" role="tree" aria-label={t("team")}>
+    <div
+      className={showHost ? "agents-tree with-host" : "agents-tree"}
+      data-testid="agents-tree"
+      role="tree"
+      aria-label={t("team")}
+    >
       {projects.map((project) => (
         <section className="agents-tree-project" data-testid={`agents-tree-project-${project.slug}`} key={project.slug}>
           <header className="agents-tree-project-head">
@@ -141,10 +155,18 @@ export function AgentsTree({
                 <VendorChip vendor={n.vendor} />
                 <span className="agents-tree-sid mono">{n.sid}</span>
                 <span className="agents-tree-title">{n.title || n.role || "—"}</span>
-                <span className={rosterDotClass(n, pulsing)} aria-hidden="true" />
+                {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
+                <span className={treeDotClass(n, pulsing)} aria-hidden="true" />
                 <span className="agents-tree-active">{relativeTime(lang, n.last_active)}</span>
                 <span className="agents-tree-cost mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
                 <span className="agents-tree-turns mono" title={t("teamColTurns")}>{n.turn_count}t</span>
+                <Link
+                  className="btn ghost mini agents-tree-open"
+                  to={chatPath(n.sid)}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {t("teamOpenLink")}
+                </Link>
               </div>
             );
           })}
@@ -154,94 +176,216 @@ export function AgentsTree({
   );
 }
 
-/** Pure presentational roster table — one row per session in delegation-tree
- *  DFS order. Exported for SSR tests (fixture rows, no data loading). */
-export function AgentsRoster({
-  rows,
-  selected,
-  pulsing,
+/** Per-vendor rollup for the KPI chips: live session count + Σcost.
+ *  Module-private (react-refresh: component files export only components);
+ *  covered through {@link VendorKpiChips}' rendered output. */
+function vendorRollup(nodes: AgentNode[]): { vendor: string; live: number; cost: number }[] {
+  const byVendor = new Map<string, { vendor: string; live: number; cost: number }>();
+  for (const n of nodes) {
+    const agg = byVendor.get(n.vendor) ?? { vendor: n.vendor, live: 0, cost: 0 };
+    if (n.status === "live") agg.live += 1;
+    agg.cost += n.cost_usd ?? 0;
+    byVendor.set(n.vendor, agg);
+  }
+  return [...byVendor.values()].sort((a, b) => a.vendor.localeCompare(b.vendor));
+}
+
+/** Per-vendor KPI chips row — hook-free presentational (exported for
+ *  node-env tests). Clicking a chip toggles the topology's vendor filter. */
+export function VendorKpiChips({
+  nodes,
+  active,
+  onToggle,
+}: {
+  nodes: AgentNode[];
+  active: string | null;
+  onToggle: (vendor: string) => void;
+}) {
+  const rollup = vendorRollup(nodes);
+  if (rollup.length === 0) return null;
+  return (
+    <div className="agents-vendor-chips" data-testid="agents-vendor-chips">
+      {rollup.map(({ vendor, live, cost }) => (
+        <button
+          key={vendor}
+          type="button"
+          className={vendor === active ? "agents-vendor-chip active" : "agents-vendor-chip"}
+          data-testid={`agents-vendor-chip-${vendor}`}
+          aria-pressed={vendor === active}
+          onClick={() => onToggle(vendor)}
+        >
+          <VendorChip vendor={vendor} />
+          {/* Single-expression text nodes keep the SSR html free of comment
+              separators, so tests can assert the literal strings. */}
+          <span className="agents-vendor-live">{`●${live}`}</span>
+          <span className="mono">{`$${cost.toFixed(2)}`}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Recent-dispatch ticker: the last {@link TICKER_SIZE} delegation frames,
+ *  newest first — `parent → child · relation · relative time`. Hook-free
+ *  presentational (exported for node-env tests); hidden when empty. */
+export function AgentsTicker({
+  events,
   lang: langProp,
   onSelect,
-  onOpenChat,
 }: {
-  rows: RosterRow[];
-  selected: string | null;
-  pulsing: Set<string>;
+  events: TimestampedAgentsEvent[];
   lang?: Lang;
   onSelect: (sid: string) => void;
-  onOpenChat?: (sid: string) => void;
+}) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  const recent = events
+    .filter((ev) => ev.kind === "delegation" && ev.parent_sid && ev.child_sid)
+    .slice(-TICKER_SIZE)
+    .reverse();
+  if (recent.length === 0) return null;
+  return (
+    <div className="agents-ticker" data-testid="agents-ticker">
+      <span className="agents-ticker-label">{t("teamTicker")}</span>
+      {recent.map((ev, i) => (
+        <button
+          key={`${ev.parent_sid}-${ev.child_sid}-${ev.receivedAt}-${i}`}
+          type="button"
+          className="agents-ticker-item"
+          data-testid="agents-ticker-item"
+          onClick={() => onSelect(ev.child_sid!)}
+        >
+          <span className="mono">{`${ev.parent_sid} → ${ev.child_sid}`}</span>
+          <span aria-hidden="true">·</span>
+          <span className="agents-ticker-relation">{ev.relation}</span>
+          <span aria-hidden="true">·</span>
+          <span className="agents-ticker-when">
+            {relativeTime(lang, new Date(ev.receivedAt).toISOString())}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Detail side panel for the selected session — hook-free presentational
+ *  (exported for node-env tests). The 打开会话 action is a real `<Link>`. */
+export function AgentsPanel({
+  node,
+  pulsing,
+  activityFold,
+  history,
+  lang: langProp,
+}: {
+  node: AgentNode;
+  pulsing: Set<string>;
+  activityFold: ActivityFold;
+  history: SessionHistoryEvent[];
+  lang?: Lang;
 }) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
   return (
-    <div className="agents-roster" data-testid="agents-roster" role="table" aria-label={t("team")}>
-      <div className="agents-roster-head" role="row">
-        <span>{t("teamColSession")}</span>
-        <span>{t("vendor")}</span>
-        <span>{t("host")}</span>
-        <span>{t("cost")}</span>
-        <span>{t("teamColTurns")}</span>
-        <span>{t("teamColLastActive")}</span>
-        <span />
+    <aside className="agents-panel" data-testid="agents-panel">
+      <h2>{node.title || node.role || node.sid}</h2>
+      <div className="agents-panel-meta">
+        <span>
+          {t("vendor")}: <span className={vendorDotClass(node.vendor)} /> {node.vendor}
+        </span>
+        <span>
+          {t("model")}: {node.model || "—"}
+        </span>
+        <span>
+          {t("host")}: {node.host}
+        </span>
+        <span>
+          {t("parentSession")}: {node.parent_sid || t("noParent")}
+        </span>
+        <span>
+          {t("depth")}: {node.depth}
+        </span>
+        <span>
+          {t("cost")}: {node.cost_usd != null ? `$${node.cost_usd.toFixed(4)}` : "—"}
+        </span>
+        <span>{relativeTime(lang, node.last_active)}</span>
       </div>
-      {rows.map(({ node: n, indent }) => (
-        <div
-          key={n.sid}
-          role="row"
-          tabIndex={0}
-          className={`agents-roster-row ${n.sid === selected ? "selected" : ""}`}
-          data-testid={`agents-roster-row-${n.sid}`}
-          onClick={() => onSelect(n.sid)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onSelect(n.sid);
-          }}
-        >
-          <span className="agents-roster-name" style={{ paddingLeft: indent * 22 }}>
-            {indent > 0 ? <span className="agents-roster-elbow">└</span> : null}
-            <span className={rosterDotClass(n, pulsing)} />
-            <span className="t">{n.title || n.role || n.sid}</span>
-            <span className="agents-roster-sid mono">{n.sid}</span>
-          </span>
-          <span><VendorChip vendor={n.vendor} /></span>
-          <span className="mono">{n.host}</span>
-          <span className="mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
-          <span className="mono">{n.turn_count}</span>
-          <span>{relativeTime(lang, n.last_active)}</span>
-          <span>
-            <button
-              type="button"
-              className="btn ghost mini"
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenChat?.(n.sid);
-              }}
-            >
-              {t("teamOpenChat")}
-            </button>
-          </span>
-        </div>
-      ))}
+
+      <h3>{t("teamActivity")}</h3>
+      <p className="agents-activity-line" data-testid="agents-activity-line">
+        {pulsing.has(node.sid) ? renderFold(activityFold) : t("teamIdle")}
+      </p>
+
+      <h3>{t("teamRecentTurns")}</h3>
+      <div className="agents-turns" data-testid="agents-turns">
+        {history.length === 0 ? (
+          <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>—</p>
+        ) : (
+          history.map((ev) => (
+            <div key={ev.turn_id} className="agents-turn-row">
+              <span className="mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>
+                {ev.ts.slice(0, 16).replace("T", " ")}
+              </span>
+              <span style={{ fontSize: 12.5, color: "var(--text-muted)" }}>
+                {(ev.assistant || ev.user || "").slice(0, 120)}
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+
+      <Link className="btn primary mini" data-testid="agents-open-chat" to={chatPath(node.sid)}>
+        {t("teamOpenChat")}
+      </Link>
+    </aside>
+  );
+}
+
+/** Team tab seg (拓扑 | 分工) — hook-free presentational (exported for
+ *  node-env tests). Sits below the global KPI/chips/ticker strip. */
+export function TeamTabSeg({
+  tab,
+  lang: langProp,
+  onSwitch,
+}: {
+  tab: "topology" | "charter";
+  lang?: Lang;
+  onSwitch: (tab: "topology" | "charter") => void;
+}) {
+  const t = makeT(langProp ?? "zh");
+  return (
+    <div className="seg agents-seg" data-testid="agents-seg">
+      <button
+        type="button"
+        className={tab === "topology" ? "active" : ""}
+        data-testid="agents-seg-topology"
+        onClick={() => onSwitch("topology")}
+      >
+        {t("teamTabTopology")}
+      </button>
+      <button
+        type="button"
+        className={tab === "charter" ? "active" : ""}
+        data-testid="agents-seg-charter"
+        onClick={() => onSwitch("charter")}
+      >
+        {t("teamTabCharter")}
+      </button>
     </div>
   );
 }
 
 export default function AgentsView({
   lang: langProp,
-  onOpenChat,
-  initialTab = "topology",
-}: {
-  lang?: Lang;
-  onOpenChat?: (sid: string) => void;
-  /** Initial tab (tests / deep links); the user switches freely afterwards. */
-  initialTab?: AgentsTab;
-} = {}) {
+  initialTab,
+}: { lang?: Lang; initialTab?: "topology" | "charter" } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
 
-  const [tab, setTab] = useState<AgentsTab>(initialTab);
+  const [tab, setTab] = useState<"topology" | "charter">(initialTab ?? "topology");
   const [graph, setGraph] = useState<AgentsGraphResponse>({ nodes: [], edges: [], hosts: [] });
   const [edges, setEdges] = useState<AgentEdge[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [vendorFilter, setVendorFilter] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [historyBySid, setHistoryBySid] = useState<Record<string, SessionHistoryEvent[]>>({});
   const [now, setNow] = useState(() => Date.now());
@@ -277,7 +421,7 @@ export default function AgentsView({
   }, []);
 
   // ---- fold fresh SSE frames: edge active state + denial toasts + the
-  // timestamped log the pulse/activity/timeline all read from ----
+  // timestamped log the pulse/activity/ticker all read from ----
   useEffect(() => {
     if (events.length <= seenCountRef.current) return;
     const fresh = events.slice(seenCountRef.current);
@@ -294,7 +438,7 @@ export default function AgentsView({
     }
   }, [events]);
 
-  // Tick `now` so the pulse window + timeline auto-advance without needing a
+  // Tick `now` so the pulse window + ticker auto-advance without needing a
   // fresh SSE frame.
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 3000);
@@ -306,7 +450,12 @@ export default function AgentsView({
     [timestamped, now],
   );
 
-  const roster = useMemo(() => flattenDelegationTree(graph.nodes), [graph.nodes]);
+  // Vendor filter: children whose parent is filtered out render as roots
+  // (`groupDelegationTrees` treats an invisible parent as no parent).
+  const visibleNodes = useMemo(
+    () => (vendorFilter ? graph.nodes.filter((n) => n.vendor === vendorFilter) : graph.nodes),
+    [graph.nodes, vendorFilter],
+  );
 
   const selectedNode = graph.nodes.find((node) => node.sid === selected) ?? null;
 
@@ -328,30 +477,6 @@ export default function AgentsView({
       .catch(() => setHistoryBySid((prev) => ({ ...prev, [selected]: [] })));
   }, [selected, historyBySid]);
 
-  const timelineNodes = useMemo(
-    () => [...graph.nodes].sort((a, b) => a.depth - b.depth || a.sid.localeCompare(b.sid)),
-    [graph.nodes],
-  );
-  const windowStart = now - TIMELINE_WINDOW_MS;
-  const timelineDispatches = useMemo(
-    () =>
-      timestamped.filter(
-        (e) =>
-          e.kind === "delegation" &&
-          e.relation === "dispatched" &&
-          e.receivedAt >= windowStart &&
-          e.parent_sid &&
-          e.child_sid,
-      ),
-    [timestamped, windowStart],
-  );
-
-  const timelineX = (ms: number): number => {
-    const clamped = Math.min(Math.max(ms, windowStart), now);
-    return ((clamped - windowStart) / TIMELINE_WINDOW_MS) * 100;
-  };
-  const rowIndex = new Map(timelineNodes.map((n, i) => [n.sid, i]));
-
   // ---- KPI strip (client-side, from the same graph + SSE data) ----
   const liveCount = graph.nodes.filter((n) => n.status === "live").length;
   const workingCount = graph.nodes.filter((n) => pulsing.has(n.sid)).length;
@@ -359,7 +484,6 @@ export default function AgentsView({
   const totalCost = graph.nodes.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
 
   const empty = !loading && graph.nodes.length === 0;
-  const showPanel = tab !== "timeline";
 
   return (
     <section className="view active agents-view" data-testid="agents-view">
@@ -384,160 +508,63 @@ export default function AgentsView({
         </div>
       </header>
 
-      <div className="seg agents-tabs" data-testid="agents-tabs">
-        {(
-          [
-            ["topology", t("teamTabTopology")],
-            ["roster", t("teamTabRoster")],
-            ["timeline", t("teamTabTimeline")],
-          ] as [AgentsTab, string][]
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            data-testid={`agents-tab-${id}`}
-            className={tab === id ? "active" : ""}
-            onClick={() => setTab(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <VendorKpiChips
+        nodes={graph.nodes}
+        active={vendorFilter}
+        onToggle={(vendor) => setVendorFilter((current) => (current === vendor ? null : vendor))}
+      />
+      <AgentsTicker events={timestamped} lang={lang} onSelect={setSelected} />
+      <TeamTabSeg tab={tab} lang={lang} onSwitch={setTab} />
 
-      <div className="agents-body">
-        <div className="agents-canvas" data-testid="agents-canvas">
-          {tab !== "timeline" && loading ? (
-            <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }}>{t("loading")}</p>
-          ) : tab !== "timeline" && empty ? (
-            <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }} data-testid="agents-empty">
-              {t("teamEmpty")}
-            </p>
-          ) : tab === "roster" ? (
-            <AgentsRoster
-              rows={roster}
-              selected={selected}
+      {tab === "charter" ? (
+        <CharterPanel
+          nodes={graph.nodes}
+          lang={lang}
+          // TEAM-7: a roster card answers "show me this vendor's sessions" —
+          // same `vendorFilter` state the KPI chips drive, so we land on an
+          // already-filtered topology with that chip active (click it to clear).
+          onVendorPick={(vendor) => {
+            setVendorFilter(vendor);
+            setTab("topology");
+          }}
+        />
+      ) : (
+        <div className="agents-body">
+          <div className="agents-canvas" data-testid="agents-canvas">
+            {loading ? (
+              <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }}>{t("loading")}</p>
+            ) : empty ? (
+              <p style={{ color: "var(--text-faint)", fontSize: 13, padding: 16 }} data-testid="agents-empty">
+                {t("teamEmpty")}
+              </p>
+            ) : (
+              <AgentsTree
+                nodes={visibleNodes}
+                edges={edges}
+                hosts={graph.hosts}
+                selected={selected}
+                pulsing={pulsing}
+                lang={lang}
+                onSelect={setSelected}
+              />
+            )}
+          </div>
+
+          {selectedNode ? (
+            <AgentsPanel
+              node={selectedNode}
               pulsing={pulsing}
+              activityFold={activityFold}
+              history={historyBySid[selectedNode.sid] ?? []}
               lang={lang}
-              onSelect={setSelected}
-              onOpenChat={onOpenChat}
             />
-          ) : tab === "topology" ? (
-            <AgentsTree
-              nodes={graph.nodes}
-              edges={edges}
-              selected={selected}
-              pulsing={pulsing}
-              lang={lang}
-              onSelect={setSelected}
-            />
-          ) : (
-            <div className="agents-timeline" data-testid="agents-timeline">
-              <h3>{t("teamTimeline")}</h3>
-              <div className="agents-timeline-rows">
-                {timelineNodes.map((n) => (
-                  <div key={n.sid} className="agents-timeline-row" data-testid={`agents-timeline-row-${n.sid}`}>
-                    <span className="agents-timeline-label">{n.title || n.role || n.sid}</span>
-                    <div className="agents-timeline-track">
-                      {n.status === "live" ? (
-                        <div
-                          className={`agents-timeline-bar ${pulsing.has(n.sid) ? "active" : ""}`}
-                          style={{ left: `${timelineX(Date.parse(n.last_active) || now)}%`, width: "2%" }}
-                        />
-                      ) : null}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <svg
-                className="agents-timeline-arrows"
-                viewBox={`0 0 100 ${Math.max(timelineNodes.length, 1) * 28}`}
-                preserveAspectRatio="none"
-              >
-                {timelineDispatches.map((ev, i) => {
-                  const fromRow = rowIndex.get(ev.parent_sid!);
-                  const toRow = rowIndex.get(ev.child_sid!);
-                  if (fromRow === undefined || toRow === undefined) return null;
-                  const x = timelineX(ev.receivedAt);
-                  return (
-                    <line
-                      key={`${ev.parent_sid}-${ev.child_sid}-${i}`}
-                      x1={x}
-                      y1={fromRow * 28 + 14}
-                      x2={x}
-                      y2={toRow * 28 + 14}
-                      className="agents-timeline-arrow"
-                      data-testid="agents-timeline-arrow"
-                    />
-                  );
-                })}
-              </svg>
-            </div>
-          )}
+          ) : graph.nodes.length > 0 ? (
+            <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
+              <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
+            </aside>
+          ) : null}
         </div>
-
-        {showPanel && selectedNode ? (
-          <aside className="agents-panel" data-testid="agents-panel">
-            <h2>{selectedNode.title || selectedNode.role || selectedNode.sid}</h2>
-            <div className="agents-panel-meta">
-              <span>
-                {t("vendor")}: <span className={vendorDotClass(selectedNode.vendor)} /> {selectedNode.vendor}
-              </span>
-              <span>
-                {t("model")}: {selectedNode.model || "—"}
-              </span>
-              <span>
-                {t("host")}: {selectedNode.host}
-              </span>
-              <span>
-                {t("parentSession")}: {selectedNode.parent_sid || t("noParent")}
-              </span>
-              <span>
-                {t("depth")}: {selectedNode.depth}
-              </span>
-              <span>
-                {t("cost")}: {selectedNode.cost_usd != null ? `$${selectedNode.cost_usd.toFixed(4)}` : "—"}
-              </span>
-              <span>{relativeTime(lang, selectedNode.last_active)}</span>
-            </div>
-
-            <h3>{t("teamActivity")}</h3>
-            <p className="agents-activity-line" data-testid="agents-activity-line">
-              {pulsing.has(selectedNode.sid) ? renderFold(activityFold) : t("teamIdle")}
-            </p>
-
-            <h3>{t("teamRecentTurns")}</h3>
-            <div className="agents-turns" data-testid="agents-turns">
-              {(historyBySid[selectedNode.sid] ?? []).length === 0 ? (
-                <p style={{ fontSize: 12.5, color: "var(--text-faint)" }}>—</p>
-              ) : (
-                (historyBySid[selectedNode.sid] ?? []).map((ev) => (
-                  <div key={ev.turn_id} className="agents-turn-row">
-                    <span className="mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>
-                      {ev.ts.slice(0, 16).replace("T", " ")}
-                    </span>
-                    <span style={{ fontSize: 12.5, color: "var(--text-muted)" }}>
-                      {(ev.assistant || ev.user || "").slice(0, 120)}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
-
-            <button
-              type="button"
-              className="btn primary mini"
-              data-testid="agents-open-chat"
-              onClick={() => onOpenChat?.(selectedNode.sid)}
-            >
-              {t("teamOpenChat")}
-            </button>
-          </aside>
-        ) : showPanel && graph.nodes.length > 0 ? (
-          <aside className="agents-panel agents-panel-empty" data-testid="agents-panel-empty">
-            <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("teamSelectHint")}</p>
-          </aside>
-        ) : null}
-      </div>
+      )}
     </section>
   );
 }

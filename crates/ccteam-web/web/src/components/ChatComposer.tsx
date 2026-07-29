@@ -328,7 +328,6 @@ export function ChatComposer({
   modelLabel,
   locked,
   allowedVendors,
-  isAdmin,
   topSlot,
   sendTestId = "composer-send",
   uploadSlug,
@@ -360,7 +359,6 @@ export function ChatComposer({
   /** Vendors installed on the target host (Home 主机绑定 vendor) — the menu
    *  only offers these. Omit to offer the full registry. */
   allowedVendors?: VendorId[];
-  isAdmin: boolean;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
   sendTestId?: string;
@@ -711,7 +709,7 @@ export function ChatComposer({
   // plus a colored dot left the harness unreadable (owner feedback).
   const modelText = modelLabel ?? draft.model;
   const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
-  const protocols = visibleProtocols(draft.vendor, isAdmin);
+  const protocols = visibleProtocols(draft.vendor);
   const sendable = scheduleMode
     ? !!text.trim() && !!resolvedScheduleWhen
     : !!text.trim() || attachments.length > 0;

@@ -1,5 +1,6 @@
 // v0.8.18 柱1 — REST client for the host-keyed agent report
-// (`GET /api/v1/hosts` + `/{host}` + `POST .../register-mcp`).
+// (`GET /api/v1/hosts` + `/{host}` + `POST .../register-mcp` +
+// `DELETE /{host}`, the last added TEAM-5/TEAM-6 for satellite removal).
 //
 // Backend SoT: `crates/ccteam-web/src/routes/hosts.rs`. Auth + error mapping
 // mirror `statusApi` / `sessionsApi`:
@@ -33,6 +34,9 @@ export interface HostSummary {
   status?: string;
   agent_count: number;
   agents_ready: number;
+  /** Unix seconds of the last satellite heartbeat — the age anchor behind the
+   *  roster's "已离线 N 天" hint. Absent for `local` (always online). */
+  last_heartbeat_unix?: number;
 }
 
 /** `GET /api/v1/hosts` response (`HostsResponse`). */
@@ -109,6 +113,18 @@ export function registerMcp(host: string, vendor?: string): Promise<RegisterMcpR
   return postJson<RegisterMcpResult>(`/api/v1/hosts/${encodeURIComponent(host)}/register-mcp${q}`);
 }
 
+/** `DELETE /api/v1/hosts/{host}` — deregister a satellite (`routes/hosts.rs`
+ *  `handle_host_remove`, TEAM-5). `local` is refused 400 server-side; an
+ *  ONLINE host is refused 409 unless `force: true` (an offline host never
+ *  needs it — the backend's own online check makes passing it harmless
+ *  either way). Returns `{host}` on success; non-2xx surfaces the server's
+ *  `{error}` body text when present (so a 409/404/400 reads as the real
+ *  reason, not just `HTTP 409`). */
+export function deleteHost(host: string, opts?: { force?: boolean }): Promise<{ host: string }> {
+  const q = opts?.force ? "?force=true" : "";
+  return deleteJson<{ host: string }>(`/api/v1/hosts/${encodeURIComponent(host)}${q}`);
+}
+
 async function getJson<T>(url: string): Promise<T> {
   let res: Response;
   try {
@@ -122,6 +138,35 @@ async function getJson<T>(url: string): Promise<T> {
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as T;
+}
+
+async function deleteJson<T>(url: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "DELETE",
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+  } catch (e) {
+    throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
+  }
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
+}
+
+/** Lift the server's `{error}` body text for a non-2xx (falls back to
+ *  `HTTP <status>` when the body isn't JSON or carries no `error` string). */
+async function errorMessage(res: Response): Promise<string> {
+  const fallback = `HTTP ${res.status}`;
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body.error === "string" && body.error.trim()) return body.error;
+    return fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 async function postJson<T>(url: string, body?: unknown): Promise<T> {

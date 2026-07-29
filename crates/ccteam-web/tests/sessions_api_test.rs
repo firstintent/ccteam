@@ -402,23 +402,39 @@ async fn read_sse_seq_until(resp: reqwest::Response, pred: impl Fn(&str) -> bool
 /// approval, not just reconnects". A BRAND-NEW SSE connection (no
 /// `Last-Event-ID` at all) while an approval is outstanding for that sid must
 /// still render the approve/deny prompt.
+///
+/// The session is CREATED first (the same fixture pattern as every other
+/// gateway-attached test here): `gate_sid` resolves sid → project before
+/// serving the stream and fails closed on a sid it can't place (074e284f), so
+/// the sid must exist as a real session — as on a live daemon, where a HITL
+/// prompt only ever fires on a spawned session.
 #[tokio::test]
 async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
-    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
-        factory,
-        "demo",
-        paths.projects_root.join("demo"),
-    );
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
-    seed_pending_approval(&gateway, "s1", "ptok").await;
 
-    let addr = spawn_server(AppState::new(paths).with_gateway(gateway)).await;
-    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+    let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    seed_pending_approval(&gateway, &sid, "ptok").await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/{sid}/events"))
         .await
         .expect("sse get");
     assert_eq!(resp.status(), 200);
@@ -447,22 +463,35 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
 async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
         Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
-    let gateway = ccteam_im::gateway::Gateway::new_with_factory(
-        factory,
-        "demo",
-        paths.projects_root.join("demo"),
-    );
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
     let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
 
-    // Connection #1 observes the first HITL prompt for s1 and records its
-    // seq (the SSE frame's `id:` line) as the watermark it'll reconnect
+    // The sid under test is a REAL spawned session (see the fresh-connect
+    // test above: `gate_sid` fails closed on a sid it can't resolve to a
+    // project).
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Connection #1 observes the first HITL prompt for the sid and records
+    // its seq (the SSE frame's `id:` line) as the watermark it'll reconnect
     // with.
-    seed_pending_approval(&gateway, "s1", "first").await;
-    let resp1 = reqwest::get(format!("http://{addr}/api/v1/sessions/s1/events"))
+    seed_pending_approval(&gateway, &sid, "first").await;
+    let resp1 = reqwest::get(format!("http://{addr}/api/v1/sessions/{sid}/events"))
         .await
         .unwrap();
     let seq1 = read_sse_seq_until(resp1, |d| d.contains("first"))
@@ -476,12 +505,12 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     // outstanding per sid at a time, matching the real HITL flow).
     let pending = gateway.lock().await.pending_handle();
     pending.lock().await.take_by_token("first");
-    seed_pending_approval(&gateway, "s1", "second").await;
+    seed_pending_approval(&gateway, &sid, "second").await;
 
     // Connection #2 reconnects naming seq1 as its watermark: it must see the
     // second approval (the gap), not a re-delivery of the first.
     let resp2 = reqwest::get(format!(
-        "http://{addr}/api/v1/sessions/s1/events?last_event_id={seq1}"
+        "http://{addr}/api/v1/sessions/{sid}/events?last_event_id={seq1}"
     ))
     .await
     .unwrap();
@@ -834,6 +863,54 @@ async fn rename_session_over_http_happy_path_and_validation() {
         .unwrap();
     assert_eq!(live.as_array().unwrap()[0]["title"], "Fix the login bug");
 
+    // Every rename reports what the VENDOR's own title surface did with it,
+    // so the UI never implies a sync that didn't happen. This fake vendor has
+    // no title API (like the ACP vendors) → `unsupported`.
+    assert_eq!(body["vendor"], "claude");
+    assert_eq!(body["vendor_sync"]["state"], "unsupported");
+    assert!(body["previous"].is_null(), "first rename replaced nothing");
+
+    // Renaming again reports what it replaced (the web toast shows it).
+    let again: Value = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "Fix the logout bug"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["previous"], "Fix the login bug");
+    assert_eq!(again["title"], "Fix the logout bug");
+
+    // A STOPPED session renames exactly like a live one — meta.json outlives
+    // the live map, and the rail offers rename on history rows.
+    let stopped = client
+        .post(format!("{base}/sessions/{sid}/stop"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), 200);
+    let after_stop = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .json(&serde_json::json!({"title": "archived work"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_stop.status(),
+        200,
+        "a stopped session must still be renameable"
+    );
+    assert_eq!(
+        after_stop.json::<Value>().await.unwrap()["title"],
+        "archived work"
+    );
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["title"], "archived work");
+    assert_eq!(meta["title_source"], "user");
+
     // Unknown sid → 404.
     let unknown = client
         .patch(format!("{base}/sessions/s999"))
@@ -916,6 +993,37 @@ async fn rename_session_denies_cross_tenant_project() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
+
+    // Cross-user fix (2026-07-28) — the ADMIN is gated by the same rule. `can_see_owner` keeps the
+    // operator out of a tenant's PROJECT (`/projects/demo/*` 404s below), but
+    // `gate_sid` used to short-circuit on `is_admin`, leaving every by-sid door
+    // (read history/status/events, POST turn, stop, rename) open on exactly the
+    // resources the project door refuses. One door, one policy.
+    for (method, path) in [
+        ("GET", format!("{base}/sessions/{sid}")),
+        ("GET", format!("{base}/sessions/{sid}/status")),
+        ("GET", format!("{base}/projects/demo/sessions")),
+    ] {
+        let r = client
+            .request(method.parse().unwrap(), &path)
+            .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "admin must not reach {path}");
+    }
+    let admin_rename = client
+        .patch(format!("{base}/sessions/{sid}"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"title": "operator override"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_rename.status(),
+        404,
+        "admin must not drive a tenant's session"
+    );
 }
 
 // ── composer attachments (uploads + skills + turn weaving) ─────────────────────

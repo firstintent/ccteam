@@ -8,16 +8,23 @@
 //! (every session that ever existed, on disk, per project) ⋈
 //! [`ccteam_im::gateway::Gateway::session_views`] (which of those are
 //! currently tracked in memory ⇒ `"live"`) ⋈
+//! [`ccteam_harness::HarnessAdapter::thread_status`] per live sid (resolved
+//! under the same lock, awaited after it drops — the SAME statusline source
+//! `GET /sessions/{sid}/status` serves, via
+//! [`super::sessions_api::resolved_thread_status`] ⇒ `nodes[].model`) ⋈
 //! [`ccteam_im::gateway::Gateway::armed_delegation_watch_sids`] (a
 //! best-effort seed for `edges[].active`, corrected live by the SSE
 //! `dispatched`/`completed` frames — see `AgentsView`'s reducer).
 //!
-//! **ACL**: admin sees every project; a tenant sees only the projects
+//! **ACL**: every identity sees exactly the projects
 //! [`crate::auth::Identity::can_see_owner`] allows (mirrors the `/projects`
 //! collection filter, `api_v1::build_projects`) — both for the graph snapshot
-//! AND for every SSE frame (a frame with no resolvable `slug` is dropped for
-//! a tenant, fail-closed; only an admin sees it). `?slug=` narrows the graph
-//! to one project (still gated by [`super::api_v1::can_see_project`]).
+//! AND for every SSE frame. The operator is NOT exempt: `can_see_owner` keeps
+//! it out of a tenant's projects, so the 2026-07-28 cross-user fix stopped streaming those sessions'
+//! live answers into the team view. The two differ only on an unattributed
+//! frame (no resolvable `slug`): the operator still sees it, a tenant fails
+//! closed. `?slug=` narrows the graph to one project (still gated by
+//! [`super::api_v1::can_see_project`]).
 //!
 //! **Status honesty**: a node is `"live"` when the gateway currently tracks
 //! it (in the in-memory session map) and `"idle"` otherwise (its `meta.json`
@@ -59,9 +66,12 @@ pub struct AgentNode {
     pub slug: String,
     pub role: String,
     pub vendor: String,
-    /// Not tracked on `meta.json`/`SessionView` today (spawn-time model
-    /// override isn't persisted) — always `null`. Reserved wire shape for
-    /// when it is.
+    /// The model the session is running RIGHT NOW — for `"live"` nodes only,
+    /// read from the same per-session statusline source as
+    /// `GET /api/v1/sessions/{sid}/status` (`thread_status`, so mid-session
+    /// model switches are reflected). `null` for idle nodes (nothing live to
+    /// report — the spawn-time `meta.json` model override is deliberately not
+    /// echoed) and for live sessions with no statusline yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub host: String,
@@ -144,12 +154,16 @@ fn normalize_host(host: &str) -> String {
 
 /// Build the graph snapshot for exactly the given (already ACL-filtered)
 /// `slugs`, from a live-session-view lookup + armed-watch set the caller
-/// resolved under the gateway lock. Pure over its inputs (`project_dir` +
-/// these maps) so it's unit-testable without a server.
+/// resolved under the gateway lock, plus `live_models` — the per-live-sid
+/// statusline model the caller read AFTER dropping that lock (only live sids
+/// ever appear in it, so an idle node's `model` is honestly `None`). Pure
+/// over its inputs (`project_dir` + these maps) so it's unit-testable
+/// without a server.
 pub(crate) fn build_agents_graph(
     project_dir_for: impl Fn(&str) -> std::path::PathBuf,
     slugs: &[String],
     live_by_sid: &HashMap<String, SessionView>,
+    live_models: &HashMap<String, String>,
     armed_watches: &HashSet<String>,
 ) -> AgentsGraphResponse {
     let mut nodes = Vec::new();
@@ -169,7 +183,7 @@ pub(crate) fn build_agents_graph(
                 slug: slug.clone(),
                 role: m.role.clone(),
                 vendor: ccteam_im::delegation::vendor_key(m.vendor).to_string(),
-                model: None,
+                model: live_models.get(&m.sid).cloned(),
                 host,
                 status: status.to_string(),
                 parent_sid: m.parent_sid.clone(),
@@ -235,34 +249,77 @@ pub(crate) async fn handle_agents_graph(
         Some(slug) => vec![slug.clone()],
         None => visible_project_slugs(&app, &identity),
     };
-    let (live_by_sid, armed_watches): (HashMap<String, SessionView>, HashSet<String>) = {
+    let (live_by_sid, armed_watches, live_handles) = {
         let guard = gw.lock().await;
-        let live = guard
+        let live: HashMap<String, SessionView> = guard
             .session_views()
             .into_iter()
             .map(|v| (v.sid.clone(), v))
             .collect();
         let armed = guard.armed_delegation_watch_sids();
-        (live, armed)
+        // `(adapter, thread)` clones for every live sid, resolved under this
+        // same single lock acquisition — the `thread_status` I/O below runs
+        // only after the guard drops (the status endpoint's lock-drop
+        // discipline).
+        let handles: Vec<_> = live
+            .keys()
+            .filter_map(|sid| {
+                guard
+                    .session_status_handle(sid)
+                    .map(|(adapter, thread)| (sid.clone(), adapter, thread))
+            })
+            .collect();
+        (live, armed, handles)
     };
+    // The live-model join: N per-live-sid statusline reads per snapshot (the
+    // SPA refreshes at 15s), through the SAME helper `GET
+    // /sessions/{sid}/status` serves — one source of truth for what a
+    // session is running.
+    let mut live_models: HashMap<String, String> = HashMap::new();
+    for (sid, adapter, thread) in live_handles {
+        let status = super::sessions_api::resolved_thread_status(adapter, thread, &sid).await;
+        if let Some(model) = status.model {
+            live_models.insert(sid, model);
+        }
+    }
     let paths = app.paths.clone();
     let graph = build_agents_graph(
         |slug| paths.project_dir(slug),
         &slugs,
         &live_by_sid,
+        &live_models,
         &armed_watches,
     );
     Json(graph).into_response()
 }
 
-/// Whether `ev` is visible to `identity` given its already-resolved visible
-/// slug set (`None` for admin ⇒ everything visible; `Some(set)` for a tenant
-/// ⇒ only a frame whose `slug` is in `set` — fail-closed: a frame with no
-/// `slug` at all is dropped for a tenant).
-fn event_visible(ev: &GatewayEvent, visible: &Option<HashSet<String>>) -> bool {
-    match visible {
-        None => true,
-        Some(set) => ev.slug.as_deref().is_some_and(|s| set.contains(s)),
+/// Which live frames an SSE subscriber may receive, resolved once per stream.
+///
+/// Cross-user fix (2026-07-28) — the admin used to subscribe with NO filter, so the team view
+/// streamed every tenant's answers/progress verbatim to the operator, on
+/// exactly the projects `can_see_owner` refuses to even list. Both identities
+/// now filter on the same visible-project set; they differ only in what to do
+/// with an UNATTRIBUTED frame (no `slug`, e.g. a HITL prompt whose context
+/// carries no project): the operator keeps seeing those, a tenant fails closed.
+#[derive(Clone)]
+struct EventAcl {
+    visible: HashSet<String>,
+    allow_unattributed: bool,
+}
+
+impl EventAcl {
+    fn resolve(app: &AppState, identity: &Identity) -> Self {
+        Self {
+            visible: visible_project_slugs(app, identity).into_iter().collect(),
+            allow_unattributed: identity.is_admin,
+        }
+    }
+}
+
+fn event_visible(ev: &GatewayEvent, acl: &EventAcl) -> bool {
+    match ev.slug.as_deref() {
+        Some(slug) => acl.visible.contains(slug),
+        None => acl.allow_unattributed,
     }
 }
 
@@ -312,11 +369,7 @@ pub(crate) async fn handle_agents_events(
 ) -> Response {
     let last_id = parse_last_event_id(&headers, &query);
     let rx = app.gateway.as_ref().map(|_| app.global_ring.subscribe());
-    let visible: Option<HashSet<String>> = if identity.is_admin {
-        None
-    } else {
-        Some(visible_project_slugs(&app, &identity).into_iter().collect())
-    };
+    let visible = EventAcl::resolve(&app, &identity);
     let stream = match rx {
         Some(rx) => {
             let catchup: Vec<Event> = match last_id {
@@ -428,6 +481,7 @@ mod tests {
             },
             &["demo".to_string()],
             &live,
+            &HashMap::new(),
             &armed,
         );
         assert_eq!(graph.nodes.len(), 2);
@@ -483,9 +537,79 @@ mod tests {
             |_| dir.clone(),
             &["demo".to_string()],
             &live,
+            &HashMap::new(),
             &HashSet::new(),
         );
         assert_eq!(graph.nodes[0].status, "live");
+    }
+
+    /// TEAM-4 — `nodes[].model` comes from the caller's post-lock statusline
+    /// join (`live_models`), never from `meta.json`: the live sid carries its
+    /// reported model, the idle sid stays honestly `None`.
+    #[test]
+    fn build_agents_graph_joins_live_model_only_for_live_nodes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        meta(
+            &dir,
+            "s1",
+            "brain",
+            ccteam_harness::AgentVendor::Claude,
+            None,
+            0,
+        );
+        meta(
+            &dir,
+            "s2",
+            "worker",
+            ccteam_harness::AgentVendor::Grok,
+            Some("s1"),
+            1,
+        );
+        let mut live: HashMap<String, SessionView> = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            SessionView {
+                sid: "s1".to_string(),
+                project: "demo".to_string(),
+                role: "brain".to_string(),
+                vendor: "claude".to_string(),
+                permission_mode: "skip".to_string(),
+                protocol: "stream-json".to_string(),
+                host: "local".to_string(),
+                current: false,
+                status: "live".to_string(),
+                last_activity_seconds: None,
+                created_at: String::new(),
+                last_active: String::new(),
+                title: None,
+                turn_count: 0,
+                cost_usd: None,
+                tokens_total: None,
+                model: None,
+                waiting_approval: false,
+                parent_sid: None,
+                delegation_depth: 0,
+            },
+        );
+        let live_models: HashMap<String, String> = [("s1".to_string(), "fable-5".to_string())]
+            .into_iter()
+            .collect();
+        let graph = build_agents_graph(
+            |_| dir.clone(),
+            &["demo".to_string()],
+            &live,
+            &live_models,
+            &HashSet::new(),
+        );
+        let by_sid = |sid: &str| graph.nodes.iter().find(|n| n.sid == sid).unwrap();
+        assert_eq!(by_sid("s1").model.as_deref(), Some("fable-5"));
+        assert_eq!(
+            by_sid("s2").model,
+            None,
+            "an idle node has nothing live to report"
+        );
     }
 
     #[test]
@@ -500,8 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn event_visible_admin_sees_everything_including_no_slug() {
-        let ev = GatewayEvent {
+    fn event_visible_admin_keeps_unattributed_but_not_a_tenants_project() {
+        let mut ev = GatewayEvent {
             id: "e".into(),
             channel: String::new(),
             chat_id: String::new(),
@@ -513,7 +637,25 @@ mod tests {
             sid: None,
             slug: None,
         };
-        assert!(event_visible(&ev, &None));
+        // The operator's ACL: its own visible projects + unattributed frames
+        // (a HITL prompt carries no slug).
+        let admin = EventAcl {
+            visible: ["adminproj".to_string()].into_iter().collect(),
+            allow_unattributed: true,
+        };
+        assert!(
+            event_visible(&ev, &admin),
+            "unattributed frames still shown"
+        );
+        ev.slug = Some("adminproj".to_string());
+        assert!(event_visible(&ev, &admin));
+        // Cross-user fix (2026-07-28) — but NOT a tenant's project. The admin used to subscribe
+        // unfiltered, so the team view streamed every tenant's live answers.
+        ev.slug = Some("tenantproj".to_string());
+        assert!(
+            !event_visible(&ev, &admin),
+            "a tenant's session events must not reach the operator's team view"
+        );
     }
 
     #[test]
@@ -530,7 +672,10 @@ mod tests {
             sid: None,
             slug: None,
         };
-        let visible = Some(["demo".to_string()].into_iter().collect());
+        let visible = EventAcl {
+            visible: ["demo".to_string()].into_iter().collect(),
+            allow_unattributed: false,
+        };
         assert!(!event_visible(&ev, &visible));
     }
 
@@ -548,7 +693,10 @@ mod tests {
             sid: None,
             slug: Some("demo".to_string()),
         };
-        let visible = Some(["demo".to_string()].into_iter().collect());
+        let visible = EventAcl {
+            visible: ["demo".to_string()].into_iter().collect(),
+            allow_unattributed: false,
+        };
         assert!(event_visible(&ev, &visible));
         ev.slug = Some("other".to_string());
         assert!(!event_visible(&ev, &visible));

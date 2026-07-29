@@ -5,7 +5,7 @@
 //! daemon-agnostic: tests drive it with a fake [`HarnessAdapter`], and
 //! the daemon can wire the same state machine into real transports.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,8 +21,8 @@ use ccteam_harness::{
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
     Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TurnDisposition,
-    TurnInput, TurnRouting,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
+    TitleSync, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -142,14 +142,14 @@ struct GatewaySession {
     /// v0.8.19 — `/status` fleet-health tracking. When a real **Turn** is
     /// submitted (the Turn branch of `submit_resolved`, NOT a directive) this
     /// is set to `Some(Instant::now())`; the event pump clears it to `None` on
-    /// `ThreadEvent::TurnCompleted`. `/status` reads it to know whether a turn
+    /// every terminal canonical boundary. `/status` reads it to know whether a turn
     /// is in flight (→ 🔵 working, showing `now - start`) or the session is
     /// idle (`None` → 🟢). Shared (`Arc<Mutex>`) so the detached pump clears
     /// the same cell the submit path set. PULL-only signal — nothing acts on it
     /// except the `/status` render.
     turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
     /// v0.9 T5 — set when a user turn is mirrored while a prior turn is still
-    /// in flight (mid-turn steer). Cleared on `TurnCompleted` after the
+    /// in flight (mid-turn steer). Cleared on the terminal boundary after the
     /// experience writer reads it. Shared with `mirror_user_turn` + pump.
     steered_this_turn: Arc<AtomicBool>,
     /// v0.8.19 — timestamp of the most recent pump event for this session
@@ -247,6 +247,43 @@ struct GatewayRouteTemplate {
     handle: String,
 }
 
+/// How a platform's operator roster was configured. `Named` lists the owner's
+/// chats; `Wildcard` (`"*"`) is an explicit "anyone may talk", which names
+/// nobody and therefore grants nobody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorBinding {
+    Named(BTreeSet<String>),
+    Wildcard,
+}
+
+/// What [`Gateway::bind_operator_allowlist`] made of an allowlist — the daemon
+/// turns this into a startup warning when a reachable bot names no owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorBindingKind {
+    /// Concrete chat ids: those chats are the operator.
+    Named,
+    /// `"*"` — the bot is open, so nobody is the operator through it.
+    Wildcard,
+    /// No allowlist at all (pre-configuration / open mode): the legacy
+    /// single-operator assumption still applies.
+    Unconfigured,
+}
+
+/// Who a frontend chat speaks for. Resolved once, in [`Gateway::principal`],
+/// and consumed by every ACL decision — the IM twin of the web
+/// [`crate::auth::Identity`]. `Guest` is the fail-closed default: an
+/// unrecognised chat is never the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Principal {
+    /// The box owner: the admin web console, or a chat NAMED in a global bot's
+    /// operator roster.
+    Operator,
+    /// A registered per-user tenant (`user:<id>`), via its own bot or web token.
+    Tenant(String),
+    /// Reached a bot but is named nowhere. Owns only what it creates.
+    Guest(String),
+}
+
 /// In-memory v8.1 route table for one daemon process.
 pub struct Gateway {
     adapter_factory: Arc<
@@ -269,6 +306,18 @@ pub struct Gateway {
     /// cold-start rebuild from their `meta.json`. Drained once on startup.
     restore_pending: Vec<String>,
     projects: BTreeMap<String, PathBuf>,
+    /// The chats that speak for the box OWNER, per platform (`"telegram"` →
+    /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
+    /// credential allowlist by the daemon (see [`Self::bind_operator_chats`]).
+    ///
+    /// The operator is a NAMED principal: reaching a bot never confers it.
+    /// Before this, `project_acl_identity` returned admin for every chat that
+    /// was not a tenant bot, so the transport allowlist silently doubled as the
+    /// privilege grant — and an OPEN bot (empty list, or Lark's `"*"` wildcard)
+    /// handed operator rights to anyone who found it. An unnamed chat is a
+    /// [`Principal::Guest`] instead: it owns only what it creates and sees no
+    /// project, so it cannot reach anything of the owner's or a tenant's.
+    operator_chats: BTreeMap<String, OperatorBinding>,
     current_project: BTreeMap<ChatKey, String>,
     /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
     /// detached event pumps can read it to label *out-of-band* answers/errors
@@ -508,12 +557,13 @@ pub enum GatewayEventKind {
         reason: Option<String>,
     },
     /// v0.9.2 — a session lifecycle transition for live web surfaces. These
-    /// frames are broadcast-only (no IM delivery); the durable state twin is a
-    /// progress event such as `session_evicted`.
+    /// frames are broadcast-only (no IM delivery); the durable state twin is
+    /// whatever already persisted the change — a progress event
+    /// (`session_evicted`) or `meta.json` itself (`renamed`).
     SessionLifecycle {
-        /// Lifecycle state, currently `evicted`.
+        /// Lifecycle state: `evicted` | `renamed`.
         state: String,
-        /// Machine-readable cause, currently `capacity`.
+        /// Machine-readable cause: `capacity` (evicted) | `user` (renamed).
         reason: String,
     },
     /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
@@ -863,6 +913,25 @@ pub struct SessionResolve {
     pub project: String,
     /// Absolute working dir hosting `.ccteam/chat/<sid>/turns.jsonl`.
     pub project_dir: PathBuf,
+}
+
+/// What [`Gateway::rename_session`] hands its callers — everything both
+/// frontends need to render an honest receipt without re-deriving anything:
+/// the title actually stored (rule-truncated), what it replaced, and what the
+/// VENDOR did with it. Kept as one value so the IM receipt and the web PATCH
+/// response describe the same rename in the same terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRename {
+    /// The renamed session's sid.
+    pub sid: String,
+    /// The cleaned title actually persisted to `meta.json`.
+    pub title: String,
+    /// The title this replaced; `None` when the session had none yet.
+    pub previous: Option<String>,
+    /// Vendor, stringified — the subject of `vendor_sync`'s message.
+    pub vendor: String,
+    /// Whether the vendor's own title surface took the new title.
+    pub vendor_sync: TitleSync,
 }
 
 /// v0.9.0 W1 (F1) — the authenticated identity of a `session_*` MCP caller,
@@ -1218,9 +1287,9 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/rename",
-        arg_hint: Some("<title>"),
-        help: "rename the current session's title (rule-based, no LLM)",
-        in_menu: false,
+        arg_hint: Some("[<id>] <title>"),
+        help: "rename a session (bare = current; syncs the vendor's own title)",
+        in_menu: true,
     },
     GatewayCommandSpec {
         name: "/newproject",
@@ -1342,6 +1411,7 @@ impl Gateway {
             next_scheduled_path: None,
             restore_pending: Vec::new(),
             projects,
+            operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
@@ -2308,7 +2378,7 @@ impl Gateway {
                 ) {
                     protocol = SessionProtocol::Acp;
                 }
-                let project = self.current_project_for(chat);
+                let project = self.require_current_project(chat)?;
                 let handle = role.clone();
                 let outcome = self
                     .start_session(
@@ -2338,21 +2408,42 @@ impl Gateway {
                 // contain spaces, so this must NOT be whitespace-split.
                 let mut it = trimmed.splitn(2, char::is_whitespace);
                 let _cmd = it.next();
-                let raw_title = it.next().unwrap_or("").trim();
-                if raw_title.is_empty() {
-                    return Err(anyhow!("用法: /rename <新标题>(重命名当前会话)"));
+                let rest = it.next().unwrap_or("").trim();
+                if rest.is_empty() {
+                    return Err(anyhow!(
+                        "用法: /rename [<sid>] <新标题>(省略 sid = 重命名当前会话)"
+                    ));
                 }
-                let sid = self
-                    .current_session
-                    .read()
-                    .unwrap()
-                    .get(chat)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!("/rename 需要一个活动会话:先 /new 或发条消息再重命名。")
-                    })?;
-                let title = self.rename_session(&sid, raw_title)?;
-                Ok(Some(format!("已重命名 {sid} → {title}")))
+                // `[<sid>] <title>` — same leading-id convention as
+                // /stop /use /interrupt. Splitting only when a REMAINDER
+                // follows keeps `/rename s3` meaning "title the current
+                // session s3", not "rename s3 to nothing".
+                let (sid, raw_title) = match split_leading_sid(rest) {
+                    Some((sid, title)) => (sid.to_string(), title),
+                    None => {
+                        let sid = self
+                            .current_session
+                            .read()
+                            .unwrap()
+                            .get(chat)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "/rename 需要一个活动会话:先 /new 或发条消息,\
+                                     也可以 /rename <sid> <新标题> 指名重命名。"
+                                )
+                            })?;
+                        (sid, rest)
+                    }
+                };
+                // Own-only, live or stopped (a history session is renameable
+                // too) — same visibility rule every other sid-addressed
+                // command applies.
+                if !self.chat_can_access_sid(chat, &sid) {
+                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                }
+                let renamed = self.rename_session(&sid, raw_title).await?;
+                Ok(Some(render_rename_receipt(&renamed)))
             }
             "/use" => {
                 let arg = parts
@@ -2396,7 +2487,7 @@ impl Gateway {
                 let accessible = self
                     .sessions
                     .get(&sid)
-                    .map(|s| Self::chat_can_access(chat, s))
+                    .map(|s| self.chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
@@ -2433,7 +2524,7 @@ impl Gateway {
                 let accessible = self
                     .sessions
                     .get(&sid)
-                    .map(|s| Self::chat_can_access(chat, s))
+                    .map(|s| self.chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
@@ -2507,7 +2598,7 @@ impl Gateway {
                 // newline-separated slug list as an inline reply.
                 if Self::channel_supports_buttons(&chat.channel) {
                     let options = self.project_switch_options(chat);
-                    let cur = self.current_project_for(chat);
+                    let cur = self.current_project_label(chat);
                     self.emit_list_options(
                         chat,
                         format!("📁 项目(点击切换,✓ = 当前 {cur}):"),
@@ -2520,7 +2611,7 @@ impl Gateway {
             }
             "/help" => Ok(Some(format!(
                 "📁 当前项目: {}\n\n{}",
-                self.current_project_for(chat),
+                self.current_project_label(chat),
                 render_help()
             ))),
             _ => Ok(None),
@@ -2631,10 +2722,10 @@ impl Gateway {
 
     fn chat_can_access_scheduled_entry(&self, chat: &ChatKey, entry: &ScheduledEntry) -> bool {
         if let Some(session) = self.sessions.get(&entry.item.sid) {
-            return Self::chat_can_access(chat, session);
+            return self.chat_can_access(chat, session);
         }
         read_session_meta(&entry.project_dir, &entry.item.sid)
-            .map(|meta| Self::owner_identity_visible(chat, &meta.owner))
+            .map(|meta| self.owner_identity_visible(chat, &meta.owner))
             .unwrap_or(false)
     }
 
@@ -2680,7 +2771,7 @@ impl Gateway {
         let live_session = self
             .sessions
             .get(id)
-            .filter(|s| Self::chat_can_access(chat, s));
+            .filter(|s| self.chat_can_access(chat, s));
         if live_session.is_none() {
             // v0.8.21 — try to cold-resume a stopped session from meta.json.
             // ACL pre-check: peek at the stored owner BEFORE spawning so we
@@ -2688,7 +2779,7 @@ impl Gateway {
             let acl_ok = self
                 .find_meta_for_sid(id)
                 .ok()
-                .map(|(_, _, meta)| Self::owner_identity_visible(chat, &meta.owner))
+                .map(|(_, _, meta)| self.owner_identity_visible(chat, &meta.owner))
                 .unwrap_or(false);
             if !acl_ok {
                 return Ok(format!("unknown session for this chat: {id}"));
@@ -2771,20 +2862,28 @@ impl Gateway {
     /// project. This is the IM twin of `build_projects`, so IM and web never
     /// diverge on who sees which project (the multi-user isolation contract).
     ///
-    /// Falls back to the UNFILTERED in-memory routing cache only when
-    /// `project_paths` isn't wired (unit tests without `enable_project_creation`),
-    /// where no persisted owner is available; production always has the paths.
+    /// The candidate set is the UNION of the on-disk catalog and the in-memory
+    /// routing registry, so this agrees with [`Self::can_see_project`] (which
+    /// authorizes off `self.projects`) by construction — the list and the door
+    /// used to disagree, and now that the list also drives project RESOLUTION
+    /// (`current_project_for`), a project you may `/cd` into but that the
+    /// catalog hasn't materialized would have read as "you have no project".
+    /// Ownership comes from the persisted `ProjectState.owner`; with no
+    /// `project_paths` wired (unit tests) every project reads as unowned, i.e.
+    /// operator-visible and tenant-hidden — the same fail-safe as the web ACL.
     fn visible_project_slugs(&self, chat: &ChatKey) -> Vec<String> {
+        let mut slugs: BTreeSet<String> = self.projects.keys().cloned().collect();
         if let Some(paths) = &self.project_paths {
             if let Ok(summaries) = ccteam_core::collect_projects(paths) {
-                return summaries
-                    .iter()
-                    .filter(|s| Self::chat_can_see_project_owner(chat, s.state.owner.as_deref()))
-                    .map(|s| s.state.slug.clone())
-                    .collect();
+                slugs.extend(summaries.into_iter().map(|s| s.state.slug));
             }
         }
-        self.projects.keys().cloned().collect()
+        slugs
+            .into_iter()
+            .filter(|slug| {
+                self.chat_can_see_project_owner(chat, self.project_owner(slug).as_deref())
+            })
+            .collect()
     }
 
     /// Whether `chat` may see/address the project `slug` — existence AND
@@ -2794,7 +2893,7 @@ impl Gateway {
     /// slug (visibility alone isn't enough — addressing must be gated too).
     fn can_see_project(&self, chat: &ChatKey, slug: &str) -> bool {
         self.projects.contains_key(slug)
-            && Self::chat_can_see_project_owner(chat, self.project_owner(slug).as_deref())
+            && self.chat_can_see_project_owner(chat, self.project_owner(slug).as_deref())
     }
 
     /// The persisted `ProjectState.owner` of `slug` (`None` when unset or the
@@ -2811,7 +2910,7 @@ impl Gateway {
     /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
     /// dropped (a pathologically long slug still shows in the text list).
     fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat);
+        let cur = self.current_project_for(chat).unwrap_or_default();
         let mut options: Vec<MessageOption> = self
             .visible_project_slugs(chat)
             .into_iter()
@@ -2842,11 +2941,11 @@ impl Gateway {
     /// numeric-sid descending) so the buttons track the text list. Ended
     /// (history) sessions switch only via their text `→ /use <sid>` hint.
     fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat);
+        let cur = self.current_project_for(chat).unwrap_or_default();
         let mut visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| Self::chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access(chat, s))
             .filter(|s| all || s.project == cur)
             .collect();
         visible.sort_by(|a, b| {
@@ -3055,7 +3154,7 @@ impl Gateway {
             handles.dedup();
             return Err(anyhow!(format_ambiguous_dm_reply(&handles)));
         }
-        let project = self.current_project_for(chat);
+        let project = self.require_current_project(chat)?;
         let plan = self.plan_new_session(
             chat.clone(),
             project,
@@ -4195,6 +4294,23 @@ impl Gateway {
                                 );
                             }
                         }
+                        // A canonical failure is a terminal turn boundary too.
+                        // Leaving the submit-side marker set makes inline waits
+                        // time out and reports the failed session as still
+                        // working even though every adapter has ended the turn.
+                        if matches!(
+                            &evt,
+                            ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)
+                        ) {
+                            activity_at_turn_start = None;
+                            session.steered_this_turn.store(false, Ordering::SeqCst);
+                            if let Ok(mut started) = session.turn_started_at.lock() {
+                                *started = None;
+                            }
+                            if let Ok(mut act) = session.latest_activity.lock() {
+                                *act = None;
+                            }
+                        }
                         // v0.8.11 E4 — for a paneless session (no hooks:
                         // stream-json AND acp), the pump mirrors each completed
                         // turn to progress.jsonl with the sid, so the
@@ -4271,6 +4387,7 @@ impl Gateway {
                             // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
                             // 只 warn,绝不阻断回复投递。
                             if let Some(dir) = project_dir.as_ref() {
+                                let failure = thread_event_failure(&evt);
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                                     turn_id: format!("{session_id}-{seq}"),
                                     ts: chrono::Utc::now(),
@@ -4282,6 +4399,9 @@ impl Gateway {
                                     assistant: text.clone(),
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
+                                    outcome: failure.map(|_| "failed".to_string()),
+                                    error_kind: failure.map(|err| err.kind.clone()),
+                                    error: failure.map(|err| err.message.clone()),
                                 };
                                 match ccteam_harness::execution::turns_mirror::append_turn(
                                     dir,
@@ -5207,6 +5327,9 @@ impl Gateway {
             assistant: String::new(),
             usage: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         if let Err(err) =
             ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
@@ -6104,50 +6227,113 @@ impl Gateway {
         pend.has(&key)
     }
 
-    fn current_project_for(&self, chat: &ChatKey) -> String {
-        self.current_project
-            .get(chat)
-            .cloned()
-            .unwrap_or_else(|| self.default_project.clone())
+    /// The chat's working project — **always one this principal may see**, or
+    /// `None` when it may see none.
+    ///
+    /// The fallback used to be the daemon's `default_project`, unconditionally.
+    /// That was the widest cross-user hole in the IM path: a tenant's bot (or
+    /// any unnamed chat) that had never `/cd`'d anywhere silently inherited the
+    /// OWNER's default project on its very first message — and the implicit
+    /// first-message spawn then started an agent, `--dangerously-skip-permissions`,
+    /// inside the owner's working tree. `/cd` was gated all along; the implicit
+    /// fallback was not, so the gate simply never ran for the common path.
+    ///
+    /// Resolution stays inside the principal's own view: the `/cd`-selected
+    /// project when still visible, else the daemon default when visible (the
+    /// single-user case, unchanged), else its first visible project.
+    fn current_project_for(&self, chat: &ChatKey) -> Option<String> {
+        let visible = self.visible_project_slugs(chat);
+        let visible_has = |slug: &str| visible.iter().any(|v| v == slug);
+        if let Some(cur) = self.current_project.get(chat) {
+            if visible_has(cur) {
+                return Some(cur.clone());
+            }
+        }
+        if visible_has(&self.default_project) {
+            return Some(self.default_project.clone());
+        }
+        let mut rest = visible;
+        rest.sort();
+        rest.into_iter().next()
+    }
+
+    /// Display form of [`Self::current_project_for`] — a principal with no
+    /// visible project reads as `(无项目)` rather than borrowing someone else's
+    /// slug for the banner.
+    fn current_project_label(&self, chat: &ChatKey) -> String {
+        self.current_project_for(chat)
+            .unwrap_or_else(|| "(无项目)".to_string())
+    }
+
+    /// The project a spawn must land in, or a directed error. Guests and
+    /// tenants with nothing of their own get an actionable refusal instead of
+    /// the owner's default project.
+    fn require_current_project(&self, chat: &ChatKey) -> Result<String> {
+        self.current_project_for(chat).ok_or_else(|| {
+            if matches!(self.principal(chat), Principal::Guest(_)) {
+                anyhow!(
+                    "这个 chat 还没有绑定到 ccteam —— 把它加入 bot 的允许列表(web 设置 → 接入 → 捕获 chat id),或让 owner 建一个用户给你"
+                )
+            } else {
+                anyhow!("你还没有可用的项目 —— 用 /newproject <slug> <path> 建一个")
+            }
+        })
     }
 
     /// Session access scope — visibility (`/sessions`) AND addressing
     /// (`/use` / `/stop`).
     ///
-    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + shared user pool**: a
-    /// chat reaches the sessions it OWNS, PLUS every session created by the web
-    /// console (`owner.channel == "user"`). The web console is ONE shared
-    /// operator identity (`web-api`) until 档1 gives per-user web tokens, so its
-    /// sessions must stay reachable from IM — the common single-user flow is
-    /// "create it on web, drive it from your phone". IM-created sessions stay
+    /// v0.8.18 柱2 (multi-user soft-partition 档0) — **OWN + one's OWN web
+    /// console pool**: a chat reaches the sessions it OWNS, plus the sessions
+    /// created by the web console OF THE SAME IDENTITY (the admin's
+    /// `user:web-api`; a tenant's `user:<tenant>`) — the common single-user flow
+    /// is "create it on web, drive it from your phone". IM-created sessions stay
     /// PRIVATE to their chat: two distinct telegram `chat_id`s never see each
     /// other's IM-created sessions.
     ///
-    /// The two pre-0.8.18 leaks are still gone: a `web` QUERIER no longer sees
-    /// IM sessions (an IM session only matches `owner == chat`, never the web
-    /// clause), and the same-current-project leak (the v0.8.13 cross-frontend-
-    /// by-project sharing) is removed. Reply routing is unaffected (per-turn
-    /// submitter via `reply_to`). HONEST SCOPE: soft (UX) isolation under one OS
-    /// uid, NOT a security boundary.
+    /// The pre-0.8.18 leaks are still gone: a `web` QUERIER never sees IM
+    /// sessions (they are not in the `user:` pool), and the same-current-project
+    /// leak (the v0.8.13 cross-frontend-by-project sharing) is removed. Reply
+    /// routing is unaffected (per-turn submitter via `reply_to`). HONEST SCOPE:
+    /// soft (UX) isolation under one OS uid, NOT a security boundary.
     ///
     /// v0.8.20 — a PER-TENANT IM bot (channel `"<platform>@<tenant>"`) and that
     /// tenant's web console are ONE identity (`user:<tenant>`, via
     /// `canonical_owner`): the bot sees + drives the tenant's WEB-created sessions
-    /// AND its own, and the tenant's web sees the bot's — CONVERGED. It still
-    /// inherits NO shared pool (other tenants + the admin pool stay hidden); the
-    /// shared user pool stays the admin/global bot's operator view.
-    fn chat_can_access(chat: &ChatKey, session: &GatewaySession) -> bool {
-        Self::chat_owner_visible(chat, &session.owner)
+    /// AND its own, and the tenant's web sees the bot's — CONVERGED. It inherits
+    /// no other pool (other tenants + the admin pool stay hidden).
+    ///
+    /// Cross-user fix (2026-07-28) — the pool leg is no longer a blanket "any `user:*` owner": with
+    /// per-user web tokens that handed the admin's global IM bot every tenant's
+    /// sessions (and every tenant's console every other tenant's). It now routes
+    /// through [`ccteam_core::identity::can_see_session_owner`], the session twin
+    /// of the project ACL — one policy, both frontends.
+    fn chat_can_access(&self, chat: &ChatKey, session: &GatewaySession) -> bool {
+        self.chat_owner_visible(chat, &session.owner)
+    }
+
+    /// [`Self::chat_can_access`] for a BARE sid, live or stopped: the live map
+    /// first (O(1)), else the on-disk `meta.json`'s owner — the same two-rung
+    /// ladder [`Self::project_slug_for_sid`] and the scheduled-entry gate walk.
+    /// One gate for every sid-addressed command that must also reach history
+    /// sessions (`/rename` today), so "stopped" never becomes an ACL hole:
+    /// an unknown sid and a foreign one are indistinguishable (`false`).
+    fn chat_can_access_sid(&self, chat: &ChatKey, sid: &str) -> bool {
+        if let Some(session) = self.sessions.get(sid) {
+            return self.chat_can_access(chat, session);
+        }
+        self.find_meta_for_sid(sid)
+            .map(|(_slug, _dir, meta)| self.owner_identity_visible(chat, &meta.owner))
+            .unwrap_or(false)
     }
 
     /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
     /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
-    /// iff (a) it owns it, or (b) — for the admin/global bot + the web querier
-    /// ONLY — the session is in the shared user pool (`owner.channel == "user"`,
-    /// i.e. any web/tenant-created session). A per-tenant IM bot (channel
-    /// `"<platform>@<tenant>"`) sees ONLY what it owns: it gets neither the shared
-    /// pool nor other tenants' IM sessions.
-    fn chat_owner_visible(chat: &ChatKey, owner: &ChatKey) -> bool {
+    /// iff (a) it owns it, or (b) the session sits in the WEB-CONSOLE pool of
+    /// the SAME identity (the admin's `user:web-api`, or a tenant's
+    /// `user:<tenant>`). Another identity's console — and any other IM chat —
+    /// stays hidden.
+    fn chat_owner_visible(&self, chat: &ChatKey, owner: &ChatKey) -> bool {
         // v0.8.21 Wave-2 — delegate to the identity-string rule. A session
         // rebuilt from `meta.json` (daemon restart) or cold-resumed carries an
         // owner round-tripped through `from_identity`, which forces
@@ -6159,7 +6345,7 @@ impl Gateway {
         // one rule; chat_id isolation is preserved (different chat_id ⇒ different
         // identity ⇒ not visible). The convergence + isolation cases are
         // unchanged (tenant/web/admin identities have `user_id == chat_id`).
-        Self::owner_identity_visible(chat, &owner.identity())
+        self.owner_identity_visible(chat, &owner.identity())
     }
 
     /// Identity-string form of [`chat_owner_visible`] for the cold-resume path,
@@ -6173,38 +6359,123 @@ impl Gateway {
     /// `canonical_owner` keeps the sender's `user_id`), that round-trip would
     /// wrongly deny the legitimate owner. Comparing the user_id-free identity
     /// strings sidesteps the lossy round-trip entirely.
-    fn owner_identity_visible(chat: &ChatKey, owner_identity: &str) -> bool {
-        // Own = the chat's canonical identity string.
-        if owner_identity == canonical_owner(chat).identity() {
-            return true;
-        }
-        // A per-tenant bot gets NO shared pool — only its own (above).
-        if crate::transport::is_tenant_bot_channel(&chat.channel) {
-            return false;
-        }
-        // Admin/global bot + web querier: the shared `user:` pool.
-        owner_identity.starts_with("user:")
+    fn owner_identity_visible(&self, chat: &ChatKey, owner_identity: &str) -> bool {
+        // ONE policy for both frontends: own ⊕ the web-console pool this
+        // identity may see (`ccteam_core::identity::can_see_session_owner` —
+        // the session twin of the project ACL's `can_see_owner`, keyed on the
+        // same owner tags). The pool leg used to be a blanket "any `user:*`
+        // owner", which predates per-user web tokens: it leaked EVERY tenant's
+        // sessions into the admin's global IM bot (and into every other
+        // tenant's console), so a `/sessions` list — or a `/use` on a listed
+        // sid, which re-points `reply_to` — crossed users.
+        let (user_id, is_admin) = self.project_acl_identity(chat);
+        ccteam_core::identity::can_see_session_owner(
+            &canonical_owner(chat).identity(),
+            &user_id,
+            is_admin,
+            owner_identity,
+        )
     }
 
-    /// Map an IM/web chat to the shared core ownership identity `(user_id,
-    /// is_admin)` that `ccteam_core::identity::can_see_owner` expects — the
-    /// IM-side twin of the web [`crate::auth::Identity`], so BOTH frontends
-    /// resolve PROJECT visibility through ONE policy (web/IM symmetry). A
-    /// per-tenant IM bot (`<platform>@<tenant>`) or a per-user web token is that
-    /// tenant (`user:<tenant>`, non-admin); every other chat — the owner's global
-    /// IM bot or the admin web console — is the operator/admin (`user:web-api`,
-    /// sees all non-tenant projects, never a tenant's private ones). HONEST
-    /// SCOPE: like the session ACL this is soft (UX) isolation under one OS uid;
-    /// treating every non-tenant-bot chat as the operator mirrors how the session
-    /// pool (`owner_identity_visible`) already grants the `user:` view.
-    fn project_acl_identity(chat: &ChatKey) -> (String, bool) {
+    /// Resolve a frontend chat to the principal it speaks for — the ONE place
+    /// an identity is decided, for both frontends.
+    ///
+    /// - **Operator** — the admin web console (holder of the web token) and the
+    ///   chats explicitly NAMED in a global bot's credential allowlist.
+    /// - **Tenant** — a per-tenant IM bot (`<platform>@<tenant>`) or a per-user
+    ///   web token; both converge on `user:<tenant>`.
+    /// - **Guest** — anyone else who got through a bot's transport allowlist.
+    ///   Owns only what it creates; sees no project; cannot create one.
+    ///
+    /// The Guest arm is the fix for a fail-OPEN default: this used to return
+    /// operator for every chat that was not a tenant bot, which made the
+    /// transport allowlist double as the privilege grant. An OPEN bot (empty
+    /// `allowed_chat_ids`, or Lark's `"*"` wildcard) therefore handed full
+    /// operator rights — every project, every session, spawn anywhere — to
+    /// whoever found it. Privilege is now a NAME, never a side effect of
+    /// reaching the door.
+    fn principal(&self, chat: &ChatKey) -> Principal {
         if let Some(tid) = crate::transport::tenant_of_bot_channel(&chat.channel) {
-            return (tid.to_string(), false);
+            return Principal::Tenant(tid.to_string());
         }
-        if chat.channel == "web" && chat.chat_id != ccteam_core::identity::ADMIN_WEB_ID {
-            return (chat.chat_id.clone(), false);
+        if chat.channel == "web" {
+            return if chat.chat_id == ccteam_core::identity::ADMIN_WEB_ID {
+                Principal::Operator
+            } else {
+                Principal::Tenant(chat.chat_id.clone())
+            };
         }
-        (ccteam_core::identity::ADMIN_WEB_ID.to_string(), true)
+        if self.is_operator_chat(chat) {
+            return Principal::Operator;
+        }
+        Principal::Guest(canonical_owner(chat).identity())
+    }
+
+    /// Whether this IM chat speaks for the box owner.
+    ///
+    /// - platform bound `Named` → only the listed chats. A platform lists
+    ///   whichever key it authorizes by (Telegram a numeric chat id →
+    ///   `ChatKey::chat_id`; Lark a sender `open_id` → `ChatKey::user_id`), so
+    ///   either field may carry the name.
+    /// - platform bound `Wildcard` → **nobody**. `"*"` is an explicit "I did not
+    ///   name anyone", and an unnamed door must not grant the box.
+    /// - platform not bound (no credentials, or the pre-configuration empty
+    ///   allowlist, or an embedded/test gateway) → the legacy single-operator
+    ///   assumption holds. Locking the half-configured owner out of their own
+    ///   bot would be a worse failure than the exposure the daemon warns about.
+    fn is_operator_chat(&self, chat: &ChatKey) -> bool {
+        match self.operator_chats.get(&chat.channel) {
+            Some(OperatorBinding::Named(named)) => {
+                named.contains(&chat.chat_id) || named.contains(&chat.user_id)
+            }
+            Some(OperatorBinding::Wildcard) => false,
+            None => true,
+        }
+    }
+
+    /// Bind `platform`'s operator roster from that global bot's credential
+    /// allowlist, and report what the binding means so the daemon can warn.
+    pub fn bind_operator_allowlist<I: IntoIterator<Item = String>>(
+        &mut self,
+        platform: &str,
+        allowlist: I,
+    ) -> OperatorBindingKind {
+        let entries: Vec<String> = allowlist
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if entries.is_empty() {
+            return OperatorBindingKind::Unconfigured;
+        }
+        if entries.iter().any(|id| id == "*") {
+            self.operator_chats
+                .insert(platform.to_string(), OperatorBinding::Wildcard);
+            return OperatorBindingKind::Wildcard;
+        }
+        match self
+            .operator_chats
+            .entry(platform.to_string())
+            .or_insert_with(|| OperatorBinding::Named(BTreeSet::new()))
+        {
+            OperatorBinding::Named(named) => named.extend(entries),
+            slot @ OperatorBinding::Wildcard => {
+                *slot = OperatorBinding::Named(entries.into_iter().collect())
+            }
+        }
+        OperatorBindingKind::Named
+    }
+
+    /// Map a chat to the shared core ownership identity `(user_id, is_admin)`
+    /// that `ccteam_core::identity::can_see_owner` expects — the IM-side twin of
+    /// the web [`crate::auth::Identity`], so BOTH frontends resolve visibility
+    /// through ONE policy (web/IM symmetry). HONEST SCOPE: like the session ACL
+    /// this is soft (UX) isolation under one OS uid, not a security boundary.
+    fn project_acl_identity(&self, chat: &ChatKey) -> (String, bool) {
+        match self.principal(chat) {
+            Principal::Operator => (ccteam_core::identity::ADMIN_WEB_ID.to_string(), true),
+            Principal::Tenant(id) | Principal::Guest(id) => (id, false),
+        }
     }
 
     /// Whether `chat` may see/address a project whose persisted
@@ -6214,8 +6485,8 @@ impl Gateway {
     /// the projects its web console does: it never sees the admin's projects, and
     /// the admin never peeks into a tenant's. Fixes the IM project-visibility
     /// leak where `/projects` / the `/cd` picker showed every owner's projects.
-    fn chat_can_see_project_owner(chat: &ChatKey, owner: Option<&str>) -> bool {
-        let (user_id, is_admin) = Self::project_acl_identity(chat);
+    fn chat_can_see_project_owner(&self, chat: &ChatKey, owner: Option<&str>) -> bool {
+        let (user_id, is_admin) = self.project_acl_identity(chat);
         ccteam_core::identity::can_see_owner(&user_id, is_admin, owner)
     }
 
@@ -6273,13 +6544,13 @@ impl Gateway {
         let mut candidates: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| Self::chat_can_access(chat, s) && s.role == role)
+            .filter(|s| self.chat_can_access(chat, s) && s.role == role)
             .collect();
         if candidates.is_empty() {
             let mut available: Vec<&str> = self
                 .sessions
                 .values()
-                .filter(|s| Self::chat_can_access(chat, s) && !s.role.is_empty())
+                .filter(|s| self.chat_can_access(chat, s) && !s.role.is_empty())
                 .map(|s| s.role.as_str())
                 .collect();
             available.sort_unstable();
@@ -6322,7 +6593,7 @@ impl Gateway {
         let accessible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| Self::chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access(chat, s))
             .collect();
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
@@ -6337,7 +6608,7 @@ impl Gateway {
         // Default scope = the chat's CURRENT project; `all` (and web) lists the
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
         // the IM footer can point at `/sessions all`.
-        let cur = self.current_project_for(chat);
+        let cur = self.current_project_label(chat);
         let (mut visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
             (accessible, 0)
         } else {
@@ -6633,7 +6904,7 @@ impl Gateway {
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| Self::chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access(chat, s))
             .collect();
         if visible.is_empty() {
             return "no sessions — start one with /new".to_string();
@@ -6653,7 +6924,7 @@ impl Gateway {
             // No focused session — keep the user oriented by leading with the
             // current project, then point at the right next step: a fresh project
             // wants a first message; a project with sessions wants `/use`.
-            let cur = self.current_project_for(chat);
+            let cur = self.current_project_label(chat);
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
                 format!(
@@ -7925,7 +8196,7 @@ impl Gateway {
 
     /// v0.9.5 feedback fix — is `sid`'s vendor turn still in flight? Reads the
     /// same `turn_started_at` cell the submit path sets and the pump clears on
-    /// `TurnCompleted` (protocol-independent). `false` for an unknown sid. A
+    /// every terminal boundary (protocol-independent). `false` for an unknown sid. A
     /// `wait_seconds` dispatch uses this to keep waiting past interim assistant
     /// messages (codex narrates mid-turn) until the TASK actually finishes.
     pub fn session_turn_in_flight(&self, sid: &str) -> bool {
@@ -8471,33 +8742,112 @@ impl Gateway {
         Ok(())
     }
 
-    /// v0.8.22 P1 — rename a LIVE session's user-facing title. An explicit
-    /// user action ⇒ `TitleSource::User`, which `apply_title` treats as
-    /// STICKY (never later overwritten by the first-message auto-title or a
-    /// vendor `ai-title`). Applies the same rule-based [`truncate_title`] the
-    /// auto-title path uses (no LLM, ever) and returns the cleaned title
-    /// actually stored. This is the ACL-less core shared by the IM `/rename`
-    /// command (targets the chat's own current session — already
-    /// ownership-scoped by `current_session`) and the web `PATCH
-    /// /api/v1/sessions/{sid}` route (project-ACL'd via `gate_sid` first).
-    /// Sync (no `.await`): a plain meta.json read-modify-write.
-    pub fn rename_session(&self, sid: &str, raw_title: &str) -> Result<String> {
-        let session = self
-            .sessions
-            .get(sid)
-            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
-        let dir = self
-            .projects
-            .get(&session.project)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+    /// Rename a session's user-facing title — the ACL-less core every frontend
+    /// shares (IM `/rename`, web `PATCH /api/v1/sessions/{sid}`), so the two
+    /// can never diverge in what a rename means.
+    ///
+    /// Three things happen, in this order:
+    ///
+    /// 1. **ccteam SoT** — the cleaned title (the same rule-based
+    ///    [`truncate_title`] the auto-title path uses; no LLM, ever) lands in
+    ///    `meta.json` as `TitleSource::User`, which `apply_title` treats as
+    ///    STICKY (never overwritten later by the first-message auto-title or a
+    ///    vendor `ai-title`).
+    /// 2. **vendor mirror** — the same title is pushed to the vendor's OWN
+    ///    title surface via [`HarnessAdapter::set_session_title`], so the
+    ///    session reads identically in `claude --resume`'s picker / codex's
+    ///    thread list. Best-effort by design: the vendor answer is REPORTED
+    ///    ([`TitleSync`]), never fatal — meta.json is the SoT and the user's
+    ///    rename must not fail because a vendor has no title API.
+    /// 3. **live surfaces** — a `SessionLifecycle{state:"renamed"}` broadcast,
+    ///    the same frame capacity eviction uses, so every open web console
+    ///    refreshes its rail the moment an IM `/rename` lands (and vice versa).
+    ///
+    /// Works on a LIVE **or a STOPPED** session: `meta.json` outlives the live
+    /// map, so the sid is resolved from the live map first and from the
+    /// on-disk metas otherwise (the same ladder [`Self::project_slug_for_sid`]
+    /// walks). A stopped session simply has no live thread to hand the vendor
+    /// push, which the adapter reports as [`TitleSync::Deferred`].
+    pub async fn rename_session(&self, sid: &str, raw_title: &str) -> Result<SessionRename> {
         let cleaned =
             truncate_title(raw_title).ok_or_else(|| anyhow!("title must not be blank"))?;
+        // Resolve (project dir, vendor, adapter, live thread) for a live OR a
+        // stopped session. A stopped one has no adapter instance in the live
+        // map, so mint one from the same factory every spawn path uses — it is
+        // a plain value (no child process) until something spawns through it.
+        let (dir, vendor, adapter, thread) = match self.sessions.get(sid) {
+            Some(session) => {
+                let dir = self
+                    .projects
+                    .get(&session.project)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+                (
+                    dir,
+                    session.vendor,
+                    Arc::clone(&session.adapter),
+                    Some(session.thread.clone()),
+                )
+            }
+            None => {
+                let (_slug, dir, meta) = self.find_meta_for_sid(sid)?;
+                let adapter = (self.adapter_factory)(meta.vendor, meta.protocol);
+                (dir, meta.vendor, adapter, None)
+            }
+        };
+
         let mut meta = read_session_meta(&dir, sid)
             .map_err(|e| anyhow!("meta.json missing for session {sid}: {e}"))?;
+        let previous = meta.title.clone();
         apply_title(&mut meta, cleaned.clone(), TitleSource::User);
         write_session_meta(&dir, &meta)?;
-        Ok(cleaned)
+
+        let target = SessionTitleTarget {
+            sid: sid.to_string(),
+            vendor_uuid: meta.vendor_uuid.clone(),
+            project_dir: dir,
+            thread,
+        };
+        let vendor_sync = match adapter.set_session_title(&target, &cleaned).await {
+            Ok(sync) => sync,
+            Err(err) => {
+                // The ccteam-side rename already succeeded; say what the vendor
+                // did rather than failing a rename the user can see took.
+                tracing::warn!(%sid, %err, "ccteam-im: vendor title push failed");
+                TitleSync::Deferred(format!("vendor push failed: {err}"))
+            }
+        };
+
+        self.emit_session_renamed(sid, &meta.slug);
+        Ok(SessionRename {
+            sid: sid.to_string(),
+            title: cleaned,
+            previous,
+            vendor: vendor_str(vendor).to_string(),
+            vendor_sync,
+        })
+    }
+
+    /// Broadcast-only twin of a rename for live web surfaces (the durable state
+    /// twin is `meta.json` itself, already written by the caller). Same frame
+    /// family as [`Self::emit_session_evicted`], so the SPA's existing
+    /// `session_lifecycle` listener refreshes the rail with no client change.
+    fn emit_session_renamed(&self, sid: &str, slug: &str) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!("session-renamed-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session renamed: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "renamed".to_string(),
+                reason: "user".to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
     }
 }
 
@@ -8548,6 +8898,36 @@ fn activity_marker(activity: &str) -> &'static str {
         "stuck" => "🔴 stuck",
         _ => "⚪ unknown",
     }
+}
+
+/// Split a `/rename` argument into an explicit `[<sid>] <title>` pair. A
+/// leading `s<N>` token counts as a TARGET only when a title follows it, so
+/// `/rename s3` still titles the current session `s3` rather than trying to
+/// rename `s3` to nothing. Pure — unit-tested directly.
+fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
+    let (head, tail) = rest.split_once(char::is_whitespace)?;
+    let looks_like_sid = head
+        .strip_prefix('s')
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    let title = tail.trim();
+    (looks_like_sid && !title.is_empty()).then_some((head, title))
+}
+
+/// The `/rename` receipt: which session changed, from what to what, and how
+/// far the new title travelled. The vendor clause is NEVER omitted — a title
+/// that only exists ccteam-side must not read as though the vendor adopted it.
+fn render_rename_receipt(r: &SessionRename) -> String {
+    let mut out = match r.previous.as_deref().filter(|p| !p.is_empty()) {
+        Some(prev) => format!("已重命名 {} 「{prev}」→「{}」", r.sid, r.title),
+        None => format!("已重命名 {} →「{}」", r.sid, r.title),
+    };
+    out.push('\n');
+    out.push_str(&match &r.vendor_sync {
+        TitleSync::Pushed => format!("· 已同步到 {} 自己的会话标题", r.vendor),
+        TitleSync::Deferred(reason) => format!("· 仅 ccteam 侧({reason})"),
+        TitleSync::Unsupported => format!("· 仅 ccteam 侧({} 无会话标题接口)", r.vendor),
+    });
+    out
 }
 
 /// v0.8.23 review §3.2-5 (item 2a) — the compact "which session just spoke"
@@ -9237,6 +9617,14 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     }
 }
 
+/// Canonical terminal failure carried by an event, independent of vendor.
+fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErrorEvent> {
+    match evt {
+        ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err),
+        _ => None,
+    }
+}
+
 /// Whether this item is long-running work that can legitimately go silent
 /// between start and complete (tools, shell, search — not the final answer).
 fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
@@ -9259,7 +9647,9 @@ fn track_open_work_items(open: &mut std::collections::HashSet<String>, evt: &Thr
         ThreadEvent::ItemCompleted { item } if is_openable_work_item(&item.details) => {
             open.remove(&item.id);
         }
-        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } => {
+        ThreadEvent::TurnCompleted { .. }
+        | ThreadEvent::TurnFailed { .. }
+        | ThreadEvent::Error(_) => {
             open.clear();
         }
         _ => {}
@@ -10044,6 +10434,34 @@ mod tests {
         panic!("turn {sid} did not reach its boundary");
     }
 
+    /// Register `slug` in the catalog with a persisted `ProjectState.owner`.
+    /// Ownership is what a tenant's visibility is computed from, so any fixture
+    /// that drives a NON-operator chat has to say which project it owns —
+    /// otherwise the principal correctly resolves to "no project" and cannot
+    /// spawn (`current_project_for`).
+    fn seed_owned_project(paths: &ccteam_core::CcteamPaths, slug: &str, owner: Option<&str>) {
+        let dir = paths.projects_root.join(slug);
+        std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
+        let mut state = ccteam_core::ProjectState::initial(slug.to_string());
+        state.owner = owner.map(str::to_string);
+        state
+            .save(&ccteam_core::CcteamPaths::project_state_in(&dir))
+            .unwrap();
+        ccteam_core::config::upsert_project(
+            &paths.root,
+            ccteam_core::ProjectEntry {
+                slug: slug.to_string(),
+                path: dir,
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+
     fn mirror_test_paths(tmp: &tempfile::TempDir) -> (CcteamPaths, PathBuf) {
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -10384,6 +10802,14 @@ mod tests {
         /// order, so the `/interrupt` test can assert the gateway invoked the
         /// adapter's interrupt (not destroy).
         interrupts: Arc<Mutex<Vec<String>>>,
+        /// `set_session_title` pushes, in call order: `(sid, title, live)` —
+        /// `live` records whether a thread handle came with it, which is what
+        /// separates a rename on a live session from one on a stopped one.
+        title_pushes: Arc<Mutex<Vec<(String, String, bool)>>>,
+        /// When set, this fake claims a vendor title surface and answers
+        /// `Pushed`; off by default so the honest "this vendor has no title
+        /// API" wording stays the default under test.
+        title_surface: bool,
         /// Liveness reported by `thread_is_live`. A test flips this to `false`
         /// to simulate the child exiting out from under a held handle (crash /
         /// OOM / long idle); `start_thread` flips it back `true` so a resume
@@ -10398,6 +10824,21 @@ mod tests {
         fn default() -> Self {
             Self::new(AgentVendor::Claude)
         }
+    }
+
+    /// A bare gateway whose operator roster names `telegram:339` — exactly what
+    /// the daemon binds from `credentials.telegram.allowed_chat_ids`. The ACL
+    /// predicates are instance methods because privilege is CONFIGURATION (a
+    /// named chat), not a property of the chat's shape: an unnamed chat is a
+    /// guest, so a test that means "the owner's phone" must say so.
+    fn acl_gateway() -> Gateway {
+        let mut gateway = Gateway::new(
+            Arc::new(FakeAdapter::new(AgentVendor::Claude)),
+            "alpha",
+            "/tmp/alpha-acl",
+        );
+        gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
+        gateway
     }
 
     impl FakeAdapter {
@@ -10424,6 +10865,8 @@ mod tests {
                 emit_turn_started: false,
                 turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
+                title_pushes: Arc::new(Mutex::new(Vec::new())),
+                title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
             }
@@ -10448,6 +10891,13 @@ mod tests {
 
         fn with_turn_failure(mut self, message: impl Into<String>) -> Self {
             self.turn_failure = Some(message.into());
+            self
+        }
+
+        /// Opt into a vendor that HAS a session-title surface (claude/codex);
+        /// the default fake reports `Unsupported` like an ACP vendor.
+        fn with_title_surface(mut self) -> Self {
+            self.title_surface = true;
             self
         }
 
@@ -10691,6 +11141,23 @@ mod tests {
 
         fn thread_is_live(&self, _h: &ThreadHandle) -> bool {
             self.live.load(Ordering::SeqCst)
+        }
+
+        async fn set_session_title(
+            &self,
+            target: &SessionTitleTarget,
+            title: &str,
+        ) -> Result<TitleSync, HarnessError> {
+            self.title_pushes.lock().await.push((
+                target.sid.clone(),
+                title.to_string(),
+                target.thread.is_some(),
+            ));
+            Ok(if self.title_surface {
+                TitleSync::Pushed
+            } else {
+                TitleSync::Unsupported
+            })
         }
     }
 
@@ -12152,6 +12619,9 @@ mod tests {
             assistant: who.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(&project_dir, &sid1, &mk("t1", "from-sid1")).unwrap();
         append_turn(&project_dir, &sid2, &mk("t2", "from-sid2")).unwrap();
@@ -13824,6 +14294,9 @@ mod tests {
                 assistant: "LGTM, two nits inline.".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();
@@ -13948,7 +14421,10 @@ mod tests {
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        gateway.rename_session("s2", "A long review title").unwrap();
+        gateway
+            .rename_session("s2", "A long review title")
+            .await
+            .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let opts = gateway.session_switch_options(&chat, false);
         assert_eq!(opts.len(), 2, "{opts:?}");
@@ -13992,7 +14468,7 @@ mod tests {
             .await
             .unwrap();
         let long = "A really really long session title that keeps going";
-        gateway.rename_session("s1", long).unwrap();
+        gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let opts = gateway.session_switch_options(&chat, false);
         let label = opts[0].label.trim_end_matches('\u{2800}');
@@ -14078,6 +14554,8 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
         gateway.register_project("beta", proj.path());
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
@@ -14106,7 +14584,7 @@ mod tests {
                 "project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"
             ]
         );
-        assert_eq!(gateway.current_project_for(&chat), "beta");
+        assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("beta"));
 
         // Tap "switch to s1" — focuses s1 and moves the project back to its own
         // (alpha).
@@ -14125,7 +14603,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
-        assert_eq!(gateway.current_project_for(&chat), "alpha");
+        assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("alpha"));
         assert_eq!(
             gateway.current_session.read().unwrap().get(&chat).cloned(),
             Some("s1".to_string())
@@ -14340,11 +14818,11 @@ mod tests {
         gateway.set_pending(shared.clone());
 
         gateway
-            .handle_text("web", "web-chat", "web-user", "/new claude reviewer")
+            .handle_text("web", "web-api", "web-api", "/new claude reviewer")
             .await
             .unwrap();
         gateway
-            .handle_text("web", "web-chat", "web-user", "/new claude qa")
+            .handle_text("web", "web-api", "web-api", "/new claude qa")
             .await
             .unwrap();
 
@@ -14359,7 +14837,7 @@ mod tests {
         shared.lock().await.tag_sid(token, "s1".to_string());
 
         let web_view = gateway
-            .handle_text("web", "web-chat", "web-user", "/sessions")
+            .handle_text("web", "web-api", "web-api", "/sessions")
             .await
             .unwrap();
         assert_eq!(
@@ -14471,6 +14949,8 @@ mod tests {
         let (paths, project_dir) = mirror_test_paths(&tmp);
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths.clone());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -14812,6 +15292,7 @@ mod tests {
     /// bot keeps the operator "own + all web" view.
     #[test]
     fn chat_owner_visible_converges_tenant_web_and_im() {
+        let gw = acl_gateway();
         // A web-created session's OWNER is the canonical user identity
         // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
         let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")); // user:uaaa
@@ -14824,34 +15305,145 @@ mod tests {
         // CONVERGENCE: uaaa's bot canonicalizes to user:uaaa → it sees uaaa's
         // web-created sessions (owner user:uaaa).
         assert!(
-            Gateway::chat_owner_visible(&bot_a, &web_a),
+            gw.chat_owner_visible(&bot_a, &web_a),
             "a tenant bot sees its tenant's web-created sessions (convergence)"
         );
         // ISOLATION: not the admin pool, not another tenant, not the admin IM.
+        assert!(!gw.chat_owner_visible(&bot_a, &web_admin), "no admin pool");
+        assert!(!gw.chat_owner_visible(&bot_a, &web_b), "no other tenant");
+        assert!(!gw.chat_owner_visible(&bot_a, &admin_tg), "no admin IM");
         assert!(
-            !Gateway::chat_owner_visible(&bot_a, &web_admin),
-            "no admin pool"
-        );
-        assert!(
-            !Gateway::chat_owner_visible(&bot_a, &web_b),
-            "no other tenant"
-        );
-        assert!(
-            !Gateway::chat_owner_visible(&bot_a, &admin_tg),
-            "no admin IM"
-        );
-        assert!(
-            !Gateway::chat_owner_visible(&bot_b, &web_a),
+            !gw.chat_owner_visible(&bot_b, &web_a),
             "ubbb's bot doesn't see uaaa's sessions"
         );
 
-        // The admin/global bot keeps the operator view: own + the shared web
-        // pool (every owner.channel == "user", incl tenants' — oversight).
-        assert!(Gateway::chat_owner_visible(&admin_tg, &admin_tg));
-        assert!(Gateway::chat_owner_visible(&admin_tg, &web_admin));
+        // The admin/global bot: own + its OWN web console pool — NOT a
+        // tenant's. (the 2026-07-28 cross-user fix: the old blanket `user:*` pool
+        // pushed tenants' sessions into the owner's IM bot, where a `/use` on a
+        // listed sid then re-pointed that session's `reply_to` at the admin
+        // chat — "IM receives another user's session messages".)
+        assert!(gw.chat_owner_visible(&admin_tg, &admin_tg));
+        assert!(gw.chat_owner_visible(&admin_tg, &web_admin));
         assert!(
-            Gateway::chat_owner_visible(&admin_tg, &web_a),
-            "the admin/global bot oversees all web sessions"
+            !gw.chat_owner_visible(&admin_tg, &web_a),
+            "the admin/global bot must NOT see a tenant's web sessions"
+        );
+        // ... and symmetrically, a tenant's WEB console (channel "web", not a
+        // bot channel) sees neither the admin pool nor another tenant.
+        let web_console_a = ChatKey::new("web", "uaaa", "uaaa");
+        assert!(gw.chat_owner_visible(&web_console_a, &web_a));
+        assert!(!gw.chat_owner_visible(&web_console_a, &web_b));
+        assert!(!gw.chat_owner_visible(&web_console_a, &web_admin));
+        assert!(!gw.chat_owner_visible(&web_console_a, &admin_tg));
+    }
+
+    /// PRIVILEGE IS A NAME (2026-07-28 owner report, part 2). Reaching a bot
+    /// must not make you the operator — the transport allowlist used to double
+    /// as the privilege grant, so a bot open to the world (`allowed_user_ids:
+    /// ["*"]`, which is what the reporter's Lark bot carried) served EVERY
+    /// stranger as the box owner: all projects, all sessions, spawn anywhere.
+    #[test]
+    fn wildcard_allowlist_names_nobody_so_grants_nobody() {
+        let owner = ChatKey::new("lark", "oc_room", "ou_owner");
+        let stranger = ChatKey::new("lark", "oc_other", "ou_stranger");
+
+        // `"*"` — an explicit "anyone may talk" — names nobody.
+        let mut gw = acl_gateway();
+        assert_eq!(
+            gw.bind_operator_allowlist("lark", ["*".to_string()]),
+            OperatorBindingKind::Wildcard
+        );
+        assert_eq!(
+            gw.principal(&owner),
+            Principal::Guest("lark:oc_room".into())
+        );
+        assert_eq!(
+            gw.principal(&stranger),
+            Principal::Guest("lark:oc_other".into())
+        );
+        // A guest sees no project — not the owner's, not a legacy unowned one.
+        assert!(!gw.chat_can_see_project_owner(&stranger, None));
+        assert!(!gw.chat_can_see_project_owner(&stranger, Some("user:web-api")));
+        assert!(!gw.chat_can_see_project_owner(&stranger, Some("user:ualice")));
+
+        // Naming the owner takes the bot back: Lark authorizes by SENDER
+        // open_id, Telegram by chat id — either field may carry the name.
+        let mut named = acl_gateway();
+        assert_eq!(
+            named.bind_operator_allowlist("lark", ["ou_owner".to_string()]),
+            OperatorBindingKind::Named
+        );
+        assert_eq!(named.principal(&owner), Principal::Operator);
+        assert_eq!(
+            named.principal(&stranger),
+            Principal::Guest("lark:oc_other".into())
+        );
+        assert!(named.chat_can_see_project_owner(&owner, Some("user:web-api")));
+
+        // An UNCONFIGURED platform keeps the legacy single-operator assumption
+        // (a half-configured owner must not be locked out of their own bot);
+        // the daemon warns about it at startup instead.
+        let plain = acl_gateway();
+        assert_eq!(plain.principal(&owner), Principal::Operator);
+    }
+
+    /// A principal never inherits the box's DEFAULT project. This was the
+    /// widest hole in the IM path: a tenant's bot (or any unnamed chat) that
+    /// had never `/cd`'d anywhere silently resolved to the owner's default
+    /// project, and the implicit first-message spawn then started an agent
+    /// inside the owner's working tree.
+    #[tokio::test]
+    async fn spawn_never_falls_back_to_a_project_the_caller_cannot_see() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        seed_owned_project(&paths, "ops", Some("user:web-api"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "ops", paths.projects_root.join("ops"));
+        gateway.enable_project_creation(paths.clone());
+        gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
+
+        // A tenant's own bot: owns nothing yet → refused, with the next step.
+        let err = gateway
+            .handle_text("telegram@ualice", "111", "alice", "hello")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("/newproject"), "actionable refusal: {msg}");
+        assert!(
+            !msg.contains("ops"),
+            "must not name the owner's project: {msg}"
+        );
+
+        // An unnamed chat on the owner's bot is a guest — same refusal, pointed
+        // at the binding step instead.
+        let guest = gateway
+            .handle_text("telegram", "999", "eve", "hello")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{guest:#}").contains("绑定"),
+            "guest is told to get bound: {guest:#}"
+        );
+
+        // Nothing was created in the owner's project.
+        assert!(gateway.session_views().is_empty(), "no session may exist");
+
+        // The owner's own named chat still spawns there.
+        gateway
+            .handle_text("telegram", "339", "rob", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway
+                .session_views()
+                .iter()
+                .map(|v| v.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ops"]
         );
     }
 
@@ -14864,6 +15456,7 @@ mod tests {
     /// the sender's `user_id`) was wrongly DENIED resume of its OWN session.
     #[test]
     fn owner_identity_visible_matches_live_acl_on_strings() {
+        let gw = acl_gateway();
         // meta.owner is the canonical identity STRING (user_id dropped).
         let admin_tg = ChatKey::new("telegram", "339", "rob"); // user_id ≠ chat_id
         let admin_owns = canonical_owner(&admin_tg).identity(); // "telegram:339"
@@ -14871,31 +15464,39 @@ mod tests {
         // THE REGRESSION: the admin bot must see its own cold session even
         // though `meta.owner` ("telegram:339") lost the "rob" user_id.
         assert!(
-            Gateway::owner_identity_visible(&admin_tg, &admin_owns),
+            gw.owner_identity_visible(&admin_tg, &admin_owns),
             "owner must see its own stopped session (user_id round-trip must not deny)"
         );
         // A DIFFERENT admin chat (other chat_id) does not see it.
         let other_tg = ChatKey::new("telegram", "999", "eve");
-        assert!(!Gateway::owner_identity_visible(&other_tg, &admin_owns));
+        assert!(!gw.owner_identity_visible(&other_tg, &admin_owns));
 
         // Web/tenant convergence + isolation, mirrored from the live-ACL test.
         let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
         let bot_a = ChatKey::new("telegram@uaaa", "111", "alice");
         let bot_b = ChatKey::new("telegram@ubbb", "222", "bob");
         assert!(
-            Gateway::owner_identity_visible(&bot_a, &web_a),
+            gw.owner_identity_visible(&bot_a, &web_a),
             "a tenant bot sees its tenant's web-created (cold) sessions"
         );
         assert!(
-            !Gateway::owner_identity_visible(&bot_b, &web_a),
+            !gw.owner_identity_visible(&bot_b, &web_a),
             "another tenant's bot does NOT"
         );
         assert!(
-            !Gateway::owner_identity_visible(&bot_a, &admin_owns),
+            !gw.owner_identity_visible(&bot_a, &admin_owns),
             "a tenant bot gets no admin pool"
         );
-        // The admin/global bot oversees the shared web pool.
-        assert!(Gateway::owner_identity_visible(&admin_tg, &web_a));
+        // The admin/global bot sees its OWN web pool — never a tenant's (the
+        // cold-resume twin of the 2026-07-28 cross-user fix).
+        assert!(gw.owner_identity_visible(
+            &admin_tg,
+            &canonical_owner(&ChatKey::new("web", "web-api", "web-api")).identity()
+        ));
+        assert!(
+            !gw.owner_identity_visible(&admin_tg, &web_a),
+            "the admin/global bot must NOT cold-resume a tenant's session"
+        );
     }
 
     /// IM PROJECT ACL — the multi-user isolation the leaky unfiltered project
@@ -14909,6 +15510,7 @@ mod tests {
     /// keyed on PROJECT owners instead of session owners.
     #[test]
     fn project_acl_isolates_tenants_from_admin_and_each_other() {
+        let gw = acl_gateway();
         // Project owner tags, as `/newproject` + web `POST /projects` stamp
         // them: a tenant's project is `user:<id>`, the admin's is the shared web
         // pool `user:web-api` or its own IM `telegram:<chat_id>`, a legacy
@@ -14929,27 +15531,27 @@ mod tests {
             ChatKey::new("web", "ualice", "ualice"),
         ] {
             assert!(
-                Gateway::chat_can_see_project_owner(&viewer, tenant_a),
+                gw.chat_can_see_project_owner(&viewer, tenant_a),
                 "a tenant sees its own project ({})",
                 viewer.channel
             );
             assert!(
-                !Gateway::chat_can_see_project_owner(&viewer, admin_web),
+                !gw.chat_can_see_project_owner(&viewer, admin_web),
                 "a tenant must NOT see the admin's web project ({})",
                 viewer.channel
             );
             assert!(
-                !Gateway::chat_can_see_project_owner(&viewer, admin_im),
+                !gw.chat_can_see_project_owner(&viewer, admin_im),
                 "a tenant must NOT see the admin's IM project ({})",
                 viewer.channel
             );
             assert!(
-                !Gateway::chat_can_see_project_owner(&viewer, tenant_b),
+                !gw.chat_can_see_project_owner(&viewer, tenant_b),
                 "a tenant must NOT see another tenant's project ({})",
                 viewer.channel
             );
             assert!(
-                !Gateway::chat_can_see_project_owner(&viewer, unowned),
+                !gw.chat_can_see_project_owner(&viewer, unowned),
                 "a tenant must NOT see a legacy unowned project ({})",
                 viewer.channel
             );
@@ -14964,22 +15566,22 @@ mod tests {
             ChatKey::new("web", "web-api", "web-api"),
         ] {
             assert!(
-                Gateway::chat_can_see_project_owner(&op, admin_web),
+                gw.chat_can_see_project_owner(&op, admin_web),
                 "operator sees its own web pool ({})",
                 op.channel
             );
             assert!(
-                Gateway::chat_can_see_project_owner(&op, admin_im),
+                gw.chat_can_see_project_owner(&op, admin_im),
                 "operator sees its own IM project ({})",
                 op.channel
             );
             assert!(
-                Gateway::chat_can_see_project_owner(&op, unowned),
+                gw.chat_can_see_project_owner(&op, unowned),
                 "operator sees legacy unowned projects ({})",
                 op.channel
             );
             assert!(
-                !Gateway::chat_can_see_project_owner(&op, tenant_a),
+                !gw.chat_can_see_project_owner(&op, tenant_a),
                 "operator must NOT peek into a tenant's project ({})",
                 op.channel
             );
@@ -14996,41 +15598,20 @@ mod tests {
     /// still fail here — the gap the pure-predicate test above can't catch.
     #[tokio::test]
     async fn im_project_list_and_cd_hide_other_owners_projects() {
-        fn seed(paths: &ccteam_core::CcteamPaths, slug: &str, owner: Option<&str>) {
-            let dir = paths.projects_root.join(slug);
-            std::fs::create_dir_all(dir.join(".ccteam")).unwrap();
-            let mut state = ccteam_core::ProjectState::initial(slug.to_string());
-            state.owner = owner.map(str::to_string);
-            state
-                .save(&ccteam_core::CcteamPaths::project_state_in(&dir))
-                .unwrap();
-            ccteam_core::config::upsert_project(
-                &paths.root,
-                ccteam_core::ProjectEntry {
-                    slug: slug.to_string(),
-                    path: dir,
-                    host: ccteam_core::LOCAL_HOST.to_string(),
-                    remote_slug: None,
-                    remote_path: None,
-                    team: "dev".to_string(),
-                    installed_at: chrono::Utc::now(),
-                },
-            )
-            .unwrap();
-        }
-
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = ccteam_core::CcteamPaths {
             root: tmp.path().join(".ccteam"),
             projects_root: tmp.path().join("projects"),
         };
         std::fs::create_dir_all(&paths.root).unwrap();
-        seed(&paths, "tenant-proj", Some("user:ualice"));
-        seed(&paths, "admin-proj", Some("user:web-api"));
-        seed(&paths, "cli-proj", None); // legacy, unowned
+        seed_owned_project(&paths, "tenant-proj", Some("user:ualice"));
+        seed_owned_project(&paths, "admin-proj", Some("user:web-api"));
+        seed_owned_project(&paths, "cli-proj", None); // legacy, unowned
 
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake, "seed", tmp.path().join("seed"));
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
         gateway.enable_project_creation(paths);
 
         let tenant = ChatKey::new("telegram@ualice", "111", "alice");
@@ -15510,6 +16091,8 @@ mod tests {
         // on-disk history).
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("telegram", ["339498819".to_string()]);
         let mut events = gateway.subscribe_events();
         // A session created from the web console (channel "web").
         gateway
@@ -15544,7 +16127,18 @@ mod tests {
     #[tokio::test]
     async fn gateway_web_and_tenant_bot_converge() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // `alpha` belongs to tenant uaaa: a tenant reaches only what it owns, so
+        // the fixture has to grant it a project rather than let it inherit the
+        // daemon default (the cross-user hole `current_project_for` closed).
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", paths.projects_root.join("alpha"));
+        gateway.enable_project_creation(paths.clone());
         let mut events = gateway.subscribe_events();
 
         // Tenant uaaa creates a session on the WEB → owned user:uaaa.
@@ -15597,10 +16191,106 @@ mod tests {
             "/sessions",
         )
         .await;
+        // Isolated down to the BANNER: ubbb owns nothing, so it reads
+        // "(无项目)" instead of borrowing uaaa's slug — the project name of
+        // another tenant used to leak here through the default-project fallback.
         assert_eq!(
             other,
-            vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"],
+            vec!["📁 当前项目: (无项目)\n暂无会话 —— /new 开一个"],
             "ubbb's bot is isolated from uaaa"
+        );
+    }
+
+    /// CROSS-USER REGRESSION (2026-07-28 owner report: "IM receives other
+    /// users' session messages") — a TENANT's web-created session must not surface in
+    /// the admin/global IM bot. The old pool rule was a blanket "any `user:*`
+    /// owner is shared", written when the web console had one (admin) identity;
+    /// per-user web tokens then made every tenant's session visible there, and
+    /// `/use` on a listed sid re-points that session's `reply_to` at the admin
+    /// chat — so the tenant's answers/progress started landing in the owner's
+    /// Telegram. The legit admin case (`user:web-api` ↔ IM) is unchanged and
+    /// covered by `gateway_web_owned_session_visible_from_im`.
+    #[tokio::test]
+    async fn gateway_tenant_web_session_is_hidden_from_admin_im_bot() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Each identity owns its own project — nobody borrows the daemon default.
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        seed_owned_project(&paths, "ops", Some("user:web-api"));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", paths.projects_root.join("alpha"));
+        gateway.enable_project_creation(paths.clone());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("telegram", ["339498819".to_string()]);
+        let mut events = gateway.subscribe_events();
+
+        // Tenant uaaa creates a session on ITS web console → owner user:uaaa.
+        gateway
+            .handle_text("web", "uaaa", "uaaa", "/new claude reviewer")
+            .await
+            .unwrap();
+
+        // The owner's global Telegram bot must NOT list it …
+        let seen = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "339498819",
+            "rob",
+            "/sessions",
+        )
+        .await;
+        // The owner's bot sees an empty fleet — and its banner names ITS OWN
+        // project (`ops`), never the tenant's `alpha`.
+        assert_eq!(
+            seen,
+            vec!["📁 当前项目: ops\n暂无会话 —— /new 开一个"],
+            "a tenant's web session must not reach the admin/global IM bot: {seen:?}"
+        );
+
+        // … and must not be able to ADDRESS it (which is what re-points
+        // `reply_to` and starts the cross-user push). Reads as unknown, so the
+        // sid's existence leaks nothing either.
+        let used = gateway
+            .handle_text("telegram", "339498819", "rob", "/use s1")
+            .await
+            .unwrap();
+        assert_eq!(
+            used,
+            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+        );
+
+        // Another TENANT's web console is equally blind to it.
+        let other_tenant = gateway
+            .handle_text("web", "ubbb", "ubbb", "/sessions")
+            .await
+            .unwrap();
+        assert!(
+            !other_tenant.iter().any(|m| m.contains("s1")),
+            "one tenant's console must not see another's sessions: {other_tenant:?}"
+        );
+
+        // The owner keeps their own web console pool (no over-correction).
+        gateway
+            .handle_text("web", "web-api", "web-api", "/new claude api")
+            .await
+            .unwrap();
+        let admin_sees = list_text(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "339498819",
+            "rob",
+            "/sessions",
+        )
+        .await;
+        assert!(
+            admin_sees.iter().any(|m| m.contains("s2")),
+            "the admin bot still drives its OWN web console sessions: {admin_sees:?}"
         );
     }
 
@@ -15670,6 +16360,8 @@ mod tests {
         let tmp_alpha = tempfile::TempDir::new().unwrap();
         let tmp_beta = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp_alpha.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.register_project("beta", tmp_beta.path());
 
         let projects = gateway
@@ -15741,6 +16433,8 @@ mod tests {
         let tmp_alpha = tempfile::TempDir::new().unwrap();
         let tmp_beta = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp_alpha.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
         gateway.register_project("beta", tmp_beta.path());
 
         gateway
@@ -15960,12 +16654,12 @@ mod tests {
             });
         let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-web");
         gateway
-            .handle_text("web", "chat-1", "alice", "/new claude reviewer")
+            .handle_text("web", "web-api", "web-api", "/new claude reviewer")
             .await
             .unwrap();
 
         let replies = gateway
-            .handle_text("web", "chat-1", "alice", "/model opus")
+            .handle_text("web", "web-api", "web-api", "/model opus")
             .await
             .unwrap();
         assert_eq!(replies, vec!["已切换 model → opus（live）"]);
@@ -16160,6 +16854,8 @@ mod tests {
         let original_secret_s2;
         {
             let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+            gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
             gateway.register_project("beta", beta.clone());
             gateway.enable_persistence(tmp.path()).unwrap();
             gateway
@@ -16687,6 +17383,8 @@ mod tests {
 
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths);
 
         // Not pre-registered in the in-memory map; /cd must reload it from
@@ -16763,6 +17461,8 @@ mod tests {
         let tmp_alpha = tempfile::TempDir::new().unwrap();
         let tmp_beta = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp_alpha.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.register_project("beta", tmp_beta.path());
 
         // Active session s1 lives in project alpha.
@@ -16813,6 +17513,8 @@ mod tests {
     async fn gateway_cd_adopts_existing_session_in_target_project() {
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.register_project("beta", "/tmp/beta");
 
         // s1 in alpha; then /cd beta + /new makes s2 in beta.
@@ -16850,6 +17552,8 @@ mod tests {
     async fn gateway_cd_overrides_single_template_project() {
         let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.register_project("beta", "/tmp/beta");
         gateway.register_bot_template(
             &BotRegistration {
@@ -16994,7 +17698,7 @@ mod tests {
 
         // The web console no longer sees a session it didn't create (own-only).
         let listing = gateway
-            .handle_text("web", "web-chat", "web-user", "/sessions")
+            .handle_text("web", "web-api", "web-api", "/sessions")
             .await
             .unwrap();
         assert_eq!(
@@ -17320,9 +18024,15 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/rename  my   custom title  ")
             .await
             .unwrap();
+        // The receipt names the session, the new title, and — always — what
+        // the vendor did with it (this fake vendor has no title surface, so
+        // the honest answer is "ccteam-side only").
         assert_eq!(
             renamed,
-            vec!["已重命名 s1 → my custom title\n↓ 本项目会话 → /sessions"]
+            vec![
+                "已重命名 s1 →「my custom title」\n· 仅 ccteam 侧(claude 无会话标题接口)\
+                 \n↓ 本项目会话 → /sessions"
+            ]
         );
 
         // The title moved off the /sessions text row onto the switch button.
@@ -17358,6 +18068,183 @@ mod tests {
             s1_button(&gateway).as_deref(),
             Some("✓ s1 claude (my custom title)"),
             "an explicit /rename must survive a later message (sticky user title)"
+        );
+    }
+
+    /// `[<sid>] <title>` parsing: a leading `s<N>` is a TARGET only when a
+    /// title follows it, so `/rename s3` still titles the CURRENT session
+    /// "s3" instead of silently renaming a different session to nothing.
+    #[test]
+    fn rename_arg_splits_a_leading_sid_only_when_a_title_follows() {
+        assert_eq!(
+            split_leading_sid("s12 release checklist"),
+            Some(("s12", "release checklist"))
+        );
+        // Extra whitespace around the title is the caller's to trim.
+        assert_eq!(
+            split_leading_sid("s3   spaced  out "),
+            Some(("s3", "spaced  out"))
+        );
+        // No remainder ⇒ the whole thing is a title for the current session.
+        assert_eq!(split_leading_sid("s3"), None);
+        assert_eq!(split_leading_sid("s3   "), None);
+        // Not a sid shape ⇒ plain title, even when it starts with `s`.
+        assert_eq!(split_leading_sid("session cleanup"), None);
+        assert_eq!(split_leading_sid("s12a bad shape"), None);
+        assert_eq!(split_leading_sid("ship the rename"), None);
+    }
+
+    /// `/rename <sid> <title>` renames a session that is NOT the current one —
+    /// the same leading-id convention `/stop` / `/use` / `/interrupt` take —
+    /// and the receipt names the session actually renamed (so a mis-parse is
+    /// visible immediately rather than silently retitling the current chat).
+    #[tokio::test]
+    async fn gateway_rename_targets_an_explicit_sid() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        // s2 is current; rename s1 by id.
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename s1 the older one")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("已重命名 s1 →「the older one」"),
+            "receipt must name the targeted sid: {:?}",
+            reply
+        );
+        let s1 = read_session_meta(tmp.path(), "s1").unwrap();
+        let s2 = read_session_meta(tmp.path(), "s2").unwrap();
+        assert_eq!(s1.title.as_deref(), Some("the older one"));
+        assert_eq!(s1.title_source, Some(TitleSource::User));
+        assert!(s2.title.is_none(), "the current session must be untouched");
+    }
+
+    /// A sid another chat owns is not renameable — and reads exactly like an
+    /// unknown one (no existence disclosure), matching `/stop`'s answer.
+    #[tokio::test]
+    async fn gateway_rename_refuses_a_foreign_sid() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-2", "bob", "/new claude cto")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-2", "bob", "/rename s1 not mine")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("unknown session for this chat: s1"),
+            "{:?}",
+            reply
+        );
+        let unknown = gateway
+            .handle_text("mock", "chat-2", "bob", "/rename s99 nope")
+            .await
+            .unwrap();
+        assert!(
+            unknown[0].starts_with("unknown session for this chat: s99"),
+            "a foreign sid and an unknown sid must read identically: {:?}",
+            unknown
+        );
+        assert!(read_session_meta(tmp.path(), "s1").unwrap().title.is_none());
+    }
+
+    /// A STOPPED session is renameable: `meta.json` outlives the live map, and
+    /// the web rail offers rename on history rows. The vendor push still runs,
+    /// with NO live thread — which is exactly what tells a vendor whose title
+    /// surface is an RPC (codex) to answer `Deferred`.
+    #[tokio::test]
+    async fn gateway_rename_works_on_a_stopped_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/stop s1")
+            .await
+            .unwrap();
+        assert!(!gateway.is_session_live("s1"));
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename s1 archived work")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].starts_with("已重命名 s1 →「archived work」"),
+            "a stopped session must rename like a live one: {:?}",
+            reply
+        );
+        let meta = read_session_meta(tmp.path(), "s1").unwrap();
+        assert_eq!(meta.title.as_deref(), Some("archived work"));
+        let pushes = fake.title_pushes.lock().await.clone();
+        assert_eq!(
+            pushes,
+            vec![("s1".to_string(), "archived work".to_string(), false)],
+            "the vendor push must run with no live thread"
+        );
+    }
+
+    /// The rename reaches the VENDOR's own title surface, and the receipt says
+    /// so — the whole point of wiring it through the adapter rather than only
+    /// writing ccteam's meta.json.
+    #[tokio::test]
+    async fn gateway_rename_pushes_the_title_to_the_vendor() {
+        let fake = Arc::new(FakeAdapter::default().with_title_surface());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename ship it")
+            .await
+            .unwrap();
+        assert!(
+            reply[0].contains("已同步到 claude 自己的会话标题"),
+            "a real push must be reported as synced: {:?}",
+            reply
+        );
+        let pushes = fake.title_pushes.lock().await.clone();
+        assert_eq!(
+            pushes,
+            vec![("s1".to_string(), "ship it".to_string(), true)],
+            "the live session's push carries its thread handle"
+        );
+
+        // Renaming again shows what it replaced.
+        let again = gateway
+            .handle_text("mock", "chat-1", "alice", "/rename ship it twice")
+            .await
+            .unwrap();
+        assert!(
+            again[0].starts_with("已重命名 s1 「ship it」→「ship it twice」"),
+            "the receipt must show the previous title: {:?}",
+            again
         );
     }
 
@@ -17922,6 +18809,17 @@ mod tests {
         assert!(notification
             .user
             .contains(&format!("session_collect{{sid:{child_sid}, tail:true}}")));
+
+        let child_failure =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &child_sid)
+                .unwrap()
+                .into_iter()
+                .find(|turn| turn.assistant == CAPACITY_ERROR)
+                .expect("vendor failure is durably mirrored in the child ledger");
+        let child_failure = serde_json::to_value(child_failure).unwrap();
+        assert_eq!(child_failure["outcome"], "failed");
+        assert_eq!(child_failure["error_kind"], "turn_failed");
+        assert_eq!(child_failure["error"], CAPACITY_ERROR);
     }
 
     /// v0.9.5 feedback fix (P0) — a codex-shaped chatty child (several
@@ -18393,6 +19291,9 @@ mod tests {
                 assistant: "the research is done".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
             },
         )
         .unwrap();
@@ -18480,6 +19381,9 @@ mod tests {
                     assistant: format!("checkpoint {n}"),
                     usage: serde_json::Value::Null,
                     tool_calls: vec![],
+                    outcome: None,
+                    error_kind: None,
+                    error: None,
                 },
             )
             .unwrap();
@@ -18537,6 +19441,8 @@ mod tests {
         let project_dir = tmp.path().to_path_buf();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gw = Gateway::new(fake, "alpha", &project_dir);
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gw.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gw.set_event_sink(etx);
         tokio::spawn(async move { while erx.recv().await.is_some() {} });
@@ -18777,6 +19683,8 @@ mod tests {
         seed_role(tmp.path(), "reviewer");
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        // The owner's own chat(s): named in the bot allowlist ⇒ operator.
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
 
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")

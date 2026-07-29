@@ -178,6 +178,12 @@ fn setup(tmp: &Path) -> PathBuf {
     std::env::set_var("FAKE_SJ_ARGV_LOG", tmp.join("argv.log"));
     std::env::remove_var("FAKE_SJ_DIE_AFTER_INIT");
     std::env::remove_var("FAKE_SJ_NO_RESULT");
+    // Clear the fault switch here, not only at the end of the test that sets
+    // it: a panicking test never reaches its own cleanup, and the leaked
+    // `FAKE_SJ_DIE_ON_RESUME=1` then killed the NEXT serial test's resume spawn
+    // — one real failure masqueraded as a second, unrelated "flaky" one.
+    // Every fault switch belongs here so each test starts from a clean slate.
+    std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
     fake
 }
 
@@ -1137,7 +1143,16 @@ async fn resume_failure_emits_reset_event_with_sid_and_reason() {
     assert_eq!(argv_mode(tmp.path()), format!("session-id {uuid}"));
 
     // The reset event landed in the progress jsonl with sid + reason.
-    let progress = tmp.path().join(".ccteam/progress/demo.jsonl");
+    // The path is `<ccteam root>/state/progress/<slug>.jsonl` — this test read
+    // it WITHOUT the `state/` segment, so it asserted on an always-empty file
+    // and failed deterministically wherever the emit path was correct. (The
+    // sibling `claude_tui_resume_test` spells the same path right.)
+    let progress = tmp
+        .path()
+        .join(".ccteam")
+        .join("state")
+        .join("progress")
+        .join("demo.jsonl");
     let body = std::fs::read_to_string(&progress).unwrap_or_default();
     assert!(
         body.contains("\"s1\"") && body.contains("resume_failed_fallback_to_fresh"),

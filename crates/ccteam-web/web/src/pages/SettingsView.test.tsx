@@ -43,6 +43,17 @@ describe("visibleSettingsItems (fail-closed ACL)", () => {
       "admin",
     ]);
   });
+
+  // The whole of the owner ruling in one assertion: 管理员 (user management) is
+  // the ONLY surface a normal user does not get. Everything else is open, and
+  // what a user may actually reach inside it is decided by identity × project
+  // ownership on the backend, not by hiding UI.
+  it("the admin tab is the ONLY difference between the two menus", () => {
+    const tenant = visibleSettingsItems(false);
+    const admin = visibleSettingsItems(true);
+    expect(admin.filter((id) => !tenant.includes(id))).toEqual(["admin"]);
+    expect(tenant.filter((id) => !admin.includes(id))).toEqual([]);
+  });
 });
 
 describe("resolveSettingsTab", () => {
@@ -144,7 +155,12 @@ describe("OpsPanel (merged Status + Hosts)", () => {
   });
 
   it("stacks daemon status above hosts (single column) without changing test ids", () => {
-    const html = renderToString(<OpsPanel lang="zh" />);
+    // Router context: the hosts panel header links to the Team page (TEAM-9).
+    const html = renderToString(
+      <MemoryRouter>
+        <OpsPanel lang="zh" />
+      </MemoryRouter>,
+    );
     expect(html).toContain('data-testid="ops-view"');
     expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');

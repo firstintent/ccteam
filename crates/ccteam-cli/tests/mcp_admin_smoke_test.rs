@@ -214,10 +214,15 @@ fn status_cost_today() {
         proj.get("cost_24h_usd").is_some(),
         "project entry must carry cost_24h_usd; got: {proj:?}"
     );
-    // cost_used_usd (alias, also present for backwards compat).
+    // The retired `cost_used_usd` alias must be GONE: v0.9.10's STATUS-SLIM-1
+    // cut the status wire to `{slug, cost_24h_usd}` (an owner-signed change —
+    // the dead load was burning the caller's context every call). This
+    // integration test sits outside the `--lib --bins` baseline, so it kept
+    // asserting the alias unnoticed; the exact key set is locked by the MCP
+    // renderer's own lib test.
     assert!(
-        proj.get("cost_used_usd").is_some(),
-        "project entry must carry cost_used_usd; got: {proj:?}"
+        proj.get("cost_used_usd").is_none(),
+        "the retired cost_used_usd alias must not come back; got: {proj:?}"
     );
     // Sanity: fresh project has zero cost.
     let cost = proj["cost_24h_usd"].as_f64().unwrap_or(-1.0);

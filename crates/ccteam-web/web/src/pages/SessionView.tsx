@@ -17,8 +17,9 @@
 // byte-exact `ccteam-pty.v1` relay via TerminalView.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Clock, X } from "lucide-react";
+import { ArrowDown, Clock, Pencil, X } from "lucide-react";
 import { ChatComposer } from "../components/ChatComposer";
+import { InlineRename } from "../components/InlineRename";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
@@ -78,15 +79,26 @@ export default function SessionView({
   sid,
   session,
   lang = "zh",
-  isAdmin = false,
+  onRename,
 }: {
   sid: string;
   session: SessionSummary | null;
   lang?: Lang;
-  isAdmin?: boolean;
+  /** Rename this session's title (the shell owns the request + toast, so the
+   *  rail and this header stay in lockstep). Omitted ⇒ the title is plain
+   *  text, no edit affordance. */
+  onRename?: (sid: string, title: string) => void | Promise<void>;
 }) {
   const t = makeT(lang);
   const [view, setView] = useState<"chat" | "terminal">("chat");
+  // Inline title edit in the header. `pendingTitle` is the optimistic value
+  // shown only WHILE the shell's rename is in flight — without it the header
+  // visibly snaps back to the old title for a beat after Enter. It is cleared
+  // the moment the request settles (the shell refreshes the session list
+  // before resolving), so a server-side truncation — or a failure — always
+  // wins over what the user typed.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [pendingTitle, setPendingTitle] = useState<string | null>(null);
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
 
@@ -346,7 +358,8 @@ export default function SessionView({
         ? "dot on"
         : "dot off";
 
-  const title = session ? railSessionLabel(session) : sid;
+  const serverTitle = session ? railSessionLabel(session) : sid;
+  const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
   const who = `${vendor} · ${sid}${statusModel ? ` · ${statusModel}` : ""}`;
 
@@ -371,9 +384,42 @@ export default function SessionView({
     <section className="view active" data-testid="conversation-view">
       <div className="conv-head">
         <span className={headDot} data-testid="conv-dot" />
-        <span className="title" data-testid="conv-title">
-          {title}
-        </span>
+        {editingTitle && onRename ? (
+          <InlineRename
+            className="title rename-input"
+            initial={title}
+            ariaLabel={`${t("renameTip")} ${sid}`}
+            onSubmit={(next) => {
+              setEditingTitle(false);
+              setPendingTitle(next);
+              void Promise.resolve(onRename(sid, next)).finally(() => setPendingTitle(null));
+            }}
+            onCancel={() => setEditingTitle(false)}
+          />
+        ) : (
+          <span
+            className="title"
+            data-testid="conv-title"
+            title={onRename ? `${t("renameTip")} · ${t("renameHint")}` : undefined}
+            onDoubleClick={() => {
+              if (onRename) setEditingTitle(true);
+            }}
+          >
+            {title}
+          </span>
+        )}
+        {onRename && !editingTitle ? (
+          <button
+            type="button"
+            className="icon-btn sm rename-title"
+            data-testid="conv-rename"
+            title={t("renameTip")}
+            aria-label={`${t("renameTip")} ${sid}`}
+            onClick={() => setEditingTitle(true)}
+          >
+            <Pencil />
+          </button>
+        ) : null}
         <div className="meta">
           <span className="chip sid">{sid}</span>
           {session ? <span className="chip">{session.project}</span> : null}
@@ -560,7 +606,6 @@ export default function SessionView({
                 draft={lockedDraft}
                 onDraftChange={() => {}}
                 locked
-                isAdmin={isAdmin}
                 modelLabel={statusModel ?? ""}
                 uploadSlug={session?.project}
                 onSchedule={scheduleText}

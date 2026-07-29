@@ -23,10 +23,9 @@ describe("VENDORS registry (5-way)", () => {
     expect(VENDORS.map((v) => v.id)).toEqual(["claude", "codex", "grok", "opencode", "kimi"]);
   });
 
-  it("claude offers stream-json (default) + terminal (admin-only, frozen)", () => {
+  it("claude offers stream-json (default) + terminal (frozen)", () => {
     const claude = vendorSpec("claude");
     expect(claude.protocols.map((p) => p.id)).toEqual(["stream-json", "terminal"]);
-    expect(claude.protocols[1]?.adminOnly).toBe(true);
   });
 
   it("codex = app-server (wire stream-json); grok/opencode/kimi = acp", () => {
@@ -43,20 +42,27 @@ describe("VENDORS registry (5-way)", () => {
   });
 });
 
-describe("visibleProtocols (terminal is admin-gated in the UI)", () => {
-  it("hides claude terminal from a tenant", () => {
-    expect(visibleProtocols("claude", false).map((p) => p.id)).toEqual(["stream-json"]);
+describe("visibleProtocols (no admin gate — same menu for every user)", () => {
+  // Cross-user fix (2026-07-28) — the protocol menu used to hide claude `terminal` from tenants.
+  // Function surfaces are open to every logged-in user; what a user may
+  // actually reach is decided by identity × project ownership on the backend,
+  // not by a hidden menu entry. The admin menu (Settings → 管理员) is the only
+  // admin-scoped surface left.
+  it("offers the full claude menu to every identity", () => {
+    expect(visibleProtocols("claude").map((p) => p.id)).toEqual(["stream-json", "terminal"]);
   });
 
-  it("shows claude terminal to the admin", () => {
-    expect(visibleProtocols("claude", true).map((p) => p.id)).toEqual([
-      "stream-json",
-      "terminal",
-    ]);
+  it("matches the vendor registry for the acp vendors", () => {
+    expect(visibleProtocols("opencode").map((p) => p.id)).toEqual(["acp"]);
+    expect(visibleProtocols("codex").map((p) => p.id)).toEqual(["app-server"]);
   });
 
-  it("is a no-op for vendors without gated protocols", () => {
-    expect(visibleProtocols("opencode", false).map((p) => p.id)).toEqual(["acp"]);
+  it("no vendor hides a protocol from anyone (nothing re-introduces a UI gate)", () => {
+    for (const vendor of VENDORS) {
+      expect(visibleProtocols(vendor.id).map((p) => p.id)).toEqual(
+        vendor.protocols.map((p) => p.id),
+      );
+    }
   });
 });
 

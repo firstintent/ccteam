@@ -167,7 +167,6 @@ describe("model button label", () => {
       <ChatComposer
         draftKey="test"
         lang="zh"
-        isAdmin
         draft={defaultDraft()}
         onDraftChange={() => {}}
         onSend={() => {}}
@@ -217,7 +216,6 @@ describe("prefill", () => {
       <ChatComposer
         draftKey="test"
         lang="zh"
-        isAdmin
         draft={defaultDraft()}
         onDraftChange={() => {}}
         onSend={() => {}}

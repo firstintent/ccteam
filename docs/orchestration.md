@@ -45,7 +45,7 @@ Your session hides the tool calls. You say the left column; the right column hap
 | "**what sessions** are running? what did that fan-out cost?" | the team tree: who reports to whom, busy or idle, per-member model and cost |
 | "**stop s47**" | explicitly closes that session (state stays on disk, resumable later) |
 
-Rule of thumb: **long work → background + completion notification** (close the laptop); **quick questions → wait inline**. These phrases work as-is in your everyday session — nothing to install first (§7).
+Rule of thumb: **long work → background + completion notification** (close the laptop); **quick questions → wait inline**. These phrases work as-is in your everyday session — nothing to install first (§8).
 
 ## 4. Making delegation pay (best practices, in plain language)
 
@@ -106,13 +106,30 @@ Default: omit `model` — vendor defaults track their latest releases.
 
 **The bill stays visible.** `session_list` and `session_collect` rows carry the model and the accrued `cost_usd` / `tokens_total` per member, so a fan-out's cost is a sum you can read, not a surprise.
 
-## 7. Wire up once
+## 7. Formations (openings for a multi-vendor team)
+
+Six openings ship as cards on the web console (Home, and Team → Charter) — each prefills the launcher with a vendor lineup; the plan itself is always yours, said in plain language:
+
+- **Commander & crews** (总控-工班) — a strong-reasoning controller plans, decomposes and accepts; codex builds, grok scouts the ecosystem; completion notifications flow back to the controller. The expensive model pays only for decomposition and acceptance — volume work rides cheaper specialists.
+- **Daily driver & advisor** (主力-顾问) — grok or codex drives the routine work; when it hits a wall, spawn an advisor session on the same repo, take the plan, let the driver execute, stop the advisor. The expensive model bills only for the hard minutes.
+- **Cross review** (交叉互审) — one vendor writes, a different vendor reviews the diff cold, disagreements return to the controller. Different models make uncorrelated mistakes; the overlap catches what self-review rubber-stamps.
+- **Bake-off** (并行竞标) — the same hard problem to 2–3 vendors in parallel; compare, keep the best, merge the good ideas. Worth it when the solution space is wide.
+- **Research triangulation** (调研三角) — grok mines X and real-time chatter, claude does the deep web read, codex verifies against the source; one controller merges. No single harness has all three windows.
+- **Cost pyramid** (金字塔用工) — kimi/opencode grind the mechanical bulk (renames, formatting, test triage); failures escalate to an expensive model. The ledger shows the savings per member.
+
+Three more that need no card:
+
+- **Overseer** (监工模式) — spawn risky-ops sessions with `permission_mode:"hitl"` (approvals pop to your IM) while bulk workers run skip. Risk gets a gate, volume keeps its speed.
+- **Standing watch** (定时值守) — schedule messages on a session (composer clock / scheduled API): grok sweeps the ecosystem every morning, claude files a weekly repo-health note. The daemon only fires the schedule; the thinking happens in the session.
+- **Many machines** (跨机编队) — bind heavy projects to a beefy satellite host; the topology wears host badges while transcripts and cost stay in one console.
+
+## 8. Wire up once
 
 There is nothing to install for orchestration itself: `ccteam config mcp` (one-time) registers the ccteam server with **all five vendors** — Claude, Codex, Grok, OpenCode, Kimi — and the server's own instructions teach any connected session the delegation flow. Want a standing orchestrator persona on top (routing habits and review gates baked in)? Install `team-brain` from the **marketplace** — a persona choice, not a prerequisite. What you do need:
 
 - `ccteam start` is running on this machine.
 - You're inside a **registered ccteam project** directory (the session resolves the project from the working directory).
-- You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §8.)
+- You're in a **plain vendor CLI session** — it reads the global config and gets the ccteam tools. (Some SDK-driven sessions don't load user-scope MCP config; see §9.)
 
 Verify in 60 seconds:
 
@@ -122,7 +139,7 @@ claude mcp list                  # server `ccteam` — ✔ Connected
 grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discovered
 ```
 
-## 8. When something's off
+## 9. When something's off
 
 | Symptom | What it is → what to do |
 |---|---|

@@ -10,6 +10,40 @@ export function railSessionLabel(s: { title?: string | null; role: string }): st
   return s.title || s.role || "(无 role)";
 }
 
+/** The rename toast: the new title, plus — always — what the VENDOR did with
+ *  it. Same three cases the IM `/rename` receipt renders, worded for the web,
+ *  so neither surface can imply a vendor sync that didn't happen. A server
+ *  that omits `vendor_sync` (older daemon) simply gets the plain line. */
+export function renameToastText(
+  lang: "zh" | "en",
+  result: {
+    sid: string;
+    title: string;
+    vendor?: string;
+    vendor_sync?: { state: "pushed" | "deferred" | "unsupported"; detail?: string };
+  },
+): string {
+  const head =
+    lang === "en"
+      ? `Renamed ${result.sid} → “${result.title}”`
+      : `已重命名 ${result.sid} →「${result.title}」`;
+  const sync = result.vendor_sync;
+  if (!sync) return head;
+  const vendor = result.vendor || "vendor";
+  if (sync.state === "pushed") {
+    return lang === "en"
+      ? `${head} · synced to ${vendor}`
+      : `${head} · 已同步到 ${vendor}`;
+  }
+  const why =
+    sync.state === "unsupported"
+      ? lang === "en"
+        ? `${vendor} has no session-title API`
+        : `${vendor} 无会话标题接口`
+      : sync.detail || (lang === "en" ? "vendor not reachable" : "vendor 暂不可达");
+  return lang === "en" ? `${head} · ccteam-side only (${why})` : `${head} · 仅 ccteam 侧(${why})`;
+}
+
 /** Chinese relative-time phrase for an RFC3339 timestamp — mirrors
  *  `ccteam-im::gateway::relative_time_zh` so IM `/sessions` and the web rail
  *  read the same way. Unparseable/empty input renders `"—"`. */

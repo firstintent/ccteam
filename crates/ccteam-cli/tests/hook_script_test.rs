@@ -108,6 +108,16 @@ fn hook_sh_falls_back_to_ccteam_internal_hook_when_no_token() {
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
         .env_remove("https_proxy")
+        // Drop the ccteam session env this test process may itself be running
+        // under. `CCTEAM_HOOKLESS=1` is injected into every stream-json child,
+        // and hook.sh honours it with an immediate `exit 0` — so inside a
+        // ccteam-managed session these tests saw a silent success that wrote
+        // nothing (two reds) and a listener nobody ever connected to (one hang).
+        // That is the whole "hook_* env-flake family": inherited env, not flake.
+        .env_remove("CCTEAM_HOOKLESS")
+        .env_remove("CCTEAM_CHAT_ROLE")
+        .env_remove("CCTEAM_CHAT_SLUG")
+        .env_remove("CCTEAM_CHAT_SID")
         .env("PATH", format!("{}:/usr/bin:/bin", stub_dir.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -154,6 +164,16 @@ fn hook_sh_with_action_routes_kind_and_action_to_cli() {
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
         .env_remove("https_proxy")
+        // Drop the ccteam session env this test process may itself be running
+        // under. `CCTEAM_HOOKLESS=1` is injected into every stream-json child,
+        // and hook.sh honours it with an immediate `exit 0` — so inside a
+        // ccteam-managed session these tests saw a silent success that wrote
+        // nothing (two reds) and a listener nobody ever connected to (one hang).
+        // That is the whole "hook_* env-flake family": inherited env, not flake.
+        .env_remove("CCTEAM_HOOKLESS")
+        .env_remove("CCTEAM_CHAT_ROLE")
+        .env_remove("CCTEAM_CHAT_SLUG")
+        .env_remove("CCTEAM_CHAT_SID")
         .env("PATH", format!("{}:/usr/bin:/bin", stub_dir.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -244,12 +264,24 @@ fn hook_sh_forwards_chat_role_and_slug_headers_on_http_path() {
         .env("HOME", tmp.path())
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_WEB_PORT", port.to_string())
-        .env("CCTEAM_CHAT_ROLE", "bob")
-        .env("CCTEAM_CHAT_SLUG", "demo-slug")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
         .env_remove("https_proxy")
+        // Drop the ccteam session env this test process may itself be running
+        // under. `CCTEAM_HOOKLESS=1` is injected into every stream-json child,
+        // and hook.sh honours it with an immediate `exit 0` — so inside a
+        // ccteam-managed session these tests saw a silent success that wrote
+        // nothing (two reds) and a listener nobody ever connected to (one hang).
+        // That is the whole "hook_* env-flake family": inherited env, not flake.
+        .env_remove("CCTEAM_HOOKLESS")
+        .env_remove("CCTEAM_CHAT_ROLE")
+        .env_remove("CCTEAM_CHAT_SLUG")
+        .env_remove("CCTEAM_CHAT_SID")
+        // …then set the two this test is actually about, so the hermetic
+        // removals above cannot clobber them (Command applies in order).
+        .env("CCTEAM_CHAT_ROLE", "bob")
+        .env("CCTEAM_CHAT_SLUG", "demo-slug")
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

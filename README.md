@@ -41,9 +41,9 @@ Paste a bot token once (Settings → Access) and the chat becomes a full console
 
 The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-ip>:7331/?token=…`) — open it from any device on your LAN. It's a chat shell, not a dashboard:
 
-- quick-start templates aimed at each vendor's strength
+- six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
-- the live delegation tree
+- a Team page: the live delegation topology — vendor, live model and cost per session, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
 - a cost pill with daily budget caps
 - marketplace and settings
 

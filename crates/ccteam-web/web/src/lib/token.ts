@@ -17,10 +17,14 @@ const STORAGE_KEY = "aoe_auth_token";
 // Companion expiry (epoch ms). This token is a Bearer mirror of the HttpOnly
 // `ccteam_token` cookie; we cap its localStorage lifetime to the SAME 7-day
 // window as the cookie's `Max-Age` (see `crates/ccteam-web/src/auth.rs`
-// `COOKIE_MAX_AGE_DAYS`) so neither auth path can outlive the other and the
-// user is re-prompted for a token after at most 7 days. Persistence across a
-// browser restart comes for free: localStorage survives it, and the expiry is
-// absolute wall-clock, not a session marker.
+// `COOKIE_MAX_AGE_DAYS`). Persistence across a browser restart comes for free:
+// localStorage survives it, and the expiry is absolute wall-clock.
+//
+// Known desync (why SSE used to 401 while REST still worked): (1) legacy
+// tokens without EXPIRY_KEY are grandfathered a fresh 7d on first read
+// (`getToken` below) while the cookie Max-Age is frozen from login time;
+// (2) browsers may drop non-Secure cookies on pure-http hosts. Server-side
+// Bearer re-mint + fetch-backed SSE heal both.
 const EXPIRY_KEY = "aoe_auth_token_exp";
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 

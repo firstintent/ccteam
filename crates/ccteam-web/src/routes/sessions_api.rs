@@ -52,6 +52,7 @@
 //! written yet. A `sid` unknown to the gateway is a 404.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -64,7 +65,10 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
-use ccteam_harness::{AgentVendor, ChoicePrompt, PermissionMode, SessionProtocol, ThreadStatus};
+use ccteam_harness::{
+    AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
+    ThreadStatus,
+};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
@@ -190,14 +194,18 @@ pub(crate) fn project_not_visible(slug: &str) -> Response {
 /// on-disk `meta.json`), then checks the caller may see it. Returns `Some(404)`
 /// when the sid is unknown OR its project isn't visible (the two are
 /// indistinguishable, so sids in other users' projects can't be probed).
-/// `None` = allowed (admin, no-gateway → the handler does its own check, or a
-/// visible project). Resolving *stopped* sessions here (not just live ones)
-/// lets an authorised caller reach a since-evicted session so the turn handler
-/// can cold-resume it (resume-by-sid) instead of 404-ing.
+/// `None` = allowed (no-gateway → the handler does its own check, or a visible
+/// project). Resolving *stopped* sessions here (not just live ones) lets an
+/// authorised caller reach a since-evicted session so the turn handler can
+/// cold-resume it (resume-by-sid) instead of 404-ing.
+///
+/// Cross-user fix (2026-07-28) — the gate runs for the ADMIN too. It used to short-circuit on
+/// `is_admin`, which contradicted the very policy it delegates to:
+/// `can_see_owner` deliberately keeps the admin OUT of a tenant's projects
+/// (`/api/v1/projects/<tenant-slug>/…` 404s), yet every by-sid door
+/// (`GET /sessions/{sid}`, `/status`, `/events`, `POST /turn`, `/stop`, …)
+/// stayed wide open on the same resources. One door, one policy.
 async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -> Option<Response> {
-    if identity.is_admin {
-        return None;
-    }
     // No live gateway → the handler runs its own no-gateway path; don't gate.
     let gw = app.gateway.as_ref()?;
     let project = {
@@ -478,14 +486,21 @@ pub struct RenameSessionRequest {
 
 /// `PATCH /api/v1/sessions/{sid}`
 ///
-/// Rename a LIVE session's user-facing title. The title is rule-based
-/// truncated server-side (whitespace-collapsed, capped ~40 chars — never an
-/// LLM call) and recorded as `TitleSource::User`, which is STICKY: it is
-/// never later overwritten by the first-message auto-title or a vendor
-/// `ai-title` (see [`ccteam_harness::apply_title`]'s precedence). 200
-/// `{sid, title}` with the cleaned title actually stored. 400 for a blank
-/// title. 404 unknown/inaccessible session (project-ACL'd via `gate_sid`,
-/// same as every other `/sessions/{sid}/*` route). 503 no gateway.
+/// Rename a session's user-facing title — live **or stopped** (a history row
+/// in the rail is renameable exactly like a live one; `meta.json` outlives the
+/// live map). The title is rule-based truncated server-side
+/// (whitespace-collapsed, capped ~40 chars — never an LLM call) and recorded
+/// as `TitleSource::User`, which is STICKY: it is never later overwritten by
+/// the first-message auto-title or a vendor `ai-title` (see
+/// [`ccteam_harness::apply_title`]'s precedence).
+///
+/// 200 `{sid, title, previous, vendor, vendor_sync:{state, detail?}}` — the
+/// cleaned title actually stored plus what the VENDOR's own title surface did
+/// with it (`pushed` | `deferred` | `unsupported`), so the UI can tell the
+/// user honestly whether the rename crossed the vendor boundary instead of
+/// implying it always does. 400 for a blank title. 404 unknown/inaccessible
+/// session (project-ACL'd via `gate_sid`, same as every other
+/// `/sessions/{sid}/*` route). 503 no gateway.
 #[utoipa::path(
     patch,
     path = "/api/v1/sessions/{sid}",
@@ -493,7 +508,7 @@ pub struct RenameSessionRequest {
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     request_body = RenameSessionRequest,
     responses(
-        (status = 200, description = "Renamed `{sid, title}`", body = serde_json::Value),
+        (status = 200, description = "Renamed `{sid, title, previous, vendor, vendor_sync}`", body = serde_json::Value),
         (status = 400, description = "Blank title"),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
@@ -520,15 +535,40 @@ pub(crate) async fn handle_patch_session(
     };
     let result = {
         let guard = gw.lock().await;
-        guard.rename_session(&sid, &body.title)
+        // Held across the vendor push, like `interrupt_session`'s adapter call:
+        // the push is one file append / one RPC, and serializing renames keeps
+        // meta.json's read-modify-write atomic against a concurrent rename.
+        guard.rename_session(&sid, &body.title).await
     };
     match result {
-        Ok(title) => Json(json!({"sid": sid, "title": title})).into_response(),
+        Ok(renamed) => Json(rename_payload(&renamed)).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "rename_session failed");
             unknown_session(&sid)
         }
     }
+}
+
+/// Serialize a [`SessionRename`] for the PATCH response. Split out so the
+/// wire shape — including the vendor-sync report the SPA renders — is
+/// unit-testable without a live gateway.
+fn rename_payload(renamed: &ccteam_im::gateway::SessionRename) -> serde_json::Value {
+    let (state, detail) = match &renamed.vendor_sync {
+        ccteam_harness::TitleSync::Pushed => ("pushed", None),
+        ccteam_harness::TitleSync::Deferred(reason) => ("deferred", Some(reason.clone())),
+        ccteam_harness::TitleSync::Unsupported => ("unsupported", None),
+    };
+    let mut sync = json!({ "state": state });
+    if let Some(detail) = detail {
+        sync["detail"] = json!(detail);
+    }
+    json!({
+        "sid": renamed.sid,
+        "title": renamed.title,
+        "previous": renamed.previous,
+        "vendor": renamed.vendor,
+        "vendor_sync": sync,
+    })
 }
 
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
@@ -564,6 +604,30 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
     })
 }
 
+/// One live session's [`ThreadStatus`], awaited AFTER the caller has dropped
+/// the gateway lock (resolve `(adapter, thread)` via
+/// [`session_status_handle`](ccteam_im::gateway::Gateway::session_status_handle)
+/// under the lock first — `thread_status` does fs/transport I/O and must
+/// never run under the gateway mutex). A `thread_status` error degrades to
+/// the empty (all-null) status, never a 5xx. This is the single source of
+/// truth for a session's live statusline: shared by `GET
+/// /sessions/{sid}/status` and the team graph's per-live-node model join
+/// ([`super::agents::handle_agents_graph`]), so both report the same model.
+pub(crate) async fn resolved_thread_status(
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+    sid: &str,
+) -> ThreadStatus {
+    match adapter.thread_status(&thread).await {
+        Ok(s) => s,
+        Err(err) => {
+            // A statusless answer is valid — degrade to empty, never a 5xx.
+            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
+            ThreadStatus::default()
+        }
+    }
+}
+
 /// `GET /api/v1/sessions/{sid}/status`
 ///
 /// The session's live statusline — model + context-window usage — for the
@@ -571,11 +635,12 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 /// suffix). Resolves the sid → `(adapter, thread)` under the gateway lock
 /// (also the 404 gate), **drops the lock**, then awaits
 /// [`HarnessAdapter::thread_status`](ccteam_harness::HarnessAdapter::thread_status)
-/// — fs/transport I/O that must never run under the gateway mutex (same
-/// lock-drop discipline as the history endpoint). 200 `{sid, model, context,
-/// status_line}`; any field is `null` until there is something to report (a
-/// fresh session before its first turn). 404 unknown sid. 503 no gateway. A
-/// `thread_status` error degrades to the empty (all-null) status, never a 5xx.
+/// via [`resolved_thread_status`] — fs/transport I/O that must never run
+/// under the gateway mutex (same lock-drop discipline as the history
+/// endpoint). 200 `{sid, model, context, status_line}`; any field is `null`
+/// until there is something to report (a fresh session before its first
+/// turn). 404 unknown sid. 503 no gateway. A `thread_status` error degrades
+/// to the empty (all-null) status, never a 5xx.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{sid}/status",
@@ -607,14 +672,7 @@ pub(crate) async fn handle_session_status(
     let Some((adapter, thread)) = resolved else {
         return unknown_session(&sid);
     };
-    let status = match adapter.thread_status(&thread).await {
-        Ok(s) => s,
-        Err(err) => {
-            // A statusless answer is valid — degrade to empty, never a 5xx.
-            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
-            ThreadStatus::default()
-        }
-    };
+    let status = resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
             "used_tokens": c.used_tokens,
@@ -863,9 +921,9 @@ pub(crate) async fn handle_session_turn(
             let Some(slug) = guard.project_slug_for_sid(&sid) else {
                 return unknown_session(&sid);
             };
-            // `gate_sid` already project-gated the caller (admin bypasses it);
-            // bind the resume to the resolved owning project so `resume_stopped_
-            // session`'s own ACL guard is satisfied (`exp == slug` holds).
+            // `gate_sid` already project-gated the caller; bind the resume to
+            // the resolved owning project so `resume_stopped_session`'s own ACL
+            // guard is satisfied (`exp == slug` holds).
             let caller_identity = identity.owner_tag();
             if let Err(err) = guard
                 .resume_stopped_session(&sid, &caller_identity, Some(&slug))
@@ -2013,6 +2071,9 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(project_dir, sid, &mk("t1", "review the diff", "LGTM")).unwrap();
         append_turn(project_dir, sid, &mk("t2", "and the tests?", "all green")).unwrap();
@@ -2053,6 +2114,9 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
@@ -2087,6 +2151,9 @@ mod tests {
             assistant: "done — s2".into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
         };
         let ev = turn_to_event(&turn);
         assert_eq!(ev["turn_id"], "t9");

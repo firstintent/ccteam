@@ -4,6 +4,12 @@
 // page structure: 开工吧! + ctx-bar (项目/角色; 主机 hidden until real host
 // data resolves; 分支 hidden — no backend data, never mocked) + composer +
 // the 快速开始 template grid (recents live in the sidebar rail).
+//
+// v0.9.11 TEAM-3: the grid renders the shared 编队起手 formation playbooks
+// (HomeView now reads router state → MemoryRouter wraps every render); the
+// Team→Home handoff's applied patch is pure-helper-tested in
+// lib/playbooks.test.ts (`applyPlaybook` / `playbookFromState`) because SSR
+// renderToString never runs effects.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,20 +25,22 @@ vi.hoisted(() => {
 });
 
 import { renderToString } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
 
-function render(isAdmin = true) {
+function render() {
   return renderToString(
-    <HomeView
-      lang="zh"
-      isAdmin={isAdmin}
-      projects={["ccteam", "demo"]}
-      projectPaths={{ ccteam: "~/rob/ccteam" }}
-      onLaunched={() => {}}
-      onOpenSettings={() => {}}
-    />,
+    <MemoryRouter>
+      <HomeView
+        lang="zh"
+        projects={["ccteam", "demo"]}
+        projectPaths={{ ccteam: "~/rob/ccteam" }}
+        onLaunched={() => {}}
+        onOpenSettings={() => {}}
+      />
+    </MemoryRouter>,
   );
 }
 
@@ -64,15 +72,16 @@ describe("HomeView (landing page)", () => {
 
   it("ctx-bar: 分支 shows READ-ONLY when the project reports current_branch", () => {
     const html = renderToString(
-      <HomeView
-        lang="zh"
-        isAdmin
-        projects={["ccteam"]}
-        projectPaths={{ ccteam: "~/rob/ccteam" }}
-        projectBranches={{ ccteam: "dev" }}
-        onLaunched={() => {}}
-        onOpenSettings={() => {}}
-      />,
+      <MemoryRouter>
+        <HomeView
+          lang="zh"
+          projects={["ccteam"]}
+          projectPaths={{ ccteam: "~/rob/ccteam" }}
+          projectBranches={{ ccteam: "dev" }}
+          onLaunched={() => {}}
+          onOpenSettings={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(html).toContain('data-testid="ctx-branch"');
     const seg = html.slice(html.indexOf('data-testid="ctx-branch"'));
@@ -127,81 +136,103 @@ describe("HomeView (landing page)", () => {
 
   it("project options wear their remote host and offline state", () => {
     const html = renderToString(
-      <HomeView
-        lang="en"
-        isAdmin
-        projects={["remote-proj"]}
-        projectPaths={{ "remote-proj": "/srv/remote-proj" }}
-        projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
-        onLaunched={() => {}}
-        onOpenSettings={() => {}}
-      />,
+      <MemoryRouter>
+        <HomeView
+          lang="en"
+          projects={["remote-proj"]}
+          projectPaths={{ "remote-proj": "/srv/remote-proj" }}
+          projectHosts={{ "remote-proj": { host: "sat-2", online: false } }}
+          onLaunched={() => {}}
+          onOpenSettings={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(html.replace(/<!-- -->/g, "")).toContain("@ sat-2");
     expect(html).toContain("offline");
     expect(html).toContain('disabled=""');
   });
 
-  it("renders the 快速开始 grid: 6 cards showcasing multi-vendor strengths", () => {
+  it("renders the 快速开始 grid: the 6 shared 编队起手 formation playbooks", () => {
     const html = render();
     expect(html).toContain('data-testid="template-grid"');
     expect(html).toContain("快速开始");
-    for (const id of ["team", "compare", "review", "code", "fast", "bulk"]) {
+    for (const id of ["commander", "advisor", "crossreview", "bakeoff", "triangulate", "pyramid"]) {
       expect(html).toContain(`data-testid="tpl-${id}"`);
     }
-    expect(html).toContain("多 agent 协作");
-    expect(html).toContain("多模型对比");
-    expect(html).toContain("跨 vendor 互审");
-    expect(html).toContain("稳定编码");
-    expect(html).toContain("极速排查");
-    expect(html).toContain("批量任务");
-    // The card carries its composer prompt as the hover title; the 协作
+    expect(html).toContain("总控-工班");
+    expect(html).toContain("主力-顾问");
+    expect(html).toContain("交叉互审");
+    expect(html).toContain("并行竞标");
+    expect(html).toContain("调研三角");
+    expect(html).toContain("金字塔用工");
+    // The card carries its composer prompt as the hover title; the commander
     // flagship's prompt drives real A2A delegation (session_spawn/dispatch).
     expect(html).toContain("session_spawn");
-    expect(html).toContain("给出你的裁决和置信度");
-    // The old recents grid is gone (recents live in the sidebar rail).
+    expect(html).toContain("择优合并成最终答案");
+    // The old recents grid is gone (recents live in the sidebar rail), and
+    // the retired single-vendor cards (code/fast/bulk era) don't resurface.
     expect(html).not.toContain('data-testid="recent-grid"');
+    expect(html).not.toContain('data-testid="tpl-team"');
+    expect(html).not.toContain('data-testid="tpl-code"');
   });
 
-  it("vendor-strength cards wear their harness brand chips", () => {
+  it("formation cards wear their harness brand chips", () => {
     const html = render();
     const grid = html.slice(html.indexOf('data-testid="template-grid"'));
-    for (const vendor of ["claude", "codex", "grok", "kimi"]) {
+    // The deck spans all five harnesses.
+    for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
       expect(grid).toContain(`data-vendor="${vendor}"`);
     }
-    // The 协作 flagship wears all four chips (claude brain + 3 specialists).
-    const team = grid.slice(
-      grid.indexOf('data-testid="tpl-team"'),
-      grid.indexOf('data-testid="tpl-compare"'),
-    );
-    for (const vendor of ["claude", "codex", "grok", "kimi"]) {
-      expect(team).toContain(`data-vendor="${vendor}"`);
-    }
-    // The 多模型对比 card fans across three brains (claude referee + two contestants).
-    const compare = grid.slice(
-      grid.indexOf('data-testid="tpl-compare"'),
-      grid.indexOf('data-testid="tpl-review"'),
+    // The 总控-工班 flagship fields the claude brain + codex/grok crews.
+    const commander = grid.slice(
+      grid.indexOf('data-testid="tpl-commander"'),
+      grid.indexOf('data-testid="tpl-advisor"'),
     );
     for (const vendor of ["claude", "codex", "grok"]) {
-      expect(compare).toContain(`data-vendor="${vendor}"`);
+      expect(commander).toContain(`data-vendor="${vendor}"`);
+    }
+    // 金字塔用工 leads cheap (kimi/opencode) and escalates to claude.
+    const pyramid = grid.slice(grid.indexOf('data-testid="tpl-pyramid"'));
+    for (const vendor of ["kimi", "opencode", "claude"]) {
+      expect(pyramid).toContain(`data-vendor="${vendor}"`);
     }
   });
 
   it("template cards speak the shell language (en)", () => {
     const html = renderToString(
-      <HomeView
-        lang="en"
-        isAdmin
-        projects={["ccteam"]}
-        projectPaths={{ ccteam: "~/rob/ccteam" }}
-        onLaunched={() => {}}
-        onOpenSettings={() => {}}
-      />,
+      <MemoryRouter>
+        <HomeView
+          lang="en"
+          projects={["ccteam"]}
+          projectPaths={{ ccteam: "~/rob/ccteam" }}
+          onLaunched={() => {}}
+          onOpenSettings={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(html).toContain("Quick start");
-    expect(html).toContain("Multi-agent team");
-    expect(html).toContain("Model face-off");
-    expect(html).toContain("Cross-vendor review");
-    expect(html).toContain("Solid coding");
+    expect(html).toContain("Commander + crews");
+    expect(html).toContain("Driver + advisor");
+    expect(html).toContain("Cross review");
+    expect(html).toContain("Pyramid staffing");
+  });
+
+  it("mounts under the Team page 起手 handoff state (one-shot router state)", () => {
+    // SSR never runs effects, so the applied composer patch itself is
+    // pure-helper-tested in lib/playbooks.test.ts (applyPlaybook /
+    // playbookFromState); this proves the page accepts the handoff entry.
+    const html = renderToString(
+      <MemoryRouter initialEntries={[{ pathname: "/", state: { playbook: "commander" } }]}>
+        <HomeView
+          lang="zh"
+          projects={["ccteam"]}
+          projectPaths={{ ccteam: "~/rob/ccteam" }}
+          onLaunched={() => {}}
+          onOpenSettings={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('data-testid="home-view"');
+    expect(html).toContain('data-testid="tpl-commander"');
   });
 });
