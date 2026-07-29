@@ -1164,6 +1164,10 @@ select:focus-visible,
 .charter-roster-head .badge { margin-left: auto; }
 .charter-roster-meta { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .charter-roster-hint { color: var(--text-faint); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+/* v0.9.11 TEAM-10 — "a newer release exists" on the version line. Good news,
+   not a fault: it borrows `.badge.ok`'s green-text accent (subdued in both
+   themes) rather than the warn red the stale-host hint uses. */
+.charter-roster-update { color: var(--green-text); margin-left: 6px; }
 .charter-roster-stats { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
 .charter-roster-live { color: var(--green); font-variant-numeric: tabular-nums; }
 /* v0.9.11 TEAM-7 — a roster card is clickable ONLY when the caller handed

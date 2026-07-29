@@ -541,6 +541,12 @@ export function tRosterOfflineFor(lang: Lang, n: number, unit: "hours" | "days")
   }
   return unit === "days" ? `已离线 ${n} 天` : `已离线 ${n} 小时`;
 }
+/** Roster card version line: an npm-catalog release newer than what this host
+ *  reports installed (`lib/vendorLatest.ts`). Only ever rendered when the
+ *  comparison actually resolved — silence, not "unknown", otherwise. */
+export function tRosterUpdateAvailable(lang: Lang, latest: string): string {
+  return lang === "en" ? `↑ ${latest} available` : `↑ ${latest} 可更新`;
+}
 
 /** Shell / nav labels, keyed by route or shell surface (pre-dictionary seam;
  *  kept for panels that still call it). */

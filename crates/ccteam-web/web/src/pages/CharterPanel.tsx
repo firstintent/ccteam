@@ -10,7 +10,9 @@
 //   online before offline; offline (non-local) sections start collapsed.
 //   Non-local headers carry a 移除/Remove button — offline fires the DELETE
 //   immediately, online arms a same-button two-click confirm first. Cards
-//   click through to the topology tab filtered to that vendor (TEAM-7).
+//   click through to the topology tab filtered to that vendor (TEAM-7); the
+//   version line carries an update-available hint from the npm catalog
+//   (`lib/vendorLatest.ts`, best-effort — no catalog, no hint) (TEAM-10).
 // - 编队起手 playbook cards (TEAM-3): the shared formation definitions from
 //   `lib/playbooks.ts` (same array the Home launcher renders — UI
 //   documentation only, no shipped prompts/personas); the 起手 CTA hands off
@@ -42,7 +44,9 @@ import {
 import { fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
 import { getHostDetail, getHosts } from "../lib/hostsApi";
 import { getRouting, putRouting } from "../lib/routingApi";
-import { makeT, tRosterOfflineFor, type Lang } from "../lib/i18n";
+import { fetchVendorLatests, isOutdated } from "../lib/vendorLatest";
+import { makeT, tRosterOfflineFor, tRosterUpdateAvailable, type Lang } from "../lib/i18n";
+import { VENDORS } from "../lib/vendors";
 import { PLAYBOOKS } from "../lib/playbooks";
 import { toastBus } from "../lib/toastBus";
 import { VendorChip } from "../components/VendorChip";
@@ -88,7 +92,14 @@ const EMPTY_COLLAPSED: Set<string> = new Set();
  *  never removes a host on its own; the click stays the user's. The clock
  *  arrives as the `nowMs` prop rather than being read here: `Date.now()`
  *  during render is impure (and `react-hooks/purity` rejects it outright),
- *  so the caller stamps it where the data lands. */
+ *  so the caller stamps it where the data lands.
+ *
+ *  TEAM-10: the version line also answers "is this the current build?" — with
+ *  a `latests` map (npm catalog, prop-drilled for the same purity reason as
+ *  `nowMs`) an installed agent behind its published release gets a subdued
+ *  `↑ <latest>` hint. Only when BOTH sides parse and the latest really is
+ *  newer: an unmapped vendor (kimi has no npm channel), a failed probe or an
+ *  unparseable version all render nothing — silence over speculation. */
 export function VendorRosterCards({
   hosts,
   nodes,
@@ -99,6 +110,7 @@ export function VendorRosterCards({
   onRemoveClick = () => {},
   onVendorPick,
   nowMs,
+  latests,
 }: {
   hosts: RosterHost[];
   nodes: AgentNode[];
@@ -115,6 +127,10 @@ export function VendorRosterCards({
    *  omit it and no age is shown at all, which is the honest default for an
    *  embedder that has no clock to offer. */
   nowMs?: number;
+  /** vendor → latest published version (`lib/vendorLatest.ts`). Owned by the
+   *  caller for the same reason as `nowMs`: the fetch is impure. Omitted /
+   *  missing entry → no hint at all. */
+  latests?: Record<string, string>;
 }) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
@@ -193,6 +209,11 @@ export function VendorRosterCards({
                     const live = mine.filter((n) => n.status === "live").length;
                     const cost = mine.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
                     const badge = rosterBadge(agent.status, t);
+                    // `isOutdated` already returns false when either side
+                    // fails to parse, so this is the whole gate.
+                    const latest = latests?.[agent.vendor];
+                    const update =
+                      agent.installed && latest && isOutdated(agent.version, latest) ? latest : null;
                     return (
                       <div
                         key={`${host}-${agent.vendor}`}
@@ -217,6 +238,14 @@ export function VendorRosterCards({
                         </div>
                         <div className="charter-roster-meta mono">
                           {agent.installed ? agent.version ?? "—" : t("notInstalled")}
+                          {update ? (
+                            <span
+                              className="charter-roster-update"
+                              data-testid={`charter-roster-update-${host}-${agent.vendor}`}
+                            >
+                              {tRosterUpdateAvailable(lang, update)}
+                            </span>
+                          ) : null}
                         </div>
                         {agent.hint ? <div className="charter-roster-hint mono">{agent.hint}</div> : null}
                         <div className="charter-roster-stats">
@@ -452,6 +481,8 @@ export default function CharterPanel({
   // in a render body is impure. `null` until then, which is exactly when the
   // roster is still empty and nothing renders anyway.
   const [nowMs, setNowMs] = useState<number | null>(null);
+  // vendor → latest published version, for the roster's update hint.
+  const [latests, setLatests] = useState<Record<string, string>>({});
 
   // Visible projects → picker options; default to the first one.
   useEffect(() => {
@@ -544,6 +575,25 @@ export default function CharterPanel({
     };
   }, []);
 
+  // Latest published versions for the update hint — fired once over the whole
+  // vendor catalog (not the roster's vendors) so it doesn't wait on, or
+  // re-fire with, the host reports; `fetchVendorLatests` drops the vendors it
+  // has no npm channel for and caches the rest. Pure decoration: any failure
+  // leaves the map empty and the roster simply says nothing about updates.
+  useEffect(() => {
+    let cancelled = false;
+    fetchVendorLatests(VENDORS.map((v) => v.id))
+      .then((map) => {
+        if (!cancelled) setLatests(map);
+      })
+      .catch(() => {
+        if (!cancelled) setLatests({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const toggleRosterCollapsed = (host: string) => {
     setRosterCollapsed((previous) => {
       const next = new Set(previous);
@@ -590,6 +640,7 @@ export default function CharterPanel({
         onRemoveClick={onRosterRemoveClick}
         onVendorPick={onVendorPick}
         nowMs={nowMs ?? undefined}
+        latests={latests}
       />
 
       <PlaybookCards lang={lang} />

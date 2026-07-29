@@ -393,6 +393,65 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     expect(many).toContain("consider removing");
   });
 
+  // TEAM-10 — "is this the current build?" on the version line. `latests` is
+  // injected here exactly as `CharterPanel` prop-drills it from
+  // `lib/vendorLatest.ts` (whose npm mapping decides which vendors can ever
+  // have an entry: claude/codex/grok/opencode — kimi has no npm channel).
+  it("(TEAM-10) an installed agent behind its published release says so", () => {
+    const html = renderToString(
+      <VendorRosterCards
+        hosts={hosts}
+        nodes={nodes}
+        collapsed={new Set()}
+        latests={{ claude: "2.1.40" }}
+      />,
+    );
+    expect(html).toContain('data-testid="charter-roster-update-local-claude"');
+    expect(html).toContain("↑ 2.1.40 可更新");
+    // The installed version stays the headline — the hint only appends.
+    expect(html).toContain("2.1.34");
+    // codex has no entry in the map → its card says nothing about updates.
+    expect(html).not.toContain('data-testid="charter-roster-update-local-codex"');
+  });
+
+  it("(TEAM-10) silence when the catalog has no answer, the version matches, or nothing is installed", () => {
+    // (a) no map at all (the default) — no hint anywhere.
+    expect(renderToString(<VendorRosterCards hosts={hosts} nodes={nodes} />)).not.toContain(
+      "charter-roster-update-",
+    );
+    // (b) latest === installed.
+    expect(
+      renderToString(
+        <VendorRosterCards hosts={hosts} nodes={nodes} latests={{ claude: "2.1.34" }} />,
+      ),
+    ).not.toContain("charter-roster-update-");
+    // (c) not installed: a version-shaped catalog entry must not turn 未安装
+    //     into an upgrade nag.
+    const absent = [
+      fixtureHost({
+        agents: [fixtureAgent({ vendor: "grok", installed: false, version: null })],
+      }),
+    ];
+    const absentHtml = renderToString(
+      <VendorRosterCards hosts={absent} nodes={[]} latests={{ grok: "9.9.9" }} />,
+    );
+    expect(absentHtml).toContain("未安装");
+    expect(absentHtml).not.toContain("charter-roster-update-");
+    // (d) an unparseable installed version — no comparison, no claim.
+    const murky = [fixtureHost({ agents: [fixtureAgent({ version: "unknown" })] })];
+    expect(
+      renderToString(<VendorRosterCards hosts={murky} nodes={[]} latests={{ claude: "2.1.40" }} />),
+    ).not.toContain("charter-roster-update-");
+  });
+
+  it("(TEAM-10) the update hint speaks the shell language", () => {
+    const en = renderToString(
+      <VendorRosterCards hosts={hosts} nodes={nodes} lang="en" latests={{ claude: "2.1.40" }} />,
+    );
+    expect(en).toContain("↑ 2.1.40 available");
+    expect(en).not.toContain("可更新");
+  });
+
   it("empty roster renders nothing", () => {
     expect(renderToString(<VendorRosterCards hosts={[]} nodes={nodes} />)).toBe("");
   });
