@@ -613,3 +613,125 @@ async fn project_acl_covers_legacy_action_pane_and_pty_routes() {
         "the owner must still reach its own project's pane snapshot"
     );
 }
+
+/// The FLEET surface is owner-scoped, not "any logged-in user".
+///
+/// Cross-user fix (2026-07-30): the whole `hosts` route file ran with no
+/// identity at all, so a plain tenant could read/mint the satellite join token
+/// (a credential that attaches a MACHINE to this daemon and then runs agent
+/// sessions on it), deregister the owner's satellites, drive the vendor-config
+/// MCP write, and read the owner's entire project catalog — slugs and absolute
+/// paths — off `GET /hosts/{host}` while `GET /api/v1/projects` correctly
+/// showed them nothing. Same病根 as the 2026-07-28 sweep: handing the caller
+/// something it was never authorized for.
+#[tokio::test]
+async fn fleet_surfaces_are_owner_scoped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+
+    // An admin-owned project, registered in the catalog AND on disk — what the
+    // host page would list for `local`.
+    let mut cfg = ccteam_core::config::CcteamConfig::default();
+    cfg.projects.push(ccteam_core::config::ProjectEntry {
+        slug: "adminproj".into(),
+        path: tmp.path().join("adminproj"),
+        host: "local".into(),
+        remote_slug: None,
+        remote_path: None,
+        team: "dev".into(),
+        installed_at: chrono::Utc::now(),
+    });
+    ccteam_core::config::save(&paths.root, &cfg).unwrap();
+    let admin_state = paths.project_state("adminproj");
+    std::fs::create_dir_all(admin_state.parent().unwrap()).unwrap();
+    let mut st = ccteam_core::ProjectState::initial_for_team("adminproj".into(), "dev".into());
+    st.owner = Some("user:web-api".into());
+    st.save(&admin_state).unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // 1. Join tokens — reading one is as good as minting one: both owner-only.
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not read the join token");
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not mint a join token");
+
+    // 2. Fleet membership + the vendor-config write.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/dxa347"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not deregister a host");
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/local/register-mcp"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "a tenant must not drive the vendor MCP registration write",
+    );
+
+    // 3. The host page's project list follows the SAME ownership policy as
+    //    `GET /api/v1/projects` — which, for this tenant, is empty.
+    let detail: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/local"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["projects"],
+        serde_json::json!([]),
+        "the host page must not leak the owner's catalog to a tenant",
+    );
+
+    // 4. The owner still sees its own fleet: token readable, catalog intact.
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "the owner reads its own join token");
+    let detail: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/local"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["projects"][0]["slug"],
+        serde_json::json!("adminproj"),
+        "the owner still sees its own projects on the host page",
+    );
+}
