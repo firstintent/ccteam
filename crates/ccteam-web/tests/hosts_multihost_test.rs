@@ -549,3 +549,147 @@ async fn gateway_create_on_offline_host_fails_clean() {
     // No live sessions.
     assert!(gw.session_views().is_empty());
 }
+
+/// TEAM-5 — `DELETE /api/v1/hosts/{host}` deregisters an offline satellite
+/// (drops its registry record) and refuses `local` / an unknown host.
+#[tokio::test]
+async fn remove_deregisters_offline_host_and_rejects_local_and_unknown() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(paths.hosts_dir()).unwrap();
+
+    let mut reg = HostRegistry::default();
+    reg.upsert(HostRecord {
+        id: "stale-sat".into(),
+        hostname: "stale-sat".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        ccteam_version: "0.9.11".into(),
+        agent_token: "t".into(),
+        last_heartbeat_unix: now_unix().saturating_sub(DEFAULT_HEARTBEAT_TTL_SECS + 30),
+        agents: vec![],
+        projects: vec![],
+        joined_at: chrono::Utc::now().to_rfc3339(),
+    });
+    reg.save(&paths.host_registry_path()).unwrap();
+
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+    let auth = format!("Bearer ccteam:{ADMIN_HEX}");
+
+    // Unknown host → 404.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/never-joined"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "unknown host must 404");
+
+    // `local` can never be removed → 400.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/local"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "local must 400");
+
+    // Offline satellite → 200, drops the registry record.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/stale-sat"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "offline host removal must succeed");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["host"], "stale-sat");
+    assert!(HostRegistry::load(&paths.host_registry_path())
+        .unwrap()
+        .get("stale-sat")
+        .is_none());
+
+    // The follow-up list no longer carries it.
+    let list: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!list["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|h| h["host"] == "stale-sat"));
+
+    // Removing it again is now unknown → 404 (idempotent-shaped, not a crash).
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/stale-sat"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
+
+/// TEAM-5 — an online (heartbeating) host is refused without `?force=true`
+/// (409), and removable with it.
+#[tokio::test]
+async fn remove_online_host_requires_force() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(paths.hosts_dir()).unwrap();
+
+    let mut reg = HostRegistry::default();
+    reg.upsert(HostRecord {
+        id: "live-sat".into(),
+        hostname: "live-sat".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        ccteam_version: "0.9.11".into(),
+        agent_token: "t".into(),
+        last_heartbeat_unix: now_unix(),
+        agents: vec![],
+        projects: vec![],
+        joined_at: chrono::Utc::now().to_rfc3339(),
+    });
+    reg.save(&paths.host_registry_path()).unwrap();
+
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+    let auth = format!("Bearer ccteam:{ADMIN_HEX}");
+
+    // Online, no force → 409, record survives.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/live-sat"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "online host without force must 409");
+    assert!(HostRegistry::load(&paths.host_registry_path())
+        .unwrap()
+        .get("live-sat")
+        .is_some());
+
+    // Online, ?force=true → 200, record dropped.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/live-sat?force=true"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "force must remove a live satellite");
+    assert!(HostRegistry::load(&paths.host_registry_path())
+        .unwrap()
+        .get("live-sat")
+        .is_none());
+}

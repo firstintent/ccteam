@@ -251,10 +251,11 @@ enum Command {
         #[command(subcommand)]
         cmd: SkillCommand,
     },
-    /// Multi-host group: `ccteam host <join|mint-token|heartbeat|ls>`.
+    /// Multi-host group: `ccteam host <join|mint-token|rm|heartbeat|ls>`.
     ///
     /// Register a satellite with the main daemon (`join`), mint a join
-    /// token on the main daemon (`mint-token`, admin web-token), send a
+    /// token on the main daemon (`mint-token`, admin web-token), deregister
+    /// a satellite from the main daemon's host registry (`rm`), send a
     /// keepalive (`heartbeat`), or list the local self credentials (`ls`).
     Host {
         #[command(subcommand)]
@@ -648,6 +649,24 @@ enum HostCommand {
         label: Option<String>,
         #[arg(long)]
         max_uses: Option<u32>,
+    },
+    /// Deregister a satellite from the main daemon's host registry (drop its
+    /// record; a later `ccteam host join` re-adds it under a fresh token).
+    /// Refuses a live (heartbeating) host unless `--force`. `local` can never
+    /// be removed — it IS the main daemon machine.
+    Rm {
+        /// Main daemon base URL.
+        #[arg(long)]
+        daemon: String,
+        /// Admin web token hex (or `ccteam:<hex>`). Env `CCTEAM_WEB_TOKEN` fallback.
+        #[arg(long)]
+        web_token: Option<String>,
+        /// Host id to deregister (see `ccteam host ls` on the satellite, or the
+        /// web Team → 分工 vendor roster on the main daemon).
+        host_id: String,
+        /// Deregister even if the host is currently online.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Show the local satellite credentials (if joined).
     Ls,
@@ -1054,6 +1073,12 @@ fn run_host(cmd: HostCommand) -> Result<()> {
             label,
             max_uses,
         } => rt.block_on(host_mint_token(daemon, web_token, label, max_uses)),
+        HostCommand::Rm {
+            daemon,
+            web_token,
+            host_id,
+            force,
+        } => rt.block_on(host_rm(daemon, web_token, host_id, force)),
         HostCommand::Ls => host_ls(&paths),
     }
 }
@@ -1139,6 +1164,38 @@ async fn host_mint_token(
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!("mint-token failed HTTP {status}: {text}");
+    }
+    println!("{text}");
+    Ok(())
+}
+
+/// TEAM-5 — `ccteam host rm`: deregister a satellite via the main daemon's
+/// `DELETE /api/v1/hosts/{host}`. Mirrors [`host_mint_token`]'s shape.
+async fn host_rm(
+    daemon: String,
+    web_token: Option<String>,
+    host_id: String,
+    force: bool,
+) -> Result<()> {
+    let tok = web_token
+        .or_else(|| std::env::var("CCTEAM_WEB_TOKEN").ok())
+        .ok_or_else(|| anyhow::anyhow!("--web-token or CCTEAM_WEB_TOKEN required"))?;
+    let bare = tok.trim().trim_start_matches("ccteam:");
+    let mut url = format!("{}/api/v1/hosts/{host_id}", daemon.trim_end_matches('/'));
+    if force {
+        url.push_str("?force=true");
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer ccteam:{bare}"))
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("rm failed HTTP {status}: {text}");
     }
     println!("{text}");
     Ok(())

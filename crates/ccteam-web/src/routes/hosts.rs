@@ -543,6 +543,95 @@ fn register_mcp_blocking(
     Ok(written)
 }
 
+/// Query for `DELETE /api/v1/hosts/{host}` — `?force=true` removes a host
+/// even while it is online (heartbeating).
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct HostRemoveQuery {
+    /// Remove even if the host is currently online.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `DELETE /api/v1/hosts/{host}` — deregister a satellite (drop its record
+/// from the registry; a later `ccteam host join` re-adds it under a fresh
+/// token). `local` can never be removed — it IS the main daemon machine.
+/// An online host is refused unless `?force=true`, so an operator does not
+/// accidentally drop a live satellite mid-session.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/hosts/{host}",
+    tag = "hosts",
+    params(
+        ("host" = String, Path, description = "Host id to deregister (never `local`)"),
+        HostRemoveQuery,
+    ),
+    responses(
+        (status = 200, description = "Removed; `{host}`", body = serde_json::Value),
+        (status = 400, description = "`host` is `local` (the main daemon machine)"),
+        (status = 404, description = "Unknown host"),
+        (status = 409, description = "Host is online; retry with `?force=true`"),
+        (status = 500, description = "Registry could not be loaded or saved"),
+    ),
+)]
+pub(crate) async fn handle_host_remove(
+    State(app): State<AppState>,
+    Path(host): Path<String>,
+    Query(q): Query<HostRemoveQuery>,
+) -> Response {
+    if host == LOCAL_HOST {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "local is the main daemon machine, not a registry entry"
+            })),
+        )
+            .into_response();
+    }
+    let path = app.paths.host_registry_path();
+    let mut reg = match ccteam_core::HostRegistry::load(&path) {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{err}")})),
+            )
+                .into_response();
+        }
+    };
+    if !q.force {
+        if let Some(rec) = reg.get(&host) {
+            if rec.status_label(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS) == "online" {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "host {host} is online; pass ?force=true to remove a live satellite"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    match reg.remove(&host) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("unknown host: {host}")})),
+        )
+            .into_response(),
+        Some(_) => {
+            if let Err(err) = reg.save(&path) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{err}")})),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({"host": host})).into_response()
+        }
+    }
+}
+
 // ── v0.8.24 Track D — join-token / join / heartbeat ───────────────────────────
 
 /// Body for `POST /api/v1/hosts/join-token`.

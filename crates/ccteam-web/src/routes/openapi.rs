@@ -149,6 +149,8 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
         .routes(routes!(super::hosts::handle_register_mcp))
+        // TEAM-5 — deregister a satellite (drop its registry record).
+        .routes(routes!(super::hosts::handle_host_remove))
         // v0.8.24 Track D — multi-host join / mint. GET (read newest valid)
         // + POST (mint) share `/hosts/join-token`. (The satellite keepalive
         // is no longer HTTP: reports ride the reverse `ccteam-host.v1` WS

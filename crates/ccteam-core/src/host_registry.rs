@@ -410,6 +410,12 @@ impl HostRegistry {
     pub fn upsert(&mut self, record: HostRecord) {
         self.hosts.insert(record.id.clone(), record);
     }
+
+    /// Remove a host record (deregistration). Returns the removed record, or
+    /// `None` if unknown. Caller persists via `save`.
+    pub fn remove(&mut self, id: &str) -> Option<HostRecord> {
+        self.hosts.remove(id)
+    }
 }
 
 // ── join tokens ──────────────────────────────────────────────────────────────
@@ -903,6 +909,32 @@ mod tests {
         let reg = HostRegistry::default();
         gate_remote_spawn(&reg, "local", true, DEFAULT_HEARTBEAT_TTL_SECS).unwrap();
         gate_remote_spawn(&reg, "", false, DEFAULT_HEARTBEAT_TTL_SECS).unwrap();
+    }
+
+    #[test]
+    fn remove_deregisters_a_known_host_and_is_none_for_unknown() {
+        let mut reg = HostRegistry::default();
+        reg.upsert(HostRecord {
+            id: "sat".into(),
+            hostname: "sat".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ccteam_version: "0.9.11".into(),
+            agent_token: "t".into(),
+            last_heartbeat_unix: now_unix(),
+            agents: vec![],
+            projects: vec![],
+            joined_at: chrono_now_rfc3339(),
+        });
+        assert!(reg.get("sat").is_some());
+
+        let removed = reg.remove("sat").expect("known host removed");
+        assert_eq!(removed.id, "sat");
+        assert!(reg.get("sat").is_none());
+
+        // Removing an unknown id is a no-op that returns None.
+        assert!(reg.remove("sat").is_none());
+        assert!(reg.remove("never-existed").is_none());
     }
 
     #[test]
