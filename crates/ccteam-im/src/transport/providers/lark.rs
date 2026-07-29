@@ -38,7 +38,6 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 

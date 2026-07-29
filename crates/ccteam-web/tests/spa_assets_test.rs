@@ -37,6 +37,27 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     }
 }
 
+/// Same server, but with the web token gate ON — the posture a phone meets.
+async fn spawn_server_with_auth() -> SocketAddr {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
+    let tmp = TempDir::new().unwrap();
+    let state = ccteam_web::AppState::with_auth(
+        fake_paths(tmp.path()),
+        ccteam_web::AuthState::enabled(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router_with_state(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    addr
+}
+
 async fn spawn_server() -> SocketAddr {
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
     std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
@@ -146,4 +167,54 @@ async fn get_assets_spa_unknown_returns_404() {
         404,
         "unknown SPA bundle assets must NOT fall back to index.html",
     );
+}
+
+/// The PWA install path is served at the ROOT, anonymously.
+///
+/// `index.html` links `/manifest.json` + `/icon-192.png`, and the manifest's
+/// own icons are root-absolute — but the bundle was mounted only under
+/// `/app/`, so on a phone every one of those 404'd and the install lost its
+/// name, icon and standalone display. Desktop never noticed: nothing on
+/// desktop asks for them. They must also be reachable WITHOUT credentials —
+/// a browser fetches a web app manifest anonymously, so gating them behind
+/// the web token means the PWA can never install at all.
+#[tokio::test]
+async fn pwa_install_files_are_served_at_the_root_without_auth() {
+    let addr = spawn_server_with_auth().await;
+    for path in ["/manifest.json", "/icon-192.png", "/icon-512.png", "/sw.js"] {
+        let resp = reqwest::get(format!("http://{addr}{path}"))
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        assert_eq!(
+            resp.status(),
+            200,
+            "{path} must be served at the root for the PWA (no auth)",
+        );
+    }
+
+    // Still not a hole in the gate: the API stays behind the token.
+    let resp = reqwest::get(format!("http://{addr}/api/v1/me"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "the API must stay gated");
+}
+
+/// `start_url` has to land inside the SPA. Pointing it at `/` costs every
+/// cold launch a 301 hop, which is exactly where iOS standalone tends to drop
+/// the session cookie.
+#[tokio::test]
+async fn manifest_start_url_lands_in_the_spa() {
+    let addr = spawn_server_with_auth().await;
+    let body = reqwest::get(format!("http://{addr}/manifest.json"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // The placeholder dist (`CCTEAM_SKIP_WEB_BUILD=1`) has no manifest.
+    if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
+        if manifest.get("start_url").is_some() {
+            assert_eq!(manifest["start_url"], serde_json::json!("/app/"));
+        }
+    }
 }

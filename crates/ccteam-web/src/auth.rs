@@ -681,7 +681,15 @@ pub async fn auth_layer(
 /// in-browser token flow can run; they hold no project state or secrets. Every
 /// other path — notably all of `/api/...` — stays behind the token gate.
 fn is_public_shell_path(path: &str) -> bool {
-    path == "/" || path == "/app" || path.starts_with("/app/") || path.starts_with("/assets/spa/")
+    path == "/"
+        || path == "/app"
+        || path.starts_with("/app/")
+        || path.starts_with("/assets/spa/")
+        // The PWA manifest + icons: the BROWSER fetches these, anonymously
+        // (a manifest request carries no cookie and no Bearer), so gating them
+        // means a phone can never install the app. They carry no secrets —
+        // the same content the public shell already serves under `/app/`.
+        || crate::routes::assets::is_root_pwa_file(path)
 }
 
 #[cfg(test)]
@@ -816,6 +824,10 @@ mod tests {
         assert!(is_public_shell_path("/app/"));
         assert!(is_public_shell_path("/app/chat/s/s1"));
         assert!(is_public_shell_path("/assets/spa/index-abc123.js"));
+        // PWA install files are fetched anonymously by the browser.
+        assert!(is_public_shell_path("/manifest.json"));
+        assert!(is_public_shell_path("/icon-192.png"));
+        assert!(is_public_shell_path("/sw.js"));
         // The API and every other gated surface are NOT.
         assert!(!is_public_shell_path("/api/v1/auth/token"));
         assert!(!is_public_shell_path("/api/v1/projects/demo/sessions"));
