@@ -719,8 +719,11 @@ async fn fleet_surfaces_are_owner_scoped() {
         "a tenant must not drive the vendor MCP registration write",
     );
 
-    // 3. The host page's project list follows the SAME ownership policy as
-    //    `GET /api/v1/projects` — which, for this tenant, is empty.
+    // 3. The host page's CATALOGED project list follows the SAME ownership
+    //    policy as `GET /api/v1/projects` — which, for this tenant, is empty.
+    //    (Un-cataloged satellite projects are a different thing: nobody owns
+    //    one yet and `POST /projects/import` lets any identity claim it, so
+    //    they stay visible — hiding them would break importing from the UI.)
     let detail: serde_json::Value = c
         .get(format!("http://{addr}/api/v1/hosts/local"))
         .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))

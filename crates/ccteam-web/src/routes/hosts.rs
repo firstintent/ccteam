@@ -375,14 +375,20 @@ pub(crate) async fn handle_host_detail(
                                             == Some(project.slug.as_str())
                                 })
                                 .map(|entry| entry.slug.clone());
-                            // An imported project follows its catalog entry's
-                            // ownership; one the satellite reports but nobody
-                            // imported yet is fleet state → operator only.
+                            // A CATALOGED project follows its catalog entry's
+                            // ownership — that is the leak this filter closes.
+                            // An un-cataloged one is nobody's yet, and it is
+                            // precisely the candidate list `POST /projects/
+                            // import` works from — a route that deliberately
+                            // lets ANY identity claim one (it stamps the
+                            // caller as owner). Hiding those from tenants
+                            // would break importing from the UI, so they stay
+                            // visible: no owner, nothing to leak.
                             let visible = match catalog_slug.as_deref() {
                                 Some(slug) => {
                                     crate::routes::api_v1::can_see_project(&app, &identity, slug)
                                 }
-                                None => identity.is_admin,
+                                None => true,
                             };
                             visible.then(|| HostProjectView {
                                 slug: project.slug,
