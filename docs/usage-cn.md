@@ -107,7 +107,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 **团队**页是多 vendor 调度的驾驶舱,两个 tab:
 
 - **拓扑** —— 跨项目、跨主机的实时委派树:每会话一行(vendor 徽章、live 模型(live 会话显示真正在跑的模型)、状态点、成本、轮次),KPI 条下有 per-vendor 小计(live 数 + 花费,点击过滤)、最近委派滚动条,跨机时行上带 host 徽章。每个会话都是**真超链接** —— 右键/中键「打开 ↗」把父子会话开在两个浏览器 tab 里对照看。点行打开详情面板(模型/主机/父会话/深度/成本/实时活动/最近对话)。
-- **分工** —— 团队的分工管理:**vendor 名册**(按主机列 installed/版本/就绪态与修复提示,外加每家的 live 会话数与花费)+ **宪章编辑器** —— 就是 agent 经 `status` 工具读的那份项目级 `routing.md`。选项目、markdown 编辑/预览、保存;项目没有宪章时只读展示全局 `~/.ccteam/routing.md`,可一键「拷入起稿」(web 只写项目文件,全局文件的写入口仍在 CLI/文件系统)。诚实语义不变:宪章是 agent 主动 PULL 的建议文本(绝不注入),超 ~4k 字符在 `status` 里节选并给全文指针。
+- **分工** —— 团队的分工管理:**vendor 名册按主机分组**(local 在前、在线优先、离线卫星默认折叠并带「移除」按钮;主机 id 恒显 —— 两台机器 OS hostname 撞名也能分清;每家 vendor 列 installed/版本/就绪态与修复提示,外加 live 会话数与花费)+ **宪章编辑器** —— 就是 agent 经 `status` 工具读的那份项目级 `routing.md`。选项目、markdown 编辑/预览、保存;项目没有宪章时只读展示全局 `~/.ccteam/routing.md`,可一键「拷入起稿」(web 只写项目文件,全局文件的写入口仍在 CLI/文件系统)。诚实语义不变:宪章是 agent 主动 PULL 的建议文本(绝不注入),超 ~4k 字符在 `status` 里节选并给全文指针。
 - **编队起手** —— 分工 tab 上的六张卡(总控-工班 / 主力-顾问 / 交叉互审 / 并行竞标 / 调研三角 / 金字塔用工),点「起手」跳到首页 launcher 预填 vendor 阵容 —— 编排本身发生在你 spawn 的会话里。完整编队目录(含监工/值守/跨机三式)见 [orchestration-cn.md](orchestration-cn.md)。
 
 ### 插件市场:装角色 / 技能 / 工作流
@@ -405,6 +405,10 @@ ccteam host join --daemon http://daemon-host:7331 --token <join-token>
 # 本机运行中的 ccteam start 30 秒内自动拨出上线。
 
 ccteam host ls                     # 查看本机卫星凭据(如已 join)
+
+# 反注册卫星(团队 → 分工 名册里每台主机也有「移除」按钮)。在线主机须 --force;
+# local 永不可删(它就是主 daemon 本机)。
+ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex> [--force]
 ```
 
 卫星每 ~25s 经控制通道上报 agent 探测与已注册项目;主机页实时显示在线状态。**项目绑定主机** —— 要在卫星上跑会话,先让它拥有一个项目,然后往那个项目里 spawn(不再按会话选主机):

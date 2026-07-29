@@ -121,7 +121,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 The **Team** page is the multi-vendor cockpit, two tabs:
 
 - **Topology** — the live delegation tree across every project and host: one row per session with vendor chip, live model (live sessions report the model actually running), status dot, cost and turn count; per-vendor KPI chips (live count + spend, click to filter), a recent-dispatch ticker, and host badges when the graph spans machines. Every session is a **real link** — right-click / middle-click **打开 ↗** to open a parent and its delegate in separate browser tabs and watch a delegation from both sides. Selecting a row opens the detail panel (model, host, parent, depth, cost, live activity, recent turns).
-- **Charter (分工)** — division-of-labor management: a **vendor roster** (per host: installed/version/readiness with remediation hints, plus live sessions and spend per vendor) and the **charter editor** — the per-project `routing.md` your agents consult via the `status` tool. Pick a project, edit with markdown preview, save; when the project has no charter the global `~/.ccteam/routing.md` shows read-only with one-click "copy as draft" (the web writes only the project file; the global file's write path stays CLI/filesystem). Honest semantics hold: agents PULL the charter (advisory, never injected), and notes beyond ~4k chars are excerpted in `status` with a pointer to the full file.
+- **Charter (分工)** — division-of-labor management: a **vendor roster grouped by host** (local first, online before offline; offline satellites start collapsed and carry a remove button — the host id is always shown, so two machines reporting the same OS hostname stay distinguishable; per vendor: installed/version/readiness with remediation hints, plus live sessions and spend) and the **charter editor** — the per-project `routing.md` your agents consult via the `status` tool. Pick a project, edit with markdown preview, save; when the project has no charter the global `~/.ccteam/routing.md` shows read-only with one-click "copy as draft" (the web writes only the project file; the global file's write path stays CLI/filesystem). Honest semantics hold: agents PULL the charter (advisory, never injected), and notes beyond ~4k chars are excerpted in `status` with a pointer to the full file.
 - **Formation playbooks (编队起手)** — six cards on the charter tab (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid). 起手 jumps to the launcher with the vendor lineup prefilled — orchestration itself happens inside the session you spawn. The full catalog (plus overseer / standing-watch / many-machines) is in [orchestration.md](orchestration.md).
 
 ### Marketplace: Install Roles, Skills, and Workflows
@@ -441,6 +441,10 @@ ccteam host join --daemon http://daemon-host:7331 --token <join-token>
 # The running `ccteam start` picks the join up within 30s and connects out.
 
 ccteam host ls                     # This machine's satellite credentials (if joined).
+
+# Deregister a satellite (Team → Charter roster shows every host with a remove
+# button too). Refuses a live host unless --force; `local` can never be removed.
+ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex> [--force]
 ```
 
 The satellite reports its agents and registered projects every ~25s over its control channel; the hosts page shows online/offline live. **Projects are bound to a host** — to run sessions on a satellite, give it a project there and spawn into that project (no per-session host choice):
