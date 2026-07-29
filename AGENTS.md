@@ -25,7 +25,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.11`(**dev 已收口** 2026-07-29,PR #171 待 owner merge;**tag/发布 HELD** 待 owner 显式发话;最近发布 = v0.9.10 2026-07-26 `/releases/latest`) |
+| Workspace version | `0.9.11`(**已发布** 2026-07-29:main `efce0196` + tag,四平台二进制在 `/releases/latest`;下版 tag 仍需 owner 显式发话) |
 | 本版 headline | 团队页驾驶舱重设计(owner 直驱 PRD 全默认拍板):拓扑独占(roster/timeline 两 tab 删)+ 会话真超链接(右键新 tab 对照父子)+ per-vendor KPI chips + 委派 ticker + live 节点 model join + 分工 charter tab(REST `GET/PUT /projects/{slug}/routing` 项目宪章编辑器(全局只读)+ vendor 名册按主机分组(在线/离线区分 + 移除主机))+ host 反注册(REST `DELETE /hosts/{id}` + CLI `host rm`,owner 实机截图追问「vendor 重复」驱动实锤根因 = 离线卫星残留撞 hostname)+ 名册收敛四连(卡点击过滤拓扑 / 离线时长+7 天建议清理 / 设置 HostsView 收敛为动作面(观察面归团队页)/ npm「可更新」提示迁名册)+ 编队起手(`lib/playbooks.ts` 6 编队唯一家,Home+团队双消费;文档编队目录 9 式双语)+ 周期同车 ACL 病根三修(具名 principal / 项目解析不越界 / session 单一归属策略)+ session rename 全链 + SSE 401 自愈 + 委派 vendor 失败外显 |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
