@@ -152,13 +152,27 @@ async fn join_registers_host_and_heartbeat_online_offline() {
         .await
         .unwrap();
     let hosts = list["hosts"].as_array().unwrap();
-    assert!(hosts.iter().any(|h| h["host"] == "local"));
+    let local = hosts
+        .iter()
+        .find(|h| h["host"] == "local")
+        .expect("local listed");
     let sat = hosts
         .iter()
         .find(|h| h["host"] == "lab-mac")
         .expect("satellite listed");
     assert_eq!(sat["status"], "online");
     assert_eq!(sat["is_local"], false);
+    // v0.9.11 TEAM-8 — the age anchor the roster's "offline for N days" hint
+    // reads: a satellite carries its heartbeat second, `local` omits the key
+    // entirely (it is always online, so there is no age to show).
+    assert!(
+        sat["last_heartbeat_unix"].as_u64().is_some(),
+        "satellite row carries last_heartbeat_unix: {sat}"
+    );
+    assert!(
+        local.get("last_heartbeat_unix").is_none(),
+        "local row omits last_heartbeat_unix entirely: {local}"
+    );
 
     // Reverse control channel (replaces the retired HTTP heartbeat): the
     // agent-token bearer upgrades `GET /api/v1/hosts/channel`; a `report`
@@ -250,10 +264,11 @@ async fn join_registers_host_and_heartbeat_online_offline() {
     }
 
     // Force offline by rewriting last_heartbeat.
+    let stale_heartbeat = now_unix().saturating_sub(DEFAULT_HEARTBEAT_TTL_SECS + 30);
     let mut reg = HostRegistry::load(&paths.host_registry_path()).unwrap();
     {
         let h = reg.get_mut("lab-mac").unwrap();
-        h.last_heartbeat_unix = now_unix().saturating_sub(DEFAULT_HEARTBEAT_TTL_SECS + 30);
+        h.last_heartbeat_unix = stale_heartbeat;
     }
     reg.save(&paths.host_registry_path()).unwrap();
 
@@ -273,6 +288,14 @@ async fn join_registers_host_and_heartbeat_online_offline() {
         .find(|h| h["host"] == "lab-mac")
         .unwrap();
     assert_eq!(sat2["status"], "offline");
+    // The summary's heartbeat second is the registry record's, verbatim —
+    // the SPA derives the offline age from it (display only; ccteam never
+    // acts on staleness by itself).
+    assert_eq!(
+        sat2["last_heartbeat_unix"].as_u64(),
+        Some(stale_heartbeat),
+        "offline summary carries the fixture's heartbeat second: {sat2}"
+    );
     // Host record still present (not deleted).
     assert!(HostRegistry::load(&paths.host_registry_path())
         .unwrap()

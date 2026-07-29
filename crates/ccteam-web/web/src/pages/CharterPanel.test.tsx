@@ -79,6 +79,12 @@ function fixtureHost(over: Partial<RosterHost> = {}): RosterHost {
   };
 }
 
+/** TEAM-8: a FIXED clock for the offline-age cases. Every heartbeat fixture
+ *  below is pinned relative to this, so nothing depends on when the suite
+ *  runs — `VendorRosterCards` takes `nowMs` as a prop for exactly this. */
+const NOW_MS = Date.UTC(2026, 6, 29, 12, 0, 0);
+const hoursAgo = (h: number) => Math.floor(NOW_MS / 1000) - h * 3600;
+
 function fixtureDoc(over: Partial<RoutingDoc> = {}): RoutingDoc {
   return {
     exists: true,
@@ -302,6 +308,89 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     expect(html).toMatch(/data-testid="charter-roster-remove-dxa347">确定移除\?</);
     // …smoke-self's is untouched.
     expect(html).toMatch(/data-testid="charter-roster-remove-smoke-self">移除</);
+  });
+
+  /** One offline satellite whose last heartbeat was `hours` before NOW_MS. */
+  const offlineFor = (hours: number): RosterHost[] => [
+    fixtureHost({
+      host: "smoke-self",
+      hostname: "claude-dev-04",
+      status: "offline",
+      agents: [],
+      last_heartbeat_unix: hoursAgo(hours),
+    }),
+  ];
+
+  it("(TEAM-8) an offline host says HOW LONG it has been out of touch", () => {
+    const html = renderToString(
+      <VendorRosterCards hosts={offlineFor(3)} nodes={[]} collapsed={new Set()} nowMs={NOW_MS} />,
+    );
+    expect(html).toContain('data-testid="charter-roster-age-smoke-self"');
+    expect(html).toContain("已离线 3 小时");
+    // Recent enough → no cleanup suggestion, and the remove button stays plain.
+    expect(html).not.toContain('data-testid="charter-roster-stale-smoke-self"');
+    expect(html).not.toContain("charter-roster-remove warn");
+  });
+
+  it("(TEAM-8) past the stale threshold it reads in days and SUGGESTS cleanup (warn button)", () => {
+    const html = renderToString(
+      <VendorRosterCards
+        hosts={offlineFor(24 * 8)}
+        nodes={[]}
+        collapsed={new Set()}
+        nowMs={NOW_MS}
+      />,
+    );
+    expect(html).toContain("已离线 8 天");
+    expect(html).toContain('data-testid="charter-roster-stale-smoke-self"');
+    expect(html).toContain("建议移除");
+    expect(html).toContain("charter-roster-remove warn");
+    // A suggestion only — the button still just calls back, nothing auto-runs.
+    expect(html).toContain('data-testid="charter-roster-remove-smoke-self"');
+  });
+
+  it("(TEAM-8) no age for an ONLINE host, nor for an offline one the API sent no heartbeat for", () => {
+    const onlineHtml = renderToString(
+      <VendorRosterCards hosts={hosts} nodes={nodes} collapsed={new Set()} nowMs={NOW_MS} />,
+    );
+    expect(onlineHtml).not.toContain("charter-roster-age-"); // local is always online
+    const noBeat = renderToString(
+      <VendorRosterCards
+        hosts={[fixtureHost({ host: "mystery", status: "offline", agents: [] })]}
+        nodes={[]}
+        collapsed={new Set()}
+        nowMs={NOW_MS}
+      />,
+    );
+    // Silence beats an invented age; removal is still offered.
+    expect(noBeat).not.toContain("charter-roster-age-");
+    expect(noBeat).toContain('data-testid="charter-roster-remove-mystery"');
+    expect(noBeat).not.toContain("charter-roster-remove warn");
+  });
+
+  it("(TEAM-8) the age line is i18n'd, with the unit pluralized in en", () => {
+    const one = renderToString(
+      <VendorRosterCards
+        hosts={offlineFor(1)}
+        nodes={[]}
+        collapsed={new Set()}
+        lang="en"
+        nowMs={NOW_MS}
+      />,
+    );
+    expect(one).toContain("offline for 1 hour");
+    expect(one).not.toContain("1 hours");
+    const many = renderToString(
+      <VendorRosterCards
+        hosts={offlineFor(24 * 9)}
+        nodes={[]}
+        collapsed={new Set()}
+        lang="en"
+        nowMs={NOW_MS}
+      />,
+    );
+    expect(many).toContain("offline for 9 days");
+    expect(many).toContain("consider removing");
   });
 
   it("empty roster renders nothing", () => {

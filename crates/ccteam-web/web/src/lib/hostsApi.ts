@@ -34,6 +34,9 @@ export interface HostSummary {
   status?: string;
   agent_count: number;
   agents_ready: number;
+  /** Unix seconds of the last satellite heartbeat — the age anchor behind the
+   *  roster's "已离线 N 天" hint. Absent for `local` (always online). */
+  last_heartbeat_unix?: number;
 }
 
 /** `GET /api/v1/hosts` response (`HostsResponse`). */

@@ -12,7 +12,13 @@ vi.mock("./hostsApi", async (importOriginal) => {
 });
 
 import { deleteHost } from "./hostsApi";
-import { handleRosterRemoveClick, sortRosterHosts, type RosterHost } from "./charterRoster";
+import {
+  handleRosterRemoveClick,
+  offlineAge,
+  sortRosterHosts,
+  STALE_AFTER_DAYS,
+  type RosterHost,
+} from "./charterRoster";
 
 function fixtureHost(over: Partial<RosterHost> = {}): RosterHost {
   return {
@@ -45,6 +51,49 @@ describe("sortRosterHosts", () => {
     const sorted = sortRosterHosts(hosts);
     expect(sorted).toEqual(hosts);
     expect(sorted).not.toBe(hosts);
+  });
+});
+
+describe("offlineAge (TEAM-8 — how long a host has been out of touch)", () => {
+  // A fixed clock: every case below pins its heartbeat relative to THIS, so
+  // nothing depends on when the suite runs.
+  const NOW_MS = Date.UTC(2026, 6, 29, 12, 0, 0);
+  const hoursAgo = (h: number) => Math.floor(NOW_MS / 1000) - h * 3600;
+
+  it("returns null with no heartbeat to measure from (local, or an older daemon)", () => {
+    expect(offlineAge(undefined, NOW_MS)).toBeNull();
+  });
+
+  it("under a day reads in hours and is not stale", () => {
+    const age = offlineAge(hoursAgo(3), NOW_MS);
+    expect(age).toEqual({ label: "hours", hours: 3, days: 0, stale: false });
+  });
+
+  it("past a day reads in days, still not stale before the threshold", () => {
+    const age = offlineAge(hoursAgo(24 * 3 + 5), NOW_MS);
+    expect(age).toMatchObject({ label: "days", days: 3, stale: false });
+  });
+
+  it("at/after the threshold it is stale (8 days) — but exactly one day short is not", () => {
+    expect(offlineAge(hoursAgo(24 * 8), NOW_MS)).toEqual({
+      label: "days",
+      hours: 24 * 8,
+      days: 8,
+      stale: true,
+    });
+    // The boundary is inclusive at STALE_AFTER_DAYS…
+    expect(offlineAge(hoursAgo(24 * STALE_AFTER_DAYS), NOW_MS)!.stale).toBe(true);
+    // …and one hour short of it still isn't.
+    expect(offlineAge(hoursAgo(24 * STALE_AFTER_DAYS - 1), NOW_MS)!.stale).toBe(false);
+  });
+
+  it("clamps a future/equal heartbeat to zero rather than reporting negative age", () => {
+    expect(offlineAge(hoursAgo(-5), NOW_MS)).toEqual({
+      label: "hours",
+      hours: 0,
+      days: 0,
+      stale: false,
+    });
   });
 });
 

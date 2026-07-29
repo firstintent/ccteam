@@ -16,6 +16,39 @@ export interface RosterHost {
   /** `online` | `offline` (`HostSummary.status`; `local` is always `online`). */
   status: string;
   agents: AgentHealth[];
+  /** Unix seconds of the last satellite heartbeat (`HostSummary`); absent for
+   *  `local` and for any host the API didn't report one for. */
+  last_heartbeat_unix?: number;
+}
+
+/** A satellite offline this long reads as forgotten rather than restarting,
+ *  so the roster SUGGESTS cleanup. Display threshold only — nothing is
+ *  automated off it; removal is always the user's explicit click. */
+export const STALE_AFTER_DAYS = 7;
+
+/** How long a host has been out of touch, derived from its last heartbeat.
+ *  PURE (`nowMs` is a parameter, never `Date.now()` inside) so both the
+ *  component and its tests pin the same clock.
+ *
+ *  `null` when there is no heartbeat to measure from (`local`, or an older
+ *  daemon that doesn't send the field) — the caller then shows nothing
+ *  rather than inventing an age. `label` picks the unit to render (`hours`
+ *  under a day, `days` beyond); both numbers are floored, and a heartbeat in
+ *  the future clamps to 0 rather than going negative. */
+export function offlineAge(
+  lastHeartbeatUnix: number | undefined,
+  nowMs: number,
+): { label: "hours" | "days"; hours: number; days: number; stale: boolean } | null {
+  if (lastHeartbeatUnix == null) return null;
+  const elapsedMs = Math.max(0, nowMs - lastHeartbeatUnix * 1000);
+  const hours = Math.floor(elapsedMs / 3_600_000);
+  const days = Math.floor(hours / 24);
+  return {
+    label: days >= 1 ? "days" : "hours",
+    hours,
+    days,
+    stale: days >= STALE_AFTER_DAYS,
+  };
 }
 
 /** Roster group order: `local` first, then online hosts before offline

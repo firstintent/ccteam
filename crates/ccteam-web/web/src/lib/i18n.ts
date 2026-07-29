@@ -252,6 +252,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     rosterRemove: "移除",
     rosterRemoveConfirm: "确定移除?",
     rosterPickHint: "查看该 vendor 的会话拓扑",
+    rosterStaleHint: "建议移除",
     vendor: "厂商",
     model: "模型",
     cost: "成本",
@@ -497,6 +498,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     rosterRemove: "Remove",
     rosterRemoveConfirm: "Confirm?",
     rosterPickHint: "View this vendor's sessions in the topology",
+    rosterStaleHint: "consider removing",
     vendor: "Vendor",
     model: "Model",
     cost: "Cost",
@@ -533,6 +535,15 @@ export function tStopped(lang: Lang, sid: string): string {
 }
 export function tRemoteProjectPath(lang: Lang, host: string): string {
   return t(lang, "newProjRemotePath").replace("{host}", host);
+}
+/** Roster host-group age line: how long an offline satellite has been out of
+ *  touch (`n` + unit come from `lib/charterRoster.ts::offlineAge`). */
+export function tRosterOfflineFor(lang: Lang, n: number, unit: "hours" | "days"): string {
+  if (lang === "en") {
+    const word = unit === "days" ? "day" : "hour";
+    return `offline for ${n} ${word}${n === 1 ? "" : "s"}`;
+  }
+  return unit === "days" ? `已离线 ${n} 天` : `已离线 ${n} 小时`;
 }
 
 /** Shell / nav labels, keyed by route or shell surface (pre-dictionary seam;

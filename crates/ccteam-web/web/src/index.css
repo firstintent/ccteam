@@ -1179,7 +1179,15 @@ select:focus-visible,
 .charter-roster-group-hostname { font-weight: 600; color: var(--text); font-size: 13px; }
 .charter-roster-group-id { color: var(--text-faint); font-size: 11px; }
 .charter-roster-group-status { color: var(--text-muted); font-size: 11.5px; }
+/* v0.9.11 TEAM-8 — how long an offline satellite has been out of touch. The
+   age itself stays subdued; past the stale threshold the 建议移除 hint and
+   the remove button take the same warn tokens `.badge.warn` /
+   `.project-host.offline` use. Emphasis only — nothing is ever auto-removed. */
+.charter-roster-group-age { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.charter-roster-group-stale { color: var(--red-text); font-size: 11.5px; }
 .charter-roster-remove { margin-left: auto; }
+.charter-roster-remove.warn { color: var(--red-text); background: var(--red-soft); border-color: color-mix(in srgb, var(--red-text) 35%, var(--border)); }
+.charter-roster-remove.warn:hover { color: var(--red-text); background: color-mix(in srgb, var(--red-soft) 70%, var(--bg-soft)); }
 .charter-roster { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
 .charter-roster-group .charter-roster { margin-top: 10px; }
 .charter-roster-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }

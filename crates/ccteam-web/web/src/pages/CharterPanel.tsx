@@ -33,11 +33,16 @@ import { useEffect, useReducer, useState } from "react";
 import { Link } from "react-router-dom";
 import type { AgentNode } from "../lib/agentsApi";
 import { charterReducer, initialCharter, type CharterState } from "../lib/charterState";
-import { handleRosterRemoveClick, sortRosterHosts, type RosterHost } from "../lib/charterRoster";
+import {
+  handleRosterRemoveClick,
+  offlineAge,
+  sortRosterHosts,
+  type RosterHost,
+} from "../lib/charterRoster";
 import { fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
 import { getHostDetail, getHosts } from "../lib/hostsApi";
 import { getRouting, putRouting } from "../lib/routingApi";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tRosterOfflineFor, type Lang } from "../lib/i18n";
 import { PLAYBOOKS } from "../lib/playbooks";
 import { toastBus } from "../lib/toastBus";
 import { VendorChip } from "../components/VendorChip";
@@ -75,7 +80,15 @@ const EMPTY_COLLAPSED: Set<string> = new Set();
  *  it turns interactive (button role + Enter key + hover, like a tree row)
  *  and hands the vendor up; the caller lands on the filtered topology. No
  *  callback = pure display (no role, no pointer), so any other embedder of
- *  this view keeps the old behavior. */
+ *  this view keeps the old behavior.
+ *
+ *  TEAM-8: an offline group also says HOW LONG it has been out of touch
+ *  (`offlineAge`) and, past `STALE_AFTER_DAYS`, SUGGESTS cleanup (subdued
+ *  hint + warn emphasis on the remove button). Suggestion only — ccteam
+ *  never removes a host on its own; the click stays the user's. The clock
+ *  arrives as the `nowMs` prop rather than being read here: `Date.now()`
+ *  during render is impure (and `react-hooks/purity` rejects it outright),
+ *  so the caller stamps it where the data lands. */
 export function VendorRosterCards({
   hosts,
   nodes,
@@ -85,6 +98,7 @@ export function VendorRosterCards({
   confirmingHost = null,
   onRemoveClick = () => {},
   onVendorPick,
+  nowMs,
 }: {
   hosts: RosterHost[];
   nodes: AgentNode[];
@@ -97,8 +111,13 @@ export function VendorRosterCards({
   onRemoveClick?: (host: string, online: boolean) => void;
   /** Present = cards are clickable "show me this vendor's sessions". */
   onVendorPick?: (vendor: string) => void;
+  /** Clock the offline age is measured against (ms). Owned by the caller —
+   *  omit it and no age is shown at all, which is the honest default for an
+   *  embedder that has no clock to offer. */
+  nowMs?: number;
 }) {
-  const t = makeT(langProp ?? "zh");
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
   if (hosts.length === 0) return null;
   const sorted = sortRosterHosts(hosts);
   const pickable = onVendorPick != null;
@@ -106,10 +125,13 @@ export function VendorRosterCards({
     <section className="charter-roster-section">
       <h3>{t("charterRoster")}</h3>
       <div className="charter-roster-groups" data-testid="charter-roster">
-        {sorted.map(({ host, hostname, status, agents }) => {
+        {sorted.map(({ host, hostname, status, agents, last_heartbeat_unix }) => {
           const isLocal = host === "local";
           const online = status === "online";
           const isCollapsed = collapsed.has(host);
+          // Age is an OFFLINE-only story: an online host's heartbeat is by
+          // definition fresh, so there is nothing worth reporting.
+          const age = online || nowMs == null ? null : offlineAge(last_heartbeat_unix, nowMs);
           return (
             <div
               key={host}
@@ -133,10 +155,30 @@ export function VendorRosterCards({
                 <span className="charter-roster-group-status">
                   {online ? t("rosterHostOnline") : t("rosterHostOffline")}
                 </span>
+                {age ? (
+                  <span
+                    className="charter-roster-group-age"
+                    data-testid={`charter-roster-age-${host}`}
+                  >
+                    {tRosterOfflineFor(lang, age.label === "days" ? age.days : age.hours, age.label)}
+                  </span>
+                ) : null}
+                {age?.stale ? (
+                  <span
+                    className="charter-roster-group-stale"
+                    data-testid={`charter-roster-stale-${host}`}
+                  >
+                    {t("rosterStaleHint")}
+                  </span>
+                ) : null}
                 {!isLocal ? (
                   <button
                     type="button"
-                    className="btn ghost mini charter-roster-remove"
+                    className={
+                      age?.stale
+                        ? "btn ghost mini charter-roster-remove warn"
+                        : "btn ghost mini charter-roster-remove"
+                    }
                     data-testid={`charter-roster-remove-${host}`}
                     onClick={() => onRemoveClick(host, online)}
                   >
@@ -405,6 +447,11 @@ export default function CharterPanel({
   const [rosterCollapsed, setRosterCollapsed] = useState<Set<string>>(() => new Set());
   const [confirmingHost, setConfirmingHost] = useState<string | null>(null);
   const [state, dispatch] = useReducer(charterReducer, initialCharter);
+  // The clock every group's offline age is measured against, STAMPED WHEN
+  // THE ROSTER LANDS (below) rather than read during render — `Date.now()`
+  // in a render body is impure. `null` until then, which is exactly when the
+  // roster is still empty and nothing renders anyway.
+  const [nowMs, setNowMs] = useState<number | null>(null);
 
   // Visible projects → picker options; default to the first one.
   useEffect(() => {
@@ -453,16 +500,34 @@ export default function CharterPanel({
         const detailed = await Promise.all(
           hosts.map(async (h) => {
             const status = h.status ?? "online";
+            // The heartbeat second rides on the SUMMARY row (the detail
+            // endpoint has no such field), so it is threaded from `h` on
+            // both the detail-ok and detail-failed paths.
+            const beat = h.last_heartbeat_unix;
             try {
               const d = await getHostDetail(h.host);
-              return { host: h.host, hostname: d.hostname, status, agents: d.agents };
+              return {
+                host: h.host,
+                hostname: d.hostname,
+                status,
+                agents: d.agents,
+                last_heartbeat_unix: beat,
+              };
             } catch {
-              return { host: h.host, hostname: h.hostname, status, agents: [] };
+              return {
+                host: h.host,
+                hostname: h.hostname,
+                status,
+                agents: [],
+                last_heartbeat_unix: beat,
+              };
             }
           }),
         );
         if (!cancelled) {
           setRoster(detailed);
+          // Pair the clock with the heartbeats it will be compared against.
+          setNowMs(Date.now());
           // Offline satellites start collapsed (local + online start open).
           setRosterCollapsed(
             new Set(
@@ -524,6 +589,7 @@ export default function CharterPanel({
         confirmingHost={confirmingHost}
         onRemoveClick={onRosterRemoveClick}
         onVendorPick={onVendorPick}
+        nowMs={nowMs ?? undefined}
       />
 
       <PlaybookCards lang={lang} />

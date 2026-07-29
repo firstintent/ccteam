@@ -92,6 +92,10 @@ pub struct HostSummary {
     pub agent_count: usize,
     /// How many agents are `ready`.
     pub agents_ready: usize,
+    /// Unix seconds of the last satellite heartbeat — the age anchor for the
+    /// UI's "offline for N days" hint. `None` for `local` (always online).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_unix: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -247,6 +251,7 @@ pub(crate) async fn handle_hosts(State(app): State<crate::state::AppState>) -> R
         status: "online".to_string(),
         agent_count: agents.len(),
         agents_ready,
+        last_heartbeat_unix: None,
     }];
     // v0.8.24 Track D — registered satellites from the host registry.
     if let Ok(reg) = ccteam_core::HostRegistry::load(&app.paths.host_registry_path()) {
@@ -261,6 +266,7 @@ pub(crate) async fn handle_hosts(State(app): State<crate::state::AppState>) -> R
                     .to_string(),
                 agent_count: h.agents.len().max(1),
                 agents_ready: ready,
+                last_heartbeat_unix: Some(h.last_heartbeat_unix),
             });
         }
     }
