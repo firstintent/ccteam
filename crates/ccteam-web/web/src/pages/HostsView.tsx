@@ -1,24 +1,29 @@
-// v0.8.24 Track A — 主机 panel (设置→运维总览), prototype `host-card` skin.
+// v0.9.11 TEAM-9 — 主机接入与注册: the ops ACTION panel (设置→运维总览).
 //
-// Layout (ops stack): each machine is a full-width card under the daemon
-// strip. Per machine: host-head · one `agent-row` per INSTALLED vendor
-// (current + latest version so updates are obvious) · a single collapsed
-// row for all uninstalled vendors · projects section (click to expand,
-// default collapsed). The ONLY write is register-mcp (ccteam's own server
-// into the vendor config — never a vendor login, never a CLI install).
+// This panel carries actions ONLY. Fleet observation — per-host × per-vendor
+// health, live session counts, spend, offline age, host removal — lives on the
+// Team page's charter roster, which is strictly richer; the health grid that
+// used to duplicate it here is deleted and the header links there instead.
+// What stays is what the Team page deliberately does not do:
+//   · register-mcp — write ccteam's own MCP server into a LOCAL vendor config
+//     (never a vendor login, never a CLI install; the backend 404s non-local).
+//   · import — adopt a satellite-reported project into the daemon catalog.
+//   · JoinCard — the real `ccteam host join` command. Exported from here and
+//     ALSO rendered by AccessView (设置·接入), where this panel's footer points
+//     rather than embedding a second copy.
 //
-// Data: GET /api/v1/hosts (registry) fanned into GET /api/v1/hosts/{host};
-// a host whose detail probe fails renders as offline (honest state).
-// Latest versions are best-effort from the public npm registry (CORS-ok).
+// Data: GET /api/v1/hosts (registry) fanned into GET /api/v1/hosts/{host}; a
+// host whose detail probe fails renders offline (honest state — we then say we
+// cannot see what it needs, not that there is nothing to do).
 
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   getHostDetail,
   getHosts,
   getJoinToken,
   mintJoinToken,
   registerMcp,
-  type AgentHealth,
   type HostDetail,
   type HostSummary,
   type JoinTokenInfo,
@@ -26,7 +31,6 @@ import {
 import { importProject } from "../lib/dashboardApi";
 import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
-import { extractVersion, fetchVendorLatests, isOutdated } from "../lib/vendorLatest";
 import { vendorDotClass } from "../lib/vendors";
 
 type HostState =
@@ -39,6 +43,35 @@ type LoadState =
   | { kind: "ready"; hosts: HostState[] };
 
 const REFRESH = "__refresh__";
+
+/** Busy-token formats — one home, shared by the handlers and the rows. */
+const registerKey = (host: string, vendor: string) => `${host}:${vendor}`;
+const importKey = (host: string, slug: string) => `import:${host}:${slug}`;
+
+/** The only two things ops can DO to a host. */
+export type PendingAction =
+  | { kind: "register"; vendor: string }
+  | { kind: "import"; slug: string; path: string };
+
+/** Actionable items for one probed host, in render order.
+ *
+ *  Local: vendors installed on PATH whose config still lacks ccteam's MCP
+ *  entry (`mcp_registrable` is false for ACP vendors — MCP rides the session
+ *  protocol there, so a CTA would be a no-op). Satellites: projects the
+ *  satellite reports but the daemon catalog has not adopted. The split is
+ *  hard — register-mcp 404s off-local, and a local project is cataloged by
+ *  definition. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with its only consumer for unit tests.
+export function pendingActionsFor(detail: HostDetail): PendingAction[] {
+  if (detail.is_local) {
+    return detail.agents
+      .filter((a) => a.mcp_registrable && a.installed && !a.mcp_registered)
+      .map((a) => ({ kind: "register", vendor: a.vendor }) as PendingAction);
+  }
+  return (detail.projects ?? [])
+    .filter((p) => !p.cataloged)
+    .map((p) => ({ kind: "import", slug: p.slug, path: p.path }) as PendingAction);
+}
 
 async function probeAll(refresh: boolean): Promise<HostState[]> {
   const { hosts } = await getHosts();
@@ -104,7 +137,7 @@ export default function HostsView({
 
   const onRegister = async (host: string, vendor: string) => {
     setActionError(null);
-    setBusy(`${host}:${vendor}`);
+    setBusy(registerKey(host, vendor));
     try {
       await registerMcp(host, vendor);
       await load(true);
@@ -120,7 +153,7 @@ export default function HostsView({
   };
 
   const onImport = async (host: string, remoteSlug: string) => {
-    const key = `import:${host}:${remoteSlug}`;
+    const key = importKey(host, remoteSlug);
     setActionError(null);
     setBusy(key);
     try {
@@ -163,12 +196,15 @@ export default function HostsView({
           {embedded ? (
             <h2 className="hosts-section-title">{t("setHosts")}</h2>
           ) : (
-            <>
-              <h1>{t("setHosts")}</h1>
-              <p>{t("hostsDesc")}</p>
-            </>
+            <h1>{t("setHosts")}</h1>
           )}
+          {/* Shown in both modes: where the observation surface went is the
+              one thing this panel must always say. */}
+          <p className="hosts-head-desc">{t("hostsDesc")}</p>
         </div>
+        <Link className="btn ghost" data-testid="hosts-team-link" to="/agents">
+          {t("hostsTeamLink")}
+        </Link>
         <button
           type="button"
           className="btn ghost"
@@ -213,31 +249,29 @@ export default function HostsView({
       ) : (
         state.hosts.map((h) =>
           h.kind === "ready" ? (
-            <HostDetailCards
+            <HostActionRow
               key={h.detail.host}
-              host={h.detail}
+              hostId={h.detail.host}
+              hostname={h.detail.hostname}
+              online
+              actions={pendingActionsFor(h.detail)}
               busy={busy}
               lang={lang}
               onRegister={(vendor) => void onRegister(h.detail.host, vendor)}
               onImport={(remoteSlug) => void onImport(h.detail.host, remoteSlug)}
             />
           ) : (
-            <div className="host-card offline" key={h.summary.host} data-testid={`host-offline-${h.summary.host}`}>
-              <div className="host-head">
-                <span className="dot off" />
-                <span className="hn">{h.summary.hostname || h.summary.host}</span>
-                <span className="badge">{t("remoteBadge")}</span>
-                <span className="badge warn">{t("offline")}</span>
-                <div className="act">
-                  <button type="button" className="btn ghost mini" onClick={() => void onRefresh()}>
-                    {t("reconnect")}
-                  </button>
-                </div>
-              </div>
-              <div style={{ padding: "16px 20px", color: "var(--text-faint)", fontSize: 13 }}>
-                {t("offlineRow")}
-              </div>
-            </div>
+            <HostActionRow
+              key={h.summary.host}
+              hostId={h.summary.host}
+              hostname={h.summary.hostname || h.summary.host}
+              online={false}
+              actions={[]}
+              busy={busy}
+              lang={lang}
+              onRegister={() => {}}
+              onImport={() => {}}
+            />
           ),
         )
       )}
@@ -356,223 +390,85 @@ ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
   );
 }
 
-/** Version cell: current · latest (highlight when an update is available). */
-export function AgentVersionCell({
-  agent,
-  latest,
-  lang = "zh",
-}: {
-  agent: AgentHealth;
-  latest?: string | null;
-  lang?: Lang;
-}) {
-  const t = makeT(lang);
-  if (!agent.installed) {
-    return <div className="ver">{t("notInstalled")}</div>;
-  }
-  const current = extractVersion(agent.version) ?? agent.version ?? "—";
-  const latestLabel = latest ?? null;
-  const stale = isOutdated(agent.version, latestLabel);
-  return (
-    <div
-      className={`ver ${stale ? "stale" : ""}`}
-      data-testid={`agent-version-${agent.vendor}`}
-      title={
-        latestLabel
-          ? stale
-            ? `current ${current} · latest ${latestLabel} (update available)`
-            : `current ${current} · latest ${latestLabel}`
-          : agent.version ?? current
-      }
-    >
-      <span className="ver-cur">{current}</span>
-      {latestLabel ? (
-        <>
-          <span className="ver-sep">→</span>
-          <span className={`ver-latest ${stale ? "stale" : ""}`}>{latestLabel}</span>
-          {stale ? <span className="badge warn ver-upd">{lang === "en" ? "update" : "可更新"}</span> : null}
-        </>
-      ) : null}
-    </div>
-  );
-}
-
-export function HostDetailCards({
-  host,
+/** One compact row per machine: identity (dot · hostname · host id) on the
+ *  left, its to-do list on the right. Hook-free so the node test suite can
+ *  walk it and fire `onClick` without a DOM. */
+export function HostActionRow({
+  hostId,
+  hostname,
+  online,
+  actions,
   busy,
   lang = "zh",
   onRegister,
   onImport,
 }: {
-  host: HostDetail;
+  hostId: string;
+  hostname: string;
+  online: boolean;
+  actions: PendingAction[];
   busy: string | null;
   lang?: Lang;
   onRegister: (vendor: string) => void;
   onImport: (remoteSlug: string) => void;
 }) {
   const t = makeT(lang);
-  // Projects default collapsed so a multi-host fleet stays scannable.
-  const [projectsOpen, setProjectsOpen] = useState(false);
-  const [latests, setLatests] = useState<Record<string, string>>({});
-
-  // Stable dep so parent re-renders with a new agents[] identity don't
-  // re-fire the npm fetch (the module cache would hit, but setState churns).
-  const vendorKey = host.agents.map((a) => a.vendor).join("\0");
-  useEffect(() => {
-    let cancelled = false;
-    const vendors = vendorKey ? vendorKey.split("\0") : [];
-    void fetchVendorLatests(vendors).then((map) => {
-      if (!cancelled) setLatests(map);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [host.host, vendorKey]);
-
-  const installed = host.agents.filter((a) => a.installed);
-  const absent = host.agents.filter((a) => !a.installed);
-  const projects = host.projects ?? [];
-
   return (
-    <div className="host-card" data-testid={`host-card-${host.host}`}>
-      {/* hostname / machine bar */}
-      <div className="host-head" data-testid="host-bar">
-        <span className="dot on" />
-        <span className="hn">{host.hostname}</span>
-        {host.is_local ? (
-          <span className="badge brand">{t("localBadge")}</span>
-        ) : (
-          <span className="badge">{t("remoteBadge")}</span>
-        )}
-        <span className="sys">
-          {host.os}/{host.arch} · ccteam {host.ccteam_version}
-        </span>
+    <div
+      className={`host-actions${online ? "" : " offline"}`}
+      data-testid={`host-actions-${hostId}`}
+    >
+      <div className="host-actions-head">
+        <span className={`dot ${online ? "on" : "off"}`} />
+        <span className="host-actions-name">{hostname}</span>
+        <span className="host-actions-id mono">{hostId}</span>
       </div>
-
-      {host.agents.length === 0 ? (
-        <div style={{ padding: "16px 20px", color: "var(--text-faint)", fontSize: 13 }}>
-          未在 PATH 上发现 claude / codex / grok / opencode / kimi。安装后点上方「{t("reprobe")}」。
-        </div>
-      ) : (
-        <>
-          {installed.map((agent) => {
-            const registering = busy === `${host.host}:${agent.vendor}`;
-            return (
-              <div
-                key={agent.vendor}
-                className="agent-row"
-                data-testid={`agent-card-${agent.vendor}`}
-              >
-                <div className="v">
-                  <span className={vendorDotClass(agent.vendor)} />
-                  {agent.vendor}
-                </div>
-                <div className="bin" title={agent.hint ?? agent.harness_id}>
-                  {agent.bin}
-                </div>
-                <AgentVersionCell agent={agent} latest={latests[agent.vendor]} lang={lang} />
-                <div data-testid={`agent-status-${agent.vendor}`}>
-                  {!agent.mcp_registrable ? (
-                    <span className="badge ok" title="MCP 随会话协议（无需注册）">
-                      就绪 · MCP 随会话协议
-                    </span>
-                  ) : agent.mcp_registered ? (
-                    <span className="badge ok">就绪 · {t("mcpOk")}</span>
-                  ) : (
-                    <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                      <span className="badge warn">需配置</span>
-                      <button
-                        type="button"
-                        className="btn primary mini"
-                        data-testid={`register-mcp-${agent.vendor}`}
-                        disabled={busy !== null}
-                        onClick={() => onRegister(agent.vendor)}
-                      >
-                        {registering ? "注册中…" : t("registerMcp")}
-                      </button>
-                    </span>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          {absent.length > 0 ? (
-            <div
-              className="agent-row absent-group"
-              data-testid="agents-absent-row"
-              title={absent.map((a) => a.vendor).join(", ")}
-            >
-              <div className="v absent-label">
-                <span className="dot off" />
-                {t("notInstalled")}
-                <span className="absent-count">{absent.length}</span>
-              </div>
-              <div className="absent-vendors" data-testid="agents-absent-list">
-                {absent.map((a) => (
-                  <span key={a.vendor} className="absent-chip" data-testid={`agent-card-${a.vendor}`}>
-                    <span className={vendorDotClass(a.vendor)} />
-                    {a.vendor}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </>
-      )}
-
-      {projects.length > 0 ? (
-        <div className="host-projects" data-testid={`host-projects-${host.host}`}>
-          <button
-            type="button"
-            className="host-projects-toggle"
-            data-testid={`host-projects-toggle-${host.host}`}
-            aria-expanded={projectsOpen}
-            onClick={() => setProjectsOpen((o) => !o)}
-          >
-            <span className={`chev ${projectsOpen ? "open" : ""}`} aria-hidden>
-              ▸
-            </span>
-            <span className="host-projects-title">{t("hostProjects")}</span>
-            <span className="host-projects-count">{projects.length}</span>
-          </button>
-          {projectsOpen
-            ? projects.map((project) => {
-                const importing = busy === `import:${host.host}:${project.slug}`;
-                return (
-                  <div
-                    className="host-project-row"
-                    data-testid={`host-project-${project.slug}`}
-                    key={project.slug}
-                  >
-                    <span className="mono">{project.slug}</span>
-                    <span className="host-project-path">{project.path}</span>
-                    {project.cataloged ? (
-                      <span className="badge ok">
-                        {t("projectCataloged")}
-                        {project.catalog_slug && project.catalog_slug !== project.slug
-                          ? ` → ${project.catalog_slug}`
-                          : ""}
-                      </span>
-                    ) : !host.is_local ? (
-                      <button
-                        type="button"
-                        className="btn primary mini"
-                        data-testid={`import-project-${project.slug}`}
-                        disabled={busy !== null}
-                        onClick={() => onImport(project.slug)}
-                      >
-                        {importing ? t("importingProject") : t("importProject")}
-                      </button>
-                    ) : (
-                      <span className="badge">—</span>
-                    )}
-                  </div>
-                );
-              })
-            : null}
-        </div>
-      ) : null}
+      <div className="host-actions-items">
+        {actions.length === 0 ? (
+          // An unreachable host has no to-do list we can trust — say that
+          // rather than claiming it is clean.
+          <span className="host-actions-idle" data-testid={`host-idle-${hostId}`}>
+            {online ? t("nothingToDo") : t("offlineRow")}
+          </span>
+        ) : (
+          actions.map((action) =>
+            action.kind === "register" ? (
+              <span className="host-action" key={`register:${action.vendor}`}>
+                <span className={vendorDotClass(action.vendor)} />
+                <span className="host-action-label">{action.vendor}</span>
+                <button
+                  type="button"
+                  className="btn primary mini"
+                  data-testid={`register-mcp-${action.vendor}`}
+                  disabled={busy !== null}
+                  onClick={() => onRegister(action.vendor)}
+                >
+                  {busy === registerKey(hostId, action.vendor)
+                    ? t("registeringMcp")
+                    : t("registerMcp")}
+                </button>
+              </span>
+            ) : (
+              <span className="host-action" key={`import:${action.slug}`}>
+                <span className="host-action-label mono" title={action.path}>
+                  {action.slug}
+                </span>
+                <button
+                  type="button"
+                  className="btn primary mini"
+                  data-testid={`import-project-${action.slug}`}
+                  disabled={busy !== null}
+                  onClick={() => onImport(action.slug)}
+                >
+                  {busy === importKey(hostId, action.slug)
+                    ? t("importingProject")
+                    : t("importProject")}
+                </button>
+              </span>
+            ),
+          )
+        )}
+      </div>
     </div>
   );
 }

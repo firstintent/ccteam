@@ -745,6 +745,9 @@ html.dark .dot.off { background: #4b4e57; }
 .hosts-head-bar { display: flex; align-items: center; gap: 14px; }
 .hosts-head-copy { flex: 1; min-width: 0; }
 .hosts-section-title { font-size: 14px; font-weight: 600; letter-spacing: .2px; color: var(--text-muted); text-transform: uppercase; }
+.hosts-head-desc { font-size: 12.5px; color: var(--text-muted); font-weight: 300; line-height: 1.5; margin-top: 5px; }
+/* The Team-page pointer is a react-router Link wearing the ghost button skin. */
+.hosts-head-bar a.btn { text-decoration: none; white-space: nowrap; }
 
 /* Daemon health strip — always the first thing on 运维总览. */
 .daemon-strip {
@@ -766,67 +769,34 @@ html.dark .dot.off { background: #4b4e57; }
 .btn.ghost:hover { color: var(--text); background: var(--bg-soft); }
 .btn.mini { padding: 4px 11px; font-size: 12px; border-radius: 6px; }
 
-.host-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-card); overflow: hidden; }
-.host-card.offline { opacity: .55; }
-.host-head { display: flex; align-items: center; gap: 12px; padding: 15px 20px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
-.host-head .hn { font-size: 15.5px; font-weight: 600; display: flex; align-items: center; gap: 9px; }
 .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 500; border: 1px solid var(--border); color: var(--text-muted); }
 .badge.brand { background: var(--bg-soft); border-color: var(--border); color: var(--text); }
 .badge.ok { background: var(--green-soft); border-color: transparent; color: var(--green-text); }
 .badge.warn { background: var(--red-soft); border-color: transparent; color: var(--red-text); }
-.host-head .sys { color: var(--text-faint); font-size: 12px; font-family: var(--font-mono); }
-.host-head .act { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
-.agent-row {
-  display: grid; grid-template-columns: 140px minmax(0, 1fr) minmax(160px, auto) auto; gap: 14px; align-items: center;
-  padding: 12px 20px; border-bottom: 1px solid var(--border-soft);
+/* Host ACTION rows (设置→运维总览). One compact row per machine: identity on
+   the left, its to-do list on the right. The per-vendor health grid that used
+   to live here moved to the Team page's charter roster. */
+.host-actions {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 18px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
 }
-.agent-row:last-child { border-bottom: none; }
-.agent-row .v { display: flex; align-items: center; gap: 9px; font-weight: 500; font-size: 14px; }
-.agent-row .bin { font-family: var(--font-mono); font-size: 12px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-row .ver {
-  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end;
+.host-actions.offline { opacity: .6; }
+.host-actions-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.host-actions-name { font-size: 14px; font-weight: 600; }
+.host-actions-id { font-size: 11.5px; color: var(--text-faint); }
+.host-actions-items {
+  margin-left: auto; display: flex; align-items: center; gap: 8px 14px;
+  flex-wrap: wrap; justify-content: flex-end;
 }
-.agent-row .ver .ver-sep { color: var(--text-faint); }
-.agent-row .ver .ver-latest { color: var(--text-faint); }
-.agent-row .ver.stale .ver-cur { color: var(--text-muted); }
-.agent-row .ver .ver-latest.stale { color: var(--red-text); font-weight: 500; }
-.agent-row .ver .ver-upd { font-size: 10px; padding: 1px 7px; }
-.agent-row.absent .v, .agent-row.absent .ver { color: var(--text-faint); }
-/* All uninstalled vendors collapse into one quiet row (wide-screen friendly). */
-.agent-row.absent-group {
-  grid-template-columns: 140px 1fr;
-  background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
-  padding-top: 10px; padding-bottom: 10px;
+.host-actions-idle { font-size: 12.5px; color: var(--text-faint); }
+.host-action { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-muted); }
+.host-action-label { font-weight: 500; }
+.host-action-label.mono {
+  font-size: 12px; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.agent-row.absent-group .absent-label { color: var(--text-faint); font-weight: 500; font-size: 13px; gap: 8px; }
-.agent-row.absent-group .absent-count {
-  font-size: 11px; font-family: var(--font-mono); color: var(--text-faint);
-  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; line-height: 18px;
-}
-.agent-row.absent-group .absent-vendors { display: flex; flex-wrap: wrap; gap: 8px 12px; justify-content: flex-start; }
-.agent-row.absent-group .absent-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12.5px; color: var(--text-faint); font-weight: 500;
-}
-.host-projects { border-top: 1px solid var(--border-soft); }
-.host-projects-toggle {
-  width: 100%; display: flex; align-items: center; gap: 8px;
-  padding: 10px 20px; background: none; border: none; cursor: pointer;
-  color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
-  text-align: left;
-}
-.host-projects-toggle:hover { background: var(--bg-soft); color: var(--text-muted); }
-.host-projects-toggle .chev { display: inline-block; transition: transform .15s; font-size: 12px; width: 12px; }
-.host-projects-toggle .chev.open { transform: rotate(90deg); }
-.host-projects-title { font-size: 11px; letter-spacing: .5px; }
-.host-projects-count {
-  margin-left: 2px; font-family: var(--font-mono); font-size: 11px;
-  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; line-height: 16px;
-}
-.host-project-row { min-height: 34px; padding: 5px 20px; display: grid; grid-template-columns: 130px minmax(120px, 1fr) auto; gap: 12px; align-items: center; border-top: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); font-size: 12px; }
-.host-project-path { color: var(--text-faint); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .join-card { border: 1px dashed var(--border); border-radius: var(--radius-card); padding: 20px; display: flex; flex-direction: column; gap: 12px; }
 .join-card.bare { border: 0; border-radius: 0; padding: 0; }
@@ -888,9 +858,7 @@ html.dark .dot.off { background: #4b4e57; }
 @media (max-width: 900px) {
   .tpl-grid, .mk-grid { grid-template-columns: 1fr; }
   .stat-grid { grid-template-columns: 1fr; }
-  .agent-row { grid-template-columns: 110px 1fr auto; }
-  .agent-row .bin { display: none; }
-  .agent-row.absent-group { grid-template-columns: 1fr; }
+  .host-actions-items { margin-left: 0; width: 100%; justify-content: flex-start; }
   .daemon-strip-sub { margin-left: 0; width: 100%; }
 }
 @media (max-width: 820px) {

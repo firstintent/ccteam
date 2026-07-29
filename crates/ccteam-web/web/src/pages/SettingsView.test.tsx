@@ -155,7 +155,12 @@ describe("OpsPanel (merged Status + Hosts)", () => {
   });
 
   it("stacks daemon status above hosts (single column) without changing test ids", () => {
-    const html = renderToString(<OpsPanel lang="zh" />);
+    // Router context: the hosts panel header links to the Team page (TEAM-9).
+    const html = renderToString(
+      <MemoryRouter>
+        <OpsPanel lang="zh" />
+      </MemoryRouter>,
+    );
     expect(html).toContain('data-testid="ops-view"');
     expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');
