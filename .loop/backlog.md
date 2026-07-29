@@ -15,23 +15,14 @@
 
 ## 当前卡
 
-### TEAM-7 名册卡点击 → 过滤拓扑(owner 批三候选 #1;subagent=opus)
-- **状态**:进行中(规划派工·2026-07-29) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:dev 会话(规划子代理 opus,串行 #1)
-- **背景**:v0.9.11 追加波后 owner 批准三候选动工。分工 tab 名册卡现为纯展示;点卡应 = 「看这家 vendor 在干什么」。
-- **规格**:`VendorRosterCards` 卡片可点(hover 态 + title 提示),回调 `onVendorPick(vendor)` 上抛;`AgentsView` 传入 handler = `setVendorFilter(vendor)` + `setTab("topology")`(AgentsView.tsx:383-387 既有 state,与 KPI chips 同一过滤源);再点拓扑 chips 可取消。i18n zh/en。
-- **DoD**:vitest(卡片回调 wire、AgentsView 切 tab+过滤联动);`make web-check` 绿;fmt;writeback 绿。
 
-### TEAM-8 离线主机 stale 外显(owner 批三候选 #2;subagent=opus)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web`(src+web,串行 #2) · **建议入口**:dev 会话(规划子代理 opus)
-- **背景**:离线残留主机(如已清的 smoke-self)靠人肉发现;名册应外显离线时长并在超阈时建议清理。**引擎零决策**:纯展示 + 建议文案,绝不自动删。
-- **规格**:后端 `HostSummary` 增 additive 字段 `last_heartbeat_unix: Option<u64>`(local = None;来源 `HostRecord.last_heartbeat_unix`,handle_hosts 直拷;OpenAPI schema 自动)。SPA:`RosterHost` 穿透该字段,分组表头对离线主机显示「已离线 <相对时长>」;超过 7 天(SPA 常量)追加建议清理文案 + 移除按钮 amber 强调。i18n zh/en。
-- **DoD**:rust(summary 字段:卫星带值/local 无)+ vitest(离线时长渲染、超阈强调);`make check`+相关 rust 测试+`make web-check` 绿;fmt;writeback 绿。
 
-### TEAM-9 HostsView 收敛为动作面(owner 批三候选 #3;subagent=opus)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web` · **建议入口**:dev 会话(规划子代理 opus,串行 #3)
-- **背景**:设置→运维 HostsView(578 行)与团队名册重叠 = per-host×vendor 健康观察网格;HostsView 独有 = register-mcp(仅 local)、卫星项目 import、`JoinCard`(AccessView 复用其导出)。收敛方向(owner 批):**运维留动作面,团队页独占观察面**。TEAM-6 的移除主机留在团队页(host 生命周期归观察面发现驱动),不回搬。
-- **规格**:HostsView 删观察网格,改为紧凑动作行:每主机一行(hostname+id+在线态)只列**可动作项**——local = 未注册且 mcp_registrable 的 vendor 注册按钮(复用既有 onRegister/registerMcp 流)+ 刷新;卫星 = 未 cataloged 远程项目 import 按钮(复用既有 onImport 流);零待办主机显「无待办」一行。`JoinCard` 原地保留(不搬文件,AccessView import 不动)。页头描述改「主机接入与注册;全队观察面 → 团队页」+ 链接 `/agents`。i18n 增删对应 key(保 parity);`HostsView.test.tsx` 重写。
-- **DoD**:vitest(动作行渲染、零待办态、团队页链接、register/import wire 不回归);`make web-check` 绿;fmt;writeback 绿。
+
+### TEAM-10 「可更新」信号迁团队名册(TEAM-9 收敛遗留;subagent=opus)
+- **状态**:进行中(规划派工·2026-07-29) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:dev 会话(规划子代理 opus,串行 #4)
+- **背景**:TEAM-9 删观察网格时,旧 `AgentVersionCell` 的 npm-latest 对比信号一并消失,`lib/vendorLatest.ts` 零生产消费者(仅自测)——收敛不该丢信号,死代码不该留。
+- **规格**:CharterPanel 一次 best-effort 拉 `fetchVendorLatests`(静默失败),`VendorRosterCards` 卡片版本行对 `isOutdated(installed, latest)` 的 vendor 追加低调「↑ <latest> 可更新」提示(覆盖面 = `npmPackageForVendor` 既有映射,不发明新渠道);测试经可注入 `latests` prop;i18n zh/en。
+- **DoD**:vitest(outdated 提示渲染/无 latest 静默);`make web-check` 绿;vendorLatest.ts 恢复有生产消费者;fmt;writeback 绿。
 
 ### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
 - **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
