@@ -26,6 +26,10 @@
   `web_chat_bridge` 的重启测试就这样在 main 上烂了很久没人发现(pump 泄漏 + 断言随架构漂移)。故口径固定为
   `--lib --bins`;**新增 binary-only crate 时必须确认它进了这个口径**。
 - **新校验 / 新门必须先证有牙**:先造缺陷态、定向测试红(留痕于卡面「验证」段),再修绿——恒绿的门 = 空洞,不算验收。
+- **`writeback.sh --selftest` 在 macOS 下自己坏**(2026-07-30 实锤):BSD sed 吃不下脚本里的 GNU sed 语法
+  (`sed: 1: "/T1 示例卡/,/^$/{…": extra characters at the end of d command`),且**退出码仍 0**(自检失败静默)。
+  本机替代实证 = 真实构造非法状态词跑一次无参 `writeback.sh` 应 RED(同日实测:状态词写成 `待排(watch 卡…)`
+  → RED「状态词不在闭合集」→ 改回闭合集 `待排` → GREEN,比 selftest 更强的有牙证据)。修 selftest 属工具债,未立卡。
 - **基线口径内的测试必须密封**:不得依赖 PATH 上的真实 vendor CLI、全局 env、或宿主特有状态——CI test job(`check.yml`,同口径)是干净环境仲裁。实锤:v0.9.9 CI 首跑咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻 → 本地恒绿假象);修法 = 注入缝(per-Gateway 可用性快照),非 env 突变、非 CI 装桩。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
@@ -39,7 +43,12 @@
   `hook.sh` 据此 `exit 0` → 桩从不被调用、一次性 listener 无人连接。修法:spawn 前 `env_remove` 整族 `CCTEAM_*` 会话变量。
   **教训**:「只在 live-daemon 宿主红」≠ flake —— 先问「宿主给了它什么」(env / 端口 / 真实 home),十有八九是测试没密封。
   另:`remove_test t03/t17` = **确定性红非 flake**(v0.9.0 废 cto 后测试语义未跟,已立卡 P1-3),判基线单列、不得再增同类;
-  注意 **CI 目前不跑测试**(只 fmt+clippy,P2-1 待补)——「CI 绿」不能当测试证据。
+  ~~注意 CI 目前不跑测试(只 fmt+clippy,P2-1 待补)~~ **已作废(2026-07-30 核 `check.yml` 实况)**:
+  `check.yml` 三 job = `fmt` + `clippy -D warnings` + **`test`(`cargo test --workspace --exclude ccteam-web --lib --bins --locked`
+  = 与 `make test-baseline` 同口径)**,故「CI 绿」**是**基线口径的干净环境证据(与本文件上方「CI test job 是干净环境仲裁」一致;
+  旧句陈旧,会误导后来会话放弃现成仲裁)。真正的限制在**触发面**:`on: push[main] + pull_request[main]` ——
+  **推 dev 本身不触发任何 job**,只有开着 dev→main PR 时才跑(AGENTS §五「周期开始即开 draft PR」正是为此)。
+  ⇒ 无 PR 期间推 dev 的提交**零 CI 覆盖**,基线数字只有本机口径,须在 PR 开启后回填仲裁值。
 - **macOS 宿主两族**(2026-07-26 ae24cb3 review 实锤,均先于该 commit、Linux CI 不受影响;修卡 = TEST-MACOS-1):
   ① `ccteam-core roles::list_library_skills_is_recursive_hidden_safe_and_sorted` —— **在 baseline 口径内**,TMPDIR 形状敏感:
   scanner `fs::canonicalize` 把 `/var/*` tempdir 解析成 `/private/var/*`,测试却按字面 tempdir 断言 path;默认 shell
