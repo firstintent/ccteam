@@ -1043,7 +1043,10 @@ struct MetaRebuildPlan {
 /// lock-dropping callers.
 struct NewSessionPlan {
     id: String,
+    /// Canonical resource owner used by session ACL and persisted meta.
     owner: ChatKey,
+    /// Concrete frontend route used for async answer delivery.
+    reply_to: ChatKey,
     project: String,
     vendor: AgentVendor,
     role: String,
@@ -1594,7 +1597,10 @@ impl Gateway {
             .model
             .clone()
             .or_else(|| role_model_id(role_detail.as_ref()));
-        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| reply_to.clone());
+        let owner = self
+            .tenant_project_owner(slug)
+            .or_else(|| ChatKey::from_identity(&meta.owner))
+            .unwrap_or_else(|| canonical_owner(reply_to));
         // Empty role ⇒ roleless: fall back to sid so @handle addressing stays
         // unique + non-empty (mirrors start_session / switch_current_role).
         let handle = if meta.role.is_empty() {
@@ -1762,15 +1768,15 @@ impl Gateway {
         Ok(())
     }
 
-    /// Drop `current_session` routes pointing at a sid no longer in the live
-    /// map (e.g. a session that failed to rebuild after restart, or a state
-    /// file edited out-of-band). Interior-mutates the shared route table.
+    /// Drop `current_session` routes pointing at a missing or foreign session.
+    /// The ownership check also scrubs routes persisted by an older buggy
+    /// session_spawn that bound a tenant project's sid to the admin web chat.
     fn drop_dead_session_routes(&self) {
-        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, sid| live.contains(sid));
+        self.current_session.write().unwrap().retain(|chat, sid| {
+            self.sessions
+                .get(sid)
+                .is_some_and(|session| self.chat_can_access(chat, session))
+        });
     }
 
     /// v0.8.21 Wave-2 — cold-start rebuild the sessions that were live at last
@@ -1792,8 +1798,12 @@ impl Gateway {
                 tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
                 continue;
             };
-            let reply_to = ChatKey::from_identity(&meta.owner)
-                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+            let reply_to = self
+                .tenant_project_owner_reply_target(&slug)
+                .or_else(|| {
+                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+                })
+                .unwrap_or_else(web_api_chat);
             if let Err(err) = self
                 .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
                 .await
@@ -1830,8 +1840,13 @@ impl Gateway {
                 } else {
                     match g.find_meta_for_sid(&sid) {
                         Ok((slug, cwd, meta)) => {
-                            let reply_to = ChatKey::from_identity(&meta.owner)
-                                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+                            let reply_to = g
+                                .tenant_project_owner_reply_target(&slug)
+                                .or_else(|| {
+                                    ChatKey::from_identity(&meta.owner)
+                                        .map(|owner| reply_target_for_owner(&owner))
+                                })
+                                .unwrap_or_else(web_api_chat);
                             match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
                                 Ok(plan) => Some((plan, reply_to)),
                                 Err(err) => {
@@ -2725,7 +2740,7 @@ impl Gateway {
             return self.chat_can_access(chat, session);
         }
         read_session_meta(&entry.project_dir, &entry.item.sid)
-            .map(|meta| self.owner_identity_visible(chat, &meta.owner))
+            .map(|meta| self.project_session_owner_visible(chat, &meta.slug, &meta.owner))
             .unwrap_or(false)
     }
 
@@ -2779,7 +2794,7 @@ impl Gateway {
             let acl_ok = self
                 .find_meta_for_sid(id)
                 .ok()
-                .map(|(_, _, meta)| self.owner_identity_visible(chat, &meta.owner))
+                .map(|(slug, _, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
                 .unwrap_or(false);
             if !acl_ok {
                 return Ok(format!("unknown session for this chat: {id}"));
@@ -2904,6 +2919,22 @@ impl Gateway {
             .as_ref()
             .and_then(|paths| ccteam_core::ProjectState::load(&paths.project_state(slug)).ok())
             .and_then(|state| state.owner)
+    }
+
+    /// Canonical tenant principal inherited by every session in a tenant-owned
+    /// project. Operator-owned projects deliberately return `None`: separate
+    /// admin IM chats keep their own session identities.
+    fn tenant_project_owner(&self, slug: &str) -> Option<ChatKey> {
+        let owner = self.project_owner(slug)?;
+        ccteam_core::identity::is_tenant_owned(Some(&owner))
+            .then(|| ChatKey::from_identity(&owner))
+            .flatten()
+    }
+
+    /// Concrete web delivery route for a tenant project's principal.
+    fn tenant_project_owner_reply_target(&self, slug: &str) -> Option<ChatKey> {
+        self.tenant_project_owner(slug)
+            .map(|owner| reply_target_for_owner(&owner))
     }
 
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
@@ -3349,7 +3380,7 @@ impl Gateway {
     #[allow(clippy::too_many_arguments)]
     fn plan_new_session(
         &mut self,
-        owner: ChatKey,
+        reply_to: ChatKey,
         project: String,
         vendor: AgentVendor,
         role: String,
@@ -3420,7 +3451,8 @@ impl Gateway {
         let adapter = (self.adapter_factory)(vendor, protocol);
         Ok(NewSessionPlan {
             id,
-            owner,
+            owner: canonical_owner(&reply_to),
+            reply_to,
             project,
             vendor,
             role,
@@ -3525,6 +3557,7 @@ impl Gateway {
         let NewSessionPlan {
             id,
             owner,
+            reply_to,
             project,
             vendor,
             role,
@@ -3555,20 +3588,16 @@ impl Gateway {
             .to_string();
         let meta_project = project.clone();
         let meta_role = role.clone();
-        let owner_channel = owner.channel.clone();
-        let owner_for_reply = owner.clone();
+        let owner_channel = reply_to.channel.clone();
         let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
         self.sessions.insert(
             id.clone(),
             GatewaySession {
                 id: id.clone(),
-                // v0.8.20 web↔IM convergence — the OWNER is the canonical identity
-                // (`user:<tenant>` for a per-tenant bot; the chat itself otherwise),
-                // so a tenant's web console + their own IM bot share ONE owner and
-                // see the SAME sessions. `reply_to` below stays the actual frontend
-                // chat (delivery target), so reply routing is unchanged.
-                owner: canonical_owner(&owner),
+                // v0.8.20 web↔IM convergence — owner is the canonical resource
+                // identity while reply_to remains the concrete frontend route.
+                owner,
                 project,
                 role,
                 vendor,
@@ -3581,7 +3610,7 @@ impl Gateway {
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(owner_for_reply)),
+                reply_to: Arc::new(std::sync::Mutex::new(reply_to.clone())),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
@@ -3596,7 +3625,7 @@ impl Gateway {
         self.current_session
             .write()
             .unwrap()
-            .insert(owner, id.clone());
+            .insert(reply_to, id.clone());
         self.persist_routing()?;
         // Write per-session meta.json for history list + resume after stop.
         {
@@ -3604,7 +3633,7 @@ impl Gateway {
             let owner_tag = self
                 .sessions
                 .get(&id)
-                .map(|s| canonical_owner(&s.owner).identity())
+                .map(|s| s.owner.identity())
                 .unwrap_or_default();
             // v0.9 T5 — snapshot role/skill fingerprints at spawn (not rehashed
             // mid-session).
@@ -6323,7 +6352,7 @@ impl Gateway {
             return self.chat_can_access(chat, session);
         }
         self.find_meta_for_sid(sid)
-            .map(|(_slug, _dir, meta)| self.owner_identity_visible(chat, &meta.owner))
+            .map(|(slug, _dir, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
             .unwrap_or(false)
     }
 
@@ -6375,6 +6404,22 @@ impl Gateway {
             is_admin,
             owner_identity,
         )
+    }
+
+    /// Session ownership inherits the project principal. The stored owner is
+    /// only a fallback for unowned legacy projects; this keeps stopped-session
+    /// ACL checks safe even when old metadata was persisted with the caller's
+    /// admin identity instead of the tenant project's identity.
+    fn project_session_owner_visible(
+        &self,
+        chat: &ChatKey,
+        slug: &str,
+        stored_owner: &str,
+    ) -> bool {
+        let owner = self
+            .tenant_project_owner(slug)
+            .map(|owner| owner.identity());
+        self.owner_identity_visible(chat, owner.as_deref().unwrap_or(stored_owner))
     }
 
     /// Resolve a frontend chat to the principal it speaks for — the ONE place
@@ -8113,10 +8158,16 @@ impl Gateway {
         )
         .await?;
         let host = host_target.host.clone();
-        let owner = ChatKey::new("web", &owner_id, &owner_id);
+        // A tenant-owned project pins every delegated session to its tenant
+        // principal even when a fleet-wide Admin or Ambient parent performs
+        // the spawn. Operator/unowned projects retain the caller-derived pool
+        // so separate admin IM chats do not collapse into one owner.
+        let reply_to = self
+            .tenant_project_owner_reply_target(&project)
+            .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
         let handle = role.clone();
         let mut plan = self.plan_new_session(
-            owner,
+            reply_to,
             project.clone(),
             vendor,
             role,
@@ -8521,12 +8572,11 @@ impl Gateway {
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
-    /// Looks the session up by id (not by current-chat routing), points its
-    /// `reply_to` at the web console so the async answer/progress events
-    /// route back to a web SSE subscriber, then submits via the owning
-    /// adapter. The lock is held only across the (fast) `submit_turn`
-    /// send-keys / RPC; the long turn streams asynchronously through the
-    /// event pump. Returns the submitted [`TurnId`]'s inner string.
+    /// Looks the session up by id (not by current-chat routing), resolves its
+    /// project owner's concrete frontend as `reply_to`, then submits via the
+    /// owning adapter. The lock is held only across the (fast) `submit_turn`
+    /// send-keys / RPC; the long turn streams asynchronously through the event
+    /// pump. Returns the submitted [`TurnId`]'s inner string.
     pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
         self.submit_to_sid_with_origin(sid, text, TurnOrigin::Internal)
             .await
@@ -8540,12 +8590,22 @@ impl Gateway {
     ) -> Result<String> {
         // Same core as the IM `submit_to_current` path (parity by construction):
         // a single-line `/command` is a session directive, everything else a
-        // turn. The synthetic web `reply_to` routes async answers / progress
-        // back to the per-`sid` SSE subscriber. An empty `message_id` (the web
-        // has no inbound IM message) + the `web` channel both suppress the 👀
-        // ack reaction — web has its own UI.
+        // turn. Project ownership selects the concrete reply frontend; an empty
+        // `message_id` and a web target suppress the IM-only 👀 ack reaction.
+        let reply_to = if let Some(session) = self.sessions.get(sid) {
+            self.tenant_project_owner_reply_target(&session.project)
+                .unwrap_or_else(|| reply_target_for_owner(&session.owner))
+        } else if let Ok((slug, _, meta)) = self.find_meta_for_sid(sid) {
+            self.tenant_project_owner_reply_target(&slug)
+                .or_else(|| {
+                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+                })
+                .unwrap_or_else(web_api_chat)
+        } else {
+            web_api_chat()
+        };
         match self
-            .submit_resolved(&web_api_chat(), sid, "", text, origin, false)
+            .submit_resolved(&reply_to, sid, "", text, origin, false)
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id
@@ -9035,11 +9095,7 @@ fn session_cost_and_tokens(
     )
 }
 
-/// The synthetic chat key used by the network resource API (W5b) as the
-/// `owner` / `reply_to` for sessions it creates or drives. `channel ==
-/// "web"` so it matches the web console's existing cross-entry sharing
-/// rules (e.g. global `/sessions`, `/use` any session), and the
-/// per-`sid` SSE filter keys on `chat_id == sid` via [`pump_target`].
+/// Admin-web fallback for an unowned legacy resource or an unknown sid.
 fn web_api_chat() -> ChatKey {
     ChatKey::new("web", "web-api", "web-api")
 }
@@ -9064,6 +9120,17 @@ fn canonical_owner(chat: &ChatKey) -> ChatKey {
     } else {
         // The admin/global IM bot, etc. — owns by the chat itself.
         chat.clone()
+    }
+}
+
+/// Map a canonical resource owner back to a concrete delivery frontend.
+/// Synthetic `user:<id>` identities use that user's web channel; real IM
+/// owners already name their delivery channel directly.
+fn reply_target_for_owner(owner: &ChatKey) -> ChatKey {
+    if owner.channel == "user" {
+        ChatKey::new("web", &owner.chat_id, &owner.chat_id)
+    } else {
+        owner.clone()
     }
 }
 
@@ -9457,8 +9524,19 @@ fn mirror_internal_web_answer(
     if origin != TurnOrigin::Internal || reply_to.channel != "web" || session.parent_sid.is_some() {
         return;
     }
-    let Some((channel, chat_id)) = paths.and_then(|p| web_owner_im_target(p, &session.owner))
-    else {
+    let Some((channel, chat_id)) = paths.and_then(|p| {
+        // Defense in depth for already-persisted poisoned session metadata:
+        // project ownership is authoritative at delivery time too. A privileged
+        // caller must not turn a tenant project's answer into an admin mirror.
+        let owner = ccteam_core::ProjectState::load(&p.project_state(&session.project))
+            .ok()
+            .and_then(|state| state.owner)
+            .filter(|owner| ccteam_core::identity::is_tenant_owned(Some(owner)))
+            .as_deref()
+            .and_then(ChatKey::from_identity)
+            .unwrap_or_else(|| session.owner.clone());
+        web_owner_im_target(p, &owner)
+    }) else {
         return;
     };
     let _ = tx.send_delivery_only(GatewayEvent {
@@ -13122,6 +13200,90 @@ mod tests {
                 "delivery-only mirror must not duplicate either web SSE ring: {event:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_admin_owner_uses_project_owner_for_delivery_and_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        seed_global_telegram(&paths, vec!["admin-chat".into()]);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // Model a meta.json produced before the session_spawn ownership fix.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(
+            gateway.sessions.get(&sid).unwrap().owner.identity(),
+            "user:web-api",
+            "fixture starts poisoned"
+        );
+        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        let rebuild = gateway
+            .plan_session_rebuild("alpha", project_dir, &meta, &web_api_chat())
+            .unwrap();
+        assert_eq!(
+            rebuild.owner.identity(),
+            "user:ualice",
+            "restart repairs the effective owner from the project SoT"
+        );
+
+        gateway
+            .submit_to_sid(&sid, "tenant-only result".into())
+            .await
+            .unwrap();
+        let answers = recv_sink_answers(&mut events, 1).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(answers[0].channel, "web");
+        assert_eq!(answers[0].chat_id, "ualice");
+        assert!(
+            events.try_recv().is_err(),
+            "poisoned metadata must not mirror tenant output to admin Telegram"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_project_keeps_delegated_session_caller_pool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("telegram:project-owner"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+
+        let sid = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        assert_eq!(
+            meta.owner, "user:web-api",
+            "operator projects preserve the caller's session pool"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
