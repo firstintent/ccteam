@@ -76,6 +76,14 @@ impl ChatKey {
     }
 }
 
+/// `slug -> tenant project principal` resolved once per ACL pass (`None` =
+/// operator-owned / unowned, i.e. no principal to inherit). The session gate
+/// runs per LIVE session, and each resolution is a `state.json` read, so the
+/// filters that walk the whole fleet thread one of these through instead of
+/// re-reading the same project N times. See
+/// [`Gateway::memoized_tenant_project_owner`] for why it never becomes a field.
+type ProjectPrincipalMemo = std::collections::HashMap<String, Option<String>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
     User,
@@ -1772,10 +1780,11 @@ impl Gateway {
     /// The ownership check also scrubs routes persisted by an older buggy
     /// session_spawn that bound a tenant project's sid to the admin web chat.
     fn drop_dead_session_routes(&self) {
+        let mut memo = ProjectPrincipalMemo::new();
         self.current_session.write().unwrap().retain(|chat, sid| {
             self.sessions
                 .get(sid)
-                .is_some_and(|session| self.chat_can_access(chat, session))
+                .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
         });
     }
 
@@ -2973,10 +2982,11 @@ impl Gateway {
     /// (history) sessions switch only via their text `→ /use <sid>` hint.
     fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat).unwrap_or_default();
+        let mut memo = ProjectPrincipalMemo::new();
         let mut visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .filter(|s| all || s.project == cur)
             .collect();
         visible.sort_by(|a, b| {
@@ -3449,9 +3459,23 @@ impl Gateway {
         let (host, wire_slug) = self.project_host_binding(&project)?;
         let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor, protocol);
+        // Ownership is decided HERE, the one sync core every fresh spawn funnels
+        // through (IM `/new` → `start_session`, REST `POST …/sessions` →
+        // `create_session_api_tuned`, MCP `session_spawn` →
+        // `create_delegated_session`), so a future entry inherits it for free
+        // instead of needing its own patch. project 是归属单元, session 继承: a
+        // tenant-owned project stamps its own principal even when a fleet-wide
+        // admin or an ambient agent does the spawning; operator-owned and
+        // unowned projects have no principal, so the caller's canonical identity
+        // still owns (keeping separate admin IM chats apart). `reply_to` is NOT
+        // touched — owner is the resource identity, reply_to the concrete
+        // delivery frontend, and a tenant's own bot must keep its IM route.
+        let owner = self
+            .tenant_project_owner(&project)
+            .unwrap_or_else(|| canonical_owner(&reply_to));
         Ok(NewSessionPlan {
             id,
-            owner: canonical_owner(&reply_to),
+            owner,
             reply_to,
             project,
             vendor,
@@ -6337,8 +6361,31 @@ impl Gateway {
     /// sessions (and every tenant's console every other tenant's). It now routes
     /// through [`ccteam_core::identity::can_see_session_owner`], the session twin
     /// of the project ACL — one policy, both frontends.
+    ///
+    /// Project inheritance (2026-07-30) — the LIVE gate reads the same rule as
+    /// its stopped twin ([`Self::chat_can_access_sid`]) via
+    /// [`Self::project_owner_visible_with`]: project 是归属单元, session 继承,
+    /// so a tenant-owned project's principal decides regardless of the owner
+    /// stamped on the session. It used to read `session.owner` raw, so a tenant
+    /// whose children carried the caller's admin pool saw them when they were
+    /// STOPPED and not when they were LIVE — while its web team page (gated at
+    /// project level) showed them either way. Two frontends, two answers.
     fn chat_can_access(&self, chat: &ChatKey, session: &GatewaySession) -> bool {
-        self.chat_owner_visible(chat, &session.owner)
+        self.chat_can_access_with(chat, session, &mut ProjectPrincipalMemo::new())
+    }
+
+    /// [`Self::chat_can_access`] with a caller-supplied per-pass memo, for the
+    /// filters that run it over EVERY live session (`/status`, `/sessions`, the
+    /// switch pickers, the route scrub). Resolving the project principal costs
+    /// a `state.json` read, so a 30-session fleet would otherwise pay 30
+    /// identical reads per render; the memo makes it one per DISTINCT slug.
+    fn chat_can_access_with(
+        &self,
+        chat: &ChatKey,
+        session: &GatewaySession,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        self.project_owner_visible_with(chat, &session.project, &session.owner.identity(), memo)
     }
 
     /// [`Self::chat_can_access`] for a BARE sid, live or stopped: the live map
@@ -6356,30 +6403,13 @@ impl Gateway {
             .unwrap_or(false)
     }
 
-    /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
-    /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
-    /// iff (a) it owns it, or (b) the session sits in the WEB-CONSOLE pool of
-    /// the SAME identity (the admin's `user:web-api`, or a tenant's
-    /// `user:<tenant>`). Another identity's console — and any other IM chat —
-    /// stays hidden.
-    fn chat_owner_visible(&self, chat: &ChatKey, owner: &ChatKey) -> bool {
-        // v0.8.21 Wave-2 — delegate to the identity-string rule. A session
-        // rebuilt from `meta.json` (daemon restart) or cold-resumed carries an
-        // owner round-tripped through `from_identity`, which forces
-        // `user_id = chat_id`; a raw `ChatKey ==` own-check would then wrongly
-        // DENY the legitimate owner. Ownership is chat-level by design
-        // (`identity()` drops `user_id` — "owned by the CHAT, not a member"), so
-        // comparing canonical identity strings is the correct, round-trip-safe
-        // invariant. This unifies the live-map ACL with the cold-resume ACL onto
-        // one rule; chat_id isolation is preserved (different chat_id ⇒ different
-        // identity ⇒ not visible). The convergence + isolation cases are
-        // unchanged (tenant/web/admin identities have `user_id == chat_id`).
-        self.owner_identity_visible(chat, &owner.identity())
-    }
-
-    /// Identity-string form of [`chat_owner_visible`] for the cold-resume path,
-    /// where the owner is a persisted `meta.owner` canonical identity string
-    /// (`"channel:chat_id"`) rather than a live [`GatewaySession`]'s `ChatKey`.
+    /// v0.8.20 F2 — the pure visibility rule, expressed on the canonical owner
+    /// IDENTITY string so it is unit-testable without a full
+    /// [`GatewaySession`], and identical for a live session and a persisted
+    /// `meta.owner`. A chat sees a session owned by `owner_identity` iff (a) it
+    /// owns it, or (b) the session sits in the WEB-CONSOLE pool of the SAME
+    /// identity (the admin's `user:web-api`, or a tenant's `user:<tenant>`).
+    /// Another identity's console — and any other IM chat — stays hidden.
     ///
     /// We MUST compare on the identity string, not by reconstructing a `ChatKey`
     /// via `from_identity` and using `==`: `ChatKey` equality includes `user_id`,
@@ -6387,7 +6417,11 @@ impl Gateway {
     /// so a round-trip loses the real `user_id`. For a non-tenant IM bot (whose
     /// `canonical_owner` keeps the sender's `user_id`), that round-trip would
     /// wrongly deny the legitimate owner. Comparing the user_id-free identity
-    /// strings sidesteps the lossy round-trip entirely.
+    /// strings sidesteps the lossy round-trip entirely — which is also why a
+    /// session rebuilt from `meta.json` after a restart still reaches its owner.
+    /// Ownership is chat-level by design ("owned by the CHAT, not a member"),
+    /// and chat_id isolation is preserved (different chat_id ⇒ different
+    /// identity ⇒ not visible).
     fn owner_identity_visible(&self, chat: &ChatKey, owner_identity: &str) -> bool {
         // ONE policy for both frontends: own ⊕ the web-console pool this
         // identity may see (`ccteam_core::identity::can_see_session_owner` —
@@ -6416,10 +6450,44 @@ impl Gateway {
         slug: &str,
         stored_owner: &str,
     ) -> bool {
-        let owner = self
-            .tenant_project_owner(slug)
-            .map(|owner| owner.identity());
-        self.owner_identity_visible(chat, owner.as_deref().unwrap_or(stored_owner))
+        self.project_owner_visible_with(chat, slug, stored_owner, &mut ProjectPrincipalMemo::new())
+    }
+
+    /// The ONE session-ownership rule, shared by the live gate
+    /// ([`Self::chat_can_access_with`]) and the stopped/meta gate
+    /// ([`Self::project_session_owner_visible`]): a tenant-owned project's
+    /// principal decides; operator-owned and unowned projects have none, so the
+    /// owner stamped on the session decides instead (that fallback is what
+    /// keeps two admin IM chats isolated from each other).
+    fn project_owner_visible_with(
+        &self,
+        chat: &ChatKey,
+        slug: &str,
+        stored_owner: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        match self.memoized_tenant_project_owner(memo, slug) {
+            Some(project_owner) => self.owner_identity_visible(chat, project_owner),
+            None => self.owner_identity_visible(chat, stored_owner),
+        }
+    }
+
+    /// [`Self::tenant_project_owner`] behind a per-pass memo. Deliberately a
+    /// LOCAL value threaded through one pass rather than a field on `Gateway`:
+    /// an ACL cache that outlives the pass can serve stale visibility after an
+    /// ownership change, and a stale ACL is worse than a `state.json` read.
+    fn memoized_tenant_project_owner<'a>(
+        &self,
+        memo: &'a mut ProjectPrincipalMemo,
+        slug: &str,
+    ) -> Option<&'a str> {
+        if !memo.contains_key(slug) {
+            memo.insert(
+                slug.to_string(),
+                self.tenant_project_owner(slug).map(|o| o.identity()),
+            );
+        }
+        memo.get(slug).and_then(Option::as_deref)
     }
 
     /// Resolve a frontend chat to the principal it speaks for — the ONE place
@@ -6586,16 +6654,17 @@ impl Gateway {
     /// An unmatched role returns a usage error listing the roles that ARE
     /// available to this chat, so the user can immediately retry.
     fn resolve_use_role_shorthand(&self, chat: &ChatKey, role: &str) -> Result<String> {
+        let mut memo = ProjectPrincipalMemo::new();
         let mut candidates: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s) && s.role == role)
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && s.role == role)
             .collect();
         if candidates.is_empty() {
             let mut available: Vec<&str> = self
                 .sessions
                 .values()
-                .filter(|s| self.chat_can_access(chat, s) && !s.role.is_empty())
+                .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && !s.role.is_empty())
                 .map(|s| s.role.as_str())
                 .collect();
             available.sort_unstable();
@@ -6635,10 +6704,11 @@ impl Gateway {
     async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
         // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
+        let mut memo = ProjectPrincipalMemo::new();
         let accessible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
@@ -6946,10 +7016,11 @@ impl Gateway {
     /// When the watchdog window is disabled (`CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS
     /// == 0`), fall back to a fixed 300s stuck threshold so 🔴 still works.
     async fn render_status(&self, chat: &ChatKey) -> String {
+        let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
             return "no sessions — start one with /new".to_string();
@@ -7404,8 +7475,8 @@ impl Gateway {
         // without this guard a tenant authorised for project A could resume a
         // session belonging to project B by passing B's sid under A's slug.
         // Bind the resolved project to the caller's authorised slug. (The IM
-        // path passes `None` — it owner-checks via `chat_owner_visible` before
-        // calling, which is the IM equivalent of this project gate.)
+        // path passes `None` — it owner-checks via `project_session_owner_visible`
+        // before calling, which is the IM equivalent of this project gate.)
         if let Some(exp) = expected_slug {
             if exp != slug {
                 anyhow::bail!("session {sid} does not belong to project {exp}");
@@ -8158,10 +8229,10 @@ impl Gateway {
         )
         .await?;
         let host = host_target.host.clone();
-        // A tenant-owned project pins every delegated session to its tenant
-        // principal even when a fleet-wide Admin or Ambient parent performs
-        // the spawn. Operator/unowned projects retain the caller-derived pool
-        // so separate admin IM chats do not collapse into one owner.
+        // DELIVERY only — ownership comes from `plan_new_session` (the project
+        // principal). A delegated spawn has no frontend of its own (its caller
+        // is an agent, not a human chat), so a tenant project's answers must
+        // land in THAT tenant's web console rather than the caller's.
         let reply_to = self
             .tenant_project_owner_reply_target(&project)
             .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
@@ -9524,19 +9595,15 @@ fn mirror_internal_web_answer(
     if origin != TurnOrigin::Internal || reply_to.channel != "web" || session.parent_sid.is_some() {
         return;
     }
-    let Some((channel, chat_id)) = paths.and_then(|p| {
-        // Defense in depth for already-persisted poisoned session metadata:
-        // project ownership is authoritative at delivery time too. A privileged
-        // caller must not turn a tenant project's answer into an admin mirror.
-        let owner = ccteam_core::ProjectState::load(&p.project_state(&session.project))
-            .ok()
-            .and_then(|state| state.owner)
-            .filter(|owner| ccteam_core::identity::is_tenant_owned(Some(owner)))
-            .as_deref()
-            .and_then(ChatKey::from_identity)
-            .unwrap_or_else(|| session.owner.clone());
-        web_owner_im_target(p, &owner)
-    }) else {
+    // `session.owner` is authoritative: ownership is settled once at spawn
+    // (`plan_new_session` inherits the project principal) and repaired at
+    // rebuild (`plan_session_rebuild` re-reads it from the project SoT), so
+    // there is no live session left whose owner could point at the wrong
+    // mailbox. Re-deriving it from `ProjectState` here would be a compat shim
+    // for metadata this repo explicitly does not migrate (§五.3/§五.4) — and a
+    // second home for the ownership rule, on the delivery hot path.
+    let Some((channel, chat_id)) = paths.and_then(|p| web_owner_im_target(p, &session.owner))
+    else {
         return;
     };
     let _ = tx.send_delivery_only(GatewayEvent {
@@ -13214,7 +13281,6 @@ mod tests {
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
-        // Model a meta.json produced before the session_spawn ownership fix.
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -13225,12 +13291,18 @@ mod tests {
             .await
             .unwrap()
             .sid;
+        // The write path now stamps the project principal, so poison the
+        // PERSISTED metadata by hand — that is the state this test is about:
+        // a `meta.json` written before ownership inherited the project (the
+        // operator's on-disk fleet), which no migration will ever rewrite.
+        let mut meta = read_session_meta(&project_dir, &sid).unwrap();
         assert_eq!(
-            gateway.sessions.get(&sid).unwrap().owner.identity(),
-            "user:web-api",
-            "fixture starts poisoned"
+            meta.owner, "user:ualice",
+            "the spawn path stamps the tenant project's principal"
         );
-        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        meta.owner = "user:web-api".to_string();
+        write_session_meta(&project_dir, &meta).unwrap();
+
         let rebuild = gateway
             .plan_session_rebuild("alpha", project_dir, &meta, &web_api_chat())
             .unwrap();
@@ -13283,6 +13355,249 @@ mod tests {
         assert_eq!(
             meta.owner, "user:web-api",
             "operator projects preserve the caller's session pool"
+        );
+    }
+
+    /// THE REPORTED BUG (2026-07-30, real machine) — a tenant's IM `/status`
+    /// rendered NO `👥 直接子会话` block and under-counted "本项目其他 N 个会话"
+    /// while that tenant's WEB team page listed the very same children. The
+    /// children (`s22..s30`) had been spawned by an ambient `session_spawn`, so
+    /// they carried the admin pool's owner (`user:web-api`); the LIVE gate read
+    /// that stored owner verbatim while its STOPPED twin (`chat_can_access_sid`)
+    /// already inherited the project principal — same chat, same project, same
+    /// session, visible when stopped and invisible when live. The web surface
+    /// gates at PROJECT level only, so the two frontends disagreed, which is
+    /// exactly what the §三 red line forbids ("ACL = 一个身份解析器 + 一套归属
+    /// 策略,两个前端共用"). project 是归属单元,session 继承 — including live.
+    #[tokio::test]
+    async fn tenant_status_lists_live_children_owned_by_the_admin_pool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        // The tenant drives its own project from its per-tenant bot; `/new`
+        // focuses the chat on s1, the parent of the delegation tree.
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        gateway
+            .handle_text("telegram@ualice", "111", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Reproduce the operator's LIVE fleet: children whose owner is the
+        // caller's admin pool, not the project's tenant. Reachable whenever a
+        // session predates its project's ownership (spawned before the
+        // inheritance rule, or spawned in a project a tenant claimed later) —
+        // the ownership decision belongs to the project, so the gate must
+        // resolve it at read time rather than trust the stamped owner.
+        gateway.sessions.get_mut(&child).unwrap().owner =
+            ChatKey::new("user", "web-api", "web-api");
+
+        assert!(
+            gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
+            "a LIVE session in a tenant-owned project belongs to that tenant"
+        );
+        let status = gateway.render_status(&tenant).await;
+        assert!(
+            status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
+            "the tenant's /status must list its project's delegated children: {status}"
+        );
+    }
+
+    /// The fallback leg must stay untouched: an operator-owned (or unowned)
+    /// project has NO tenant principal to inherit, so the stored owner still
+    /// decides and two admin IM chats on one bot stay isolated from each other
+    /// ("IM chat 之间互相隔离" — the 档0 rule the v0.8.13 same-project sharing
+    /// was reverted for; do not let project inheritance quietly re-add it).
+    #[tokio::test]
+    async fn operator_and_unowned_projects_keep_per_im_chat_isolation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, _project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "ops", Some("user:web-api")); // operator pool
+        seed_owned_project(&paths, "legacy", None); // legacy `ccteam init`
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "ops", paths.projects_root.join("ops"));
+        // Both chats are NAMED in the allowlist ⇒ both are the operator.
+        gateway.bind_operator_allowlist("telegram", ["111".to_string(), "222".to_string()]);
+        gateway.enable_project_creation(paths);
+
+        let rob = ChatKey::new("telegram", "111", "rob");
+        let eve = ChatKey::new("telegram", "222", "eve");
+        for slug in ["ops", "legacy"] {
+            gateway.change_project(&rob, slug).unwrap();
+            gateway.change_project(&eve, slug).unwrap();
+            gateway
+                .handle_text("telegram", "111", "rob", "/new claude reviewer")
+                .await
+                .unwrap();
+            gateway
+                .handle_text("telegram", "222", "eve", "/new claude reviewer")
+                .await
+                .unwrap();
+            let focused = |chat: &ChatKey| {
+                gateway
+                    .current_session
+                    .read()
+                    .unwrap()
+                    .get(chat)
+                    .cloned()
+                    .expect("/new focuses the chat")
+            };
+            let (mine, theirs) = (focused(&rob), focused(&eve));
+            assert!(
+                gateway.chat_can_access(&rob, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: a chat sees its own session"
+            );
+            assert!(
+                !gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
+                "{slug}: an admin chat must NOT see another admin chat's session"
+            );
+            assert!(
+                !gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: isolation is symmetric"
+            );
+        }
+    }
+
+    /// Live and stopped must answer identically for the SAME (chat, session):
+    /// the divergence IS the bug (a `/status` that hides what `/rename` reaches).
+    #[tokio::test]
+    async fn live_and_stopped_session_gates_agree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Stamp the pre-inheritance owner on BOTH rungs of the ladder (live map
+        // + on-disk meta), so the two gates read the same poisoned input.
+        gateway.sessions.get_mut(&sid).unwrap().owner = ChatKey::new("user", "web-api", "web-api");
+        let mut meta = read_session_meta(&project_dir, &sid).unwrap();
+        meta.owner = "user:web-api".to_string();
+        write_session_meta(&project_dir, &meta).unwrap();
+
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        let live = gateway.chat_can_access(&tenant, gateway.sessions.get(&sid).unwrap());
+        gateway.sessions.remove(&sid); // the session stops; meta.json stays
+        let stopped = gateway.chat_can_access_sid(&tenant, &sid);
+        assert_eq!(
+            live, stopped,
+            "one ownership policy: live and stopped cannot disagree"
+        );
+        assert!(live, "the tenant owns everything in its own project");
+    }
+
+    /// The WRITE path decides ownership once, in `plan_new_session`, so every
+    /// spawn entry (IM `/new`, REST `POST …/sessions`, MCP `session_spawn`) is
+    /// covered without its own patch (§五 总纲 判据②). The persisted
+    /// `meta.owner` is what `ccteam-web` serves verbatim, so getting it right
+    /// here is what keeps the two frontends telling one story.
+    #[tokio::test]
+    async fn fresh_session_meta_owner_follows_project_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, _project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "tenant-proj", Some("user:ualice"));
+        seed_owned_project(&paths, "ops", Some("user:web-api"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "ops", paths.projects_root.join("ops"));
+        gateway.enable_project_creation(paths.clone());
+
+        let tenant_sid = gateway
+            .create_session_api_tuned(
+                "tenant-proj".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(
+            read_session_meta(&paths.projects_root.join("tenant-proj"), &tenant_sid)
+                .unwrap()
+                .owner,
+            "user:ualice",
+            "a tenant project stamps its own principal on every fresh session"
+        );
+
+        let ops_sid = gateway
+            .create_session_api(
+                "ops".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(
+            read_session_meta(&paths.projects_root.join("ops"), &ops_sid)
+                .unwrap()
+                .owner,
+            "user:web-api",
+            "an operator project still stamps the caller-derived owner"
+        );
+    }
+
+    /// `owner` is the resource identity; `reply_to` is the concrete delivery
+    /// frontend — inheriting the first must never rewrite the second. A tenant
+    /// bot creating a session in its own project keeps its TELEGRAM route;
+    /// pinning `reply_to` to `web:<tenant>` would silently kill IM delivery.
+    #[tokio::test]
+    async fn tenant_bot_spawn_keeps_its_im_reply_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        gateway
+            .handle_text("telegram@ualice", "111", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let session = gateway.sessions.get("s1").expect("session s1");
+        assert_eq!(session.owner.identity(), "user:ualice");
+        let reply_to = session.reply_to.lock().unwrap().clone();
+        assert_eq!(reply_to.channel, "telegram@ualice", "IM delivery survives");
+        assert_eq!(reply_to.chat_id, "111");
+        assert_eq!(
+            read_session_meta(&project_dir, "s1").unwrap().owner,
+            "user:ualice"
         );
     }
 
@@ -15453,13 +15768,13 @@ mod tests {
     /// still sees NOTHING of other tenants or the admin pool. The admin/global
     /// bot keeps the operator "own + all web" view.
     #[test]
-    fn chat_owner_visible_converges_tenant_web_and_im() {
+    fn session_owner_visibility_converges_tenant_web_and_im() {
         let gw = acl_gateway();
         // A web-created session's OWNER is the canonical user identity
         // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
-        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")); // user:uaaa
-        let web_b = canonical_owner(&ChatKey::new("web", "ubbb", "ubbb")); // user:ubbb
-        let web_admin = canonical_owner(&ChatKey::new("web", "web-api", "web-api")); // user:web-api
+        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
+        let web_b = canonical_owner(&ChatKey::new("web", "ubbb", "ubbb")).identity(); // user:ubbb
+        let web_admin = canonical_owner(&ChatKey::new("web", "web-api", "web-api")).identity();
         let admin_tg = ChatKey::new("telegram", "339", "rob");
         let bot_a = ChatKey::new("telegram@uaaa", "111", "alice"); // uaaa's IM bot
         let bot_b = ChatKey::new("telegram@ubbb", "222", "bob");
@@ -15467,15 +15782,24 @@ mod tests {
         // CONVERGENCE: uaaa's bot canonicalizes to user:uaaa → it sees uaaa's
         // web-created sessions (owner user:uaaa).
         assert!(
-            gw.chat_owner_visible(&bot_a, &web_a),
+            gw.owner_identity_visible(&bot_a, &web_a),
             "a tenant bot sees its tenant's web-created sessions (convergence)"
         );
         // ISOLATION: not the admin pool, not another tenant, not the admin IM.
-        assert!(!gw.chat_owner_visible(&bot_a, &web_admin), "no admin pool");
-        assert!(!gw.chat_owner_visible(&bot_a, &web_b), "no other tenant");
-        assert!(!gw.chat_owner_visible(&bot_a, &admin_tg), "no admin IM");
         assert!(
-            !gw.chat_owner_visible(&bot_b, &web_a),
+            !gw.owner_identity_visible(&bot_a, &web_admin),
+            "no admin pool"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_a, &web_b),
+            "no other tenant"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_a, &admin_tg.identity()),
+            "no admin IM"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_b, &web_a),
             "ubbb's bot doesn't see uaaa's sessions"
         );
 
@@ -15484,19 +15808,19 @@ mod tests {
         // pushed tenants' sessions into the owner's IM bot, where a `/use` on a
         // listed sid then re-pointed that session's `reply_to` at the admin
         // chat — "IM receives another user's session messages".)
-        assert!(gw.chat_owner_visible(&admin_tg, &admin_tg));
-        assert!(gw.chat_owner_visible(&admin_tg, &web_admin));
+        assert!(gw.owner_identity_visible(&admin_tg, &admin_tg.identity()));
+        assert!(gw.owner_identity_visible(&admin_tg, &web_admin));
         assert!(
-            !gw.chat_owner_visible(&admin_tg, &web_a),
+            !gw.owner_identity_visible(&admin_tg, &web_a),
             "the admin/global bot must NOT see a tenant's web sessions"
         );
         // ... and symmetrically, a tenant's WEB console (channel "web", not a
         // bot channel) sees neither the admin pool nor another tenant.
         let web_console_a = ChatKey::new("web", "uaaa", "uaaa");
-        assert!(gw.chat_owner_visible(&web_console_a, &web_a));
-        assert!(!gw.chat_owner_visible(&web_console_a, &web_b));
-        assert!(!gw.chat_owner_visible(&web_console_a, &web_admin));
-        assert!(!gw.chat_owner_visible(&web_console_a, &admin_tg));
+        assert!(gw.owner_identity_visible(&web_console_a, &web_a));
+        assert!(!gw.owner_identity_visible(&web_console_a, &web_b));
+        assert!(!gw.owner_identity_visible(&web_console_a, &web_admin));
+        assert!(!gw.owner_identity_visible(&web_console_a, &admin_tg.identity()));
     }
 
     /// PRIVILEGE IS A NAME (2026-07-28 owner report, part 2). Reaching a bot
@@ -15609,9 +15933,9 @@ mod tests {
         );
     }
 
-    /// v0.8.21 cold-resume ACL — `owner_identity_visible` (the identity-string
-    /// form used when resuming a STOPPED session from `meta.owner`) must agree
-    /// with the live `chat_owner_visible` rule. The regression it guards: the
+    /// v0.8.21 cold-resume ACL — `owner_identity_visible` reads a persisted
+    /// `meta.owner` when resuming a STOPPED session, and must agree with the
+    /// live gate (`chat_can_access`). The regression it guards: the
     /// earlier cold path reconstructed a `ChatKey` via `from_identity` and
     /// compared with `==`, but `ChatKey` equality includes `user_id` while
     /// `identity()` drops it — so an admin IM bot (whose `canonical_owner` keeps
@@ -15668,8 +15992,8 @@ mod tests {
     /// MCP list (`visible_user_projects`), since all three now authorize off the
     /// same `ProjectState.owner` through the same core policy
     /// (`ccteam_core::identity::can_see_owner`). Pure-predicate twin of
-    /// `chat_owner_visible_converges_tenant_web_and_im` (the session rule),
-    /// keyed on PROJECT owners instead of session owners.
+    /// `session_owner_visibility_converges_tenant_web_and_im` (the session
+    /// rule), keyed on PROJECT owners instead of session owners.
     #[test]
     fn project_acl_isolates_tenants_from_admin_and_each_other() {
         let gw = acl_gateway();
