@@ -15,8 +15,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use super::protocol::{
-    content_text, cost_from_usage_update, is_replay, is_turn_boundary, usage_from_prompt_result,
-    AvailableCommand,
+    content_text, cost_from_usage_update, is_replay, is_turn_boundary,
+    stop_reason_from_prompt_result, usage_from_prompt_result, AvailableCommand,
 };
 use super::transport::{AcpWriteBarrier, Notification};
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
@@ -527,6 +527,13 @@ fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<Thread
 }
 
 /// Finalize a turn from the `session/prompt` response (authoritative).
+///
+/// The response's `stopReason` decides whether this is an ANSWER or a
+/// FAILURE. Both shapes still deliver whatever the vendor managed to produce
+/// (never drop paid-for output), but a non-clean reason ends the turn with
+/// [`ThreadEvent::TurnFailed`] so the failure reaches the user, `turns.jsonl`
+/// (`outcome:"failed"`) and the delegation parent instead of masquerading as
+/// the final reply.
 pub fn finalize_from_prompt_result(
     state: &mut SessionTranslateState,
     result: &Value,
@@ -563,7 +570,31 @@ pub fn finalize_from_prompt_result(
         .map(|b| b.turn_id.clone())
         .unwrap_or_else(|| "unknown".into());
     let text = buf.map(|b| b.text).unwrap_or_default();
+    let stop = stop_reason_from_prompt_result(result);
     let mut out = Vec::new();
+    if let Some(message) = stop.failure_message() {
+        // Partial output first — it was produced and paid for, and it is often
+        // the only clue about how far the turn got. Empty text is dropped
+        // downstream, so an unconditional push stays correct.
+        out.push(ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: format!("{turn_id}-msg"),
+                details: ThreadItemDetails::AgentMessage(text),
+            },
+        });
+        // TurnFailed is the terminal event (same convention as
+        // claude_stream_json's `is_failure` path): it clears the gateway's
+        // in-flight marker, flushes the delegation boundary with
+        // `vendor_error`, and no TurnCompleted follows.
+        out.push(ThreadEvent::TurnFailed {
+            turn_id,
+            err: ThreadErrorEvent {
+                kind: format!("stop_reason:{}", stop.wire()),
+                message,
+            },
+        });
+        return out;
+    }
     out.push(ThreadEvent::ItemCompleted {
         item: ThreadItem {
             id: format!("{turn_id}-msg"),
@@ -691,6 +722,87 @@ mod tests {
             ThreadEvent::TurnCompleted { usage, .. } => *usage,
             _ => unreachable!(),
         };
+    }
+
+    /// Buffer some partial text, then finalize with `reason`.
+    fn finalize_with_stop_reason(reason: &str) -> Vec<ThreadEvent> {
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t-stop", Arc::new(Notify::new()));
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"先读 state"}
+                    }
+                }),
+            },
+        );
+        let events = finalize_from_prompt_result(&mut st, &json!({ "stopReason": reason }));
+        assert!(
+            st.buffer.is_none(),
+            "the turn buffer must be released whatever the outcome"
+        );
+        events
+    }
+
+    #[test]
+    fn non_clean_stop_reason_delivers_partial_text_then_fails_the_turn() {
+        // The s172 shape: a vendor ends a turn abnormally after emitting a
+        // mid-turn preamble. Pre-fix this finalized as TurnCompleted and the
+        // preamble was delivered as if it were the final answer.
+        for (reason, want_kind) in [
+            ("refusal", "stop_reason:refusal"),
+            ("max_tokens", "stop_reason:max_tokens"),
+            ("max_turn_requests", "stop_reason:max_turn_requests"),
+            ("something_new", "stop_reason:something_new"),
+        ] {
+            let events = finalize_with_stop_reason(reason);
+            assert_eq!(events.len(), 2, "{reason}: partial text + failure");
+            match &events[0] {
+                ThreadEvent::ItemCompleted { item } => match &item.details {
+                    // Never drop output the user already paid for.
+                    ThreadItemDetails::AgentMessage(t) => assert_eq!(t, "先读 state"),
+                    other => panic!("{reason}: unexpected {other:?}"),
+                },
+                other => panic!("{reason}: unexpected {other:?}"),
+            }
+            match &events[1] {
+                ThreadEvent::TurnFailed { turn_id, err } => {
+                    assert_eq!(turn_id, "t-stop");
+                    assert_eq!(err.kind, want_kind);
+                    assert!(err.message.contains(reason), "{reason}: {}", err.message);
+                }
+                other => panic!("{reason}: must be TurnFailed, got {other:?}"),
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ThreadEvent::TurnCompleted { .. })),
+                "{reason}: a failed turn must not also report completion"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_stop_reasons_still_complete_normally() {
+        // end_turn, cancelled and an absent field must all keep the answer
+        // path — a `/stop` is not a defect and an omitted field is not either.
+        for reason in ["end_turn", "cancelled"] {
+            let events = finalize_with_stop_reason(reason);
+            assert_eq!(events.len(), 2, "{reason}");
+            assert!(
+                matches!(&events[1], ThreadEvent::TurnCompleted { .. }),
+                "{reason}: must complete, got {:?}",
+                events[1]
+            );
+        }
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t-bare", Arc::new(Notify::new()));
+        let events = finalize_from_prompt_result(&mut st, &json!({}));
+        assert!(matches!(&events[1], ThreadEvent::TurnCompleted { .. }));
     }
 
     #[test]

@@ -16,6 +16,29 @@
 //! - Skip sessions use [`InboundPolicy::AutoAllowPermission`] — kimi's
 //!   `session/request_permission` reverse RPC must never silently block the
 //!   default (skip) posture.
+//!
+//! ## Known vendor limit: kimi hides its own turn failures (kimi 0.29.x)
+//!
+//! Verified on a live binary 2026-07-30. Kimi's ACP layer maps its internal
+//! `turn.ended` reason to a stop reason as
+//! `completed→end_turn`, `cancelled→cancelled`, `blocked→refusal`, and
+//! **`failed→end_turn`** (only `provider.filtered` becomes `refusal`). The
+//! error payload it holds at that moment — e.g.
+//! `{"code":"provider.rate_limit","message":"429 The engine is currently
+//! overloaded"}` after ten internal retries — goes to kimi's own rotating log
+//! files and **never onto the wire or stderr** (its stderr carries node
+//! warnings only). So a kimi turn that failed is indistinguishable, on every
+//! channel ccteam can see, from one that answered: ccteam reports the partial
+//! text as the reply because that is genuinely all the vendor said.
+//!
+//! ccteam's side of the contract is fixed generically — `stopReason` is parsed
+//! and any non-clean reason becomes a real `TurnFailed`
+//! ([`crate::execution::acp::AcpStopReason`]), which covers every ACP vendor
+//! including kimi's `refusal`/`cancelled` paths. Recovering the *collapsed*
+//! `failed` case would mean reading kimi's private session-log layout; that is
+//! deliberately NOT done (unstable non-contract surface). The honest signal a
+//! user gets meanwhile is the gateway's silence watchdog, which now reports the
+//! turn's elapsed time and last observed activity. Fix belongs upstream.
 
 pub mod bridge;
 pub mod protocol;
@@ -637,9 +660,22 @@ impl HarnessAdapter for KimiAcpAdapter {
                 } else {
                     ThreadStatus::default()
                 };
-                let receipt = status
+                let mut receipt = status
                     .status_suffix()
                     .unwrap_or_else(|| "kimi · acp".into());
+                // `ctx —` on the status line is the TRUTH for kimi, not a
+                // defect: its ACP wire carries neither a context window nor a
+                // token count (see the module header). Say so where the user
+                // asks, instead of leaving a bare dash that reads as broken.
+                // Grok (`_meta.totalContextTokens` + `totalTokens`) and
+                // OpenCode (`usage_update{used,size}`) do report, so their
+                // sessions show a real percentage.
+                if status.context.is_none() {
+                    receipt.push_str(
+                        "；ctx 不可用 —— kimi 的 ACP 面不上报 context window / token 用量\
+                         (vendor 限制,非 ccteam 缺失)",
+                    );
+                }
                 Ok(DirectiveOutcome::Done { receipt })
             }
             "compact" => Ok(DirectiveOutcome::Rejected {

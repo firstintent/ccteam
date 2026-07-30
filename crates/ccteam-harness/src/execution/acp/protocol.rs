@@ -16,6 +16,113 @@ pub struct AvailableCommand {
     pub input: Option<Value>,
 }
 
+/// The `stopReason` an ACP vendor reports on its `session/prompt` result —
+/// the ONLY place the protocol says how a turn ended.
+///
+/// A `session/prompt` result is a *successful* JSON-RPC response even when the
+/// turn did not produce an answer (refused, truncated, cancelled), so a client
+/// that ignores this field reports every vendor outcome as a clean answer:
+/// half-finished text lands in `turns.jsonl` as the final reply and a
+/// delegation parent is told the task completed. Parsing it here (shared by
+/// every ACP vendor, present and future) is what keeps the completion contract
+/// honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpStopReason {
+    /// The vendor finished normally. Also the verdict for an **absent** field:
+    /// not every build emits one, and treating silence as failure would break
+    /// working vendors.
+    EndTurn,
+    /// `session/cancel` took effect — an explicit stop, not a defect. Whatever
+    /// the vendor produced first is still the answer.
+    Cancelled,
+    /// Output window exhausted → the answer is truncated, not complete.
+    MaxTokens,
+    /// Vendor-side turn-request budget exhausted mid-task.
+    MaxTurnRequests,
+    /// The vendor declined to answer (also where kimi maps its own
+    /// `blocked` / content-filtered turns).
+    Refusal,
+    /// A reason this ccteam does not know, kept verbatim. Reported as a
+    /// failure on purpose: an unrecognized terminal state must never be
+    /// laundered into "answered".
+    Other(String),
+}
+
+impl AcpStopReason {
+    /// The wire spelling, for error kinds and logs.
+    pub fn wire(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::Cancelled => "cancelled",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxTurnRequests => "max_turn_requests",
+            Self::Refusal => "refusal",
+            Self::Other(raw) => raw.as_str(),
+        }
+    }
+
+    /// Whether the turn may be finalized as an ordinary completed answer.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::EndTurn | Self::Cancelled)
+    }
+
+    /// The honest sentence for a non-clean outcome (`None` when clean). Goes
+    /// to the user verbatim and into `turns.jsonl`'s `error`, so it names the
+    /// wire reason rather than paraphrasing it.
+    pub fn failure_message(&self) -> Option<String> {
+        match self {
+            Self::EndTurn | Self::Cancelled => None,
+            Self::MaxTokens => Some(
+                "⚠️ vendor ended the turn at its output limit (stopReason=max_tokens) — \
+                 the reply above is truncated, not a finished answer."
+                    .into(),
+            ),
+            Self::MaxTurnRequests => Some(
+                "⚠️ vendor ended the turn at its request budget \
+                 (stopReason=max_turn_requests) — the task did not finish."
+                    .into(),
+            ),
+            Self::Refusal => Some(
+                "⚠️ vendor refused this turn (stopReason=refusal) — no answer was produced.".into(),
+            ),
+            Self::Other(raw) => Some(format!(
+                "⚠️ vendor ended the turn with an unrecognized stopReason={raw} — \
+                 treating it as a failure rather than an answer."
+            )),
+        }
+    }
+}
+
+/// Read `stopReason` off a `session/prompt` result.
+///
+/// Tolerant by design: top-level or `_meta`, and case/separator-insensitive
+/// (`end_turn` / `endTurn` / `END-TURN` all land on [`AcpStopReason::EndTurn`])
+/// because ACP implementations differ on spelling. Absent or blank → `EndTurn`.
+pub fn stop_reason_from_prompt_result(result: &Value) -> AcpStopReason {
+    let raw = result
+        .get("stopReason")
+        .or_else(|| result.pointer("/_meta/stopReason"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw.is_empty() {
+        return AcpStopReason::EndTurn;
+    }
+    let normalized: String = raw
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "endturn" => AcpStopReason::EndTurn,
+        "cancelled" | "canceled" => AcpStopReason::Cancelled,
+        "maxtokens" => AcpStopReason::MaxTokens,
+        "maxturnrequests" => AcpStopReason::MaxTurnRequests,
+        "refusal" | "refused" => AcpStopReason::Refusal,
+        _ => AcpStopReason::Other(raw.to_string()),
+    }
+}
+
 /// Map `session/prompt` result → usage.
 ///
 /// - **Grok**: fields live under `_meta` (`inputTokens`, `cachedReadTokens`, …).
@@ -413,6 +520,83 @@ pub fn is_replay(params: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stop_reason_maps_every_spec_value_and_tolerates_spelling() {
+        for (raw, want) in [
+            ("end_turn", AcpStopReason::EndTurn),
+            ("endTurn", AcpStopReason::EndTurn),
+            ("END-TURN", AcpStopReason::EndTurn),
+            ("cancelled", AcpStopReason::Cancelled),
+            ("canceled", AcpStopReason::Cancelled),
+            ("max_tokens", AcpStopReason::MaxTokens),
+            ("maxTokens", AcpStopReason::MaxTokens),
+            ("max_turn_requests", AcpStopReason::MaxTurnRequests),
+            ("refusal", AcpStopReason::Refusal),
+        ] {
+            assert_eq!(
+                stop_reason_from_prompt_result(&json!({ "stopReason": raw })),
+                want,
+                "stopReason {raw} must map to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_blank_stop_reason_stays_clean() {
+        // Not every ACP build emits one; treating silence as failure would
+        // break working vendors (grok/opencode omit it on some paths).
+        for result in [
+            json!({}),
+            json!({ "stopReason": "  " }),
+            json!({"usage":{}}),
+        ] {
+            let stop = stop_reason_from_prompt_result(&result);
+            assert_eq!(stop, AcpStopReason::EndTurn);
+            assert!(stop.is_clean());
+            assert!(stop.failure_message().is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_stop_reason_fails_loud_and_keeps_the_raw_value() {
+        let stop = stop_reason_from_prompt_result(&json!({ "stopReason": "exploded" }));
+        assert_eq!(stop, AcpStopReason::Other("exploded".into()));
+        assert!(
+            !stop.is_clean(),
+            "an unknown terminal state is not an answer"
+        );
+        assert_eq!(stop.wire(), "exploded");
+        assert!(stop
+            .failure_message()
+            .expect("unknown reason must report")
+            .contains("exploded"));
+    }
+
+    #[test]
+    fn cancelled_is_clean_but_truncating_reasons_are_not() {
+        assert!(AcpStopReason::Cancelled.is_clean(), "/stop is not a defect");
+        for stop in [
+            AcpStopReason::MaxTokens,
+            AcpStopReason::MaxTurnRequests,
+            AcpStopReason::Refusal,
+        ] {
+            assert!(!stop.is_clean());
+            let msg = stop.failure_message().expect("must carry a message");
+            assert!(
+                msg.contains(stop.wire()),
+                "the message must name the wire reason: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_reason_also_reads_from_meta() {
+        assert_eq!(
+            stop_reason_from_prompt_result(&json!({ "_meta": { "stopReason": "refusal" } })),
+            AcpStopReason::Refusal
+        );
+    }
 
     #[test]
     fn usage_maps_section11_fields() {

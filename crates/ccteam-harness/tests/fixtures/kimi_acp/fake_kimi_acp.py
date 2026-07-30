@@ -308,7 +308,17 @@ def main() -> None:
                 },
             )
             # Kimi's ACP wire carries NO usage/cost — stopReason only.
-            reply(req_id, {"stopReason": "end_turn"})
+            #
+            # A prompt containing `STOP:<reason>` makes this fake end the turn
+            # with that stopReason instead of `end_turn`, so tests can drive the
+            # abnormal-outcome path (refusal / max_tokens / an unknown value)
+            # over the real adapter. Live kimi reaches these through its own
+            # `blocked` / content-filter mapping.
+            stop_reason = "end_turn"
+            marker = "STOP:"
+            if marker in text:
+                stop_reason = text.split(marker, 1)[1].split()[0].strip()
+            reply(req_id, {"stopReason": stop_reason})
             continue
 
         if method == "session/cancel":

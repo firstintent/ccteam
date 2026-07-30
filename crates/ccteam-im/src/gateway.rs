@@ -174,10 +174,13 @@ struct GatewaySession {
     /// to `None` on `TurnCompleted`. `/status` appends it on the 🔵 working line.
     latest_activity: Arc<std::sync::Mutex<Option<String>>>,
     /// v0.8.x (concurrency review §4.1 P1) — the in-flight turn's watchdog
-    /// arm: `Some((turn_id, start_visible_events))` from the moment
-    /// `after_turn_submitted` submits a turn until the session's own event
-    /// pump either sees it answer (`visible_events` moves past
-    /// `start_visible_events`) or fires the one-shot stall warning for it.
+    /// arm: `Some((turn_id, start_visible_events))` from the moment the turn is
+    /// known to be RUNNING (`after_turn_submitted` for a `Started`/`Injected`
+    /// submission; the pump's canonical `TurnStarted` for one that was queued
+    /// behind a predecessor) until the session's own event pump either sees it
+    /// answer (`visible_events` moves past `start_visible_events`) or fires the
+    /// one-shot stall warning for it. A queued turn is never armed — it is not
+    /// silent, it is waiting.
     /// Folds the old detached per-turn `spawn_turn_timeout_watchdog` task into
     /// the pump's own `tokio::select!` loop (one fewer task per turn); kept
     /// separate from `turn_started_at` (directive-driven turns intentionally
@@ -4131,10 +4134,34 @@ impl Gateway {
                         // previous TurnCompleted already cleared it. Native
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
-                        if matches!(&evt, ThreadEvent::TurnStarted { .. }) {
+                        if let ThreadEvent::TurnStarted { turn_id } = &evt {
                             if let Ok(mut started) = session.turn_started_at.lock() {
                                 if started.is_none() {
                                     *started = Some(Instant::now());
+                                }
+                            }
+                            // …and the silence watchdog follows the same
+                            // authority. The submit path arms only the turns it
+                            // knows are running (`Started` / `Injected`), so a
+                            // turn that was QUEUED behind a predecessor is armed
+                            // here, the moment it actually begins — with a fresh
+                            // `visible_events` baseline. Re-arming on a
+                            // different id also drops a stale arm left by a turn
+                            // that already answered but whose tick has not run
+                            // yet; without that, every queued turn would go
+                            // unwatched.
+                            if !watch_timeout.is_zero() {
+                                if let Ok(mut watch) = session.watched_turn.lock() {
+                                    let stale = watch
+                                        .as_ref()
+                                        .map(|(armed, _)| armed != turn_id)
+                                        .unwrap_or(true);
+                                    if stale {
+                                        *watch = Some((
+                                            turn_id.clone(),
+                                            session.visible_events.load(Ordering::SeqCst),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -6032,7 +6059,12 @@ impl Gateway {
         // origin and transcript bookkeeping are visible.
         submitted.release_completion();
         let drained = self
-            .after_turn_submitted(session, start_visible_events, &turn_id.0)
+            .after_turn_submitted(
+                session,
+                start_visible_events,
+                &turn_id.0,
+                submitted.disposition,
+            )
             .await?;
         Ok(SubmitResult::Turn {
             id: turn_id.0,
@@ -6072,8 +6104,16 @@ impl Gateway {
                 if let Ok(mut origins) = session.turn_origins.lock() {
                     origins.insert(turn_id.0.clone(), origin);
                 }
-                self.after_turn_submitted(session, start_visible_events, &turn_id.0)
-                    .await
+                // A directive that resolves to a turn was submitted by the
+                // adapter itself (`/model` re-prompt, grok steer): it is
+                // running, not queued.
+                self.after_turn_submitted(
+                    session,
+                    start_visible_events,
+                    &turn_id.0,
+                    TurnDisposition::Started,
+                )
+                .await
             }
             DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
             DirectiveOutcome::Rejected { reason } => Ok(vec![reason]),
@@ -6092,6 +6132,7 @@ impl Gateway {
         session: &GatewaySession,
         start_visible_events: u64,
         turn_id: &str,
+        disposition: TurnDisposition,
     ) -> Result<Vec<String>> {
         if self.event_sink.is_some() {
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog
@@ -6104,7 +6145,17 @@ impl Gateway {
             // (`emit_turn_stall_warning`) that `spawn_turn_timeout_watchdog`
             // used to do standalone. Skip arming entirely when the window is
             // disabled (`0` = off) — matches the old early return.
-            if !gateway_turn_timeout_duration().is_zero() {
+            //
+            // A QUEUED submission is NOT in flight: an adapter without a native
+            // interjection channel (kimi / opencode ACP) parks it behind the
+            // active vendor turn, and it may legitimately sit there for as long
+            // as that turn runs. Arming here would blame the queued turn for
+            // its predecessor's silence and tell the user a turn "went silent"
+            // when it has not started — the same reason `turn_started_at` is
+            // only stamped for `Started`. The pump arms it instead when its
+            // canonical `TurnStarted` proves it really began.
+            if !gateway_turn_timeout_duration().is_zero() && disposition != TurnDisposition::Queued
+            {
                 if let Ok(mut watch) = session.watched_turn.lock() {
                     *watch = Some((turn_id.to_string(), start_visible_events));
                 }
@@ -9412,11 +9463,33 @@ fn emit_turn_stall_warning(
         Ok(target) => (target.channel.clone(), target.chat_id.clone()),
         Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
     };
+    // Carry the two facts ccteam actually owns about the silence: how long the
+    // turn has been running and what the last thing it did was. Without them
+    // the warning cannot be told apart from a legitimately quiet build — and a
+    // vendor hung in its own internal retry loop (kimi's 429 backoff reports
+    // nothing on the ACP wire) reads as "last seen: a tool call 16m ago", which
+    // is diagnosable.
+    let elapsed = session
+        .turn_started_at
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|start| format!(" (running {})", humanize_dur(start.elapsed())))
+        .unwrap_or_default();
+    let last_seen = session
+        .latest_activity
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| format!(" Last observed activity: {a}."))
+        .unwrap_or_else(|| " No activity was ever observed for this turn.".into());
     let content = format!(
-        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id} (no tokens, tool \
-         calls or progress). Heads-up only — the watchdog does NOT interrupt it (a long \
-         command like a benchmark legitimately emits no events). If it is truly stuck, \
-         `/stop` the session; tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}{elapsed} — no tokens, \
+         tool calls or progress.{last_seen} Heads-up only — the watchdog does NOT interrupt it \
+         (a long command like a benchmark legitimately emits no events, and a vendor stuck in \
+         its own retry loop reports nothing either). If it is truly stuck, `/stop` the session; \
+         tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
     );
     let _ = tx.send(GatewayEvent {
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
@@ -11540,6 +11613,83 @@ mod tests {
         })
         .await
         .expect("event pump stamps queued TurnStarted");
+    }
+
+    /// A QUEUED submission is waiting, not silent. Arming the silence watchdog
+    /// on it produces a "turn went silent — /stop the session" warning for a
+    /// turn that never started, blaming it for its predecessor's silence (the
+    /// s172 shape: kimi ACP parks a mid-turn message in FIFO, and the queued
+    /// turn got a stall warning 5m later while the real turn was still running).
+    /// The pump's canonical `TurnStarted` is the authority instead.
+    #[tokio::test]
+    async fn queued_submission_never_arms_the_watchdog_but_its_turn_start_does() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default().with_inject_degraded_to_queue());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let identity = gateway.sessions[&sid].thread.identity.clone();
+
+        // A running turn IS armed — that is the watchdog's real job.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        assert!(
+            gateway.sessions[&sid]
+                .watched_turn
+                .lock()
+                .unwrap()
+                .is_some(),
+            "a Started submission must be watched"
+        );
+
+        // Clear the arm the way the watchdog does once it has warned, then let
+        // a second message degrade to FIFO behind the active turn.
+        *gateway.sessions[&sid].watched_turn.lock().unwrap() = None;
+        gateway.submit_to_sid(&sid, "queued".into()).await.unwrap();
+        assert_eq!(
+            fake.routings.lock().await.len(),
+            2,
+            "both messages reached the adapter"
+        );
+        assert!(
+            gateway.sessions[&sid]
+                .watched_turn
+                .lock()
+                .unwrap()
+                .is_none(),
+            "a queued turn has not started and must not be watched for silence"
+        );
+
+        // …and when it really starts, the pump arms it by its own turn id.
+        fake.events.lock().await.push_back((
+            identity,
+            ThreadEvent::TurnStarted {
+                turn_id: "queued-2".into(),
+            },
+        ));
+        fake.events_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let armed = gateway.sessions[&sid].watched_turn.lock().unwrap().clone();
+                if let Some((turn_id, _)) = armed {
+                    assert_eq!(turn_id, "queued-2");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canonical TurnStarted arms the watchdog for the turn that began");
     }
 
     /// V0.8.6 W5b — the resource-API spine: create a session via

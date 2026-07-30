@@ -169,6 +169,78 @@ async fn handshake_prompt_final_only_on_fake() {
     clear_fake();
 }
 
+/// An ACP `session/prompt` result is a *successful* JSON-RPC response even when
+/// the turn produced no answer, so ignoring `stopReason` reports every vendor
+/// outcome as a clean reply — the partial text lands in `turns.jsonl` as the
+/// final answer and a delegation parent is told the task completed. Any
+/// non-clean reason must reach the event stream as `TurnFailed`, still carrying
+/// whatever partial output the vendor produced.
+#[tokio::test]
+#[serial]
+async fn abnormal_stop_reason_surfaces_as_turn_failed_with_partial_text() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-stop"),
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut partial = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        partial.push(t);
+                    }
+                }
+                ThreadEvent::TurnFailed { err, .. } => return (partial, Some(err)),
+                ThreadEvent::TurnCompleted { .. } => return (partial, None),
+                _ => {}
+            }
+        }
+        (partial, None)
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("STOP:refusal go".into()))
+        .await
+        .expect("submit");
+
+    let (partial, failure) = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    let err = failure.expect("a refused turn must not report completion");
+    assert_eq!(err.kind, "stop_reason:refusal");
+    assert!(
+        err.message.contains("refusal"),
+        "the failure must name the wire reason: {}",
+        err.message
+    );
+    assert_eq!(
+        partial.len(),
+        1,
+        "output the vendor did produce is still delivered"
+    );
+    assert!(partial[0].contains("STOP:refusal"));
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// The application requests Inject by default, but Kimi's public ACP adapter
 /// does not expose its internal `turn.steer`. The adapter must degrade without
 /// loss to two FIFO turns rather than cancel or reject the second message.
@@ -608,6 +680,66 @@ async fn model_directive_lists_and_sets() {
             assert!(reason.contains("切换失败"), "reason={reason}");
         }
         other => panic!("expected Rejected for unknown model, got {other:?}"),
+    }
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// Kimi's ACP wire reports neither a context window nor token counts (verified
+/// against the 0.29.x binary: `usage_update` / `session_info_update` exist in
+/// its ACP schema but are never emitted, and its internal
+/// `event.session.usage_updated` is not bridged). So `ctx —` is the truth, and
+/// `/status` must SAY that rather than leave a bare dash the user reads as a
+/// ccteam defect. Grok and OpenCode do report and keep their percentage.
+#[tokio::test]
+#[serial]
+async fn status_directive_explains_why_kimi_has_no_context_reading() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-ctx"),
+        )
+        .await
+        .expect("start ok");
+
+    // No context on the wire → none in the status.
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert!(
+        status.context.is_none(),
+        "kimi reports no context; inventing one would be fabricated data"
+    );
+
+    let outcome = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "context".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match outcome {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("ctx 不可用"), "receipt={receipt}");
+            assert!(
+                receipt.contains("vendor"),
+                "the reason must name the vendor limit: {receipt}"
+            );
+            // The model it DOES know still leads the receipt.
+            assert!(
+                receipt.contains("kimi-k2-0905-preview"),
+                "receipt={receipt}"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
     }
 
     adapter.close_thread(&handle).await.unwrap();
