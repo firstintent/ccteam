@@ -36,7 +36,8 @@ pub struct TenantTelegram {
     /// The @BotFather bot token (distinct from every other bot — two bots
     /// sharing a token 409-conflict on `getUpdates`).
     pub bot_token: String,
-    /// Chat IDs this tenant's bot accepts. Empty = accept any chat it's in.
+    /// Chat IDs this tenant's bot accepts. Empty = closed until explicitly
+    /// bound (the global/owner Telegram bot has separate legacy semantics).
     #[serde(default)]
     pub allowed_chat_ids: Vec<String>,
 }

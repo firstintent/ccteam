@@ -21,7 +21,8 @@ use anyhow::Context as _;
 use crate::latency::now_unix_ms;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind,
+    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -48,16 +49,11 @@ pub struct TelegramChannel {
     /// identity by `Gateway::principal`, so an unbound bot handing a stranger
     /// the tenant's projects and sessions is not a mode anyone opted into.
     open_when_unset: bool,
-    /// JSONL sink for chat ids this bot rejected, so the web setup flow can
-    /// show the user the id to allow (the Lark `open_id` flow, for Telegram).
-    probe_path: Option<std::path::PathBuf>,
+    /// Shared setup probe + one-shot binding notice for rejected senders.
+    rejected_senders: RejectedSenderNotifier,
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
     name: String,
-    /// Chats whose non-allowlisted drop was already WARN-logged once —
-    /// the drop is otherwise invisible (DEBUG) while the getUpdates
-    /// offset keeps advancing, which reads as a message black hole.
-    warned_chats: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TelegramChannel {
@@ -69,14 +65,13 @@ impl TelegramChannel {
             bot_token,
             allowed_chat_ids,
             open_when_unset: true,
-            probe_path: None,
+            rejected_senders: RejectedSenderNotifier::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(POLL_TIMEOUT_SECS + 10))
                 .build()
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
             name: "telegram".to_string(),
-            warned_chats: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -99,7 +94,7 @@ impl TelegramChannel {
     /// Record rejected chat ids to `path` so the owner of this bot can
     /// discover the id to allow from the web UI instead of the daemon log.
     pub fn with_rejected_sender_probe_path(mut self, path: std::path::PathBuf) -> Self {
-        self.probe_path = Some(path);
+        self.rejected_senders = RejectedSenderNotifier::with_probe_path(path);
         self
     }
 
@@ -117,22 +112,21 @@ impl TelegramChannel {
         self.allowed_chat_ids.iter().any(|id| id == chat_id)
     }
 
-    /// Record a rejected chat id for the web setup flow (no-op without a
-    /// probe path). Telegram's sender id and conversation id are the same
-    /// value, so both probe fields carry the chat id.
-    async fn record_rejected_chat(&self, chat_id: &str, message_id: i64, date: i64) {
-        let Some(path) = self.probe_path.as_ref() else {
-            return;
-        };
-        crate::transport::RejectedSenderProbe {
-            channel: self.name.clone(),
-            sender_id: chat_id.to_string(),
-            chat_id: chat_id.to_string(),
-            message_id: message_id.to_string(),
-            timestamp: date.max(0) as u64,
-        }
-        .append_to(path)
-        .await;
+    /// Keep the allowlist fail-closed while making the rejection actionable.
+    /// Telegram's binding id and conversation id are both the chat id.
+    async fn reject_chat(&self, chat_id: &str, message_id: i64, date: i64) {
+        self.rejected_senders
+            .record_and_notify(
+                self,
+                RejectedSenderProbe {
+                    channel: self.name.clone(),
+                    sender_id: chat_id.to_string(),
+                    chat_id: chat_id.to_string(),
+                    message_id: message_id.to_string(),
+                    timestamp: date.max(0) as u64,
+                },
+            )
+            .await;
     }
 
     /// Resolve a `file_id` to its server-side `file_path` via `getFile`.
@@ -229,6 +223,7 @@ impl TelegramChannel {
         };
         let chat_id = msg.chat.id.to_string();
         if !self.chat_allowed(&chat_id) {
+            self.reject_chat(&chat_id, msg.message_id, msg.date).await;
             return;
         }
         let sender = cb
@@ -616,21 +611,7 @@ impl Channel for TelegramChannel {
                 if let Some(m) = upd.message {
                     let chat_id = m.chat.id.to_string();
                     if !self.chat_allowed(&chat_id) {
-                        self.record_rejected_chat(&chat_id, m.message_id, m.date)
-                            .await;
-                        // WARN once per chat: the update is consumed
-                        // (offset advances) yet never reaches the
-                        // gateway, so a silent DEBUG here reads as the
-                        // bot ignoring the user entirely.
-                        if self.warned_chats.lock().await.insert(chat_id.clone()) {
-                            tracing::warn!(
-                                chat = %chat_id,
-                                allowlist_len = self.allowed_chat_ids.len(),
-                                "telegram: dropping messages from non-allowlisted chat (offset still advances; further drops from this chat log at DEBUG)"
-                            );
-                        } else {
-                            tracing::debug!(chat = %chat_id, "drop msg from non-allowed chat");
-                        }
+                        self.reject_chat(&chat_id, m.message_id, m.date).await;
                         continue;
                     }
                     let sender = m
