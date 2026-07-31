@@ -1,7 +1,7 @@
 # ccteam Makefile — thin convenience wrappers around cargo / npm / the CLI.
 #
 #   make gate            # full pre-push gate: fmt + clippy + tests + SPA
-#   make install         # THE install: build release + symlink to $(BIN_DIR)/ccteam
+#   make install         # THE install: build release + copy to $(BIN_DIR)/ccteam
 #                        #   + `ccteam daemon restart` (self-managed setsid daemon;
 #                        #   migrates any legacy systemd/launchd unit) + next steps
 #   make start           # run the daemon in the FOREGROUND (dev / one-off)
@@ -16,7 +16,12 @@
 BIN_DIR      ?= $(HOME)/.local/bin
 BIN_NAME     := ccteam
 BIN_LINK     := $(BIN_DIR)/$(BIN_NAME)
-RELEASE_BIN  := $(CURDIR)/target/release/$(BIN_NAME)
+# Cargo may redirect its target directory through CARGO_TARGET_DIR or
+# .cargo/config.toml. Resolve the same directory Cargo uses instead of assuming
+# every build lands below this checkout. The first arm avoids invoking
+# `cargo metadata` when the caller already supplied the environment variable.
+CARGO_TARGET_DIR_RESOLVED = $(or $(strip $(CARGO_TARGET_DIR)),$(shell cargo metadata --no-deps --format-version 1 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'))
+RELEASE_BIN  = $(abspath $(CARGO_TARGET_DIR_RESOLVED))/release/$(BIN_NAME)
 CCTEAM_HOME  ?= $(HOME)/.ccteam
 WEB_DIR      := $(CURDIR)/crates/ccteam-web/web
 WEB_PORT     ?= 7331
@@ -37,7 +42,7 @@ DAEMON_LOG   := $(CCTEAM_HOME)/daemon.log
 .DEFAULT_GOAL := help
 .PHONY: help build release clean fmt fmt-check clippy check test test-web \
         web web-deps web-check gate \
-        install next-steps uninstall reinstall require-cli require-node \
+        install install-binary next-steps uninstall reinstall require-cli require-node \
         config init start stop status doctor \
         daemon-start daemon-stop \
         daemon-restart daemon-status daemon-logs \
@@ -59,8 +64,8 @@ help:
 	@printf '  \033[1mmake gate\033[0m          full pre-push gate (fmt+clippy+test+test-web+web-check)\n'
 	@printf '  make clean         cargo clean + rm SPA dist\n\n'
 	@printf '\033[1mInstall\033[0m\n'
-	@printf '  \033[1mmake install\033[0m       build release + symlink + `ccteam daemon restart` (self-managed daemon)\n'
-	@printf '  make uninstall     stop the daemon + remove the symlink (state untouched)\n'
+	@printf '  \033[1mmake install\033[0m       build release + atomic copy + `ccteam daemon restart` (self-managed daemon)\n'
+	@printf '  make uninstall     stop the daemon + remove the executable (state untouched)\n'
 	@printf '  make reinstall     uninstall + install\n\n'
 	@printf '\033[1mRun foreground (daemon = IM gateway + web UI + MCP, one process)\033[0m\n'
 	@printf '  make config        ccteam config   (register MCP + IM creds + prefs)\n'
@@ -72,7 +77,7 @@ help:
 	@printf '\033[1mDaemon ops (self-managed setsid daemon; Linux / macOS / WSL, one mechanism)\033[0m\n'
 	@printf '  make daemon-status     ccteam daemon status  (pid / ready / running-vs-binary version)\n'
 	@printf '  make daemon-logs       ccteam daemon logs -f  (%s)\n' '$(DAEMON_LOG)'
-	@printf '  make daemon-restart    rebuild release + ccteam daemon restart\n'
+	@printf '  make daemon-restart    rebuild + deploy release + ccteam daemon restart\n'
 	@printf '  make daemon-stop       ccteam daemon stop\n'
 	@printf '  make daemon-start      ccteam daemon start\n\n'
 	@printf '\033[1mState reset (destructive)\033[0m\n'
@@ -86,6 +91,13 @@ help:
 # (make CCTEAM_SKIP_WEB_BUILD=1 ...) — make exports only env-origin vars by default.
 ifdef CCTEAM_SKIP_WEB_BUILD
 export CCTEAM_SKIP_WEB_BUILD
+endif
+
+# A command-line make override must reach Cargo too. Environment-origin
+# variables are already exported, but spelling this out also covers
+# `make CARGO_TARGET_DIR=... install`.
+ifdef CARGO_TARGET_DIR
+export CARGO_TARGET_DIR
 endif
 
 # Preflight for from-source builds. `make build/release/web/clippy/test/...`
@@ -170,16 +182,29 @@ gate: fmt-check clippy test test-web web-check
 
 # --- Install / uninstall -----------------------------------------------------
 #
-# `make install` is THE product install: release build → symlink → `ccteam
-# daemon restart` (self-managed setsid daemon). Symlink (not copy): a fresh
-# `cargo build --release` goes live on the next `daemon restart`. `daemon
-# restart` runs the one-time legacy-unit takeover, so a dev box that used to
-# run the old systemd/launchd service migrates cleanly on this install.
+# `make install` is THE product install: release build → atomic executable
+# copy → `ccteam daemon restart` (self-managed setsid daemon). The installed
+# executable is deliberately independent of Cargo's build tree: shared target
+# cleanup or a redirected CARGO_TARGET_DIR must never break the live daemon.
+# `daemon restart` runs the one-time legacy-unit takeover, so a dev box that
+# used to run the old systemd/launchd service migrates cleanly on this install.
 
-install: release
-	@mkdir -p $(BIN_DIR)
-	@ln -sf $(RELEASE_BIN) $(BIN_LINK)
-	@printf 'installed: %s -> %s\n' '$(BIN_LINK)' '$(RELEASE_BIN)'
+install-binary: release
+	@set -eu; \
+	_release_bin="$(RELEASE_BIN)"; \
+	if [ ! -x "$$_release_bin" ]; then \
+	    printf '\033[31merror:\033[0m Cargo release binary not found: %s\n' "$$_release_bin" >&2; \
+	    exit 1; \
+	fi; \
+	mkdir -p "$(BIN_DIR)"; \
+	_tmp="$$(mktemp "$(BIN_DIR)/.$(BIN_NAME).install.XXXXXX")"; \
+	trap 'rm -f "$$_tmp"' EXIT HUP INT TERM; \
+	install -m 755 "$$_release_bin" "$$_tmp"; \
+	mv -f "$$_tmp" "$(BIN_LINK)"; \
+	trap - EXIT HUP INT TERM; \
+	printf 'installed: %s (copied from %s)\n' '$(BIN_LINK)' "$$_release_bin"
+
+install: install-binary
 	@case ":$$PATH:" in \
 	    *:$(BIN_DIR):*) ;; \
 	    *) printf '\033[33mwarning:\033[0m %s is not on PATH; add it to your shell rc.\n' '$(BIN_DIR)' ;; \
@@ -279,9 +304,9 @@ daemon-start:
 daemon-stop:
 	@$(BIN_NAME) daemon stop
 
-# Rebuild release then restart — the symlinked binary makes the new build live.
-daemon-restart: release
-	@$(BIN_NAME) daemon restart
+# Rebuild, atomically deploy the executable, then restart that exact binary.
+daemon-restart: install-binary
+	@$(BIN_LINK) daemon restart
 
 daemon-status:
 	@$(BIN_NAME) daemon status
