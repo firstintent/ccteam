@@ -25,7 +25,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.12`(ship gate 已过,dev→main PR 待合并 + tag;发布回填见 `.loop/state.md`;下版 tag 仍需 owner 显式发话) |
+| Workspace version | `0.9.12`(**已发布** 2026-08-02:main `0c953f38` + tag,四平台二进制在 `/releases/latest`;下版 tag 仍需 owner 显式发话) |
 | 本版 headline | **spawn 调参轴打通**(model + effort,五 vendor × 四入口一致):每 vendor 走自己的通道下发(claude/grok argv · codex sticky first-turn override · ACP `session/set_config_option` 按 spec category `thought_level` 取轴、不再钉某家 id)+ **显式选择被拒即报错**(不再静默吃 vendor 默认)+ `meta.json` 持久化 `effort` 让 resume/`/role`/重建都续用 + 发现面 `GET /api/v1/models`(vendor 自报目录 + 强度梯,advisory **永非白名单**)+ MCP `status` spawn 配方内联两轴 + IM `/new … model= effort=`(order-free k=v)+ web composer 按 vendor 渲染真菜单(全局梯删除)+ 团队拓扑「模型·强度」列 + 响应式树;**上下文口径修正**(`used_tokens: Option<u64>` + `ContextSource` provenance —— 未知不再谎报 0%,ACP status 快照落盘让 resume/挤停/重启不丢占用,kimi 经其自报 `status` 命令拉真占用)+ **ACP turn 结局契约**(`stopReason` 不再把失败洗成答案);**MCP 注册全 vendor 全路径统一 HTTP**(旧 stdio 条目升级自愈 + 认 daemon 真实端口)+ **install 单一落点阶梯**(install.sh / `make install` 同址 + 影子副本外显 + channel marker,治「三个 binary 三个真相」)+ IM/web 租户面五修(live session 继承 tenant project owner · 每租户 bot fail-closed · PWA 根路径匿名 · 未编目卫星项目可见 · fleet 面 owner 门) |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
