@@ -124,6 +124,27 @@ export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): 
   }
 }
 
+/** The inverse of {@link wireEffort}: a backend effort token (from the live
+ *  statusline — `GET /sessions/{sid}/status`, `agents/graph` nodes) → the
+ *  dictionary key that labels it. Vendor-agnostic (`xhigh` and `max` are the
+ *  same top rung across codex/claude). Unknown/absent → `null`, so a caller
+ *  renders the raw token or nothing — never a fake level. */
+export function effortKeyOf(effort: string | null | undefined): EffortKey | null {
+  switch ((effort ?? "").toLowerCase()) {
+    case "low":
+      return "effLow";
+    case "medium":
+      return "effMid";
+    case "high":
+      return "effHigh";
+    case "max":
+    case "xhigh":
+      return "effMax";
+    default:
+      return null;
+  }
+}
+
 /** Protocols a caller may pick for `vendor`. Cross-user fix (2026-07-28) — no admin gate: every
  *  logged-in user gets the same functional surface, and what they may reach is
  *  decided by identity × project ownership on the backend, not by hiding menu

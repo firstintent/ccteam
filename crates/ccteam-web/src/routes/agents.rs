@@ -11,7 +11,8 @@
 //! [`ccteam_harness::HarnessAdapter::thread_status`] per live sid (resolved
 //! under the same lock, awaited after it drops — the SAME statusline source
 //! `GET /sessions/{sid}/status` serves, via
-//! [`super::sessions_api::resolved_thread_status`] ⇒ `nodes[].model`) ⋈
+//! [`super::sessions_api::resolved_thread_status`] ⇒ `nodes[].model` +
+//! `nodes[].effort`) ⋈
 //! [`ccteam_im::gateway::Gateway::armed_delegation_watch_sids`] (a
 //! best-effort seed for `edges[].active`, corrected live by the SSE
 //! `dispatched`/`completed` frames — see `AgentsView`'s reducer).
@@ -45,6 +46,7 @@ use axum::{
     },
     Extension, Json,
 };
+use ccteam_harness::ThreadStatus;
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,11 @@ pub struct AgentNode {
     /// echoed) and for live sessions with no statusline yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning-effort level that model runs at (`low`/`medium`/`high`/
+    /// `xhigh`/`max`), from the same live statusline join as `model`. `null`
+    /// on idle nodes and on vendors/models with no effort axis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub host: String,
     /// `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). See
     /// the module doc's status-honesty note.
@@ -154,16 +161,16 @@ fn normalize_host(host: &str) -> String {
 
 /// Build the graph snapshot for exactly the given (already ACL-filtered)
 /// `slugs`, from a live-session-view lookup + armed-watch set the caller
-/// resolved under the gateway lock, plus `live_models` — the per-live-sid
-/// statusline model the caller read AFTER dropping that lock (only live sids
-/// ever appear in it, so an idle node's `model` is honestly `None`). Pure
-/// over its inputs (`project_dir` + these maps) so it's unit-testable
+/// resolved under the gateway lock, plus `live_status` — the per-live-sid
+/// statusline the caller read AFTER dropping that lock (only live sids ever
+/// appear in it, so an idle node's `model`/`effort` are honestly `None`).
+/// Pure over its inputs (`project_dir` + these maps) so it's unit-testable
 /// without a server.
 pub(crate) fn build_agents_graph(
     project_dir_for: impl Fn(&str) -> std::path::PathBuf,
     slugs: &[String],
     live_by_sid: &HashMap<String, SessionView>,
-    live_models: &HashMap<String, String>,
+    live_status: &HashMap<String, ThreadStatus>,
     armed_watches: &HashSet<String>,
 ) -> AgentsGraphResponse {
     let mut nodes = Vec::new();
@@ -178,12 +185,14 @@ pub(crate) fn build_agents_graph(
             } else {
                 "idle"
             };
+            let live = live_status.get(&m.sid);
             nodes.push(AgentNode {
                 sid: m.sid.clone(),
                 slug: slug.clone(),
                 role: m.role.clone(),
                 vendor: ccteam_im::delegation::vendor_key(m.vendor).to_string(),
-                model: live_models.get(&m.sid).cloned(),
+                model: live.and_then(|s| s.model.clone()),
+                effort: live.and_then(|s| s.effort.clone()),
                 host,
                 status: status.to_string(),
                 parent_sid: m.parent_sid.clone(),
@@ -271,23 +280,21 @@ pub(crate) async fn handle_agents_graph(
             .collect();
         (live, armed, handles)
     };
-    // The live-model join: N per-live-sid statusline reads per snapshot (the
-    // SPA refreshes at 15s), through the SAME helper `GET
+    // The live-statusline join (model + effort): N per-live-sid reads per
+    // snapshot (the SPA refreshes at 15s), through the SAME helper `GET
     // /sessions/{sid}/status` serves — one source of truth for what a
     // session is running.
-    let mut live_models: HashMap<String, String> = HashMap::new();
+    let mut live_status: HashMap<String, ThreadStatus> = HashMap::new();
     for (sid, adapter, thread) in live_handles {
         let status = super::sessions_api::resolved_thread_status(adapter, thread, &sid).await;
-        if let Some(model) = status.model {
-            live_models.insert(sid, model);
-        }
+        live_status.insert(sid, status);
     }
     let paths = app.paths.clone();
     let graph = build_agents_graph(
         |slug| paths.project_dir(slug),
         &slugs,
         &live_by_sid,
-        &live_models,
+        &live_status,
         &armed_watches,
     );
     Json(graph).into_response()
@@ -543,9 +550,10 @@ mod tests {
         assert_eq!(graph.nodes[0].status, "live");
     }
 
-    /// TEAM-4 — `nodes[].model` comes from the caller's post-lock statusline
-    /// join (`live_models`), never from `meta.json`: the live sid carries its
-    /// reported model, the idle sid stays honestly `None`.
+    /// TEAM-4 — `nodes[].model` + `nodes[].effort` come from the caller's
+    /// post-lock statusline join (`live_status`), never from `meta.json`: the
+    /// live sid carries its reported model/effort, the idle sid stays honestly
+    /// `None`.
     #[test]
     fn build_agents_graph_joins_live_model_only_for_live_nodes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -593,23 +601,32 @@ mod tests {
                 delegation_depth: 0,
             },
         );
-        let live_models: HashMap<String, String> = [("s1".to_string(), "fable-5".to_string())]
-            .into_iter()
-            .collect();
+        let live_status: HashMap<String, ThreadStatus> = [(
+            "s1".to_string(),
+            ThreadStatus {
+                model: Some("fable-5".to_string()),
+                effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
         let graph = build_agents_graph(
             |_| dir.clone(),
             &["demo".to_string()],
             &live,
-            &live_models,
+            &live_status,
             &HashSet::new(),
         );
         let by_sid = |sid: &str| graph.nodes.iter().find(|n| n.sid == sid).unwrap();
         assert_eq!(by_sid("s1").model.as_deref(), Some("fable-5"));
+        assert_eq!(by_sid("s1").effort.as_deref(), Some("high"));
         assert_eq!(
             by_sid("s2").model,
             None,
             "an idle node has nothing live to report"
         );
+        assert_eq!(by_sid("s2").effort, None);
     }
 
     #[test]

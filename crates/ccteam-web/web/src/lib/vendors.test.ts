@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   defaultDraft,
+  effortKeyOf,
   modelSwitchFor,
   wireEffort,
   normalizeDraft,
@@ -138,6 +139,29 @@ describe("wireEffort (A-U3 create-form effort field)", () => {
   it("defaultDraft starts at effDefault (nothing wired until picked)", () => {
     expect(defaultDraft().effortKey).toBe("effDefault");
     expect(wireEffort(defaultDraft())).toBeNull();
+  });
+});
+
+describe("effortKeyOf (backend effort token → dictionary key)", () => {
+  it("maps the four levels", () => {
+    expect(effortKeyOf("low")).toBe("effLow");
+    expect(effortKeyOf("medium")).toBe("effMid");
+    expect(effortKeyOf("high")).toBe("effHigh");
+    expect(effortKeyOf("max")).toBe("effMax");
+    expect(effortKeyOf("xhigh")).toBe("effMax");
+  });
+
+  it("returns null (hide, never fake) for unknown/absent", () => {
+    expect(effortKeyOf(null)).toBeNull();
+    expect(effortKeyOf(undefined)).toBeNull();
+    expect(effortKeyOf("weird")).toBeNull();
+  });
+
+  it("round-trips every wired claude/codex token back to its key", () => {
+    for (const key of ["effLow", "effMid", "effHigh", "effMax"] as const) {
+      expect(effortKeyOf(wireEffort({ vendor: "claude", effortKey: key }))).toBe(key);
+      expect(effortKeyOf(wireEffort({ vendor: "codex", effortKey: key }))).toBe(key);
+    }
   });
 });
 

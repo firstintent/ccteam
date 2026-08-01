@@ -24,7 +24,7 @@ vi.hoisted(() => {
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 
-import SessionView, { effortKeyOf } from "./SessionView";
+import SessionView from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
@@ -128,22 +128,6 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(strip(local)).not.toContain("@ local");
     const remote = render({ ...SESSION, host: "dev04" });
     expect(strip(remote)).toContain("@ dev04");
-  });
-});
-
-describe("effortKeyOf (backend effort token → dictionary key)", () => {
-  it("maps the four levels", () => {
-    expect(effortKeyOf("low")).toBe("effLow");
-    expect(effortKeyOf("medium")).toBe("effMid");
-    expect(effortKeyOf("high")).toBe("effHigh");
-    expect(effortKeyOf("max")).toBe("effMax");
-    expect(effortKeyOf("xhigh")).toBe("effMax");
-  });
-
-  it("returns null (hide, never fake) for unknown/absent", () => {
-    expect(effortKeyOf(null)).toBeNull();
-    expect(effortKeyOf(undefined)).toBeNull();
-    expect(effortKeyOf("weird")).toBeNull();
   });
 });
 

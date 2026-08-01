@@ -104,11 +104,12 @@ impl HarnessAdapter for FakeAdapter {
     }
 
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        // Every LIVE session's statusline reports this model — the graph's
-        // model join (TEAM-4) reads it through the same source as
-        // `GET /sessions/{sid}/status`.
+        // Every LIVE session's statusline reports this model + effort — the
+        // graph's statusline join (TEAM-4) reads it through the same source
+        // as `GET /sessions/{sid}/status`.
         Ok(ThreadStatus {
             model: Some("agents-test-model".to_string()),
+            effort: Some("high".to_string()),
             ..ThreadStatus::default()
         })
     }
@@ -364,12 +365,12 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
     assert_eq!(resp.status(), 404);
 }
 
-/// TEAM-4 — the graph joins each LIVE node with the model its session runs
-/// right now, read through the SAME statusline source as
+/// TEAM-4 — the graph joins each LIVE node with the model + reasoning effort
+/// its session runs right now, read through the SAME statusline source as
 /// `GET /sessions/{sid}/status` (this file's `FakeAdapter` reports
-/// `agents-test-model` from `thread_status`). An idle (persisted-only) node
-/// stays `null` even though its `meta.json` carries a spawn-time `model`
-/// override — nothing live to report.
+/// `agents-test-model` / `high` from `thread_status`). An idle
+/// (persisted-only) node stays `null` even though its `meta.json` carries a
+/// spawn-time `model` override — nothing live to report.
 #[tokio::test]
 async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -405,11 +406,20 @@ async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
         Value::String("agents-test-model".to_string()),
         "live node carries the statusline model: {body}"
     );
+    assert_eq!(
+        live["effort"],
+        Value::String("high".to_string()),
+        "live node carries the statusline effort: {body}"
+    );
     let idle = node("s9");
     assert_eq!(idle["status"], Value::String("idle".to_string()));
     assert!(
         idle["model"].is_null(),
         "idle node must not echo the spawn-time meta model: {body}"
+    );
+    assert!(
+        idle["effort"].is_null(),
+        "idle node has no live effort to report: {body}"
     );
 }
 

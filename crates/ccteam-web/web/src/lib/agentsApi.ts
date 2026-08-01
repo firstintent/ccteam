@@ -12,6 +12,10 @@ export interface AgentNode {
   role: string;
   vendor: string;
   model?: string | null;
+  /** Reasoning-effort token off the same live statusline join as `model`
+   *  (`low`/`medium`/`high`/`xhigh`/`max`); absent on idle nodes and on
+   *  vendors with no effort axis. */
+  effort?: string | null;
   host: string;
   /** `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). */
   status: string;

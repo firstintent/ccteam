@@ -29,6 +29,7 @@ import { useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import {
   defaultDraft,
+  effortKeyOf,
   normalizeDraft,
   type ComposerDraft,
 } from "../lib/vendors";
@@ -55,25 +56,6 @@ import {
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
-
-/** Map the backend effort token to the dictionary key (unknown → null hides
- *  the label — never a fake value). */
-// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
-export function effortKeyOf(effort: string | null | undefined): ComposerDraft["effortKey"] | null {
-  switch ((effort ?? "").toLowerCase()) {
-    case "low":
-      return "effLow";
-    case "medium":
-      return "effMid";
-    case "high":
-      return "effHigh";
-    case "max":
-    case "xhigh":
-      return "effMax";
-    default:
-      return null;
-  }
-}
 
 export default function SessionView({
   sid,
