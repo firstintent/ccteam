@@ -502,7 +502,7 @@ pub(crate) async fn handle_register_mcp(
     };
 
     let token_path = app.paths.web_token_path();
-    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&app.paths.root.join("run"));
     let result = tokio::task::spawn_blocking(move || {
         register_mcp_blocking(want.as_deref(), &token_path, &mcp_http_url)
     })

@@ -35,21 +35,36 @@ pub fn session_mcp_bearer(sid: &str, secret: &str) -> String {
     format!("ccteam-sid:{sid}:{secret}")
 }
 
-/// Default daemon MCP HTTP URL. Override with `CCTEAM_MCP_HTTP_URL`.
-pub fn default_mcp_http_url() -> String {
+/// Last-resort daemon MCP URL, matching `daemon_cli::DEFAULT_WEB_BIND`'s port.
+/// Only correct when the daemon runs on the default bind — prefer
+/// `ccteam_core::mcp_register::resolve_mcp_http_url`, which also honours the
+/// bind the running daemon actually recorded.
+pub const FALLBACK_MCP_HTTP_URL: &str = "http://127.0.0.1:7331/mcp";
+
+/// Explicit operator override of the daemon MCP URL, if any:
+/// `CCTEAM_MCP_HTTP_URL` (full URL) or `CCTEAM_WEB_URL` (base + `/mcp`).
+/// `None` when neither is set — the caller decides what to fall back to.
+pub fn mcp_http_url_from_env() -> Option<String> {
     if let Ok(u) = std::env::var("CCTEAM_MCP_HTTP_URL") {
         let t = u.trim();
         if !t.is_empty() {
-            return t.to_string();
+            return Some(t.to_string());
         }
     }
     if let Ok(base) = std::env::var("CCTEAM_WEB_URL") {
         let b = base.trim().trim_end_matches('/');
         if !b.is_empty() {
-            return format!("{b}/mcp");
+            return Some(format!("{b}/mcp"));
         }
     }
-    "http://127.0.0.1:7331/mcp".to_string()
+    None
+}
+
+/// Default daemon MCP HTTP URL: operator override, else the default-bind
+/// fallback. Used where no `CcteamPaths` is in scope (session spawn, whose
+/// config the daemon itself writes).
+pub fn default_mcp_http_url() -> String {
+    mcp_http_url_from_env().unwrap_or_else(|| FALLBACK_MCP_HTTP_URL.to_string())
 }
 
 /// Inputs for a curated session MCP config.

@@ -114,6 +114,34 @@ impl Sandbox {
         .unwrap();
     }
 
+    /// What an EXISTING user's configs look like before upgrading to the
+    /// HTTP-only registration: ccteam's own entry is a stdio `mcp-serve`
+    /// child, pointing at whatever binary path was current back then.
+    fn seed_legacy_stdio_entries(&self) {
+        std::fs::write(
+            &self.claude_json,
+            r#"{"userID":"keep-me","mcpServers":{"sibling":{"command":"sibling"},"ccteam":{"command":"/old/path/ccteam","args":["internal","mcp-serve"],"env":{}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            self.codex_home.join("config.toml"),
+            "[mcp_servers.ccteam]\ncommand = \"/old/path/ccteam\"\nargs = [\"internal\", \"mcp-serve\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.grok_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            self.grok_config(),
+            "[mcp_servers.ccteam]\ncommand = \"/old/path/ccteam\"\nargs = [\"internal\", \"mcp-serve\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.opencode_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            self.opencode_config(),
+            r#"{"mcp":{"ccteam":{"type":"local","command":["/old/path/ccteam","internal","mcp-serve"]}}}"#,
+        )
+        .unwrap();
+    }
+
     fn run(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_ccteam"))
             .args(["internal", "register-mcp", "--json"])
@@ -222,4 +250,57 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
         serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
     assert_eq!(claude_after["mcpServers"]["sibling"]["command"], "sibling");
     assert!(sb.ccteam_home.starts_with(&sb.root));
+}
+
+/// The upgrade path for EXISTING users: nobody edits `~/.claude.json` by hand.
+/// Daemon start (`ccteam start` / `daemon restart` / the restart `ccteam update`
+/// performs) runs this same auto-registration unconditionally, so a legacy stdio
+/// `mcp-serve` entry is rewritten to HTTP in place — for every vendor, not just
+/// Claude — while the user's own sibling servers and unrelated keys survive.
+#[test]
+fn upgrade_rewrites_legacy_stdio_entries_to_http_for_every_vendor() {
+    let sb = Sandbox::new();
+    sb.seed_legacy_stdio_entries();
+
+    parse_output(&sb.run());
+
+    let claude: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
+    let entry = &claude["mcpServers"]["ccteam"];
+    assert_eq!(entry["type"], "http", "claude entry must become HTTP");
+    assert!(entry["url"].is_string());
+    assert!(
+        entry["headers"]["Authorization"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("Bearer ccteam:")),
+        "claude entry must carry the admin bearer: {entry}"
+    );
+    // The stdio child is gone — no leftover key can combine with `url`.
+    for stale in ["command", "args", "env"] {
+        assert!(
+            entry.get(stale).is_none(),
+            "legacy `{stale}` survived the rewrite: {entry}"
+        );
+    }
+    // Merge, never clobber: the user's other server and unrelated keys stay.
+    assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
+    assert_eq!(claude["userID"], "keep-me");
+
+    let codex: toml::Table =
+        toml::from_str(&std::fs::read_to_string(sb.codex_home.join("config.toml")).unwrap())
+            .unwrap();
+    let codex_entry = codex["mcp_servers"]["ccteam"].as_table().unwrap();
+    assert!(codex_entry.contains_key("url"));
+    assert!(!codex_entry.contains_key("command"));
+
+    let grok: toml::Table =
+        toml::from_str(&std::fs::read_to_string(sb.grok_config()).unwrap()).unwrap();
+    let grok_entry = grok["mcp_servers"]["ccteam"].as_table().unwrap();
+    assert!(grok_entry.contains_key("url"));
+    assert!(!grok_entry.contains_key("command"));
+
+    let opencode: Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.opencode_config()).unwrap()).unwrap();
+    assert_eq!(opencode["mcp"]["ccteam"]["type"], "remote");
+    assert!(opencode["mcp"]["ccteam"].get("command").is_none());
 }

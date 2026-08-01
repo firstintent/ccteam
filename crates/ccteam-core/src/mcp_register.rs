@@ -36,6 +36,62 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+/// Filename under `~/.ccteam/run/` where a starting daemon records the MCP URL
+/// its own web bind resolves to.
+const DAEMON_MCP_URL_FILE: &str = "mcp-url";
+
+/// Record the MCP URL implied by the daemon's actual web bind, so registration
+/// paths that run OUT OF BAND (`ccteam config mcp`, doctor) target the port the
+/// daemon really listens on instead of guessing the default.
+///
+/// Called at daemon start, before auto-registration. Best-effort by contract:
+/// the caller logs and continues, since a stale/missing record only costs the
+/// default guess. A non-parsing bind is `Ok(())` with nothing written — the
+/// startup path reports that error properly a few lines later.
+pub fn record_daemon_mcp_url(run_dir: &Path, web_bind: &str) -> Result<()> {
+    let Some(url) = mcp_url_from_bind(web_bind) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    atomic_write(&run_dir.join(DAEMON_MCP_URL_FILE), url.as_bytes())
+}
+
+/// Resolve the MCP URL to register: explicit operator override
+/// (`CCTEAM_MCP_HTTP_URL` / `CCTEAM_WEB_URL`) → the running daemon's recorded
+/// bind → the default-bind fallback.
+///
+/// This is what makes an HTTP registration correct on a non-default
+/// `--web-bind`. The old stdio entry was port-agnostic (the child dialled the
+/// unix socket), so without this the move to HTTP would break exactly the users
+/// who bind somewhere else.
+pub fn resolve_mcp_http_url(run_dir: &Path) -> String {
+    if let Some(url) = ccteam_harness::execution::mcp_config::mcp_http_url_from_env() {
+        return url;
+    }
+    if let Ok(body) = std::fs::read_to_string(run_dir.join(DAEMON_MCP_URL_FILE)) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL.to_string()
+}
+
+/// `<bind>` → the loopback URL a vendor on this host should dial. A wildcard
+/// bind (`0.0.0.0` / `[::]`) is not a destination, so it maps to loopback on the
+/// same port; a concrete address is kept as-is. `None` when unparseable.
+fn mcp_url_from_bind(web_bind: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = web_bind.trim().parse().ok()?;
+    let port = addr.port();
+    if addr.ip().is_unspecified() {
+        return Some(format!("http://127.0.0.1:{port}/mcp"));
+    }
+    Some(match addr.ip() {
+        std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}/mcp"),
+        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}/mcp"),
+    })
+}
+
 /// Register the ccteam MCP server in Claude's `~/.claude.json` as an
 /// `mcpServers.ccteam` Streamable HTTP entry (`type` + `url` + `headers` —
 /// the shape `claude mcp add --transport http` writes, and the same one the
@@ -610,6 +666,56 @@ fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_url_from_bind_maps_wildcard_to_loopback_and_keeps_concrete() {
+        // A wildcard bind is not a destination — a vendor on this host must
+        // dial loopback on the SAME port (the whole point: non-default ports).
+        assert_eq!(
+            mcp_url_from_bind("0.0.0.0:8080").as_deref(),
+            Some("http://127.0.0.1:8080/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::]:9000").as_deref(),
+            Some("http://127.0.0.1:9000/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("127.0.0.1:7331").as_deref(),
+            Some("http://127.0.0.1:7331/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("192.168.1.5:7331").as_deref(),
+            Some("http://192.168.1.5:7331/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::1]:7331").as_deref(),
+            Some("http://[::1]:7331/mcp")
+        );
+        // Unparseable → None, so startup writes nothing and reports the bind
+        // error through its own path.
+        assert!(mcp_url_from_bind("not-an-addr").is_none());
+        assert!(mcp_url_from_bind("").is_none());
+    }
+
+    #[test]
+    fn resolve_mcp_http_url_prefers_recorded_bind_over_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        // Nothing recorded yet → default-bind fallback.
+        assert_eq!(
+            resolve_mcp_http_url(&run_dir),
+            ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL
+        );
+        // A daemon on a custom port records it; registration follows.
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:8080").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:8080/mcp");
+        // Re-record on restart (idempotent, last write wins).
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:9100").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
+        // An unparseable bind leaves the previous record intact.
+        record_daemon_mcp_url(&run_dir, "bogus").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
+    }
 
     #[test]
     fn install_mcp_into_writes_http_url_and_admin_header() {

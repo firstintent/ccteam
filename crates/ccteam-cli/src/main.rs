@@ -1637,6 +1637,17 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
     }
 
+    // Record the MCP URL this daemon's own web bind implies BEFORE registering,
+    // so every vendor entry written below — and every later out-of-band
+    // `ccteam config mcp` — targets the port we actually listen on. The old
+    // stdio entry was port-agnostic; an HTTP one is not, so guessing the default
+    // here would break exactly the operators who bind somewhere else.
+    if let Err(err) =
+        ccteam_core::mcp_register::record_daemon_mcp_url(&paths.root.join("run"), &web.bind)
+    {
+        tracing::warn!(error = %err, bind = %web.bind, "could not record the daemon MCP URL; vendor registration falls back to the default bind");
+    }
+
     let mut registered = Vec::new();
     for (vendor, result) in crate::mcp_serve::auto_register_vendor_mcp() {
         match result {
