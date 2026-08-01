@@ -1017,15 +1017,28 @@ pub struct SpawnCtx {
     /// deterministic per-model pricing; a model absent from the pricing
     /// table prices to `None` (exposed as "—"), never a fallback rate.
     pub model_id: Option<String>,
-    /// v0.8.24 A-U3 — explicit reasoning-effort token for this thread.
-    /// `None` = vendor default (no flag / no override emitted). Wired only
-    /// where the vendor verifiably supports it: Claude stream-json
-    /// (`--effort low|medium|high|xhigh|max`), Codex app-server (the
-    /// `effort` turn/start override, `none|minimal|low|medium|high|xhigh`),
-    /// OpenCode ACP (`session/set_config_option {configId:"effort"}`,
-    /// value = a model variant). Grok's `--reasoning-effort` value set is
-    /// undocumented, so it is NOT wired (an invalid value would fail the
-    /// spawn). Terminal protocol is frozen — never extended with this.
+    /// Explicit reasoning-effort token for this thread. `None` = vendor
+    /// default: nothing is emitted and the vendor's own resolution holds —
+    /// that is what an omitted effort means at every ccteam entry point.
+    ///
+    /// Applied through each vendor's own seam, with the value passed VERBATIM
+    /// (ccteam does not police vendor value sets; the vendor owns that
+    /// verdict, and the ladders a caller is offered come from
+    /// [`crate::model_catalog::supported_efforts`]):
+    /// - Claude stream-json: `--effort` argv;
+    /// - Codex app-server: the sticky `effort` override on the first
+    ///   `turn/start` (codex takes no argv for it);
+    /// - Grok ACP: `--reasoning-effort` argv (its handshake declares the
+    ///   levels in `_meta.reasoningEfforts`);
+    /// - OpenCode / Kimi ACP: `session/set_config_option` on the axis id the
+    ///   vendor declared in its handshake (`effort` / `thinking` — see
+    ///   [`crate::execution::acp::ModelInfo::effort_config_id`]).
+    ///
+    /// A vendor REFUSING an explicit value fails the spawn
+    /// ([`crate::execution::acp::spawn_pick_refused`]) rather than handing
+    /// back a session quietly running on something else. The one surface that
+    /// cannot carry it is the frozen terminal protocol, which refuses the
+    /// spawn with a message naming stream-json instead of ignoring the pick.
     pub effort: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops

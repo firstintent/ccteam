@@ -569,6 +569,9 @@ impl HarnessAdapter for KimiAcpAdapter {
             }
         };
 
+        // The effort axis id kimi just declared (`thinking`), kept before
+        // `info` moves — never hardcoded here, see `ModelInfo`.
+        let effort_config_id = info.effort_config_id.clone();
         let live = self.register_live(
             transport,
             session_id,
@@ -579,19 +582,21 @@ impl HarnessAdapter for KimiAcpAdapter {
             info,
             ctx.permission_mode,
         );
-        // Best-effort spawn-time model via the SAME vendor-native seam the
-        // `/model` directive uses (`session/set_model`; `kimi acp` takes no
-        // model argv). A failure must never fail the spawn — the session
-        // then runs on kimi's own default (honest degrade, warn only). The
-        // effort axis is NOT wired in this version (PRD non-goal).
+        // Spawn-time model + effort through the SAME vendor-native seams the
+        // `/model` directive uses: `session/set_model` for the model (kimi's
+        // pinned method; `kimi acp` takes no model argv) and
+        // `session/set_config_option` for the effort axis it declared.
+        //
+        // A refusal FAILS the spawn (`spawn_pick_refused`): warning and
+        // continuing handed the caller a session running on something other
+        // than what they named, and reported success.
         if let Some(model) = ctx
             .model_id
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
-            match live
-                .transport
+            live.transport
                 .call(
                     "session/set_model",
                     json!({
@@ -600,18 +605,35 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-            {
-                Ok(_) => {
-                    if let Ok(mut st) = live.state.lock() {
-                        st.model = Some(model.to_string());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    sid = %ctx.sid,
-                    model,
-                    error = %e,
-                    "kimi spawn-time session/set_model failed; continuing with vendor default"
-                ),
+                .map_err(|e| crate::execution::acp::spawn_pick_refused("model", model, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                st.model = Some(model.to_string());
+            }
+        }
+        if let Some(effort) = ctx
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            // The id kimi just declared wins; `thinking` is only the cold
+            // fallback for a snapshot that omitted the axis (a model with no
+            // thinking knob). Either way the vendor gets the call and owns the
+            // verdict — same shape as the opencode sibling.
+            let config_id = effort_config_id.as_deref().unwrap_or("thinking");
+            live.transport
+                .call(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": live.session_id,
+                        "configId": config_id,
+                        "value": effort,
+                    }),
+                )
+                .await
+                .map_err(|e| crate::execution::acp::spawn_pick_refused("effort", effort, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                st.effort = Some(effort.to_string());
             }
         }
         let mut handle = Self::make_handle(&live);

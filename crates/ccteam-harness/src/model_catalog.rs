@@ -111,6 +111,68 @@ pub fn record_vendor_models_best_effort(vendor: &str, source: &str, models: Vec<
     }
 }
 
+/// Reasoning-effort levels a vendor is known to accept, **vendor-first**: the
+/// union of what its own last handshake declared (per-model `efforts` in the
+/// catalog above) and, only when the catalog has nothing to say, a pinned set
+/// verified against the installed CLI.
+///
+/// This is an AFFORDANCE, never a gate — it populates menus and `--help` text
+/// so a caller is offered what the vendor actually takes. A value that is not
+/// in this list is still passed through to the vendor, which owns the verdict:
+/// dropping a caller's explicit pick because a cached table didn't recognise
+/// it is exactly the failure mode this module exists to end.
+///
+/// Empty = ccteam knows of no effort axis for that vendor (OpenCode's levels
+/// are per-model "variants" its handshake does not enumerate today).
+pub fn supported_efforts_in(root: &Path, vendor: &str) -> Vec<String> {
+    let vendor = vendor.trim().to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    if let Some(entry) = load_model_catalog_in(root).0.get(&vendor) {
+        for model in &entry.models {
+            for effort in &model.efforts {
+                let effort = effort.trim();
+                if !effort.is_empty() && !out.iter().any(|e| e == effort) {
+                    out.push(effort.to_string());
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out = pinned_efforts(&vendor);
+    }
+    out
+}
+
+/// Environment-resolved [`supported_efforts_in`].
+pub fn supported_efforts(vendor: &str) -> Vec<String> {
+    ccteam_root_from_env()
+        .as_deref()
+        .map(|root| supported_efforts_in(root, vendor))
+        .unwrap_or_else(|| pinned_efforts(&vendor.trim().to_ascii_lowercase()))
+}
+
+/// CLI-verified fallback ladders, used only until a vendor handshake records
+/// its own (2026-08-02, installed binaries):
+/// - claude 2.x: `claude --help` → `--effort <level> (low, medium, high,
+///   xhigh, max)`;
+/// - codex: `ReasoningEffort` accepts more (`none`/`minimal`/`ultra`), but
+///   which ones a model takes is per-model — offer the four every reasoning
+///   model has;
+/// - grok / kimi / opencode: their handshakes declare the axis (grok
+///   `_meta.reasoningEfforts`, kimi `thought_level` options), so these are
+///   only the cold-start guess before the first session.
+fn pinned_efforts(vendor: &str) -> Vec<String> {
+    let levels: &[&str] = match vendor {
+        "claude" => &["low", "medium", "high", "xhigh", "max"],
+        "codex" => &["low", "medium", "high", "xhigh"],
+        "grok" => &["low", "medium", "high"],
+        "kimi" => &["low", "high", "max"],
+        // OpenCode: no shared axis on the wire today (per-model variants).
+        _ => &[],
+    };
+    levels.iter().map(|s| s.to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +184,51 @@ mod tests {
             display_name: Some(format!("Display {id}")),
             efforts: vec!["low".to_string(), "high".to_string()],
         }
+    }
+
+    /// The ladder a caller is OFFERED comes from the vendor itself whenever it
+    /// has spoken; the pinned set is only the cold-start answer before the
+    /// first session. Neither is a gate — see `supported_efforts_in`.
+    #[test]
+    fn supported_efforts_prefer_the_vendors_own_declaration() {
+        let root = tempfile::tempdir().unwrap();
+        // Cold start: nothing observed yet → the CLI-verified pinned ladders,
+        // which differ per vendor (kimi has no `medium`, grok no `max`).
+        assert_eq!(
+            supported_efforts_in(root.path(), "claude"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            supported_efforts_in(root.path(), "kimi"),
+            vec!["low", "high", "max"]
+        );
+        assert_eq!(
+            supported_efforts_in(root.path(), "grok"),
+            vec!["low", "medium", "high"]
+        );
+        // OpenCode declares no shared axis today — an empty ladder is the
+        // honest answer, not a borrowed one.
+        assert!(supported_efforts_in(root.path(), "opencode").is_empty());
+
+        // Once the vendor declares its own, that wins — including a level the
+        // pinned set never knew.
+        record_vendor_models_in(
+            root.path(),
+            "kimi",
+            "ACP session availableModels",
+            vec![CatalogModel {
+                id: "kimi-code/k3".into(),
+                display_name: Some("K3".into()),
+                efforts: vec!["low".into(), "high".into(), "ludicrous".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            supported_efforts_in(root.path(), "kimi"),
+            vec!["low", "high", "ludicrous"]
+        );
+        // Unknown vendor: no ladder invented.
+        assert!(supported_efforts_in(root.path(), "nope").is_empty());
     }
 
     #[test]

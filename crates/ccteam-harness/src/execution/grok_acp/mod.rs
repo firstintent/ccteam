@@ -528,6 +528,7 @@ impl HarnessAdapter for GrokAcpAdapter {
             &GrokSpawnInput {
                 permission_mode: ctx.permission_mode,
                 model_id: ctx.model_id.as_deref(),
+                effort: ctx.effort.as_deref(),
             },
         );
         let program = argv[0].clone();

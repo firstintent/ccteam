@@ -74,6 +74,7 @@ fn spawn_spec_always_approve_before_stdio() {
         &GrokSpawnInput {
             permission_mode: PermissionMode::Skip,
             model_id: Some("grok-4.5"),
+            effort: None,
         },
     );
     assert_eq!(

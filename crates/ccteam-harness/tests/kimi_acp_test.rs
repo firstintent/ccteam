@@ -935,6 +935,103 @@ async fn spawn_time_model_set_via_set_model() {
     clear_fake();
 }
 
+/// Spawn-time effort lands through the axis id KIMI declared (`thinking`,
+/// category `thought_level`) — not opencode's `effort` id, and not a value
+/// ccteam guessed. Omitted ⇒ nothing sent ⇒ kimi's own default (`high` in the
+/// fake, matching the live 0.31.1 handshake).
+#[tokio::test]
+#[serial]
+async fn spawn_time_effort_lands_on_the_declared_axis() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+
+    let mut ctx = spawn_ctx(&tmp, "s-tune-effort");
+    ctx.effort = Some("max".into());
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("start ok");
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("max")
+    );
+    adapter.close_thread(&handle).await.unwrap();
+
+    // Nothing asked → the vendor's own default, untouched.
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-tune-default"),
+        )
+        .await
+        .expect("start ok");
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("high"),
+        "an omitted effort must leave the vendor default alone"
+    );
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// A vendor refusal of an EXPLICIT pick fails the spawn instead of handing
+/// back a session quietly running on something else (the old behaviour was a
+/// `tracing::warn!` and a success).
+#[tokio::test]
+#[serial]
+async fn a_refused_spawn_pick_fails_the_spawn() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+
+    let mut ctx = spawn_ctx(&tmp, "s-refused-effort");
+    ctx.effort = Some("ludicrous".into());
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("vendor refuses an undeclared level");
+    let msg = err.to_string();
+    assert!(msg.contains("effort"), "err={msg}");
+    assert!(msg.contains("ludicrous"), "err={msg}");
+
+    let mut ctx = spawn_ctx(&tmp, "s-refused-model");
+    ctx.model_id = Some("made-up-model".into());
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("vendor refuses an unknown model");
+    assert!(err.to_string().contains("made-up-model"), "err={err}");
+    clear_fake();
+}
+
 #[test]
 fn no_tmux_rmux_imports_in_kimi_module_sources() {
     // Structural red-line: kimi path must not import tmux/rmux crates/modules.

@@ -609,6 +609,21 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // The terminal protocol is frozen (maintenance-only, 规划淘汰), so it
+        // does not carry the effort axis the stream-json path does. Say that
+        // instead of ignoring the pick: every other vendor/protocol now either
+        // applies an explicit effort or fails loudly, and a silent drop here
+        // would be the one surface that still lies about it.
+        if let Some(effort) = ctx
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            return Err(HarnessError::SpawnFailed(format!(
+                "claude terminal 协议不接 effort(`{effort}`);用默认 stream-json 协议,或省略 effort"
+            )));
+        }
         // v0.8.8 F2 — roleless session 合法:空 role → spawn 不加 `--agent`
         // (vendor 原生裸 claude 自读项目 CLAUDE.md)。这是红线允许的(红线只禁
         // 注入 system prompt,不禁省略 `--agent`),故移除原先的非空 role 硬挡。

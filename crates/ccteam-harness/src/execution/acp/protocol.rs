@@ -225,6 +225,14 @@ pub struct ModelInfo {
     pub model: Option<String>,
     pub window: Option<u64>,
     pub effort: Option<String>,
+    /// `configOptions[].id` of the effort axis the vendor declared — the value
+    /// to send back as `session/set_config_option.configId` when SETTING an
+    /// effort. Vendors disagree on the id (`effort` for OpenCode, `thinking`
+    /// for Kimi) and agree on nothing but the category, so the id has to
+    /// travel with the value instead of being hardcoded at each call site.
+    /// `None` for a vendor that declares no axis (or reports effort through
+    /// grok's `_meta` instead of `configOptions`).
+    pub effort_config_id: Option<String>,
     /// Vendor-supplied catalog for the bare-`/model` picker.
     ///
     /// - **Grok**: `models.availableModels[]` (live, changes with CLI upgrades).
@@ -361,6 +369,10 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
                 model,
                 window: None,
                 effort,
+                effort_config_id: effort_entry
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 available,
             };
         }
@@ -398,6 +410,10 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
         model,
         window,
         effort,
+        // Grok reports its effort through `_meta`, not a `configOptions`
+        // select — there is no configId to set it back with (its spawn-time
+        // axis is the `--reasoning-effort` argv flag instead).
+        effort_config_id: None,
         available,
     }
 }

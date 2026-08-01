@@ -510,6 +510,8 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             }
         };
 
+        // The axis id the vendor just declared, kept before `info` moves.
+        let effort_config_id = info.effort_config_id.clone();
         let live = self.register_live(
             transport,
             session_id,
@@ -520,48 +522,49 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             info,
             ctx.permission_mode,
         );
-        // v0.8.24 A-U3 — best-effort spawn-time model/effort via the SAME
-        // vendor-native seam the `/model` directive uses
-        // (`session/set_config_option`; opencode's `session/new` takes no
-        // model). A failure must never fail the spawn — the session then
-        // runs on opencode's self-selected default (honest degrade, warn
-        // only). Model value shape is opencode's `provider/model[/variant]`;
-        // effort must be one of the model's variants.
-        for (config_id, value) in [
-            ("model", ctx.model_id.as_deref()),
-            ("effort", ctx.effort.as_deref()),
+        // Spawn-time model/effort via the SAME vendor-native seam the `/model`
+        // directive uses (`session/set_config_option`; opencode's
+        // `session/new` takes no model). Model value shape is opencode's
+        // `provider/model[/variant]`; the effort axis is whatever id opencode
+        // declared in the handshake (`effort` today) — read from the snapshot,
+        // never hardcoded, so a vendor that renames it keeps working.
+        //
+        // A refusal FAILS the spawn (see `spawn_pick_refused`): this used to
+        // warn-and-continue, which handed the caller a session running on
+        // something other than what they asked for and told them it worked.
+        let effort_axis = effort_config_id.as_deref().unwrap_or("effort");
+        for axis in [
+            crate::execution::acp::SpawnAxis {
+                what: "model",
+                config_id: "model",
+                value: ctx.model_id.as_deref().unwrap_or_default().trim(),
+            },
+            crate::execution::acp::SpawnAxis {
+                what: "effort",
+                config_id: effort_axis,
+                value: ctx.effort.as_deref().unwrap_or_default().trim(),
+            },
         ] {
-            let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            if axis.value.is_empty() {
                 continue;
-            };
-            match live
-                .transport
+            }
+            live.transport
                 .call(
                     "session/set_config_option",
                     json!({
                         "sessionId": live.session_id,
-                        "configId": config_id,
-                        "value": value,
+                        "configId": axis.config_id,
+                        "value": axis.value,
                     }),
                 )
                 .await
-            {
-                Ok(_) => {
-                    if let Ok(mut st) = live.state.lock() {
-                        if config_id == "model" {
-                            st.model = Some(value.to_string());
-                        } else {
-                            st.effort = Some(value.to_string());
-                        }
-                    }
+                .map_err(|e| crate::execution::acp::spawn_pick_refused(axis.what, axis.value, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                if axis.what == "model" {
+                    st.model = Some(axis.value.to_string());
+                } else {
+                    st.effort = Some(axis.value.to_string());
                 }
-                Err(e) => tracing::warn!(
-                    sid = %ctx.sid,
-                    config_id,
-                    value,
-                    error = %e,
-                    "opencode spawn-time set_config_option failed; continuing with vendor default"
-                ),
             }
         }
         let mut handle = Self::make_handle(&live);

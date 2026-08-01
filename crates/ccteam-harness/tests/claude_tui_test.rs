@@ -37,6 +37,43 @@ fn kill_session_quiet(name: &str) {
         .output();
 }
 
+/// The terminal protocol is frozen and carries no `--effort`. Every other
+/// spawn surface now either applies an explicit effort or fails loudly, so
+/// this one must not be the surface that silently ignores it. Rejected before
+/// any tmux work happens — no pane, no fake binary needed.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn spawn_time_effort_is_refused_rather_than_ignored() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ctx = SpawnCtx {
+        slug: "tui-effort".into(),
+        sid: "s-effort".into(),
+        cwd: tmp.path().to_path_buf(),
+        project_dir: tmp.path().to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        effort: Some("high".into()),
+        permission_mode: PermissionMode::Skip,
+        secret: String::new(),
+        remote: None,
+    };
+    let err = ClaudeTuiAdapter::new()
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("terminal must refuse an effort it cannot apply");
+    let msg = err.to_string();
+    assert!(msg.contains("effort"), "err={msg}");
+    assert!(
+        msg.contains("stream-json"),
+        "err must name the way out: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn start_thread_spawns_tmux_and_returns_handle() {
