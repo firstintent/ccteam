@@ -9,8 +9,14 @@
 //! - Model switches ride `session/set_model` (`{sessionId, modelId}`; kimi
 //!   also accepts `session/set_config_option` with configId `model`, but the
 //!   dedicated method is the pinned surface). `kimi acp` takes no model argv.
-//! - The effort axis (`session/set_config_option` thinking) is NOT wired in
-//!   this version (PRD non-goal — backlog).
+//! - The effort axis is kimi's `thinking` config option (ACP category
+//!   `thought_level`): a select of the current model's own levels
+//!   (`low|high|max`, plus `off` unless the model is always-thinking).
+//!   Read from the `configOptions` snapshot (handshake + every
+//!   `config_option_update`), written by `session/set_config_option`
+//!   (`/model <id> <effort>`) — same shape the opencode sibling uses under
+//!   its `effort` id. Spawn-time effort is still not wired (backlog): the
+//!   session starts at kimi's own default and `/model` moves it.
 //! - Kimi has no `--agent` persona face → sessions are roleless-only; kimi
 //!   reads the project `AGENTS.md` natively (no prompt injection red line).
 //! - Skip sessions use [`InboundPolicy::AutoAllowPermission`] — kimi's
@@ -779,10 +785,33 @@ impl HarnessAdapter for KimiAcpAdapter {
                             }
                         }
                         let mut receipt = format!("已切换 model → {model_id}（live）");
-                        if effort.is_some() {
-                            // Effort axis (kimi thinking) is not wired in this
-                            // version (PRD non-goal) — say so, never silently drop.
-                            receipt.push_str("；effort 轴本版未接，已忽略");
+                        if let Some(ref e) = effort {
+                            // Kimi's effort ladder is the `thought_level` config
+                            // option (`low|high|max`, plus `off` when the model
+                            // allows it) — the same `set_config_option` call the
+                            // opencode sibling makes under its own `effort` id.
+                            match live
+                                .transport
+                                .call(
+                                    "session/set_config_option",
+                                    json!({
+                                        "sessionId": live.session_id,
+                                        "configId": "thinking",
+                                        "value": e,
+                                    }),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    if let Ok(mut st) = live.state.lock() {
+                                        st.effort = Some(e.clone());
+                                    }
+                                    receipt.push_str(&format!("；effort → {e}"));
+                                }
+                                Err(err) => {
+                                    receipt.push_str(&format!("；effort 切换失败: {err}"));
+                                }
+                            }
                         }
                         Ok(DirectiveOutcome::Done { receipt })
                     }

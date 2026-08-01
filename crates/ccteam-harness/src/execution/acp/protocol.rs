@@ -228,8 +228,8 @@ pub struct ModelInfo {
     /// Vendor-supplied catalog for the bare-`/model` picker.
     ///
     /// - **Grok**: `models.availableModels[]` (live, changes with CLI upgrades).
-    /// - **OpenCode**: `configOptions[id=model].options[]` (+ shared effort
-    ///   levels from `configOptions[id=effort].options[]`).
+    /// - **OpenCode / Kimi**: `configOptions[id=model].options[]` (+ the effort
+    ///   levels off the `thought_level` axis — see [`effort_config_entry`]).
     ///
     /// Never a ccteam-hardcoded name list.
     pub available: Vec<AcpModelOption>,
@@ -298,19 +298,41 @@ pub fn split_trailing_effort(arg: &str, known_efforts: &[String]) -> (String, Op
     (arg.to_string(), None)
 }
 
-/// Pull model info from a `session/new` / `session/load` / `session/resume` result.
+/// The reasoning-effort axis of a `configOptions[]` snapshot.
+///
+/// Matched by the ACP spec CATEGORY (`thought_level` — the reserved bucket for
+/// reasoning knobs) first, and only then by the ids vendors happen to ship
+/// (`effort` — OpenCode; `thinking` — Kimi). Keying on one vendor's id is what
+/// made ccteam report "no effort" for a Kimi session that was plainly running
+/// at `high`: the value was on the wire the whole time, under an id our reader
+/// didn't know. Category-first means the next spec-conforming vendor is read
+/// with no new branch.
+fn effort_config_entry(opts: &[Value]) -> Option<&Value> {
+    let by = |pred: &dyn Fn(&Value) -> bool| opts.iter().find(|o| pred(o));
+    by(&|o| o.get("category").and_then(|v| v.as_str()) == Some("thought_level")).or_else(|| {
+        by(&|o| {
+            matches!(
+                o.get("id").and_then(|v| v.as_str()),
+                Some("effort") | Some("thinking")
+            )
+        })
+    })
+}
+
+/// Pull model info from a `session/new` / `session/load` / `session/resume`
+/// result — or from a `config_option_update` payload, which carries the same
+/// `configOptions[]` snapshot.
 ///
 /// - **Grok**: `models.currentModelId` + full `availableModels` (+ `_meta`).
-/// - **OpenCode**: `configOptions` with `id=model|effort` (current + options).
+/// - **OpenCode / Kimi**: `configOptions` with `id=model` + the
+///   [`effort_config_entry`] axis (current value + selectable levels).
 pub fn pluck_model_info(result: &Value) -> ModelInfo {
-    // OpenCode path first: configOptions present without models block.
+    // configOptions path first (OpenCode / Kimi): present without a models block.
     if let Some(opts) = result.get("configOptions").and_then(|v| v.as_array()) {
         let model_entry = opts
             .iter()
             .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"));
-        let effort_entry = opts
-            .iter()
-            .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("effort"));
+        let effort_entry = effort_config_entry(opts);
         let model = model_entry
             .and_then(|o| o.get("currentValue"))
             .and_then(|v| v.as_str())
@@ -319,7 +341,11 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
             .and_then(|o| o.get("currentValue"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        // Shared effort axis (OpenCode models share one effort select).
+        // One effort select for the snapshot: OpenCode shares it across models,
+        // Kimi scopes it to the currently-selected model (and omits it entirely
+        // for a model with no thinking axis — then `effort_levels` is empty and
+        // no model×effort picker rows are minted). Either way the levels are
+        // the vendor's own, refreshed by every `config_option_update`.
         let effort_levels = effort_entry
             .and_then(|o| o.get("options"))
             .and_then(|a| a.as_array())
@@ -677,6 +703,72 @@ mod tests {
         let opts = acp_model_picker_options(&info.available);
         assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].id, "tokenopen/gpt-5.5 low");
+    }
+
+    /// Kimi ships the effort axis under id `thinking` with the ACP spec
+    /// category `thought_level` (verified on 0.31.1). Matching opencode's
+    /// `effort` id alone reported "no effort" for a session running at `high`.
+    #[test]
+    fn model_info_reads_kimis_thought_level_axis() {
+        let result = json!({
+            "sessionId": "session_abc",
+            "configOptions": [
+                {
+                    "type":"select","id":"model","name":"Model","category":"model",
+                    "currentValue":"kimi-code/k3",
+                    "options": [
+                        {"value":"kimi-code/k3","name":"K3"},
+                        {"value":"kimi-code/kimi-for-coding","name":"K2.7 Coding"}
+                    ]
+                },
+                {
+                    "type":"select","id":"thinking","name":"Thinking","category":"thought_level",
+                    "currentValue":"high",
+                    "options": [
+                        {"value":"low","name":"Low"},
+                        {"value":"high","name":"High"},
+                        {"value":"max","name":"Max"}
+                    ]
+                },
+                {
+                    "type":"select","id":"mode","name":"Mode","category":"mode",
+                    "currentValue":"default",
+                    "options": [{"value":"default","name":"Default"}]
+                }
+            ]
+        });
+        let info = pluck_model_info(&result);
+        assert_eq!(info.model.as_deref(), Some("kimi-code/k3"));
+        assert_eq!(info.effort.as_deref(), Some("high"));
+        assert_eq!(info.available[0].efforts, vec!["low", "high", "max"]);
+        // `mode` is a select too — only the thought_level axis may be read as
+        // effort, or a session would report `default` as its reasoning level.
+        assert_ne!(info.effort.as_deref(), Some("default"));
+    }
+
+    /// A model with no thinking axis ships no `thought_level` option at all
+    /// (kimi omits it) — that is honestly "no effort", and no model×effort
+    /// picker rows are minted.
+    #[test]
+    fn model_info_has_no_effort_when_the_axis_is_absent() {
+        let result = json!({
+            "configOptions": [
+                {
+                    "type":"select","id":"model","category":"model",
+                    "currentValue":"kimi-code/plain",
+                    "options": [{"value":"kimi-code/plain","name":"Plain"}]
+                },
+                {
+                    "type":"select","id":"mode","category":"mode",
+                    "currentValue":"default",
+                    "options": [{"value":"default","name":"Default"}]
+                }
+            ]
+        });
+        let info = pluck_model_info(&result);
+        assert_eq!(info.effort, None);
+        assert!(info.available[0].efforts.is_empty());
+        assert_eq!(acp_model_picker_options(&info.available).len(), 1);
     }
 
     #[test]

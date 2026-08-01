@@ -514,9 +514,23 @@ fn apply_session_update(
             apply_model_changed(state, params);
             Vec::new()
         }
-        "plan" | "current_mode_update" | "config_option_update" | "session_info_update" => {
+        // Kimi (and any configOptions vendor) republishes the WHOLE snapshot
+        // whenever model / thinking / mode changes — from our own
+        // `session/set_config_option` or from the user's own TUI. Re-plucking it
+        // is what keeps the statusline's model · effort honest mid-session;
+        // dropping the frame is why a switched effort used to read as the
+        // handshake value forever.
+        "config_option_update" => {
+            let info = super::protocol::pluck_model_info(&update);
+            if let Some(model) = info.model {
+                state.model = Some(model);
+            }
+            // An absent axis means the current model has none — report nothing
+            // rather than a stale level from the previous model.
+            state.effort = info.effort;
             Vec::new()
         }
+        "plan" | "current_mode_update" | "session_info_update" => Vec::new(),
         _ => {
             if !kind.is_empty() && state.warned_methods.insert(format!("update:{kind}")) {
                 tracing::warn!(kind, "acp: skipping unknown sessionUpdate kind (warn-once)");
@@ -743,6 +757,61 @@ mod tests {
 
         // Nothing at all → no fragment on the statusline.
         assert!(SessionTranslateState::default().context_usage().is_none());
+    }
+
+    /// `config_option_update` is how a configOptions vendor (kimi) announces
+    /// every model / thinking change — from our own `set_config_option` or
+    /// from the user's own TUI picker. Dropping the frame (what ccteam did)
+    /// froze the statusline at the handshake values for the rest of the
+    /// session.
+    #[test]
+    fn config_option_update_refreshes_model_and_effort() {
+        let mut st = SessionTranslateState {
+            model: Some("kimi-code/k3".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {"id":"model","category":"model","currentValue":"kimi-code/k3-256k",
+                             "options":[{"value":"kimi-code/k3-256k","name":"K3-256k"}]},
+                            {"id":"thinking","category":"thought_level","currentValue":"max",
+                             "options":[{"value":"low"},{"value":"high"},{"value":"max"}]}
+                        ]
+                    }
+                }),
+            },
+        );
+        assert_eq!(st.model.as_deref(), Some("kimi-code/k3-256k"));
+        assert_eq!(st.effort.as_deref(), Some("max"));
+
+        // Switching to a model with no thinking axis drops the option from the
+        // snapshot — report nothing, not the previous model's level.
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {"id":"model","category":"model","currentValue":"kimi-code/plain",
+                             "options":[{"value":"kimi-code/plain","name":"Plain"}]},
+                            {"id":"mode","category":"mode","currentValue":"default",
+                             "options":[{"value":"default"}]}
+                        ]
+                    }
+                }),
+            },
+        );
+        assert_eq!(st.model.as_deref(), Some("kimi-code/plain"));
+        assert_eq!(st.effort, None);
     }
 
     /// `usage_update` is the vendor stating occupancy; the prompt result's

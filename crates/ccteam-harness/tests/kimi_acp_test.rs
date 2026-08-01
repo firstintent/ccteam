@@ -605,13 +605,15 @@ async fn model_directive_lists_and_sets() {
         ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
         other => panic!("expected NeedsChoice, got {other:?}"),
     };
+    // Rows are model×effort while the vendor declares a thought_level axis
+    // (kimi 0.31.1 does) — the id is exactly the `/model <id> [effort]` form.
     let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
     assert!(
-        ids.contains(&"kimi-k2-0905-preview"),
+        ids.iter().any(|id| id.starts_with("kimi-k2-0905-preview")),
         "picker must include kimi-k2-0905-preview from vendor options, got {ids:?}"
     );
     assert!(
-        ids.contains(&"kimi-k2-thinking"),
+        ids.iter().any(|id| id.starts_with("kimi-k2-thinking")),
         "picker must include kimi-k2-thinking from vendor options, got {ids:?}"
     );
 
@@ -681,6 +683,119 @@ async fn model_directive_lists_and_sets() {
         }
         other => panic!("expected Rejected for unknown model, got {other:?}"),
     }
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// Kimi's effort ladder is the ACP `thought_level` config option, id
+/// `thinking` — NOT opencode's `effort` id. Reading only the latter is why a
+/// kimi session that was plainly running at `high` reported no effort at all
+/// (verified on kimi 0.31.1: `session/new` answers
+/// `{"id":"thinking","category":"thought_level","currentValue":"high",
+/// "options":[low,high,max]}`).
+///
+/// The whole round trip: the handshake value reaches the statusline, the
+/// picker offers the vendor's own model×effort rows, `/model <id> <effort>`
+/// sets it through `session/set_config_option`, and the vendor's
+/// `config_option_update` — the frame ccteam used to drop — keeps the
+/// statusline honest afterwards.
+#[tokio::test]
+#[serial]
+async fn effort_reads_and_writes_kimis_thought_level_option() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-effort"),
+        )
+        .await
+        .unwrap();
+
+    // 1. Handshake: the current level rides the statusline.
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(
+        status.effort.as_deref(),
+        Some("high"),
+        "handshake thought_level must reach the statusline"
+    );
+
+    // 2. Picker: the vendor's own levels, never a ccteam-invented ladder.
+    let bare = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    let prompt = match bare {
+        ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
+        other => panic!("expected NeedsChoice, got {other:?}"),
+    };
+    let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        ids.contains(&"kimi-k2-thinking max"),
+        "picker must expand model×effort from the vendor levels, got {ids:?}"
+    );
+
+    // 3. Write: `/model <id> <effort>` lands the level and says so.
+    let set = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "kimi-k2-thinking max".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match set {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("effort → max"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let after = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(after.model.as_deref(), Some("kimi-k2-thinking"));
+    assert_eq!(after.effort.as_deref(), Some("max"));
+
+    // 4. A level the vendor doesn't declare is rejected by the vendor, and the
+    //    receipt says the model moved but the effort did not (never silent).
+    let bad = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "kimi-k2-0905-preview low".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match bad {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("effort → low"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("low")
+    );
 
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();
