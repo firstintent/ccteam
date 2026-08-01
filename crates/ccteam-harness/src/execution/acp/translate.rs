@@ -779,8 +779,10 @@ mod tests {
     /// 80% — the last real measurement must survive.
     #[test]
     fn zero_total_tokens_never_overwrites_real_occupancy() {
-        let mut st = SessionTranslateState::default();
-        st.window_tokens = Some(500_000);
+        let mut st = SessionTranslateState {
+            window_tokens: Some(500_000),
+            ..Default::default()
+        };
         st.begin_turn("t1", Arc::new(Notify::new()));
         finalize_from_prompt_result(
             &mut st,
